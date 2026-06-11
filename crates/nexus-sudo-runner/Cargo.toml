@@ -11,6 +11,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "macros"] }
 anyhow = "1"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
+
+[lints]
+workspace = true

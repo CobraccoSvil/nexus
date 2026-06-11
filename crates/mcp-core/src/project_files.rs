@@ -194,7 +194,7 @@ pub async fn create_project_entry(
         &state.db,
         user_id,
         &context,
-        &[relative_path.clone()],
+        std::slice::from_ref(&relative_path),
         context.details.root_path.as_deref(),
     )
     .await?;
@@ -259,7 +259,7 @@ pub async fn rename_project_entry(
         &state.db,
         user_id,
         &context,
-        &[new_relative_path.clone()],
+        std::slice::from_ref(&new_relative_path),
         context.details.root_path.as_deref(),
     )
     .await?;

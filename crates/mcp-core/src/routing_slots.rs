@@ -16,9 +16,7 @@
 //! Quando piu' provider hanno la stessa chiave, vengono ordinati per
 //! `priority DESC` ed esposti come chain di fallback (utile per cooldown).
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -70,8 +68,6 @@ pub struct SlotsRoutingEntry {
     pub required_capabilities: Vec<String>,
     pub requires_tool_use: bool,
     pub cost_direction: String,
-    #[allow(dead_code)]
-    pub rationale: String,
 }
 
 /// Requisito di routing derivato dal lookup di una chiave slot. Non contiene
@@ -84,8 +80,6 @@ pub struct SlotRequirement {
     pub required_capabilities: Vec<String>,
     pub requires_tool_use: bool,
     pub cost_direction: String,
-    #[allow(dead_code)]
-    pub rationale: String,
 }
 
 /// Matrice slots in memoria. Cache TTL 60s, refresh background.
@@ -94,7 +88,6 @@ pub struct SlotsRoutingMatrix {
     /// Tutte le entry attive. Lookup itera con fallback wildcard.
     /// (Numero piccolo: ~50-200 entry. Iterazione lineare e' OK.)
     pub entries: Vec<SlotsRoutingEntry>,
-    pub loaded_at: Instant,
 }
 
 impl SlotsRoutingMatrix {
@@ -159,11 +152,11 @@ impl SlotsRoutingMatrix {
                         return false;
                     }
                     // framework: stringhe vuote ammesse come wildcard
-                    let fw_ok = match fw_probe {
+                    
+                    match fw_probe {
                         Some(f) if !f.is_empty() => e.framework == f || e.framework == "*",
                         _ => e.framework == "*",
-                    };
-                    fw_ok
+                    }
                 })
                 .collect();
             if !matches.is_empty() {
@@ -181,7 +174,6 @@ impl SlotsRoutingMatrix {
                     required_capabilities: e.required_capabilities.clone(),
                     requires_tool_use: e.requires_tool_use,
                     cost_direction: e.cost_direction.clone(),
-                    rationale: e.rationale.clone(),
                 });
             }
         }
@@ -194,6 +186,10 @@ impl SlotsRoutingMatrix {
     }
 
     /// True se non ci sono entry (DB vuoto o tabella appena migrata).
+    #[expect(
+        dead_code,
+        reason = "complemento richiesto da clippy::len_without_is_empty: len() e' usato in produzione"
+    )]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -391,11 +387,10 @@ async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> 
         Vec<String>,
         bool,
         String,
-        String,
     )> = sqlx::query_as(
         r#"SELECT action_verb, target_type, framework, scope,
                       preferred_tier, required_capabilities, requires_tool_use,
-                      cost_direction, rationale
+                      cost_direction
                  FROM nexus_routing_slots_matrix
                 WHERE is_active = TRUE"#,
     )
@@ -405,7 +400,7 @@ async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> 
     let entries: Vec<SlotsRoutingEntry> = rows
         .into_iter()
         .map(
-            |(av, tt, fw, sc, tier, caps, tool_use, cost, rat)| SlotsRoutingEntry {
+            |(av, tt, fw, sc, tier, caps, tool_use, cost)| SlotsRoutingEntry {
                 action_verb: av,
                 target_type: tt,
                 framework: fw,
@@ -414,14 +409,10 @@ async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> 
                 required_capabilities: caps,
                 requires_tool_use: tool_use,
                 cost_direction: cost,
-                rationale: rat,
             },
         )
         .collect();
-    Ok(SlotsRoutingMatrix {
-        entries,
-        loaded_at: Instant::now(),
-    })
+    Ok(SlotsRoutingMatrix { entries })
 }
 
 /// Cache thread-safe con refresh background ogni 60s. Pattern identico a
@@ -429,14 +420,12 @@ async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> 
 #[derive(Debug, Clone)]
 pub struct SlotsRoutingMatrixCache {
     inner: Arc<RwLock<Option<Arc<SlotsRoutingMatrix>>>>,
-    last_error: Arc<RwLock<Option<String>>>,
 }
 
 impl SlotsRoutingMatrixCache {
     pub fn empty() -> Self {
         Self {
             inner: Arc::new(RwLock::new(None)),
-            last_error: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -457,7 +446,6 @@ impl SlotsRoutingMatrixCache {
                      Il routing slot-based sara' disabilitato; \
                      fallback al routing classico (intent, behavior_mode)."
                 );
-                *cache.last_error.write().await = Some(e);
             }
         }
         // Spawn refresh background ogni 60s
@@ -471,11 +459,9 @@ impl SlotsRoutingMatrixCache {
                 match fetch_slots_from_db(&db_for_refresh).await {
                     Ok(m) => {
                         *cache_for_refresh.inner.write().await = Some(Arc::new(m));
-                        *cache_for_refresh.last_error.write().await = None;
                     }
                     Err(e) => {
                         warn!("SlotsRoutingMatrix refresh fallito: {e}");
-                        *cache_for_refresh.last_error.write().await = Some(e);
                     }
                 }
             }
@@ -486,11 +472,6 @@ impl SlotsRoutingMatrixCache {
     /// Snapshot corrente, se disponibile. None se DB non e' stato letto.
     pub async fn current_async(&self) -> Option<Arc<SlotsRoutingMatrix>> {
         self.inner.read().await.as_ref().map(Arc::clone)
-    }
-
-    #[allow(dead_code)]
-    pub async fn last_error(&self) -> Option<String> {
-        self.last_error.read().await.clone()
     }
 }
 
@@ -516,7 +497,6 @@ mod tests {
             required_capabilities: caps.iter().map(|s| s.to_string()).collect(),
             requires_tool_use: true,
             cost_direction: cost.into(),
-            rationale: String::new(),
         }
     }
 
@@ -563,7 +543,6 @@ mod tests {
                 entry("write", "tests", "*", "single", "light", &["code"], "asc"),
                 entry("delete", "*", "*", "*", "medium", &["code"], "desc"),
             ],
-            loaded_at: Instant::now(),
         }
     }
 
@@ -819,7 +798,6 @@ mod tests {
                     "asc",
                 ),
             ],
-            loaded_at: Instant::now(),
         };
         let slots = ActionSlots {
             action_verb: "resolve".into(),
@@ -940,7 +918,6 @@ mod tests {
                 ),
                 entry("delete", "*", "*", "*", "medium", &["code"], "desc"),
             ],
-            loaded_at: Instant::now(),
         }
     }
 

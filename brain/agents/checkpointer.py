@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 
 from .postgres_checkpointer import PostgresCheckpointer
 
@@ -38,15 +37,3 @@ def create_checkpointer() -> PostgresCheckpointer:
     logger.info(f"Creazione checkpointer PostgreSQL con connessione: {connection_string.split('@')[1] if '@' in connection_string else 'localhost'}")
 
     return PostgresCheckpointer(connection_string=connection_string)
-
-
-def get_memory_db_path() -> str:
-    """Deprecato: il learning storage ora usa PostgreSQL.
-
-    Mantenuto per retrocompatibilita. Il path non viene piu utilizzato
-    dal sistema — i dati sono in brain_learning_interactions su PostgreSQL.
-    """
-    brain_root = Path(__file__).parent.parent
-    nexus_memory = brain_root / "nexus_memory"
-    nexus_memory.mkdir(parents=True, exist_ok=True)
-    return str(nexus_memory / "learning.db")

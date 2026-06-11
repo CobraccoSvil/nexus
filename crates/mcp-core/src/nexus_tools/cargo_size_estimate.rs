@@ -30,7 +30,7 @@ impl NexusToolHandler for CargoSizeEstimateTool {
                 }
             }
         }
-        bins.sort_by(|a, b| b.1.cmp(&a.1));
+        bins.sort_by_key(|b| std::cmp::Reverse(b.1));
         let total: u64 = bins.iter().map(|(_, s)| s).sum();
         let items: Vec<Value> = bins
             .iter()

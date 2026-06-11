@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
@@ -21,19 +21,6 @@ use crate::project_db::exec::{
     archive_ddl, execute_query, open_pool, resolve_project_conn, QueryExecError,
 };
 use crate::{auth::Claims, AppState};
-
-#[derive(Debug, Serialize)]
-pub struct ProjectMigrationRow {
-    pub id: String,
-    pub filename: String,
-    pub checksum: Option<String>,
-    pub status: String,
-    pub description: Option<String>,
-    pub created_by_agent: Option<String>,
-    pub created_at: String,
-    pub applied_at: Option<String>,
-    pub error_message: Option<String>,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct ApplyMigrationsBody {

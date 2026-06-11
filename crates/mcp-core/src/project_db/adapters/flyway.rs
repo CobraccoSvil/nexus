@@ -2,7 +2,7 @@
 
 use super::MigrationAdapter;
 use crate::project_db::{
-    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+    AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -11,14 +11,6 @@ pub struct FlywayAdapter;
 
 #[async_trait]
 impl MigrationAdapter for FlywayAdapter {
-    async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
-        super::list_pending_files(
-            ctx,
-            |n| (n.starts_with('V') || n.starts_with('R')) && n.ends_with(".sql"),
-            true,
-        )
-    }
-
     async fn create_migration(
         &self,
         ctx: &ProjectDbContext,
@@ -93,8 +85,7 @@ fn next_flyway_version(dir: &std::path::Path) -> (u32, u32) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('V') {
-                let rest = &name[1..];
+            if let Some(rest) = name.strip_prefix('V') {
                 let ver_str: String = rest
                     .chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '_')

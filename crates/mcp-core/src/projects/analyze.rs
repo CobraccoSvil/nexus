@@ -249,7 +249,7 @@ pub fn detect_languages(ext_counts: &BTreeMap<String, u32>) -> Vec<Value> {
             results.push((lang.to_string(), count));
         }
     }
-    results.sort_by(|a, b| b.1.cmp(&a.1));
+    results.sort_by_key(|r| std::cmp::Reverse(r.1));
     results
         .into_iter()
         .map(|(lang, count)| json!({ "language": lang, "fileCount": count }))
@@ -293,9 +293,9 @@ pub async fn collect_search_dirs(root: &Path) -> Vec<std::path::PathBuf> {
 /// Controlla se uno dei dirs contiene un file con certa estensione.
 pub fn has_extension_in_dirs(dirs: &[std::path::PathBuf], ext: &str) -> bool {
     dirs.iter().any(|d| {
-        std::fs::read_dir(d).ok().map_or(false, |mut e| {
+        std::fs::read_dir(d).ok().is_some_and(|mut e| {
             e.any(|entry| {
-                entry.ok().map_or(false, |e| {
+                entry.ok().is_some_and(|e| {
                     e.path().extension().and_then(|x| x.to_str()) == Some(ext)
                 })
             })
@@ -526,10 +526,10 @@ pub async fn detect_frameworks(root: &Path) -> Vec<String> {
             found.insert("Django".to_string());
         }
         // Flask
-        if !found.contains("Flask") {
-            if dir.join("app.py").exists()
+        if !found.contains("Flask")
+            && (dir.join("app.py").exists()
                 || dir.join("wsgi.py").exists()
-                || dir.join("application.py").exists()
+                || dir.join("application.py").exists())
             {
                 if let Ok(content) = std::fs::read_to_string(dir.join("requirements.txt")) {
                     if content.to_lowercase().contains("flask") {
@@ -537,17 +537,15 @@ pub async fn detect_frameworks(root: &Path) -> Vec<String> {
                     }
                 }
             }
-        }
         // FastAPI
-        if !found.contains("FastAPI") {
-            if dir.join("main.py").exists() || dir.join("app.py").exists() {
+        if !found.contains("FastAPI")
+            && (dir.join("main.py").exists() || dir.join("app.py").exists()) {
                 if let Ok(content) = std::fs::read_to_string(dir.join("requirements.txt")) {
                     if content.to_lowercase().contains("fastapi") {
                         found.insert("FastAPI".to_string());
                     }
                 }
             }
-        }
     }
 
     // Rilevamento per estensione file

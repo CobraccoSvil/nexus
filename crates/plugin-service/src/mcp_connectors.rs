@@ -12,7 +12,7 @@
 //!   GET  /internal/mcp/tools/:user_id/:project_id -> load_mcp_tools_for_agent
 //!   POST /internal/mcp/execute                     -> execute_mcp_tool
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use axum::{
     extract::{Extension, Path as AxumPath, State},
@@ -39,7 +39,7 @@ use nexus_mcp_client::server_storage::{
     list_servers_for_user, parse_json_string_set, row_to_json, set_enabled, upsert_discovered_tools,
 };
 
-use crate::mcp_client::{self, McpServerConfig, McpTransport};
+use crate::mcp_client::{self};
 use crate::AppState;
 
 async fn trigger_prompt_template_tool_reassignment() {

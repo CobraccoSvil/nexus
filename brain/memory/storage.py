@@ -149,35 +149,11 @@ class PostgresLearningStorage:
             conn.commit()
         return True
 
-    def get_recent_interactions(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Recupera le interazioni piu recenti."""
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM brain_learning_interactions ORDER BY id DESC LIMIT %s",
-                    (limit,),
-                )
-                columns = [desc[0] for desc in cur.description] if cur.description else []
-                rows = cur.fetchall()
-        return [dict(zip(columns, row)) for row in rows]
-
     def get_task_stats(self) -> list[dict[str, Any]]:
         """Recupera le statistiche aggregate per tipo di task."""
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM brain_task_stats ORDER BY total_count DESC")
-                columns = [desc[0] for desc in cur.description] if cur.description else []
-                rows = cur.fetchall()
-        return [dict(zip(columns, row)) for row in rows]
-
-    def get_interactions_by_task(self, task_type: str, limit: int = 20) -> list[dict[str, Any]]:
-        """Recupera interazioni filtrate per tipo di task."""
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM brain_learning_interactions WHERE task_type = %s ORDER BY id DESC LIMIT %s",
-                    (task_type, limit),
-                )
                 columns = [desc[0] for desc in cur.description] if cur.description else []
                 rows = cur.fetchall()
         return [dict(zip(columns, row)) for row in rows]

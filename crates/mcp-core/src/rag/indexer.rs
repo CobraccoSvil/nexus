@@ -234,27 +234,6 @@ pub async fn index_attachment(
     Ok(n)
 }
 
-pub async fn delete_source(
-    db: &PgPool,
-    source_kind: SourceKind,
-    source_id: &str,
-) -> Result<(), RagError> {
-    let cfg = current_config(db).await?;
-    let http = Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| RagError::Qdrant(format!("reqwest build: {e}")))?;
-    let collection = cfg.collection_for(source_kind);
-    let filters = vec![("source_id".to_string(), json!(source_id))];
-    qdrant_client::delete_by_filter(&http, &cfg.qdrant_url, collection, filters).await?;
-    tracing::info!(
-        "rag.delete_source: kind={} source_id={} rimosso",
-        source_kind.as_str(),
-        source_id
-    );
-    Ok(())
-}
-
 /// ID stabile per un punto Qdrant: SHA-256(name) -> primi 16 bytes -> UUID v4-shape.
 /// Cosi' reindicizzare la stessa source+chunk_index sovrascrive il punto.
 fn stable_point_id(name: &str) -> String {

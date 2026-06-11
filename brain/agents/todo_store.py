@@ -91,27 +91,6 @@ def list_todos(run_id: str) -> list[dict[str, Any]]:
         conn.close()
 
 
-def count_pending(run_id: str) -> int:
-    """Conta i todos in stato non terminale (pending o in_progress)."""
-    conn = _get_conn()
-    if conn is None:
-        return 0
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT COUNT(*) AS n FROM nexus_agent_todos
-                   WHERE run_id = %s AND status IN ('pending','in_progress')""",
-                (run_id,),
-            )
-            row = cur.fetchone()
-            return int(row["n"]) if row else 0
-    except Exception as exc:
-        logger.warning("todo_store.count_pending run_id=%s fallito: %s", run_id, exc)
-        return 0
-    finally:
-        conn.close()
-
-
 def active_todo(run_id: str) -> dict[str, Any] | None:
     """Ritorna il todo "attivo" (in_progress se presente, altrimenti primo pending)."""
     todos = list_todos(run_id)
@@ -148,15 +127,6 @@ def stats(run_id: str) -> dict[str, int]:
         return out
     finally:
         conn.close()
-
-
-def all_completed(run_id: str) -> bool:
-    """True se ci sono todos E tutti sono completed o skipped."""
-    s = stats(run_id)
-    if s["total"] == 0:
-        return False
-    terminal = s["completed"] + s["skipped"]
-    return terminal == s["total"]
 
 
 def increment_iteration_seen(run_id: str) -> None:

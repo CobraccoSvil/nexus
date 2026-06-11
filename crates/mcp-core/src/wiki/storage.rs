@@ -33,7 +33,7 @@ pub struct WikiDocCreate {
     pub intent: Option<String>,
     pub public_read: bool,
     /// Se l'utente passa esplicitamente un vault_file_path (es. import da
-    /// vault esistente); altrimenti `build_vault_path` lo deriva da kind/slug.
+    /// vault esistente); altrimenti resta NULL e il path non viene derivato.
     pub vault_file_path: Option<String>,
 }
 

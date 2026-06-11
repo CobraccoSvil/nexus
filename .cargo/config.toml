@@ -1,2 +1,7 @@
+# NB: fino al 2026-06-11 qui c'era `rustflags = ["--cap-lints", "allow"]`
+# (presente dal bootstrap del monorepo): cappava TUTTI i lint, anche dei crate
+# del workspace, rendendo cieco il gate `cargo clippy -D warnings` di verify.sh
+# e nascondendo 170 warning di dead code reali. Rimosso dopo la bonifica
+# (zero warning sul workspace): i lint delle DIPENDENZE esterne restano
+# silenziati da cargo automaticamente, il flag globale non serviva.
 [build]
-rustflags = ["--cap-lints", "allow"]

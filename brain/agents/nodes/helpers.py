@@ -342,8 +342,8 @@ def turn_action_oriented(state) -> bool:
     dalla semantica del classifier LLM del turno corrente (requires_tools /
     agentic_score, soglia DB `routing.action_oriented_min_agentic_score`).
 
-    Sostituisce le euristiche testuali locali (`_detect_action_request` sul
-    PRIMO messaggio della history) sparse in 5 call site: in una sessione
+    Sostituisce le euristiche testuali locali (keyword-matching sul
+    PRIMO messaggio della history, rimosse) sparse in 5 call site: in una sessione
     iniziata con una richiesta d'azione OGNI turno successivo risultava
     "azione" per sempre. Incidente osservato 2026-06-10: "riassumi in due
     righe cosa hai sistemato" valutato sul primo messaggio (un crash da
@@ -1115,53 +1115,6 @@ def _describe_tool_call(name: str, args: dict[str, Any] | None) -> str:
     return f"Chiamo tool: {nm}"
 
 
-# ── G1 Python: rilevamento richieste d'azione ─────────────────────────────
-_ACTION_PATTERNS: tuple[str, ...] = (
-    # Italiano — imperativo / infinito / futuro
-    "avvia", "avviare", "lancia", "lanciare",
-    "esegui", "eseguire",
-    "builda", "buildare",
-    "crea ", "creare", "crea il", "crea la",
-    "installa", "installare",
-    "configura", "configurare",
-    "deploya", "deployare",
-    "compila", "compilare",
-    "fai partire", "metti in piedi", "porta in su", "metti online",
-    "avvia i servizi", "avvia il backend", "avvia il frontend", "avvia il server",
-    "scaffolda", "inizializza il progetto", "crea il progetto",
-    "scrivi i file", "genera il progetto",
-    # Inglese — imperativo / common forms
-    "start ", "launch ", " run ", "run the", " build", "build the",
-    " create ", "create the", "install ", "setup ", "set up ",
-    "configure ", "deploy ", "compile ", "scaffold ",
-    # Tecnologie specifiche
-    "docker", "docker-compose", "docker compose",
-    "npm install", "npm run", "pnpm install", "pnpm run",
-    "cargo build", "cargo run", "dotnet run", "dotnet build",
-    "pip install", "pip3 install", "apt install", "apt-get install",
-    "systemctl start", "service start", "make ",
-    # Creazione struttura progetto
-    "crea la struttura", "crea le directory", "crea i file",
-    "structure", "scaffolding",
-)
-
-
-def _detect_action_request(text: str) -> bool:
-    """DEPRECATA (2026-06-10): non usare in nuovi call site.
-
-    Euristica keyword sostituita dal punto unico `turn_action_oriented(state)`
-    (campo `action_oriented` calcolato da router_node dal classifier LLM sul
-    turno corrente). I 5 call site storici sono stati convertiti; questa resta
-    solo come riferimento e per i test unitari finche' non vengono migrati.
-
-    Speculare a crates/mcp-core/src/agent_types.rs::detect_action_request.
-    """
-    if not text or not text.strip():
-        return False
-    lower = text.lower()
-    return any(p in lower for p in _ACTION_PATTERNS)
-
-
 # ── FIX C: richiesta esplicita di verifica/test da parte dell'utente ────────
 # Incident run f1db9550: l'utente ha chiesto "verifica tu stesso provando ad
 # accedere con costantino@cobracco.it" ma l'agente ha chiuso senza eseguire
@@ -1190,8 +1143,8 @@ _VERIFICATION_REQUEST_PATTERNS: tuple[str, ...] = (
 def _detect_verification_request(text: str) -> bool:
     """True se il messaggio utente chiede esplicitamente di verificare/testare.
 
-    Diverso da `_detect_action_request` (che valuta una richiesta d'azione
-    generica): qui isoliamo la richiesta di VERIFICA reale (provare il flusso,
+    Diverso dal rilevamento di una richiesta d'azione generica (punto unico
+    `turn_action_oriented`): qui isoliamo la richiesta di VERIFICA reale (provare il flusso,
     fare login, testare il funzionamento) cosi' l'agente sa che deve eseguire
     la prova e riportarne l'esito, non solo "fare" e dichiarare completato.
     """
@@ -1285,9 +1238,9 @@ def _inject_verification_directive(
 # Pattern di "intenzione imminente non compiuta": il modello annuncia la
 # prossima azione (verifica/lettura/esecuzione) ma chiude il turno SENZA
 # emettere alcuna tool call. Tipico dei modelli thinking con tool_choice=auto
-# (gemini-2.5, deepseek-v4): narrano il piano e si fermano. A differenza di
-# _detect_action_request — che valuta la richiesta dell'utente (input) — questo
-# valuta l'OUTPUT del modello, cosi' il nudge scatta anche quando il primo
+# (gemini-2.5, deepseek-v4): narrano il piano e si fermano. A differenza del
+# rilevamento azione sul turno utente (input, punto unico turn_action_oriented),
+# questo valuta l'OUTPUT del modello, cosi' il nudge scatta anche quando il primo
 # messaggio umano non e' imperativo (es. "l'applicazione non parte").
 _INTENT_NARRATION_PATTERNS: tuple[str, ...] = (
     # Italiano — intenzione futura imminente (verbi d'azione al presente/futuro)
@@ -1983,62 +1936,11 @@ def _detect_recent_tool_error(messages: list, lookback: int = 4) -> bool:
     return False
 
 
-# ── Lookup prezzi modelli da ai_price_catalog ──────────────────────────────
-_PRICE_CACHE: dict[str, tuple[float, float]] = {}
-_PRICE_CACHE_TS: dict[str, float] = {}
-_PRICE_TTL_S = 300.0
-
-
-def _lookup_price(provider: str, model: str) -> tuple[float, float]:
-    """Ritorna (input_cost_per_mtok, output_cost_per_mtok) da ai_price_catalog.
-    Cache 5min. Ritorna (0,0) se modello non trovato (niente errore bloccante)."""
-    import os
-    key = f"{provider}|{model}"
-    now = time.monotonic()
-    if key in _PRICE_CACHE and (now - _PRICE_CACHE_TS.get(key, 0)) < _PRICE_TTL_S:
-        return _PRICE_CACHE[key]
-    try:
-        import psycopg2
-        db_url = get_db_url()
-        with psycopg2.connect(db_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT input_cost_per_million_tokens, output_cost_per_million_tokens "
-                    "FROM ai_price_catalog "
-                    "WHERE provider = %s AND model = %s AND is_enabled = TRUE "
-                    "ORDER BY effective_from DESC LIMIT 1",
-                    (provider, model),
-                )
-                row = cur.fetchone()
-        if row:
-            result = (float(row[0]), float(row[1]))
-        else:
-            result = (0.0, 0.0)
-    except Exception as e:
-        logger.warning("_lookup_price(%s/%s) fallito: %s", provider, model, e)
-        result = (0.0, 0.0)
-    _PRICE_CACHE[key] = result
-    _PRICE_CACHE_TS[key] = now
-    return result
-
 # ── Limiti output tool per gestione contesto ────────────────────────────────
 # Tronca risultati tool singoli troppo grandi (20% testa + 80% coda)
 MAX_TOOL_RESULT_CHARS = 6000
 # Budget totale contesto: oltre questo soglia i tool result vecchi vengono compressi
 MAX_CONTEXT_CHARS = 400_000
-
-
-def _smart_truncate(text: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
-    """Tronca preservando testa (20%) e coda (80%) per mantenere errori finali."""
-    if len(text) <= max_chars:
-        return text
-    head_size = max_chars // 5
-    tail_size = max_chars - head_size - 80
-    return (
-        text[:head_size]
-        + f"\n\n[... TRONCATO: {len(text) - head_size - tail_size} caratteri omessi ...]\n\n"
-        + text[-tail_size:]
-    )
 
 
 def _estimate_context_chars(messages: list) -> int:
@@ -2062,7 +1964,6 @@ def _estimate_context_chars(messages: list) -> int:
 # evitare ri-tokenizzazione di messaggi gia' visti (perf critica con history
 # lunga). Fallback a chars//4 se tiktoken non disponibile (regola H: niente
 # panic, degrada in modo controllato).
-import functools as _functools_for_tok
 import hashlib as _hashlib_for_tok
 
 _TOKENIZER_CACHE: dict[str, Any] = {"encoder": None, "name": None}
@@ -2087,14 +1988,6 @@ def _get_tokenizer():
     _TOKENIZER_CACHE["encoder"] = enc
     _TOKENIZER_CACHE["name"] = name
     return enc
-
-
-@_functools_for_tok.lru_cache(maxsize=4096)
-def _count_tokens_cached(content_hash: str, length: int) -> int:
-    """Slot LRU: il vero conteggio passa per _count_tokens (che chiama questa)."""
-    # NB: questa funzione e' un placeholder per cache: la chiave include hash+len
-    # per evitare collisioni. Il valore reale viene messo via _count_tokens.
-    return length // 4  # fallback se mai raggiunto direttamente
 
 
 def _count_tokens(text: str) -> int:

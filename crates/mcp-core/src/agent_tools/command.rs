@@ -11,16 +11,15 @@ const RUN_TESTS_MAX_TIMEOUT: u64 = 300;
 
 /// Progetto con DB registrato e `allow_ddl_override = false` (default): schema change solo via migration.
 async fn strict_migration_only_project(ctx: &AgentToolContext) -> bool {
-    match sqlx::query_scalar::<_, bool>(
-        "SELECT allow_ddl_override FROM project_database_config WHERE project_id = $1 LIMIT 1",
+    matches!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT allow_ddl_override FROM project_database_config WHERE project_id = $1 LIMIT 1",
+        )
+        .bind(ctx.project_id)
+        .fetch_optional(&*ctx.db)
+        .await,
+        Ok(Some(false))
     )
-    .bind(ctx.project_id)
-    .fetch_optional(&*ctx.db)
-    .await
-    {
-        Ok(Some(false)) => true,
-        _ => false,
-    }
 }
 
 fn shell_command_bypasses_migration_policy(cmd: &str) -> bool {
@@ -286,7 +285,17 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
 // ---------------------------------------------------------------------------
 
 /// Esegue i test del progetto in modo sincrono con timeout esteso.
-/// Chiamato direttamente da agent_loop.rs (non via execute_agent_tool).
+///
+/// NB: il tool `run_tests` e' esposto al modello (tool_schema), raccomandato
+/// dai prompt e whitelistato nelle migrazioni 0218/0286, ma il dispatcher
+/// `execute_agent_tool` NON ha il braccio "run_tests": ogni invocazione oggi
+/// fallisce con "Tool run_tests non esiste". Il vecchio chiamante
+/// (agent_loop.rs) e' stato smantellato col passaggio del loop al brain.
+/// Fix tracciato: ricablare il braccio in dispatch.rs (task aperto).
+#[expect(
+    dead_code,
+    reason = "tool dichiarato nel catalogo DB, scollegato dal dispatcher: in attesa di ricablaggio (vedi doc-comment)"
+)]
 pub(crate) async fn tool_run_tests(
     ctx: &AgentToolContext,
     input: &Value,
@@ -671,7 +680,7 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
     if sanitized
         .chars()
         .next()
-        .map_or(true, |c| c.is_ascii_digit())
+        .is_none_or(|c| c.is_ascii_digit())
     {
         sanitized.insert(0, 'p');
     }

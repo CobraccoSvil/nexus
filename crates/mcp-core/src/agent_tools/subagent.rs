@@ -394,9 +394,7 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
     let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
-            return format!(
-                "\u{274C} [nexus_subagent_poll] parametro 'subagent_run_id' obbligatorio"
-            )
+            return "\u{274C} [nexus_subagent_poll] parametro 'subagent_run_id' obbligatorio".to_string()
         }
     };
     let row = sqlx::query(
@@ -437,9 +435,7 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
-            return format!(
-                "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"
-            )
+            return "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio".to_string()
         }
     };
     // Best-effort: aggiorna lo stato a 'running' e chiama l'endpoint brain

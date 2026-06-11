@@ -102,18 +102,6 @@ pub fn contains_ddl_statement(sql: &str) -> bool {
     DDL_KEYWORDS.iter().any(|kw| upper.contains(kw))
 }
 
-/// Restituisce payload JSON strutturato DDL_BLOCKED serializzato come stringa.
-#[allow(dead_code)]
-pub fn ddl_blocked_response(project_id: uuid::Uuid) -> String {
-    serde_json::json!({
-        "error": "DDL_BLOCKED",
-        "message": "Modifica schema bloccata. Nexus richiede l'uso del migration runner per modifiche schema sui progetti utente.",
-        "suggested_tool": "project_db_create_migration",
-        "override_endpoint": format!("/api/projects/{}/db/override-request", project_id),
-        "hint": "Usa project_db_create_migration({\"name\": \"...\", \"sql\": \"...\"}) per creare una migration tracciabile."
-    }).to_string()
-}
-
 pub async fn get_pool() -> Result<PgPool, String> {
     let db_url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL not set".to_string())?;
     PgPoolOptions::new()
@@ -126,25 +114,13 @@ pub async fn get_pool() -> Result<PgPool, String> {
 
 // ── Pool per DB del progetto ─────────────────────────────────────────
 
-/// Apre un pool temporaneo verso un DSN arbitrario (PostgreSQL).
-/// Supporta sia formato `postgres://` che ADO.NET (`Server=...;...`).
-pub async fn get_pool_for_dsn(dsn: &str) -> Result<PgPool, String> {
-    let normalized = normalize_dsn(dsn)?;
-    PgPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&normalized)
-        .await
-        .map_err(|e| format!("connect failed: {}", e))
-}
-
 /// Cerca la connection_string nella tabella `project_database_config`
 /// per il progetto dato, poi apre un pool temporaneo verso quel DB.
 pub async fn get_pool_for_project(
     nexus_pool: &PgPool,
     project_id: uuid::Uuid,
 ) -> Result<PgPool, String> {
-    use sqlx::Row;
+    
 
     let row: Option<(Vec<u8>, String)> = sqlx::query_as(
         r#"SELECT connection_secret, engine
@@ -209,9 +185,7 @@ fn normalize_dsn(dsn: &str) -> Result<String, String> {
         return parse_ado_net_dsn(trimmed);
     }
 
-    Err(format!(
-        "Formato DSN non riconosciuto. Atteso postgres://... o Server=...;Port=...;Database=...;User Id=...;Password=...;"
-    ))
+    Err("Formato DSN non riconosciuto. Atteso postgres://... o Server=...;Port=...;Database=...;User Id=...;Password=...;".to_string())
 }
 
 fn parse_ado_net_dsn(dsn: &str) -> Result<String, String> {

@@ -693,10 +693,8 @@ pub async fn validate_env_overrides(
         if k.eq_ignore_ascii_case("REDIS_URL") {
             let low = v.to_lowercase();
             if low.contains(":6379") || low.contains("ideai-redis") {
-                return Err(format!(
-                    "REDIS_URL punta al Redis Nexus (:6379 o ideai-redis). \
-                     I progetti devono usare il proprio Redis allocato via wizard."
-                ));
+                return Err("REDIS_URL punta al Redis Nexus (:6379 o ideai-redis). \
+                     I progetti devono usare il proprio Redis allocato via wizard.".to_string());
             }
         }
     }

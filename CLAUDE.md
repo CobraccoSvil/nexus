@@ -74,7 +74,7 @@ I nomi dei modelli AI (`mistral-small-latest`, `gemini-2.5-flash`, `claude-haiku
   - `state.orchestrator.routing_matrix.current_async().await?` ritorna `Result<Arc<RoutingMatrix>, String>` — propaga errore (HTTP 503) se DB down
   - `matrix.lookup(intent, mode)` per routing utente
   - `matrix.default_model(provider)` per default per provider
-  - `matrix.purpose_model(purpose_key)` per task interni (chat title, doc gen, ecc.)
+  - `internal_routing::resolve_purpose_model(state, purpose)` per task interni (chat title, doc gen, ecc.) — tier-aware: un purpose con `tier` valorizzato ignora il `model_id` statico
 - **Python** (cache 60s):
   - `_load_analyzer_provider_chain()` solleva `AnalyzerChainUnavailable` se DB down
   - `_default_model_for_provider(provider)` solleva `DefaultModelUnavailable` se DB down o provider non configurato

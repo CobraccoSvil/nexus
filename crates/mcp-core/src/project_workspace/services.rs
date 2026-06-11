@@ -303,7 +303,7 @@ pub async fn get_project_services_status(
                         .strip_prefix("NRestarts=")
                         .and_then(|v| v.parse::<u32>().ok())
                 })
-                .map_or(false, |n| n > 2)
+                .is_some_and(|n| n > 2)
         } else {
             false
         };
@@ -645,76 +645,6 @@ pub async fn restart_all_project_services(
         }
     }
     Ok(Json(json!({ "slug": slug, "restarted": results })))
-}
-
-/// POST /api/projects/:id/services/stop-all
-/// Ferma tutti i `{slug}-*.service` del progetto e rilascia le porte dal port_registry.
-pub async fn stop_all_project_services(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let project_id = Uuid::parse_str(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
-    let context = load_project_context(&state.db, project_id, user_id).await?;
-    let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
-
-    let prefix = format!("{}-", slug);
-    let list = tokio::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "list-units",
-            "--type=service",
-            "--all",
-            "--no-legend",
-            "--no-pager",
-        ])
-        .output()
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let list_str = String::from_utf8_lossy(&list.stdout);
-    let units: Vec<String> = list_str
-        .lines()
-        .filter_map(|line| {
-            let unit = line.split_whitespace().next()?;
-            if unit.starts_with(&prefix) {
-                Some(unit.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Helper: rilascia porte dal registry leggendo il unit file.
-    async fn release_ports_for_unit(state: &AppState, unit_name: &str) {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let unit_path = format!("{}/.config/systemd/user/{}", home, unit_name);
-        if let Ok(content) = tokio::fs::read_to_string(&unit_path).await {
-            let ports = extract_ports_from_unit(&content);
-            for p in ports {
-                let _ = state.port_registry.release(p).await;
-            }
-        }
-    }
-
-    let mut stopped = Vec::new();
-    for unit in &units {
-        let out = tokio::process::Command::new("systemctl")
-            .args(["--user", "stop", unit])
-            .output()
-            .await;
-        release_ports_for_unit(&state, unit).await;
-        match out {
-            Ok(o) => stopped.push(json!({
-                "unit": unit,
-                "ok": o.status.success(),
-                "stderr": String::from_utf8_lossy(&o.stderr).to_string(),
-            })),
-            Err(e) => stopped.push(json!({ "unit": unit, "ok": false, "stderr": e.to_string() })),
-        }
-    }
-    Ok(Json(json!({ "slug": slug, "stopped": stopped })))
 }
 
 // ── POST /api/projects/:id/services/cleanup-ports ───────────────────────────
@@ -1063,7 +993,7 @@ pub(super) async fn detect_project_ports(
     let mut all_pids: std::collections::HashSet<u32> = agent_pids
         .iter()
         .map(|p| *p as u32)
-        .chain(systemd_pids.into_iter())
+        .chain(systemd_pids)
         .collect();
 
     // Scan /proc per costruire mappa figli e trovare processi con cwd nel project_root.
@@ -1314,7 +1244,7 @@ pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
 /// Range riservato HTTP:  4000–4079  (microservizi Nexus)
 /// Range riservato gRPC:  4100–4139  (canali gRPC interni, target migrazione)
 /// Porte gRPC attuali:    50051–50501 (in uso finché non migrati)
-/// Progetti utente:       5000+ (assegnate da find_free_port)
+/// Progetti utente:       20000-39999 (bucket assegnati da find_free_project_port)
 pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     // Porte di sistema
     80, 443,
@@ -1366,8 +1296,8 @@ pub fn project_bucket_start(project_id: &Uuid) -> u16 {
     // Hash stabile: usa i primi 8 byte (big-endian) del UUID.
     let b = project_id.as_bytes();
     let mut v: u64 = 0;
-    for i in 0..8 {
-        v = (v << 8) | (b[i] as u64);
+    for &byte in b.iter().take(8) {
+        v = (v << 8) | (byte as u64);
     }
     let buckets: u64 = ((PROJECT_PORT_RANGE_END - PROJECT_PORT_RANGE_START + 1) as u64)
         / (PROJECT_PORT_BUCKET_SIZE as u64);
@@ -1409,14 +1339,13 @@ pub(super) async fn find_free_project_port(
 
     let mut port = start;
     while port <= end {
-        if !reserved.contains(&port) && !allocated.contains(&port) {
-            if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        if !reserved.contains(&port) && !allocated.contains(&port)
+            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
                 .await
                 .is_ok()
             {
                 return port;
             }
-        }
         port += 1;
     }
 
@@ -1459,81 +1388,17 @@ pub(super) async fn deterministic_project_port_for_key(
     let mut tries: u16 = 0;
     while tries < PROJECT_PORT_BUCKET_SIZE {
         let port = start.saturating_add(offset);
-        if port >= start && port <= end && !reserved.contains(&port) && !allocated.contains(&port) {
-            if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        if port >= start && port <= end && !reserved.contains(&port) && !allocated.contains(&port)
+            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
                 .await
                 .is_ok()
             {
                 return port;
             }
-        }
         offset = (offset + 1) % PROJECT_PORT_BUCKET_SIZE;
         tries += 1;
     }
     find_free_project_port(project_id, registry).await
-}
-
-/// Trova la prima porta TCP libera a partire da `start`, escludendo le porte
-/// riservate da Nexus E quelle gia' allocate nel registro centralizzato.
-pub(super) async fn find_free_port(
-    start: u16,
-    registry: &crate::port_registry::PortRegistryCache,
-) -> u16 {
-    let reserved: std::collections::HashSet<u16> = NEXUS_RESERVED_PORTS.iter().copied().collect();
-    let allocated: std::collections::HashSet<u16> = registry
-        .current()
-        .await
-        .all_allocated_ports()
-        .into_iter()
-        .collect();
-    let mut port = start;
-    loop {
-        if port > 65000 {
-            return start;
-        } // fallback di sicurezza
-        if reserved.contains(&port) || allocated.contains(&port) {
-            port += 1;
-            continue;
-        }
-        // Evita assegnazioni fuori dal range progetti quando start è nel range progetti.
-        if start >= PROJECT_PORT_RANGE_START && start <= PROJECT_PORT_RANGE_END {
-            if port < PROJECT_PORT_RANGE_START || port > PROJECT_PORT_RANGE_END {
-                port = PROJECT_PORT_RANGE_START;
-                continue;
-            }
-        }
-        if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .is_ok()
-        {
-            return port;
-        }
-        port += 1;
-    }
-}
-
-/// Versione senza registry (legacy, per contesti dove il registry non e' disponibile).
-/// Da usare solo in test o during bootstrap.
-#[allow(dead_code)]
-pub(super) async fn find_free_port_no_registry(start: u16) -> u16 {
-    let reserved: std::collections::HashSet<u16> = NEXUS_RESERVED_PORTS.iter().copied().collect();
-    let mut port = start;
-    loop {
-        if port > 65000 {
-            return start;
-        }
-        if reserved.contains(&port) {
-            port += 1;
-            continue;
-        }
-        if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .is_ok()
-        {
-            return port;
-        }
-        port += 1;
-    }
 }
 
 /// Restituisce true se lo script npm/pnpm/yarn è probabilmente un web server
@@ -1625,8 +1490,7 @@ async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
                         host_part
                             .rsplit(':')
                             .next()
-                            .and_then(|p| p.trim().parse::<u16>().ok())
-                            .map_or(false, |p| p == *target_port)
+                            .and_then(|p| p.trim().parse::<u16>().ok()) == Some(*target_port)
                     } else {
                         false
                     }
@@ -2155,8 +2019,8 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
         };
         if let Some(kids) = children.get(&pid) {
             for &child in kids {
-                if !pid_to_project.contains_key(&child) {
-                    pid_to_project.insert(child, proj);
+                if let std::collections::hash_map::Entry::Vacant(e) = pid_to_project.entry(child) {
+                    e.insert(proj);
                     queue.push_back(child);
                 }
             }
@@ -2234,7 +2098,7 @@ fn resolve_pids_by_cwd(
         for (proj_id, root) in project_roots {
             if cwd.starts_with(root.as_str()) || cwd == *root {
                 let len = root.len();
-                if best.map_or(true, |(_, prev_len)| len > prev_len) {
+                if best.is_none_or(|(_, prev_len)| len > prev_len) {
                     best = Some((*proj_id, len));
                 }
             }

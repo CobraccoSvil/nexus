@@ -53,7 +53,6 @@ mod plugins;
 mod port_registry;
 mod process_resume;
 mod profiles;
-mod project_context;
 mod project_db;
 mod project_db_routes;
 mod project_files;
@@ -64,7 +63,6 @@ mod prompt_templates;
 mod provider_cooldown;
 mod provider_error_classifier;
 mod provider_health_probe;
-mod quality_guard;
 mod rag;
 mod routes;
 mod routing_config;
@@ -92,10 +90,8 @@ use std::sync::Arc;
 
 use axum::http::{header as http_header, HeaderValue, Method};
 use axum::{
-    extract::{DefaultBodyLimit, State},
-    middleware as axum_mw,
-    routing::{delete, get, patch, post, put},
-    Json, Router,
+    extract::State,
+    Json,
 };
 use chrono::Utc;
 use dashmap::{DashMap, DashSet};
@@ -133,16 +129,6 @@ struct AppState {
     /// `true` se l'immagine `nexus-sandbox:latest` è disponibile nel daemon Docker.
     /// Quando `true`, ogni processo agente gira in un container Docker isolato.
     sandbox_available: bool,
-    /// Cache della matrice di routing letta da DB (vedi migrazione 0101).
-    /// Refresh background ogni 60s. Sostituisce i model name hardcoded
-    /// che erano sparsi in orchestrator.rs / chat_messages.rs / models.rs.
-    routing_matrix: routing_matrix::RoutingMatrixCache,
-    /// Cache parametri routing (settings.routing.*) — mig 0111. Refresh 60s.
-    /// Sostituisce le costanti hardcoded come LLM_CLASSIFIER_MIN_CONFIDENCE.
-    routing_thresholds: routing_config::RoutingThresholdsCache,
-    /// Cache mapping intent -> tier/capability/preferred_provider — mig 0110.
-    /// Sostituisce i match Rust statici in orchestrator.rs:444-490.
-    intent_capability: routing_config::IntentCapabilityCache,
     /// Registro centralizzato porte TCP allocate ai progetti — mig 0114.
     /// Impedisce conflitti tra progetti e con porte interne Nexus.
     port_registry: port_registry::PortRegistryCache,
@@ -541,9 +527,9 @@ async fn main() -> anyhow::Result<()> {
         let base = Orchestrator::new(
             neural_client,
             template_cache.clone(),
-            routing_matrix_cache.clone(),
-            routing_thresholds_cache.clone(),
-            intent_capability_cache.clone(),
+            routing_matrix_cache,
+            routing_thresholds_cache,
+            intent_capability_cache,
             slots_matrix_cache.clone(),
         );
         if nexus_gw.is_healthy().await {
@@ -582,9 +568,6 @@ async fn main() -> anyhow::Result<()> {
         terminal_consumers: Arc::new(DashMap::new()),
         template_cache,
         sandbox_available,
-        routing_matrix: routing_matrix_cache,
-        routing_thresholds: routing_thresholds_cache,
-        intent_capability: intent_capability_cache,
         port_registry: port_registry_cache,
         dependency_status: std::sync::Arc::new(task_watchdog::DependencyStatus::new()),
         indexing_projects: Arc::new(DashSet::new()),
@@ -1119,10 +1102,7 @@ async fn main() -> anyhow::Result<()> {
             let deps = tool_runner_server::ToolRunnerDeps {
                 db: state.db.clone(),
                 neural: state.orchestrator.neural.clone(),
-                agent_channels: state.agent_channels.clone(),
                 playwright_channels: state.playwright_channels.clone(),
-                terminal_consumers: state.terminal_consumers.clone(),
-                template_cache: state.template_cache.clone(),
                 dependency_status: state.dependency_status.clone(),
                 project_channels: state.project_channels.clone(),
                 monitor_registry: state.monitor_registry.clone(),
@@ -1207,6 +1187,7 @@ async fn main() -> anyhow::Result<()> {
         match std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
         {
             Ok(lock_file) => {

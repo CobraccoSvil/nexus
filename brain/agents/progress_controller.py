@@ -38,7 +38,7 @@ from typing import Literal
 # Assi di stallo riconosciuti. Stringhe stabili: usate come chiavi negli insiemi
 # di stato ("assi gia' guidati") e nei log/meta_step.
 Axis = Literal[
-    "exploration", "signature", "g1_descriptive", "repeated_command", "repeated_action"
+    "exploration", "signature", "g1_descriptive", "repeated_action"
 ]
 
 # Azioni possibili, in ordine di severita' crescente.
@@ -70,8 +70,6 @@ class ProgressSignals:
     signature_loop_tool: str | None = None
     # G1 descrittivo: il modello descrive senza agire (reroute_count >= max).
     g1_over_cap: bool = False
-    # Comando ripetuto fallito: (comando, conteggio) oppure None.
-    repeated_command: tuple[str, int] | None = None
     # Azione produttiva (scrittura/comando) ripetuta identica oltre soglia:
     # (label, conteggio) oppure None. Indipendente dall'esito (anche se riesce).
     repeated_action: tuple[str, int] | None = None

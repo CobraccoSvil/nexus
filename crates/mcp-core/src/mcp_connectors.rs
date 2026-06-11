@@ -12,7 +12,6 @@
 //!   `load_mcp_tools_for_agent()` → carica tool definitions dai server abilitati
 //!   `execute_mcp_tool()`         → esegue un tool su un server esterno
 
-use std::collections::HashSet;
 
 use axum::{
     extract::{Extension, Path as AxumPath, State},
@@ -26,7 +25,7 @@ use uuid::Uuid;
 use crate::{
     auth::Claims,
     chat_learning::{api_error, parse_user_id, ApiError, ApiResult},
-    mcp_client::{self, McpServerConfig, McpTransport},
+    mcp_client::{self},
     AppState,
 };
 
@@ -408,43 +407,41 @@ pub async fn execute_mcp_tool(
     let config = build_config(&server_id, &name, &transport, &row);
 
     if let Some(plugin_instance_id) = plugin_instance_id {
-        if let Ok(policy_row) = sqlx::query(
+        if let Ok(Some(policy_row)) = sqlx::query(
             "SELECT mode, tools, blocked_tools FROM plugin_instance_tool_policies WHERE plugin_instance_id = $1",
         )
         .bind(plugin_instance_id)
         .fetch_optional(db)
         .await
         {
-            if let Some(policy_row) = policy_row {
-                let mode: Option<String> = policy_row.try_get("mode").ok();
-                let tools: Value = policy_row.try_get("tools").unwrap_or(json!([]));
-                let blocked: Value = policy_row.try_get("blocked_tools").unwrap_or(json!([]));
-                let allowed_tools = parse_json_string_set(&tools);
-                let blocked_tools = parse_json_string_set(&blocked);
-                if !is_tool_allowed_by_policy(
-                    mode.as_deref(),
-                    &allowed_tools,
-                    &blocked_tools,
-                    tool_name,
-                ) {
-                    let _ = sqlx::query(
-                        r#"
-                        INSERT INTO plugin_audit_events
-                            (plugin_instance_id, action, status, message, payload)
-                        VALUES ($1, 'call_tool', 'denied', $2, $3)
-                        "#,
-                    )
-                    .bind(plugin_instance_id)
-                    .bind(format!("Tool '{}' bloccato da policy", tool_name))
-                    .bind(json!({ "toolName": tool_name, "serverId": server_id.to_string() }))
-                    .execute(db)
-                    .await;
+            let mode: Option<String> = policy_row.try_get("mode").ok();
+            let tools: Value = policy_row.try_get("tools").unwrap_or(json!([]));
+            let blocked: Value = policy_row.try_get("blocked_tools").unwrap_or(json!([]));
+            let allowed_tools = parse_json_string_set(&tools);
+            let blocked_tools = parse_json_string_set(&blocked);
+            if !is_tool_allowed_by_policy(
+                mode.as_deref(),
+                &allowed_tools,
+                &blocked_tools,
+                tool_name,
+            ) {
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO plugin_audit_events
+                        (plugin_instance_id, action, status, message, payload)
+                    VALUES ($1, 'call_tool', 'denied', $2, $3)
+                    "#,
+                )
+                .bind(plugin_instance_id)
+                .bind(format!("Tool '{}' bloccato da policy", tool_name))
+                .bind(json!({ "toolName": tool_name, "serverId": server_id.to_string() }))
+                .execute(db)
+                .await;
 
-                    return format!(
-                        "Errore: tool MCP '{}' non consentito dalla policy del plugin",
-                        tool_name
-                    );
-                }
+                return format!(
+                    "Errore: tool MCP '{}' non consentito dalla policy del plugin",
+                    tool_name
+                );
             }
         }
     }

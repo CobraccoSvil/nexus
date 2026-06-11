@@ -9,7 +9,6 @@ axum.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
 redis.workspace = true
-prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -31,8 +30,6 @@ mcp-token = { path = "../mcp-token" }
 mcp-ast = { path = "../mcp-ast" }
 mcp-quality = { path = "../mcp-quality" }
 mcp-db = { path = "../mcp-db" }
-mcp-comments = { path = "../mcp-comments" }
-mcp-learning = { path = "../mcp-learning" }
 mcp-proto = { path = "../mcp-proto" }
 nexus-auth = { path = "../nexus-auth" }
 nexus-mcp-client = { path = "../nexus-mcp-client" }
@@ -89,3 +86,6 @@ onnx = ["nexus-orchestrator/onnx"]
 # sui volumi bind-mount, evitando il bug "delete_project lascia dir orfana").
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[lints]
+workspace = true

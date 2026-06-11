@@ -1,38 +1,17 @@
-//! Nexus Routing A/B — active co-routing feature flag.
+//! Nexus Routing — mapping `AgentType → tier/prompt` e contatori A/B.
 //!
-//! Blocco B della Fase 9: promuove il suggerimento del `NexusBridge` Q-Learning
-//! da log osservazionale a override attivo di `self.provider` / `self.model`
-//! in `agent_loop.rs`, controllato da una percentuale letta dal DB.
-//!
-//! Schema:
-//! - `nexus_active_routing_pct` (chiave in tabella `settings`) — valore intero
-//!   in [0, 100]. Percentuale di richieste per cui, se il bridge produce una
-//!   decisione e il mapping `AgentType → (provider, model)` ha successo,
-//!   l'override viene applicato. Default: 0 (feature off).
-//!
-//! - `agent_type_to_model(AgentType, &RoutingMatrix) -> Option<(provider, model)>`
+//! - `agent_type_to_model(db, AgentType) -> Option<(provider, model)>`
 //!   — assegna un tier (opus/sonnet/haiku) a ciascun AgentType e lo risolve
-//!   tramite `purpose_model("agent_tier_*")` dalla matrice DB (mig 0104).
-//!   Se un AgentType non e' mappato o il tier manca nel DB, l'override viene
-//!   saltato e si incrementa `NEXUS_AB_FALLBACK_TOTAL`.
+//!   tramite il punto unico tier-only `resolve_purpose_model_db` (mig 0104).
 //!
 //! - 4 contatori atomici esposti in Prometheus da `nexus_bridge::nexus_prometheus`:
 //!     * `nexus_ab_decisions_total` — quante volte è stato valutato il coin-flip
 //!     * `nexus_ab_overrides_total` — quante volte abbiamo sostituito provider/model
 //!     * `nexus_ab_fallback_total`  — quante volte decisione presente ma non mappabile
 //!     * `nexus_ab_forced_total`    — quante volte il routing è stato forzato da client
-//!
-//! Il design è intenzionalmente conservativo: il fallback silenzioso non rompe
-//! mai il flusso principale. Se il DB fallisce, la percentuale è 0 (off); se
-//! il mapping fallisce, usiamo il provider/model originale.
 
-use crate::routing_matrix::RoutingMatrix;
 use nexus_orchestrator::AgentType;
-use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Chiave di settings che controlla la percentuale di routing attivo.
-pub const SETTINGS_KEY_ACTIVE_ROUTING_PCT: &str = "nexus_active_routing_pct";
 
 /// Contatore: quante volte abbiamo valutato il coin-flip del routing A/B.
 /// Incrementato ogni volta che `agent_loop` raggiunge l'hook (indipendentemente
@@ -168,44 +147,6 @@ fn agent_type_to_tier(agent_type: &AgentType) -> Option<&'static str> {
     }
 }
 
-/// Legge dalla tabella `settings` la percentuale corrente di routing attivo.
-/// Range valido [0, 100]; valori fuori range o errori DB ritornano 0 (feature off).
-///
-/// Nota: questa funzione è chiamata al massimo una volta per agent run (hook
-/// iniziale), quindi non serve caching aggressivo. Se in futuro serviranno
-/// cadence più alte, valutare una cache atomica con TTL ~5s.
-pub async fn read_nexus_active_routing_pct(db: &PgPool) -> u8 {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM settings WHERE key = $1 LIMIT 1")
-            .bind(SETTINGS_KEY_ACTIVE_ROUTING_PCT)
-            .fetch_optional(db)
-            .await
-            .ok()
-            .flatten();
-
-    let Some((raw,)) = row else {
-        return 0;
-    };
-
-    raw.trim().parse::<u8>().unwrap_or(0).min(100)
-}
-
-/// Decide se applicare l'override A/B per questa richiesta.
-///
-/// Ritorna `true` con probabilità `pct/100`. Usa `rand::thread_rng()` per il
-/// coin flip (nessuno stato condiviso, non serve determinismo).
-pub fn should_override_ab(pct: u8) -> bool {
-    if pct == 0 {
-        return false;
-    }
-    if pct >= 100 {
-        return true;
-    }
-    use rand::Rng;
-    let roll: u8 = rand::thread_rng().gen_range(0..100);
-    roll < pct
-}
-
 /// Mappa ogni `AgentType` alla chiave DB (`nexus_prompt_templates.key`)
 /// che contiene il system prompt appropriato.
 ///
@@ -315,13 +256,6 @@ pub fn get_agent_system_prompt(agent_type: &AgentType) -> String {
         .replace("{{project}}", "")
 }
 
-/// Incrementa un contatore atomico con ordering `Relaxed`.
-/// I contatori sono monotoni, non servono garanzie di ordering tra di loro.
-#[inline]
-pub fn incr(counter: &AtomicU64) {
-    counter.fetch_add(1, Ordering::Relaxed);
-}
-
 /// Snapshot dei 4 contatori A/B per esposizione in Prometheus.
 pub struct AbCounters {
     pub decisions: u64,
@@ -343,8 +277,6 @@ pub fn snapshot_counters() -> AbCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::time::Instant;
 
     /// Lista canonica dei 60 AgentType registrati. Punto unico (regola L /
     /// ADR 0026) per evitare duplicazione fra i test che iterano sulle varianti
@@ -414,40 +346,6 @@ mod tests {
         ]
     }
 
-    fn test_matrix() -> RoutingMatrix {
-        let mut purpose_models = HashMap::new();
-        purpose_models.insert(
-            TIER_OPUS.to_string(),
-            (
-                "test_provider_opus".to_string(),
-                "test_model_opus".to_string(),
-            ),
-        );
-        purpose_models.insert(
-            TIER_SONNET.to_string(),
-            (
-                "test_provider_sonnet".to_string(),
-                "test_model_sonnet".to_string(),
-            ),
-        );
-        purpose_models.insert(
-            TIER_HAIKU.to_string(),
-            (
-                "test_provider_haiku".to_string(),
-                "test_model_haiku".to_string(),
-            ),
-        );
-        RoutingMatrix {
-            by_intent_mode: HashMap::new(),
-            default_models: HashMap::new(),
-            purpose_models,
-            purpose_tiers: HashMap::new(),
-            escalations: HashMap::new(),
-            manual_overrides: std::collections::HashSet::new(),
-            loaded_at: Instant::now(),
-        }
-    }
-
     // NB: la risoluzione tier->modello (agent_type_to_model) e' ora async e passa
     // dal punto unico tier-only (testato in internal_routing). Qui testiamo la
     // mappatura PURA agent_type->tier, che e' la logica propria di questo modulo.
@@ -515,51 +413,6 @@ mod tests {
     #[test]
     fn test_agent_type_to_tier_custom_is_none() {
         assert!(agent_type_to_tier(&AgentType::Custom("anything".to_string())).is_none());
-    }
-
-    #[test]
-    fn test_should_override_boundary_cases() {
-        // 0% → mai
-        for _ in 0..100 {
-            assert!(!should_override_ab(0));
-        }
-        // 100% → sempre
-        for _ in 0..100 {
-            assert!(should_override_ab(100));
-        }
-        // 255% (clamp implicito via u8) → sempre
-        assert!(should_override_ab(200));
-    }
-
-    #[test]
-    fn test_should_override_distribution_roughly_matches_pct() {
-        // Con 50% su 2000 trial, l'intervallo atteso è [900, 1100] con
-        // ampio margine di sicurezza (3-sigma sarebbe ~[933, 1067]).
-        let mut hits = 0;
-        for _ in 0..2000 {
-            if should_override_ab(50) {
-                hits += 1;
-            }
-        }
-        assert!(
-            (900..=1100).contains(&hits),
-            "50% distribution out of band: got {} hits",
-            hits
-        );
-    }
-
-    #[test]
-    fn test_counters_start_at_zero_and_increment() {
-        // Non possiamo assumere zero assoluto (altri test possono averli
-        // incrementati), quindi testiamo in delta.
-        let before = snapshot_counters();
-        incr(&NEXUS_AB_DECISIONS_TOTAL);
-        incr(&NEXUS_AB_OVERRIDES_TOTAL);
-        incr(&NEXUS_AB_FALLBACK_TOTAL);
-        let after = snapshot_counters();
-        assert_eq!(after.decisions, before.decisions + 1);
-        assert_eq!(after.overrides, before.overrides + 1);
-        assert_eq!(after.fallback, before.fallback + 1);
     }
 
     #[test]

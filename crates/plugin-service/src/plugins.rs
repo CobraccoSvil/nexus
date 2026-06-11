@@ -56,13 +56,6 @@ pub struct InstallPluginRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-pub struct UpdatePluginRequest {
-    pub version: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TogglePluginRequest {
     pub enabled: bool,
 }
@@ -126,8 +119,6 @@ struct CatalogConfig {
     stdio_command: Option<String>,
     stdio_args: Value,
     required_secret_refs: Value,
-    #[allow(dead_code)]
-    optional_secret_refs: Value,
     default_scope: String,
     allowed_commands: Value,
     default_tool_policy: Value,
@@ -187,8 +178,7 @@ fn can_manage_instance(row: &sqlx::postgres::PgRow, user_id: Uuid, role: &str) -
 
 fn format_compact_error(message: &str) -> String {
     let compact = message
-        .replace('\n', " ")
-        .replace('\r', " ")
+        .replace(['\n', '\r'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -219,18 +209,6 @@ fn redirect_with_status(return_to: &str, status: &str, message: Option<&str>) ->
         target.push_str(&urlencoding::encode(message));
     }
     Redirect::temporary(&target).into_response()
-}
-
-#[allow(dead_code)]
-fn parse_json_string_set(raw: &Value) -> HashSet<String> {
-    raw.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default()
 }
 
 fn is_figma_pat(token: &str) -> bool {
@@ -359,7 +337,7 @@ async fn get_catalog_by_install_request(
         sqlx::query(
             r#"
             SELECT c.id, c.slug, c.name, c.description, c.transport, c.http_url, c.stdio_command,
-                c.stdio_args, c.required_secret_refs, c.optional_secret_refs, c.default_scope,
+                c.stdio_args, c.required_secret_refs, c.default_scope,
                 c.allowed_commands, c.default_tool_policy, c.is_allowlisted, c.enabled,
                 r.id AS release_id, r.version AS release_version
             FROM plugin_catalog_items c
@@ -383,7 +361,7 @@ async fn get_catalog_by_install_request(
         sqlx::query(
             r#"
             SELECT c.id, c.slug, c.name, c.description, c.transport, c.http_url, c.stdio_command,
-                c.stdio_args, c.required_secret_refs, c.optional_secret_refs, c.default_scope,
+                c.stdio_args, c.required_secret_refs, c.default_scope,
                 c.allowed_commands, c.default_tool_policy, c.is_allowlisted, c.enabled,
                 r.id AS release_id, r.version AS release_version
             FROM plugin_catalog_items c
@@ -424,7 +402,6 @@ async fn get_catalog_by_install_request(
         stdio_command: row.try_get("stdio_command").unwrap_or(None),
         stdio_args: row.try_get("stdio_args").unwrap_or(json!([])),
         required_secret_refs: row.try_get("required_secret_refs").unwrap_or(json!([])),
-        optional_secret_refs: row.try_get("optional_secret_refs").unwrap_or(json!([])),
         default_scope: row.try_get("default_scope").unwrap_or_else(|_| "global".to_string()),
         allowed_commands: row.try_get("allowed_commands").unwrap_or(json!([])),
         default_tool_policy: row
@@ -599,8 +576,6 @@ async fn resolve_plugin_runtime_config(
 }
 
 struct PluginResolution {
-    #[allow(dead_code)]
-    plugin_instance_id: Uuid,
     mcp_server_id: Uuid,
     mcp_server_name: String,
     plugin_slug: String,
@@ -624,7 +599,6 @@ async fn build_plugin_resolution(
     let config = resolve_plugin_runtime_config(db, &row, &secret_bindings).await;
 
     Ok(PluginResolution {
-        plugin_instance_id,
         mcp_server_id,
         mcp_server_name,
         plugin_slug,

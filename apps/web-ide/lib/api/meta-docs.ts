@@ -77,7 +77,7 @@ export async function triggerMetaDocsRefresh(): Promise<{
   return fetchJson(`/api/meta-docs/refresh-all`, { method: "POST", body: "{}" });
 }
 
-export interface MetaDocsGraphNode {
+interface MetaDocsGraphNode {
   id: string;
   kind: MetaDocKind;
   title: string;
@@ -133,14 +133,6 @@ export async function getMetaDocRevision(
   version: number,
 ): Promise<WikiRevision> {
   return fetchJson(`/api/meta-docs/${id}/revisions/${version}`);
-}
-
-export async function getMetaDocDiff(
-  id: string,
-  from: number,
-  to: number,
-): Promise<{ from: WikiRevision; to: WikiRevision }> {
-  return fetchJson(`/api/meta-docs/${id}/diff?from=${from}&to=${to}`);
 }
 
 export async function restoreMetaDocRevision(

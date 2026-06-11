@@ -157,7 +157,7 @@ pub fn optimize_sections(sections: &[ContextSection], token_budget: usize) -> Se
     let mandatory_tokens: usize = mandatory.iter().map(|s| count_tokens(&s.content)).sum();
     let mut remaining_budget = token_budget.saturating_sub(mandatory_tokens);
 
-    let mut included: Vec<&ContextSection> = mandatory.drain(..).collect();
+    let mut included: Vec<&ContextSection> = std::mem::take(&mut mandatory);
     let mut dropped: Vec<DroppedSection> = Vec::new();
 
     for section in &optional {
@@ -175,7 +175,7 @@ pub fn optimize_sections(sections: &[ContextSection], token_budget: usize) -> Se
     }
 
     // Riordina per priorità originale prima di assemblare
-    included.sort_by(|a, b| a.priority.cmp(&b.priority));
+    included.sort_by_key(|a| a.priority);
 
     let assembled = included
         .iter()

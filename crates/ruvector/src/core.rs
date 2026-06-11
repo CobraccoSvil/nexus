@@ -397,16 +397,13 @@ impl HnswDb {
         let deleted = nodes.iter().filter(|n| n.deleted).count();
         let active = total - deleted;
 
-        let avg_neighbors = if active > 0 {
-            nodes
-                .iter()
-                .filter(|n| !n.deleted)
-                .map(|n| n.neighbors.iter().map(|l| l.len()).sum::<usize>())
-                .sum::<usize>()
-                / active
-        } else {
-            0
-        };
+        let avg_neighbors = nodes
+            .iter()
+            .filter(|n| !n.deleted)
+            .map(|n| n.neighbors.iter().map(|l| l.len()).sum::<usize>())
+            .sum::<usize>()
+            .checked_div(active)
+            .unwrap_or(0);
 
         HnswStats {
             total_nodes: total,

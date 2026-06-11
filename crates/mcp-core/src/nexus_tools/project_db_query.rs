@@ -178,13 +178,13 @@ fn decode_column(row: &sqlx::postgres::PgRow, name: &str, type_name: &str) -> Va
             .try_get::<Option<i32>, _>(name)
             .ok()
             .flatten()
-            .map(|v| Value::from(v))
+            .map(Value::from)
             .unwrap_or(Value::Null),
         "INT8" => row
             .try_get::<Option<i64>, _>(name)
             .ok()
             .flatten()
-            .map(|v| Value::from(v))
+            .map(Value::from)
             .unwrap_or(Value::Null),
         "FLOAT4" => row
             .try_get::<Option<f32>, _>(name)
@@ -196,19 +196,19 @@ fn decode_column(row: &sqlx::postgres::PgRow, name: &str, type_name: &str) -> Va
             .try_get::<Option<f64>, _>(name)
             .ok()
             .flatten()
-            .map(|v| Value::from(v))
+            .map(Value::from)
             .unwrap_or(Value::Null),
         "BOOL" => row
             .try_get::<Option<bool>, _>(name)
             .ok()
             .flatten()
-            .map(|v| Value::from(v))
+            .map(Value::from)
             .unwrap_or(Value::Null),
         "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CHAR" => row
             .try_get::<Option<String>, _>(name)
             .ok()
             .flatten()
-            .map(|v| Value::from(v))
+            .map(Value::from)
             .unwrap_or(Value::Null),
         "UUID" => row
             .try_get::<Option<uuid::Uuid>, _>(name)
@@ -244,7 +244,7 @@ fn decode_column(row: &sqlx::postgres::PgRow, name: &str, type_name: &str) -> Va
             row.try_get::<Option<String>, _>(name)
                 .ok()
                 .flatten()
-                .map(|v| Value::from(v))
+                .map(Value::from)
                 .unwrap_or(Value::Null)
         }
     }

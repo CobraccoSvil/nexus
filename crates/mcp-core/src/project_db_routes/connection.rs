@@ -31,7 +31,7 @@ struct DetectionResult {
 
 fn read_text(path: &std::path::Path, max_bytes: usize) -> Option<String> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
+    let f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::with_capacity(max_bytes.min(65536));
     f.take(max_bytes as u64).read_to_end(&mut buf).ok()?;
     String::from_utf8(buf).ok()
@@ -475,16 +475,13 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
                         // di Postgres (Host=, Port=5432, postgres://) PRIMA di SQL Server.
                         // Necessario perche' Npgsql usa "Server=host;Port=5432;Database=...",
                         // stessi token usati da SQL Server (Server=host,1433;Database=...).
-                        let detected: Option<&'static str> =
-                            if lc.contains("postgresql://") || lc.contains("postgres://") {
-                                Some("postgres")
-                            } else if lc.contains("host=") {
-                                Some("postgres")
-                            } else if lc.contains("port=5432") {
-                                Some("postgres")
-                            } else if lc.contains("port=3306") {
-                                Some("mysql")
-                            } else if lc.contains("mysql://") {
+                        let detected: Option<&'static str> = if lc.contains("postgresql://")
+                            || lc.contains("postgres://")
+                            || lc.contains("host=")
+                            || lc.contains("port=5432")
+                        {
+                            Some("postgres")
+                        } else if lc.contains("port=3306") || lc.contains("mysql://") {
                                 Some("mysql")
                             } else if lc.contains("initial catalog=") {
                                 // Univocamente SQL Server

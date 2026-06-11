@@ -75,16 +75,3 @@ pub enum BuildGraphMembership {
     /// determinare la membership. Best-effort, niente warning bloccanti.
     Unknown { reason: String },
 }
-
-impl BuildGraphMembership {
-    /// Estrae la ragione testuale dal valore.
-    pub fn reason(&self) -> &str {
-        match self {
-            Self::InGraph { reason }
-            | Self::OutOfGraph { reason }
-            | Self::Entrypoint { reason }
-            | Self::Generated { reason }
-            | Self::Unknown { reason } => reason,
-        }
-    }
-}

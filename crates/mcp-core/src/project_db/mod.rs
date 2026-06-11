@@ -22,7 +22,6 @@ pub mod exec;
 pub mod runner;
 
 use std::path::PathBuf;
-use uuid::Uuid;
 
 // ── Errore unificato ──────────────────────────────────────────────────────
 
@@ -31,23 +30,11 @@ pub enum ProjectDbError {
     #[error("DDL bloccato: usa project_db_create_migration. Tool suggerito: {suggested_tool}")]
     DdlBlocked { suggested_tool: String },
 
-    #[error("Adapter '{tool}' non supportato in V1")]
-    UnsupportedAdapter { tool: String },
-
-    #[error("Configurazione DB non trovata per il progetto {project_id}")]
-    ConfigNotFound { project_id: Uuid },
-
-    #[error("Errore connessione DB: {0}")]
-    Connection(String),
-
     #[error("Errore filesystem: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("Errore serializzazione: {0}")]
     Serialization(#[from] serde_json::Error),
-
-    #[error("Errore database Nexus: {0}")]
-    NexusDb(String),
 
     #[error("Adapter error: {0}")]
     Adapter(String),
@@ -151,15 +138,6 @@ pub struct DbProfile {
     pub confidence: f32,
 }
 
-/// Una migration in attesa o già applicata.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Migration {
-    pub filename: String,
-    pub checksum: String,
-    pub description: Option<String>,
-    pub sql: Option<String>,
-}
-
 /// Risultato dell'applicazione di una migration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppliedMigration {
@@ -178,8 +156,6 @@ pub struct RolledBackMigration {
 pub struct ProjectDbContext {
     /// Path assoluta della root del progetto utente.
     pub project_root: PathBuf,
-    /// UUID del progetto in Nexus.
-    pub project_id: Uuid,
     /// Tool di migrazione configurato.
     pub migration_tool: MigrationTool,
     /// Path relativa alla cartella migrations.

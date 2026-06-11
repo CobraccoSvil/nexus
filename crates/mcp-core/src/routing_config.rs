@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::sync::RwLock;
@@ -33,32 +33,12 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 pub struct RoutingThresholds {
     pub llm_classifier_min_confidence: f32,
     pub llm_classifier_timeout_seconds: f32,
-    pub classifier_cache_ttl_seconds: u64,
-    pub classifier_cache_max_entries: u32,
-    pub classifier_provider: String,
-    pub classifier_model: String,
     pub token_threshold_chat_breve: u32,
     pub token_threshold_chat_media: u32,
     pub token_threshold_complex_fix: u32,
-    pub token_threshold_long_context: u32,
-    /// L2 (disambiguation): top intent confidence sotto questa soglia →
-    /// richiesta di chiarimento all'utente. Sorgente: `settings.routing.ambiguity_min_confidence` (mig 0132).
-    pub ambiguity_min_confidence: f32,
-    /// L2 (disambiguation): margine (top − second_candidate) sotto questa soglia →
-    /// richiesta di chiarimento. Sorgente: `settings.routing.ambiguity_min_margin` (mig 0132).
-    pub ambiguity_min_margin: f32,
     /// L3 / Heartbeat SSE: secondi di silenzio stream brain→mcp-core prima
     /// di considerare il run bloccato. Sorgente: `settings.routing.sse_heartbeat_max_silence_secs` (mig 0132).
     pub sse_heartbeat_max_silence_secs: u64,
-    /// Soglia di confidence del classificatore deterministico keyword sopra
-    /// la quale si SALTA l'LLM (match ad altissima confidenza, piu' veloce e
-    /// robusto). Sorgente: `settings.routing.intent_deterministic_high`.
-    pub intent_deterministic_high: f32,
-    /// Soglia minima di confidence del classificatore deterministico sotto la
-    /// quale NON lo si usa nemmeno come fallback quando l'LLM fallisce.
-    /// Sorgente: `settings.routing.intent_deterministic_min`.
-    pub intent_deterministic_min: f32,
-    pub loaded_at: Instant,
 }
 
 impl RoutingThresholds {
@@ -70,22 +50,10 @@ impl RoutingThresholds {
         Self {
             llm_classifier_min_confidence: 0.60,
             llm_classifier_timeout_seconds: 5.0,
-            classifier_cache_ttl_seconds: 86_400,
-            classifier_cache_max_entries: 10_000,
-            classifier_provider: "google".to_string(),
-            classifier_model: "gemini-2.5-flash".to_string(),
             token_threshold_chat_breve: 400,
             token_threshold_chat_media: 1_500,
             token_threshold_complex_fix: 3_000,
-            token_threshold_long_context: 6_000,
-            // Default tecnici per i nuovi parametri (mig 0132). Usati solo
-            // come ricovero parziale se la chiave manca dal DB.
-            ambiguity_min_confidence: 0.70,
-            ambiguity_min_margin: 0.15,
             sse_heartbeat_max_silence_secs: 120,
-            intent_deterministic_high: 0.85,
-            intent_deterministic_min: 0.60,
-            loaded_at: Instant::now(),
         }
     }
 }
@@ -143,41 +111,13 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
             }
         }
     };
-    // Provider/modello del classifier: niente fallback hardcoded (CLAUDE.md §G).
-    // Se mancano, errore esplicito che propaga al chiamante (HTTP 503 a runtime).
-    let classifier_provider = map
-        .get("routing.classifier_provider")
-        .filter(|v| !v.is_empty())
-        .cloned()
-        .ok_or_else(|| {
-            "settings 'routing.classifier_provider' mancante (richiede mig 0111)".to_string()
-        })?;
-    let classifier_model = map
-        .get("routing.classifier_model")
-        .filter(|v| !v.is_empty())
-        .cloned()
-        .ok_or_else(|| {
-            "settings 'routing.classifier_model' mancante (richiede mig 0111)".to_string()
-        })?;
-
     Ok(RoutingThresholds {
         llm_classifier_min_confidence: parse_f32("routing.llm_classifier_min_confidence", 0.60),
         llm_classifier_timeout_seconds: parse_f32("routing.llm_classifier_timeout_seconds", 5.0),
-        classifier_cache_ttl_seconds: parse_u64("routing.classifier_cache_ttl_seconds", 86_400),
-        classifier_cache_max_entries: parse_u32("routing.classifier_cache_max_entries", 10_000),
-        classifier_provider,
-        classifier_model,
         token_threshold_chat_breve: parse_u32("routing.token_threshold_chat_breve", 400),
         token_threshold_chat_media: parse_u32("routing.token_threshold_chat_media", 1_500),
         token_threshold_complex_fix: parse_u32("routing.token_threshold_complex_fix", 3_000),
-        token_threshold_long_context: parse_u32("routing.token_threshold_long_context", 6_000),
-        // Nuovi parametri (mig 0132)
-        ambiguity_min_confidence: parse_f32("routing.ambiguity_min_confidence", 0.70),
-        ambiguity_min_margin: parse_f32("routing.ambiguity_min_margin", 0.15),
         sse_heartbeat_max_silence_secs: parse_u64("routing.sse_heartbeat_max_silence_secs", 120),
-        intent_deterministic_high: parse_f32("routing.intent_deterministic_high", 0.85),
-        intent_deterministic_min: parse_f32("routing.intent_deterministic_min", 0.60),
-        loaded_at: Instant::now(),
     })
 }
 
@@ -186,7 +126,6 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
 /// Una riga di `nexus_intent_capability` (mig 0110).
 #[derive(Debug, Clone)]
 pub struct IntentCapability {
-    pub intent: String,
     pub base_tier: String,
     pub base_capability: String,
     pub preferred_provider: Option<String>,
@@ -218,26 +157,11 @@ impl IntentCapability {
 #[derive(Debug, Clone)]
 pub struct IntentCapabilityMap {
     pub by_intent: HashMap<String, IntentCapability>,
-    pub loaded_at: Instant,
 }
 
 impl IntentCapabilityMap {
     pub fn get(&self, intent: &str) -> Option<&IntentCapability> {
         self.by_intent.get(intent)
-    }
-
-    /// Conveniente: tier effettivo per (intent, tokens). Ritorna None se
-    /// l'intent non e' mappato.
-    pub fn tier_for(&self, intent: &str, tokens: u32) -> Option<String> {
-        self.by_intent
-            .get(intent)
-            .map(|c| c.tier_for_tokens(tokens))
-    }
-
-    pub fn capability_for(&self, intent: &str) -> Option<&str> {
-        self.by_intent
-            .get(intent)
-            .map(|c| c.base_capability.as_str())
     }
 
     pub fn preferred_provider_for(&self, intent: &str) -> Option<&str> {
@@ -278,7 +202,6 @@ async fn fetch_intent_capability_from_db(db: &PgPool) -> Result<IntentCapability
         .map(
             |(intent, base_tier, base_capability, preferred_provider, mt, ht)| {
                 let cap = IntentCapability {
-                    intent: intent.clone(),
                     base_tier,
                     base_capability,
                     preferred_provider,
@@ -290,10 +213,7 @@ async fn fetch_intent_capability_from_db(db: &PgPool) -> Result<IntentCapability
         )
         .collect();
 
-    Ok(IntentCapabilityMap {
-        by_intent,
-        loaded_at: Instant::now(),
-    })
+    Ok(IntentCapabilityMap { by_intent })
 }
 
 // ── Cache wrapper ───────────────────────────────────────────────────────────
@@ -303,7 +223,6 @@ async fn fetch_intent_capability_from_db(db: &PgPool) -> Result<IntentCapability
 #[derive(Clone)]
 pub struct ConfigCache<T: Clone + Send + Sync + 'static> {
     inner: Arc<RwLock<Option<Arc<T>>>>,
-    last_error: Arc<RwLock<Option<String>>>,
     name: &'static str,
 }
 
@@ -348,16 +267,13 @@ impl<T: Clone + Send + Sync + 'static> ConfigCache<T> {
         }
 
         let inner = Arc::new(RwLock::new(initial));
-        let last_error = Arc::new(RwLock::new(last_err));
         let cache = Self {
             inner: inner.clone(),
-            last_error: last_error.clone(),
             name,
         };
 
         // Refresh background. Se fallisce, mantieni la cache precedente.
         let inner_bg = inner;
-        let last_err_bg = last_error;
         let db_bg = db;
         let fetcher_bg = fetcher;
         let name_bg = name;
@@ -371,10 +287,6 @@ impl<T: Clone + Send + Sync + 'static> ConfigCache<T> {
                             let mut w = inner_bg.write().await;
                             *w = Some(arc);
                         }
-                        {
-                            let mut e = last_err_bg.write().await;
-                            *e = None;
-                        }
                         debug!("{}: refresh OK", name_bg);
                     }
                     Err(e) => {
@@ -382,8 +294,6 @@ impl<T: Clone + Send + Sync + 'static> ConfigCache<T> {
                             "{}: refresh fallito ({}). Mantengo cache precedente.",
                             name_bg, e
                         );
-                        let mut le = last_err_bg.write().await;
-                        *le = Some(e);
                     }
                 }
             }
@@ -432,7 +342,6 @@ mod tests {
     use super::*;
 
     fn cap(
-        intent: &str,
         tier: &str,
         cap: &str,
         preferred: Option<&str>,
@@ -440,7 +349,6 @@ mod tests {
         ht: Option<u32>,
     ) -> IntentCapability {
         IntentCapability {
-            intent: intent.to_string(),
             base_tier: tier.to_string(),
             base_capability: cap.to_string(),
             preferred_provider: preferred.map(String::from),
@@ -449,9 +357,20 @@ mod tests {
         }
     }
 
+    /// Helper test-only: tier effettivo per (intent, tokens), come fa la
+    /// produzione in orchestrator/core.rs (map.get + tier_for_tokens).
+    fn tier_for(m: &IntentCapabilityMap, intent: &str, tokens: u32) -> Option<String> {
+        m.get(intent).map(|c| c.tier_for_tokens(tokens))
+    }
+
+    /// Helper test-only: base_capability per intent.
+    fn capability_for<'a>(m: &'a IntentCapabilityMap, intent: &str) -> Option<&'a str> {
+        m.get(intent).map(|c| c.base_capability.as_str())
+    }
+
     #[test]
     fn test_intent_capability_tier_for_tokens_no_promotion() {
-        let c = cap("test", "light", "code", None, None, None);
+        let c = cap("light", "code", None, None, None);
         assert_eq!(c.tier_for_tokens(100), "light");
         assert_eq!(c.tier_for_tokens(10_000), "light");
     }
@@ -459,7 +378,7 @@ mod tests {
     #[test]
     fn test_intent_capability_tier_for_tokens_medium_promotion() {
         // fix: light -> medium se tokens >= 3000
-        let c = cap("fix", "light", "code", None, Some(3000), None);
+        let c = cap("light", "code", None, Some(3000), None);
         assert_eq!(c.tier_for_tokens(1000), "light");
         assert_eq!(c.tier_for_tokens(3000), "medium");
         assert_eq!(c.tier_for_tokens(5000), "medium");
@@ -468,7 +387,7 @@ mod tests {
     #[test]
     fn test_intent_capability_tier_for_tokens_heavy_promotion() {
         // chat: light -> heavy se tokens >= 6000
-        let c = cap("chat", "light", "chat", Some("openai"), None, Some(6000));
+        let c = cap("light", "chat", Some("openai"), None, Some(6000));
         assert_eq!(c.tier_for_tokens(500), "light");
         assert_eq!(c.tier_for_tokens(6000), "heavy");
         assert_eq!(c.tier_for_tokens(10000), "heavy");
@@ -479,29 +398,16 @@ mod tests {
         let mut by_intent = HashMap::new();
         by_intent.insert(
             "system_admin".to_string(),
-            cap(
-                "system_admin",
-                "heavy",
-                "reasoning",
-                Some("anthropic"),
-                None,
-                None,
-            ),
+            cap("heavy", "reasoning", Some("anthropic"), None, None),
         );
-        by_intent.insert(
-            "test".to_string(),
-            cap("test", "light", "code", None, None, None),
-        );
-        let m = IntentCapabilityMap {
-            by_intent,
-            loaded_at: Instant::now(),
-        };
-        assert_eq!(m.tier_for("system_admin", 100), Some("heavy".to_string()));
-        assert_eq!(m.capability_for("system_admin"), Some("reasoning"));
+        by_intent.insert("test".to_string(), cap("light", "code", None, None, None));
+        let m = IntentCapabilityMap { by_intent };
+        assert_eq!(tier_for(&m, "system_admin", 100), Some("heavy".to_string()));
+        assert_eq!(capability_for(&m, "system_admin"), Some("reasoning"));
         assert_eq!(m.preferred_provider_for("system_admin"), Some("anthropic"));
         assert_eq!(m.preferred_provider_for("test"), None);
         // Intent non mappato
-        assert_eq!(m.tier_for("unknown", 100), None);
+        assert_eq!(tier_for(&m, "unknown", 100), None);
     }
 
     #[test]
@@ -553,20 +459,17 @@ mod tests {
         // debug@1000 -> heavy/reasoning, fix@1000 -> light/code, fix@4000 -> medium/code
         let mut by_intent = HashMap::new();
         for (i, t, c, pp, mt, ht) in seed {
-            by_intent.insert(i.to_string(), cap(i, t, c, *pp, *mt, *ht));
+            by_intent.insert(i.to_string(), cap(t, c, *pp, *mt, *ht));
         }
-        let m = IntentCapabilityMap {
-            by_intent,
-            loaded_at: Instant::now(),
-        };
-        assert_eq!(m.tier_for("debug", 1000), Some("heavy".into()));
-        assert_eq!(m.capability_for("debug"), Some("reasoning"));
-        assert_eq!(m.tier_for("fix", 1000), Some("light".into()));
-        assert_eq!(m.tier_for("fix", 4000), Some("medium".into()));
-        assert_eq!(m.tier_for("system_admin", 50), Some("heavy".into()));
-        assert_eq!(m.tier_for("file_ops", 50), Some("medium".into()));
-        assert_eq!(m.capability_for("system_admin"), Some("reasoning"));
-        assert_eq!(m.capability_for("file_ops"), Some("reasoning"));
+        let m = IntentCapabilityMap { by_intent };
+        assert_eq!(tier_for(&m, "debug", 1000), Some("heavy".into()));
+        assert_eq!(capability_for(&m, "debug"), Some("reasoning"));
+        assert_eq!(tier_for(&m, "fix", 1000), Some("light".into()));
+        assert_eq!(tier_for(&m, "fix", 4000), Some("medium".into()));
+        assert_eq!(tier_for(&m, "system_admin", 50), Some("heavy".into()));
+        assert_eq!(tier_for(&m, "file_ops", 50), Some("medium".into()));
+        assert_eq!(capability_for(&m, "system_admin"), Some("reasoning"));
+        assert_eq!(capability_for(&m, "file_ops"), Some("reasoning"));
     }
 
     #[test]
@@ -575,15 +478,9 @@ mod tests {
         let d = RoutingThresholds::defaults();
         assert!((d.llm_classifier_min_confidence - 0.60).abs() < 1e-6);
         assert!((d.llm_classifier_timeout_seconds - 5.0).abs() < 1e-6);
-        assert_eq!(d.classifier_cache_ttl_seconds, 86_400);
-        assert_eq!(d.classifier_cache_max_entries, 10_000);
-        assert_eq!(d.classifier_provider, "google");
-        assert_eq!(d.classifier_model, "gemini-2.5-flash");
         assert_eq!(d.token_threshold_chat_breve, 400);
         assert_eq!(d.token_threshold_chat_media, 1_500);
         assert_eq!(d.token_threshold_complex_fix, 3_000);
-        assert_eq!(d.token_threshold_long_context, 6_000);
-        assert!((d.intent_deterministic_high - 0.85).abs() < 1e-6);
-        assert!((d.intent_deterministic_min - 0.60).abs() < 1e-6);
+        assert_eq!(d.sse_heartbeat_max_silence_secs, 120);
     }
 }

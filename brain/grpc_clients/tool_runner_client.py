@@ -13,7 +13,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 
 import grpc
 
@@ -224,29 +224,3 @@ class ToolRunnerClient:
             duration_ms=resp.duration_ms,
             exit_code=(resp.exit_code if getattr(resp, "has_exit_code", False) else None),
         )
-
-    async def stream_tool_output(
-        self,
-        *,
-        tool_name: str,
-        tool_input: Any,
-        session_id: str,
-        tool_use_id: str,
-        correlation_id: str | None = None,
-    ) -> AsyncIterator[tool_runner_pb2.ToolChunk]:
-        """Esecuzione streaming per tool long-running."""
-        stub = await self._ensure_channel()
-        if isinstance(tool_input, str):
-            input_json = tool_input
-        else:
-            input_json = json.dumps(tool_input, ensure_ascii=False)
-
-        req = tool_runner_pb2.ExecuteToolRequest(
-            tool_name=tool_name,
-            tool_input_json=input_json,
-            session_id=session_id,
-            tool_use_id=tool_use_id,
-            correlation_id=correlation_id or str(uuid.uuid4()),
-        )
-        async for chunk in stub.StreamToolOutput(req):
-            yield chunk

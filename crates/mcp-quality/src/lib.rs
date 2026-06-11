@@ -76,8 +76,8 @@ pub fn extract_function_bodies(source: &str, max_fns: usize) -> Vec<FunctionBody
             let mut depth = 0i32;
             let mut found_open = false;
             let mut end = i;
-            for j in i..lines.len() {
-                for ch in lines[j].chars() {
+            for (j, line) in lines.iter().enumerate().skip(i) {
+                for ch in line.chars() {
                     match ch {
                         '{' => { found_open = true; depth += 1; }
                         '}' if found_open => {

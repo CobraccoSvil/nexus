@@ -498,8 +498,7 @@ async fn ingest_one_file(
 }
 
 /// Inferisce il kind dal path relativo (prima componente di directory) quando
-/// il frontmatter non lo specifica. Riusa la classificazione di
-/// `docs_core::vault::build_vault_path`.
+/// il frontmatter non lo specifica (convenzione directory-per-kind del vault).
 fn infer_kind_from_path(rel_path: &str) -> String {
     let first = rel_path
         .split('/')

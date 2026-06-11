@@ -168,7 +168,7 @@ async fn check_microservices() -> EnvironmentCheck {
     let handles: Vec<_> = services
         .iter()
         .map(|(name, port)| {
-            let addr = format!("127.0.0.1:{port}");
+            let _addr = format!("127.0.0.1:{port}");
             let p = *port;
             (
                 *name,
@@ -1247,7 +1247,7 @@ pub async fn providers_status_internal(
                     if let Some(providers) = body.get("providers").and_then(|v| v.as_object()) {
                         for (name, secs_val) in providers.iter() {
                             if let Some(secs) = secs_val.as_u64() {
-                                let mins = (secs + 59) / 60;
+                                let mins = secs.div_ceil(60);
                                 let reason = Some(format!(
                                     "Quota provider esaurita (rilevato dal brain). Nexus userà un altro provider per ~{}min.",
                                     mins

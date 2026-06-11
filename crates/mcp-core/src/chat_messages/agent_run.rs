@@ -16,8 +16,6 @@ pub(crate) struct SpawnAgentParams {
     pub(crate) profile_provider: Option<String>,
     pub(crate) profile_model: Option<String>,
     pub(crate) attachments: Vec<ChatAttachment>,
-    /// Ruolo utente JWT (es. "admin", "editor") — per i tool nexus_builtin
-    pub(crate) user_role: String,
     /// Agent type hint dal client (bypassa Q-Learning se presente).
     /// Quando valorizzato attiva `agent_type_forced` in `spawn_agent_run`, che
     /// e' il punto unico (regola L) di bypass del gate di disambiguazione: i
@@ -226,7 +224,7 @@ fn cooldown_note_from_snapshot(snap: &[(String, u64, Option<String>)]) -> Option
             any_billing = true;
         }
         if r.is_empty() {
-            let mins = (secs + 59) / 60;
+            let mins = secs.div_ceil(60);
             parts.push(format!("{} (~{} min)", name, mins));
         } else {
             parts.push(format!("{} ({})", name, r));
@@ -2442,7 +2440,7 @@ pub(crate) async fn spawn_agent_run(
                     .bind(project_id_cp)
                     .bind(&result.provider)
                     .bind(&result.model)
-                    .bind(classified_intent_for_loop.as_ref() as &str)
+                    .bind(classified_intent_for_loop as &str)
                     .bind(if result.hollow_completion_kind.is_empty() {
                         "UNKNOWN"
                     } else {

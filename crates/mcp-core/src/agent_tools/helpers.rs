@@ -41,10 +41,7 @@ pub(crate) fn looks_like_long_running_command(command: &str, patterns: &[String]
     let normalized = lower
         .replace("&&", " ")
         .replace("||", " ")
-        .replace(';', " ")
-        .replace('|', " ")
-        .replace('(', " ")
-        .replace(')', " ");
+        .replace([';', '|', '(', ')'], " ");
     let tokens: Vec<&str> = normalized.split_whitespace().collect();
 
     for pattern in patterns {
@@ -61,7 +58,7 @@ pub(crate) fn looks_like_long_running_command(command: &str, patterns: &[String]
             }
             // Match case-insensitive su tutti i token
             let pat_lower = pat_tokens[0].to_lowercase();
-            if tokens.iter().any(|t| *t == pat_lower.as_str()) {
+            if tokens.contains(&pat_lower.as_str()) {
                 return true;
             }
         } else {

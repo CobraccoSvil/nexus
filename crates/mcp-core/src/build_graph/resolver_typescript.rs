@@ -26,8 +26,6 @@ struct TsConfigRaw {
     files: Vec<String>,
     #[serde(default)]
     references: Vec<TsReference>,
-    #[serde(default)]
-    compiler_options: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -38,12 +36,6 @@ struct TsReference {
 #[derive(Debug, Deserialize, Default)]
 struct PackageJsonRaw {
     workspaces: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct PnpmWorkspaceRaw {
-    #[serde(default)]
-    packages: Vec<String>,
 }
 
 /// Risolve il build graph TypeScript.

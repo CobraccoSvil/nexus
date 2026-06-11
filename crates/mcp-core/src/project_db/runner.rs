@@ -7,11 +7,9 @@ use crate::project_db::{
         generic_sql::GenericSqlAdapter, knex::KnexAdapter, liquibase::LiquibaseAdapter,
         prisma::PrismaAdapter, sqlx_migrate::SqlxMigrateAdapter, MigrationAdapter,
     },
-    AppliedMigration, Migration, MigrationTool, ProjectDbContext, ProjectDbError,
-    RolledBackMigration,
+    AppliedMigration, MigrationTool, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// Parole chiave DDL da bloccare quando il target è un progetto utente.
 const DDL_KEYWORDS: &[&str] = &[
@@ -46,26 +44,6 @@ pub fn contains_ddl(sql: &str) -> bool {
     DDL_KEYWORDS.iter().any(|kw| upper.contains(kw))
 }
 
-/// Errore strutturato restituito quando DDL viene bloccato.
-#[derive(Debug, serde::Serialize)]
-pub struct DdlBlockedPayload {
-    pub error: &'static str,
-    pub message: String,
-    pub suggested_tool: &'static str,
-    pub override_endpoint: String,
-}
-
-impl DdlBlockedPayload {
-    pub fn new(project_id: Uuid) -> Self {
-        Self {
-            error: "DDL_BLOCKED",
-            message: "Modifica schema bloccata. Usa project_db_create_migration per creare una migration tracciabile.".into(),
-            suggested_tool: "project_db_create_migration",
-            override_endpoint: format!("/api/projects/{}/db/override-request", project_id),
-        }
-    }
-}
-
 /// Seleziona l'adapter corretto in base al tool dichiarato.
 pub fn adapter_for(tool: &MigrationTool) -> Arc<dyn MigrationAdapter> {
     match tool {
@@ -84,7 +62,8 @@ pub fn adapter_for(tool: &MigrationTool) -> Arc<dyn MigrationAdapter> {
 // Import locale per Rails
 use crate::project_db::adapters::rails::RailsAdapter;
 
-/// Orchestratore principale — usato dai 4 tool MCP `project_db_*`.
+/// Orchestratore principale — usato dai 3 tool MCP `project_db_*`
+/// (create_migration / apply_migration / rollback).
 pub struct MigrationRunner {
     adapter: Arc<dyn MigrationAdapter>,
     ctx: ProjectDbContext,
@@ -94,11 +73,6 @@ impl MigrationRunner {
     pub fn new(ctx: ProjectDbContext) -> Self {
         let adapter = adapter_for(&ctx.migration_tool);
         Self { adapter, ctx }
-    }
-
-    /// Lista migration pending.
-    pub async fn list_pending(&self) -> Result<Vec<Migration>, ProjectDbError> {
-        self.adapter.list_pending(&self.ctx).await
     }
 
     /// Crea un file migration per il SQL fornito.

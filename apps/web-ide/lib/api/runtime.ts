@@ -1,18 +1,6 @@
 import { API_BASE, fetchJson } from "./_shared";
 
-export interface AgentProcess {
-  id: string;
-  label: string;
-  command: string;
-  status: string;
-  exitCode: number | null;
-  output: string;
-  errorOutput: string;
-  pid: number | null;
-  createdAt: string;
-}
-
-export type RunConfigRole = "frontend" | "backend" | "service" | "test" | "tool";
+type RunConfigRole = "frontend" | "backend" | "service" | "test" | "tool";
 
 export interface RunConfigItem {
   id: string;
@@ -58,10 +46,6 @@ export interface PlaywrightRunSummary {
   command?: string;
   exitCode?: number;
   [k: string]: unknown;
-}
-
-export interface PlaywrightRunDetail extends PlaywrightRunSummary {
-  outputLog: string;
 }
 
 export type PlaywrightArtifact = {
@@ -249,13 +233,6 @@ export async function getPlaywrightRuns(
   projectId: string,
 ): Promise<{ runs: PlaywrightRunSummary[]; configured?: boolean }> {
   return fetchJson(`${API_BASE}/api/projects/${projectId}/playwright/runs`);
-}
-
-export async function getPlaywrightRunDetail(
-  projectId: string,
-  runId: string,
-): Promise<PlaywrightRunDetail> {
-  return fetchJson(`${API_BASE}/api/projects/${projectId}/playwright/runs/${runId}`);
 }
 
 /**

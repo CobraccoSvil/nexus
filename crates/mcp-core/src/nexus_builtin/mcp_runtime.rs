@@ -324,7 +324,7 @@ async fn semantic_search(
 
     // Filtra per scope (sicurezza)
     let user_str = user_id.to_string();
-    let project_str = project_id.to_string();
+    let _project_str = project_id.to_string();
     let mut results = Vec::new();
     for hit in hits {
         let p = hit.get("payload").cloned().unwrap_or_else(|| json!({}));
@@ -467,7 +467,7 @@ async fn handle_mcp_tool_search_inner(
     if query.is_empty() {
         return format_json(&json!({"error": "query richiesto"}));
     }
-    let limit = parse_i64(arguments.get("limit"), 10).clamp(1, 50) as i64;
+    let limit = parse_i64(arguments.get("limit"), 10).clamp(1, 50);
 
     // ── Tentativo 0: tool builtin Nexus (locale, ILIKE su AGENT_TOOLS_JSON) ──
     // Senza questo i tool nexus_extract_* / nexus_read_attachment / ecc. non
@@ -481,7 +481,7 @@ async fn handle_mcp_tool_search_inner(
         match semantic_search(db, neural, &query, user_id, project_id, limit).await {
             Ok(results) if !results.is_empty() || !builtin_matches.is_empty() => {
                 let mut merged = builtin_matches.clone();
-                merged.extend(results.into_iter());
+                merged.extend(results);
                 return format_json(&json!({
                     "query": query,
                     "count": merged.len(),
@@ -514,7 +514,7 @@ async fn handle_mcp_tool_search_inner(
     let rows = if tokens.is_empty() {
         // Nessun token significativo (query di sole stopword/simboli):
         // fallback al comportamento legacy (frase intera) per non regredire.
-        let like = format!("%{}%", query.replace('%', "").replace('_', ""));
+        let like = format!("%{}%", query.replace(['%', '_'], ""));
         sqlx::query(
             r#"
             SELECT
@@ -632,7 +632,7 @@ async fn handle_mcp_tool_search_inner(
     // allegati / lettura risorse interne, e mettendoli in cima riduciamo il
     // rischio che il modello cerchi un MCP esterno equivalente.
     let mut merged = builtin_matches;
-    merged.extend(external_results.into_iter());
+    merged.extend(external_results);
 
     // Osservabilita': nessun payload sensibile, solo la query (gia' loggata
     // altrove come metadato del tool call) + conteggi.

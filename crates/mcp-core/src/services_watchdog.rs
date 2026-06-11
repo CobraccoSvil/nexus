@@ -15,8 +15,8 @@
 //!     DATABASE_URL/JWT di bootstrap, la build in debug;
 //!   - duplicare quella logica qui significherebbe replicare 5 percorsi di
 //!     avvio diversi e tenerli sincronizzati a mano (fragile, viola DRY).
-//!   Il pattern detached e' lo stesso di `task_watchdog::try_restart_gateway`
-//!   e `wizard::spawn_detached_service` (setsid nohup ... > log 2>&1 < /dev/null &).
+//!     Il pattern detached e' lo stesso di `task_watchdog::try_restart_gateway`
+//!     e `wizard::spawn_detached_service` (setsid nohup ... > log 2>&1 < /dev/null &).
 //!
 //! Anti-restart-loop:
 //!   - dopo un riavvio, COOLDOWN (`agent.watchdog.restart_cooldown_seconds`)

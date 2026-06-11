@@ -75,16 +75,6 @@ pub fn extract_cargo_diagnostics(ndjson: &str) -> (Vec<Value>, Vec<Value>) {
     (errors, warnings)
 }
 
-/// Conta i messaggi di build-finished nel flusso NDJSON.
-#[allow(dead_code)]
-pub fn count_build_finished(ndjson: &str) -> usize {
-    ndjson
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
-        .filter(|v| v.get("reason").and_then(Value::as_str) == Some("build-finished"))
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,12 +92,6 @@ mod tests {
         assert_eq!(errors[0]["file"], "src/lib.rs");
         assert_eq!(errors[0]["line"], 10);
         assert_eq!(warnings[0]["message"], "unused var");
-    }
-
-    #[test]
-    fn test_count_build_finished() {
-        let stream = "{\"reason\":\"build-finished\",\"success\":true}\n";
-        assert_eq!(count_build_finished(stream), 1);
     }
 
     #[test]

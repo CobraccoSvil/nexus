@@ -210,42 +210,6 @@ pub async fn run_one_round(db: &PgPool) -> anyhow::Result<PromoteStats> {
 /// reale di disponibilita' modelli da risolvere a monte (catalog).
 ///
 /// Ritorna il numero di righe disattivate.
-/// Stato minimale di una riga matrix per la decisione di cleanup (testabile).
-#[derive(Debug, Clone)]
-struct MatrixRowRef {
-    provider: String,
-    model_id: String,
-    is_active: bool,
-    manual_override: bool,
-}
-
-/// Stato minimale di un modello del catalog per la decisione di cleanup.
-#[derive(Debug, Clone)]
-struct CatalogHealthRef {
-    provider: String,
-    model: String,
-    is_enabled: bool,
-    consecutive_failures: i32,
-}
-
-/// Regola PURA: la riga matrix va disattivata dal cleanup?
-/// True sse: e' attiva, non manuale, e nel catalog NON esiste un modello sano
-/// (`is_enabled=true AND consecutive_failures=0`) con stesso provider
-/// (case-insensitive) e stesso model_id.
-/// Identica alla condizione della query SQL di `cleanup_stale_rows`.
-fn row_should_be_deactivated(row: &MatrixRowRef, catalog: &[CatalogHealthRef]) -> bool {
-    if !row.is_active || row.manual_override {
-        return false;
-    }
-    let has_healthy = catalog.iter().any(|c| {
-        c.provider.eq_ignore_ascii_case(&row.provider)
-            && c.model == row.model_id
-            && c.is_enabled
-            && c.consecutive_failures == 0
-    });
-    !has_healthy
-}
-
 pub async fn cleanup_stale_rows(db: &PgPool) -> sqlx::Result<u64> {
     // Flag enforcement (settings, regola G — niente env/hardcode).
     let enabled = sqlx::query_scalar::<_, String>(
@@ -767,7 +731,7 @@ pub(crate) fn tier_rank(tier: &str) -> i32 {
     }
 }
 
-pub(crate) fn cost_score(
+fn cost_score(
     req: &IntentRequirement,
     m: &CatalogModel,
     catalog: &[CatalogModel],
@@ -1072,6 +1036,46 @@ mod tests {
     }
 
     // ── Cleanup pass (A) ─────────────────────────────────────────────────
+    // Spec eseguibile della query SQL di `cleanup_stale_rows`: la condizione
+    // di disattivazione e' replicata qui come funzione pura per i test di
+    // regressione (la produzione esegue direttamente l'UPDATE SQL).
+
+    /// Stato minimale di una riga matrix per la decisione di cleanup (testabile).
+    #[derive(Debug, Clone)]
+    struct MatrixRowRef {
+        provider: String,
+        model_id: String,
+        is_active: bool,
+        manual_override: bool,
+    }
+
+    /// Stato minimale di un modello del catalog per la decisione di cleanup.
+    #[derive(Debug, Clone)]
+    struct CatalogHealthRef {
+        provider: String,
+        model: String,
+        is_enabled: bool,
+        consecutive_failures: i32,
+    }
+
+    /// Regola PURA: la riga matrix va disattivata dal cleanup?
+    /// True sse: e' attiva, non manuale, e nel catalog NON esiste un modello sano
+    /// (`is_enabled=true AND consecutive_failures=0`) con stesso provider
+    /// (case-insensitive) e stesso model_id.
+    /// Identica alla condizione della query SQL di `cleanup_stale_rows`.
+    fn row_should_be_deactivated(row: &MatrixRowRef, catalog: &[CatalogHealthRef]) -> bool {
+        if !row.is_active || row.manual_override {
+            return false;
+        }
+        let has_healthy = catalog.iter().any(|c| {
+            c.provider.eq_ignore_ascii_case(&row.provider)
+                && c.model == row.model_id
+                && c.is_enabled
+                && c.consecutive_failures == 0
+        });
+        !has_healthy
+    }
+
     fn mrow(provider: &str, model_id: &str, active: bool, manual: bool) -> MatrixRowRef {
         MatrixRowRef {
             provider: provider.into(),

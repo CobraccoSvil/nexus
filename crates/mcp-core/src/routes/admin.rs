@@ -125,6 +125,26 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                     middleware::require_admin,
                 )),
         )
+        // Associazione server MCP <-> profilo. Gli handler esistevano dalla
+        // nascita ma le route NON erano mai state montate: la sezione MCP
+        // della pagina /admin/profiles falliva in silenzio (bonifica dead
+        // code 2026-06-11, il warning never-used ha rivelato il gap).
+        .route(
+            "/api/admin/profiles/:id/mcp-servers",
+            get(profiles::admin_get_profile_mcp_servers)
+                .put(profiles::admin_set_profile_mcp_servers)
+                .layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
+        )
+        .route(
+            "/api/admin/global-mcp-servers",
+            get(profiles::admin_list_global_mcp_servers).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
         // Admin — profili custom degli utenti (read-only)
         .route(
             "/api/admin/user-profiles",

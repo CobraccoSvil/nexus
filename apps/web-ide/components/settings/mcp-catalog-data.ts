@@ -1,7 +1,7 @@
 // Catalogo curato di server MCP per lo sviluppo software.
 // Usato dal pannello "Catalogo" in McpConnectors.
 
-export type CatalogCategory =
+type CatalogCategory =
   | "databases"
   | "version-control"
   | "cloud"
@@ -29,24 +29,6 @@ export interface CatalogEntry {
   docsUrl?: string;
   official?: boolean;
 }
-
-export const CATALOG_CATEGORIES: Array<{
-  value: CatalogCategory | "all";
-  label: string;
-  emoji: string;
-}> = [
-  { value: "all", label: "Tutti", emoji: "🔌" },
-  { value: "databases", label: "Database", emoji: "🗄️" },
-  { value: "version-control", label: "Controllo versione", emoji: "🔀" },
-  { value: "cloud", label: "Cloud & API", emoji: "☁️" },
-  { value: "dev-tools", label: "Dev tools", emoji: "🛠️" },
-  { value: "filesystem", label: "Filesystem", emoji: "📁" },
-  { value: "search", label: "Ricerca", emoji: "🔍" },
-  { value: "ai-ml", label: "AI / ML", emoji: "🤖" },
-  { value: "productivity", label: "Produttività", emoji: "📋" },
-  { value: "monitoring", label: "Monitoring", emoji: "📊" },
-  { value: "communication", label: "Comunicazione", emoji: "💬" },
-];
 
 export const MCP_CATALOG: CatalogEntry[] = [
   // ── Filesystem ────────────────────────────────────────────────────────────

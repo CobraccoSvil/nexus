@@ -111,7 +111,7 @@ impl NexusToolHandler for FindPubApiTool {
 
         let total: usize = by_kind.values().sum();
         let mut top_files: Vec<(String, usize)> = by_file.into_iter().collect();
-        top_files.sort_by(|a, b| b.1.cmp(&a.1));
+        top_files.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top_files: Vec<Value> = top_files
             .into_iter()
             .take(top)

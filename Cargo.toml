@@ -58,3 +58,14 @@ notify = { version = "6", features = ["serde"] }
 
 [workspace.dependencies.tonic-build]
 version = "0.12"
+
+# Lint policy del workspace (post-rimozione del --cap-lints globale,
+# bonifica 2026-06-11). I lint di CORRETTEZZA restano attivi e bloccanti
+# via verify.sh (-D warnings); qui si silenziano SOLO le classi stilistiche
+# del backlog storico, tracciate in docs/tech-debt-rust.md. Niente nuovi
+# allow senza motivazione scritta.
+[workspace.lints.clippy]
+too_many_arguments = "allow"          # 16 firme storiche; refactor invasivo, backlog
+type_complexity = "allow"             # 9 tipi axum/tuple storici, backlog
+doc_overindented_list_items = "allow" # 38 doc-comment storici, solo formattazione
+empty_line_after_doc_comments = "allow" # 5 casi, solo formattazione

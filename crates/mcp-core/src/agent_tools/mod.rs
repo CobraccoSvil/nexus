@@ -9,7 +9,7 @@
 //!
 //! Splitting interno (refactor god-file):
 //! - `tool_schema`    — costante `AGENT_TOOLS_JSON` (schema tool, dato puro)
-//! - `context`        — `AgentToolContext` + `is_mutating_tool`
+//! - `context`        — `AgentToolContext`
 //! - `helpers`        — costanti lettura file, pattern protetti, helper condivisi
 //! - `dispatch`       — `execute_agent_tool` (routing nome-tool -> handler)
 //! - `profile_tools`  — tool profili utente + stub dispatch_subtask
@@ -62,31 +62,26 @@ pub(crate) mod vision_tools;
 pub(crate) mod visual_compare;
 
 // ── API pubblica del package (call site esterni: invariata) ─────────────────
-pub use context::{is_mutating_tool, AgentToolContext};
+pub use context::AgentToolContext;
 pub use dispatch::execute_agent_tool;
 pub use tool_schema::AGENT_TOOLS_JSON;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
-pub(crate) use command::tool_run_tests;
 
 // ── Re-export per i sottomoduli che usano `use super::*` ────────────────────
 // Mantengono risolvibili i simboli che prima vivevano in questo file: tipi base,
 // helper condivisi e path di crate referenziati via `super::`.
 pub(crate) use std::path::{Path, PathBuf};
-pub(crate) use std::sync::Arc;
 
 pub(crate) use serde_json::Value;
-pub(crate) use sqlx::{PgPool, Row};
+pub(crate) use sqlx::Row;
 pub(crate) use tokio::process::Command;
 pub(crate) use uuid::Uuid;
 
 pub(crate) use crate::projects::{resolve_relative_path, run_git_command};
-pub(crate) use crate::vector_memory;
-pub(crate) use ::mcp_db;
-pub(crate) use ::mcp_quality;
 
 pub(crate) use helpers::{
     classify_command_error, extract_file_structure, format_process_output, is_protected_path,
-    looks_like_long_running_command, PROTECTED_PATTERNS, READ_FILE_LINES_MAX,
+    looks_like_long_running_command, READ_FILE_LINES_MAX,
     READ_FILE_STRUCTURE_HINT_LINES,
 };

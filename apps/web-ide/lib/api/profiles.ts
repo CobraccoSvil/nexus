@@ -57,10 +57,6 @@ export async function setDefaultProfile(id: string): Promise<{ ok: boolean }> {
   return fetchJson(`${API_BASE}/api/profiles/${id}/default`, { method: "POST" });
 }
 
-export async function forkProfile(id: string): Promise<UserProfile> {
-  return fetchJson(`${API_BASE}/api/profiles/${id}/fork`, { method: "POST" });
-}
-
 // ── Admin profile management ────────────────────────────────────────────────
 
 export async function adminListProfiles(): Promise<{ profiles: UserProfile[] }> {

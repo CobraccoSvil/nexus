@@ -1180,7 +1180,7 @@ fn extract_readable_strings(bytes: &[u8], min_len: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     for &b in bytes {
-        let printable = b == b'\n' || b == b'\t' || (b >= 0x20 && b < 0x7F);
+        let printable = b == b'\n' || b == b'\t' || (0x20..0x7F).contains(&b);
         if printable {
             current.push(b as char);
         } else if current.len() >= min_len {
@@ -1315,7 +1315,7 @@ mod tests {
         let v = extract_figma(&buf, limits()).expect("extract");
         assert_eq!(v["format"], "figma_binary_legacy");
         assert_eq!(v["extracted_strings_fallback"], true);
-        assert!(v["extracted_strings"].as_array().unwrap().len() >= 1);
+        assert!(!v["extracted_strings"].as_array().unwrap().is_empty());
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -13,24 +12,17 @@ pub(crate) static LLM_CLASSIFIER_ENABLED: AtomicBool = AtomicBool::new(true);
 pub fn set_llm_classifier_enabled(val: bool) {
     LLM_CLASSIFIER_ENABLED.store(val, Ordering::Relaxed);
 }
-use serde_json::{json, Value};
-use sqlx::PgPool;
+use serde_json::Value;
 use uuid::Uuid;
 
 // Re-export: i submodule fanno `use super::*` e ottengono questi tipi senza
 // duplicare il blocco `use mcp_proto::neural::{...}` (regola L, S73).
 pub(crate) use mcp_proto::neural::{
-    neural_core_service_client::NeuralCoreServiceClient, ClassifyIntentRequest, EmbedTextRequest,
-    GenerateAgentTurnRequest, GenerateCompletionRequest, RouteModelRequest,
+    neural_core_service_client::NeuralCoreServiceClient, EmbedTextRequest,
+    GenerateAgentTurnRequest, GenerateCompletionRequest,
 };
 
-use crate::{
-    billing::{self, UsageNumbers},
-    domain::OrchestratorAudit,
-    nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest, NexusGatewayClient},
-    provider_cooldown::{is_provider_in_cooldown, put_provider_in_cooldown},
-    vector_memory,
-};
+use crate::nexus_gateway::NexusGatewayClient;
 
 pub(crate) const KNOWN_PROVIDERS: [&str; 5] =
     ["anthropic", "openai", "google", "deepseek", "mistral"];
@@ -135,8 +127,6 @@ pub struct OrchestratorRequest {
 #[derive(Debug, Clone)]
 pub struct OrchestratorResult {
     pub payload: Value,
-    #[allow(dead_code)]
-    pub audit: OrchestratorAudit,
 }
 
 #[derive(Clone)]

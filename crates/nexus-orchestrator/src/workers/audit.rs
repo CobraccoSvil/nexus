@@ -25,15 +25,11 @@ const SUSPICIOUS_PATTERNS: &[(&str, &str)] = &[
     ("unsafe_exec", "exec("),
 ];
 
+#[derive(Default)]
 pub struct AuditWorker {
     strict: bool,
 }
 
-impl Default for AuditWorker {
-    fn default() -> Self {
-        Self { strict: false }
-    }
-}
 
 impl AuditWorker {
     pub fn new() -> Self {

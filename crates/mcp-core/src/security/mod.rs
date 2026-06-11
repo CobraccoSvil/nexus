@@ -26,4 +26,3 @@ pub mod resource_linter;
 
 // Re-export simbolico per uso esterno
 pub use audit::{record_audit, AuditEntry};
-pub use quotas::{load_quota, ResourceQuota};

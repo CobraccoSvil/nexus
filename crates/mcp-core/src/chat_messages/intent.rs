@@ -20,27 +20,7 @@ pub(crate) async fn read_session_automation_mode(db: &PgPool, session_id: Uuid) 
             .flatten();
     AutomationMode::from_str_lenient(raw.as_deref())
 }
-#[allow(dead_code)]
-pub(crate) fn parse_provider_hierarchy(raw: &str) -> Vec<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    if trimmed.starts_with('[') {
-        if let Ok(items) = serde_json::from_str::<Vec<String>>(trimmed) {
-            return items
-                .into_iter()
-                .map(|item| item.trim().to_lowercase())
-                .filter(|item| !item.is_empty())
-                .collect();
-        }
-    }
-    trimmed
-        .split(',')
-        .map(|item| item.trim().to_lowercase())
-        .filter(|item| !item.is_empty())
-        .collect()
-}
+
 /// Guard-rail anti-mismatch: verifica che model appartenga a provider.
 ///
 /// La fonte di verita della coppia provider/model resta
@@ -84,7 +64,7 @@ pub(crate) fn model_belongs_to_provider(provider: &str, model: &str) -> bool {
 }
 
 // default_model_for_provider e load_agent_provider_defaults rimossi dopo refactor 0101.
-// Erano duplicati di logica in orchestrator.rs e marcati #[allow(dead_code)].
+// Erano duplicati di logica in orchestrator.rs e marcati .
 // Per leggere il default per provider usare:
 //   crate::orchestrator::default_model_for_provider(matrix, provider)
 // con matrix ottenuta da state.orchestrator.routing_matrix.current().

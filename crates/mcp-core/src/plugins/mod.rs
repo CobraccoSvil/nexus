@@ -126,9 +126,8 @@ pub(super) struct CatalogConfig {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
+
 pub(super) struct PluginResolution {
-    pub(super) plugin_instance_id: Uuid,
     pub(super) mcp_server_id: Uuid,
     pub(super) mcp_server_name: String,
     pub(super) plugin_slug: String,
@@ -188,8 +187,7 @@ pub(super) fn can_manage_instance(row: &sqlx::postgres::PgRow, user_id: Uuid, ro
 
 pub(super) fn format_compact_error(message: &str) -> String {
     let compact = message
-        .replace('\n', " ")
-        .replace('\r', " ")
+        .replace(['\n', '\r'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -1193,7 +1191,6 @@ pub(super) async fn build_plugin_resolution(
     let config = resolve_plugin_runtime_config(db, &row, &secret_bindings).await;
 
     Ok(PluginResolution {
-        plugin_instance_id,
         mcp_server_id,
         mcp_server_name,
         plugin_slug,

@@ -47,7 +47,7 @@ use uuid::Uuid;
 const ARTIFACT_KINDS: &[&str] = &["chat_note", "run_summary", "other"];
 
 fn is_artifact_kind(kind: &str) -> bool {
-    ARTIFACT_KINDS.iter().any(|k| *k == kind)
+    ARTIFACT_KINDS.contains(&kind)
 }
 
 // Quanto body inviare al modello: sufficiente per capire l'argomento, basso
@@ -281,7 +281,7 @@ fn sanitize_title(raw: &str, max_words: u32) -> Option<String> {
         let trimmed = line
             .trim()
             .trim_matches(|c| c == '"' || c == '\'' || c == '«' || c == '»' || c == '`')
-            .trim_end_matches(|c| c == '.' || c == ';' || c == ',')
+            .trim_end_matches(['.', ';', ','])
             .trim()
             .to_string();
         if trimmed == line {

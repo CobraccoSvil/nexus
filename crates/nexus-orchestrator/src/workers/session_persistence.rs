@@ -110,7 +110,7 @@ impl LearningWorker for SessionPersistenceWorker {
         // Statistiche swarm (se presenti)
         let (swarm_tasks_total, swarm_tasks_success) =
             if let Some(swarm) = &context.swarm_result {
-                (swarm.task_results.len(), swarm.success_count as usize)
+                (swarm.task_results.len(), swarm.success_count)
             } else {
                 (0, 0)
             };

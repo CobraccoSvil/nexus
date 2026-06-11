@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, AsyncIterator
+from typing import Any
 
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 
@@ -174,32 +174,6 @@ class VllmProvider(BaseProvider):
             content=text,
             metadata=meta,
         )
-
-    async def generate_stream(
-        self,
-        model: str,
-        prompt: str,
-        **kwargs: Any,
-    ) -> AsyncIterator[str]:
-        """Streaming via Chat Completions API con stream=True."""
-        client = self._get_client()
-        max_tokens = int(kwargs.get("max_tokens", 4096))
-        try:
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                stream=True,
-            )
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    yield delta.content
-        except Exception as exc:
-            logger.error("vllm stream failed: %s", exc)
-            yield f"[vLLM stream error: {exc}]"
 
     async def generate_agent_turn(
         self,

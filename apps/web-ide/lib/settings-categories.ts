@@ -24,7 +24,7 @@ export interface SettingsCategory {
 }
 
 /** Ordine e label delle categorie note (non e' un filtro di visibilita'). */
-export const KNOWN_CATEGORY_META: ReadonlyArray<{ key: string; label?: string }> = [
+const KNOWN_CATEGORY_META: ReadonlyArray<{ key: string; label?: string }> = [
   { key: "providers", label: "Provider AI" },
   { key: "routing", label: "Routing" },
   { key: "connectors", label: "Plugin MCP" },

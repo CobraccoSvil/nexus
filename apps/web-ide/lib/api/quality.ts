@@ -145,9 +145,3 @@ export async function markFindingFalsePositive(findingId: number | string, reaso
     body: JSON.stringify({ reason, rule_key: ruleKey }),
   });
 }
-
-export async function getFalsePositiveStats(): Promise<Array<{ rule_key: string; count: number }>> {
-  const res = await fetch(`${API_BASE}/api/quality/false-positive-stats`, { credentials: "include" });
-  if (!res.ok) return [];
-  return res.json();
-}

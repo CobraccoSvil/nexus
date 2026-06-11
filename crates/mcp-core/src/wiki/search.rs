@@ -220,7 +220,7 @@ pub async fn search(
     let qfilter = build_qdrant_filter(scope, body.project_id, include_cross_scope, &filter);
     // top_k margine: chiediamo `limit * 3` per dare spazio al filtro ACL
     // (qualche hit potrebbe non essere visibile e va scartato).
-    let top_k_qdrant = ((limit as usize).saturating_mul(3)).max(10).min(300);
+    let top_k_qdrant = ((limit as usize).saturating_mul(3)).clamp(10, 300);
 
     let hits = crate::vector_memory::search_wiki_content_points_filtered(
         &state.db,

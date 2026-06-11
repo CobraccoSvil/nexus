@@ -61,7 +61,6 @@ impl NexusToolHandler for ProjectDbCreateMigrationTool {
 
         let db_ctx = ProjectDbContext {
             project_root: ctx.project_root.clone(),
-            project_id: ctx.project_id,
             migration_tool,
             migration_path,
         };

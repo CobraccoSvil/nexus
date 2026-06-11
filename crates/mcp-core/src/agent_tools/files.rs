@@ -623,7 +623,7 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
                 let lines: Vec<String> = stdout
                     .lines()
                     .map(|line| {
-                        line.replacen(&ctx.root_path.to_string_lossy().as_ref(), "", 1)
+                        line.replacen(ctx.root_path.to_string_lossy().as_ref(), "", 1)
                             .trim_start_matches(['/', '\\'])
                             .to_string()
                     })
@@ -631,8 +631,7 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
                 let total_lines = lines.len();
                 // Troncamento: limita per numero righe e per dimensione bytes
                 let mut result = String::new();
-                let mut count = 0;
-                for line in &lines {
+                for (count, line) in lines.iter().enumerate() {
                     if count >= MAX_OUTPUT_LINES || result.len() + line.len() > MAX_OUTPUT_BYTES {
                         let msg = format!(
                             "\n\n[Risultato troncato: mostrate {} di {} righe. Usa un pattern piu' specifico o limita il path.]",
@@ -645,7 +644,6 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
                         result.push('\n');
                     }
                     result.push_str(line);
-                    count += 1;
                 }
                 result
             }

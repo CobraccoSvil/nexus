@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, AsyncIterator
+from typing import Any
 
 import httpx
 
@@ -117,33 +117,6 @@ class OllamaProvider(BaseProvider):
                 content=f"[Ollama Error: {meta['error']}]",
                 metadata=meta,
             )
-
-    async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
-        try:
-            async with self._get_client().stream(
-                "POST", "/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": True,
-                    "options": {"temperature": kwargs.get("temperature", 0.7)},
-                },
-                timeout=120.0,
-            ) as resp:
-                resp.raise_for_status()
-                import json as _json
-                async for line in resp.aiter_lines():
-                    if line:
-                        try:
-                            chunk = _json.loads(line)
-                            if text := chunk.get("response"):
-                                yield text
-                            if chunk.get("done"):
-                                break
-                        except _json.JSONDecodeError:
-                            continue
-        except Exception as e:
-            yield f"[Ollama stream error: {e}]"
 
     async def generate_agent_turn(
         self,

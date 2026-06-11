@@ -9,9 +9,8 @@ campagna de-duplicazione):
 - ``get_setting(key, default)`` / ``get_bool_setting`` / ``get_int_setting``
   varianti legacy ``best-effort``: ingoiano l'errore DB e tornano al
   ``default`` passato. Mantenute per i call site storici dei provider.
-- ``get_setting_checked`` / ``get_bool_setting_checked`` /
-  ``get_int_setting_checked``: propagano l'errore DB e non accettano
-  fallback hardcoded (regola G + H). Preferibili per il codice NUOVO.
+- ``get_setting_checked``: propaga l'errore DB e non accetta fallback
+  hardcoded (regola G + H). Preferibile per il codice NUOVO.
 
 La connessione passa per ``brain.utils.db_pool.connect`` (punto unico DB,
 regola L / ADR 0026). Niente connection string copiata qui.
@@ -88,24 +87,6 @@ def get_setting_checked(key: str) -> Optional[str]:
     return _read_setting_raw(key)
 
 
-def get_bool_setting_checked(key: str) -> Optional[bool]:
-    """Variante booleana di ``get_setting_checked``. Valori veri:
-    ``true|1|yes|on`` (case-insensitive)."""
-    raw = get_setting_checked(key)
-    if raw is None:
-        return None
-    return raw.strip().lower() in ("true", "1", "yes", "on")
-
-
-def get_int_setting_checked(key: str) -> Optional[int]:
-    """Variante intera di ``get_setting_checked``. Solleva ``ValueError`` se
-    il valore non e' un intero."""
-    raw = get_setting_checked(key)
-    if raw is None:
-        return None
-    return int(raw.strip())
-
-
 # ── Varianti LEGACY (best-effort, ingoiano gli errori). ─────────────────────
 
 def get_setting(key: str, default: str = "") -> str:
@@ -132,14 +113,14 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def get_bool_setting(key: str, default: bool = False) -> bool:
-    """Variante booleana legacy. Vedi ``get_bool_setting_checked``."""
+    """Variante booleana legacy best-effort (vedi ``get_setting``)."""
     return get_setting(key, "true" if default else "false").strip().lower() in (
         "true", "1", "yes", "on",
     )
 
 
 def get_int_setting(key: str, default: int = 0) -> int:
-    """Variante intera legacy. Vedi ``get_int_setting_checked``."""
+    """Variante intera legacy best-effort (vedi ``get_setting``)."""
     raw = get_setting(key, str(default)).strip()
     try:
         return int(raw)

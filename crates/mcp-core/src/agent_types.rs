@@ -10,11 +10,6 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[allow(dead_code)]
-pub const AGENT_MAX_ITERATIONS: u32 = 60;
-#[allow(dead_code)]
-pub const AGENT_TIMEOUT_SECS: u64 = 480;
-
 // ---------------------------------------------------------------------------
 // SupervisorMode — modalità di supervisione AI del worker
 // ---------------------------------------------------------------------------
@@ -46,30 +41,13 @@ impl SupervisorMode {
         }
     }
 
-    #[allow(dead_code)]
+    
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "anomaly" | "c" => Self::Anomaly,
             "interleaved" | "a" => Self::Interleaved,
             "continuous" | "b" => Self::Continuous,
             _ => Self::None,
-        }
-    }
-
-    /// Ogni quante iterazioni controllare (per Interleaved)
-    #[allow(dead_code)]
-    fn check_interval(self) -> u32 {
-        5
-    }
-
-    /// Se il supervisor deve essere chiamato a questa iterazione
-    #[allow(dead_code)]
-    pub fn should_check(self, iteration: u32, anomaly: bool) -> bool {
-        match self {
-            Self::None => false,
-            Self::Anomaly => anomaly,
-            Self::Interleaved => iteration > 0 && iteration % self.check_interval() == 0,
-            Self::Continuous => iteration > 0,
         }
     }
 }
@@ -107,7 +85,7 @@ pub enum AgentStepStatus {
 }
 
 impl AgentStepStatus {
-    #[allow(dead_code)]
+    
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -362,7 +340,7 @@ pub struct AgentStepEvent {
 // ---------------------------------------------------------------------------
 
 /// Rileva se il messaggio utente richiede un'azione operativa (build, deploy, run, ecc.).
-#[allow(dead_code)]
+
 pub(crate) fn detect_action_request(text: &str) -> bool {
     if text.trim().is_empty() {
         return false;
@@ -501,40 +479,8 @@ pub(crate) fn tool_failure_action(
 // DB helpers
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
-pub async fn insert_agent_run(
-    db: &PgPool,
-    run_id: Uuid,
-    session_id: Uuid,
-    project_id: Uuid,
-    user_id: Uuid,
-    message_id: Uuid,
-    automation_mode: &str,
-    provider: &str,
-    model: &str,
-    supervisor_mode: SupervisorMode,
-) {
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO agent_runs (id, session_id, project_id, user_id, run_message_id, status, automation_mode, provider, model, supervisor_mode)
-        VALUES ($1, $2, $3, $4, $5, 'running', $6, $7, $8, $9)
-        "#,
-    )
-    .bind(run_id)
-    .bind(session_id)
-    .bind(project_id)
-    .bind(user_id)
-    .bind(message_id)
-    .bind(automation_mode)
-    .bind(provider)
-    .bind(model)
-    .bind(supervisor_mode.as_str())
-    .execute(db)
-    .await;
-}
-
 /// Funzione pubblica per finalizzare un run (usata da chat_messages per la ripresa).
-#[allow(dead_code)]
+
 pub async fn finalize_agent_run(
     db: &PgPool,
     run_id: Uuid,
@@ -765,8 +711,12 @@ Thumbs.db
 
 /// G4: dopo un run completato con successo cerca l'ultimo `shell_exec` che ha
 /// eseguito `docker compose up` e salva il comando esatto in `memory_entries`
-/// con ns_type='project'. Al turno successivo, `build_project_context_block`
-/// lo mostrerà in "Memoria di progetto" → l'agente sa già cosa eseguire.
+/// con ns_type='project'.
+///
+/// NOTA: con la rimozione del modulo morto `project_context.rs` non esiste
+/// piu' alcun lettore di `memory_entries` nel repo: questa scrittura e'
+/// funzionalmente orfana finche' non viene cablata un'iniezione nel prompt
+/// (oppure rimossa anche questa funzione).
 ///
 /// Fire-and-forget: gli errori non bloccano il return del run.
 pub async fn save_startup_command_if_needed(db: &PgPool, project_id: Uuid, steps: &[AgentStep]) {

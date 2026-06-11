@@ -4,7 +4,6 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use sqlx::PgPool;
 
 use crate::AppState;
 
@@ -94,12 +93,4 @@ pub async fn delete_pattern(
     }
 
     Ok(Json(json!({ "ok": true })))
-}
-
-#[allow(dead_code)]
-pub async fn load_enabled_patterns(db: &PgPool) -> Vec<String> {
-    sqlx::query_scalar::<_, String>("SELECT pattern FROM long_running_patterns WHERE enabled = TRUE")
-        .fetch_all(db)
-        .await
-        .unwrap_or_default()
 }

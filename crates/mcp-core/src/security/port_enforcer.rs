@@ -14,7 +14,6 @@
 use std::time::Duration;
 
 use serde_json::json;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::project_workspace::services::{

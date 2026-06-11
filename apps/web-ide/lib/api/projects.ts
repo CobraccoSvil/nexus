@@ -115,7 +115,7 @@ export async function analyzeProject(projectId: string): Promise<ProjectAnalysis
 
 // ── Deep analysis (agent.project.analyzer) ──────────────────────────────────
 
-export interface DeepAnalysisIssue {
+interface DeepAnalysisIssue {
   severity: "high" | "medium" | "low";
   title: string;
   files: string[];
@@ -123,7 +123,7 @@ export interface DeepAnalysisIssue {
   suggested_fix: string;
 }
 
-export interface DeepAnalysisService {
+interface DeepAnalysisService {
   name: string;
   type: string;
   port: number | null;
@@ -150,16 +150,6 @@ export interface DeepAnalysisInsights {
   pre_launch_checks: Array<{ service: string; checks: string[] }>;
   suggested_actions: Array<{ priority: number; title: string; command: string | null; rationale: string }>;
   notes?: string;
-}
-
-export interface DeepAnalysisResponse {
-  status: "completed" | "partial" | "failed";
-  insights: DeepAnalysisInsights | null;
-  model_used: string | null;
-  duration_ms: number;
-  config_files_count: number;
-  registered_services_count: number;
-  error?: string | null;
 }
 
 /** Risposta del POST /deep-analyze (refactor 0102: ora asincrono).
@@ -227,14 +217,4 @@ export async function getProjectChanges(
   since: number,
 ): Promise<{ since: number; count: number; changed: Array<{ path: string; mtime: number }> }> {
   return fetchJson(`${API_BASE}/api/projects/${projectId}/changes?since=${since}`);
-}
-
-export async function setProjectDefaultProfile(
-  projectId: string,
-  profileId: string | null,
-): Promise<{ ok: boolean; profileId: string | null }> {
-  return fetchJson(`${API_BASE}/api/projects/${projectId}/default-profile`, {
-    method: "PATCH",
-    body: JSON.stringify({ profileId: profileId ?? "" }),
-  });
 }

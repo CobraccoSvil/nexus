@@ -922,7 +922,7 @@ pub async fn get_graph(
 
     // Se seed_doc_id e' presente: restringi nodi ai vicini di 1 hop + seed.
     let seed_doc_id = q.seed_doc_id;
-    let seed_clause = seed_doc_id.map(|seed| {
+    let seed_clause = seed_doc_id.map(|_seed| {
         let idx = next_idx;
         next_idx += 1;
         format!(

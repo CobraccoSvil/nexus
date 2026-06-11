@@ -54,7 +54,7 @@ static NEXUS_BRIDGE: OnceLock<Arc<NexusBridge>> = OnceLock::new();
 
 /// Bridge Nexus — wrapper thread-safe sui componenti nexus-orchestrator
 pub struct NexusBridge {
-    #[allow(dead_code)]
+    
     router: Arc<QLearningRouter>,
     scheduler: Arc<LearningScheduler>,
     /// Namespace globale per observability dei dati che attraversano il bridge
@@ -528,7 +528,7 @@ impl NexusBridge {
     }
 
     /// Router Q-Learning sottostante
-    #[allow(dead_code)]
+    
     pub fn router(&self) -> &Arc<QLearningRouter> {
         &self.router
     }
@@ -698,7 +698,7 @@ impl NexusBridge {
             tokens_used: 0,
         };
         let routing = RoutingDecision {
-            agent_type: agent_type,
+            agent_type,
             q_value: quality_score,
             confidence: quality_score,
             candidates: Vec::new(),
@@ -928,16 +928,16 @@ impl NexusBridge {
     /// Recupera metriche aggregate per uno specifico agent type.
     /// Ritorna statistiche di latency, costo, reward e success/failure count
     /// utili per dashboard e monitoring.
-    pub fn get_agent_metrics(&self, agent_type: &AgentType, limit: usize) -> AgentMetrics {
-        let stats = self.router_stats();
+    pub fn get_agent_metrics(&self, agent_type: &AgentType, _limit: usize) -> AgentMetrics {
+        let _stats = self.router_stats();
 
         // Ricerca nelle metriche del router le statistiche per questo agent
-        let mut avg_latency_ms = 0.0;
-        let mut avg_cost_usd = 0.0;
-        let mut avg_reward = 0.0;
-        let mut success_count: i32 = 0;
-        let mut failure_count: i32 = 0;
-        let mut total_tokens_processed: i32 = 0;
+        let avg_latency_ms = 0.0;
+        let avg_cost_usd = 0.0;
+        let avg_reward = 0.0;
+        let success_count: i32 = 0;
+        let failure_count: i32 = 0;
+        let total_tokens_processed: i32 = 0;
 
         // Ricerca il Q-value per questo agent (best tra tutti i task type)
         let q_value = self

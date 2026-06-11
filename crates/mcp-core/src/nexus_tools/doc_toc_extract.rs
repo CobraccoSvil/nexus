@@ -26,7 +26,7 @@ impl NexusToolHandler for DocTocExtractTool {
         for line in content.lines() {
             let trimmed = line.trim_start();
             let depth = trimmed.chars().take_while(|c| *c == '#').count();
-            if depth >= 1 && depth <= 6 {
+            if (1..=6).contains(&depth) {
                 let text = trimmed[depth..].trim().to_string();
                 if !text.is_empty() {
                     headings.push(json!({"depth": depth, "text": text}));

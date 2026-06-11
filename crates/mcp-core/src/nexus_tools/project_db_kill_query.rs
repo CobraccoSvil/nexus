@@ -26,7 +26,7 @@ impl NexusToolHandler for ProjectDbKillQueryTool {
 
         let project_pool = db_helper::get_pool_for_project(&nexus_pool, ctx.project_id)
             .await
-            .map_err(|e| NexusToolError::BadInput(e))?;
+            .map_err(NexusToolError::BadInput)?;
 
         nexus_pool.close().await;
 

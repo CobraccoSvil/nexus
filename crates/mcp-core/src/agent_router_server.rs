@@ -21,7 +21,7 @@ use nexus_orchestrator::AgentType;
 use nexus_orchestrator::SelectionStrategy;
 use tonic::{transport::Server, Request, Response, Status};
 
-use crate::nexus_bridge::{AgentMetrics, NexusBridge};
+use crate::nexus_bridge::NexusBridge;
 
 /// Converte un nome "brain-style" (snake_case, es. "coder", "github_pr_manager")
 /// nel nome PascalCase atteso da `AgentType::from_name`. Idempotente: se il
@@ -54,7 +54,6 @@ fn snake_to_pascal(name: &str) -> String {
         .replace("Qa", "QA")
         .replace("Ui", "UI")
         .replace("Etl", "ETL")
-        .replace("I18n", "I18n")
         .replace("PrManager", "PRManager")
 }
 
@@ -249,7 +248,7 @@ impl AgentRouter for AgentRouterService {
 
         let pascal = snake_to_pascal(&req.agent_type);
         let agent_type = AgentType::from_name(&pascal);
-        let limit = std::cmp::max(1, std::cmp::min(100, req.limit)) as usize;
+        let limit = req.limit.clamp(1, 100) as usize;
 
         let metrics = bridge.get_agent_metrics(&agent_type, limit);
 

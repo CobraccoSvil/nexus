@@ -44,7 +44,7 @@ pub async fn get_project_audit(
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
 
-    let limit = q.limit.unwrap_or(50).min(200).max(1);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
 
     // Costruisci query dinamica con filtri opzionali

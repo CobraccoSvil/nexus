@@ -15,7 +15,6 @@
 
 use anyhow::{anyhow, Context, Result};
 use sqlx::PgPool;
-use std::time::Duration;
 use tokio::process::Command;
 
 /// Outcome di una chiamata sudo_manager::execute.

@@ -100,7 +100,7 @@ pub async fn list_documents(
     .bind(project_id)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?;
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     let docs: Vec<Value> = rows
         .iter()
@@ -180,7 +180,7 @@ pub async fn get_document(
     .bind(document_id)
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
     .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
 
     // Punto unico mapping JSON in nexus_types::documents_dto (regola L, S62).
@@ -206,7 +206,7 @@ pub async fn download_document(
     .bind(project_id)
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
     .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
 
     let file_path: String = row.get("file_path");
@@ -226,7 +226,7 @@ pub async fn download_document(
     let bytes = fs::read(&abs_path).await.map_err(|e| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Errore lettura file: {e}"),
+            format!("Errore lettura file: {e}"),
         )
     })?;
 
@@ -249,7 +249,7 @@ pub async fn download_document(
         .map_err(|e| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Response error: {e}"),
+                format!("Response error: {e}"),
             )
         })?;
 
@@ -273,7 +273,7 @@ pub async fn list_versions(
     .bind(document_id)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?;
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     let versions: Vec<Value> = rows
         .iter()
@@ -312,7 +312,7 @@ pub async fn delete_document(
     .bind(project_id)
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
     .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
 
     let file_path: String = row.get("file_path");
@@ -323,7 +323,7 @@ pub async fn delete_document(
         .bind(document_id)
         .execute(&state.db)
         .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?;
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     // Delete file from filesystem
     let context = load_project_context(&state.db, project_id, parse_user_id(&claims)?).await?;

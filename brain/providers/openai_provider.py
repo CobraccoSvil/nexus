@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, AsyncIterator
+from typing import Any
 
 # NB (ADR 0024 / regola L): _is_o_series qui sotto NON e' una decisione di
 # CAPABILITY (tool_use/thinking, che vengono dalla vista 0318 via cap), ma un
@@ -324,16 +324,12 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
         tools: list[dict],
         max_tokens: int = 4096,
         system_text: str = "",
-        extended_thinking: bool = False,
     ):
         """Fix M3: streaming agent-turn per OpenAI (paritetico con Anthropic).
 
         Yield: {"type": "token", "delta": str} per ogni delta di testo
                {"type": "done", "result": dict} al termine (schema generate_agent_turn)
                {"type": "error", "message": str, "metadata"?: dict} in caso di errore
-
-        Nota: il parametro extended_thinking e' ignorato lato OpenAI (reasoning
-        traces non sono esposte in stream dall'API chat.completions).
         """
         if not self._api_key:
             yield {"type": "error", "message": "OpenAI API key non configurata"}
@@ -475,32 +471,6 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
         except Exception as e:
             meta = format_error_result(e, self.name, model)
             yield {"type": "error", "message": meta.get("error", str(e)), "metadata": meta}
-
-    async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
-        if not self._api_key:
-            yield "[OpenAI API key not configured]"
-            return
-        try:
-            client = self._get_client()
-            max_tok = kwargs.get("max_tokens", 4096)
-            stream_kwargs: dict[str, Any] = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": True,
-            }
-            if _is_o_series(model):
-                stream_kwargs["max_completion_tokens"] = max_tok
-            else:
-                stream_kwargs["max_tokens"] = max_tok
-                stream_kwargs["temperature"] = kwargs.get("temperature", 0.7)
-            stream = await client.chat.completions.create(**stream_kwargs)
-            async for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    yield delta.content
-        except Exception as e:
-            logger.error("OpenAI stream failed: %s", e)
-            yield f"[Error: {e}]"
 
     async def test_connection(self) -> dict[str, Any]:
         if not self._api_key:

@@ -122,24 +122,12 @@ def enabled() -> bool:
     return bool(get()["reflection_enabled"])
 
 
-def sample_rate() -> float:
-    return float(get()["reflection_sample_rate"])
-
-
 def timeout_s() -> float:
     return float(get()["reflection_timeout_s"])
 
 
 def model() -> str:
     return str(get()["reflection_model"])
-
-
-def reward_weight() -> float:
-    return float(get()["reflection_reward_weight"])
-
-
-def reasoning_bank_min_score() -> float:
-    return float(get()["reflection_reasoning_bank_min_score"])
 
 
 def force_reload() -> None:

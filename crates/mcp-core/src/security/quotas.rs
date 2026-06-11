@@ -244,6 +244,10 @@ pub async fn check_can_use_disk(
 
 /// Invalida la cache uso disco di un progetto (dopo cancellazioni che liberano
 /// spazio, per non bloccare scritture legittime fino allo scadere del TTL).
+#[expect(
+    dead_code,
+    reason = "wiring mancante: tool_delete_file (agent_tools/files.rs) deve chiamarla dopo le cancellazioni, altrimenti un progetto a quota piena resta bloccato in scrittura fino al TTL di 5 minuti"
+)]
 pub async fn invalidate_disk_cache(project_id: Uuid) {
     let mut write = disk_cache().write().await;
     write.remove(&project_id);

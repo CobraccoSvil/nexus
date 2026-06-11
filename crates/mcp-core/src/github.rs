@@ -6,13 +6,11 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use nexus_http::build_client as nexus_build_client;
 use rand::Rng;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
-use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
 use crate::{

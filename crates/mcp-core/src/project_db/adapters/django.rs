@@ -2,7 +2,7 @@
 
 use super::MigrationAdapter;
 use crate::project_db::{
-    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+    AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -11,10 +11,6 @@ pub struct DjangoAdapter;
 
 #[async_trait]
 impl MigrationAdapter for DjangoAdapter {
-    async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
-        super::list_pending_files(ctx, |n| n.ends_with(".py") && !n.starts_with("__"), false)
-    }
-
     async fn create_migration(
         &self,
         ctx: &ProjectDbContext,
@@ -60,7 +56,7 @@ impl MigrationAdapter for DjangoAdapter {
 
     async fn rollback_last(
         &self,
-        ctx: &ProjectDbContext,
+        _ctx: &ProjectDbContext,
         _connection_url: &str,
     ) -> Result<Option<RolledBackMigration>, ProjectDbError> {
         // Django rollback richiede nome app e migrazione target — non supportato in V1

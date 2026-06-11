@@ -10,6 +10,6 @@ description = "Client HTTP condiviso per Nexus: timeout, retry, proxy e connecti
 reqwest = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-anyhow = { workspace = true }
+
+[lints]
+workspace = true

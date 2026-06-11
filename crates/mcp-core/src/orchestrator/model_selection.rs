@@ -29,7 +29,6 @@ pub(crate) struct ScoringWeights {
     pub cost: f32,
     pub context: f32,
     pub capabilities: f32,
-    pub cost_direction: String,
 }
 
 /// Chiave/valore della riga sentinella dei pesi di default.
@@ -51,7 +50,7 @@ fn weights_cache() -> &'static TtlCache<String, ScoringWeights> {
 /// peso fittizio.
 async fn fetch_default_weights(db: &PgPool) -> Result<ScoringWeights, String> {
     let row = sqlx::query(
-        "SELECT weight_tier, weight_cost, weight_context, weight_capabilities, cost_direction \
+        "SELECT weight_tier, weight_cost, weight_context, weight_capabilities \
            FROM nexus_intent_routing_requirements \
           WHERE intent = '*' AND behavior_mode = '*'",
     )
@@ -77,9 +76,6 @@ async fn fetch_default_weights(db: &PgPool) -> Result<ScoringWeights, String> {
         capabilities: row
             .try_get("weight_capabilities")
             .map_err(|e| format!("default_scoring_weights: weight_capabilities: {e}"))?,
-        cost_direction: row
-            .try_get("cost_direction")
-            .map_err(|e| format!("default_scoring_weights: cost_direction: {e}"))?,
     })
 }
 
@@ -365,7 +361,6 @@ mod tests {
         assert!((w.cost - 0.30).abs() < 1e-6);
         assert!((w.context - 0.15).abs() < 1e-6);
         assert!((w.capabilities - 0.15).abs() < 1e-6);
-        assert_eq!(w.cost_direction, "desc");
     }
 
     #[sqlx::test]

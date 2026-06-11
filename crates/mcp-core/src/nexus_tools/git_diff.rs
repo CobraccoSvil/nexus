@@ -99,7 +99,7 @@ struct DiffStat {
 /// `5 files changed, 123 insertions(+), 45 deletions(-)`
 fn parse_diff_stat(stdout: &str) -> DiffStat {
     let mut s = DiffStat::default();
-    let last = stdout.lines().filter(|l| !l.trim().is_empty()).last();
+    let last = stdout.lines().rfind(|l| !l.trim().is_empty());
     let Some(last) = last else {
         return s;
     };

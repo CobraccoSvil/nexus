@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import tempfile
-from typing import Any, AsyncIterator
+from typing import Any
 
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
@@ -694,28 +694,6 @@ class GoogleProvider(BaseProvider):
                 content=f"[Error: {meta['error']}]",
                 metadata=meta,
             )
-
-    async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
-        ok, reason = self._is_configured()
-        if not ok:
-            yield f"[Google provider non configurato: {reason}]"
-            return
-        try:
-            from google.genai import types  # type: ignore[import]
-            client = self._get_client()
-            async for chunk in await client.aio.models.generate_content_stream(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=kwargs.get("max_tokens", 4096),
-                    temperature=kwargs.get("temperature", 0.7),
-                ),
-            ):
-                if chunk.text:
-                    yield chunk.text
-        except Exception as e:
-            logger.error("Google stream failed: %s", e)
-            yield f"[Error: {e}]"
 
     async def test_connection(self) -> dict[str, Any]:
         ok, reason = self._is_configured()

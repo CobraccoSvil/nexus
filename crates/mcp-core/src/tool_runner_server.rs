@@ -20,9 +20,7 @@ use tonic::{transport::Server, Request, Response, Status};
 use uuid::Uuid;
 
 use crate::agent_tools::{execute_agent_tool, AgentToolContext};
-use crate::orchestrator::{AutomationMode, NeuralCoreClient};
-use crate::prompt_templates::TemplateCache;
-use crate::{AgentChannels, TerminalConsumers};
+use crate::orchestrator::NeuralCoreClient;
 
 /// Dipendenze condivise iniettate nel service. E' una slice sottile di
 /// AppState: teniamo qui solo cio' che serve per costruire un
@@ -31,10 +29,7 @@ use crate::{AgentChannels, TerminalConsumers};
 pub struct ToolRunnerDeps {
     pub db: PgPool,
     pub neural: NeuralCoreClient,
-    pub agent_channels: AgentChannels,
     pub playwright_channels: crate::playwright_live::PlaywrightChannels,
-    pub terminal_consumers: TerminalConsumers,
-    pub template_cache: TemplateCache,
     pub dependency_status: crate::task_watchdog::DependencyStatusRef,
     pub project_channels: nexus_events::ProjectChannels,
     pub monitor_registry: std::sync::Arc<
@@ -124,13 +119,9 @@ impl ToolRunnerService {
             session_id: Some(session_id),
             db: Arc::new(self.deps.db.clone()),
             parent_run_id: None,
-            agent_channels: self.deps.agent_channels.clone(),
             playwright_channels: self.deps.playwright_channels.clone(),
             neural: self.deps.neural.clone(),
-            automation_mode: AutomationMode::Automatic,
-            terminal_consumers: self.deps.terminal_consumers.clone(),
             long_running_patterns,
-            template_cache: self.deps.template_cache.clone(),
             user_role: info.user_role.clone(),
             is_nexus_operator: matches!(info.user_role.as_str(), "owner" | "admin"),
             dependency_status: self.deps.dependency_status.clone(),

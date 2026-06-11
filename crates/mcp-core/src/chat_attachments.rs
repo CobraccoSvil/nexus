@@ -33,7 +33,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -97,7 +97,7 @@ pub fn sanitize_attachment_filename(name: &str) -> String {
     // Prendi solo l'ultimo componente: scarta eventuali separatori inviati dal client.
     let trimmed = name.trim();
     let last_component = trimmed
-        .rsplit(|c: char| c == '/' || c == '\\')
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or("")
         .trim();
@@ -152,14 +152,13 @@ fn ensure_path_within(base: &Path, candidate: &Path) -> Result<(), ApiError> {
                     "Percorso allegato non sicuro: contiene componenti '..'",
                 ));
             }
-            Component::RootDir | Component::Prefix(_) => {
-                if !candidate.starts_with(base) {
+            Component::RootDir | Component::Prefix(_)
+                if !candidate.starts_with(base) => {
                     return Err(api_error(
                         StatusCode::BAD_REQUEST,
                         "Percorso allegato non sicuro: root assoluta",
                     ));
                 }
-            }
             _ => {}
         }
     }
@@ -517,75 +516,6 @@ pub async fn persist_message_attachments(
     }
 
     saved
-}
-
-/// Lista degli allegati associati a un messaggio (usata per popolare la UI
-/// quando si ricarica una sessione).
-pub async fn list_attachments_for_message(
-    db: &PgPool,
-    message_id: Uuid,
-) -> Result<Vec<SavedAttachment>, ApiError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, message_id, project_id, file_name, file_path,
-               mime_type, size_bytes, kind, kb_note_id, indexed_at, created_at
-        FROM chat_message_attachments
-        WHERE message_id = $1
-        ORDER BY created_at ASC
-        "#,
-    )
-    .bind(message_id)
-    .fetch_all(db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: Uuid = row
-            .try_get("id")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let msg_id: Uuid = row
-            .try_get("message_id")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let project_id: Uuid = row
-            .try_get("project_id")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let file_name: String = row
-            .try_get("file_name")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let file_path: String = row
-            .try_get("file_path")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let mime_type: String = row
-            .try_get("mime_type")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let size_bytes: i64 = row
-            .try_get("size_bytes")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let kind: String = row
-            .try_get("kind")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let kb_note_id: Option<Uuid> = row.try_get("kb_note_id").unwrap_or(None);
-        let indexed_at: Option<DateTime<Utc>> = row.try_get("indexed_at").unwrap_or(None);
-        let created_at: DateTime<Utc> = row
-            .try_get("created_at")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        out.push(SavedAttachment {
-            id: id.to_string(),
-            message_id: msg_id.to_string(),
-            project_id: project_id.to_string(),
-            file_name,
-            file_path,
-            mime_type,
-            size_bytes,
-            kind,
-            kb_note_id: kb_note_id.map(|v| v.to_string()),
-            indexed_at: indexed_at.map(|v| v.to_rfc3339()),
-            created_at: created_at.to_rfc3339(),
-        });
-    }
-    Ok(out)
 }
 
 /// Serializza una lista di SavedAttachment in JSON pronto per la risposta API.

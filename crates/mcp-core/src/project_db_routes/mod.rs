@@ -36,16 +36,15 @@ mod shared;
 // `nexus_builtin/mod.rs`) non cambiano.
 pub use config::{
     delete_project_db_connection, get_project_db_config, list_project_db_connections,
-    set_primary_project_db_connection, set_project_db_config, ProjectDbConfigResponse,
-    SetDbConfigBody,
+    set_primary_project_db_connection, set_project_db_config,
 };
-pub use connection::{detect_project_db, test_project_db_connection, TestConnectionBody};
+pub use connection::{detect_project_db, test_project_db_connection};
 pub use migrations::{
     apply_project_migrations, list_project_migrations, request_ddl_override,
-    rollback_project_migration, ApplyMigrationsBody, OverrideRequestBody, ProjectMigrationRow,
+    rollback_project_migration,
 };
-pub use provision::{provision_internal_core, provision_project_db, ProvisionDbBody};
+pub use provision::{provision_internal_core, provision_project_db};
 pub use query::{
     discover_schema_candidates, execute_project_db_query, import_project_db_schema,
-    read_schema_file, ExecuteQueryBody, ImportSchemaBody,
+    read_schema_file,
 };

@@ -316,7 +316,6 @@ class PostgresCheckpointer(BaseCheckpointSaver):
         for row in rows:
             checkpoint_data = _safe_loads(row["checkpoint_data"])
             metadata = _safe_loads(row["metadata"])
-            versions = json_module.loads(row["versions"])
 
             yield CheckpointTuple(
                 config={

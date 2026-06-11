@@ -597,8 +597,14 @@ use uuid::Uuid;
 
 /// Flag di sicurezza dichiarati da ogni handler. Usati dal dispatcher per
 /// enforcement pre-run e per documentazione al chiamante.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "contratto safety() del trait NexusToolHandler: il dispatcher non consuma ancora i flag, le impl li dichiarano gia'"
+    )
+)]
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
 pub struct NexusToolSafety {
     /// Il tool non modifica lo stato del filesystem del progetto.
     pub read_only: bool,
@@ -610,7 +616,7 @@ pub struct NexusToolSafety {
     pub network_egress: bool,
 }
 
-#[allow(dead_code)]
+
 impl NexusToolSafety {
     /// Preset: read-only puro (nessuna scrittura FS, nessun subprocess).
     pub const fn read_only() -> Self {
@@ -652,7 +658,7 @@ pub struct NexusToolContext {
     /// UUID del progetto nella tabella `projects`.
     pub project_id: Uuid,
     /// UUID dell'utente che ha invocato il tool.
-    #[allow(dead_code)]
+    
     pub user_id: Uuid,
     /// Timeout di default per eventuali subprocess (secondi).
     pub timeout_secs: u64,
@@ -666,12 +672,6 @@ impl NexusToolContext {
             user_id,
             timeout_secs: 120,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_timeout(mut self, secs: u64) -> Self {
-        self.timeout_secs = secs;
-        self
     }
 }
 
@@ -720,13 +720,25 @@ pub trait NexusToolHandler: Send + Sync {
 
     /// Schema JSON dell'input atteso. Usato per discovery / documentazione.
     /// Default: oggetto vuoto (il tool non richiede argomenti).
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "API di superficie del trait: gli handler la implementano, il dispatcher non la consuma ancora"
+        )
+    )]
     fn input_schema(&self) -> Value {
         serde_json::json!({"type": "object", "properties": {}})
     }
 
     /// Flag di sicurezza del tool. Default: read_only.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "API di superficie del trait: gli handler la implementano, il dispatcher non la consuma ancora"
+        )
+    )]
     fn safety(&self) -> NexusToolSafety {
         NexusToolSafety::read_only()
     }
@@ -769,12 +781,5 @@ mod tests {
         assert!(ros.read_only && ros.can_execute_subproc);
         let ws = NexusToolSafety::write_subproc();
         assert!(ws.can_write_filesystem && ws.can_execute_subproc);
-    }
-
-    #[test]
-    fn test_context_with_timeout() {
-        let ctx = NexusToolContext::new(PathBuf::from("/tmp"), Uuid::nil(), Uuid::nil())
-            .with_timeout(300);
-        assert_eq!(ctx.timeout_secs, 300);
     }
 }

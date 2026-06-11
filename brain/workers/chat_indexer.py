@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from typing import Iterable
 
 import httpx
 import psycopg

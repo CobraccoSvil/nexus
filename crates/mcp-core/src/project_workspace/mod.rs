@@ -1,12 +1,9 @@
 // Sotto-moduli per dominio del workspace di progetto
 pub mod allocate_port;
-pub mod auto_bootstrap;
-pub mod browser_check;
 pub mod build_diagnostics;
 pub mod changes;
 pub mod compose_ports;
 pub mod execute_cmd;
-pub mod fs_events;
 pub mod logs;
 pub mod monitor_seed;
 pub mod playwright_install;
@@ -15,14 +12,12 @@ pub mod processes;
 pub mod resource_violation_remediation;
 pub mod run_configs;
 pub mod run_mode;
-pub mod runtime_issues;
 pub mod scan_ports;
 pub mod service_discovery;
 pub mod service_log_diagnose;
 pub mod service_observer;
 pub mod service_observer_remediation;
 pub mod services;
-pub mod sync_ports;
 pub mod user_manager;
 pub mod wizard;
 pub mod workbench;
@@ -43,7 +38,7 @@ use uuid::Uuid;
 
 use crate::nexus_gateway::{GwMessage, GwMetadata, GwRequest};
 use crate::projects::{
-    api_error, list_directory_nodes, load_project_context, load_projects_base_root,
+    api_error, list_directory_nodes, load_project_context,
     load_user_project_preferences, parse_user_id, refresh_git_snapshot,
     save_user_project_preferences, sign_terminal_token, terminal_session_secret, terminal_shell,
     upsert_open_session, TerminalSessionClaims, TerminalSessionResponse,
@@ -84,17 +79,11 @@ pub use wizard::{uninstall_project_service, wizard_detect_services, wizard_insta
 pub use run_configs::{
     compute_run_config_suggestions, create_run_config, delete_run_config, detect_run_configs,
     get_run_configs, launch_run_config, save_suggestions_cache, update_run_config,
-    CreateRunConfigBody,
 };
 
-pub use processes::{
-    clear_finished_processes, get_sandbox_config_api, set_sandbox_config_api, stop_agent_process,
-    stream_agent_process_logs,
-};
+pub use processes::{clear_finished_processes, stop_agent_process, stream_agent_process_logs};
 
-// Funzioni pub(crate) usate da project_context.rs e run_configs.rs
-pub(crate) use wizard::collect_compose_files;
-pub(crate) use wizard::parse_compose_services;
+// Funzioni pub(crate) usate da run_configs.rs
 
 /// Raccoglie ricorsivamente i file .spec.ts / .spec.js in una directory.
 /// Condivisa tra wizard.rs (detect_playwright_suggestions) e run_configs.rs (detect_run_configs).

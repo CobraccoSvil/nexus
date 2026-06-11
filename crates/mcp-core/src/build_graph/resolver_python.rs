@@ -155,13 +155,12 @@ pub async fn resolve_python(
     if include_globs.is_empty() {
         if let Ok(mut rd) = tokio::fs::read_dir(project_root).await {
             while let Ok(Some(entry)) = rd.next_entry().await {
-                if entry.path().is_dir() {
-                    if entry.path().join("__init__.py").exists() {
+                if entry.path().is_dir()
+                    && entry.path().join("__init__.py").exists() {
                         if let Some(name) = entry.file_name().to_str() {
                             include_globs.push(format!("{}/**", name));
                         }
                     }
-                }
             }
         }
         if include_globs.is_empty() {

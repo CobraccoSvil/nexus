@@ -207,7 +207,7 @@ mod tests {
         let ns = Arc::new(MemoryNamespace::new("limit-test"));
         for i in 0..10 {
             ns.set(
-                &format!("pattern:{i}"),
+                format!("pattern:{i}"),
                 serde_json::json!({"i": i}),
                 "ul",
             );

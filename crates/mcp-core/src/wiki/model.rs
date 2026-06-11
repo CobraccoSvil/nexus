@@ -37,34 +37,6 @@ impl WikiScope {
     }
 }
 
-/// Stato del lock di modifica di un documento (auto vs protected vs frozen).
-/// Mantiene compatibilita' semantica con `nexus_meta_docs.edit_lock` storico.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EditLock {
-    None,
-    Protected,
-    Frozen,
-}
-
-impl EditLock {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EditLock::None => "none",
-            EditLock::Protected => "protected",
-            EditLock::Frozen => "frozen",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Self {
-        match raw {
-            "protected" => EditLock::Protected,
-            "frozen" => EditLock::Frozen,
-            _ => EditLock::None,
-        }
-    }
-}
-
 /// Riga della tabella `wiki_docs`. Riflette esattamente lo schema della mig 0295.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct WikiDoc {
@@ -93,33 +65,6 @@ pub struct WikiDoc {
     pub public_read: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-/// Riga della tabella `wiki_links` (grafo a livello di documenti).
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct WikiLink {
-    pub from_doc_id: Uuid,
-    pub to_doc_id: Uuid,
-    pub rel_type: String,
-    pub confidence: f32,
-    pub created_by: String,
-    pub evidence: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Riga della tabella `wiki_concept_triples` (knowledge graph reale).
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct WikiTriple {
-    pub id: Uuid,
-    pub subj_doc_id: Uuid,
-    pub predicate: String,
-    pub obj_doc_id: Option<Uuid>,
-    pub obj_text: Option<String>,
-    pub obj_external: Option<String>,
-    pub source: String,
-    pub confidence: f32,
-    pub evidence: Option<String>,
-    pub created_at: DateTime<Utc>,
 }
 
 /// Riga della tabella `wiki_doc_revisions` (versioning).

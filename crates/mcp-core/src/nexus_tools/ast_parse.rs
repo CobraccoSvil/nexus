@@ -81,7 +81,7 @@ fn lang_ext(lang: &str) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
+
 fn _use_detect() {
     // Keep mcp_ast::detect_language in the public surface for doc references.
     let _ = detect_language("x.rs");

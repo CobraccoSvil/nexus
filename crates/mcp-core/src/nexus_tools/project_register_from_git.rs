@@ -8,7 +8,6 @@ use super::db_helper;
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use sqlx::Row;
 use uuid::Uuid;
 
 pub struct ProjectRegisterFromGitTool;

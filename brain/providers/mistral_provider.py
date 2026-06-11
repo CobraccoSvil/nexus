@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, AsyncIterator
+from typing import Any
 
 from .base import (
     ApiKeyClientMixin,
@@ -268,27 +268,6 @@ class MistralProvider(BaseProvider, ApiKeyClientMixin):
             )
         except Exception as e:
             return build_agent_turn_error(e, self.name, model)
-
-    async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
-        if not self._api_key:
-            yield "[Mistral API key not configured]"
-            return
-        try:
-            client = self._get_client()
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=kwargs.get("max_tokens", 4096),
-                temperature=kwargs.get("temperature", 0.7),
-                stream=True,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    yield delta.content
-        except Exception as e:
-            logger.error("Mistral stream failed: %s", e)
-            yield f"[Error: {e}]"
 
     async def test_connection(self) -> dict[str, Any]:
         if not self._api_key:

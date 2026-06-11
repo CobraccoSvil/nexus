@@ -103,8 +103,7 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
                 .get("chunk_lines")
                 .and_then(Value::as_u64)
                 .unwrap_or(50)
-                .max(10)
-                .min(200) as usize;
+                .clamp(10, 200) as usize;
             tool_search_file_semantic(ctx, &path, &query, top_k, chunk_lines).await
         }
         "recall_context" => {

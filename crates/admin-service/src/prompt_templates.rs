@@ -17,7 +17,7 @@ use crate::AppState;
 // TemplateCache e get_template_or_default: punto unico in nexus-types
 // (regola L / ADR 0026). Qui solo re-export, usato da main.rs come
 // `admin_service::prompt_templates::TemplateCache`.
-pub use nexus_types::{get_template_or_default, TemplateCache};
+pub use nexus_types::TemplateCache;
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
 pub struct PromptTemplate {
@@ -78,15 +78,6 @@ pub struct AiSuggestReq {
 pub struct FalsePositiveReq {
     pub reason: Option<String>,
     pub rule_key: Option<String>,
-    #[allow(dead_code)]
-    pub code_snippet: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-pub struct FalsePositiveStat {
-    pub rule_key: Option<String>,
-    pub count: Option<i64>,
 }
 
 pub async fn list_templates_handler(
@@ -582,18 +573,6 @@ Rispondi con SOLO un array JSON valido, senza commenti, senza markdown:
     })))
 }
 
-#[allow(dead_code)]
-pub async fn get_disabled_quality_rules(db: &PgPool) -> std::collections::HashSet<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT key FROM nexus_prompt_templates WHERE category='quality' AND is_active=FALSE",
-    )
-    .fetch_all(db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .collect()
-}
-
 // -- MCP Tools Management --
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -759,12 +738,6 @@ pub async fn get_available_mcp_tools_handler(
 #[derive(Debug, Deserialize)]
 pub struct BulkAssignToolsReq {
     pub template_keys: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BulkToolResult {
-    pub key: String,
-    pub tools_count: usize,
 }
 
 static BATCH_ASSIGN_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1022,8 +995,8 @@ pub async fn batch_assign_tools_handler(
             BATCH_ASSIGN_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
 
             // Se nel frattempo è arrivata un'altra richiesta, riesegui una volta.
-            if BATCH_ASSIGN_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                if BATCH_ASSIGN_RUNNING
+            if BATCH_ASSIGN_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst)
+                && BATCH_ASSIGN_RUNNING
                     .compare_exchange(
                         false,
                         true,
@@ -1031,13 +1004,12 @@ pub async fn batch_assign_tools_handler(
                         std::sync::atomic::Ordering::SeqCst,
                     )
                     .is_ok()
-                {
-                    let state_clone2 = state.clone();
-                    tokio::spawn(async move {
-                        let _ = run_batch_assign_tools_job(state_clone2, None).await;
-                        BATCH_ASSIGN_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-                    });
-                }
+            {
+                let state_clone2 = state.clone();
+                tokio::spawn(async move {
+                    let _ = run_batch_assign_tools_job(state_clone2, None).await;
+                    BATCH_ASSIGN_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
             }
         });
 

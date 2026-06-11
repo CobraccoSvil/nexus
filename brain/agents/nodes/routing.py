@@ -1,6 +1,6 @@
 """Funzioni di routing condizionale del grafo LangGraph di Nexus.
 
-Le route_after_* e route_by_task_type decidono il prossimo nodo in base allo
+Le route_after_* decidono il prossimo nodo in base allo
 state. Estratte da nodes.py mantenendo nomi e logica identici. Importano gli
 helper puri da .helpers e i moduli fratelli (orchestrator_config, final_gate)
 via import locale dentro le funzioni dove gia' avveniva, per evitare cicli.
@@ -280,9 +280,3 @@ def route_after_regression_gate(state: AgentState) -> str:
     if state.get("stop_reason") == "tool_use":
         return "executor"
     return "learner"
-
-
-def route_by_task_type(state: AgentState) -> str:
-    """Routing condizionale: mappa task_type al nodo executor."""
-    # Tutti i task_type validi vanno verso executor
-    return "executor"

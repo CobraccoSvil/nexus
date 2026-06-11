@@ -42,8 +42,7 @@ def validate_tool_args(tool: CanonicalTool, args: dict[str, Any]) -> ValidationR
     if not isinstance(schema, dict) or not schema:
         return ValidationResult(ok=True)
     try:
-        import jsonschema  # type: ignore[import]
-        from jsonschema import Draft202012Validator
+        from jsonschema import Draft202012Validator  # type: ignore[import]
     except Exception:
         logger.debug("jsonschema non disponibile: skip validazione tool args")
         return ValidationResult(ok=True)

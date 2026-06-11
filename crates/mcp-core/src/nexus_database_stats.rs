@@ -1,5 +1,5 @@
 /// Endpoint per statistiche del database Nexus interno.
-use axum::{extract::State, Json};
+use axum::Json;
 use serde_json::json;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]

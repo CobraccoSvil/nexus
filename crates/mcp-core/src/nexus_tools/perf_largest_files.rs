@@ -47,7 +47,7 @@ impl NexusToolHandler for PerfLargestFilesTool {
                 collect(r, &ctx.project_root, 0, &mut all);
             }
         }
-        all.sort_by(|a, b| b.1.cmp(&a.1));
+        all.sort_by_key(|f| std::cmp::Reverse(f.1));
         let top: Vec<Value> = all
             .into_iter()
             .take(limit)

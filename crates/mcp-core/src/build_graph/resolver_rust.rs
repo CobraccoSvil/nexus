@@ -35,15 +35,10 @@ struct CargoWorkspace {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct CargoPackage {
-    #[allow(dead_code)]
-    name: Option<String>,
-}
+struct CargoPackage {}
 
 #[derive(Debug, Deserialize, Default)]
 struct CargoBin {
-    #[allow(dead_code)]
-    name: Option<String>,
     path: Option<String>,
 }
 

@@ -15,25 +15,8 @@ export interface HealthResponse {
   };
 }
 
-export interface DashboardResponse {
-  total_runs: number;
-  tokens_consumed: number;
-  tokens_saved: number;
-  quality_findings: number;
-  active_jobs: number;
-  recent_runs: Array<{
-    id: string;
-    status: string;
-    created_at: string;
-  }>;
-}
-
 export async function getHealth(): Promise<HealthResponse> {
   return fetchJson(`${API_BASE}/api/health`);
-}
-
-export async function getDashboard(): Promise<DashboardResponse> {
-  return fetchJson(`${API_BASE}/api/dashboard`);
 }
 
 // ── Environment Status ─────────────────────────────────────────────────────

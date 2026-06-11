@@ -129,7 +129,7 @@ pub(super) async fn tool_nexus_verify_scaffold(ctx: &AgentToolContext, input: &V
     let all_deps: std::collections::HashSet<String> = deps
         .as_object()
         .into_iter()
-        .chain(dev_deps.as_object().into_iter())
+        .chain(dev_deps.as_object())
         .flat_map(|m| m.keys().cloned())
         .collect();
 

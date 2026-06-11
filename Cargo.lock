@@ -15,18 +15,15 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
- "dashmap",
  "dotenvy",
  "nexus-auth",
  "nexus-http",
  "nexus-types",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
  "sqlx",
  "tokio",
- "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -272,12 +269,10 @@ dependencies = [
  "chrono",
  "dotenvy",
  "nexus-auth",
- "nexus-types",
  "serde",
  "serde_json",
  "sqlx",
  "tokio",
- "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -354,12 +349,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "spki",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
- "tokio-stream",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -439,21 +431,15 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures",
- "mcp-proto",
  "nexus-auth",
  "nexus-types",
- "prost",
  "redis",
- "regex",
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "sqlx",
  "tokio",
  "tokio-stream",
- "tonic",
- "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -880,7 +866,6 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
- "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -1973,7 +1958,6 @@ version = "0.1.0"
 dependencies = [
  "regex",
  "serde",
- "serde_json",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",
@@ -1989,7 +1973,6 @@ dependencies = [
  "chrono",
  "regex",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2012,9 +1995,7 @@ dependencies = [
  "libc",
  "lru",
  "mcp-ast",
- "mcp-comments",
  "mcp-db",
- "mcp-learning",
  "mcp-proto",
  "mcp-quality",
  "mcp-token",
@@ -2029,7 +2010,6 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pdf-extract",
- "prost",
  "quick-xml",
  "rand 0.8.5",
  "redis",
@@ -2062,9 +2042,7 @@ dependencies = [
 name = "mcp-db"
 version = "0.1.0"
 dependencies = [
- "regex",
  "serde",
- "serde_json",
  "sqlparser",
 ]
 
@@ -2083,8 +2061,6 @@ name = "mcp-proto"
 version = "0.1.0"
 dependencies = [
  "prost",
- "serde",
- "serde_json",
  "tonic",
  "tonic-build",
 ]
@@ -2095,7 +2071,6 @@ version = "0.1.0"
 dependencies = [
  "regex",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2103,7 +2078,6 @@ name = "mcp-token"
 version = "0.1.0"
 dependencies = [
  "serde",
- "serde_json",
  "tiktoken-rs",
 ]
 
@@ -2215,19 +2189,6 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.15.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb12d4e967ec485a5f71c6311fe28158e9d6f4bc4a447b474184d0f91a8fa32"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "rawpointer",
-]
-
-[[package]]
-name = "ndarray"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
@@ -2247,16 +2208,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "chrono",
  "jsonwebtoken",
  "rand 0.8.5",
  "serde",
- "serde_json",
  "sha2",
  "sqlx",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -2279,7 +2237,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
- "tokio-stream",
  "tracing",
  "uuid",
 ]
@@ -2288,10 +2245,7 @@ dependencies = [
 name = "nexus-http"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "reqwest",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
 ]
@@ -2319,15 +2273,12 @@ dependencies = [
  "chrono",
  "criterion",
  "dashmap",
- "futures",
  "nexus-auth",
  "nexus-events",
  "nexus-http",
- "nexus-types",
  "ort",
  "parking_lot",
  "rand 0.8.5",
- "reqwest",
  "ruvector",
  "serde",
  "serde_json",
@@ -2345,11 +2296,9 @@ name = "nexus-sudo-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "regex",
  "sqlx",
  "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -2577,7 +2526,7 @@ version = "2.0.0-rc.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7de3af33d24a745ffb8fab904b13478438d1cd52868e6f17735ef6e1f8bf133"
 dependencies = [
- "ndarray 0.17.2",
+ "ndarray",
  "ort-sys",
  "smallvec",
  "tracing",
@@ -2829,16 +2778,13 @@ dependencies = [
  "dotenvy",
  "jsonwebtoken",
  "nexus-auth",
- "nexus-http",
  "nexus-mcp-client",
  "nexus-types",
  "reqwest",
  "serde",
  "serde_json",
  "sqlx",
- "thiserror 1.0.69",
  "tokio",
- "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -3470,7 +3416,6 @@ dependencies = [
  "chrono",
  "criterion",
  "dashmap",
- "ndarray 0.15.6",
  "ordered-float",
  "parking_lot",
  "proptest",

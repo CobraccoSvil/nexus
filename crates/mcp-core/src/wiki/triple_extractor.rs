@@ -54,7 +54,7 @@ const PREDICATE_WHITELIST: &[&str] = &[
 ];
 
 fn is_valid_predicate(p: &str) -> bool {
-    PREDICATE_WHITELIST.iter().any(|x| *x == p)
+    PREDICATE_WHITELIST.contains(&p)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -414,7 +414,7 @@ async fn resolve_target_doc(
 /// Inserisce una tripla. Se gia' esiste una riga con stessi (subj, predicate,
 /// object) e source='llm', aggiorna confidence/evidence solo se nuovo confidence
 /// > vecchio. Non esiste un UNIQUE constraint a DB (la PK e' uuid), quindi
-/// l'idempotenza e' implementata application-side con una SELECT preliminare.
+/// > l'idempotenza e' implementata application-side con una SELECT preliminare.
 async fn upsert_triple(
     db: &PgPool,
     subj_doc_id: Uuid,

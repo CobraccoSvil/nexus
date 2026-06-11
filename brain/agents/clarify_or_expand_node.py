@@ -870,14 +870,3 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
 
     # mode=="skip" o sconosciuto
     return {}
-
-
-def route_after_clarify(state: AgentState) -> str:
-    """Conditional edge: se clarify ha emesso una domanda, fermiamo il turno.
-
-    Restituisce "end" per terminare oppure "continue" per proseguire con il
-    routing standard (planner o executor).
-    """
-    if state.get("pending_clarify"):
-        return "end"
-    return "continue"

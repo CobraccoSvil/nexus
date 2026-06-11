@@ -66,8 +66,6 @@ impl NexusToolHandler for CargoBenchTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_bench_count_heuristic() {
         // Output libtest tipico per bench

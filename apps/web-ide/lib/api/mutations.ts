@@ -52,11 +52,6 @@ export interface RevertResult {
   message?: string;
 }
 
-export interface RevertConflict {
-  error: string;
-  conflict: { current_sha: string; expected_sha: string };
-}
-
 export async function revertMutation(
   projectId: string,
   mutationId: number,
@@ -64,20 +59,6 @@ export async function revertMutation(
 ): Promise<RevertResult> {
   return fetchJson(
     `${API_BASE}/api/projects/${projectId}/mutations/${mutationId}/revert`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ force }),
-    },
-  );
-}
-
-export async function revertLast(
-  projectId: string,
-  force = false,
-): Promise<RevertResult> {
-  return fetchJson(
-    `${API_BASE}/api/projects/${projectId}/mutations/revert-last`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },

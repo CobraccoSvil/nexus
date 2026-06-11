@@ -313,7 +313,7 @@ impl LearningWorker for GuidelineAlignmentWorker {
                 error!("guideline_alignment: lettura guideline attive fallita: {e}");
                 return WorkerOutcome::fail(
                     self.name(),
-                    &format!("guideline_set_hash fallita: {e}"),
+                    format!("guideline_set_hash fallita: {e}"),
                     start.elapsed().as_millis() as u64,
                 );
             }
@@ -326,7 +326,7 @@ impl LearningWorker for GuidelineAlignmentWorker {
                 error!("guideline_alignment: select_templates fallita: {e}");
                 return WorkerOutcome::fail(
                     self.name(),
-                    &format!("select_templates fallita: {e}"),
+                    format!("select_templates fallita: {e}"),
                     start.elapsed().as_millis() as u64,
                 );
             }

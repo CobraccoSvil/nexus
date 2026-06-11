@@ -124,7 +124,7 @@ pub(crate) fn normalize_attachments(input: &[ChatAttachmentRequest]) -> Vec<Chat
                 && attachment
                     .base64_content
                     .as_ref()
-                    .map_or(false, |b| !b.is_empty());
+                    .is_some_and(|b| !b.is_empty());
             if !has_text && !has_image {
                 return None;
             }

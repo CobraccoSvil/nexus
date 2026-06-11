@@ -68,13 +68,6 @@ export async function enablePromptTemplate(key: string): Promise<{ status: strin
   return fetchJson(`${API_BASE}/api/prompt-templates/${encodeURIComponent(key)}/enable`, { method: "POST" });
 }
 
-export interface AiSuggestResponse {
-  suggestion: string;
-  provider: string;
-  model: string;
-  suggested_tools?: PromptMcpTool[];  // STEP 8: tool suggeriti automaticamente
-}
-
 export async function aiSuggestPromptTemplate(key: string, instruction: string): Promise<{ suggestion: string; suggested_tools?: PromptMcpTool[] }> {
   return fetchJson(`${API_BASE}/api/prompt-templates/${encodeURIComponent(key)}/ai-suggest`, {
     method: "POST",
@@ -218,12 +211,6 @@ export async function listSharedDirectives(): Promise<{
   total: number;
 }> {
   return fetchJson(`${adminServiceUrl("/shared-directives")}`);
-}
-
-export async function getSharedDirective(key: string): Promise<SharedDirective> {
-  return fetchJson(
-    `${adminServiceUrl(`/shared-directives/${encodeURIComponent(key)}`)}`,
-  );
 }
 
 export async function createSharedDirective(data: {

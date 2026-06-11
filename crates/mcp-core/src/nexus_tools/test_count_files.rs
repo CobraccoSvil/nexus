@@ -20,11 +20,10 @@ fn walk(dir: &Path, depth: usize, in_tests_dir: bool, files: &mut Vec<String>) {
             if p.is_dir() {
                 let entering_tests = name == "tests";
                 walk(&p, depth + 1, in_tests_dir || entering_tests, files);
-            } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
-                if in_tests_dir || name.ends_with("_test.rs") || name.ends_with("_tests.rs") {
+            } else if p.extension().and_then(|e| e.to_str()) == Some("rs")
+                && (in_tests_dir || name.ends_with("_test.rs") || name.ends_with("_tests.rs")) {
                     files.push(name);
                 }
-            }
         }
     }
 }

@@ -124,7 +124,7 @@ pub async fn handle_doc_generate(
 
     // Se content_json manca o è vuoto, auto-genera il contenuto analizzando il progetto
     let content = match args.get("content_json") {
-        Some(v) if !v.is_null() && v.as_object().map_or(true, |o| !o.is_empty()) => v.clone(),
+        Some(v) if !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty()) => v.clone(),
         _ => {
             // Raccogli informazioni sul progetto per generare il contenuto automaticamente
             tracing::info!(
@@ -159,7 +159,7 @@ pub async fn handle_doc_generate(
                     if name.starts_with('.') {
                         continue;
                     }
-                    let is_dir = entry.file_type().await.map_or(false, |t| t.is_dir());
+                    let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
                     project_context.push_str(&format!(
                         "{}{}\n",
                         name,

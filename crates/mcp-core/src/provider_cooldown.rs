@@ -1,9 +1,9 @@
 //! Cooldown e circuit breaker per provider LLM.
 //!
 //! Estratto da `agent_loop.rs` durante la Fase 4 del refactor Nexus: i symbol
-//! `is_provider_in_cooldown`, `put_provider_in_cooldown`,
-//! `reset_provider_failures`, `all_providers_in_cooldown` sono usati anche
-//! fuori dal loop agente (es. `orchestrator.rs`).
+//! `is_provider_in_cooldown`, `put_provider_in_cooldown` e
+//! `reset_provider_failures` sono usati anche fuori dal loop agente
+//! (es. `orchestrator.rs`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,7 +99,7 @@ fn record_provider_failure(provider: &str) -> bool {
 }
 
 /// Reset del contatore fallimenti (chiamare su successo = stato CLOSED).
-#[allow(dead_code)]
+
 pub(crate) fn reset_provider_failures(provider: &str) {
     let store = PROVIDER_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
@@ -628,32 +628,6 @@ pub async fn restore_billing_cooldowns_from_db(db: &sqlx::PgPool) {
     }
 }
 
-/// Controlla se tutti i provider nell'ordine di fallback sono in cooldown.
-/// Restituisce `Some(secondi_rimanenti)` se tutti sono in cooldown, `None` se almeno uno è disponibile.
-#[allow(dead_code)]
-pub(crate) fn all_providers_in_cooldown(provider_order: &[String]) -> Option<u64> {
-    if provider_order.is_empty() {
-        return None;
-    }
-    let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
-    let map = match store.lock() {
-        Ok(m) => m,
-        Err(_) => return None,
-    };
-    let now = std::time::Instant::now();
-    let mut min_remaining: Option<u64> = None;
-    for p in provider_order {
-        match map.get(&p.to_lowercase()) {
-            Some(&until) if until > now => {
-                let secs = (until - now).as_secs().max(1);
-                min_remaining = Some(min_remaining.map_or(secs, |prev| prev.min(secs)));
-            }
-            _ => return None, // almeno un provider disponibile
-        }
-    }
-    min_remaining
-}
-
 // =====================================================================
 // TEST SCALABILITA' COOLDOWN PROVIDER
 // =====================================================================
@@ -741,51 +715,6 @@ mod tests {
             entry.unwrap().2.as_deref(),
             Some("billing_error from redis")
         );
-    }
-
-    #[test]
-    fn all_providers_in_cooldown_rileva_correttamente() {
-        // Scenario chiave per lo scaling: se TUTTI i provider sono down,
-        // il caller deve sapere per quanto attendere prima di ritentare.
-        let providers = vec![
-            "__test_all_cd_p1".to_string(),
-            "__test_all_cd_p2".to_string(),
-            "__test_all_cd_p3".to_string(),
-        ];
-        for p in &providers {
-            put_provider_in_short_cooldown(p, "rate limit", 120);
-        }
-        let remaining = all_providers_in_cooldown(&providers);
-        assert!(remaining.is_some());
-        let secs = remaining.unwrap();
-        assert!(
-            secs > 0 && secs <= 120,
-            "remaining {}s fuori range [1, 120]",
-            secs
-        );
-    }
-
-    #[test]
-    fn all_providers_in_cooldown_ritorna_none_se_almeno_uno_disponibile() {
-        // Caso frequente: scaling intra-provider deve poter procedere se almeno
-        // un provider della gerarchia e' fuori cooldown.
-        let providers = vec![
-            "__test_partial_cd_p1".to_string(),
-            "__test_partial_cd_p2_AVAILABLE".to_string(),
-        ];
-        put_provider_in_short_cooldown(&providers[0], "rate limit", 60);
-        // providers[1] NON viene messo in cooldown
-        let result = all_providers_in_cooldown(&providers);
-        assert_eq!(
-            result, None,
-            "se almeno un provider e' libero, all_providers_in_cooldown deve essere None"
-        );
-    }
-
-    #[test]
-    fn all_providers_in_cooldown_lista_vuota_ritorna_none() {
-        let result = all_providers_in_cooldown(&[]);
-        assert_eq!(result, None);
     }
 
     #[test]

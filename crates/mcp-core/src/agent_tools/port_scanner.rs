@@ -9,7 +9,6 @@
 //!
 //! Vedi ADR 0010 per il contesto della decisione.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -186,11 +185,6 @@ pub async fn is_enforcement_enabled(db: &PgPool) -> bool {
 pub async fn _reset_cache_for_tests() {
     let mut guard = ENFORCEMENT_CACHE.write().await;
     *guard = None;
-}
-
-#[allow(dead_code)]
-pub async fn is_enforcement_enabled_arc(db: &Arc<PgPool>) -> bool {
-    is_enforcement_enabled(db.as_ref()).await
 }
 
 fn should_skip_path(path: &str) -> bool {

@@ -11,7 +11,7 @@ use crate::AppState;
 
 // Tipi DTO: punto unico in nexus_types::admin_dto (regola L / ADR 0026, Wave C2).
 pub use nexus_types::admin_dto::{
-    AddProjectMemberRequest, AdminProjectSummary, ListAllProjectsResponse,
+    AddProjectMemberRequest, ListAllProjectsResponse,
     ListProjectMembersResponse, PortDetail, PortProjectsRequest, PortProjectsResponse,
     ProjectMemberResponse, UpdateProjectMemberRequest,
 };

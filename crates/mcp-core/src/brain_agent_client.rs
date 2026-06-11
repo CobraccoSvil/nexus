@@ -43,6 +43,7 @@ fn brain_rest_url() -> String {
 /// - Se count >= soglia: invia solo AGENT_TOOLS_JSON (che contiene già
 ///   `nexus_mcp_tool_search` + `nexus_mcp_tool_call`). Il brain usa la
 ///   ricerca semantica per scoprire i tool a runtime — discovery mode.
+///
 /// Fallback hardcoded dei tool essenziali per modelli o-series (o1/o3/o4-mini).
 /// Questi modelli non supportano `tool_choice` e con 40+ tool tendono a
 /// "narrare" invece di fare tool call. La soluzione e' passare solo i tool
@@ -286,7 +287,7 @@ pub async fn build_tools_json_for_agent(
     user_id: Uuid,
     project_id: Uuid,
     automation_mode: &crate::orchestrator::AutomationMode,
-    provider: &str,
+    _provider: &str,
     model: &str,
 ) -> Value {
     // Legge soglia dal DB
@@ -1209,9 +1210,9 @@ pub async fn run_via_brain(
     } else if ended && final_gate_passed {
         // Verifica E2E (final_gate) superata: successo verificato (mig 0386).
         AgentRunStatus::CompletedVerified
-    } else if ended {
-        AgentRunStatus::Completed
     } else {
+        // Sia il run terminato senza final_gate sia il fallback non-ended
+        // convergono su Completed (i rami erano identici; semantica invariata).
         AgentRunStatus::Completed
     };
 

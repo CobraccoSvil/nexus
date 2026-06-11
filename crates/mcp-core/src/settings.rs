@@ -4,13 +4,11 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use sqlx::PgPool;
 use std::path::PathBuf;
-use tokio;
 
 // Tipi DTO: punto unico in nexus_types::settings_dto (regola L / ADR 0026, S8).
 pub use nexus_types::settings_dto::{
-    BulkSettingEntry, BulkUpdateRequest, CreateDirectoryRequest, FsBrowseQuery, Setting,
+    BulkUpdateRequest, CreateDirectoryRequest, FsBrowseQuery, Setting,
     UpdateSettingRequest,
 };
 
@@ -287,7 +285,7 @@ pub async fn update_setting(
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             let client = nexus_http::build_client();
             let _ = client
-                .post(&format!("{}/reload-settings", neural_url))
+                .post(format!("{}/reload-settings", neural_url))
                 .json(&serde_json::json!({}))
                 .send()
                 .await;
@@ -298,7 +296,7 @@ pub async fn update_setting(
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             let client = nexus_http::build_client();
             let _ = client
-                .post(&format!("{}/reload-settings", neural_url))
+                .post(format!("{}/reload-settings", neural_url))
                 .json(&serde_json::json!({}))
                 .send()
                 .await;

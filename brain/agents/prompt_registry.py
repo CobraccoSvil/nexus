@@ -25,15 +25,12 @@ logger = logging.getLogger(__name__)
 _lock = threading.RLock()
 _prompts: dict[str, str] = {}
 _shared_directives: list[tuple[str, str, str]] = []  # (key, content, scope)
-_initialized: bool = False
 
 
 def initialize(prompts: dict[str, str]) -> None:
     """Popola il registry con il dizionario chiave -> contenuto."""
-    global _initialized
     with _lock:
         _prompts.update(prompts)
-        _initialized = True
     logger.info("prompt_registry: %d prompt caricati (totale %d)",
                 len(prompts), len(_prompts))
 
@@ -135,31 +132,3 @@ def get_prompt(key: str) -> str:
         logger.error("AGENT PROMPT MISSING: key='%s' non in registry", key)
         return ""
     return val + _directives_for_key(key)
-
-
-def get_prompt_raw(key: str) -> str:
-    """Recupera il prompt senza direttive condivise (per admin UI, export)."""
-    with _lock:
-        val = _prompts.get(key)
-    if val is None:
-        return ""
-    return val
-
-
-def get_shared_directives() -> list[tuple[str, str, str]]:
-    """Ritorna le direttive condivise caricate (key, content, scope)."""
-    with _lock:
-        return list(_shared_directives)
-
-
-def is_initialized() -> bool:
-    with _lock:
-        return _initialized
-
-
-def reset_for_tests() -> None:
-    global _initialized, _shared_directives
-    with _lock:
-        _prompts.clear()
-        _shared_directives = []
-        _initialized = False

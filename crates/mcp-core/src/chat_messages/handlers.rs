@@ -74,7 +74,7 @@ pub async fn list_chat_messages(
 
         let entry = attachments_by_msg
             .entry(msg_id.to_string())
-            .or_insert_with(Vec::new);
+            .or_default();
         entry.push(json!({
             "id": att_id.to_string(),
             "messageId": msg_id.to_string(),
@@ -549,7 +549,7 @@ pub async fn send_chat_message(
                     let msg_id_r = user_message_id;
                     let provider_r = prev_provider.clone();
                     let model_r = prev_model.clone();
-                    let automation_r = automation_mode.clone();
+                    let automation_r = automation_mode;
                     let supervisor_r = prev_supervisor;
                     let template_cache_r = state.template_cache.clone();
                     let routing_thresholds_for_resume =
@@ -766,7 +766,7 @@ pub async fn send_chat_message(
                 project_id: context.project_id,
                 user_message_id,
                 content: content.to_string(),
-                automation_mode: automation_mode.clone(),
+                automation_mode,
                 supervisor_mode,
                 profile_prompt_block,
                 system_context: system_context.clone(),
@@ -778,7 +778,6 @@ pub async fn send_chat_message(
                     normalize_attachments(&body.attachments),
                     &saved_attachments_list,
                 ),
-                user_role: claims.role.clone(),
                 nexus_agent_type_hint: body.agent_type_hint.clone(),
             },
         )
@@ -1151,7 +1150,7 @@ pub async fn resend_chat_message(
                 project_id,
                 user_message_id: resent_user_message_id,
                 content: source_prompt.clone(),
-                automation_mode: automation_mode.clone(),
+                automation_mode,
                 supervisor_mode: SupervisorMode::default(),
                 profile_prompt_block,
                 system_context: system_context_str,
@@ -1160,7 +1159,6 @@ pub async fn resend_chat_message(
                 profile_provider: None,
                 profile_model: None,
                 attachments: attachments.clone(),
-                user_role: claims.role.clone(),
                 nexus_agent_type_hint: None, // resend non usa hint
             },
         )
@@ -1208,7 +1206,7 @@ pub async fn resend_chat_message(
         None,
         provider_override,
         model_override,
-        automation_mode.clone(),
+        automation_mode,
         attachments,
     )
     .await;

@@ -32,7 +32,6 @@ use super::exec::run_cmd;
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::Path;
 
 pub struct DeployCheckTool;
 
@@ -180,7 +179,7 @@ impl NexusToolHandler for DeployCheckTool {
 
 /// Helper pure function per testing: presenza di deploy markers in una root data.
 #[cfg(test)]
-fn has_any_deploy_marker(root: &Path) -> bool {
+fn has_any_deploy_marker(root: &std::path::Path) -> bool {
     let deploy_signals = [
         "Dockerfile",
         "docker-compose.yml",

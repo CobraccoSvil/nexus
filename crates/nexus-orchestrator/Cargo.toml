@@ -14,14 +14,11 @@ sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-reqwest.workspace = true
-futures.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 
 # Local crates
 ruvector = { path = "../ruvector" }
-nexus-types = { path = "../nexus-types" }
 nexus-events = { path = "../nexus-events" }
 nexus-auth = { path = "../nexus-auth" }
 nexus-http.workspace = true
@@ -53,3 +50,6 @@ onnx = ["dep:ort", "dep:tokenizers"]
 [dev-dependencies]
 criterion = "0.5"
 tokio-test = "0.4"
+
+[lints]
+workspace = true

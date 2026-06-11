@@ -10,7 +10,7 @@ use crate::AppState;
 
 // Tipi DTO: punto unico in nexus_types::settings_dto (regola L / ADR 0026, S8).
 pub use nexus_types::settings_dto::{
-    BulkSettingEntry, BulkUpdateRequest, CreateDirectoryRequest, FsBrowseQuery, Setting,
+    BulkUpdateRequest, CreateDirectoryRequest, FsBrowseQuery, Setting,
     UpdateSettingRequest,
 };
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -29,11 +29,6 @@ class BaseProvider(abc.ABC):
     @abc.abstractmethod
     async def generate(self, model: str, prompt: str, **kwargs: Any) -> ProviderResult:
         ...
-
-    @abc.abstractmethod
-    async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
-        ...
-        yield  # type: ignore
 
     @abc.abstractmethod
     async def generate_agent_turn(

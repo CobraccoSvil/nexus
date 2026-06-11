@@ -1,34 +1,5 @@
 use super::*;
 
-pub async fn get_sandbox_config_api(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let project_id = Uuid::parse_str(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
-    load_project_context(&state.db, project_id, user_id).await?;
-    let cfg = crate::sandbox::load_project_sandbox_config(&state.db, project_id).await;
-    Ok(Json(serde_json::to_value(&cfg).unwrap_or_default()))
-}
-
-pub async fn set_sandbox_config_api(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath(id): AxumPath<String>,
-    Json(body): Json<crate::sandbox::ProjectSandboxConfig>,
-) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let project_id = Uuid::parse_str(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
-    load_project_context(&state.db, project_id, user_id).await?;
-    crate::sandbox::save_project_sandbox_config(&state.db, project_id, &body)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(json!({ "ok": true })))
-}
-
 pub async fn stop_agent_process(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,

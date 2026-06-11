@@ -230,8 +230,8 @@ fn check_missing_where(stmt: &Statement) -> Vec<DbFinding> {
                 });
             }
         }
-        Statement::Delete(del) => {
-            if del.selection.is_none() {
+        Statement::Delete(del)
+            if del.selection.is_none() => {
                 findings.push(DbFinding {
                     category: "safety".into(),
                     severity: "high".into(),
@@ -239,7 +239,6 @@ fn check_missing_where(stmt: &Statement) -> Vec<DbFinding> {
                     detail: "This will delete ALL rows in the table".into(),
                 });
             }
-        }
         _ => {}
     }
     findings

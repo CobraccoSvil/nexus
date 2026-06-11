@@ -30,7 +30,7 @@ const MARKER: &str = "# AUTO-GENERATO dal DB Nexus";
 /// canonico. I tool semantici/memoria degradano a Grep (non replicati su CLI).
 fn map_mcp_to_claude(whitelist: &[String]) -> Vec<&'static str> {
     let mut set: Vec<&'static str> = Vec::new();
-    let mut push = |t: &'static str, set: &mut Vec<&'static str>| {
+    let push = |t: &'static str, set: &mut Vec<&'static str>| {
         if !set.contains(&t) {
             set.push(t);
         }

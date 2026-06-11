@@ -6,7 +6,7 @@
 //! V1 supporta solo PostgreSQL; gli adapter non-Postgres sono stub documentati.
 
 use crate::project_db::{
-    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+    AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -24,9 +24,6 @@ pub mod sqlx_migrate;
 /// Trait comune implementato da ogni adapter.
 #[async_trait]
 pub trait MigrationAdapter: Send + Sync {
-    /// Elenca le migration in stato 'pending' (create ma non applicate).
-    async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError>;
-
     /// Crea un nuovo file migration con il contenuto SQL fornito.
     /// Restituisce il path assoluto del file creato.
     async fn create_migration(
@@ -49,15 +46,6 @@ pub trait MigrationAdapter: Send + Sync {
         ctx: &ProjectDbContext,
         connection_url: &str,
     ) -> Result<Option<RolledBackMigration>, ProjectDbError>;
-
-    /// Calcola SHA-256 del contenuto di una migration.
-    fn checksum(&self, content: &str) -> String {
-        use std::fmt::Write as _;
-        // SHA-256 semplice senza dipendenze extra: usiamo sha2 se disponibile,
-        // altrimenti una rappresentazione deterministca del contenuto.
-        // In Nexus sha2 è già dipendenza transitiva (via ring/rustls).
-        sha256_hex(content)
-    }
 }
 
 /// Calcola SHA-256 come stringa hex.
@@ -84,53 +72,6 @@ pub(crate) fn sha256_hex(input: &str) -> String {
         h.wrapping_add(h2),
         h.wrapping_mul(h2)
     )
-}
-
-/// Elenca le migration nella `migration_path` del progetto applicando il filtro
-/// dato (es. `*.sql`, `*.py` senza prefisso `__`). Helper condiviso fra adapter
-/// che leggono file-based migrations dal filesystem — punto unico (regola L /
-/// ADR 0026, step S10). Prima questo loop era duplicato in alembic.rs e
-/// sqlx_migrate.rs (cluster 40L).
-///
-/// - `file_filter`: predicato che riceve il nome file e decide se includerlo.
-/// - `include_sql`: se `true` il campo `Migration.sql` riceve il contenuto del
-///   file (sqlx-style); se `false` resta `None` (alembic-style, dove il vero
-///   SQL e' all'interno della Migration via Alembic API).
-pub(crate) fn list_pending_files(
-    ctx: &ProjectDbContext,
-    file_filter: impl Fn(&str) -> bool,
-    include_sql: bool,
-) -> Result<Vec<Migration>, ProjectDbError> {
-    let dir = ctx.project_root.join(&ctx.migration_path);
-    if !dir.exists() {
-        return Ok(vec![]);
-    }
-    let mut files: Vec<_> = std::fs::read_dir(&dir)?
-        .flatten()
-        .filter(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            file_filter(&name)
-        })
-        .collect();
-    files.sort_by_key(|e| e.file_name());
-
-    let mut result = Vec::new();
-    for entry in files {
-        let path = entry.path();
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let filename = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        result.push(Migration {
-            filename: filename.clone(),
-            checksum: sha256_hex(&content),
-            description: Some(filename.clone()),
-            sql: if include_sql { Some(content) } else { None },
-        });
-    }
-    Ok(result)
 }
 
 /// Sanitizza un nome migration mantenendo solo alfanumerici e underscore.

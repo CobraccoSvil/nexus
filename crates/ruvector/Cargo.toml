@@ -19,7 +19,6 @@ chrono.workspace = true
 # RuVector specific
 # hnsw_rs = "0.3"                   # HNSW algorithm (optional - we implement custom)
 ordered-float = "4.0"               # Deterministic float ordering
-ndarray = "0.15"                    # Matrix operations
 # rusqlite = { version = "0.30", features = ["bundled", "chrono", "uuid"] }  # SQLite (Phase 3)
 parking_lot = "0.12"                # Fast Mutex/RwLock
 dashmap.workspace = true            # Concurrent HashMap
@@ -33,3 +32,6 @@ rand = "0.8"                        # Random number generation
 criterion = "0.5"
 proptest = "1.0"
 tokio-test = "0.4"
+
+[lints]
+workspace = true

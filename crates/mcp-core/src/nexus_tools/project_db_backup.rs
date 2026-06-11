@@ -4,7 +4,6 @@
 //! Supporta formato plain o custom, schema-only opzionale.
 
 use super::db_helper;
-use super::exec;
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;
 use serde_json::{json, Value};

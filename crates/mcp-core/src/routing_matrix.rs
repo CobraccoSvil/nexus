@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::sync::RwLock;
@@ -77,8 +77,6 @@ pub struct RoutingMatrix {
     /// tier-runtime NON deve sovrascriverle. Campo PARALLELO a `by_intent_mode`
     /// (non cambia lookup): zero impatto sui call site esistenti.
     pub manual_overrides: HashSet<(String, String)>,
-    /// Quando e' stata caricata l'ultima volta (per debug/UI)
-    pub loaded_at: Instant,
 }
 
 impl RoutingMatrix {
@@ -122,22 +120,11 @@ impl RoutingMatrix {
         self.default_models.get(provider).cloned()
     }
 
-    /// Modello per uno specifico task interno (es. "chat_title_generator").
-    /// Vedi migrazione 0102.
-    pub fn purpose_model(&self, purpose: &str) -> Option<(String, String)> {
-        self.purpose_models.get(purpose).cloned()
-    }
-
     /// Regola tier-based per un purpose, se configurata (mig 0203).
     /// Se ritorna Some, il chiamante deve risolvere il modello dinamicamente
-    /// dal catalog (tier+capability) invece di usare `purpose_model`.
+    /// dal catalog (tier+capability); `purpose_models` resta come ultimo fallback.
     pub fn purpose_tier(&self, purpose: &str) -> Option<PurposeTierRule> {
         self.purpose_tiers.get(purpose).cloned()
-    }
-
-    /// Numero totale di entry attive in tutta la matrice.
-    pub fn total_entries(&self) -> usize {
-        self.by_intent_mode.len() + self.default_models.len() + self.purpose_models.len()
     }
 
     /// Matrice di test pre-popolata con un sottoinsieme rappresentativo:
@@ -266,7 +253,6 @@ impl RoutingMatrix {
             purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             manual_overrides: HashSet::new(),
-            loaded_at: Instant::now(),
         }
     }
 }
@@ -403,7 +389,6 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
         purpose_tiers,
         escalations,
         manual_overrides,
-        loaded_at: Instant::now(),
     })
 }
 
@@ -416,7 +401,6 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
 #[derive(Clone)]
 pub struct RoutingMatrixCache {
     inner: Arc<RwLock<Option<Arc<RoutingMatrix>>>>,
-    last_error: Arc<RwLock<Option<String>>>,
 }
 
 impl RoutingMatrixCache {
@@ -466,16 +450,13 @@ impl RoutingMatrixCache {
         }
 
         let inner = Arc::new(RwLock::new(initial));
-        let last_error = Arc::new(RwLock::new(last_err));
         let cache = Self {
             inner: inner.clone(),
-            last_error: last_error.clone(),
         };
 
         // Spawn refresh background. Errori NON sostituiscono la cache valida
         // precedente — manteniamo l'ultima matrice buona finche' DB non torna up.
         let inner_bg = inner;
-        let last_err_bg = last_error;
         let db_bg = db;
         tokio::spawn(async move {
             loop {
@@ -487,10 +468,6 @@ impl RoutingMatrixCache {
                             let mut w = inner_bg.write().await;
                             *w = Some(arc);
                         }
-                        {
-                            let mut e = last_err_bg.write().await;
-                            *e = None;
-                        }
                         debug!("routing_matrix: refresh OK");
                     }
                     Err(e) => {
@@ -498,8 +475,6 @@ impl RoutingMatrixCache {
                             "routing_matrix: refresh fallito ({}). Mantengo cache precedente.",
                             e
                         );
-                        let mut le = last_err_bg.write().await;
-                        *le = Some(e);
                     }
                 }
             }
@@ -535,11 +510,6 @@ impl RoutingMatrixCache {
             .map(Arc::clone)
             .ok_or_else(|| "routing_matrix non caricata (DB down all'avvio?)".to_string())
     }
-
-    /// Ultimo errore osservato dal refresh (per dashboard admin).
-    pub async fn last_error(&self) -> Option<String> {
-        self.last_error.read().await.clone()
-    }
 }
 
 #[cfg(test)]
@@ -571,7 +541,6 @@ mod tests {
             purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             manual_overrides: HashSet::new(),
-            loaded_at: Instant::now(),
         }
     }
 
@@ -703,26 +672,16 @@ mod tests {
     }
 
     #[test]
-    fn total_entries_somma_tutte_e_3_le_mappe() {
-        let mut m = make_test_matrix();
-        m.escalations.insert(
-            ("file_ops".to_string(), "bilanciata".to_string()),
-            EscalationRule {
-                threshold_tokens: 10000,
-                provider: "anthropic".to_string(),
-                model_id: "claude-opus-4-6".to_string(),
-            },
-        );
-        // 2 entry by_intent_mode + 2 default + 1 purpose = 5 (escalations escluse)
-        assert_eq!(m.total_entries(), 5);
-    }
-
-    #[test]
-    fn purpose_model_ritorna_tupla_provider_modello() {
+    fn purpose_models_contiene_tupla_provider_modello() {
+        // La risoluzione purpose in produzione passa dal punto unico tier-only
+        // (internal_routing::resolve_purpose_model); qui validiamo solo che il
+        // campo purpose_models (fallback statico) sia popolato correttamente.
         let m = make_test_matrix();
-        let pm = m.purpose_model("chat_title_generator");
-        assert_eq!(pm, Some(("openai".to_string(), "gpt-4.1-nano".to_string())));
-        assert_eq!(m.purpose_model("inesistente"), None);
+        assert_eq!(
+            m.purpose_models.get("chat_title_generator"),
+            Some(&("openai".to_string(), "gpt-4.1-nano".to_string()))
+        );
+        assert_eq!(m.purpose_models.get("inesistente"), None);
     }
 
     #[test]
@@ -763,11 +722,7 @@ mod tests {
             "fix_complesso",
         ];
         for intent in &intent_critici {
-            let mode = if intent.starts_with("chat") {
-                "bilanciata"
-            } else {
-                "bilanciata"
-            };
+            let mode = "bilanciata";
             assert!(
                 m.lookup(intent, mode).is_some(),
                 "intent critico '{}' senza routing in mode 'bilanciata' — fallback chain rotta",
@@ -780,7 +735,7 @@ mod tests {
     fn escalation_for_ritorna_none_quando_assente() {
         let m = make_test_matrix();
         let key = ("file_ops".to_string(), "approfondita".to_string());
-        assert!(m.escalations.get(&key).is_none());
+        assert!(!m.escalations.contains_key(&key));
     }
 
     #[test]

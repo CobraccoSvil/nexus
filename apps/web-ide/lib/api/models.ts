@@ -19,33 +19,11 @@ export interface ModelCatalogEntry {
   isEnabled: boolean;
 }
 
-export interface RoutingPreviewEntry {
-  intent: string;
-  provider: string;
-  model: string;
-  inputCost: number;
-  speed: string;
-}
-
-export interface RoutingPreviewResponse {
-  mode: string;
-  estimatedAvgCostInputPerMillion: number;
-  routing: RoutingPreviewEntry[];
-}
-
 export async function getModels(provider?: string): Promise<{ models: ModelCatalogEntry[] }> {
   const url = provider
     ? `${API_BASE}/api/models?provider=${encodeURIComponent(provider)}`
     : `${API_BASE}/api/models`;
   return fetchJson(url);
-}
-
-export async function getRoutingPreview(mode: string): Promise<RoutingPreviewResponse> {
-  return fetchJson(`${API_BASE}/api/models/routing-preview?mode=${encodeURIComponent(mode)}`);
-}
-
-export async function syncModelCatalog(): Promise<{ updated: number; added: number; skipped: number }> {
-  return fetchJson(`${API_BASE}/api/admin/sync-model-catalog`, { method: "POST" });
 }
 
 // ── Model Catalog (per dropdown billing) ───────────────────────────────────

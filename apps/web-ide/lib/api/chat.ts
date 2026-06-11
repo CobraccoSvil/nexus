@@ -1,18 +1,5 @@
 import { API_BASE, fetchJson } from "./_shared";
 
-export interface ChatResponse {
-  content: string;
-  provider: string;
-  model: string;
-  tokens_used: number;
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  total_tokens?: number;
-  total_cost?: number;
-  currency?: string;
-  quota_status?: string;
-}
-
 export interface ChatSessionSummary {
   id: string;
   projectId: string;
@@ -167,17 +154,6 @@ export interface PrecheckResult {
   reason: string | null;
 }
 
-export async function sendChat(
-  projectId: string,
-  profileId: string,
-  message: string,
-): Promise<ChatResponse> {
-  return fetchJson(`${API_BASE}/api/chat`, {
-    method: "POST",
-    body: JSON.stringify({ project_id: projectId, profile_id: profileId, message }),
-  });
-}
-
 export async function getChatSessions(projectId: string): Promise<{ sessions: ChatSessionSummary[] }> {
   const url = new URL(`${API_BASE}/api/chat/sessions`, typeof window !== "undefined" ? window.location.origin : "http://localhost");
   url.searchParams.set("projectId", projectId);
@@ -289,13 +265,6 @@ export async function indexAttachmentsToKb(
  *  raw di un allegato. Il backend valida l'accesso via project_id. */
 export function getAttachmentRawUrl(attachmentId: string): string {
   return `${API_BASE}/api/chat/attachments/${encodeURIComponent(attachmentId)}/raw`;
-}
-
-export async function precheckChatMessage(message: string, sessionId?: string): Promise<PrecheckResult> {
-  return fetchJson(`${API_BASE}/api/chat/precheck`, {
-    method: "POST",
-    body: JSON.stringify({ message, sessionId }),
-  });
 }
 
 export async function resendChatMessage(

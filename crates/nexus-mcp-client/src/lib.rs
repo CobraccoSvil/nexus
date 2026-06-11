@@ -158,8 +158,7 @@ async fn http_jsonrpc(
 
 fn compact_response_message(text: &str) -> String {
     let compact = text
-        .replace('\n', " ")
-        .replace('\r', " ")
+        .replace(['\n', '\r'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");

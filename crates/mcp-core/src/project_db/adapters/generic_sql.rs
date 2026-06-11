@@ -4,9 +4,9 @@
 //! cartella `migrations/` con file `.sql`. Nexus numera i file con il
 //! pattern `YYYYMMDD_HHMMSS_<nome>.sql` e li applica in ordine.
 
-use super::{migration_timestamp, sha256_hex, MigrationAdapter};
+use super::MigrationAdapter;
 use crate::project_db::{
-    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+    AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -15,36 +15,6 @@ pub struct GenericSqlAdapter;
 
 #[async_trait]
 impl MigrationAdapter for GenericSqlAdapter {
-    async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
-        let dir = ctx.project_root.join(&ctx.migration_path);
-        if !dir.exists() {
-            return Ok(vec![]);
-        }
-        let mut files: Vec<_> = std::fs::read_dir(&dir)?
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".sql"))
-            .collect();
-        files.sort_by_key(|e| e.file_name());
-
-        let mut result = Vec::new();
-        for entry in files {
-            let path = entry.path();
-            let content = std::fs::read_to_string(&path)?;
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            result.push(Migration {
-                filename: filename.clone(),
-                checksum: sha256_hex(&content),
-                description: Some(filename.trim_end_matches(".sql").to_string()),
-                sql: Some(content),
-            });
-        }
-        Ok(result)
-    }
-
     async fn create_migration(
         &self,
         ctx: &ProjectDbContext,

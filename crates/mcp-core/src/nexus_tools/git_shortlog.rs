@@ -55,7 +55,7 @@ impl NexusToolHandler for GitShortlogTool {
                 entries.push((c, name, email));
             }
         }
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.0));
         let total_authors = entries.len();
         let top: Vec<Value> = entries
             .into_iter()

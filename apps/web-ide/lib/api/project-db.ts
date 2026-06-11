@@ -183,18 +183,6 @@ export async function executeProjectDbQuery(
   });
 }
 
-export async function createProjectMigration(
-  projectId: string,
-  name: string,
-  sql: string,
-  description?: string
-): Promise<{ ok: boolean; filename?: string; checksum?: string }> {
-  return fetchJson(`${API_BASE}/api/projects/${projectId}/db/migrations`, {
-    method: "POST",
-    body: JSON.stringify({ name, sql, description }),
-  });
-}
-
 export async function applyProjectMigrations(
   projectId: string,
   filename?: string

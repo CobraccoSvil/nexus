@@ -138,7 +138,7 @@ impl LearningWorker for ClusteringWorker {
 
             let accum = groups
                 .entry(pattern.agent_type.clone())
-                .or_insert_with(ClusterAccum::default);
+                .or_default();
             accum.count += 1;
             if pattern.success {
                 accum.successes += 1;

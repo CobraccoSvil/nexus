@@ -206,7 +206,6 @@ pub(super) async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Valu
             .get(format!("{brain_http_url}/batch-analyze/{batch_id}/status"))
             .send()
             .await
-            .and_then(|r| Ok(r))
         {
             Ok(r) => r,
             Err(e) => return format!("[batch_analyze_code] Errore polling status: {e}"),

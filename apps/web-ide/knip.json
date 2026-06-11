@@ -1,0 +1,13 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "app/**/{page,layout,template,error,loading,not-found}.tsx",
+    "app/**/route.ts",
+    "middleware.ts",
+    "next.config.ts",
+    "playwright.config.ts",
+    "e2e/**/*.spec.ts",
+    "e2e/**/_setup.ts"
+  ],
+  "ignoreBinaries": ["ps", "tsc"]
+}

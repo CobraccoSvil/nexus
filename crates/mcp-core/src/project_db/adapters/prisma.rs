@@ -1,8 +1,8 @@
 //! Adapter Prisma (Node.js/TypeScript) — crea migration tramite `prisma migrate dev --create-only`.
 
-use super::{sha256_hex, MigrationAdapter};
+use super::MigrationAdapter;
 use crate::project_db::{
-    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+    AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -11,33 +11,6 @@ pub struct PrismaAdapter;
 
 #[async_trait]
 impl MigrationAdapter for PrismaAdapter {
-    async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
-        // Prisma migrations: directory con migration.sql dentro
-        let base = ctx.project_root.join(&ctx.migration_path);
-        if !base.exists() {
-            return Ok(vec![]);
-        }
-        let mut result = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            let mut dirs: Vec<_> = entries.flatten().filter(|e| e.path().is_dir()).collect();
-            dirs.sort_by_key(|e| e.file_name());
-            for dir in dirs {
-                let sql_path = dir.path().join("migration.sql");
-                if sql_path.exists() {
-                    let content = std::fs::read_to_string(&sql_path).unwrap_or_default();
-                    let dirname = dir.file_name().to_string_lossy().to_string();
-                    result.push(Migration {
-                        filename: format!("{}/migration.sql", dirname),
-                        checksum: sha256_hex(&content),
-                        description: Some(dirname),
-                        sql: Some(content),
-                    });
-                }
-            }
-        }
-        Ok(result)
-    }
-
     async fn create_migration(
         &self,
         ctx: &ProjectDbContext,
@@ -76,7 +49,7 @@ impl MigrationAdapter for PrismaAdapter {
         // Trova la directory migration appena creata
         let base = ctx.project_root.join(&ctx.migration_path);
         let mut dirs: Vec<_> = std::fs::read_dir(&base)
-            .map_err(|e| ProjectDbError::Io(e))?
+            .map_err(ProjectDbError::Io)?
             .flatten()
             .filter(|e| e.path().is_dir())
             .collect();

@@ -52,7 +52,6 @@ fn test_route_model_with_mode_no_hardcoded_last_resort() {
         purpose_tiers: HashMap::new(),
         escalations: HashMap::new(),
         manual_overrides: std::collections::HashSet::new(),
-        loaded_at: std::time::Instant::now(),
     };
     let thr = TokenThresholds::defaults();
     // No preferred_provider -> sentinella

@@ -6,7 +6,5 @@
 //! site interni a plugin-service non devono cambiare il path d'import.
 
 pub use nexus_mcp_client::{
-    call_tool, call_tool_http, call_tool_http_with_client, call_tool_stdio, list_tools,
-    list_tools_http, list_tools_http_with_client, list_tools_stdio, McpError, McpServerConfig,
-    McpTool, McpToolResult, McpTransport,
+    call_tool, list_tools, McpServerConfig, McpTransport,
 };

@@ -1,4 +1,3 @@
-use std::sync::Arc;
 
 use axum::{
     extract::{Extension, Path as AxumPath, State},
@@ -13,7 +12,6 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
-    agent_tools::AgentToolContext,
     agent_types::{AgentRunStatus, AgentStep, AgentStepEvent, AgentStepStatus, SupervisorMode},
     auth::Claims,
     chat_learning::{
@@ -116,5 +114,4 @@ pub(crate) use run::*;
 pub use handlers::{
     delete_chat_message, feedback_assist_handler, feedback_error, feedback_positive, legacy_chat,
     list_chat_messages, precheck_chat_message, resend_chat_message, send_chat_message,
-    FeedbackAssistRequest, PrecheckRequest,
 };

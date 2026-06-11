@@ -52,39 +52,13 @@ export async function createMcpServer(payload: CreateMcpServerPayload): Promise<
   });
 }
 
-export async function updateMcpServer(
-  serverId: string,
-  updates: Partial<CreateMcpServerPayload & { enabled: boolean }>,
-): Promise<McpServer> {
-  return fetchJson(`${API_BASE}/api/mcp-servers/${serverId}`, {
-    method: "PUT",
-    body: JSON.stringify(updates),
-  });
-}
-
 export async function deleteMcpServer(serverId: string): Promise<{ deleted: boolean }> {
   return fetchJson(`${API_BASE}/api/mcp-servers/${serverId}`, { method: "DELETE" });
 }
 
-export async function toggleMcpServer(
-  serverId: string,
-  enabled: boolean,
-): Promise<{ id: string; enabled: boolean }> {
-  return fetchJson(`${API_BASE}/api/mcp-servers/${serverId}/toggle`, {
-    method: "PUT",
-    body: JSON.stringify({ enabled }),
-  });
-}
-
-export async function testMcpServer(
-  serverId: string,
-): Promise<{ success: boolean; toolCount: number; tools: McpServerTool[]; error?: string }> {
-  return fetchJson(`${API_BASE}/api/mcp-servers/${serverId}/test`, { method: "POST" });
-}
-
 // --- Plugin Manager ---
 
-export interface PluginRelease {
+interface PluginRelease {
   id?: string;
   version: string;
   changelog?: string;
@@ -145,23 +119,6 @@ export interface PluginInstance {
   createdAt?: string;
   updatedAt?: string;
   canManage?: boolean;
-}
-
-export interface PluginHealthRun {
-  id?: string;
-  success: boolean;
-  toolCount: number;
-  errorMessage?: string;
-  details?: Record<string, unknown>;
-  createdAt?: string;
-}
-
-export interface PluginHealth {
-  pluginInstanceId: string;
-  status: "unknown" | "ok" | "error";
-  lastMessage?: string;
-  lastTestedAt?: string;
-  runs: PluginHealthRun[];
 }
 
 export interface FigmaOAuthStatus {
@@ -260,10 +217,6 @@ export async function testPlugin(
   return fetchJson(`${API_BASE}/api/plugins/${pluginInstanceId}/test`, {
     method: "POST",
   });
-}
-
-export async function getPluginHealth(pluginInstanceId: string): Promise<PluginHealth> {
-  return fetchJson(`${API_BASE}/api/plugins/${pluginInstanceId}/health`);
 }
 
 export async function updatePluginToolPolicy(

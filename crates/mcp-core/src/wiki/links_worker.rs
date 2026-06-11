@@ -178,24 +178,21 @@ pub struct RecomputeReport {
 // Helpers DB
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Riga minimale per il worker: id, scope, project_id, title, body_md,
-/// qdrant_point_id, public_read. Tutto cio' che serve per risolvere wikilink
+/// Riga minimale per il worker: id, scope, project_id, body_md,
+/// qdrant_point_id. Tutto cio' che serve per risolvere wikilink
 /// e fare semantic search.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DocRow {
     id: Uuid,
     scope: String,
     project_id: Option<Uuid>,
-    title: String,
     body_md: String,
     qdrant_point_id: Option<String>,
-    #[allow(dead_code)]
-    public_read: bool,
 }
 
 async fn fetch_doc(db: &PgPool, doc_id: Uuid) -> Result<Option<DocRow>> {
     let row = sqlx::query_as::<_, DocRow>(
-        "SELECT id, scope, project_id, title, body_md, qdrant_point_id, public_read \
+        "SELECT id, scope, project_id, body_md, qdrant_point_id \
          FROM wiki_docs WHERE id = $1",
     )
     .bind(doc_id)
@@ -212,14 +209,14 @@ async fn fetch_docs_for_scope(
 ) -> Result<Vec<DocRow>> {
     let rows = match (scope, project_id) {
         (None, _) => sqlx::query_as::<_, DocRow>(
-            "SELECT id, scope, project_id, title, body_md, qdrant_point_id, public_read \
+            "SELECT id, scope, project_id, body_md, qdrant_point_id \
              FROM wiki_docs ORDER BY updated_at DESC",
         )
         .fetch_all(db)
         .await
         .context("SELECT wiki_docs (all)")?,
         (Some(s), None) => sqlx::query_as::<_, DocRow>(
-            "SELECT id, scope, project_id, title, body_md, qdrant_point_id, public_read \
+            "SELECT id, scope, project_id, body_md, qdrant_point_id \
              FROM wiki_docs WHERE scope = $1 ORDER BY updated_at DESC",
         )
         .bind(s.as_str())
@@ -227,7 +224,7 @@ async fn fetch_docs_for_scope(
         .await
         .context("SELECT wiki_docs (scope)")?,
         (Some(s), Some(pid)) => sqlx::query_as::<_, DocRow>(
-            "SELECT id, scope, project_id, title, body_md, qdrant_point_id, public_read \
+            "SELECT id, scope, project_id, body_md, qdrant_point_id \
              FROM wiki_docs WHERE scope = $1 AND project_id = $2 ORDER BY updated_at DESC",
         )
         .bind(s.as_str())

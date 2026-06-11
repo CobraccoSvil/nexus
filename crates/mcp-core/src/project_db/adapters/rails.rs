@@ -2,7 +2,7 @@
 
 use super::MigrationAdapter;
 use crate::project_db::{
-    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+    AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -11,10 +11,6 @@ pub struct RailsAdapter;
 
 #[async_trait]
 impl MigrationAdapter for RailsAdapter {
-    async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
-        super::list_pending_files(ctx, |n| n.ends_with(".rb"), false)
-    }
-
     async fn create_migration(
         &self,
         ctx: &ProjectDbContext,

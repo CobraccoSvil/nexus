@@ -27,7 +27,7 @@ impl NexusToolHandler for DocHeadingDepthTool {
         for line in content.lines() {
             let trimmed = line.trim_start();
             let depth = trimmed.chars().take_while(|c| *c == '#').count();
-            if depth >= 1 && depth <= 6 && trimmed.chars().nth(depth) == Some(' ') {
+            if (1..=6).contains(&depth) && trimmed.chars().nth(depth) == Some(' ') {
                 counts[depth] += 1;
                 if depth > max {
                     max = depth;

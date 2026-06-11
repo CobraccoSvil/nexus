@@ -93,23 +93,6 @@ def build_reminder_text(run_id: str) -> str | None:
     )
 
 
-def should_inject(state: dict[str, Any]) -> bool:
-    """True se al prossimo turno deve essere appeso il reminder.
-
-    Logica: ogni N step (configurabile), basato sul contatore
-    `since_last_todo_reminder` in state. Il contatore viene incrementato
-    in tool_dispatch_node ad ogni round.
-    """
-    cfg = orchestrator_config.get()
-    if not cfg["plan_phase_enabled"]:
-        return False
-    if not state.get("plan_phase_active"):
-        return False
-    counter = int(state.get("since_last_todo_reminder", 0) or 0)
-    every_n = max(1, int(cfg["todo_reminder_every_n_steps"]))
-    return counter >= every_n
-
-
 def append_reminder_block(anthropic_content_blocks: list, reminder_text: str) -> None:
     """Modifica in place la lista di blocchi anthropic_content aggiungendo
     un blocco text con il system-reminder.

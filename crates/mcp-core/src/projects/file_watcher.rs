@@ -241,7 +241,7 @@ fn is_notify_file(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|s| s.to_lowercase());
     if let Some(ext) = ext {
-        if NOTIFY_EXTENSIONS.iter().any(|e| *e == ext.as_str()) {
+        if NOTIFY_EXTENSIONS.contains(&ext.as_str()) {
             return true;
         }
     }

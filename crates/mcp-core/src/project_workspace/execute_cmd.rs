@@ -59,7 +59,7 @@ pub async fn execute_command(
         })));
     }
 
-    let timeout_secs = body.timeout_secs.unwrap_or(60).min(120).max(5);
+    let timeout_secs = body.timeout_secs.unwrap_or(60).clamp(5, 120);
     let timeout = Duration::from_secs(timeout_secs);
     let start = std::time::Instant::now();
 

@@ -90,7 +90,6 @@ from .helpers import (
     _stream_thinking_live,
     _emit_thinking,
     _describe_tool_call,
-    _ACTION_PATTERNS,
     turn_action_oriented,
     _INTENT_NARRATION_PATTERNS,
     _detect_unfulfilled_intent,
@@ -105,12 +104,8 @@ from .helpers import (
     _load_repeated_action_threshold,
     _load_repeated_action_force_diagnose_enabled,
     _detect_recent_tool_error,
-    _PRICE_CACHE,
-    _PRICE_CACHE_TS,
-    _PRICE_TTL_S,
     MAX_TOOL_RESULT_CHARS,
     MAX_CONTEXT_CHARS,
-    _smart_truncate,
     _estimate_context_chars,
     _estimate_context_tokens,
     _dedup_tool_results,
@@ -147,7 +142,6 @@ from .routing import (
     route_after_executor,
     route_after_regression_gate,
     route_after_verifier,
-    route_by_task_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,7 +153,7 @@ def _smart_truncate_lossless(
     source_kind: str = "tool_result",
     metadata: dict[str, Any] | None = None,
 ) -> str:
-    """Variante LOSSLESS di _smart_truncate: prima di tagliare offloada in RAG.
+    """Troncamento LOSSLESS (testa+coda): prima di tagliare offloada in RAG.
 
     Se il testo supera `max_chars`, il contenuto COMPLETO viene indicizzato in
     Qdrant (collection tool_results_chunks) via context_offload, poi nel prompt

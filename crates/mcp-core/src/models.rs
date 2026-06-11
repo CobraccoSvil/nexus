@@ -755,15 +755,6 @@ pub async fn sync_model_catalog(State(state): State<AppState>) -> Json<Value> {
     }
 }
 
-/// POST /api/admin/auto-upgrade-models
-/// Trigger manuale per la promotion auto (utile per testare senza aspettare cron).
-pub async fn auto_upgrade_models_endpoint(State(state): State<AppState>) -> Json<Value> {
-    match auto_upgrade_models_and_routing(&state.db).await {
-        Ok(()) => Json(json!({ "ok": true })),
-        Err(e) => Json(json!({ "ok": false, "error": e })),
-    }
-}
-
 /// POST /api/admin/probe-models
 /// Esegue un round one-shot del model_health_probe: pinga ogni modello
 /// enabled, applica counter / auto-disable. Usa la soglia configurata in

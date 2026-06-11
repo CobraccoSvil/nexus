@@ -271,8 +271,8 @@ fn extract_tar_entry(bytes: &[u8], entry_path: &str, gz: bool) -> Result<(Vec<u8
 fn encode_payload(entry_path: &str, payload: Vec<u8>, total_size: u64, encoding: &str) -> String {
     let is_text_like = encoding == "text"
         || (encoding == "auto"
-            && super::attachment_inspector::detect_kind(&payload, entry_path, "").0 == "text"
-            || (encoding == "auto" && is_likely_text(&payload)));
+            && (super::attachment_inspector::detect_kind(&payload, entry_path, "").0 == "text"
+                || is_likely_text(&payload)));
     let read_bytes = payload.len();
     let (content, encoding_label) = if is_text_like {
         match String::from_utf8(payload.clone()) {

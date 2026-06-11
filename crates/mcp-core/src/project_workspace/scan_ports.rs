@@ -1,7 +1,5 @@
 //! Fix M1: parser auto-popola `nexus_port_allocations` dai metadata del progetto.
 //!
-//! POST /api/projects/:id/services/scan-ports
-//!
 //! Scansiona:
 //! - package.json scripts.dev / scripts.start per `--port N` pattern
 //! - vite.config.ts per `server.port = N`
@@ -17,6 +15,18 @@
 
 use super::*;
 use regex::Regex;
+
+/// Regex `server.port = N` dei vite.config.{ts,js,mjs} (compilata una volta sola,
+/// fuori dal loop sulle estensioni).
+// safety: pattern literal valido
+static VITE_PORT_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"port\s*[:=]\s*(\d+)").unwrap());
+
+/// Regex `ports: - "N:M"` dei docker-compose (compilata una volta sola,
+/// fuori dal loop sui nomi file compose).
+// safety: pattern literal valido
+static COMPOSE_PORT_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r#"-\s+"?(\d{4,5}):\d{2,5}"?"#).unwrap());
 
 /// I 3 path package.json scansionati (root + frontend/ + backend/) con la
 /// label canonica associata. Punto unico (regola L, S71) per il pattern
@@ -60,8 +70,7 @@ fn scan_content(content: &str, patterns: &[(Regex, &str)]) -> Vec<(i32, String)>
 }
 
 /// Fix M31: scansiona il filesystem del progetto e ritorna le porte rilevate.
-/// Helper sync senza dipendenze HTTP, riusabile da auto_populate_port_allocations
-/// e dall'handler scan_ports REST.
+/// Helper sync senza dipendenze HTTP, usato da auto_populate_port_allocations.
 /// Ritorna: Vec<(port, label, source)>
 pub fn compute_detected_ports(root: &std::path::Path) -> Vec<(i32, String, String)> {
     let mut detected: Vec<(i32, String, String)> = Vec::new();
@@ -90,8 +99,7 @@ pub fn compute_detected_ports(root: &std::path::Path) -> Vec<(i32, String, Strin
         if !p.is_file() {
             continue;
         }
-        let patterns: Vec<(Regex, &str)> =
-            vec![(Regex::new(r"port\s*[:=]\s*(\d+)").unwrap(), "frontend")];
+        let patterns: Vec<(Regex, &str)> = vec![(VITE_PORT_RE.clone(), "frontend")];
         for (port, lbl) in scan_file(&p, &patterns) {
             detected.push((port, lbl, "vite.config".to_string()));
         }
@@ -120,10 +128,7 @@ pub fn compute_detected_ports(root: &std::path::Path) -> Vec<(i32, String, Strin
         if !p.is_file() {
             continue;
         }
-        let patterns: Vec<(Regex, &str)> = vec![(
-            Regex::new(r#"-\s+"?(\d{4,5}):\d{2,5}"?"#).unwrap(),
-            "compose",
-        )];
+        let patterns: Vec<(Regex, &str)> = vec![(COMPOSE_PORT_RE.clone(), "compose")];
         for (port, lbl) in scan_file(&p, &patterns) {
             detected.push((port, lbl, format!("compose:{}", name)));
         }
@@ -177,122 +182,4 @@ pub async fn auto_populate_port_allocations(
         inserted,
         project_id
     );
-}
-
-pub async fn scan_ports(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let project_id = Uuid::parse_str(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
-    let context = load_project_context(&state.db, project_id, user_id).await?;
-    let root = &context.root_path;
-
-    let mut detected: Vec<(i32, String, String)> = Vec::new(); // (port, label, source)
-
-    // Helper per scansionare un file con regex
-    async fn scan_file(path: &std::path::Path, patterns: &[(Regex, &str)]) -> Vec<(i32, String)> {
-        match tokio::fs::read_to_string(path).await {
-            Ok(s) => scan_content(&s, patterns),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    // 1) package.json (root + frontend/ + backend/): punto unico S71.
-    for (pkg, label_base) in package_json_path_labels(root) {
-        if !pkg.is_file() {
-            continue;
-        }
-        let patterns = package_json_regex_patterns(label_base);
-        let found = scan_file(&pkg, &patterns).await;
-        for (p, lbl) in found {
-            detected.push((p, lbl, format!("package.json:{}", label_base)));
-        }
-    }
-
-    // 2) vite.config.ts/js/mjs (frontend)
-    for ext in &["ts", "js", "mjs"] {
-        let p = root.join("frontend").join(format!("vite.config.{}", ext));
-        if !p.is_file() {
-            continue;
-        }
-        let patterns = vec![(Regex::new(r"port\s*[:=]\s*(\d+)").unwrap(), "frontend")];
-        let found = scan_file(&p, &patterns).await;
-        for (port, lbl) in found {
-            detected.push((port, lbl, "vite.config".to_string()));
-        }
-    }
-
-    // 3) Procfile
-    let procfile = root.join("Procfile");
-    if procfile.is_file() {
-        let patterns = vec![
-            (Regex::new(r"-p\s+(\d+)").unwrap(), "app"),
-            (Regex::new(r"--port[= ](\d+)").unwrap(), "app"),
-        ];
-        let found = scan_file(&procfile, &patterns).await;
-        for (port, lbl) in found {
-            detected.push((port, lbl, "Procfile".to_string()));
-        }
-    }
-
-    // 4) docker-compose.yml
-    for name in &[
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "compose.yml",
-        "compose.yaml",
-    ] {
-        let p = root.join(name);
-        if !p.is_file() {
-            continue;
-        }
-        let patterns = vec![(
-            Regex::new(r#"-\s+"?(\d{4,5}):\d{2,5}"?"#).unwrap(),
-            "compose",
-        )];
-        let found = scan_file(&p, &patterns).await;
-        for (port, lbl) in found {
-            detected.push((port, lbl, format!("compose:{}", name)));
-        }
-        break;
-    }
-
-    // Deduplica per (port, label) e UPSERT
-    let mut seen = std::collections::HashSet::new();
-    let mut inserted = Vec::new();
-    for (port, label, source) in &detected {
-        let key = (*port, label.clone());
-        if !seen.insert(key) {
-            continue;
-        }
-        let result = sqlx::query(
-            r#"
-            INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode)
-            VALUES ($1, $2, $3, 'auto-detected')
-            ON CONFLICT DO NOTHING
-            RETURNING id
-            "#,
-        )
-        .bind(project_id)
-        .bind(port)
-        .bind(label)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
-        if result.is_some() {
-            inserted.push(json!({"port": port, "label": label, "source": source}));
-        }
-    }
-
-    Ok(Json(json!({
-        "ok": true,
-        "detected_count": detected.len(),
-        "inserted_count": inserted.len(),
-        "inserted": inserted,
-        "raw_detections": detected.iter().map(|(p, l, s)| json!({"port": p, "label": l, "source": s})).collect::<Vec<_>>(),
-    })))
 }

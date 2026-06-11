@@ -28,8 +28,20 @@ const POLICY_CACHE_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 pub struct ResourcePolicy {
     pub enabled: bool,
+    #[expect(
+        dead_code,
+        reason = "mirror del catalogo DB nexus_resource_policies (mig 0397): dovra' sostituire gli hardcode \"error\" in resource_linter/port_enforcer, gap da chiudere senza amputare il contratto"
+    )]
     pub severity: String,
+    #[expect(
+        dead_code,
+        reason = "mirror del catalogo DB nexus_resource_policies (mig 0397): concetto vivo, oggi letto via SQL diretto in resource_violation_remediation"
+    )]
     pub auto_remediate: bool,
+    #[expect(
+        dead_code,
+        reason = "mirror del catalogo DB nexus_resource_policies (mig 0397): configurazione dei sub-scanner per il lavoro residuo fs/db/container"
+    )]
     pub params: serde_json::Value,
 }
 
@@ -286,7 +298,7 @@ pub async fn open_resource_violation(
 ///     tabelle `nexus_*` / `_sqlx_migrations` (infrastruttura, fuori scope
 ///     progetto — il blocco del DB Nexus a livello connessione e' ortogonale);
 ///   - `DROP DATABASE` / `DROP SCHEMA` (oltre il singolo oggetto applicativo).
-/// DROP/TRUNCATE di una singola tabella applicativa restano permessi (sviluppo).
+///     DROP/TRUNCATE di una singola tabella applicativa restano permessi (sviluppo).
 pub fn check_dangerous_sql(sql: &str) -> Option<String> {
     // Normalizza: minuscolo, spazi collassati, niente commenti di riga.
     let lower = sql.to_lowercase();

@@ -162,7 +162,7 @@ pub async fn revert_last(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<RevertBody>,
 ) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
+    let _user_id = parse_user_id(&claims)?;
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
 
@@ -201,5 +201,5 @@ pub async fn revert_last(
 }
 
 // I tipi axum::Json e State sono sopra; necessari per il binding handler.
-#[allow(dead_code)]
+
 fn _ensure_imports(_v: Value) {}

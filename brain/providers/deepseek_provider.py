@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, AsyncIterator
+from typing import Any
 
 # Modelli DeepSeek "reasoning" che non accettano temperature, top_p
 # e non supportano tool calling.
@@ -325,29 +325,6 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
             )
         except Exception as e:
             return build_agent_turn_error(e, self.name, model)
-
-    async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
-        if not self._api_key:
-            yield "[DeepSeek API key not configured]"
-            return
-        try:
-            client = self._get_client()
-            stream_kwargs: dict[str, Any] = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": kwargs.get("max_tokens", 4096),
-                "stream": True,
-            }
-            if not _is_deepseek_reasoning(model):
-                stream_kwargs["temperature"] = kwargs.get("temperature", 0.7)
-            stream = await client.chat.completions.create(**stream_kwargs)
-            async for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    yield delta.content
-        except Exception as e:
-            logger.error("DeepSeek stream failed: %s", e)
-            yield f"[Error: {e}]"
 
     async def test_connection(self) -> dict[str, Any]:
         if not self._api_key:

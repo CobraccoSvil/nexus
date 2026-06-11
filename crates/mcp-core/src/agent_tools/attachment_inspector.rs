@@ -25,12 +25,6 @@ use super::AgentToolContext;
 /// - Figma binari (header proprietario nei primi KB)
 const HEADER_READ_BYTES: usize = 32 * 1024;
 
-/// Estensioni considerate "sospette" per scatenare l'inspector anche senza
-/// MIME octet-stream. Mantieni l'elenco corto: l'utente del tool deve essere
-/// l'agente quando ha gia' un sospetto, non un'attivazione automatica.
-#[allow(dead_code)]
-const SUSPICIOUS_EXTENSIONS: &[&str] = &[".make", ".dat", ".bin", ".pkg", ".fig", ".aux"];
-
 /// Lookup di un allegato accessibile dal contesto agente corrente.
 ///
 /// Filtra per `project_id` per impedire cross-project leak.

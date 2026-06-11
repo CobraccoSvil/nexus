@@ -249,7 +249,7 @@ pub fn synthesize_bundle(project: &str, patterns: Vec<ExtractedPattern>) -> Know
         }
     }
     let mut top_files: Vec<_> = file_counts.into_iter().collect();
-    top_files.sort_by(|a, b| b.1.cmp(&a.1));
+    top_files.sort_by_key(|f| std::cmp::Reverse(f.1));
     let top_files: Vec<String> = top_files
         .into_iter()
         .take(10)

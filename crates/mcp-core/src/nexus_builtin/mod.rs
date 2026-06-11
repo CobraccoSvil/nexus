@@ -32,7 +32,7 @@ pub use catalog::{nexus_builtin_server_id, NEXUS_BUILTIN_SERVER_ID_STR};
 // Import privati usati dai sotto-moduli tramite `use super::*`
 use catalog::NEXUS_TOOLS;
 use docs::{
-    bump_version, get_project_slug, handle_doc_list, handle_doc_search, handle_doc_status,
+    get_project_slug, handle_doc_list, handle_doc_search, handle_doc_status,
     handle_doc_update,
 };
 use mutations::{

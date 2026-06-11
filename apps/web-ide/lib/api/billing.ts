@@ -30,13 +30,13 @@ export interface BillingQuota {
   updated_at: string;
 }
 
-export interface BillingUsageSummary {
+interface BillingUsageSummary {
   total_tokens: number;
   total_cost: number;
   total_runs: number;
 }
 
-export interface BillingUsageBreakdownItem {
+interface BillingUsageBreakdownItem {
   provider: string;
   model: string;
   total_tokens: number;

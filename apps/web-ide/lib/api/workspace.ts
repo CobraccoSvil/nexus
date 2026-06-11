@@ -7,19 +7,6 @@ export interface WorkspaceTreeNode {
   hasChildren: boolean;
 }
 
-export interface BrowseDirectoryNode {
-  name: string;
-  path: string;
-  hasChildren: boolean;
-}
-
-export interface BrowseDirectoriesResponse {
-  roots: string[];
-  currentPath: string;
-  parentPath?: string;
-  directories: BrowseDirectoryNode[];
-}
-
 export interface ProjectFileBuffer {
   path: string;
   content: string;
@@ -104,45 +91,6 @@ export interface OutputEvent {
   title: string;
   text: string;
   createdAt: string;
-}
-
-export async function browseServerDirectories(path?: string): Promise<BrowseDirectoriesResponse> {
-  const buildUrl = (base: string) => {
-    const url = new URL(`${base}/api/fs/directories`);
-    if (path?.trim()) {
-      url.searchParams.set("path", path.trim());
-    }
-    return url.toString();
-  };
-
-  try {
-    return await fetchJson(buildUrl(API_BASE));
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.includes("API error 404") &&
-      typeof window !== "undefined"
-    ) {
-      const fallbackBase = `${window.location.protocol}//${window.location.hostname}:4000`;
-      if (fallbackBase !== API_BASE) {
-        return fetchJson(buildUrl(fallbackBase));
-      }
-    }
-    throw error;
-  }
-}
-
-export async function createServerDirectory(
-  parentPath: string,
-  name: string,
-): Promise<{ ok: boolean; path: string }> {
-  return fetchJson(`${API_BASE}/api/fs/directories/create`, {
-    method: "POST",
-    body: JSON.stringify({
-      parent_path: parentPath,
-      name,
-    }),
-  });
 }
 
 export async function getWorkbenchState(

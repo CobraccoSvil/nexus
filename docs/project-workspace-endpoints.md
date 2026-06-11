@@ -44,42 +44,6 @@ Risposta: `{ok, stack_detected, steps[]}`.
 
 Codice: [crates/mcp-core/src/project_workspace/auto_bootstrap.rs](../crates/mcp-core/src/project_workspace/auto_bootstrap.rs).
 
-## GET /api/projects/:id/runtime-issues
-
-Lista issue runtime tracciate dagli hook tool agente.
-
-Query: `?status=open|resolved|all` (default `open`).
-
-Risposta: `{issues: [{id, source, severity, message, fingerprint, status, ...}]}`.
-
-## POST /api/projects/:id/runtime-issues
-
-INSERT di una runtime issue. Dedup via `fingerprint = sha256(message+command)[:16]` con `ON CONFLICT (project_id, fingerprint)`.
-
-Body: `{source, severity, message, details?, run_id?, step_id?, tool_name?, command?, exit_code?}`.
-
-Risposta: `{ok, id, created: bool}`.
-
-## PATCH /api/projects/:id/runtime-issues/:iid
-
-Aggiorna lo `status` di una issue (`open`/`resolved`/`ignored`).
-
-Body: `{status: string}`.
-
-Codice: [crates/mcp-core/src/project_workspace/runtime_issues.rs](../crates/mcp-core/src/project_workspace/runtime_issues.rs).
-
-Tabella: [db/migrations/0138_project_runtime_issues.sql](../db/migrations/0138_project_runtime_issues.sql).
-
-## GET /api/projects/:id/fs-events
-
-Snapshot polling-based per refresh tree EXPLORER. Scansione BFS depth 4, esclude `node_modules`, `.git`, `target`, `.next`, `dist`, `build`.
-
-Query: `?since_fingerprint=N` (per detect cambiamenti senza polling pesante).
-
-Risposta: `{fingerprint, file_count, last_modified_iso, changed: bool}`.
-
-Codice: [crates/mcp-core/src/project_workspace/fs_events.rs](../crates/mcp-core/src/project_workspace/fs_events.rs).
-
 ## POST /api/projects/:id/github/create-repo
 
 Crea un nuovo repository GitHub per l'utente connesso e configura `origin` remote sul progetto.

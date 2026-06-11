@@ -1,35 +1,18 @@
 """Tipi canonici del layer provider (ricostruzione M0/M3 del piano).
 
-Contiene le dataclass condivise tra capability_loader, tool_translator,
-tool_validator e gli adapter provider:
+Contiene le dataclass condivise tra capability_loader, tool_validator e gli
+adapter provider (tool_translator e' stato rimosso: layer dialetti mai
+cablato, bonifica dead code 2026-06-11):
 
 - ProviderCapability: specchio runtime della tabella nexus_provider_capabilities
   (mig 0240). Fonte unica dei parametri per-modello. Nessun default di business
   qui: i valori arrivano sempre dal DB (regola G).
 - CanonicalTool: definizione tool neutra rispetto al provider.
-- CanonicalToolUseBlock: tool-call normalizzato (id, name, input) indipendente
-  dal dialetto del provider.
-- StopReason: enum canonico (stile Anthropic) verso cui i provider normalizzano.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
-
-
-class StopReason(str, Enum):
-    """Motivo di terminazione del turno, normalizzato (stile Anthropic).
-
-    I provider mappano il proprio finish/stop su questi valori in fase di
-    normalize(). `UNKNOWN` quando il provider non fornisce un segnale chiaro.
-    """
-    END_TURN = "end_turn"
-    TOOL_USE = "tool_use"
-    MAX_TOKENS = "max_tokens"
-    STOP_SEQUENCE = "stop_sequence"
-    ERROR = "error"
-    UNKNOWN = "unknown"
 
 
 @dataclass(slots=True)
@@ -130,21 +113,3 @@ class CanonicalTool:
             description=str(tool.get("description", "")),
             input_schema=dict(tool.get("input_schema") or {}),
         )
-
-
-@dataclass(slots=True)
-class CanonicalToolUseBlock:
-    """Tool-call normalizzato, indipendente dal dialetto del provider.
-
-    `id` e' l'identificativo del tool-call (tool_use_id Anthropic, tool_call.id
-    OpenAI, sintetizzato per Google/text-fallback). `dialect_meta` conserva
-    metadati grezzi del provider per audit.
-    """
-    id: str
-    name: str
-    input: dict[str, Any] = field(default_factory=dict)
-    dialect_meta: dict[str, Any] = field(default_factory=dict)
-
-    def to_anthropic_block(self) -> dict[str, Any]:
-        """Rappresentazione in blocco assistant Anthropic (type=tool_use)."""
-        return {"type": "tool_use", "id": self.id, "name": self.name, "input": self.input}

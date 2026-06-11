@@ -288,7 +288,7 @@ impl LearningScheduler {
         let entry = stats
             .per_worker
             .entry(name.to_string())
-            .or_insert_with(WorkerStats::default);
+            .or_default();
         entry.runs += 1;
         if !outcome.success {
             entry.failures += 1;

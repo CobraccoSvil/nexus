@@ -339,6 +339,16 @@ pub async fn index_project_bootstrap_vectors(
 
 // ── Indicizzazione file codice ────────────────────────────────────────────────
 
+// safety: pattern literal valido
+static RE_JSX_TEXT_LABEL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r">\s*([A-Za-zÀ-ÿ][^<>{}\n]{3,60})\s*<").unwrap()
+});
+
+// safety: pattern literal valido
+static RE_UI_PROP_LABEL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"(?:title|label|placeholder|aria-label)=["']([^"']{3,60})["']"#).unwrap()
+});
+
 pub async fn index_project_code_files(state: &AppState, project_id: Uuid, root: &Path) -> Value {
     const SKIP_DIRS: &[&str] = &[
         "node_modules",
@@ -438,8 +448,7 @@ pub async fn index_project_code_files(state: &AppState, project_id: Uuid, root: 
         // Estrai UI labels per tsx/jsx/vue
         let ui_labels: Vec<String> = if matches!(ext.as_str(), "tsx" | "jsx" | "vue") {
             let mut labels: Vec<String> = Vec::new();
-            let re_jsx = regex::Regex::new(r">\s*([A-Za-zÀ-ÿ][^<>{}\n]{3,60})\s*<").unwrap();
-            for cap in re_jsx.captures_iter(&content) {
+            for cap in RE_JSX_TEXT_LABEL.captures_iter(&content) {
                 let label = cap[1].trim().to_string();
                 if !labels.contains(&label) {
                     labels.push(label.clone());
@@ -449,11 +458,7 @@ pub async fn index_project_code_files(state: &AppState, project_id: Uuid, root: 
                 }
             }
             if labels.len() < 20 {
-                let re_props = regex::Regex::new(
-                    r#"(?:title|label|placeholder|aria-label)=["']([^"']{3,60})["']"#,
-                )
-                .unwrap();
-                for cap in re_props.captures_iter(&content) {
+                for cap in RE_UI_PROP_LABEL.captures_iter(&content) {
                     let label = cap[1].trim().to_string();
                     if !labels.contains(&label) {
                         labels.push(label.clone());

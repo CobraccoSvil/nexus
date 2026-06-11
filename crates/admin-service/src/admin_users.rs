@@ -18,7 +18,7 @@ pub async fn list_users(
     Query(params): Query<ListUsersQuery>,
 ) -> Result<Json<ListUsersResponse>, StatusCode> {
     let page = params.page.unwrap_or(1).max(1);
-    let limit = params.limit.unwrap_or(20).min(100).max(1);
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * limit;
 
     let total: i32 = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")

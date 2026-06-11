@@ -56,8 +56,6 @@ pub struct GwPrivacyRerouted {
 #[derive(Deserialize, Debug, Clone)]
 pub struct GwResponse {
     pub content: String,
-    #[serde(default)]
-    pub tool_calls: Option<serde_json::Value>,
     pub usage: GwUsage,
     pub model_used: String,
     pub provider_used: String,

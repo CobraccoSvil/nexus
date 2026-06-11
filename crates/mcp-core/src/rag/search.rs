@@ -78,7 +78,7 @@ pub async fn search_semantic(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let top_k = top_k.unwrap_or(cfg.top_k_default).max(1).min(100);
+    let top_k = top_k.unwrap_or(cfg.top_k_default).clamp(1, 100);
     let kinds = if source_kinds.is_empty() {
         vec![
             SourceKind::Attachment,

@@ -120,17 +120,6 @@ fn default_dist_dir() -> PathBuf {
     PathBuf::from("apps/browser-bridge-extension/dist")
 }
 
-fn find_first_with_ext(dir: &Path, ext: &str) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut matches: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext))
-        .collect();
-    matches.sort();
-    matches.into_iter().next_back()
-}
-
 // ---------- Calcolo extension ID ----------
 
 #[derive(Debug, thiserror::Error)]

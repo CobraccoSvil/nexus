@@ -234,11 +234,7 @@ impl MemoryNamespace {
             .iter()
             .filter_map(|e| {
                 let key = e.key();
-                if let Some(task_id) = key.strip_prefix("task_result:") {
-                    Some((task_id.to_string(), e.value().clone()))
-                } else {
-                    None
-                }
+                key.strip_prefix("task_result:").map(|task_id| (task_id.to_string(), e.value().clone()))
             })
             .collect()
     }

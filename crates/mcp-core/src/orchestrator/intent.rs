@@ -3,25 +3,10 @@
 //! promozione / fallback deterministico: quando l'LLM non risponde si usa
 //! l'intent di sistema neutro `agentic_default`.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use uuid::Uuid;
 
-use mcp_proto::neural::{
-    neural_core_service_client::NeuralCoreServiceClient, ClassifyIntentRequest, EmbedTextRequest,
-    GenerateAgentTurnRequest, GenerateCompletionRequest, RouteModelRequest,
-};
 
-use crate::{
-    billing::{self, UsageNumbers},
-    domain::OrchestratorAudit,
-    nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest, NexusGatewayClient},
-    provider_cooldown::{is_provider_in_cooldown, put_provider_in_cooldown},
-    vector_memory,
-};
 
 use super::*;
 
@@ -39,11 +24,21 @@ use super::*;
 pub(crate) struct AgenticIntentResponse {
     intent: String,
     agentic_score: f32,
+    #[expect(
+        dead_code,
+        reason = "campo obbligatorio del contratto JSON di POST /classify-intent-agentic: senza serde(default) la deserializzazione valida la risposta del brain"
+    )]
     requires_tools: bool,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "campo obbligatorio del contratto JSON di POST /classify-intent-agentic: senza serde(default) la deserializzazione valida la risposta del brain"
+    )]
     complexity: String,
     confidence: f32,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "campo obbligatorio del contratto JSON di POST /classify-intent-agentic: senza serde(default) la deserializzazione valida la risposta del brain"
+    )]
     model_used: String,
     #[serde(default)]
     cached: bool,
@@ -187,8 +182,9 @@ pub(crate) fn intent_str_to_static(intent: &str) -> Option<&'static str> {
         "system_admin" => Some("system_admin"),
         "code_read" => Some("code_read"),
         // Intent di sistema: non emesso dal classifier LLM, ma assegnato come
-        // fallback neutro quando l'LLM non risponde (vedi classify_intent_async_*).
-        // Mappato qui per coerenza se mai dovesse transitare per questa funzione.
+        // fallback neutro quando l'LLM non risponde (vedi
+        // classify_intent_async_with_threshold). Mappato qui per coerenza se
+        // mai dovesse transitare per questa funzione.
         "agentic_default" => Some("agentic_default"),
         _ => None,
     }
@@ -411,12 +407,4 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
         is_ambiguous: parsed.is_ambiguous,
         slots: parsed.slots,
     }
-}
-
-/// Wrapper che usa i default hardcoded — solo per call site che non hanno
-/// accesso a `Orchestrator` (e quindi a `RoutingThresholds`).
-/// Il path principale (resolve_agent_provider*, run) usa
-/// `Orchestrator::classify_intent_with_db_thresholds`.
-pub(crate) async fn classify_intent_async(message: &str) -> (&'static str, f32) {
-    classify_intent_async_with_threshold(message, LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0).await
 }

@@ -12,7 +12,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
@@ -20,21 +20,6 @@ use uuid::Uuid;
 use super::shared::{api_err, ApiResult};
 type ApiError = (StatusCode, Json<Value>);
 use crate::{auth::Claims, AppState};
-
-// ── Strutture di risposta ────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct ProjectDbConfigResponse {
-    pub project_id: String,
-    pub engine: Option<String>,
-    pub hosting_mode: Option<String>,
-    pub migration_tool: Option<String>,
-    pub migration_path: Option<String>,
-    pub allow_ddl_override: bool,
-    pub detection_metadata: Value,
-    pub pending_count: i64,
-    pub applied_count: i64,
-}
 
 // ── Corpi richiesta ──────────────────────────────────────────────────────────
 

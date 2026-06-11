@@ -172,24 +172,6 @@ class EmbeddingService:
             logger.error("Search failed: %s", e)
             return []
 
-    def index_code_file(self, file_path: str, content: str, chunk_size: int = 500) -> int:
-        """Index a code file by chunking and storing embeddings."""
-        chunks = self._chunk_text(content, chunk_size)
-        if not chunks:
-            return 0
-
-        embeddings = self.embed_batch(self._default_model, chunks)
-        ids = [f"{file_path}::chunk_{i}" for i in range(len(chunks))]
-        vectors = [e.values for e in embeddings]
-        payloads = [
-            {"file_path": file_path, "chunk_index": i, "text": chunk}
-            for i, chunk in enumerate(chunks)
-        ]
-
-        if self.store_vectors(ids, vectors, payloads):
-            return len(chunks)
-        return 0
-
     def semantic_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
         """Search indexed code by semantic similarity."""
         query_vec = self.embed_text(self._default_model, query)

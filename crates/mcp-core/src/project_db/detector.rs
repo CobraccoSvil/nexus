@@ -329,6 +329,7 @@ fn detect_dotnet(project_root: &Path) -> Option<(DbEngine, Option<MigrationTool>
 /// la keyword `Server=`:
 ///   - SQL Server:   `Server=host[,port];Database=name;...`           (port via virgola)
 ///   - Npgsql:       `Server=host;Port=5432;Database=name;...`        (port keyword separata)
+///
 /// Prima dei controlli generici facciamo passare i segnali univoci di Postgres
 /// (Host=, Port=5432, schema postgres://) per evitare il falso positivo SQL Server.
 fn engine_from_appsettings(content: &str) -> Option<DbEngine> {

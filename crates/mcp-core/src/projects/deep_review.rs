@@ -415,19 +415,3 @@ pub async fn get_deep_review_status(
         "total": total,
     })))
 }
-
-#[allow(dead_code)]
-pub(super) fn parse_issues_from_response(text: &str) -> Vec<Value> {
-    let start = text.find('{');
-    let end = text.rfind('}').map(|i| i + 1);
-    if let (Some(s), Some(e)) = (start, end) {
-        if e > s {
-            if let Ok(parsed) = serde_json::from_str::<Value>(&text[s..e]) {
-                if let Some(arr) = parsed["issues"].as_array() {
-                    return arr.clone();
-                }
-            }
-        }
-    }
-    vec![]
-}

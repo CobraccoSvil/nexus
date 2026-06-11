@@ -110,8 +110,10 @@ fn walk_count(
             continue;
         };
         let prefix = comment_prefix(lang);
-        let mut s = Stat::default();
-        s.files = 1;
+        let mut s = Stat {
+            files: 1,
+            ..Default::default()
+        };
         for line in content.lines() {
             s.lines += 1;
             let t = line.trim();

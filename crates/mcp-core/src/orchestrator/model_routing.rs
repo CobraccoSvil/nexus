@@ -1,21 +1,11 @@
 //! Routing modello: stima complessita', selezione dal catalog,
 //! soglie token, RoutingConfig e default per provider.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
-use uuid::Uuid;
 
 // Tipi mcp_proto::neural ri-esportati da super::* (regola L, S73).
-use crate::{
-    billing::{self, UsageNumbers},
-    domain::OrchestratorAudit,
-    nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest, NexusGatewayClient},
-    provider_cooldown::{is_provider_in_cooldown, put_provider_in_cooldown},
-    vector_memory,
-};
 
 use super::*;
 
@@ -23,8 +13,6 @@ use super::*;
 pub(crate) struct RoutingDecision {
     pub(crate) provider: String,
     pub(crate) model: String,
-    #[allow(dead_code)]
-    pub(crate) rationale: &'static str,
 }
 
 /// Soglie token per intent_key (route_model_with_mode). Letti da
@@ -130,8 +118,6 @@ pub(crate) fn compute_no_capable_provider(
 pub(crate) struct DynamicRoutingDecision {
     pub(crate) provider: String,
     pub(crate) model: String,
-    #[allow(dead_code)]
-    pub(crate) rationale: &'static str,
 }
 
 /// Stima la complessità reale del messaggio ignorando liste/elenchi ripetitivi
@@ -214,22 +200,19 @@ pub(crate) async fn route_model_from_catalog(
         "light" => vec!["light", "medium"],
         other => vec![other],
     };
+    // Branch: catalog dynamic routing (selettore agentico unico).
     select_agentic_model(db, &tier_chain, Some(capability), 0, &[], order_clause)
         .await
-        .map(|(provider, model)| DynamicRoutingDecision {
-            provider,
-            model,
-            rationale: "catalog dynamic routing (selettore agentico unico)",
-        })
+        .map(|(provider, model)| DynamicRoutingDecision { provider, model })
 }
 
 /// Seleziona il miglior modello del catalog per un dato `tier`, opzionalmente
 /// filtrato per `capability` e `requires_tool_use`. Usato dalla risoluzione
 /// tier-based dei purpose (mig 0203): es. il purpose 'planner' -> tier 'heavy'
 /// + capability 'reasoning' sceglie dinamicamente il miglior modello heavy
-/// disponibile (esclusi i provider in cooldown), il piu' economico tra i
-/// featured. Ritorna None se nessun candidato soddisfa i criteri (il chiamante
-/// cade sul fallback statico del purpose).
+///   disponibile (esclusi i provider in cooldown), il piu' economico tra i
+///   featured. Ritorna None se nessun candidato soddisfa i criteri (il chiamante
+///   cade sul fallback statico del purpose).
 pub async fn best_model_for_tier(
     db: &PgPool,
     tier: &str,
@@ -440,11 +423,8 @@ pub(crate) fn route_model_with_mode(
     // 1. Lookup diretto (intent_key, mode) nella matrice DB con escalation
     if let Some((provider, model)) = matrix.lookup_with_budget(intent_key, mode, est_i32) {
         if !in_cooldown(&provider) {
-            return RoutingDecision {
-                provider,
-                model,
-                rationale: "routing_matrix DB",
-            };
+            // Branch: routing_matrix DB.
+            return RoutingDecision { provider, model };
         }
         tracing::warn!(
             "route_model_with_mode: skip provider {} (in cooldown)",
@@ -458,11 +438,8 @@ pub(crate) fn route_model_with_mode(
             matrix.lookup_with_budget(intent_key, "bilanciata", est_i32)
         {
             if !in_cooldown(&provider) {
-                return RoutingDecision {
-                    provider,
-                    model,
-                    rationale: "routing_matrix DB (mode fallback bilanciata)",
-                };
+                // Branch: routing_matrix DB (mode fallback bilanciata).
+                return RoutingDecision { provider, model };
             }
             tracing::warn!(
                 "route_model_with_mode: skip provider {} su fallback bilanciata (in cooldown)",
@@ -475,11 +452,8 @@ pub(crate) fn route_model_with_mode(
     for try_mode in &["bilanciata", "approfondita", "veloce", "economica"] {
         if let Some((provider, model)) = matrix.lookup_with_budget(intent_key, try_mode, est_i32) {
             if !in_cooldown(&provider) {
-                return RoutingDecision {
-                    provider,
-                    model,
-                    rationale: "routing_matrix DB (cooldown bypass: any mode)",
-                };
+                // Branch: routing_matrix DB (cooldown bypass: any mode).
+                return RoutingDecision { provider, model };
             }
         }
     }
@@ -491,10 +465,10 @@ pub(crate) fn route_model_with_mode(
     // RoutingResolveResult { no_capable_provider: true } → HTTP 503.
     if let Some(provider) = preferred_provider_for_intent {
         if let Some(model) = matrix.default_model(provider) {
+            // Branch: routing_matrix default per preferred_provider intent.
             return RoutingDecision {
                 provider: provider.to_string(),
                 model,
-                rationale: "routing_matrix default per preferred_provider intent",
             };
         }
     }
@@ -506,10 +480,10 @@ pub(crate) fn route_model_with_mode(
          Verifica nexus_routing_matrix e nexus_intent_capability.",
         intent_key, mode
     );
+    // Branch: no model available — verifica routing matrix + intent_capability.
     RoutingDecision {
         provider: "__no_model__".to_string(),
         model: "__no_model__".to_string(),
-        rationale: "no model available — verifica routing matrix + intent_capability",
     }
 }
 

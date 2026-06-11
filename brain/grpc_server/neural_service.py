@@ -85,12 +85,6 @@ def _classify_provider_error(exc: Exception) -> tuple[str, str]:
     )
 
 
-def _humanize_provider_error(exc: Exception) -> str:
-    """Wrapper retrocompatibile: restituisce solo il messaggio umano."""
-    _, human = _classify_provider_error(exc)
-    return human
-
-
 def _normalize_provider_result(result, provider: str, model: str) -> tuple[str, object, str]:
     """Normalizza il `content` di un ProviderResult (gestendo list/dict/non-str)
     e classifica eventuali errori "[Error: ...]" sanitizzandoli per l'UI.

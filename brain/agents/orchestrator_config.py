@@ -317,22 +317,6 @@ def get() -> dict[str, Any]:
 
 # ── Accessori tipizzati ────────────────────────────────────────────────────
 
-def plan_phase_enabled() -> bool:
-    return bool(get()["plan_phase_enabled"])
-
-
-def verifier_enabled() -> bool:
-    return bool(get()["verifier_enabled"])
-
-
-def plan_behavior_modes() -> list[str]:
-    return list(get()["plan_behavior_modes"])
-
-
-def plan_intents() -> list[str]:
-    return list(get()["plan_intents"])
-
-
 def plan_min_token_budget() -> int:
     return int(get()["plan_min_token_budget"])
 
@@ -345,16 +329,8 @@ def todo_reminder_every_n_steps() -> int:
     return int(get()["todo_reminder_every_n_steps"])
 
 
-def todo_reminder_min_todos() -> int:
-    return int(get()["todo_reminder_min_todos"])
-
-
 def max_verify_cycles() -> int:
     return int(get()["max_verify_cycles"])
-
-
-def max_plan_revisions() -> int:
-    return int(get()["max_plan_revisions"])
 
 
 def verifier_timeout_s() -> float:
@@ -367,14 +343,6 @@ def worker_mode_enabled() -> bool:
 
 def worker_mode_tool_whitelist() -> list[str]:
     return list(get()["worker_mode_tool_whitelist"])
-
-
-def adaptive_classifier_enabled() -> bool:
-    return bool(get()["adaptive_classifier_enabled"])
-
-
-def adaptive_gating_enabled() -> bool:
-    return bool(get()["adaptive_gating_enabled"])
 
 
 def subagents_enabled() -> bool:
@@ -395,10 +363,6 @@ def plan_rationale_min_score() -> float:
 
 def plan_rationale_persist_as_note() -> bool:
     return bool(get()["plan_rationale_persist_as_note"])
-
-
-def auto_delegation_enabled() -> bool:
-    return bool(get()["auto_delegation_enabled"])
 
 
 def is_eligible(behavior_mode: str | None, intent: str | None, token_budget: int) -> bool:

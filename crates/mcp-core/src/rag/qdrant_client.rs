@@ -1,9 +1,8 @@
 //! Client HTTP minimo per Qdrant.
 //!
 //! Usa l'API REST (`PUT /collections/{c}` per ensure, `PUT /collections/{c}/points`
-//! per upsert, `POST /collections/{c}/points/search` per search, `POST
-//! /collections/{c}/points/delete` per delete). Non porta dipendenze in piu'
-//! (riusa reqwest gia' nel workspace).
+//! per upsert, `POST /collections/{c}/points/search` per search). Non porta
+//! dipendenze in piu' (riusa reqwest gia' nel workspace).
 //!
 //! Filtraggio nativo Qdrant via `must` su `payload.project_id` e altri campi.
 
@@ -150,58 +149,15 @@ pub async fn search_points(
         .unwrap_or_default();
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        let id = item
-            .get("id")
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .unwrap_or_default();
         let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
         let payload = item.get("payload").cloned().unwrap_or(Value::Null);
-        out.push(QdrantHit { id, score, payload });
+        out.push(QdrantHit { score, payload });
     }
     Ok(out)
 }
 
-/// Cancella tutti i punti che matchano i filtri (es. tutto un source_id).
-pub async fn delete_by_filter(
-    client: &Client,
-    base_url: &str,
-    collection: &str,
-    must_filters: Vec<(String, Value)>,
-) -> Result<(), RagError> {
-    if must_filters.is_empty() {
-        return Err(RagError::Qdrant("delete senza filtri rifiutata".into()));
-    }
-    let url = format!(
-        "{}/collections/{}/points/delete?wait=true",
-        base_url.trim_end_matches('/'),
-        collection
-    );
-    let must_array: Vec<Value> = must_filters
-        .into_iter()
-        .map(|(k, v)| json!({"key": k, "match": {"value": v}}))
-        .collect();
-    let body = json!({"filter": {"must": must_array}});
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| RagError::Qdrant(format!("delete: {e}")))?;
-    if !resp.status().is_success() {
-        let st = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        // 404 collection inesistente: non e' un errore (cleanup idempotente).
-        if st.as_u16() == 404 {
-            return Ok(());
-        }
-        return Err(RagError::Qdrant(format!("delete fallita: {st} {text}")));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 pub struct QdrantHit {
-    pub id: String,
     pub score: f32,
     pub payload: Value,
 }

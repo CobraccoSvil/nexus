@@ -199,7 +199,7 @@ pub async fn get_project_problems(
             };
             let mut msg = format!("Servizio {unit}: {signal_kind}{metric_part}");
             if let Some(d) = detail.as_deref().filter(|s| !s.is_empty()) {
-                msg.push_str("\n");
+                msg.push('\n');
                 msg.push_str(d);
             }
             (format!("service_observer:{signal_kind}"), msg)
@@ -240,7 +240,7 @@ pub async fn get_project_problems(
             }
         }
         if let Some(d) = details.as_deref().filter(|s| !s.is_empty()) {
-            message.push_str("\n");
+            message.push('\n');
             message.push_str(d);
         }
         items.push(json!({

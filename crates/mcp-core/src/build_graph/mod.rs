@@ -23,5 +23,5 @@ pub mod tool;
 
 pub use cache::BuildGraphCache;
 pub use membership::is_in_build_graph;
-pub use model::{BuildGraphInfo, BuildGraphMembership};
+pub use model::BuildGraphMembership;
 pub use tool::handle_build_graph_info;

@@ -14,7 +14,6 @@
 //! 6. Salva il risultato in `jobs` (kind = "playwright_test") per il pannello Playwright.
 
 use super::*;
-use chrono;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -265,7 +264,7 @@ fn pick_playwright_root_with_stale(base: &Path) -> (std::path::PathBuf, Vec<std:
         return (base.to_path_buf(), Vec::new());
     }
 
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
     let chosen = candidates[0].0.clone();
     let chosen_count = candidates[0].1;
 
@@ -279,10 +278,6 @@ fn pick_playwright_root_with_stale(base: &Path) -> (std::path::PathBuf, Vec<std:
         .collect();
 
     (chosen, stale)
-}
-
-fn pick_playwright_root(base: &Path) -> std::path::PathBuf {
-    pick_playwright_root_with_stale(base).0
 }
 
 pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Value) -> String {
@@ -504,11 +499,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     let mut base_url = if let Some(explicit) = explicit_base_url {
         // Override esplicito dall'utente
         Some(explicit)
-    } else if let Some(port) = pick_dev_port(&port_rows) {
-        Some(format!("http://localhost:{}", port))
-    } else {
-        None
-    };
+    } else { pick_dev_port(&port_rows).map(|port| format!("http://localhost:{}", port)) };
 
     // Fallback: se la porta scelta non risponde, prova le altre porte allocate
     if let Some(ref url) = base_url {
@@ -1312,7 +1303,7 @@ pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> S
 
 /// Helper comune: esegue un comando con timeout e cattura output.
 async fn run_test_command(
-    ctx: &AgentToolContext,
+    _ctx: &AgentToolContext,
     command: &str,
     work_dir: &Path,
     timeout_secs: u64,

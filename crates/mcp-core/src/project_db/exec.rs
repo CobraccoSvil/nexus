@@ -1060,8 +1060,8 @@ fn first_token_upper(sql: &str) -> String {
 
 fn second_meaningful_token_upper(sql: &str) -> String {
     // Salta IF EXISTS / IF NOT EXISTS dopo CREATE/DROP.
-    let mut iter = sql.split_whitespace().skip(1);
-    while let Some(tok) = iter.next() {
+    let iter = sql.split_whitespace().skip(1);
+    for tok in iter {
         let up = tok.to_uppercase();
         if up == "IF" || up == "NOT" || up == "EXISTS" || up == "OR" || up == "REPLACE" {
             continue;
@@ -1072,8 +1072,8 @@ fn second_meaningful_token_upper(sql: &str) -> String {
 }
 
 fn third_meaningful_identifier(sql: &str) -> Option<String> {
-    let mut iter = sql.split_whitespace().skip(2);
-    while let Some(tok) = iter.next() {
+    let iter = sql.split_whitespace().skip(2);
+    for tok in iter {
         let up = tok.to_uppercase();
         if up == "IF" || up == "NOT" || up == "EXISTS" || up == "OR" || up == "REPLACE" {
             continue;

@@ -184,7 +184,7 @@ impl NexusToolHandler for HttpRequestTool {
         };
 
         Ok(json!({
-            "ok": status >= 200 && status < 400,
+            "ok": (200..400).contains(&status),
             "status": status,
             "status_text": status_text,
             "latency_ms": elapsed_ms,

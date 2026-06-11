@@ -77,7 +77,6 @@ impl NexusToolHandler for ProjectDbRollbackTool {
                 .unwrap_or(MigrationTool::GenericSql);
             let db_ctx = ProjectDbContext {
                 project_root: ctx.project_root.clone(),
-                project_id: ctx.project_id,
                 migration_tool,
                 migration_path,
             };

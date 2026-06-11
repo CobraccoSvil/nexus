@@ -445,12 +445,6 @@ def list_profiles() -> list[AgentProfile]:
     return sorted(_profiles().values(), key=lambda p: (p.category, p.name))
 
 
-def reset_cache() -> None:
-    """Helper per test: forza reload al prossimo get_profile."""
-    global _cache
-    _cache = None
-
-
 # ── Routing intent → profile ────────────────────────────────────────────────
 
 # Mapping minimo intent-to-profile; il router semantico puo' essere esteso

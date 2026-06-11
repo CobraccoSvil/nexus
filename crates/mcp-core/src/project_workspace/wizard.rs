@@ -122,7 +122,7 @@ async fn run_env_setup(cwd: &str, unit_name: &str) -> Vec<serde_json::Value> {
             tokio::fs::read_dir(cwd)
                 .await
                 .ok()
-                .map(|mut rd| {
+                .map(|rd| {
                     // La lettura in async richiede un loop; usiamo std come fallback
                     // perché il read_dir async non ha un metodo .any() diretto.
                     drop(rd);
@@ -383,6 +383,11 @@ pub(super) async fn mark_existing_services(suggestions: &mut [serde_json::Value]
     }
 }
 
+// safety: pattern literal valido
+static RE_COMPOSE_PORT_VAR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\$\{(PORT[A-Z0-9_]*)(?::-\d+)?\}").unwrap()
+});
+
 pub async fn wizard_detect_services(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -527,8 +532,7 @@ pub async fn wizard_detect_services(
                 .filter_map(|l| {
                     let t = l.trim();
                     if t.starts_with("name") && content.contains("[[bin]]") {
-                        t.splitn(2, '=')
-                            .nth(1)
+                        t.split_once('=').map(|x| x.1)
                             .map(|v| v.trim().trim_matches('"').to_string())
                     } else {
                         None
@@ -577,16 +581,14 @@ pub async fn wizard_detect_services(
             // usa le porte del bucket di progetto (regola I / ADR 0010).
             let mut env_obj = serde_json::Map::new();
             if let Ok(compose) = tokio::fs::read_to_string(&dc_path).await {
-                if let Ok(re) = regex::Regex::new(r"\$\{(PORT[A-Z0-9_]*)(?::-\d+)?\}") {
-                    let mut seen = std::collections::HashSet::new();
-                    for cap in re.captures_iter(&compose) {
-                        if let Some(m) = cap.get(1) {
-                            let var = m.as_str().to_string();
-                            if seen.insert(var.clone()) {
-                                let key = format!("docker-{}", var.to_lowercase());
-                                let p = suggest_port(&state, &project_id, &key).await;
-                                env_obj.insert(var, serde_json::Value::String(p.to_string()));
-                            }
+                let mut seen = std::collections::HashSet::new();
+                for cap in RE_COMPOSE_PORT_VAR.captures_iter(&compose) {
+                    if let Some(m) = cap.get(1) {
+                        let var = m.as_str().to_string();
+                        if seen.insert(var.clone()) {
+                            let key = format!("docker-{}", var.to_lowercase());
+                            let p = suggest_port(&state, &project_id, &key).await;
+                            env_obj.insert(var, serde_json::Value::String(p.to_string()));
                         }
                     }
                 }
@@ -1579,7 +1581,7 @@ pub async fn wizard_install_service(
     // ── Auto-setup ambiente: installa dipendenze per qualsiasi framework ────────
     // Rilevamento automatico: pnpm/yarn/npm, .NET, Python (uv/poetry/pip/pipenv),
     // Go, Ruby, PHP. Lo step viene saltato se il done_marker è già presente.
-    let setup_log = run_env_setup(&cwd, &unit_name).await;
+    let setup_log = run_env_setup(cwd, &unit_name).await;
 
     Ok(Json(json!({
         "ok":        ok,
@@ -1764,7 +1766,7 @@ pub(super) async fn refine_with_nexus(
     project_id: Uuid,
     user_id: Uuid,
     root: &std::path::Path,
-    suggestions: &mut Vec<Value>,
+    suggestions: &mut [Value],
 ) {
     let gw = match &state.orchestrator.nexus_gateway {
         Some(g) => g,
@@ -1940,8 +1942,8 @@ pub(super) fn classify_role(
             let deps = pkg.get("dependencies").and_then(|v| v.as_object());
             let dev_deps = pkg.get("devDependencies").and_then(|v| v.as_object());
             let has_dep = |key: &str| -> bool {
-                deps.map_or(false, |d| d.contains_key(key))
-                    || dev_deps.map_or(false, |d| d.contains_key(key))
+                deps.is_some_and(|d| d.contains_key(key))
+                    || dev_deps.is_some_and(|d| d.contains_key(key))
             };
             if has_dep("next")
                 || has_dep("react")

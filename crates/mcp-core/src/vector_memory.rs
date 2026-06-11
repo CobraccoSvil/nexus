@@ -387,7 +387,8 @@ pub async fn upsert_project_context_point(
 }
 
 /// Ricerca semantica nella collezione `project_context` di Qdrant.
-/// Usata da `project_context::build_project_context_block` per la sezione RAG.
+/// Usata da `nexus_builtin::docs` (doc generation) e
+/// `agent_tools::semantic_tools` per il recupero della knowledge base.
 pub async fn search_project_context_points(
     db: &PgPool,
     query_vector: &[f32],
@@ -1283,28 +1284,6 @@ pub async fn upsert_wiki_content_point(
         return Err(anyhow!("wiki_content upsert fallito: {payload}"));
     }
     Ok(())
-}
-
-/// Conta i punti nella collection `wiki_content`. Utile per smoke-test dopo
-/// il re-ingest. Restituisce 0 se la collection non esiste.
-pub async fn count_wiki_content_points(db: &PgPool) -> anyhow::Result<u64> {
-    let (base_url, collection) = qdrant_wiki_content_config(db).await?;
-    let url = format!("{base_url}/collections/{collection}/points/count");
-    let client = nexus_http::build_client();
-    let response = client
-        .post(&url)
-        .json(&json!({ "exact": true }))
-        .send()
-        .await
-        .context("count wiki_content fallito")?;
-    if !response.status().is_success() {
-        return Ok(0);
-    }
-    let v: Value = response.json().await.unwrap_or_else(|_| json!({}));
-    Ok(v.get("result")
-        .and_then(|r| r.get("count"))
-        .and_then(|c| c.as_u64())
-        .unwrap_or(0))
 }
 
 /// Recupera il vector di un point in `wiki_content` (id = doc UUID stringa).

@@ -176,8 +176,8 @@ pub async fn spawn_agent_process(
         let mut stdout_buf = String::new();
         let mut stderr_buf = String::new();
 
-        let stdout_reader = stdout.map(|s| tokio::io::BufReader::new(s));
-        let stderr_reader = stderr.map(|s| tokio::io::BufReader::new(s));
+        let stdout_reader = stdout.map(tokio::io::BufReader::new);
+        let stderr_reader = stderr.map(tokio::io::BufReader::new);
 
         let mut stdout_lines = stdout_reader.map(|r| r.lines());
         let mut stderr_lines = stderr_reader.map(|r| r.lines());
@@ -331,7 +331,6 @@ pub async fn read_process_output(
     };
 
     Ok(ProcessOutput {
-        process_id,
         command,
         pid,
         status,
@@ -343,9 +342,8 @@ pub async fn read_process_output(
 
 use sqlx::Row;
 
-#[allow(dead_code)]
+
 pub struct ProcessOutput {
-    pub process_id: Uuid,
     pub command: String,
     pub pid: Option<i32>,
     pub status: String,
@@ -426,7 +424,7 @@ pub async fn list_processes(db: &PgPool, project_id: Uuid) -> Result<Vec<Process
         .collect())
 }
 
-#[allow(dead_code)]
+
 pub struct ProcessSummary {
     pub id: Uuid,
     pub label: String,

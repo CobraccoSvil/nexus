@@ -1,8 +1,8 @@
 //! Adapter sqlx-migrate (Rust) — crea migration tramite `sqlx migrate add`.
 
-use super::{list_pending_files, MigrationAdapter};
+use super::MigrationAdapter;
 use crate::project_db::{
-    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+    AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -11,11 +11,6 @@ pub struct SqlxMigrateAdapter;
 
 #[async_trait]
 impl MigrationAdapter for SqlxMigrateAdapter {
-    async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
-        // Punto unico: scansione file-based via `list_pending_files` (regola L).
-        list_pending_files(ctx, |n| n.ends_with(".sql"), true)
-    }
-
     async fn create_migration(
         &self,
         ctx: &ProjectDbContext,

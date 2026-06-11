@@ -14,7 +14,6 @@ from .nodes import (
     route_after_executor,
     route_after_regression_gate,
     route_after_verifier,
-    route_by_task_type,
     router_node,
     tool_dispatch_node,
 )
@@ -30,7 +29,6 @@ from .understanding_node import understanding_node, configure as _configure_unde
 from .clarify_or_expand_node import (
     clarify_or_expand_node,
     configure as _configure_clarify,
-    route_after_clarify,
 )
 from .state import AgentState
 
@@ -80,7 +78,6 @@ def create_agent_graph(
     providers: Any,
     router: Any,
     embeddings: Any,
-    checkpointer_path: str | None = None,
     tool_runner: Any = None,
     agent_router: Any = None,
     agentic_classifier: Any = None,
@@ -91,7 +88,6 @@ def create_agent_graph(
         providers: ProviderRegistry globale di Nexus
         router: SemanticRouter globale di Nexus
         embeddings: EmbeddingService globale di Nexus
-        checkpointer_path: Deprecato, ignorato. Il checkpointer usa PostgreSQL.
         tool_runner: Runner opzionale per tool dispatch.
         agent_router: Router agente opzionale.
 

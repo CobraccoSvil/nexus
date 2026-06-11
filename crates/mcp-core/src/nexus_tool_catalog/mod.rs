@@ -132,7 +132,10 @@ pub struct NexusToolSpec {
     /// Categoria
     pub category: NexusToolCategory,
     /// Breve descrizione per LLM / UI
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "superficie descrittiva del catalogo tool, esposizione UI/LLM pianificata; popolata da ~300 seed"
+    )]
     pub description: String,
     /// Tool implementato (true) o scaffold stub (false)
     pub implemented: bool,
@@ -150,12 +153,6 @@ impl NexusToolSpec {
             description: description.into(),
             implemented: false,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn implemented(mut self) -> Self {
-        self.implemented = true;
-        self
     }
 }
 
@@ -389,7 +386,13 @@ impl NexusToolCatalog {
     }
 
     /// Recupera la spec di un tool per nome (compat. con versione Fase 6).
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "zero call site oggi; candidata a rimozione in un passaggio successivo di bonifica"
+        )
+    )]
     pub fn get(&self, name: &str) -> Option<NexusToolSpec> {
         self.tools.get(name).map(|r| r.spec.clone())
     }
@@ -438,8 +441,7 @@ impl NexusToolCatalog {
         tokio::task::spawn_blocking(move || handle.block_on(handler.execute(&ctx, &args)))
             .await
             .map_err(|e| {
-                NexusToolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                NexusToolError::Io(std::io::Error::other(
                     format!("tool join error: {e}"),
                 ))
             })?
@@ -459,7 +461,13 @@ impl NexusToolCatalog {
         self.tools.len()
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "richiesto dal lint clippy len_without_is_empty accanto a len()"
+        )
+    )]
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -549,7 +557,7 @@ mod tests {
     #[test]
     fn test_catalog_with_builtins() {
         let c = NexusToolCatalog::with_builtins();
-        assert!(c.len() > 0);
+        assert!(!c.is_empty());
         // Il seed dovrebbe coprire tutte le categorie principali
         let bd = c.breakdown();
         let covered: usize = bd.iter().filter(|(_, n)| *n > 0).count();
@@ -582,8 +590,11 @@ mod tests {
     }
 
     #[test]
-    fn test_implemented_builder() {
-        let spec = NexusToolSpec::new("x", NexusToolCategory::Other, "y").implemented();
+    fn test_implemented_field() {
+        // Il builder .implemented() e' stato rimosso (mai usato in produzione,
+        // bonifica 2026-06-11): il campo si assegna direttamente.
+        let mut spec = NexusToolSpec::new("x", NexusToolCategory::Other, "y");
+        spec.implemented = true;
         assert!(spec.implemented);
     }
 

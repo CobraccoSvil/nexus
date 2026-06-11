@@ -435,7 +435,7 @@ async fn try_restart_systemd_or_process(name_hint: &str) {
 
     // Fallback: cerca il processo e invia SIGHUP per forzare un reload
     let pgrep = tokio::process::Command::new("pgrep")
-        .args(["-f", &format!("{name_hint}")])
+        .args(["-f", name_hint])
         .output()
         .await;
 

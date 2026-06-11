@@ -271,7 +271,7 @@ impl OnnxMiniLmEmbedder {
     }
 
     /// Normalizzazione L2 in-place.
-    fn l2_normalize(v: &mut Vec<f32>) {
+    fn l2_normalize(v: &mut [f32]) {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 1e-9 {
             for x in v.iter_mut() {

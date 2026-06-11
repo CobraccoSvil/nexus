@@ -9,9 +9,9 @@ pub mod indexer;
 pub mod qdrant_client;
 pub mod search;
 
-pub use config::{current_config, RagConfig};
-pub use indexer::{delete_source, index_attachment, index_text};
-pub use search::{search_semantic, SearchHit};
+pub use config::current_config;
+pub use indexer::index_attachment;
+pub use search::search_semantic;
 
 use serde::{Deserialize, Serialize};
 

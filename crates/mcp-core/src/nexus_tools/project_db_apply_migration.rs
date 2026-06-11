@@ -65,7 +65,6 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
 
         let db_ctx = ProjectDbContext {
             project_root: ctx.project_root.clone(),
-            project_id: ctx.project_id,
             migration_tool,
             migration_path,
         };
@@ -83,7 +82,7 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
         let rows_to_apply: Vec<&sqlx::postgres::PgRow> = pending_rows
             .iter()
             .filter(|row| {
-                target_filename.as_deref().map_or(true, |fname| {
+                target_filename.as_deref().is_none_or(|fname| {
                     row.try_get::<String, _>("filename")
                         .map(|f| f == fname)
                         .unwrap_or(false)

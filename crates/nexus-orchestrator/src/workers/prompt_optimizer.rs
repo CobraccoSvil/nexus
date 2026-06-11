@@ -227,7 +227,7 @@ impl PromptOptimizerWorker {
             }
         }
         let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|s| std::cmp::Reverse(s.1));
         sorted.into_iter().take(5).map(|(w, _)| w).collect()
     }
 
@@ -453,7 +453,7 @@ impl LearningWorker for PromptOptimizerWorker {
                 error!("prompt_optimizer: errore aggregate_metrics: {}", e);
                 return WorkerOutcome::fail(
                     self.name(),
-                    &format!("aggregate_metrics fallita: {e}"),
+                    format!("aggregate_metrics fallita: {e}"),
                     start.elapsed().as_millis() as u64,
                 );
             }

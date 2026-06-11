@@ -1275,8 +1275,6 @@ async fn fetch_provider_models(provider: &str, api_key: &str) -> anyhow::Result<
         }
         #[derive(Debug, Deserialize)]
         struct BrainModelsResponse {
-            #[allow(dead_code)]
-            provider: String,
             models: Vec<String>,
         }
         let body: BrainModelsResponse = resp.json().await?;

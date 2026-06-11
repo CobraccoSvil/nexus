@@ -1,23 +1,16 @@
 //! Implementazione principale di Orchestrator: orchestrazione
 //! del run agentico, risoluzione provider, prompt e routing.
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
-use mcp_proto::neural::{
-    neural_core_service_client::NeuralCoreServiceClient, ClassifyIntentRequest, EmbedTextRequest,
-    GenerateAgentTurnRequest, GenerateCompletionRequest, RouteModelRequest,
-};
 
 use crate::{
     billing::{self, UsageNumbers},
     domain::OrchestratorAudit,
     nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest, NexusGatewayClient},
-    provider_cooldown::{is_provider_in_cooldown, put_provider_in_cooldown},
+    provider_cooldown::is_provider_in_cooldown,
     vector_memory,
 };
 
@@ -52,8 +45,8 @@ impl Orchestrator {
         self.neural.is_healthy().await
     }
 
-    /// Classifier intent che usa le soglie da DB (mig 0111). Sostituisce le
-    /// chiamate a `classify_intent_async(message)` nei call site di routing.
+    /// Classifier intent che usa le soglie da DB (mig 0111) e delega a
+    /// `classify_intent_async_with_threshold` nei call site di routing.
     /// Se la cache `routing_thresholds` non e' disponibile, fallback ai default.
     async fn classify_intent_with_db_thresholds(&self, message: &str) -> (&'static str, f32) {
         let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
@@ -1460,7 +1453,7 @@ impl Orchestrator {
             "attachments_count": input.attachments.len(),
         });
 
-        Ok(OrchestratorResult { payload, audit })
+        Ok(OrchestratorResult { payload })
     }
 
     async fn load_prompt_corrections(

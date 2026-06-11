@@ -23,7 +23,7 @@
 //! Ritorna JSON con: target_dir, dev_port, config_path, smoke_test_path, packages_installed.
 
 use super::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -81,7 +81,7 @@ fn pick_dev_port(allocations: &[(i32, String)]) -> i32 {
 
 /// Rileva la directory frontend cercando un package.json con dipendenze React/Vite/Next.
 /// Se non trovato, ritorna `root` (progetto monolitico).
-async fn detect_frontend_dir(root: &PathBuf) -> PathBuf {
+async fn detect_frontend_dir(root: &Path) -> PathBuf {
     let frontend_signals = ["react", "vite", "next", "@vitejs/plugin-react"];
 
     // Cerca subdir con package.json contenente uno dei signal
@@ -100,11 +100,11 @@ async fn detect_frontend_dir(root: &PathBuf) -> PathBuf {
     // Fallback: root stesso, se ha package.json
     let root_pkg = root.join("package.json");
     if root_pkg.is_file() {
-        return root.clone();
+        return root.to_path_buf();
     }
 
     // Ultimo fallback: root (l'agente dovra gestire l'errore di install)
-    root.clone()
+    root.to_path_buf()
 }
 
 /// Esegue un comando con timeout, ritorna (stdout, stderr, exit_code).

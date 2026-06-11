@@ -246,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // sanity check deliberato sulle relazioni tra costanti
     fn test_constants_sane() {
         assert!(DEFAULT_RETRIES <= MAX_RETRIES);
         assert!(INITIAL_BACKOFF_MS < MAX_BACKOFF_MS);

@@ -24,7 +24,6 @@ use crate::agent_types::SupervisorMode;
 use crate::chat_messages::{
     insert_message, session_has_active_run, spawn_agent_run, SpawnAgentParams, SpawnOutcome,
 };
-use crate::orchestrator::AutomationMode;
 use crate::AppState;
 
 /// Attesa iniziale: lascia stabilizzare l'avvio prima del primo round.
@@ -417,7 +416,6 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
             profile_provider: None,
             profile_model: None,
             attachments: Vec::new(),
-            user_role: "system".to_string(),
             nexus_agent_type_hint: None,
         };
 

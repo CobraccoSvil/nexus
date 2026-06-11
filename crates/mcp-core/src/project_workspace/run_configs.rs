@@ -1,6 +1,6 @@
 use super::services::{
-    deterministic_project_port_for_key, find_free_port, find_free_project_port,
-    is_web_service_script, NEXUS_RESERVED_PORTS,
+    deterministic_project_port_for_key, find_free_project_port, is_web_service_script,
+    NEXUS_RESERVED_PORTS,
 };
 use super::wizard::{
     classify_role, collect_cargo_workspace_members, collect_compose_files, collect_workspace_dirs,
@@ -1109,7 +1109,7 @@ pub async fn launch_run_config(
 
     if let Some(p) = forced_port {
         if reserved.contains(&p) {
-            // extra safety; should not happen because find_free_port excludes reserved
+            // extra safety; should not happen because find_free_project_port excludes reserved
             let safe = find_free_project_port(&project_id, &state.port_registry).await;
             env_vars.insert("PORT".to_string(), safe.to_string());
         } else if !env_vars.contains_key("PORT") {

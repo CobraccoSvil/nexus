@@ -24,8 +24,6 @@ use crate::AppState;
 #[derive(Debug, Clone)]
 pub(crate) struct ViolationRow {
     pub id: Uuid,
-    pub metric: String,
-    pub value: f64,
     pub file_path: Option<String>,
     pub detail: String,
     pub signature: String,
@@ -136,9 +134,9 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
 
     // Violazioni aperte, escluse quelle in cooldown e quelle di regole non
     // auto-riparabili (join col catalogo: metric = 'kind/rule').
-    let rows: Vec<(Uuid, String, f64, Option<String>, Option<String>, Option<String>)> =
+    let rows: Vec<(Uuid, Option<String>, Option<String>, Option<String>)> =
         sqlx::query_as(
-            "SELECT d.id, d.metric, COALESCE(d.value, 0), d.file_path, d.detail, d.error_signature_hash \
+            "SELECT d.id, d.file_path, d.detail, d.error_signature_hash \
                FROM service_diagnoses d \
                JOIN nexus_resource_policies p \
                  ON p.resource_kind = split_part(d.metric, '/', 1) \
@@ -160,10 +158,8 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     }
     let violations: Vec<ViolationRow> = rows
         .into_iter()
-        .map(|(id, metric, value, file_path, detail, sig)| ViolationRow {
+        .map(|(id, file_path, detail, sig)| ViolationRow {
             id,
-            metric,
-            value,
             file_path,
             detail: detail.unwrap_or_default(),
             signature: sig.unwrap_or_default(),
@@ -312,7 +308,6 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         profile_provider: None,
         profile_model: None,
         attachments: Vec::new(),
-        user_role: "system".to_string(),
         nexus_agent_type_hint: Some("debugger".to_string()),
     };
 
@@ -522,8 +517,6 @@ mod tests {
         let template = "V:\n{violations}\nB: {bucket_start}-{bucket_end}\nA:\n{allocated_ports}";
         let violations = vec![ViolationRow {
             id: Uuid::nil(),
-            metric: "port/enforce_hardcode".into(),
-            value: 5000.0,
             file_path: Some("server.js".into()),
             detail: "server.js:1 5000 (port/enforce_hardcode) | app.listen(5000)".into(),
             signature: "abc".into(),

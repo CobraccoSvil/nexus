@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, AsyncIterator
+from typing import Any
 
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
@@ -228,14 +228,12 @@ class AnthropicProvider(BaseProvider):
         tools: list[dict],
         max_tokens: int = 4096,
         system_text: str = "",
-        extended_thinking: bool = False,
         force_tool_choice: bool | None = None,
     ) -> ProviderResult:
         """Esegue un turno agente con tool_use support nativo Anthropic.
 
-        extended_thinking=True abilita il budget di ragionamento interno (8k token).
-        Il parametro e' opt-in: NON attivare per default perche' ogni chiamata
-        thinking aggiunge fino a 8000 token di output addebitati a prezzo pieno.
+        Il thinking e' governato esclusivamente dalla capability DB
+        (thinking_config / ai_price_catalog), mai da parametri del chiamante.
         """
         if not self._api_key:
             return ProviderResult(
@@ -418,8 +416,8 @@ class AnthropicProvider(BaseProvider):
 
             # Set di modelli "thinking-capable" letto da ai_price_catalog.capabilities
             # (mig 0170). Cache 60s. Modificabili dall'admin senza rideploy.
-            # Il parametro extended_thinking (legacy) viene IGNORATO: la sorgente
-            # di verita' e' esclusivamente il DB per evitare costi imprevisti.
+            # La sorgente di verita' e' esclusivamente il DB per evitare costi
+            # imprevisti (nessun parametro thinking dal chiamante).
             try:
                 thinking_models = _load_thinking_models()
             except ThinkingModelsUnavailable as _tm_err:
@@ -581,7 +579,6 @@ class AnthropicProvider(BaseProvider):
         tools: list[dict],
         max_tokens: int = 8192,
         system_text: str = "",
-        extended_thinking: bool = False,
     ):
         """Streaming di un turno agente: yielda token parziali poi il risultato finale.
 
@@ -781,23 +778,6 @@ class AnthropicProvider(BaseProvider):
         except Exception as e:
             meta = format_error_result(e, self.name, model)
             yield {"type": "error", "message": meta.get("error", str(e)), "metadata": meta}
-
-    async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
-        if not self._api_key:
-            yield "[Anthropic API key not configured]"
-            return
-        try:
-            client = self._get_client()
-            async with client.messages.stream(
-                model=model,
-                max_tokens=kwargs.get("max_tokens", 4096),
-                messages=[{"role": "user", "content": prompt}],
-            ) as stream:
-                async for text in stream.text_stream:
-                    yield text
-        except Exception as e:
-            logger.error("Anthropic stream failed: %s", e)
-            yield f"[Error: {e}]"
 
     async def test_connection(self) -> dict[str, Any]:
         if not self._api_key:

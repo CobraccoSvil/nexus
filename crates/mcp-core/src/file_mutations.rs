@@ -32,8 +32,6 @@ const DEFAULT_MAX_TRACK_BYTES: i64 = 5 * 1024 * 1024;
 #[derive(Debug)]
 pub struct RecordedMutation {
     pub id: i64,
-    /// True se contenuto > cap: revert non possibile, solo metadati salvati.
-    pub truncated: bool,
 }
 
 /// Calcola lo SHA-256 in hex di un blocco di byte.
@@ -93,7 +91,6 @@ pub async fn record_mutation(
     let cap = max_track_bytes(db).await;
     let truncate_before = before_size.map(|s| s > cap).unwrap_or(false);
     let truncate_after = after_size.map(|s| s > cap).unwrap_or(false);
-    let truncated = truncate_before || truncate_after;
 
     let stored_before: Option<&str> = if truncate_before {
         None
@@ -126,7 +123,7 @@ pub async fn record_mutation(
     .await?;
 
     let id: i64 = row.try_get("id")?;
-    Ok(RecordedMutation { id, truncated })
+    Ok(RecordedMutation { id })
 }
 
 /// Riga di una mutazione, esportabile come JSON al frontend.

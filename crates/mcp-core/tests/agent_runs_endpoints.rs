@@ -23,12 +23,10 @@ fn jwt() -> Option<String> {
 async fn client() -> Option<reqwest::Client> {
     // Skip se nessun JWT — i contract test richiedono auth admin.
     jwt()?;
-    Some(
-        reqwest::Client::builder()
+    reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
-            .ok()?,
-    )
+            .ok()
 }
 
 async fn cookie_header() -> String {

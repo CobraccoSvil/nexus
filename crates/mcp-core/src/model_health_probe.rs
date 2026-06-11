@@ -928,8 +928,7 @@ pub(crate) fn classification_from_error_class(ec: &str) -> Classification {
 }
 
 /// Estrae il testo del content dalla response in vari formati provider.
-/// Versione "text" usata per pattern-match su "[Error:". `extract_content_len`
-/// resta come wrapper per backward-compat con i test esistenti.
+/// Versione "text" usata per pattern-match su "[Error:".
 fn extract_content_text(value: &serde_json::Value) -> String {
     if let Some(s) = value.get("content").and_then(|v| v.as_str()) {
         return s.to_string();
@@ -963,43 +962,6 @@ fn extract_content_text(value: &serde_json::Value) -> String {
         }
     }
     String::new()
-}
-
-fn extract_content_len(value: &serde_json::Value) -> usize {
-    // Cerca il content in diversi formati comuni.
-    if let Some(s) = value.get("content").and_then(|v| v.as_str()) {
-        return s.trim().len();
-    }
-    if let Some(arr) = value.get("choices").and_then(|v| v.as_array()) {
-        if let Some(first) = arr.first() {
-            if let Some(s) = first
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                return s.trim().len();
-            }
-        }
-    }
-    if let Some(candidates) = value.get("candidates").and_then(|v| v.as_array()) {
-        if let Some(first) = candidates.first() {
-            if let Some(parts) = first
-                .get("content")
-                .and_then(|c| c.get("parts"))
-                .and_then(|p| p.as_array())
-            {
-                let mut total = 0usize;
-                for p in parts {
-                    if let Some(s) = p.get("text").and_then(|t| t.as_str()) {
-                        total += s.trim().len();
-                    }
-                }
-                return total;
-            }
-        }
-    }
-    // Fallback: lunghezza JSON serializzato senza spazi.
-    serde_json::to_string(value).map(|s| s.len()).unwrap_or(0)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1052,7 +1014,7 @@ mod tests {
     #[test]
     fn extract_content_anthropic() {
         let v = serde_json::json!({"content": "Hello!"});
-        assert_eq!(extract_content_len(&v), 6);
+        assert_eq!(extract_content_text(&v), "Hello!");
     }
 
     #[test]
@@ -1060,7 +1022,7 @@ mod tests {
         let v = serde_json::json!({
             "choices": [{ "message": { "content": "Hi there" } }]
         });
-        assert_eq!(extract_content_len(&v), 8);
+        assert_eq!(extract_content_text(&v), "Hi there");
     }
 
     #[test]
@@ -1070,13 +1032,13 @@ mod tests {
                 "content": { "parts": [{ "text": "hello" }, { "text": "!" }] }
             }]
         });
-        assert_eq!(extract_content_len(&v), 6);
+        assert_eq!(extract_content_text(&v), "hello!");
     }
 
     #[test]
     fn extract_content_empty() {
         let v = serde_json::json!({"content": ""});
-        assert_eq!(extract_content_len(&v), 0);
+        assert_eq!(extract_content_text(&v), "");
     }
 
     // --- FIX 1: tool-probe verdict ------------------------------------------

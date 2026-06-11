@@ -5,12 +5,12 @@
 //! progetto potrebbe avere allocazioni al primo avvio).
 //!
 //! Ogni porta allocata e' unica a livello DB (vincolo UNIQUE su `port`).
-//! Il registro viene consultato da `find_free_port()` per evitare conflitti
-//! e dagli endpoint API per assegnazioni manuali.
+//! Il registro viene consultato da `find_free_project_port()` per evitare
+//! conflitti e dagli endpoint API per assegnazioni manuali.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::sync::RwLock;
@@ -38,8 +38,6 @@ pub struct PortRegistry {
     pub by_port: HashMap<u16, PortAllocation>,
     /// project_id -> lista porte
     pub by_project: HashMap<Uuid, Vec<u16>>,
-    /// Timestamp di caricamento (per debug/UI)
-    pub loaded_at: Instant,
 }
 
 impl PortRegistry {
@@ -61,7 +59,7 @@ impl PortRegistry {
             .unwrap_or_default()
     }
 
-    /// Insieme di tutte le porte allocate (per `find_free_port`).
+    /// Insieme di tutte le porte allocate (per `find_free_project_port`).
     pub fn all_allocated_ports(&self) -> Vec<u16> {
         self.by_port.keys().copied().collect()
     }
@@ -110,7 +108,6 @@ async fn fetch_from_db(db: &PgPool) -> Result<PortRegistry, String> {
     Ok(PortRegistry {
         by_port,
         by_project,
-        loaded_at: Instant::now(),
     })
 }
 
@@ -275,7 +272,6 @@ impl PortRegistryCache {
             *w = Arc::new(PortRegistry {
                 by_port: new_by_port,
                 by_project: new_by_project,
-                loaded_at: Instant::now(),
             });
         }
 
@@ -313,42 +309,10 @@ impl PortRegistryCache {
             *w = Arc::new(PortRegistry {
                 by_port: new_by_port,
                 by_project: new_by_project,
-                loaded_at: Instant::now(),
             });
         }
 
         Ok(())
-    }
-
-    /// Rilascia tutte le porte di un progetto.
-    pub async fn release_all_for_project(&self, project_id: &Uuid) -> Result<u64, String> {
-        let result = sqlx::query("DELETE FROM nexus_port_allocations WHERE project_id = $1")
-            .bind(project_id)
-            .execute(&self.db)
-            .await
-            .map_err(|e| format!("Errore DB durante rilascio porte progetto: {}", e))?;
-
-        // Aggiorna cache inline
-        {
-            let mut w = self.inner.write().await;
-            let old = &**w;
-            let mut new_by_port = old.by_port.clone();
-            let mut new_by_project = old.by_project.clone();
-
-            if let Some(ports) = new_by_project.remove(project_id) {
-                for p in ports {
-                    new_by_port.remove(&p);
-                }
-            }
-
-            *w = Arc::new(PortRegistry {
-                by_port: new_by_port,
-                by_project: new_by_project,
-                loaded_at: Instant::now(),
-            });
-        }
-
-        Ok(result.rows_affected())
     }
 
     /// Startup recovery: sincronizza il registro con i file .service esistenti.
@@ -365,7 +329,7 @@ impl PortRegistryCache {
 
         // 1. Rimuovi allocazioni orfane (il file .service non esiste piu')
         let registry = self.current().await;
-        for (_, alloc) in &registry.by_port {
+        for alloc in registry.by_port.values() {
             if let Some(ref unit) = alloc.service_unit {
                 let path = format!("{}/{}", svc_dir, unit);
                 if !std::path::Path::new(&path).exists() {
@@ -603,7 +567,7 @@ fn dev_server_roots_to_kill(procs: &[(u32, u64, u32)]) -> Vec<u32> {
         return Vec::new();
     }
     // Ordina per start time decrescente: la prima radice e' la piu' recente, da tenere.
-    roots.sort_by(|a, b| b.1.cmp(&a.1));
+    roots.sort_by_key(|r| std::cmp::Reverse(r.1));
     roots.iter().skip(1).map(|(p, _)| *p).collect()
 }
 

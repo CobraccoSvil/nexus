@@ -102,7 +102,7 @@ fn extract_imports(file_path: &str, content: &str) -> Vec<String> {
         None => return Vec::new(),
     };
     let mut out: Vec<String> = Vec::new();
-    let mut push = |s: String, out: &mut Vec<String>| {
+    let push = |s: String, out: &mut Vec<String>| {
         let trimmed = s.trim().to_string();
         if !trimmed.is_empty() && !out.contains(&trimmed) && out.len() < MAX_IMPORTS_PER_FILE {
             out.push(trimmed);

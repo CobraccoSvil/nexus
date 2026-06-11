@@ -84,7 +84,7 @@ fn derive_app_db_name(slug: Option<&str>, project_id: Uuid) -> String {
     if sanitized
         .chars()
         .next()
-        .map_or(true, |c| c.is_ascii_digit())
+        .is_none_or(|c| c.is_ascii_digit())
     {
         sanitized.insert(0, 'p');
     }
@@ -195,7 +195,8 @@ pub async fn provision_project_db(
             }
 
             // Test superato: salva la configurazione (riusa set_project_db_config).
-            set_project_db_config(
+            // Il Json di risposta non serve: questo handler costruisce il suo.
+            let _ = set_project_db_config(
                 State(state.clone()),
                 Extension(claims),
                 AxumPath(project_id),

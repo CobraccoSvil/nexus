@@ -69,8 +69,6 @@ pub struct UpsertTemplateReq {
 pub struct FalsePositiveReq {
     pub reason: Option<String>,
     pub rule_key: Option<String>,
-    #[allow(dead_code)]
-    pub code_snippet: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -929,7 +927,7 @@ oppure\n\
 
                             prompt_tools.push(PromptMcpTool {
                                 tool_name,
-                                tool_server: tool_server,
+                                tool_server,
                                 usage_context: usage_ctx_opt,
                             });
 
@@ -1319,19 +1317,6 @@ pub async fn available_mcp_tools_handler(
         .collect();
 
     Ok(Json(serde_json::json!(tools)))
-}
-
-/// Get set of disabled quality rule keys from DB (for RuleOverrides)
-#[allow(dead_code)]
-pub async fn get_disabled_quality_rules(db: &PgPool) -> std::collections::HashSet<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT key FROM nexus_prompt_templates WHERE category='quality' AND is_active=FALSE",
-    )
-    .fetch_all(db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .collect()
 }
 
 #[cfg(test)]

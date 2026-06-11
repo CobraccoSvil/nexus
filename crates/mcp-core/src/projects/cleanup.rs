@@ -174,7 +174,7 @@ async fn cleanup_docker_containers(slug: &str) -> DockerResult {
 
     let mut container_ids: Vec<String> = Vec::new();
     match by_label {
-        Ok(ids) => container_ids.extend(ids.into_iter()),
+        Ok(ids) => container_ids.extend(ids),
         Err(e) => out.errors.push(format!("docker ps (label): {}", e)),
     }
     match by_name {
@@ -187,11 +187,10 @@ async fn cleanup_docker_containers(slug: &str) -> DockerResult {
                 }
                 let name = parts[0];
                 let id = parts[1].to_string();
-                if name == slug || name.starts_with(&prefix) {
-                    if !container_ids.contains(&id) {
+                if (name == slug || name.starts_with(&prefix))
+                    && !container_ids.contains(&id) {
                         container_ids.push(id);
                     }
-                }
             }
         }
         Err(e) => out.errors.push(format!("docker ps (name): {}", e)),

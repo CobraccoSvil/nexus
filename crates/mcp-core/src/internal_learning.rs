@@ -43,6 +43,10 @@ pub struct LearningFeedbackRequest {
     /// True se l'episodio e' terminale (run completato). Falso per
     /// step intermedi (oggi sempre true; mantenuto per compatibility col
     /// vecchio gRPC `FeedbackRequest`).
+    #[expect(
+        dead_code,
+        reason = "contratto wire del brain: oggi sempre true, previsto per step intermedi"
+    )]
     #[serde(default = "default_true")]
     pub is_terminal: bool,
 }

@@ -1,6 +1,6 @@
 import { API_BASE, NEURAL_BASE, fetchJson, fetchJsonNoAuth } from "./_shared";
 
-export interface AgentStepUsage {
+interface AgentStepUsage {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
@@ -23,7 +23,7 @@ export interface AgentStep {
   topP?: number;
 }
 
-export interface AITraceToolCall {
+interface AITraceToolCall {
   name: string;
   input: Record<string, unknown>;
 }
@@ -44,14 +44,14 @@ export interface AITraceEvent {
   cacheReadTokens?: number;
 }
 
-export interface AgentPendingAction {
+interface AgentPendingAction {
   index: number;
   toolName: string;
   toolInput: Record<string, unknown>;
   description: string;
 }
 
-export interface AgentRunUsage {
+interface AgentRunUsage {
   totalPromptTokens?: number;
   totalCompletionTokens?: number;
   totalTokens?: number;
@@ -151,57 +151,14 @@ export async function cancelAgentRun(
 
 // --- Neural Core (Python :8001) ---
 
-export interface IntentResponse {
-  intent: string;
-  confidence: string;
-}
-
-export interface RouteResponse {
-  intent: string;
-  provider: string;
-  model: string;
-  rationale: string;
-  confidence: string;
-}
-
 export interface ProviderModelsResponse {
   provider: string;
   status: string;
   models: string[];
 }
 
-export async function classifyIntent(
-  projectId: string,
-  profileId: string,
-  message: string,
-): Promise<IntentResponse> {
-  return fetchJsonNoAuth(`${NEURAL_BASE}/classify-intent`, {
-    method: "POST",
-    body: JSON.stringify({ project_id: projectId, profile_id: profileId, message }),
-  });
-}
-
-export async function routeModel(
-  projectId: string,
-  profileId: string,
-  message: string,
-): Promise<RouteResponse> {
-  return fetchJsonNoAuth(`${NEURAL_BASE}/route-model`, {
-    method: "POST",
-    body: JSON.stringify({ project_id: projectId, profile_id: profileId, message }),
-  });
-}
-
 export async function getProviderModels(provider: string): Promise<ProviderModelsResponse> {
   return fetchJsonNoAuth(`${NEURAL_BASE}/providers/${provider}/models`);
-}
-
-export async function getProviderHealth(provider: string): Promise<Record<string, unknown>> {
-  return fetchJsonNoAuth(`${NEURAL_BASE}/providers/${provider}/health`);
-}
-
-export async function getNeuralHealth(): Promise<Record<string, string>> {
-  return fetchJsonNoAuth(`${NEURAL_BASE}/health`);
 }
 
 /** Stati terminali di un run agente (allineati al backend agent_runs.status). */

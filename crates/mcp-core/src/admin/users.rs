@@ -3,7 +3,6 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -14,15 +13,6 @@ pub use nexus_types::admin_dto::{
     UserProjectRole, UserResponse, UserWithProjectsResponse,
 };
 
-/// CreateUserRequest e' specifico di mcp-core (admin-service non lo usa); resta
-/// locale.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct CreateUserRequest {
-    pub email: String,
-    pub display_name: String,
-}
-
 // List users with pagination
 pub async fn list_users(
     State(state): State<AppState>,
@@ -31,7 +21,7 @@ pub async fn list_users(
     tracing::warn!("list_users: CALLED!");
 
     let page = params.page.unwrap_or(1).max(1);
-    let limit = params.limit.unwrap_or(20).min(100).max(1);
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * limit;
 
     tracing::warn!(

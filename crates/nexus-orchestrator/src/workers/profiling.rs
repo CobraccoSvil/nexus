@@ -53,7 +53,7 @@ impl LearningWorker for ProfilingWorker {
             if let Ok(result) = &outcome.result {
                 times_by_agent
                     .entry(result.agent_type.name().to_string())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(result.execution_time_ms);
             }
         }

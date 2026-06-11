@@ -15,7 +15,6 @@ use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use crate::{
-    agent_types::AgentStepEvent,
     auth::Claims,
     chat_learning::{api_error, parse_user_id, ApiError, ApiResult},
     AppState,

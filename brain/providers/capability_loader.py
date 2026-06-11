@@ -138,9 +138,3 @@ def load_capability(provider: str, model: str) -> ProviderCapability:
     _CACHE[key] = cap
     _CACHE_TS[key] = now
     return cap
-
-
-def clear_cache() -> None:
-    """Svuota la cache (utile nei test)."""
-    _CACHE.clear()
-    _CACHE_TS.clear()

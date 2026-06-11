@@ -23,7 +23,7 @@ export interface KnowledgeNote {
   backlinks?: KnowledgeLink[];
 }
 
-export interface KnowledgeLink {
+interface KnowledgeLink {
   linkId: string;
   fromNoteId?: string;
   toNoteId?: string;
@@ -32,12 +32,6 @@ export interface KnowledgeLink {
   relType: string;
   createdBy: string;
   confidence: number;
-}
-
-export interface KnowledgeTag {
-  tag: string;
-  noteCount: number;
-  lastUsedAt: string;
 }
 
 export interface SimilarHit {
@@ -83,48 +77,9 @@ export async function patchKnowledgeNote(
   });
 }
 
-export async function deleteKnowledgeNote(
-  projectId: string,
-  noteId: string,
-): Promise<{ ok: boolean; deleted: string }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/notes/${noteId}`, {
-    method: "DELETE",
-  });
-}
-
-export async function findSimilarKnowledge(
-  projectId: string,
-  text: string,
-  signal?: AbortSignal,
-): Promise<{ hits: SimilarHit[] }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/similar`, {
-    method: "POST",
-    body: JSON.stringify({ text }),
-    signal,
-  });
-}
-
-export async function createKnowledgeLink(
-  projectId: string,
-  body: { from_note_id: string; to_note_id: string; rel_type: string },
-): Promise<{ linkId: string }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/links`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-}
-
-export async function deleteKnowledgeLink(projectId: string, linkId: string): Promise<{ ok: boolean }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/links/${linkId}`, { method: "DELETE" });
-}
-
-export async function listKnowledgeTags(projectId: string): Promise<{ tags: KnowledgeTag[] }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/tags`);
-}
-
 // ── Knowledge graph (Cytoscape data) ────────────────────────────────────
 
-export interface KnowledgeGraphNode {
+interface KnowledgeGraphNode {
   id: string;
   title: string;
   intent: string | null;
@@ -160,138 +115,6 @@ export async function getKnowledgeGraph(
   return fetchJson(`/api/projects/${projectId}/knowledge/graph${qs ? `?${qs}` : ""}`);
 }
 
-export async function recomputeKnowledgeLinks(
-  projectId: string,
-): Promise<{ ok: boolean; notes_processed: number; links_created: number }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/recompute-links`, {
-    method: "POST",
-    body: "{}",
-  });
-}
-
-// W2 code-wiki: avvia la generazione della documentazione AI per-file.
-// La generazione gira in background; le note code_doc compaiono man mano.
-export async function generateCodeWiki(
-  projectId: string,
-): Promise<{ ok: boolean; started: boolean }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/code-wiki/generate`, {
-    method: "POST",
-    body: "{}",
-  });
-}
-
-export async function rebuildKnowledge(
-  projectId: string,
-  opts?: { reset?: boolean },
-): Promise<{
-  ok: boolean;
-  reset: boolean;
-  messages_total: number;
-  notes_created: number;
-  skipped_short: number;
-  linked_notes: number;
-  links_created: number;
-}> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/rebuild`, {
-    method: "POST",
-    body: JSON.stringify({ reset: opts?.reset ?? false }),
-  });
-}
-
-export async function extractFunctionalSpecs(
-  projectId: string,
-  opts?: { limit?: number; include_files?: boolean; files_limit?: number },
-): Promise<{
-  ok: boolean;
-  messages_scanned: number;
-  messages_skipped_short: number;
-  messages_with_specs: number;
-  files_scanned: number;
-  files_skipped_short: number;
-  files_with_specs: number;
-  specs_extracted: number;
-  specs_applied: number;
-  llm_errors: number;
-  linked_notes: number;
-  links_created: number;
-}> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/extract-functional`, {
-    method: "POST",
-    body: JSON.stringify({
-      limit: opts?.limit ?? 50,
-      include_files: opts?.include_files ?? true,
-      files_limit: opts?.files_limit ?? 80,
-    }),
-  });
-}
-
-/**
- * Endpoint unificato: inizializza o aggiorna l'intera KB del progetto in
- * un solo colpo (resiliente). Sostituisce il flusso a tre tasti.
- *
- * Pipeline interna:
- *   1. FunctionalSpecAgent (chat + file `.md`/sorgenti) → note kind=functional
- *   2. 3 generator (technical/functional/test)
- *   3. Rebuild idempotente da chat_messages user
- *   4. Ricalcolo link automatici
- */
-export async function initOrRefreshKnowledge(
-  projectId: string,
-  opts?: { reset?: boolean; chat_limit?: number; files_limit?: number },
-): Promise<{
-  ok: boolean;
-  reset: boolean;
-  deleted_notes: number;
-  functional_agent: {
-    messages_scanned?: number;
-    messages_with_specs?: number;
-    files_scanned?: number;
-    files_with_specs?: number;
-    specs_extracted?: number;
-    specs_applied?: number;
-    llm_errors?: number;
-  };
-  generators: { notes_generated?: number; notes_applied?: number };
-  rebuild_from_chat: { messages_total?: number; notes_created?: number };
-  links: { notes_processed?: number; links_created?: number };
-  warnings: string[];
-}> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/init-or-refresh`, {
-    method: "POST",
-    body: JSON.stringify({
-      reset: opts?.reset ?? false,
-      chat_limit: opts?.chat_limit ?? 100,
-      files_limit: opts?.files_limit ?? 80,
-    }),
-  });
-}
-
-export async function createKnowledgeNoteManual(
-  projectId: string,
-  body: { title: string; body_md: string; intent?: string; tags?: string[]; file_paths?: string[] },
-): Promise<{ ok: boolean; note_id: string; intent: string }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/notes/manual`, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-}
-
-// ── Obsidian vault config (per progetto) ────────────────────────────────
-
-export async function getObsidianVaultName(projectId: string): Promise<{ obsidian_vault_name: string }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/obsidian-vault`);
-}
-
-export async function putObsidianVaultName(
-  projectId: string,
-  obsidian_vault_name: string,
-): Promise<{ ok: boolean; obsidian_vault_name: string }> {
-  return fetchJson(`/api/projects/${projectId}/knowledge/obsidian-vault`, {
-    method: "PUT",
-    body: JSON.stringify({ obsidian_vault_name }),
-  });
-}
-
 // ── Wiki editing + versioning per knowledge notes (Fase 2/3 wiki unification) ──
 
 export async function listKnowledgeNoteRevisions(
@@ -310,17 +133,6 @@ export async function getKnowledgeNoteRevision(
 ): Promise<WikiRevision> {
   return fetchJson(
     `/api/projects/${projectId}/knowledge/notes/${noteId}/revisions/${version}`,
-  );
-}
-
-export async function getKnowledgeNoteDiff(
-  projectId: string,
-  noteId: string,
-  from: number,
-  to: number,
-): Promise<{ from: WikiRevision; to: WikiRevision }> {
-  return fetchJson(
-    `/api/projects/${projectId}/knowledge/notes/${noteId}/diff?from=${from}&to=${to}`,
   );
 }
 

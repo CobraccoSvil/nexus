@@ -60,8 +60,10 @@ impl QLearningRouter {
         let hnsw_config = HnswConfig::default();
         let agent_hnsw = Arc::new(HnswDb::new(hnsw_config));
 
-        let mut stats = RouterStats::default();
-        stats.current_epsilon = config.epsilon;
+        let stats = RouterStats {
+            current_epsilon: config.epsilon,
+            ..Default::default()
+        };
 
         Self {
             config,

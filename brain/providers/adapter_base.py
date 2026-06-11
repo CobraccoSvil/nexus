@@ -5,7 +5,6 @@ prima erano hardcoded nei singoli provider, leggendole dalle capability DB:
 
 - resolve_max_tokens   (M5): budget risposta entro il tetto hard del modello.
 - resolve_tool_choice  (M5): spec tool_choice nel dialetto del provider.
-- translate_tools_for  (M1): payload tool + doc block per il dialetto del modello.
 - is_soft_failure      (M4): rileva il turno "vuoto" (end_turn senza tool e con
                               poco contenuto) che va trattato come fallimento
                               soft e instradato al fallback chain.
@@ -20,9 +19,8 @@ from typing import Any
 
 import logging
 
-from ._models import CanonicalTool, ProviderCapability
+from ._models import ProviderCapability
 from ._schema_utils import is_first_agent_turn
-from .tool_translator import dialect_for_capability
 
 logger = logging.getLogger(__name__)
 
@@ -428,20 +426,6 @@ def should_disable_thinking(
     if has_tools:
         return True
     return internal_task and _internal_text_thinking_disabled()
-
-
-def translate_tools_for(
-    cap: ProviderCapability, tools: list[CanonicalTool]
-) -> tuple[list[dict] | None, str]:
-    """(payload_tool, doc_block) per il dialetto del modello.
-
-    payload_tool e None per i provider tool-mute; in quel caso doc_block contiene
-    la descrizione testuale dei tool da iniettare nel system prompt.
-    """
-    dialect = dialect_for_capability(cap)
-    payload = dialect.translate_tools(tools, cap)
-    doc = dialect.documentation_block(tools) if payload is None else ""
-    return payload, doc
 
 
 def is_soft_failure(

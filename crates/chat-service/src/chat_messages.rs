@@ -14,11 +14,7 @@ use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
-    #[allow(dead_code)]
-    pub session_id: Option<String>,
     pub content: String,
-    #[allow(dead_code)]
-    pub attachments: Option<Vec<Value>>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub automation: Option<String>,

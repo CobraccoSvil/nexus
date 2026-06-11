@@ -311,6 +311,7 @@ async fn unit_active_enter(unit: &str) -> Option<String> {
 ///   1. `nexus_port_allocations` (porte allocate dal port_registry);
 ///   2. variabili `Environment` del unit il cui nome contiene PORT (es. PORT,
 ///      PORT_BACKEND) — copre gli unit creati fuori dal flusso port_registry.
+///
 /// Vuoto = servizio senza porta nota (worker): readiness non applicabile.
 async fn ports_for_unit(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<u16> {
     let mut ports: HashSet<u16> = HashSet::new();

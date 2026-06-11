@@ -5,5 +5,7 @@ version.workspace = true
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
 tiktoken-rs = "0.6"
+
+[lints]
+workspace = true

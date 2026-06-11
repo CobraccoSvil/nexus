@@ -6,8 +6,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mcp_db;
-use mcp_quality;
 
 use axum::{
     extract::{Extension, Path as AxumPath, Query, State},
@@ -1575,7 +1573,6 @@ pub use crud::*;
 pub use custom_instructions::*;
 pub use deep_analyze::*;
 pub use deep_review::*;
-pub use file_watcher::spawn_file_watcher;
 pub use indexing::*;
 pub use quality::*;
 pub use terminal::*;

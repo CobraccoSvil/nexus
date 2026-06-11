@@ -23,7 +23,6 @@ use regex::RegexSet;
 #[derive(Debug, Clone)]
 pub struct BlockReason {
     pub category: &'static str,
-    pub pattern_index: usize,
     pub message: &'static str,
     pub remediation: &'static str,
 }
@@ -263,7 +262,6 @@ pub fn check_command(cmd: &str) -> Option<BlockReason> {
     if has_system_systemctl(normalized) {
         return Some(BlockReason {
             category: "systemctl_system",
-            pattern_index: usize::MAX,
             message: "Gestione servizi systemd di SISTEMA vietata",
             remediation: "Per i servizi del progetto usa `systemctl --user <slug>-<servizio>.service`. `systemctl` di sistema e' sysadmin, fuori scope progetto.",
         });
@@ -276,7 +274,6 @@ pub fn check_command(cmd: &str) -> Option<BlockReason> {
     let (category, _re, message, remediation) = FORBIDDEN_PATTERNS[idx];
     Some(BlockReason {
         category,
-        pattern_index: idx,
         message,
         remediation,
     })

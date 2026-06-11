@@ -100,6 +100,10 @@ enum BridgeRequest {
     Eval { request_id: String, tab_id: Option<i64>, expression_b64: String, await_promise: bool },
     ListTabs { request_id: String },
     AttachTab { request_id: String, tab_id: i64 },
+    #[expect(
+        dead_code,
+        reason = "protocollo WS simmetrico: detach_tab gia' gestito dall'estensione (background.js), tool MCP browser.detach_tab da esporre"
+    )]
     DetachTab { request_id: String, tab_id: i64 },
     Heartbeat,
 }
@@ -472,7 +476,10 @@ fn push_capped<T>(buf: &mut VecDeque<T>, item: T) {
 
 #[derive(Deserialize)]
 struct JsonRpcReq {
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "campo del wire-format JSON-RPC 2.0, accettato ma non validato"
+    )]
     jsonrpc: Option<String>,
     id: Option<Value>,
     method: String,

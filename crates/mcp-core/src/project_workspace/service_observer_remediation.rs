@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 use crate::agent_types::SupervisorMode;
 use crate::chat_messages::{insert_message, spawn_agent_run, SpawnAgentParams, SpawnOutcome};
-use crate::orchestrator::AutomationMode;
 use crate::AppState;
 
 #[allow(clippy::too_many_arguments)]
@@ -152,7 +151,6 @@ pub(crate) async fn maybe_trigger_debugger(
         profile_provider: None,
         profile_model: None,
         attachments: Vec::new(),
-        user_role: "system".to_string(),
         // Forza l'agente Debugger (il prompt esplicito nel content rinforza).
         nexus_agent_type_hint: Some("debugger".to_string()),
     };

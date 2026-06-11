@@ -53,12 +53,11 @@ fn parse_playwright_output(stdout: &str, stderr: &str) -> PlaywrightStats {
         }
 
         // Righe tipo "    ✓  1 [chromium] › auth.spec.ts:10:3 › should login"
-        if trimmed.starts_with('✓') || trimmed.starts_with("  ✓") || trimmed.contains("] ›") {
-            if trimmed.contains("FAILED") || trimmed.starts_with('✘') || trimmed.starts_with("  ✘")
+        if (trimmed.starts_with('✓') || trimmed.starts_with("  ✓") || trimmed.contains("] ›"))
+            && (trimmed.contains("FAILED") || trimmed.starts_with('✘') || trimmed.starts_with("  ✘"))
             {
                 stats.failed_tests.push(trimmed.to_string());
             }
-        }
 
         // Righe tipo "    ✘  1 [chromium] › home.spec.ts:5:3 › should load ─────"
         if trimmed.starts_with('✘') || (trimmed.contains("✘") && trimmed.contains("›")) {
