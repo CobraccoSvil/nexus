@@ -67,6 +67,13 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             )),
         )
         .route(
+            "/api/admin/settings-categories",
+            get(settings::list_categories).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
+        .route(
             "/api/admin/billing/prices",
             get(billing::list_prices).post(billing::create_price).layer(
                 axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),

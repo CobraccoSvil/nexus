@@ -40,7 +40,6 @@ mod model_catalog_sync;
 mod model_health_probe;
 mod models;
 mod mutations_api;
-mod nexus_autofix_worker;
 mod nexus_bridge;
 mod nexus_builtin;
 mod nexus_database_stats;
@@ -1097,8 +1096,11 @@ async fn main() -> anyhow::Result<()> {
     // restano in sincrono solo via `POST /api/wiki/reingest`.
     agent_tool_result_cache::start_cleanup_worker(state.db.clone());
 
-    // NexusAutoFixAgent: intercetta E2E fallimenti e genera change_drafts.
-    nexus_autofix_worker::start_nexus_autofix_worker(state.clone());
+    // NexusAutoFixAgent RIMOSSO (audit settings 2026-06-11): il worker
+    // pollava nexus_e2e_runs ogni 300s, ma NESSUN codice ha mai scritto in
+    // quella tabella (il runner E2E del vault meta-docs non fu mai
+    // implementato; sistema sostituito dal wiki unificato, ADR 0017 v2).
+    // Girava a vuoto dalla nascita. Vedi mig 0406 per il cleanup settings.
 
     // ToolRunner gRPC server (Fase 1 refactor orchestrazione LangGraph).
     // Valore canonico: settings.tool_runner_enabled nel DB (admin panel).

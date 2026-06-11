@@ -20,8 +20,8 @@ import { getGatewayProviders } from "../../lib/api-client";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
-
-export const CATEGORY_ORDER = ["providers", "routing", "security", "infrastructure", "embeddings", "quality", "learning", "agent", "optimizer", "reflection", "auth", "custom"];
+// Le categorie di navigazione derivano dai dati: vedi lib/settings-categories.ts
+// (punto unico, regola L). La vecchia CATEGORY_ORDER hardcoded e' stata rimossa.
 
 interface SettingsPanelProps {
   category?: string;

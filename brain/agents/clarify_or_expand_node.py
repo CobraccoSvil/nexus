@@ -101,6 +101,11 @@ def _load_config() -> dict[str, Any]:
         "intake_gate_enabled": False,
         "intake_match_min_score": 0.7,
         "intake_topk": 5,
+        # M14.4: conferma su duplicate gia' implementati-e-verificati. Chiave DB
+        # clarify.confirm_if_implemented (rinominata da kb.intake.* in mig 0408:
+        # il loader legge SOLO clarify.% e la chiave non veniva mai caricata —
+        # bug di wiring dalla nascita, audit settings 2026-06-11).
+        "confirm_if_implemented": True,
         # Sotto (<=) questo agentic_score un intent chat e' small-talk puro
         # (saluti/ringraziamenti) e bypassa l'intake gate. Sopra, anche una
         # "chat" e' una richiesta sostanziale e consulta la KB del progetto.
@@ -171,6 +176,8 @@ def _load_config() -> dict[str, Any]:
                             defaults["smalltalk_agentic_score_max"] = float(value)
                         except (TypeError, ValueError):
                             pass
+                    elif short == "confirm_if_implemented":
+                        defaults["confirm_if_implemented"] = str(value).lower() not in ("false", "0", "off")
     except Exception as exc:
         logger.debug("clarify_or_expand: _load_config fallback (%s)", exc)
     return defaults
@@ -445,7 +452,7 @@ def _apply_intake_verdict(state: AgentState, intake: dict, cfg: dict) -> dict[st
             meta_steps.persist_async(run_id, ms)
         # M14.4: se la richiesta e' GIA' implementata-e-verificata, chiede sempre
         # conferma prima di rifarla, ANCHE in automatico (decisione utente:
-        # evitare di rifare lavoro gia' fatto). Gated kb.intake.confirm_if_implemented.
+        # evitare di rifare lavoro gia' fatto). Gated clarify.confirm_if_implemented.
         confirm_if_impl = bool(cfg.get("confirm_if_implemented", True))
         force_confirm = confirm_if_impl and impl.get("implemented")
         if not is_auto or force_confirm:

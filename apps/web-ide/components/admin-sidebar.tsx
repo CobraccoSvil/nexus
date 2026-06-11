@@ -6,21 +6,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
-
-const settingsSubKeys = [
-  { key: "providers", href: "/admin/settings/providers" as Route },
-  { key: "routing", href: "/admin/settings/routing" as Route },
-  { key: "connectors", href: "/admin/settings/connectors" as Route, label: "Plugin MCP" },
-  { key: "security", href: "/admin/settings/security" as Route, label: "Sicurezza & DLP" },
-  { key: "infrastructure", href: "/admin/settings/infrastructure" as Route },
-  { key: "embeddings", href: "/admin/settings/embeddings" as Route },
-  { key: "quality", href: "/admin/settings/quality" as Route },
-  { key: "learning", href: "/admin/settings/learning" as Route },
-  { key: "agent", href: "/admin/settings/agent" as Route, label: "Agenti AI" },
-  { key: "optimizer", href: "/admin/settings/optimizer" as Route, label: "Ottimizzatore" },
-  { key: "reflection", href: "/admin/settings/reflection" as Route, label: "Self-Reflection" },
-  { key: "auth", href: "/admin/settings/auth" as Route },
-];
+import { useSettingsCategories } from "../lib/settings-categories";
 
 export function AdminSidebar({
   compact = false,
@@ -32,6 +18,9 @@ export function AdminSidebar({
   const pathname = usePathname();
   const tc = useThemeColors();
   const { t } = useI18n();
+  // Voci settings derivate dai DATI (SELECT DISTINCT category) — regola L:
+  // una categoria nuova nel DB diventa navigabile senza toccare il frontend.
+  const settingsCategories = useSettingsCategories();
 
   const menuGroups = [
     {
@@ -158,14 +147,16 @@ export function AdminSidebar({
       </Link>
 
       <div className="flex-col" style={{ marginLeft: compact ? 20 : 32, gap: 1 }}>
-        {settingsSubKeys.map((item) => {
-          const active = pathname === item.href;
-          const catKey = `cat.${item.key}` as Parameters<typeof t>[0];
-          const displayLabel = "label" in item && item.label ? item.label : t(catKey);
+        {settingsCategories.map((item) => {
+          const href = `/admin/settings/${item.key}` as Route;
+          const active = pathname === href;
+          const catKey = `cat.${item.key}`;
+          const translated = t(catKey as Parameters<typeof t>[0]);
+          const displayLabel = translated !== catKey ? translated : item.label;
           return (
             <Link
               key={item.key}
-              href={item.href}
+              href={href}
               className="text-sm transition-all"
               onClick={onNavigate}
               style={{

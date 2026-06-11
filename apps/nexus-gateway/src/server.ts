@@ -36,6 +36,11 @@ const DB_KEY_MAP: Record<string, string> = {
   rate_limit_per_provider_window_ms: "RATE_LIMIT_PER_PROVIDER_WINDOW_MS",
   health_check_interval_ms:          "HEALTH_CHECK_INTERVAL_MS",
   default_max_tokens:                "DEFAULT_MAX_TOKENS",
+  // Profilo operativo (config/policies/*.yaml). Il commit 5591746 dichiarava
+  // la chiave gestita "da settings DB (admin panel)" ma il bridge non era mai
+  // stato costruito: il profilo cadeva sempre sul default env/cloud (audit
+  // settings 2026-06-11, regola G).
+  nexus_profile:                     "NEXUS_PROFILE",
 };
 
 async function loadApiKeysFromDb(): Promise<void> {

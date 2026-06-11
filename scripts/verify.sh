@@ -48,4 +48,9 @@ else
     echo "-- verify: Rust saltato (VERIFY_SKIP_RUST=1)"
 fi
 
+# Gate ratchet configurazioni: settings morte/fantasma/invisibili possono solo
+# scendere (baseline in scripts/audit-settings-baseline.json). Se il DB live
+# non e' raggiungibile lo script degrada da solo in modalita' --no-db.
+run_phase "audit settings (gate ratchet)" bash scripts/audit-settings.sh --gate
+
 echo -e "${GREEN}OK verify: tutte le fasi passate${NC}"

@@ -106,6 +106,12 @@ _KEYS = (
     "final_gate_runtime_check_enabled",
     "final_gate_runtime_log_command",
     "final_gate_runtime_error_patterns",
+    # Clarifying questions pre-flight del planner (mig 0158). Lette da
+    # planner_node (cfg.get) fin dalla nascita ma MAI caricate dal DB: il
+    # bug di wiring le rendeva inerti (audit settings 2026-06-11) — il
+    # toggle in OrchestratorPanel non aveva alcun effetto.
+    "clarifying_questions_enabled",
+    "clarifying_questions_max",
 )
 
 # Override del nome completo (key DB) per le chiavi che NON usano il prefisso
@@ -214,6 +220,9 @@ _SAFE_DEFAULTS: dict[str, Any] = {
         "500 (Internal Server Error)",
         "Internal Server Error",
     ],
+    # Clarifying questions pre-flight del planner (vedi nota in _KEYS).
+    "clarifying_questions_enabled": True,
+    "clarifying_questions_max": 3,
 }
 
 _lock = threading.RLock()

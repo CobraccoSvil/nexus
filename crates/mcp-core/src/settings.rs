@@ -204,6 +204,32 @@ pub async fn list_by_category(
     Json(serde_json::json!({ "settings": masked }))
 }
 
+/// GET /api/admin/settings-categories — categorie distinte con conteggio.
+///
+/// Fonte per la sidebar admin dinamica (regola L): le voci di navigazione
+/// derivano dai DATI, non da una lista hardcoded nel frontend. Prima del
+/// fix le categorie fuori dalla lista statica erano invisibili (160 chiavi
+/// non amministrabili da UI).
+pub async fn list_categories(State(state): State<super::AppState>) -> Json<serde_json::Value> {
+    let rows: Vec<(String, i64)> = match sqlx::query_as(
+        "SELECT category, count(*) FROM settings WHERE category <> '' GROUP BY category ORDER BY category",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("list_categories: SELECT fallito: {}", e);
+            Vec::new()
+        }
+    };
+    let categories: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(category, count)| serde_json::json!({ "category": category, "count": count }))
+        .collect();
+    Json(serde_json::json!({ "categories": categories }))
+}
+
 /// PUT /api/settings/:key — update a single setting
 pub async fn update_setting(
     State(state): State<super::AppState>,
