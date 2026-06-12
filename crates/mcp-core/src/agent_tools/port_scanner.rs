@@ -388,17 +388,65 @@ pub async fn enforce_write_ports(
     if !is_enforcement_enabled(ctx.db.as_ref()).await {
         return None;
     }
-    if let PortScanOutcome::Reject(findings) = scan_content(path, content) {
-        audit_port_rejection(ctx, "port_hardcode_rejected", tool_name, path, &findings);
-        return Some(format_reject_message(path, &findings));
+    let rejection: Option<String> =
+        if let PortScanOutcome::Reject(findings) = scan_content(path, content) {
+            audit_port_rejection(ctx, "port_hardcode_rejected", tool_name, path, &findings);
+            Some(format_reject_message(path, &findings))
+        } else if let Some(unalloc) =
+            unallocated_bucket_findings(ctx.db.as_ref(), ctx.project_id, path, content).await
+        {
+            audit_port_rejection(ctx, "port_unallocated_rejected", tool_name, path, &unalloc);
+            Some(format_unallocated_message(path, &unalloc))
+        } else {
+            None
+        };
+    // Arricchimento anti-loop: l'agente spesso ha GIA' chiamato request_port ma
+    // poi hardcoda una porta diversa (es. allocata 21950, scrive 21951) ed entra
+    // in loop sullo stesso rifiuto. Mostrargli le porte gia' allocate al progetto
+    // rompe il loop indicando il numero ESATTO da usare (fix definitivo, regola H).
+    match rejection {
+        Some(mut msg) => {
+            msg.push_str(&allocated_ports_hint(ctx.db.as_ref(), ctx.project_id).await);
+            Some(msg)
+        }
+        None => None,
     }
-    if let Some(unalloc) =
-        unallocated_bucket_findings(ctx.db.as_ref(), ctx.project_id, path, content).await
-    {
-        audit_port_rejection(ctx, "port_unallocated_rejected", tool_name, path, &unalloc);
-        return Some(format_unallocated_message(path, &unalloc));
+}
+
+/// Blocco testuale con le porte GIA' allocate al progetto (label incluso), da
+/// appendere ai messaggi di rifiuto. Stringa vuota se nessuna allocazione o su
+/// errore DB (best-effort: non deve impedire il rifiuto).
+async fn allocated_ports_hint(db: &PgPool, project_id: uuid::Uuid) -> String {
+    let rows: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT port::int, COALESCE(label, '?') \
+         FROM nexus_port_allocations WHERE project_id = $1 ORDER BY port",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let ports: Vec<(u32, String)> = rows.into_iter().map(|(p, l)| (p as u32, l)).collect();
+    render_allocated_hint(&ports)
+}
+
+/// Rendering puro del blocco "porte gia' allocate" (testabile senza DB).
+fn render_allocated_hint(ports: &[(u32, String)]) -> String {
+    if ports.is_empty() {
+        return String::new();
     }
-    None
+    let mut s = String::from(
+        "\n\nPORTE GIA' ALLOCATE a questo progetto (usa ESATTAMENTE una di queste, \
+         non un numero a caso):\n",
+    );
+    for (port, label) in ports.iter().take(20) {
+        s.push_str(&format!("  - {port} (label: {label})\n"));
+    }
+    s.push_str(
+        "Se la porta che ti serve e' gia' in questa lista, riscrivi l'edit con quel \
+         numero ESATTO (o, meglio, leggi solo da env senza fallback hardcoded). Chiama \
+         request_port SOLO per un servizio NUOVO non ancora elencato qui.\n",
+    );
+    s
 }
 
 /// Variante di `reject_unallocated_bucket_ports` che ritorna i findings (per
@@ -528,6 +576,22 @@ mod tests {
         assert!(matches!(res, PortScanOutcome::Allowed));
         let res = scan_content("config/.env.local", "PORT=3000\n");
         assert!(matches!(res, PortScanOutcome::Allowed));
+    }
+
+    #[test]
+    fn allocated_hint_elenca_le_porte() {
+        // Fix anti-loop porte: il messaggio di rifiuto elenca le porte gia'
+        // allocate con il numero ESATTO da usare.
+        let ports = vec![(21950u32, "frontend".to_string()), (21951u32, "backend".to_string())];
+        let hint = render_allocated_hint(&ports);
+        assert!(hint.contains("21950 (label: frontend)"), "{hint}");
+        assert!(hint.contains("21951 (label: backend)"), "{hint}");
+        assert!(hint.contains("ESATTAMENTE"), "{hint}");
+    }
+
+    #[test]
+    fn allocated_hint_vuoto_senza_allocazioni() {
+        assert!(render_allocated_hint(&[]).is_empty());
     }
 
     #[test]
