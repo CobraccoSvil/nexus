@@ -247,6 +247,16 @@ start_service() {
     # (debug|release) e riavvia la unit. NB: le eventuali env extra ($@) NON
     # vengono propagate qui — una unit che ne richiede deve dichiararle nel
     # proprio file .service (oggi nessuna unit installata le richiede).
+    # ADR 0028 L3: se la unit --system e' installata (deploy/install-system-units.sh)
+    # ha la precedenza — i servizi core girano sotto PID 1, immuni dalla caduta del
+    # manager --user in WSL. Restart via sudo (puo' chiedere la password).
+    if [ -f "$bin" ] && [ -f "/etc/systemd/system/nexus-${name}.service" ]; then
+        mkdir -p "${ROOT}/target/nexus-current"
+        ln -sfn "$bin" "${ROOT}/target/nexus-current/${name}"
+        sudo systemctl restart "nexus-${name}.service"
+        echo "  ${name} via systemd --system nexus-${name}.service (PID1, ADR 0028 L3) log=${logfile}"
+        return
+    fi
     if [ -f "$bin" ] && _service_unit_installed "$name"; then
         mkdir -p "${ROOT}/target/nexus-current"
         ln -sfn "$bin" "${ROOT}/target/nexus-current/${name}"
@@ -316,6 +326,12 @@ stop_brain() {
 
 start_brain() {
     local logfile="/tmp/nexus-neural.log"
+    # ADR 0028 L3: unit --system ha la precedenza (vedi start dei servizi Rust).
+    if [ -f "/etc/systemd/system/nexus-brain.service" ]; then
+        sudo systemctl restart nexus-brain.service
+        echo "  brain via systemd --system nexus-brain.service (PID1, ADR 0028 L3) log=${logfile}"
+        return
+    fi
     if _brain_unit_installed; then
         systemctl --user restart nexus-brain.service
         echo "  brain via systemd nexus-brain.service (auto-restart on-failure) log=${logfile}"

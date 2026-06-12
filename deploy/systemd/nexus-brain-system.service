@@ -1,0 +1,35 @@
+# nexus-brain.service — Neural Core di Nexus come unit systemd --SYSTEM.
+#
+# ADR 0028 livello 3 (2026-06-12): i servizi core di Nexus erano unit
+# systemd --user, gestite dal manager user@<UID>. In WSL quel manager
+# raggiunge `exit.target` e si spegne quando la sessione logind si chiude
+# (chiusura terminale / errore WSL Relay vsock), NONOSTANTE `loginctl
+# enable-linger`: porta giu' mcp-core e brain durante una chat. I container
+# Docker (Postgres/Qdrant/Redis) non cadono MAI perche' girano come servizi
+# --system gestiti da PID 1. Stessa scelta qui: PID 1 e' indipendente da
+# logind/sessioni/linger, quindi il brain sopravvive alla caduta della
+# sessione utente.
+#
+# Installata da deploy/install-system-units.sh (sostituisce __USER__/__UID__).
+
+[Unit]
+Description=Nexus Neural Core (brain Python) [system-level, ADR 0028 L3]
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=/home/__USER__/ideai
+EnvironmentFile=-/home/__USER__/ideai/.env
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+ExecStart=/usr/bin/python3 -m brain.grpc_server.main --rest
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/tmp/nexus-neural.log
+StandardError=append:/tmp/nexus-neural.log
+
+[Install]
+WantedBy=multi-user.target
