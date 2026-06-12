@@ -17,18 +17,16 @@ from typing import Any
 # Modelli della serie "reasoning" di OpenAI che non accettano temperature, top_p
 # e usano max_completion_tokens invece di max_tokens.
 #
-# Aggiornato 2026-05-20: aggiunti gpt-5 family e gpt-4.5. Prima i log brain
-# erano pieni di "Unsupported parameter: 'max_tokens' is not supported with
-# this model. Use 'max_completion_tokens' instead." per gpt-5, gpt-5-mini,
-# gpt-5.4, gpt-5.5 ecc. che ricadevano nel ramo "use max_tokens".
+# Solo gli o-series (o1/o3/o4) restano elencati: le famiglie GPT-5 e GPT-4.5
+# sono coperte da REGOLA DI FAMIGLIA per prefisso in `_is_o_series` (vedi sotto),
+# cosi' ogni nuova release (gpt-5.1, gpt-5.6, gpt-5-mini, ...) e' gestita senza
+# doverla aggiungere a mano. Prima la lista esatta non includeva `gpt-5.1` ->
+# ricadeva nel ramo `max_tokens` -> "Unsupported parameter: 'max_tokens' ...
+# Use 'max_completion_tokens' instead." -> 400 -> il model_health_probe lo
+# auto-disabilitava e metteva l'intero provider openai in cooldown (regola G:
+# niente nomi-modello hardcoded da manutenere).
 _O_SERIES_MODELS = frozenset({
-    # Reasoning models (originale)
     "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini",
-    # GPT-5 family (rilasciati 2025+): tutti richiedono max_completion_tokens
-    "gpt-5", "gpt-5-mini", "gpt-5-nano",
-    "gpt-5.2", "gpt-5.3", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.5",
-    # GPT-4.5 family (anche reasoning)
-    "gpt-4.5", "gpt-4.5-preview",
 })
 
 # Modelli OpenAI che NON sono supportati su /v1/chat/completions ma solo
@@ -42,9 +40,25 @@ _RESPONSES_ONLY_MODELS = frozenset({
 
 
 def _is_responses_only(model: str) -> bool:
-    """Modelli OpenAI che richiedono /v1/responses (non supportati dal brain)."""
+    """Modelli OpenAI che richiedono /v1/responses (non supportati dal brain).
+
+    Oltre alla lista esplicita, REGOLA DI FAMIGLIA: le varianti `-pro`, `-codex`,
+    `-deep-research` della famiglia reasoning (gpt-5* / o1 / o3 / o4) non sono
+    chat-compatibili (404 "This is not a chat model" su /v1/chat/completions),
+    quindi vanno trattate come responses-only senza elencarle (es. gpt-5.1-codex,
+    gpt-5.6-pro)."""
     model_lower = model.lower()
-    return any(model_lower == m or model_lower.startswith(m + "-") for m in _RESPONSES_ONLY_MODELS)
+    if any(model_lower == m or model_lower.startswith(m + "-") for m in _RESPONSES_ONLY_MODELS):
+        return True
+    is_reasoning_family = (
+        model_lower.startswith("gpt-5")
+        or model_lower.startswith("o1")
+        or model_lower.startswith("o3")
+        or model_lower.startswith("o4")
+    )
+    if is_reasoning_family and any(s in model_lower for s in ("-pro", "-codex", "-deep-research")):
+        return True
+    return False
 
 # Soglia: se un modello o-series riceve piu' di N tool, applichiamo il filtro
 # safety net lato Python (il filtro principale avviene lato Rust in
@@ -80,8 +94,15 @@ def _filter_essential_tools_o_series(tools: list[dict]) -> list[dict]:
 
 
 def _is_o_series(model: str) -> bool:
-    """Restituisce True se il modello e' della serie reasoning (o1/o3/o4-mini)."""
+    """True se il modello richiede max_completion_tokens (e non accetta
+    temperature/top_p, vuole il ruolo 'developer'): serie reasoning o-series
+    PIU' l'intera famiglia GPT-5 e GPT-4.5.
+
+    REGOLA DI FAMIGLIA per prefisso: ogni release gpt-5.x (gpt-5.1, gpt-5.6,
+    gpt-5-mini, ...) e gpt-4.5* e' coperta senza elencarla a mano (regola G)."""
     model_lower = model.lower()
+    if model_lower.startswith("gpt-5") or model_lower.startswith("gpt-4.5"):
+        return True
     return any(model_lower == m or model_lower.startswith(m + "-") for m in _O_SERIES_MODELS)
 
 from .base import OpenAICompatProviderBase, ProviderResult
