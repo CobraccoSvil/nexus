@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -811,6 +812,63 @@ pub async fn refresh_rendered(
     Ok(())
 }
 
+/// Ingest di decisioni distillate dalla compattazione di sessione (mig 0413)
+/// come eventi kind='decision' source='distilled'. Le decisioni durano a livello
+/// SESSIONE (dedup_key per contenuto normalizzato, senza run_id): il render le
+/// mostra nella sezione "Decisioni:" del digest, sopravvivendo alla
+/// compattazione successiva. Best-effort: i chiamanti ignorano l'errore.
+pub async fn ingest_decisions(
+    db: &PgPool,
+    session_id: Uuid,
+    project_id: Option<Uuid>,
+    decisions: &[String],
+) -> Result<usize> {
+    let settings = current_settings(db).await;
+    if !settings.enabled || decisions.is_empty() {
+        return Ok(0);
+    }
+    let mut inserted = 0usize;
+    for d in decisions {
+        let text = d.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let dedup_key = format!("decision|{}", normalized_hash(text));
+        let res = sqlx::query(
+            "INSERT INTO nexus_session_worklog_events \
+             (session_id, project_id, run_id, kind, payload, source, dedup_key) \
+             VALUES ($1, $2, NULL, 'decision', $3, 'distilled', $4) \
+             ON CONFLICT (session_id, dedup_key) DO UPDATE SET payload = EXCLUDED.payload",
+        )
+        .bind(session_id)
+        .bind(project_id)
+        .bind(json!({ "text": text }))
+        .bind(&dedup_key)
+        .execute(db)
+        .await;
+        match res {
+            Ok(_) => inserted += 1,
+            Err(e) => {
+                tracing::warn!(error = %e, %session_id, "session_worklog: insert decision fallito");
+            }
+        }
+    }
+    if inserted > 0 {
+        refresh_rendered(db, session_id, project_id, &settings).await?;
+        tracing::info!(%session_id, decisions = inserted, "session_worklog: decisioni distillate ingerite");
+    }
+    Ok(inserted)
+}
+
+/// Hash del testo normalizzato (lowercase, spazi collassati): dedup robusto a
+/// differenze cosmetiche, condiviso da decisioni e (concettualmente) regole.
+fn normalized_hash(text: &str) -> String {
+    let normalized = text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Legge il digest materializzato della sessione (punto unico di lettura lato
 /// Rust, gemello di `fetch_worklog_block` lato brain). `None` se assente, vuoto
 /// o su errore (fail-open): i chiamanti degradano senza bloccare.
@@ -1113,6 +1171,25 @@ mod tests {
         let rows = out.matches("edit_file: src/b.ts").count();
         assert_eq!(rows, 1, "una sola riga aggregata: {out}");
         assert!(out.contains("fallita 3 volte"), "count sommato cross-run: {out}");
+    }
+
+    #[test]
+    fn digest_mostra_decisioni_distillate() {
+        // Le decisioni (mig 0413, dalla compattazione) appaiono nella sezione
+        // dedicata del digest provider-neutro.
+        let events = vec![
+            ev("status", json!({"text": "run completato"})),
+            ev("decision", json!({"text": "Adottato pattern repository per il data layer"})),
+        ];
+        let out = render_digest(&events, events.len(), 8, 100_000);
+        assert!(out.contains("Decisioni:"), "sezione decisioni assente: {out}");
+        assert!(out.contains("pattern repository"));
+    }
+
+    #[test]
+    fn normalized_hash_dedup_decisioni() {
+        assert_eq!(normalized_hash("Usa pnpm"), normalized_hash("usa   PNPM"));
+        assert_ne!(normalized_hash("Usa pnpm"), normalized_hash("Usa yarn"));
     }
 
     #[test]

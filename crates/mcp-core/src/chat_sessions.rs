@@ -436,11 +436,31 @@ pub(crate) async fn compact_session_core(
         })
         .collect();
 
-    // Append summarization instruction
-    msgs.push(json!({
-        "role": "user",
-        "content": "Riassumi questa conversazione estraendo: le decisioni chiave prese, i cambiamenti al codice effettuati, i contesti e le conoscenze apprese utili per il progetto. Sii conciso e strutturato con bullet points."
-    }));
+    // Istruzione di compattazione. Con il gate strutturato (mig 0413) usa il
+    // template DB system.session_compact_structured (output JSON: riassunto +
+    // decisioni durature -> worklog); altrimenti il prompt legacy testuale.
+    // Fallback al legacy se il template e' vuoto (regola H).
+    let structured_compact = nexus_auth::get_setting(&state.db, "agent.worklog.compact_writes_decisions")
+        .await
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true);
+    const LEGACY_COMPACT_PROMPT: &str = "Riassumi questa conversazione estraendo: le decisioni chiave prese, i cambiamenti al codice effettuati, i contesti e le conoscenze apprese utili per il progetto. Sii conciso e strutturato con bullet points.";
+    let compact_instruction = if structured_compact {
+        let tpl = nexus_types::get_template_or_default(
+            &state.db,
+            &state.template_cache,
+            "system.session_compact_structured",
+        )
+        .await;
+        if tpl.trim().is_empty() {
+            LEGACY_COMPACT_PROMPT.to_string()
+        } else {
+            tpl
+        }
+    } else {
+        LEGACY_COMPACT_PROMPT.to_string()
+    };
+    msgs.push(json!({ "role": "user", "content": compact_instruction }));
 
     let messages_json =
         serde_json::to_string(&msgs).map_err(|e| CompactError::internal(e.to_string()))?;
@@ -504,6 +524,34 @@ pub(crate) async fn compact_session_core(
         .unwrap_or("")
         .trim()
         .to_string();
+
+    // Parsing strutturato (mig 0413): se il gate e' attivo e il modello ha
+    // prodotto JSON, usa summary_markdown come riassunto ed estrai le decisioni
+    // durature per il worklog. Fallback al testo grezzo se non e' JSON (regola H).
+    let mut distilled_decisions: Vec<String> = Vec::new();
+    let summary_text = if structured_compact {
+        match nexus_types::llm_json::extract_json_block(&summary_text) {
+            Some(parsed) => {
+                if let Some(arr) = parsed.get("decisions").and_then(|v| v.as_array()) {
+                    distilled_decisions = arr
+                        .iter()
+                        .filter_map(|d| d.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                parsed
+                    .get("summary_markdown")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(summary_text)
+            }
+            None => summary_text,
+        }
+    } else {
+        summary_text
+    };
 
     // Detection riassunto degenere: il neural service ritorna sempre 200 anche
     // quando tutti i provider falliscono, con `content` tipo "[Error: ...]" o
@@ -693,6 +741,19 @@ pub(crate) async fn compact_session_core(
             status: "compacted".into(),
         },
     );
+
+    // Decisioni durature distillate -> worklog (mig 0413), best-effort: il
+    // digest provider-neutro le mostra nella sezione "Decisioni:" e sopravvivono
+    // alla compattazione successiva (non piu' solo nel testo libero del summary).
+    if !distilled_decisions.is_empty() {
+        let _ = crate::session_worklog::ingest_decisions(
+            &state.db,
+            session_id,
+            Some(project_id),
+            &distilled_decisions,
+        )
+        .await;
+    }
 
     Ok(CompactOutcome {
         summary_text,
