@@ -85,6 +85,8 @@ class ApiKeyClientMixin:
         self._api_key_provider = lambda: load_api_key(self.name)
         self._client: Any | None = None
         self._cached_key: str = ""
+        # Event loop in cui il client async e' stato creato (vedi _get_client).
+        self._client_loop: Any | None = None
 
     @property
     def _api_key(self) -> str:
@@ -104,9 +106,30 @@ class ApiKeyClientMixin:
 
     def _get_client(self) -> Any:
         """Restituisce il client cacheato (lo crea on-demand alla prima chiamata
-        o quando la API key cambia). Chiama ``_create_client`` della sottoclasse."""
+        o quando la API key cambia). Chiama ``_create_client`` della sottoclasse.
+
+        LOOP-AWARE: il gRPC server del brain e' sincrono e usa ``asyncio.run()``
+        per ogni RPC (``neural_service.py``), quindi crea e CHIUDE un event loop
+        ad ogni chiamata. Un client httpx async cachato avrebbe, al secondo uso,
+        connessioni nel connection-pool legate al loop ormai chiuso: alla
+        chiusura/riuso httpx fa ``loop.call_soon`` sul loop morto ->
+        ``RuntimeError('Event loop is closed')`` che l'SDK OpenAI wrappa in
+        ``APIConnectionError('Connection error.')`` -> il provider risultava
+        "non raggiungibile" e finiva in cooldown anche con rete e credito OK.
+        Soluzione: se il loop corrente e' diverso da quello di creazione,
+        scartiamo il client e ne creiamo uno nuovo legato al loop attivo. Il
+        pooling intra-RPC (stesso loop) resta intatto."""
+        import asyncio
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if self._client is not None and self._client_loop is not current_loop:
+            self._client = None
         if self._client is None:
             self._client = self._create_client(self._api_key)  # type: ignore[attr-defined]
+            self._client_loop = current_loop
         return self._client
 
     def _create_client(self, api_key: str) -> Any:
