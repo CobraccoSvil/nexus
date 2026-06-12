@@ -36,6 +36,7 @@ export function AdminSidebar({
         { label: "Sub-agents kinds", href: "/admin/orchestrator/subagents" as Route, icon: "SA" },
         { label: "Feedback AI", href: "/admin/ai-feedback" as Route, icon: "F" },
         { label: "Apprendimento Progetto", href: "/admin/project-learning" as Route, icon: "AP" },
+        { label: "Learned Instructions", href: "/admin/learned-instructions" as Route, icon: "LI" },
       ],
     },
     {

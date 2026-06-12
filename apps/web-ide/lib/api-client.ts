@@ -32,3 +32,4 @@ export * from "./api/admin-users";
 export * from "./api/project-db";
 export * from "./api/knowledge";
 export * from "./api/meta-docs";
+export * from "./api/learned-instructions";
