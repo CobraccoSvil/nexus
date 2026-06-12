@@ -19,7 +19,13 @@ Wants=network-online.target
 Type=simple
 User=__USER__
 Group=__USER__
-WorkingDirectory=/home/__USER__/ideai/apps/web-ide
+# WorkingDirectory = root del monorepo (NON apps/web-ide): il server.js di Next
+# standalone risolve .next e i node_modules relativi alla root, come faceva
+# deploy-local.sh (node apps/web-ide/server.js lanciato da ROOT).
+WorkingDirectory=/home/__USER__/ideai
+# .env serve per DATABASE_URL: il web-ide risolve la propria porta dal DB
+# (regola G, niente default hardcoded). Stessa fonte di brain/mcp-core.
+EnvironmentFile=-/home/__USER__/ideai/.env
 Environment=NODE_ENV=production
 ExecStart=/usr/bin/node /home/__USER__/ideai/apps/web-ide/server.js
 Restart=on-failure
