@@ -626,6 +626,11 @@ pub async fn send_chat_message(
                         // inseriva nulla per i run vuoti e finalizzava lo status grezzo.
                         let resume_answer =
                             crate::chat_messages::agent_run::compose_turn_answer(&result);
+                        // Recap narrativo opzionale (mig 0415): stesso punto unico
+                        // del finalize spawn. Gate off di default -> no-op.
+                        let resume_answer =
+                            crate::chat_messages::agent_run::narrative_or(&state, &result, resume_answer)
+                                .await;
                         let resume_status =
                             crate::chat_messages::agent_run::canonical_run_status(&result);
                         if let Some(ref answer) = resume_answer {

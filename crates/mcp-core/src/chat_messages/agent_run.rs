@@ -312,6 +312,94 @@ pub(crate) fn compose_turn_answer(
     }
 }
 
+/// Recap NARRATIVO opzionale (mig 0415, Fase D del flusso chat leggibile). Se il
+/// gate `agent.chat.narrative_recap_enabled` e' attivo e il run e' hollow con
+/// azioni concrete, chiede a un LLM leggero (purpose `turn_recap`) di
+/// trasformare il recap deterministico `base` in una breve narrativa. E' il
+/// PUNTO UNICO della logica narrativa (regola L): i due call-site — finalize
+/// dello spawn e resume — la invocano. Fallback al `base` su qualunque
+/// condizione non soddisfatta o errore (regola H): a gate spento, purpose non
+/// configurato o LLM fallito, il comportamento resta il recap deterministico.
+pub(crate) async fn narrative_or(
+    state: &AppState,
+    result: &crate::agent_types::AgentRunResult,
+    base: Option<String>,
+) -> Option<String> {
+    let Some(base_text) = base.as_ref().map(ToOwned::to_owned) else {
+        return base;
+    };
+    let enabled = nexus_auth::get_setting(&state.db, "agent.chat.narrative_recap_enabled")
+        .await
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !enabled || !is_report_hollow(result) || result.steps.is_empty() {
+        return base;
+    }
+
+    use crate::internal_routing::{resolve_purpose_model, PurposeResolution};
+    let (provider, model) = match resolve_purpose_model(state, "turn_recap").await {
+        PurposeResolution::Resolved { provider, model, .. } => (provider, model),
+        _ => return base,
+    };
+
+    // Riassunto dei fatti deterministici per il prompt (azioni + errori).
+    let facts = crate::session_worklog::collect_step_facts(&result.steps, 200);
+    let mut actions = String::new();
+    for line in facts.action_lines.iter().take(20) {
+        actions.push_str(line);
+        actions.push('\n');
+    }
+    for e in facts.errors.iter().take(10) {
+        actions.push_str(&format!(
+            "- errore [{}] {}: {}\n",
+            e.tool,
+            e.detail,
+            e.excerpt.chars().take(120).collect::<String>()
+        ));
+    }
+
+    let template = nexus_types::get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        "system.turn_recap_narrative",
+    )
+    .await;
+    if template.trim().is_empty() {
+        return base;
+    }
+    let prompt = template
+        .replace("{{recap}}", &base_text)
+        .replace("{{actions}}", actions.trim());
+    let messages_json =
+        serde_json::to_string(&json!([{ "role": "user", "content": prompt }])).unwrap_or_default();
+
+    match state
+        .orchestrator
+        .neural
+        .generate_agent_turn(&provider, &model, &messages_json, "[]", 600, "")
+        .await
+    {
+        Ok(v) => {
+            let narr = v
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // Niente payload nei log (regola F): solo l'esito.
+            if narr.chars().count() >= 20 {
+                Some(narr)
+            } else {
+                base
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "turn_recap: narrativa fallita, uso recap deterministico");
+            base
+        }
+    }
+}
+
 /// Costruisce il messaggio iniziale per il brain arricchendolo con il contenuto
 /// reale degli allegati (pre-extraction nel prompt — ADR 0010/0011/0012).
 ///
@@ -1709,6 +1797,11 @@ pub(crate) async fn spawn_agent_run(
         });
     }
 
+    // Clone di AppState per il finalize dentro il task 'static: serve a
+    // narrative_or (mig 0415) per risolvere il purpose e chiamare il neural.
+    // Cheap: i campi di AppState sono Arc/pool condivisi.
+    let state_for_finalize = state.clone();
+
     tokio::spawn(async move {
         use futures::FutureExt;
 
@@ -2498,6 +2591,11 @@ pub(crate) async fn spawn_agent_run(
                     }),
                 _ => None,
             };
+
+            // Recap NARRATIVO opzionale (mig 0415, gate off di default): a gate
+            // attivo, i run hollow ricevono una sintesi LLM al posto del recap
+            // secco. Punto unico narrative_or; fallback al deterministico.
+            let answer_owned = narrative_or(&state_for_finalize, &result, answer_owned).await;
 
             if let Some(ref answer) = answer_owned {
                 // Annota la risposta solo se l'intent richiedeva tool e l'agente
