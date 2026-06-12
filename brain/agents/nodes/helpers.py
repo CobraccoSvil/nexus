@@ -535,6 +535,10 @@ _EXPLORATION_ONLY_TOOLS: frozenset[str] = frozenset({
     # rendendo il loop infinito (es. gemini-flash-lite che cerca ossessivamente
     # tool per una domanda conversazionale invece di rispondere).
     "nexus_mcp_tool_search",
+    # Worklog di sessione (mig 0411): lettura paginata della storia di lavoro.
+    # Read-only puro: senza questa voce un loop di sole letture worklog
+    # conterebbe come "produttivo" e neutralizzerebbe l'anti-loop.
+    "nexus_get_worklog",
 })
 
 # ── Cache soglia loop esplorativo (TTL 60s) ─────────────────────────────────
@@ -2160,7 +2164,21 @@ def _load_system_offload_config() -> tuple[int, int]:
 # scattava SEMPRE) e il modello non vedeva MAI act-first/playbook/KB — concausa
 # di "descrive invece di eseguire", loop, G1. Override DB:
 # agent.context.system_offload_sections (CSV di tag).
-_SYS_OFFLOADABLE_SECTIONS_DEFAULT = "examples,reflection,knowledge_base_progetto"
+# Ordine = PRIORITA' di offload (da sinistra: si offloada per primo). Le sezioni
+# informative leggere vanno per prime; session_worklog e' ultima risorsa perche'
+# e' continuita' operativa, ma resta recuperabile via il suo tool dedicato
+# (nexus_get_worklog), quindi e' preferibile estrarlo piuttosto che decapitare le
+# DIRETTIVE col taglio head. learned_instructions NON e' offloadabile (piccolo,
+# senza tool di recupero garantito): resta sempre inline.
+_SYS_OFFLOADABLE_SECTIONS_DEFAULT = (
+    "examples,reflection,knowledge_base_progetto,session_worklog"
+)
+
+# Tool di recupero suggerito nel pointer, per sezione offloadata. Le sezioni non
+# elencate rimandano alla ricerca semantica generica.
+_SYS_OFFLOAD_RECOVERY_TOOL = {
+    "session_worklog": "nexus_get_worklog",
+}
 
 
 def _extract_offloadable_sections(
@@ -2208,29 +2226,43 @@ def _offload_system_prompt_if_huge(system_text: str, embeddings: Any | None) -> 
 
     try:
         from brain.agents import context_offload
-        remaining, sections = _extract_offloadable_sections(system_text, tags)
+        # Offload PRIORITIZZATO e budget-aware: estrae una sezione per volta in
+        # ordine di priorita' (lista tags) e si FERMA appena il system rientra
+        # sotto soglia. Cosi' le sezioni piu' critiche (es. session_worklog, in
+        # fondo) restano inline finche' non sono davvero necessarie.
+        remaining = system_text
         pointers: list[str] = []
         offloaded_chars = 0
-        for tag, block in sections:
-            offload = context_offload.offload_to_rag(
-                embeddings,
-                block,
-                source_kind="system_context",
-                metadata={"section": tag},
-            )
-            offloaded_chars += len(block)
-            pointers.append(
-                f"[Sezione <{tag}> ({len(block)} char) disponibile via "
-                f"nexus_search_semantic se serve.]"
-            )
+        offloaded_count = 0
+        for tag in tags:
+            if _count_tokens(remaining) <= threshold_tokens:
+                break
+            sub_remaining, sections = _extract_offloadable_sections(remaining, [tag])
+            if not sections:
+                continue
+            recovery_tool = _SYS_OFFLOAD_RECOVERY_TOOL.get(tag, "nexus_search_semantic")
+            for _tag, block in sections:
+                context_offload.offload_to_rag(
+                    embeddings,
+                    block,
+                    source_kind="system_context",
+                    metadata={"section": _tag},
+                )
+                offloaded_chars += len(block)
+                offloaded_count += 1
+                pointers.append(
+                    f"[Sezione <{_tag}> ({len(block)} char) disponibile via "
+                    f"{recovery_tool} se serve.]"
+                )
+            remaining = sub_remaining
         result = remaining.rstrip()
         if pointers:
             result += "\n\n" + "\n".join(pointers)
         new_tokens = _count_tokens(result)
         logger.info(
             "system_prompt_offload: %d -> %d token (offload %d sezioni, %d char; "
-            "DIRETTIVE intatte)",
-            est_tokens, new_tokens, len(sections), offloaded_chars,
+            "DIRETTIVE intatte, budget-aware prioritizzato)",
+            est_tokens, new_tokens, offloaded_count, offloaded_chars,
         )
         # Safety-net: se ANCHE senza le sezioni informative il system resta
         # enorme (>2x threshold), il vecchio taglio head e' l'ultima risorsa —

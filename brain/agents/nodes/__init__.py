@@ -390,6 +390,49 @@ _MCP_CORE_INTERNAL_URL = os.environ.get(
 )
 
 
+def _dedup_kb_against_rag(rag_block: str, kb_block: str) -> str:
+    """Rimuove dal blocco KB gli item il cui testo e' gia' presente nel blocco
+    RAG-chat (overlap cross-fonte: lo stesso messaggio utente puo' essere
+    indicizzato sia in Qdrant chat sia nella KB). Confronto per testo
+    NORMALIZZATO (lowercase, spazi collassati, primi 256 char -> hash).
+
+    Conservativo (regola H, niente toppe rischiose): su qualunque errore, o se
+    non ci sono testi comparabili (es. KB in mode 'index', solo titoli in
+    attributi self-closing), ritorna kb_block INVARIATO. Agisce solo dove c'e'
+    overlap testuale certo (mode 'full' con <contenuto>).
+    """
+    import re as _re
+    import hashlib as _hashlib
+
+    def _norm_hash(s: str) -> str:
+        n = " ".join(s.strip().lower().split())[:256]
+        return _hashlib.sha1(n.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    try:
+        rag_hashes: set[str] = set()
+        for m in _re.finditer(r"<interazione[^>]*>(.*?)</interazione>", rag_block, _re.DOTALL):
+            t = m.group(1).strip()
+            if t:
+                rag_hashes.add(_norm_hash(t))
+        if not rag_hashes:
+            return kb_block
+
+        def _maybe_drop(match: "_re.Match[str]") -> str:
+            block = match.group(0)
+            cm = _re.search(r"<contenuto>(.*?)</contenuto>", block, _re.DOTALL)
+            if cm and _norm_hash(cm.group(1).strip()) in rag_hashes:
+                return ""  # duplicato gia' nel RAG: scarta l'intero item KB
+            return block
+
+        deduped = _re.sub(r"<nota[^>]*>.*?</nota>", _maybe_drop, kb_block, flags=_re.DOTALL)
+        deduped = _re.sub(
+            r"<doc_codice[^>]*>.*?</doc_codice>", _maybe_drop, deduped, flags=_re.DOTALL
+        )
+        return deduped
+    except Exception:
+        return kb_block
+
+
 def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
     """Recupera note rilevanti dalla Knowledge Base per-progetto e formatta come contesto.
 
@@ -816,12 +859,20 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 # e prependi come contesto pertinente. Riduce le tool call
                 # ridondanti (read_file dello stesso file) su task ricorrenti.
                 rag_block = _build_rag_context(intent, str(text))
-                if rag_block:
-                    rendered = rag_block + "\n\n" + rendered
                 # KB inline: cerca note rilevanti nella Knowledge Base del progetto.
                 # Diverso da _build_rag_context (interazioni chat passate):
                 # qui prendiamo note auto+manuali con context specifico del progetto.
                 kb_block = _build_kb_rag_context(intent, str(state.get("project_id") or ""), str(text))
+                # Dedup cross-fonte: RAG-chat (Qdrant) e KB possono restituire lo
+                # STESSO item (un messaggio utente indicizzato in entrambi). Rimuove
+                # dal blocco KB gli item gia' presenti nel RAG, evitando di pagare
+                # due volte lo stesso snippet. Conservativo: no-op se non trova testi
+                # comparabili (es. KB in mode 'index', solo titoli/attributi).
+                if rag_block and kb_block:
+                    kb_block = _dedup_kb_against_rag(rag_block, kb_block)
+                # Ordine finale (prepend): KB sopra, poi RAG, poi prompt base.
+                if rag_block:
+                    rendered = rag_block + "\n\n" + rendered
                 if kb_block:
                     rendered = kb_block + "\n\n" + rendered
                 # PR-3 Codex pattern: project_instructions.md injection nel system_text.
