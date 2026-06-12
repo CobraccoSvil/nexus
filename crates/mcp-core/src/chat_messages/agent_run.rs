@@ -68,47 +68,18 @@ pub(crate) fn trunc_chars(s: String, max: usize) -> String {
 /// `build_action_recap` (caso hollow: final_answer vuoto) e `action_recap_footer`
 /// (caso final_answer non-conclusivo).
 fn collect_actions(steps: &[AgentStep]) -> (Vec<String>, std::collections::BTreeSet<String>) {
-    use std::collections::BTreeSet;
-    let mut lines: Vec<String> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut files_touched: BTreeSet<String> = BTreeSet::new();
-    for step in steps {
-        if step.status != AgentStepStatus::Completed || step.tool_name.is_empty() {
-            continue;
-        }
-        // Dettaglio leggibile dall'input del tool, in ordine di preferenza.
-        // "to" copre rename_file/fs_move (usano from/to, non path).
-        let detail = ["path", "file", "command", "pattern", "query", "to"]
-            .iter()
-            .find_map(|k| step.tool_input.get(*k).and_then(|v| v.as_str()))
-            .map(|s| trunc_chars(s.to_string(), 120));
-        let line = match &detail {
-            Some(d) => format!("- `{}`: {}", step.tool_name, d),
-            None => format!("- `{}`", step.tool_name),
-        };
-        if seen.insert(line.clone()) {
-            lines.push(line);
-        }
-        if matches!(
-            step.tool_name.as_str(),
-            "write_file" | "edit_file" | "create_file" | "apply_patch"
-        ) {
-            if let Some(p) = step.tool_input.get("path").and_then(|v| v.as_str()) {
-                files_touched.insert(p.to_string());
-            }
-        }
-        // Spostamenti: la destinazione E' un file/albero toccato. Senza questo,
-        // un run di soli rename aveva files_touched VUOTO: il recap non poteva
-        // contraddire un resoconto che dichiarava path ormai svuotati dai rename
-        // stessi (incidente Beauty-Book: "scritto in figma_export/" dopo aver
-        // spostato tutto in src/ con 2 rename).
-        if matches!(step.tool_name.as_str(), "rename_file" | "fs_move") {
-            if let Some(to) = step.tool_input.get("to").and_then(|v| v.as_str()) {
-                files_touched.insert(to.to_string());
-            }
-        }
-    }
-    (lines, files_touched)
+    // Punto unico (regola L): l'estrazione dei fatti dagli step vive in
+    // session_worklog::collect_step_facts (che la condivide con l'ingest del
+    // worklog di sessione, mig 0411). Qui resta solo l'adattamento alla firma
+    // storica del recap: righe-azione + set dei path toccati.
+    let facts = crate::session_worklog::collect_step_facts(
+        steps,
+        crate::session_worklog::DEFAULT_ERROR_EXCERPT_CHARS,
+    );
+    (
+        facts.action_lines,
+        facts.files_touched.into_keys().collect(),
+    )
 }
 
 fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
@@ -751,6 +722,24 @@ pub(crate) async fn supersede_active_runs(
             session_id,
             reason
         );
+        // Worklog di sessione (mig 0411): ingest SINCRONO del lavoro gia'
+        // svolto dai run superati, dagli agent_steps gia' persistiti
+        // incrementalmente dal brain (M68). Sincrono by-design: il chiamante
+        // (spawn_agent_run) compone il contesto del NUOVO run subito dopo, e
+        // deve trovare il digest aggiornato — altrimenti il nuovo run ripete
+        // le azioni del run interrotto. Best-effort sul singolo run.
+        let label = if reason == "user_cancel" {
+            "annullato dall'utente"
+        } else {
+            "superseduto (interrotto da un nuovo messaggio)"
+        };
+        for cid in &cancelled_ids {
+            if let Err(e) =
+                crate::session_worklog::ingest_from_db_steps(&state.db, *cid, label).await
+            {
+                tracing::warn!(error = %e, run_id = %cid, "session_worklog: ingest al supersede fallito");
+            }
+        }
     }
     cancelled_ids
 }
@@ -1537,12 +1526,21 @@ pub(crate) async fn spawn_agent_run(
     let initial_msg = if superseded_runs.is_empty() {
         initial_msg
     } else {
+        // Nota arricchita dal worklog (mig 0411): sintesi del lavoro gia'
+        // svolto dal run interrotto + puntatore al blocco <session_worklog>.
+        // L'ingest e' gia' avvenuto SINCRONO dentro supersede_active_runs.
+        let worklog_note = crate::session_worklog::supersede_summary(
+            &state.db,
+            params.session_id,
+            &superseded_runs,
+        )
+        .await;
         format!(
             "[NOTA OPERATIVA — generata dal sistema]\nIl run precedente su questa \
              sessione e' stato INTERROTTO e sostituito da questo messaggio. Il task \
              corrente e' SOLO quello del messaggio qui sotto: non riprendere ne' \
              continuare il lavoro del run precedente se non e' esplicitamente \
-             richiesto dal nuovo messaggio.\n\n{initial_msg}"
+             richiesto dal nuovo messaggio.{worklog_note}\n\n{initial_msg}"
         )
     };
 
@@ -2777,6 +2775,23 @@ pub(crate) async fn spawn_agent_run(
                     run_id,
                     result.steps.len()
                 );
+
+                // Worklog di sessione (mig 0411): deriva gli eventi operativi
+                // strutturati dagli step e rinfresca il digest provider-neutro
+                // che il brain inietta nei run successivi della sessione.
+                // Best-effort: un errore qui non tocca l'esito del run.
+                if let Err(e) = crate::session_worklog::ingest_steps_for_run(
+                    &db_clone,
+                    session_id_cp,
+                    Some(project_id_cp),
+                    run_id,
+                    status_str,
+                    &result.steps,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "session_worklog: ingest a fine run fallito");
+                }
             }
         }); // chiude AssertUnwindSafe(async move { ... })
 

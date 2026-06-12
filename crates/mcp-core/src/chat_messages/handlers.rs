@@ -655,6 +655,7 @@ pub async fn send_chat_message(
                         }
 
                         let _run_completed = resume_status.is_success();
+                        let resume_status_str = resume_status.as_str();
                         crate::agent_types::finalize_agent_run(
                             &db_clone2,
                             new_run_id,
@@ -663,6 +664,22 @@ pub async fn send_chat_message(
                             result.iteration_count,
                         )
                         .await;
+
+                        // Worklog di sessione (mig 0411): stesso hook del
+                        // percorso spawn principale — anche il resume di
+                        // conferma alimenta la storia di lavoro. Best-effort.
+                        if let Err(e) = crate::session_worklog::ingest_steps_for_run(
+                            &db_clone2,
+                            session_id_r,
+                            Some(project_id_r),
+                            new_run_id,
+                            resume_status_str,
+                            &result.steps,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e, "session_worklog: ingest al resume fallito");
+                        }
 
                         // ADR 0017 v2 TODO 7: il worker
                         // `wiki::run_summary_worker` (avviato in main.rs,

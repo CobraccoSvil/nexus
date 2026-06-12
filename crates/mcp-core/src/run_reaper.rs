@@ -76,6 +76,23 @@ pub async fn reap_stale_runs(db: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid>
         stale_seconds
     );
 
+    // Worklog di sessione (mig 0411): anche il lavoro dei run interrotti
+    // (crash/stallo) entra nella storia di lavoro — gli agent_steps sono gia'
+    // in DB grazie alla persistenza incrementale del brain (M68). Il run
+    // successivo sulla stessa sessione vede cosa era gia' stato fatto invece
+    // di ripartire da zero. Best-effort per singolo run.
+    for rid in &reaped {
+        if let Err(e) = crate::session_worklog::ingest_from_db_steps(
+            db,
+            *rid,
+            "interrotto (crash o stallo del servizio)",
+        )
+        .await
+        {
+            tracing::warn!(error = %e, run_id = %rid, "session_worklog: ingest al reap fallito");
+        }
+    }
+
     // Messaggio assistente SOLO per i run appena reapati (completed_at recente),
     // se hanno un messaggio-richiesta e non hanno gia' un assistente associato.
     let inserted = sqlx::query(

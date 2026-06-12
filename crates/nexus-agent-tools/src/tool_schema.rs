@@ -1505,4 +1505,18 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       "required": ["query"]
     }
   }
+  ,
+  {
+    "name": "nexus_get_worklog",
+    "description": "Legge la storia di lavoro della sessione corrente (worklog): eventi strutturati registrati dal sistema sui run precedenti — file gia' creati/modificati, comandi eseguiti con esito, errori incontrati, tentativi falliti da non ripetere, stato dei run. Usalo quando il digest <session_worklog> nel contesto non basta e serve il dettaglio completo (es. quale errore esatto ha dato un comando, quali file sono gia' stati toccati). Read-only, paginato, nessun costo di ricerca.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "enum": ["file_touched", "command", "error", "retry_ok", "failed_attempt", "status", "decision"], "description": "Filtra per tipo di evento. Default: tutti."},
+        "run_id": {"type": "string", "description": "Restringe agli eventi di un singolo run (UUID)."},
+        "limit": {"type": "integer", "description": "Numero massimo di eventi per pagina (default e cap da settings agent.worklog.tool_page_size)."},
+        "offset": {"type": "integer", "description": "Offset di paginazione (default 0). Gli eventi sono ordinati dal piu' recente."}
+      }
+    }
+  }
 ]"#;

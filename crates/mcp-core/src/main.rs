@@ -72,11 +72,13 @@ mod routing_matrix;
 mod routing_matrix_auto_promoter;
 mod routing_slots;
 mod brain_url;
+mod learned_instructions;
 mod run_reaper;
 pub use nexus_tool_kit::sandbox;
 mod security;
 mod services_watchdog;
 mod session_autocommit;
+mod session_worklog;
 mod settings;
 mod static_preview;
 mod sudo_manager;
@@ -723,6 +725,9 @@ async fn main() -> anyhow::Result<()> {
     // Arricchimento LLM dei wiki_docs kind=code (placeholder -> scheda + embedding).
     // Modello come categoria/tier configurabile da admin (mig 0331, regola G/L).
     wiki::code_docs_enricher::start_code_docs_enricher_worker(std::sync::Arc::new(state.wiki_deps()));
+    // Distiller delle learned instructions (livello 2 continuita', mig 0412):
+    // regole durature di progetto dagli eventi worklog + wiki_docs.
+    learned_instructions::spawn_learned_instructions_distiller(state.clone());
 
     // ── PR hardening: avvio writer audit centralizzato + port enforcer ───
     // Audit writer: consuma il canale `record_audit(...)` e fa batch INSERT

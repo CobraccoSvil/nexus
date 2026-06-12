@@ -18,6 +18,26 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                     middleware::require_admin,
                 )),
         )
+        // Learned instructions (mig 0412): review umana delle regole distillate.
+        .route(
+            "/api/admin/learned-instructions",
+            get(learned_instructions::list_learned_instructions).layer(
+                axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
+            ),
+        )
+        .route(
+            "/api/admin/learned-instructions/distill",
+            post(learned_instructions::distill_now).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
+        .route(
+            "/api/admin/learned-instructions/:id",
+            patch(learned_instructions::patch_learned_instruction).layer(
+                axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
+            ),
+        )
         // Bug 7 fix: trigger manuale del worker model_catalog_sync.
         // POST /api/admin/catalog-sync -> esegue 1 tick subito e ritorna lo stats.
         // Utile per onboarding (popola subito catalog) e test E2E (no attesa interval).

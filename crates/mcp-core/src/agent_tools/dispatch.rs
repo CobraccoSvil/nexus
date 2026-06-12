@@ -187,6 +187,11 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         // FASE 2 "resa Figma Make": verifica visiva (screenshot vs design).
         "nexus_visual_compare" => visual_compare::tool_nexus_visual_compare(ctx, input).await,
         "nexus_search_semantic" => rag_search::tool_nexus_search_semantic(ctx, input).await,
+        // Worklog di sessione (mig 0411): drill-down on-demand della storia di
+        // lavoro — il digest compatto sta nel system, il dettaglio vive qui.
+        // VINCOLO: deve restare in _ALWAYS_ON_TOOLS (profile_loader.py) cosi'
+        // il modello puo' sempre approfondire oltre il digest (contratto D8).
+        "nexus_get_worklog" => crate::session_worklog::tool_nexus_get_worklog(ctx, input).await,
         // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
         // Dispatch verso nexus_builtin::execute_with_neural per usare
         // la ricerca semantica quando neural è disponibile (Qdrant).

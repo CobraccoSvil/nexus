@@ -896,6 +896,48 @@ async def router_node(state: AgentState) -> dict[str, Any]:
             intent, token_budget, behavior_mode,
         )
 
+    # ── Worklog di sessione (mig 0411): continuita' cross-run/provider ──────
+    # Blocco <session_worklog> appeso al system_text EFFETTIVO (pattern
+    # task_playbook: mcp-core passa quasi sempre un system_text gia' composto,
+    # quindi FUORI dal ramo "if not system_text"). E' puro testo provider-neutro:
+    # sopravvive identico al cascade fallback e resta nel system anche quando la
+    # history viene compressa/trimmata (fix compact-amnesia by construction).
+    # Il rendering vive UNA volta in Rust (regola L); qui solo fetch + append.
+    # Guardia anti-duplicato per i turni successivi. Best-effort, mai bloccante.
+    try:
+        from .. import session_worklog as _session_worklog
+        _wl_session = str(state.get("session_id") or "")
+        _wl_st = updates.get("system_text") or state.get("system_text") or ""
+        if _wl_session and _wl_st and "<session_worklog>" not in _wl_st:
+            _wl_block = _session_worklog.fetch_worklog_block(_wl_session)
+            if _wl_block:
+                updates["system_text"] = _wl_st + "\n\n" + _wl_block
+                logger.info(
+                    "router_node: session_worklog injected (%d chars, session=%s)",
+                    len(_wl_block), _wl_session[:8],
+                )
+    except Exception as _exc:
+        logger.debug("session_worklog injection skip: %s", _exc)
+
+    # ── Learned instructions (mig 0412): regole durature di progetto ────────
+    # Livello 2 della continuita' (analogo auto-memory): regole stabili
+    # distillate dall'esperienza, SEMPRE iniettate. Stesso pattern del worklog
+    # (puro testo provider-neutro, guardia anti-duplicato, best-effort).
+    try:
+        from .. import session_worklog as _session_worklog
+        _li_project = str(state.get("project_id") or "")
+        _li_st = updates.get("system_text") or state.get("system_text") or ""
+        if _li_project and _li_st and "<learned_instructions>" not in _li_st:
+            _li_block = _session_worklog.fetch_learned_instructions_block(_li_project)
+            if _li_block:
+                updates["system_text"] = _li_st + "\n\n" + _li_block
+                logger.info(
+                    "router_node: learned_instructions injected (%d chars, project=%s)",
+                    len(_li_block), _li_project[:8],
+                )
+    except Exception as _exc:
+        logger.debug("learned_instructions injection skip: %s", _exc)
+
     # ── Enforcement report-only: rimuovi i tool di MODIFICA file ────────────
     # I tool write/edit/delete/rename sono in _ALWAYS_ON_TOOLS (bypassano il
     # filtro per intent), quindi anche un task di sola verifica li avrebbe.
