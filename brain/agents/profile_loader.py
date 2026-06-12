@@ -93,6 +93,10 @@ class AgentProfile:
         "nexus_db_query",
         "nexus_db_tables",
         "nexus_db_describe",
+        # Worklog di sessione (mig 0411): drill-down read-only della storia di
+        # lavoro. Il digest <session_worklog> nel system lo referenzia
+        # esplicitamente, quindi deve restare invocabile per OGNI intent.
+        "nexus_get_worklog",
     }
 
     def filter_tools(self, tools_json: list[dict]) -> list[dict]:
