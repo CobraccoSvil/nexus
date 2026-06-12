@@ -61,6 +61,16 @@ touch /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-webide.log
 chown root:root /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-webide.log
 chmod 644 /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-webide.log
 
+# 3bis. Disabilita i meccanismi di auto-restart APPLICATIVI di mcp-core: con i
+#   servizi a --system il restart e' gia' garantito da systemd (Restart=on-failure),
+#   quindi sono ridondanti E conflittuali. ensure_user_manager risuscitava il
+#   manager --user instabile (-> deactivate del core a ~2min); services_watchdog
+#   riavviava il web-ide via deploy-local.sh -> processo nohup in conflitto con la
+#   unit systemd (-> porta occupata -> crash-loop). Best-effort (DB up).
+docker exec -i ideai-postgres-nexus-1 psql -U nexus -d nexus -c \
+  "UPDATE settings SET value='false' WHERE key IN ('agent.user_manager.autostart_enabled','agent.watchdog.enabled');" \
+  >/dev/null 2>&1 && echo "  ensure_user_manager + services_watchdog disabilitati (ridondanti con --system)" || true
+
 # 4. Avvia: brain (gRPC 50051) prima, poi mcp-core e web-ide.
 systemctl daemon-reload
 systemctl reset-failed nexus-brain nexus-mcp-core nexus-web-ide 2>/dev/null || true
