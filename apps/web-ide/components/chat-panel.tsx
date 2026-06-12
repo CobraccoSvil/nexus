@@ -17,6 +17,7 @@ import { useGlobalDialog } from "./global-dialog-provider";
 import { FeedbackErrorDialog } from "./feedback-error-dialog";
 import { IconButton } from "./icon-button";
 import { MessageList } from "./chat/message-list";
+import { SessionWorklogPanel } from "./chat/session-worklog-panel";
 import { AgentStepsPanel } from "./chat/agent-steps-panel";
 import {
   AgentMetaStepCard as AgentMetaStepCardLazy,
@@ -1111,6 +1112,10 @@ export function ChatPanel({
             reconnectSuccess={reconnectSuccess}
             tc={tc}
           />
+
+          {messages.length > 0 && sessionId ? (
+            <SessionWorklogPanel sessionId={sessionId} />
+          ) : null}
 
           <MessageList
             messages={messages}

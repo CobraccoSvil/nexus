@@ -384,6 +384,26 @@ pub async fn get_agent_run(
     })))
 }
 
+/// GET /api/chat/sessions/:id/worklog -- digest provider-neutro della storia di
+/// lavoro della sessione (mig 0411). Espone all'utente "cosa e' stato fatto"
+/// (file toccati, comandi con esito, errori, tentativi falliti, decisioni), lo
+/// stesso testo iniettato nel system_text dell'LLM. Stringa vuota se il worklog
+/// e' assente o disabilitato.
+pub async fn get_session_worklog(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
+    let context = crate::chat_sessions::load_session_context(&state.db, session_id, user_id).await?;
+    let block = crate::session_worklog::fetch_rendered_block(&state.db, context.session_id)
+        .await
+        .unwrap_or_default();
+    Ok(Json(json!({ "renderedBlock": block })))
+}
+
 /// GET /api/chat/agent-runs/:run_id/next-actions -- scelte di proseguimento
 /// (meta_step `next_actions`) persistite per il run. Serve a RIPRISTINARE i
 /// pulsanti delle scelte dopo un reload o sui turni passati: i meta_step live

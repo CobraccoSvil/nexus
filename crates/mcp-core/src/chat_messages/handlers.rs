@@ -12,10 +12,13 @@ pub async fn list_chat_messages(
 
     let rows = sqlx::query(
         r#"
-        SELECT id, session_id, project_id, role, content, metadata, request_message_id, deleted_at, created_at
-        FROM chat_messages
-        WHERE session_id = $1
-        ORDER BY created_at ASC
+        SELECT cm.id, cm.session_id, cm.project_id, cm.role, cm.content, cm.metadata,
+               cm.request_message_id, cm.deleted_at, cm.created_at,
+               ar.status AS run_status
+        FROM chat_messages cm
+        LEFT JOIN agent_runs ar ON ar.run_message_id = cm.id
+        WHERE cm.session_id = $1
+        ORDER BY cm.created_at ASC
         "#,
     )
     .bind(context.session_id)

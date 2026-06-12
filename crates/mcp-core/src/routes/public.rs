@@ -176,6 +176,13 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             )),
         )
         .route(
+            "/api/chat/sessions/:id/worklog",
+            get(chat_agent::get_session_worklog).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
             "/api/chat/sessions/:session_id/active-run",
             get(chat_agent::get_active_run_for_session).layer(axum_mw::from_fn_with_state(
                 state.clone(),

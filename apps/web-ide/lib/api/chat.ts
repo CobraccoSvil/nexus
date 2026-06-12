@@ -32,6 +32,11 @@ export interface ChatMessage {
   currency?: string;
   automationMode?: "study" | "confirm" | "automatic" | "agent";
   resendOfMessageId?: string;
+  /** Stato CANONICO del run che ha prodotto questo messaggio assistant
+      (agent_runs.status via LEFT JOIN lato backend). Permette il badge di stato
+      PERSISTENTE sotto la risposta (completato/non riuscito/interrotto/in
+      attesa), coerente anche dopo un reload. Undefined per i messaggi utente. */
+  runStatus?: string;
   /** True quando il messaggio e' stato generato automaticamente dal sistema
       (es. auto-continuazione in modalita' "automatic"). La UI lo nasconde
       per non confondere l'utente: il backend lo persiste comunque per
@@ -214,6 +219,15 @@ export async function getChatMessages(
   sessionId: string,
 ): Promise<{ sessionId: string; projectId: string; messages: ChatMessage[] }> {
   return fetchJson(`${API_BASE}/api/chat/sessions/${sessionId}/messages`);
+}
+
+/** Digest provider-neutro della "storia di lavoro" della sessione (mig 0411):
+    file toccati, comandi con esito, errori, tentativi falliti, decisioni. E' lo
+    stesso testo iniettato nel system_text dell'LLM, esposto qui all'utente. */
+export async function getSessionWorklog(
+  sessionId: string,
+): Promise<{ renderedBlock: string }> {
+  return fetchJson(`${API_BASE}/api/chat/sessions/${sessionId}/worklog`);
 }
 
 export async function sendChatMessage(

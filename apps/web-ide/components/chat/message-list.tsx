@@ -303,6 +303,45 @@ function StepStatusBadge({ status, tc }: { status: AgentStep["status"]; tc: Them
   );
 }
 
+// Badge PERSISTENTE dello stato del turno, mostrato sotto la risposta assistant.
+// Lo stato e' quello canonico del run (agent_runs.status via backend), quindi
+// resta coerente anche dopo un reload e rende esplicito "cosa e' successo e
+// com'e' finito" — chiude la percezione di turni scollegati.
+function RunStatusBadge({ status, tc }: { status: string; tc: ThemeColors }) {
+  const config: Record<string, { label: string; color: string; bg: string }> = {
+    completed: { label: "completato", color: "#22c55e", bg: "#22c55e18" },
+    completed_verified: { label: "completato e verificato", color: "#22c55e", bg: "#22c55e18" },
+    failed: { label: "non riuscito", color: tc.error, bg: `${tc.error}18` },
+    failed_diagnosed: { label: "non riuscito (diagnosi)", color: tc.error, bg: `${tc.error}18` },
+    timed_out: { label: "tempo scaduto", color: tc.error, bg: `${tc.error}18` },
+    loop_aborted: { label: "interrotto (loop)", color: tc.error, bg: `${tc.error}18` },
+    cancelled: { label: "interrotto", color: tc.textMuted, bg: `${tc.border}20` },
+    interrupted: { label: "interrotto (riavvio)", color: "#f59e0b", bg: "#f59e0b18" },
+    provider_unavailable: { label: "provider non disponibile", color: "#f59e0b", bg: "#f59e0b18" },
+    awaiting_confirmation: { label: "in attesa di conferma", color: "#8b5cf6", bg: "#8b5cf618" },
+    blocked_needs_input: { label: "in attesa di input", color: "#8b5cf6", bg: "#8b5cf618" },
+    running: { label: "in corso", color: tc.accent, bg: `${tc.accent}18` },
+  };
+  const c = config[status];
+  if (!c) return null;
+  return (
+    <span style={{
+      display: "inline-flex",
+      alignItems: "center",
+      fontSize: 10,
+      fontWeight: 600,
+      color: c.color,
+      background: c.bg,
+      border: `1px solid ${c.color}40`,
+      borderRadius: 5,
+      padding: "1px 7px",
+      whiteSpace: "nowrap",
+    }}>
+      {c.label}
+    </span>
+  );
+}
+
 function InlineTruncated({ text, maxLen = 400, tc, mono = true }: { text: string; maxLen?: number; tc: ThemeColors; mono?: boolean }) {
   const [full, setFull] = useState(false);
   const truncated = text.length > maxLen;
@@ -1057,6 +1096,14 @@ export function MessageList({
               })()}
             </div>
 
+            {/* Badge di stato del turno (persistente, dal run canonico): rende
+                esplicito com'e' finito il run e demarca la fine del turno. */}
+            {!isUser && message.runStatus && (
+              <div style={{ marginTop: 6 }}>
+                <RunStatusBadge status={message.runStatus} tc={tc} />
+              </div>
+            )}
+
             {/* Scelte di proseguimento: pulsanti attaccati a fine proposta DENTRO
                 la bolla del messaggio assistant che le ha generate (vicino al
                 testo). Sorgente: scelte live (SSE) se disponibili per questo run,
@@ -1077,8 +1124,10 @@ export function MessageList({
               <AttachmentChips attachments={message.attachments} tc={tc} />
             )}
 
-            {/* Pannello step agente (caricamento lazy dal DB) */}
-            {!isUser && message.runId && message.automationMode === "agent" && (
+            {/* Pannello step agente (caricamento lazy dal DB): mostrato per
+                OGNI run, non solo in modalita' agent, cosi' si vede sempre cosa
+                e' stato fatto. Si auto-nasconde se il run non ha prodotto step. */}
+            {!isUser && message.runId && (
               <AgentRunStepsInline runId={message.runId} tc={tc} />
             )}
 
