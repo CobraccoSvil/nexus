@@ -42,17 +42,27 @@ for svc in nexus-brain nexus-mcp-core; do
   echo "  installato /etc/systemd/system/${svc}.service"
 done
 
-# I log restano sui file storici; assicura che siano scrivibili dall'utente.
+# Log su file storici /tmp/nexus-*.log. ATTENZIONE: fs.protected_regular=2
+# (hardening kernel) impedisce a systemd (PID1=root) di aprire in append un
+# file NON di sua proprieta' in una dir sticky world-writable come /tmp ->
+# errore "Failed to set up standard output: Permission denied" (status
+# 209/STDOUT) e crash-loop. Le unit --system aprono StandardOutput come root,
+# quindi i log devono essere di proprieta' di ROOT: root li apre come owner
+# (protected_regular soddisfatto) e passa il fd gia' aperto al processo
+# User=administrator, che ci scrive. I tool di lettura (tail) restano ok (644).
 touch /tmp/nexus-neural.log /tmp/nexus-mcp-core.log
-chown "$USER_NAME":"$USER_NAME" /tmp/nexus-neural.log /tmp/nexus-mcp-core.log
+chown root:root /tmp/nexus-neural.log /tmp/nexus-mcp-core.log
+chmod 644 /tmp/nexus-neural.log /tmp/nexus-mcp-core.log
 
 # 3. Avvia: brain prima (mcp-core attende il gRPC 50051), poi mcp-core.
 systemctl daemon-reload
+# Azzera eventuali crash-loop/start-limit da tentativi precedenti.
+systemctl reset-failed nexus-brain.service nexus-mcp-core.service 2>/dev/null || true
 systemctl enable nexus-brain.service nexus-mcp-core.service >/dev/null 2>&1 || true
 systemctl restart nexus-brain.service
-sleep 6
+sleep 8
 systemctl restart nexus-mcp-core.service
-sleep 12
+sleep 14
 
 # 4. Verifica.
 echo "==> Stato unit:"
