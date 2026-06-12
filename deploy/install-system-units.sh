@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# ADR 0028 livello 3 — Sposta mcp-core e brain da systemd --user a --SYSTEM.
+# ADR 0028 livello 3 — Sposta mcp-core, brain e web-ide da systemd --user a
+# --SYSTEM (gestiti da PID 1, immuni dalla caduta del manager --user in WSL).
 #
 # Perche': in WSL il manager systemd --user (user@<UID>) raggiunge exit.target e
 # si spegne quando la sessione logind si chiude (chiusura terminale / errore WSL
-# Relay vsock), NONOSTANTE loginctl enable-linger -> porta giu' mcp-core e brain
-# anche durante una chat. PID 1 (--system) e' indipendente da logind/sessioni/
-# linger, come i container Docker che infatti non cadono mai. Idempotente.
+# Relay vsock), NONOSTANTE loginctl enable-linger -> porta giu' Nexus anche
+# durante una chat. PID 1 e' indipendente da logind/sessioni/linger, come i
+# container Docker che infatti non cadono mai. Idempotente.
 #
 # USO:  sudo bash deploy/install-system-units.sh
 set -eu
@@ -21,20 +22,29 @@ HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 ROOT="$HOME_DIR/ideai"
 SRC="$ROOT/deploy/systemd"
 
-echo "==> Nexus core -> systemd --system (utente=$USER_NAME uid=$USER_UID)"
+# SELF-DETACH: disabilitare le unit --user (sotto) puo' far cadere il manager
+# user@UID in WSL, che termina la user-slice INCLUSO questo script se gira nella
+# sessione utente (osservato: lo script si auto-terminava con "Terminated"). Ci
+# si ri-esegue UNA volta in uno scope --system adottato da PID 1, immune.
+if [ -z "${NEXUS_INSTALL_DETACHED:-}" ]; then
+  echo "==> Ri-eseguo in scope --system (immune alla caduta sessione WSL)..."
+  exec systemd-run --scope --collect --quiet \
+    --setenv=NEXUS_INSTALL_DETACHED=1 --setenv=SUDO_USER="$USER_NAME" \
+    bash "$ROOT/deploy/install-system-units.sh"
+fi
 
-# 1. Disabilita le unit --user omonime (evita doppioni: stesso nome, scope
-#    diverso -> due processi sulla stessa porta). Rimuove i symlink di enable e
-#    ferma i servizi/manager --user se attivi (best-effort).
+echo "==> Nexus -> systemd --system (utente=$USER_NAME uid=$USER_UID)"
+
+# 1. Disabilita le unit --user omonime (mcp-core/brain: stesso nome, scope
+#    diverso -> doppioni di porta) e ferma il web-ide legacy (nohup).
 USER_WANTS="$HOME_DIR/.config/systemd/user/default.target.wants"
-for svc in nexus-mcp-core nexus-brain; do
-  rm -f "$USER_WANTS/${svc}.service"
-done
+rm -f "$USER_WANTS/nexus-mcp-core.service" "$USER_WANTS/nexus-brain.service"
 runuser -l "$USER_NAME" -c "XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user stop nexus-mcp-core.service nexus-brain.service" 2>/dev/null || true
-echo "  unit --user disabilitate"
+pkill -f "apps/web-ide/server.js" 2>/dev/null || true
+echo "  unit --user disabilitate, web-ide legacy fermato"
 
-# 2. Genera e installa le unit --system dal template (sostituendo USER/UID).
-for svc in nexus-brain nexus-mcp-core; do
+# 2. Genera e installa le unit --system dai template.
+for svc in nexus-brain nexus-mcp-core nexus-web-ide; do
   src="$SRC/${svc}-system.service"
   [ -f "$src" ] || { echo "ERRORE: template mancante $src" >&2; exit 1; }
   sed -e "s/__USER__/$USER_NAME/g" -e "s/__UID__/$USER_UID/g" "$src" \
@@ -42,36 +52,33 @@ for svc in nexus-brain nexus-mcp-core; do
   echo "  installato /etc/systemd/system/${svc}.service"
 done
 
-# Log su file storici /tmp/nexus-*.log. ATTENZIONE: fs.protected_regular=2
-# (hardening kernel) impedisce a systemd (PID1=root) di aprire in append un
-# file NON di sua proprieta' in una dir sticky world-writable come /tmp ->
-# errore "Failed to set up standard output: Permission denied" (status
-# 209/STDOUT) e crash-loop. Le unit --system aprono StandardOutput come root,
-# quindi i log devono essere di proprieta' di ROOT: root li apre come owner
-# (protected_regular soddisfatto) e passa il fd gia' aperto al processo
-# User=administrator, che ci scrive. I tool di lettura (tail) restano ok (644).
-touch /tmp/nexus-neural.log /tmp/nexus-mcp-core.log
-chown root:root /tmp/nexus-neural.log /tmp/nexus-mcp-core.log
-chmod 644 /tmp/nexus-neural.log /tmp/nexus-mcp-core.log
+# 3. Log su file storici /tmp/nexus-*.log di proprieta' ROOT: fs.protected_regular
+#    (=2) impedisce a systemd (PID1=root) di aprire in append un file NON suo in
+#    una dir sticky world-writable come /tmp (errore 209/STDOUT, crash-loop). Le
+#    unit --system aprono StandardOutput come root -> i log devono essere di root
+#    (apre come owner, passa il fd al processo User=). I tail restano ok (644).
+touch /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-webide.log
+chown root:root /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-webide.log
+chmod 644 /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-webide.log
 
-# 3. Avvia: brain prima (mcp-core attende il gRPC 50051), poi mcp-core.
+# 4. Avvia: brain (gRPC 50051) prima, poi mcp-core e web-ide.
 systemctl daemon-reload
-# Azzera eventuali crash-loop/start-limit da tentativi precedenti.
-systemctl reset-failed nexus-brain.service nexus-mcp-core.service 2>/dev/null || true
-systemctl enable nexus-brain.service nexus-mcp-core.service >/dev/null 2>&1 || true
-systemctl restart nexus-brain.service
+systemctl reset-failed nexus-brain nexus-mcp-core nexus-web-ide 2>/dev/null || true
+systemctl enable nexus-brain nexus-mcp-core nexus-web-ide >/dev/null 2>&1 || true
+systemctl start nexus-brain.service
 sleep 8
-systemctl restart nexus-mcp-core.service
-sleep 14
+systemctl start nexus-mcp-core.service nexus-web-ide.service
+sleep 12
 
-# 4. Verifica.
+# 5. Verifica.
 echo "==> Stato unit:"
-systemctl is-active nexus-brain.service nexus-mcp-core.service || true
+systemctl is-active nexus-brain nexus-mcp-core nexus-web-ide || true
 echo "==> Health:"
 curl -s -o /dev/null -w "  brain(8001)=%{http_code}\n" --max-time 6 http://127.0.0.1:8001/health || true
 curl -s -o /dev/null -w "  mcp-core(4000)=%{http_code}\n" --max-time 6 http://127.0.0.1:4000/health || true
+curl -s -o /dev/null -w "  web-ide(3000)=%{http_code}\n" --max-time 6 http://127.0.0.1:3000/ || true
 
 echo
-echo "==> Fatto. Restart futuri:  sudo systemctl restart nexus-mcp-core nexus-brain"
+echo "==> Fatto. Restart futuri:  sudo systemctl restart nexus-mcp-core nexus-brain nexus-web-ide"
 echo "==> Test di stabilita' definitivo: chiudi TUTTI i terminali WSL, attendi"
 echo "    1-2 min, poi  curl http://127.0.0.1:4000/health  deve dare 200."

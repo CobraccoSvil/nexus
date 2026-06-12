@@ -1,0 +1,31 @@
+# nexus-web-ide.service — Frontend Next.js di Nexus come unit systemd --SYSTEM.
+#
+# ADR 0028 livello 3 (2026-06-12). Vedi nexus-brain-system.service per il
+# razionale: i servizi --user cadono con la sessione WSL (exit.target). Il
+# web-ide era avviato da deploy-local.sh con setsid nohup (processo nudo) ->
+# stessa fragilita'. Qui passa sotto PID 1.
+#
+# Richiede la build di produzione (apps/web-ide/.next, prodotta da
+# `./deploy/deploy-local.sh --web`). server.js ascolta su 0.0.0.0:3000.
+#
+# Installata da deploy/install-system-units.sh (sostituisce __USER__/__UID__).
+
+[Unit]
+Description=Nexus web-ide (Next.js frontend) [system-level, ADR 0028 L3]
+After=network-online.target nexus-mcp-core.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=/home/__USER__/ideai/apps/web-ide
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /home/__USER__/ideai/apps/web-ide/server.js
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:/tmp/nexus-webide.log
+StandardError=append:/tmp/nexus-webide.log
+
+[Install]
+WantedBy=multi-user.target
