@@ -435,10 +435,16 @@ prompt_service_menu() {
 }
 
 stop_webide() {
-    # Fix M49: il pattern "server\.js" matchava ANCHE il nexus-gateway
-    # (node apps/nexus-gateway/dist/server.js), causando il kill collaterale
-    # del gateway a ogni rebuild --web. Ora il match e' ristretto al solo
-    # binary del web-ide (apps/web-ide/server.js).
+    # ADR 0028 L3: se gestito da systemd --system, fermalo via systemctl —
+    # un pkill verrebbe rilanciato da Restart=on-failure entro pochi secondi
+    # (doppia istanza sulla porta col restart successivo).
+    if [ -f "/etc/systemd/system/nexus-web-ide.service" ]; then
+        sudo systemctl stop nexus-web-ide.service 2>/dev/null || true
+    fi
+    # Defense-in-depth: residui nohup legacy. Fix M49: il pattern "server\.js"
+    # matchava ANCHE il nexus-gateway (node apps/nexus-gateway/dist/server.js),
+    # causando il kill collaterale del gateway a ogni rebuild --web. Match
+    # ristretto al solo binary del web-ide (apps/web-ide/server.js).
     pkill -f "apps/web-ide/server\.js" 2>/dev/null || true
     pkill -f "next-server" 2>/dev/null || true
     pkill -f "next start"  2>/dev/null || true
@@ -447,10 +453,25 @@ stop_webide() {
 
 start_webide() {
     local logfile="/tmp/nexus-webide.log"
+    # ADR 0028 L3: unit --system ha la precedenza (come Rust e brain). Avviata da
+    # PID1 (root), systemd apre il log in append COME root e passa il fd al
+    # processo (User=): scrive su /tmp/nexus-webide.log anche se il file e' di
+    # proprieta' root, risolvendo il "Permission denied" del nohup --user.
+    if [ -f "/etc/systemd/system/nexus-web-ide.service" ]; then
+        sudo systemctl restart nexus-web-ide.service
+        echo "  web-ide via systemd --system nexus-web-ide.service (PID1, ADR 0028 L3) log=${logfile}"
+        return
+    fi
+    if systemctl --user cat nexus-web-ide.service >/dev/null 2>&1; then
+        systemctl --user restart nexus-web-ide.service
+        echo "  web-ide via systemd nexus-web-ide.service (auto-restart on-failure) log=${logfile}"
+        return
+    fi
     setsid nohup env NODE_ENV=production node "${ROOT}/apps/web-ide/server.js" \
         > "$logfile" 2>&1 < /dev/null &
+    local pid=$!
     disown || true
-    echo "  web-ide PID=$! log=${logfile}"
+    echo "  web-ide PID=${pid} log=${logfile} (nohup legacy: installa l'auto-restart con deploy/install-system-units.sh)"
 }
 
 build_webide() {
