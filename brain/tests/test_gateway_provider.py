@@ -487,3 +487,80 @@ async def test_errore_timeout_mappa_su_provider_result(monkeypatch: pytest.Monke
 def test_list_models_vuoto() -> None:
     # Il gateway non espone un catalogo proprio (governato dal DB).
     assert gp.GatewayProvider().list_models() == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vision: blocco image_url propagato intatto al gateway
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_convert_messages_propaga_image_url() -> None:
+    """convert_messages_to_openai con un blocco image_url emette un content-ARRAY
+    (parti text + image_url) invece della stringa. Senza immagini resta stringa."""
+    from brain.providers.adapter_base import convert_messages_to_openai
+
+    # Con immagine: content e' una lista di parti, l'image_url passa intatto.
+    out = convert_messages_to_openai(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "descrivi"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            }
+        ]
+    )
+    assert len(out) == 1
+    content = out[0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "descrivi"}
+    assert content[1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+
+    # Senza immagine: comportamento storico (content stringa).
+    out_text = convert_messages_to_openai(
+        [{"role": "user", "content": [{"type": "text", "text": "solo testo"}]}]
+    )
+    assert out_text[0]["content"] == "solo testo"
+
+
+@pytest.mark.asyncio
+async def test_generate_agent_turn_payload_con_immagine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Il blocco image_url di un messaggio user arriva nel payload del gateway
+    come content-array (vision via gateway, non SDK diretto)."""
+    captured = _install_complete_double(
+        monkeypatch,
+        {
+            "content": "DESCRIZIONE: un gatto\nOCR:",
+            "usage": {"input_tokens": 100, "output_tokens": 8},
+            "model_used": "gemini-x",
+            "provider_used": "google",
+            "finish_reason": "end_turn",
+        },
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "descrivi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,ZZZ"}},
+            ],
+        }
+    ]
+    # model "provider/model" -> pin del provider sul gateway.
+    res = await gp.GatewayProvider().generate_agent_turn(
+        "google/gemini-x", messages, [], max_tokens=2048,
+    )
+    assert res.content == "DESCRIZIONE: un gatto\nOCR:"
+
+    payload = captured.captured_payload
+    assert payload is not None
+    assert payload["model"] == "gemini-x"
+    assert payload["pin_provider"] == "google"
+    user_msg = payload["messages"][0]
+    assert user_msg["role"] == "user"
+    assert isinstance(user_msg["content"], list)
+    assert user_msg["content"][1]["type"] == "image_url"
+    assert user_msg["content"][1]["image_url"]["url"] == "data:image/png;base64,ZZZ"

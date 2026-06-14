@@ -11,8 +11,6 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from brain.grpc_server import runtime
-
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -68,10 +66,76 @@ def _parse_vision_response(text: str) -> tuple[str, str | None]:
     return description, ocr_value
 
 
+def _data_uri(mime: str, image_bytes: bytes) -> str:
+    """Costruisce un data URI ``data:<mime>;base64,<b64>`` da byte immagine.
+
+    E' il formato accettato dal blocco ``image_url`` del gateway (mappato poi
+    al dialetto del provider: openai_compat usa il data URI tale e quale,
+    anthropic/google lo decodificano in source base64 / inline_data).
+    """
+    import base64 as _b64
+
+    b64 = _b64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+async def _gateway_vision_call(
+    *,
+    endpoint: str,
+    provider_name: str,
+    model: str,
+    messages: list[dict],
+) -> str:
+    """Esegue la chiamata vision via GatewayProvider e ritorna il testo grezzo.
+
+    Punto unico (regola L) per /vision/describe e /vision/compare: costruisce il
+    model pinnato ``provider/model``, delega a ``generate_agent_turn`` (nessun
+    tool) e mappa l'esito sullo stesso schema di errore degli endpoint:
+      - 502 se il gateway/provider segnala errore (ProviderResult error);
+      - 502 se la risposta e' vuota (nessun contenuto utile da parsare).
+    Il routing/cooldown/privacy vivono nel gateway; qui niente SDK vendor.
+    """
+    from brain.providers.gateway_provider import GatewayProvider
+
+    pinned_model = f"{provider_name}/{model}"
+    try:
+        result = await GatewayProvider().generate_agent_turn(
+            model=pinned_model,
+            messages=messages,
+            tools=[],
+            max_tokens=2048,
+            system_text="",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("%s: chiamata gateway fallita: %s", endpoint, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider {provider_name} vision via gateway fallito: {exc}",
+        )
+
+    meta = result.metadata or {}
+    if meta.get("stop_reason") == "error" or meta.get("error"):
+        err = meta.get("error") or "errore non specificato"
+        logger.error("%s: gateway ha segnalato errore (%s/%s): %s", endpoint, provider_name, model, err)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider {provider_name} vision via gateway fallito: {err}",
+        )
+
+    return result.content or ""
+
+
 @router.post("/vision/describe")
 async def vision_describe(body: VisionDescribeRequest) -> dict[str, object]:
     """Descrive un immagine usando il modello configurato in
     nexus_purpose_model.vision_describe.
+
+    La chiamata multimodale passa dal gateway LLM Rust (GatewayProvider) invece
+    che dagli SDK vendor diretti: il brain costruisce i messaggi con un blocco
+    ``image_url`` (data URI) e delega a ``generate_agent_turn`` con il model nel
+    formato ``provider/model`` (pin del provider risolto dal purpose). Il
+    gateway possiede routing/cooldown/privacy e mappa il blocco immagine al
+    dialetto del provider. Gli SDK e ``_get_client`` restano per batch/catalog.
 
     Errori espliciti (no fallback nascosti):
       - 503 se purpose non configurato o mcp-core irraggiungibile;
@@ -129,141 +193,23 @@ async def vision_describe(body: VisionDescribeRequest) -> dict[str, object]:
 
     prompt_text = (body.question or "").strip() or _VISION_DEFAULT_PROMPT
 
-    # 3) Esegui call multimodale per provider.
-    if provider_name == "google":
-        try:
-            from brain.providers.google_provider import GoogleProvider
-            from google.genai import types as _genai_types  # type: ignore[import]
-        except Exception as exc:
-            logger.error("vision_describe: import Google SDK fallito: %s", exc)
-            raise HTTPException(
-                status_code=503,
-                detail=f"Google SDK non disponibile: {exc}",
-            )
-        gp = runtime.providers.get_provider("google")
-        if gp is None or not isinstance(gp, GoogleProvider):
-            raise HTTPException(
-                status_code=503,
-                detail="Provider google non istanziato nel registry.",
-            )
-        ok, reason = gp._is_configured()
-        if not ok:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Provider google non configurato: {reason}",
-            )
-        try:
-            client = gp._get_client()
-            part = _genai_types.Part.from_bytes(data=image_bytes, mime_type=mime)
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=[part, prompt_text],
-                config=_genai_types.GenerateContentConfig(
-                    max_output_tokens=2048,
-                    temperature=0.2,
-                ),
-            )
-            text = response.text or ""
-        except Exception as exc:
-            logger.error("vision_describe: provider google ha fallito: %s", exc)
-            raise HTTPException(
-                status_code=502,
-                detail=f"Provider google vision fallito: {exc}",
-            )
-    elif provider_name == "anthropic":
-        # Vision via Anthropic Messages API (image block base64). Riusa il client
-        # del provider gia' istanziato nel registry (stesso pattern di google).
-        from brain.providers.anthropic_provider import AnthropicProvider
-
-        ap = runtime.providers.get_provider("anthropic")
-        if ap is None or not isinstance(ap, AnthropicProvider):
-            raise HTTPException(
-                status_code=503,
-                detail="Provider anthropic non istanziato nel registry.",
-            )
-        try:
-            import base64 as _b64
-
-            b64 = _b64.b64encode(image_bytes).decode("ascii")
-            client = ap._get_client()
-            response = await client.messages.create(
-                model=model,
-                max_tokens=2048,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {"type": "base64", "media_type": mime, "data": b64},
-                            },
-                            {"type": "text", "text": prompt_text},
-                        ],
-                    }
-                ],
-            )
-            text = "".join(
-                getattr(blk, "text", "") for blk in (response.content or [])
-                if getattr(blk, "type", "") == "text"
-            )
-        except Exception as exc:
-            logger.error("vision_describe: provider anthropic ha fallito: %s", exc)
-            raise HTTPException(
-                status_code=502,
-                detail=f"Provider anthropic vision fallito: {exc}",
-            )
-    elif provider_name == "openai":
-        # Vision via OpenAI Chat Completions API (image_url data URI). Riusa il
-        # client OpenAI-compatible del provider (stesso pattern di google).
-        from brain.providers.openai_provider import OpenAIProvider
-
-        op = runtime.providers.get_provider("openai")
-        if op is None or not isinstance(op, OpenAIProvider):
-            raise HTTPException(
-                status_code=503,
-                detail="Provider openai non istanziato nel registry.",
-            )
-        try:
-            import base64 as _b64
-
-            b64 = _b64.b64encode(image_bytes).decode("ascii")
-            client = op._get_client()
-            response = await client.chat.completions.create(
-                model=model,
-                max_tokens=2048,
-                temperature=0.2,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt_text},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                            },
-                        ],
-                    }
-                ],
-            )
-            text = response.choices[0].message.content or ""
-        except Exception as exc:
-            logger.error("vision_describe: provider openai ha fallito: %s", exc)
-            raise HTTPException(
-                status_code=502,
-                detail=f"Provider openai vision fallito: {exc}",
-            )
-    else:
-        logger.error("vision_describe: provider %r non supportato.", provider_name)
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                f"Provider {provider_name!r} non ancora supportato dall endpoint vision. "
-                "I provider instradabili sono nel setting DB `vision.routable_providers` "
-                "(mig 0373, punto unico): classify_capabilities marca supports_vision solo "
-                "per quelli, quindi il routing per tier non li sceglie. Aggiungere un "
-                "provider = aggiornare il setting + il ramo corrispondente qui in vision.py."
-            ),
-        )
+    # 3) Esegui call multimodale via gateway (GatewayProvider). Il model e' nel
+    #    formato "provider/model" -> il gateway pinna ESATTAMENTE quel provider.
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": _data_uri(mime, image_bytes)}},
+            ],
+        }
+    ]
+    text = await _gateway_vision_call(
+        endpoint="vision_describe",
+        provider_name=provider_name,
+        model=model,
+        messages=messages,
+    )
 
     description, ocr_text = _parse_vision_response(text)
     elapsed_ms = int((_time.perf_counter() - t0) * 1000)
@@ -430,45 +376,25 @@ async def vision_compare(body: VisualCompareRequest) -> dict[str, object]:
             ),
         )
 
-    if provider_name == "google":
-        try:
-            from brain.providers.google_provider import GoogleProvider
-            from google.genai import types as _genai_types  # type: ignore[import]
-        except Exception as exc:
-            logger.error("vision_compare: import Google SDK fallito: %s", exc)
-            raise HTTPException(status_code=503, detail=f"Google SDK non disponibile: {exc}")
-        gp = runtime.providers.get_provider("google")
-        if gp is None or not isinstance(gp, GoogleProvider):
-            raise HTTPException(status_code=503, detail="Provider google non istanziato nel registry.")
-        ok, reason = gp._is_configured()
-        if not ok:
-            raise HTTPException(status_code=503, detail=f"Provider google non configurato: {reason}")
-        try:
-            client = gp._get_client()
-            shot_part = _genai_types.Part.from_bytes(data=screenshot_bytes, mime_type=screenshot_mime)
-            ref_part = _genai_types.Part.from_bytes(data=reference_bytes, mime_type=reference_mime)
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=[shot_part, ref_part, _VISUAL_COMPARE_PROMPT],
-                config=_genai_types.GenerateContentConfig(
-                    max_output_tokens=2048,
-                    temperature=0.2,
-                ),
-            )
-            text = response.text or ""
-        except Exception as exc:
-            logger.error("vision_compare: provider google ha fallito: %s", exc)
-            raise HTTPException(status_code=502, detail=f"Provider google vision fallito: {exc}")
-    else:
-        logger.error("vision_compare: provider %r non supportato.", provider_name)
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                f"Provider {provider_name!r} non ancora supportato dall endpoint vision compare. "
-                "Configura google in nexus_purpose_model.visual_compare oppure estendi "
-                "brain/grpc_server/main.py per il provider scelto."
-            ),
-        )
+    # Call multimodale via gateway: prompt + DUE immagini (screenshot poi
+    # reference, stesso ordine atteso dal prompt). Il model "provider/model"
+    # pinna il provider sul gateway.
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _VISUAL_COMPARE_PROMPT},
+                {"type": "image_url", "image_url": {"url": _data_uri(screenshot_mime, screenshot_bytes)}},
+                {"type": "image_url", "image_url": {"url": _data_uri(reference_mime, reference_bytes)}},
+            ],
+        }
+    ]
+    text = await _gateway_vision_call(
+        endpoint="vision_compare",
+        provider_name=provider_name,
+        model=model,
+        messages=messages,
+    )
 
     parsed = _parse_visual_compare_response(text)
     elapsed_ms = int((_time.perf_counter() - t0) * 1000)

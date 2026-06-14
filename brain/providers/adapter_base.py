@@ -68,11 +68,23 @@ def convert_messages_to_openai(messages: list[dict]) -> list[dict]:
             reasoning_parts: list[str] = []
             tool_calls: list[dict] = []
             tool_results: list[dict] = []
+            # Blocchi immagine multimodali nel formato OpenAI nativo
+            # ({type:"image_url", image_url:{url}}). Raccolti separatamente:
+            # se presenti, il messaggio emette un content-ARRAY (parti text +
+            # image_url) invece della stringa, cosi' la vision passa intatta al
+            # gateway (che lo mappa al dialetto del provider: openai_compat,
+            # anthropic, google). Senza immagini il comportamento resta
+            # identico (content stringa).
+            image_parts: list[dict] = []
 
             for block in content:
                 btype = block.get("type")
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
+                elif btype == "image_url":
+                    iu = block.get("image_url")
+                    if iu:
+                        image_parts.append({"type": "image_url", "image_url": iu})
                 elif btype == "reasoning":
                     # DeepSeek thinking mode: il reasoning_content del turno con
                     # tool_calls DEVE essere rispedito (400 altrimenti). Guarded:
@@ -107,6 +119,15 @@ def convert_messages_to_openai(messages: list[dict]) -> list[dict]:
                     oai_msg["reasoning_content"] = "\n".join(p for p in reasoning_parts if p)
                 oai_msg["tool_calls"] = tool_calls
                 result.append(oai_msg)
+            elif image_parts:
+                # Messaggio multimodale: emette content-array OpenAI nativo
+                # (parti testo seguite dalle immagini). Le parti testo restano
+                # blocchi {type:"text"} per coerenza col content-array.
+                parts: list[dict] = [
+                    {"type": "text", "text": t} for t in text_parts if t
+                ]
+                parts.extend(image_parts)
+                result.append({"role": role, "content": parts})
             else:
                 result.append({"role": role, "content": " ".join(text_parts)})
         else:
