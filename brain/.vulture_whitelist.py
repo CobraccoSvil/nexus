@@ -81,7 +81,6 @@ classify_intent  # handler FastAPI
 classify_intent_agentic  # handler FastAPI
 classify_intent_agentic_stats  # handler FastAPI
 embed  # handler FastAPI
-list_models_live  # handler FastAPI
 provider_health  # handler FastAPI
 complete  # handler FastAPI
 reload_settings  # handler FastAPI
