@@ -66,6 +66,38 @@ _DEFAULT_STREAM_TIMEOUT_S = 300.0
 # i campi metadata; usiamo l'UUID di sistema invece di stringhe vuote.
 _SYSTEM_UUID = "00000000-0000-0000-0000-000000000000"
 
+# Provider noti, coerenti coi nomi costruiti come LlmProvider lato gateway Rust
+# (crates/nexus-gateway/src/providers/*: fn name() -> "openai"|"anthropic"|...).
+# Quando il model arriva nel formato "<provider>/<model>" e il prefisso e' uno di
+# questi, lo splittiamo in pin_provider + model concreto: cosi' il gateway esegue
+# ESATTAMENTE quel provider (path pin) senza ri-fare il routing per-tier ne' il
+# fallback cross-provider (gli alias "-fallback"). Un prefisso NON noto (es. un
+# nome di modello che contiene "/" ma non e' un provider) non attiva il pin: il
+# model resta invariato e il gateway segue il routing storico.
+_KNOWN_GATEWAY_PROVIDERS = frozenset(
+    {"openai", "anthropic", "mistral", "deepseek", "google", "vllm"}
+)
+
+
+def _split_pin_provider(model: str) -> tuple[str | None, str]:
+    """Splitta un model ``"<provider>/<model>"`` in ``(pin_provider, model)``.
+
+    Ritorna ``(provider, resto)`` solo se la prima componente prima del primo
+    ``/`` e' un provider noto del gateway (``_KNOWN_GATEWAY_PROVIDERS``). In tutti
+    gli altri casi (nessun ``/``, prefisso non riconosciuto, componente vuota)
+    ritorna ``(None, model)`` invariato: nessun pin, comportamento storico.
+
+    Lo split usa ``split_once`` semantico (solo la PRIMA ``/``), coerente con
+    ``strip_model_prefix`` del gateway: un model con piu' segmenti (es.
+    ``vllm/org/modello``) mantiene il resto intatto come modello concreto.
+    """
+    prefix, sep, rest = model.partition("/")
+    if not sep or not rest:
+        return None, model
+    if prefix.lower() in _KNOWN_GATEWAY_PROVIDERS:
+        return prefix.lower(), rest
+    return None, model
+
 
 def _gateway_url() -> str:
     """URL base del gateway LLM Rust.
@@ -341,11 +373,14 @@ class GatewayProvider(BaseProvider):
     async def generate(self, model: str, prompt: str, **kwargs: Any) -> ProviderResult:
         """Completion semplice: un solo turno user, nessun tool. Inoltra a
         POST /v1/complete e mappa la LlmResponse nel ProviderResult."""
+        pin_provider, concrete_model = _split_pin_provider(model)
         payload: dict[str, Any] = {
-            "model": model,
+            "model": concrete_model,
             "messages": [{"role": "user", "content": prompt}],
             "metadata": _build_metadata("brain.generate"),
         }
+        if pin_provider:
+            payload["pin_provider"] = pin_provider
         if "temperature" in kwargs:
             payload["temperature"] = kwargs["temperature"]
         if "max_tokens" in kwargs:
@@ -396,12 +431,15 @@ class GatewayProvider(BaseProvider):
         tool_choice e la policy thinking sono decisi dal gateway/provider a valle:
         non li ri-deriviamo qui per non duplicare logica (regola L).
         """
+        pin_provider, concrete_model = _split_pin_provider(model)
         payload: dict[str, Any] = {
-            "model": model,
+            "model": concrete_model,
             "messages": _to_gateway_messages(messages, system_text),
             "max_tokens": max_tokens,
             "metadata": _build_metadata("brain.agent_turn"),
         }
+        if pin_provider:
+            payload["pin_provider"] = pin_provider
         gw_tools = _to_gateway_tools(tools) if tools else []
         if gw_tools:
             payload["tools"] = gw_tools
@@ -496,13 +534,16 @@ class GatewayProvider(BaseProvider):
         ``finish_reason="error"`` + ``error``/``error_class`` (nessun raise per
         non rompere il generatore lato chiamante).
         """
+        pin_provider, concrete_model = _split_pin_provider(model)
         payload: dict[str, Any] = {
-            "model": model,
+            "model": concrete_model,
             "messages": _to_gateway_messages(messages, system_text),
             "max_tokens": max_tokens,
             "stream": True,
             "metadata": _build_metadata("brain.stream"),
         }
+        if pin_provider:
+            payload["pin_provider"] = pin_provider
         gw_tools = _to_gateway_tools(tools) if tools else []
         if gw_tools:
             payload["tools"] = gw_tools

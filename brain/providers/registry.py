@@ -670,6 +670,27 @@ def _close_loop_safely(loop: "asyncio.AbstractEventLoop", provider_obj: object |
     loop.close()
 
 
+def _use_gateway_provider() -> bool:
+    """Feature flag (regola G): quando True il registry usa il GatewayProvider
+    come TRASPORTO al posto degli adapter SDK, mantenendo invariati routing,
+    cooldown e cascade-fallback del brain (la selezione (provider, model) resta
+    qui; il gateway riceve il model nel formato ``provider/model`` che il
+    GatewayProvider traduce in ``pin_provider``+``model`` concreto, cosi' il
+    gateway esegue ESATTAMENTE il provider deciso dal brain senza rifare il
+    routing per-tier ne' il fallback cross-provider).
+
+    Default False (comportamento attuale, SDK). Letto dalla tabella ``settings``
+    chiave ``brain.use_gateway_provider``; best-effort: se il DB e' down resta
+    False (nessun cambio di trasporto silenzioso). Rollback immediato spegnendo
+    il flag in DB (cache 60s del settings cached loader).
+    """
+    try:
+        from brain.utils.settings_db import get_bool_setting_cached
+        return get_bool_setting_cached("brain.use_gateway_provider", False)
+    except Exception:
+        return False
+
+
 class ProviderRegistry:
     def __init__(self) -> None:
         self._providers: dict[str, BaseProvider] = {
@@ -683,6 +704,48 @@ class ProviderRegistry:
         }
         # Tutti i provider abilitati di default; _load_keys_from_db() può sovrascrivere
         self._disabled: set[str] = set()
+        # Trasporto gateway (lazy): istanziato solo quando il flag e' acceso, cosi'
+        # con flag OFF il GatewayProvider non viene neppure costruito. E' solo il
+        # TRASPORTO: il routing/cooldown/cascade restano in questo registry.
+        self._gateway_provider: BaseProvider | None = None
+
+    def _gateway(self) -> BaseProvider:
+        """Istanza lazy del GatewayProvider (trasporto verso il gateway Rust)."""
+        if self._gateway_provider is None:
+            from .gateway_provider import GatewayProvider
+            self._gateway_provider = GatewayProvider()
+        return self._gateway_provider
+
+    def _transport_for(self, provider_name: str) -> BaseProvider | None:
+        """Ritorna il provider da usare come TRASPORTO per ``provider_name``.
+
+        Flag ON  -> GatewayProvider (delega al gateway Rust). Flag OFF -> adapter
+        SDK registrato. Punto unico del bivio trasporto (regola L): tutti i path
+        di esecuzione (generate / agent turn) passano da qui, cosi' il flag
+        governa l'intero registry da un solo posto.
+        """
+        if _use_gateway_provider():
+            return self._gateway()
+        return self._providers.get(provider_name)
+
+    @staticmethod
+    def _transport_model(provider_name: str, model: str) -> str:
+        """Model da inviare al trasporto.
+
+        Con il GatewayProvider il routing/provider e' gia' deciso dal brain:
+        passiamo il model prefissato ``provider/model``. Il GatewayProvider lo
+        splitta in ``pin_provider``+``model`` concreto (vedi
+        ``gateway_provider._split_pin_provider``), cosi' il gateway esegue
+        ESATTAMENTE quel provider (path pin) SENZA rifare il routing per-tier ne'
+        il fallback cross-provider. Se il model e' gia' prefissato non lo
+        raddoppia. Con gli adapter SDK il prefisso non serve (ogni adapter parla
+        col proprio vendor) e il model resta invariato.
+        """
+        if not _use_gateway_provider():
+            return model
+        if "/" in model:
+            return model
+        return f"{provider_name}/{model}"
 
     def set_enabled(self, name: str, enabled: bool) -> None:
         """Abilita o disabilita un provider. Thread-safe (GIL)."""
@@ -747,7 +810,11 @@ class ProviderRegistry:
                 content=f"[Provider '{provider}' è disabilitato]",
                 metadata={"error": "provider_disabled"},
             )
-        p = self._providers.get(provider)
+        # Bivio trasporto (flag brain.use_gateway_provider): SDK o gateway.
+        # Il (provider, model) e' gia' scelto dal chiamante; qui si decide solo il
+        # trasporto. Con il gateway il model viaggia come "provider/model".
+        p = self._transport_for(provider)
+        wire_model = self._transport_model(provider, model)
         if p is None:
             return ProviderResult(
                 provider=provider, model=model,
@@ -769,7 +836,7 @@ class ProviderRegistry:
                 asyncio.set_event_loop(loop)
                 try:
                     return loop.run_until_complete(
-                        p.generate(model, prompt, internal_task=internal_task)
+                        p.generate(wire_model, prompt, internal_task=internal_task)
                     )
                 finally:
                     _close_loop_safely(loop, p)
@@ -972,7 +1039,12 @@ class ProviderRegistry:
                 metadata={"error": "agent_turn_not_supported"},
             )
         def _run_agent_turn(prov_name: str, prov_model: str) -> ProviderResult:
-            prov = self._providers.get(prov_name)
+            # Bivio trasporto (flag brain.use_gateway_provider): SDK o gateway.
+            # Il routing ha gia' scelto (prov_name, prov_model); qui si decide solo
+            # COME eseguire la chiamata. Con il gateway il model viaggia come
+            # "provider/model" (vedi _transport_model) per non rifare il routing.
+            prov = self._transport_for(prov_name)
+            wire_model = self._transport_model(prov_name, prov_model)
             if prov is None or not hasattr(prov, "generate_agent_turn"):
                 return ProviderResult(
                     provider=prov_name, model=prov_model,
@@ -1027,7 +1099,7 @@ class ProviderRegistry:
                     asyncio.set_event_loop(loop)
                     try:
                         return loop.run_until_complete(
-                            prov.generate_agent_turn(prov_model, messages, tools, max_tokens, **_agent_kwargs)
+                            prov.generate_agent_turn(wire_model, messages, tools, max_tokens, **_agent_kwargs)
                         )
                     finally:
                         # Teardown sicuro: chiude i client async del provider e

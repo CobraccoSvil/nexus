@@ -166,6 +166,8 @@ async def test_generate_agent_turn_costruisce_request_gateway(
     payload = captured.captured_payload
     assert payload is not None
     assert payload["model"] == "claude-x"
+    # model senza prefisso provider noto -> nessun pin (routing storico gateway).
+    assert "pin_provider" not in payload
     assert payload["max_tokens"] == 2048
     # system_text -> primo messaggio role=system
     assert payload["messages"][0] == {"role": "system", "content": "sei un agente"}
@@ -205,7 +207,107 @@ async def test_generate_request_minimale(monkeypatch: pytest.MonkeyPatch) -> Non
     assert payload["messages"] == [{"role": "user", "content": "dimmi ciao"}]
     assert payload["temperature"] == 0.2
     assert payload["max_tokens"] == 64
+    # model "m" senza prefisso provider -> nessun pin.
+    assert "pin_provider" not in payload
     assert payload["metadata"]["feature"] == "brain.generate"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Split provider/model -> pin_provider (esecuzione ESATTA lato gateway)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_split_pin_provider_helper() -> None:
+    """``_split_pin_provider`` separa il provider noto dal model concreto.
+
+    - prefisso provider noto -> (provider, model_senza_prefisso);
+    - nessun ``/`` -> (None, model invariato);
+    - prefisso NON noto -> (None, model invariato);
+    - piu' segmenti -> split SOLO sul primo ``/`` (resto come model concreto);
+    - prefisso case-insensitive normalizzato a minuscolo.
+    """
+    assert gp._split_pin_provider("anthropic/claude-x") == ("anthropic", "claude-x")
+    assert gp._split_pin_provider("openai/gpt-4o-mini") == ("openai", "gpt-4o-mini")
+    assert gp._split_pin_provider("gpt-4o-mini") == (None, "gpt-4o-mini")
+    # "claude-x" contiene un prefisso non-provider con "/": resta invariato.
+    assert gp._split_pin_provider("some-vendor/model") == (None, "some-vendor/model")
+    # split solo sul primo "/": il resto (anche con "/") e' il model concreto.
+    assert gp._split_pin_provider("vllm/org/modello") == ("vllm", "org/modello")
+    # case-insensitive sul prefisso.
+    assert gp._split_pin_provider("Anthropic/claude-x") == ("anthropic", "claude-x")
+    # componente vuota dopo "/" -> nessun pin.
+    assert gp._split_pin_provider("openai/") == (None, "openai/")
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_model_prefissato_setta_pin_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un model ``"<provider>/<model>"`` viene splittato: il payload porta
+    ``pin_provider=<provider>`` e ``model=<model concreto senza prefisso>``,
+    cosi' il gateway esegue ESATTAMENTE quel provider (no routing, no fallback
+    cross-provider)."""
+    captured = _install_complete_double(
+        monkeypatch,
+        {
+            "content": "ok",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "model_used": "claude-x",
+            "provider_used": "anthropic",
+            "finish_reason": "end_turn",
+        },
+    )
+    await gp.GatewayProvider().generate_agent_turn(
+        "anthropic/claude-x", [{"role": "user", "content": "ciao"}], [],
+    )
+    payload = captured.captured_payload
+    assert payload["pin_provider"] == "anthropic"
+    assert payload["model"] == "claude-x"
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_model_senza_prefisso_non_setta_pin_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un model senza prefisso provider noto NON attiva il pin: il payload non
+    contiene ``pin_provider`` e il model resta invariato (routing storico)."""
+    captured = _install_complete_double(
+        monkeypatch,
+        {
+            "content": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "model_used": "gpt-4o-mini",
+            "provider_used": "openai",
+            "finish_reason": "end_turn",
+        },
+    )
+    await gp.GatewayProvider().generate_agent_turn(
+        "gpt-4o-mini", [{"role": "user", "content": "ciao"}], [],
+    )
+    payload = captured.captured_payload
+    assert "pin_provider" not in payload
+    assert payload["model"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_generate_model_prefissato_setta_pin_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anche la completion semplice ``generate`` splitta il prefisso provider."""
+    captured = _install_complete_double(
+        monkeypatch,
+        {
+            "content": "ciao",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "model_used": "gpt-4o-mini",
+            "provider_used": "openai",
+            "finish_reason": "stop",
+        },
+    )
+    await gp.GatewayProvider().generate("openai/gpt-4o-mini", "ping")
+    payload = captured.captured_payload
+    assert payload["pin_provider"] == "openai"
+    assert payload["model"] == "gpt-4o-mini"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
