@@ -208,6 +208,7 @@ impl LlmProvider for DeepSeekProvider {
                     usage: None,
                     provider_used: Some("deepseek".to_string()),
                     model_used: None,
+                    reasoning_delta: None,
                 });
             }
 
@@ -226,6 +227,7 @@ impl LlmProvider for DeepSeekProvider {
                     usage: None,
                     provider_used: Some("deepseek".to_string()),
                     model_used: None,
+                    reasoning_delta: None,
                 });
             }
 
@@ -236,6 +238,7 @@ impl LlmProvider for DeepSeekProvider {
                 usage: last_usage,
                 provider_used: Some("deepseek".to_string()),
                 model_used: None,
+                reasoning_delta: None,
             });
 
             let out = futures::stream::iter(rebuilt.into_iter().map(Ok));
@@ -264,12 +267,16 @@ mod tests {
             usage: LlmUsage {
                 input_tokens: 1,
                 output_tokens: 1,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
             },
             model_used: "deepseek-x".to_string(),
             provider_used: "deepseek".to_string(),
             latency_ms: 1,
             finish_reason: "stop".to_string(),
             privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
         }
     }
 

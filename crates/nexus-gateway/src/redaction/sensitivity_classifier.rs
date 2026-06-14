@@ -124,6 +124,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             name: None,
+            thinking_signature: None,
         }
     }
 

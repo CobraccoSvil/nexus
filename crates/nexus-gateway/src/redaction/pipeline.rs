@@ -205,6 +205,7 @@ fn with_content(msg: &LlmMessage, text: String) -> LlmMessage {
         tool_call_id: msg.tool_call_id.clone(),
         tool_calls: msg.tool_calls.clone(),
         name: msg.name.clone(),
+        thinking_signature: msg.thinking_signature.clone(),
     }
 }
 
@@ -236,6 +237,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             name: None,
+            thinking_signature: None,
         }
     }
 
@@ -248,6 +250,7 @@ mod tests {
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: meta(request_id),
         }
     }
@@ -302,12 +305,16 @@ mod tests {
             usage: LlmUsage {
                 input_tokens: 1,
                 output_tokens: 1,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
             },
             model_used: "gw-test".into(),
             provider_used: "test".into(),
             latency_ms: 1,
             finish_reason: "stop".into(),
             privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
         };
         let rehydrated = p.rehydrate(&response, &mut res.map);
         assert!(rehydrated.content.contains("dbSecret"));
@@ -351,6 +358,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             name: None,
+            thinking_signature: None,
         };
         let req = request(vec![sys], "req-sys");
         let res = p.redact(&req).await.expect("redazione ok");

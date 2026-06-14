@@ -439,6 +439,8 @@ async fn build_sse_stream(
                                     latency_ms: 0,
                                     finish_reason: chunk.finish_reason.clone().unwrap_or_default(),
                                     privacy_rerouted: None,
+                                    reasoning: None,
+                                    thinking_signature: None,
                                 };
                                 record_usage_to_ledger(&state.db, &body, &resp).await;
                             }
@@ -561,12 +563,16 @@ mod tests {
                     usage: LlmUsage {
                         input_tokens: 1,
                         output_tokens: 1,
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
                     },
                     model_used: req.model.clone(),
                     provider_used: self.name.clone(),
                     latency_ms: 0,
                     finish_reason: "stop".into(),
                     privacy_rerouted: None,
+                    reasoning: None,
+                    thinking_signature: None,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
             }
@@ -588,12 +594,14 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
                 name: None,
+                thinking_signature: None,
             }],
             temperature: None,
             max_tokens: None,
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: RequestMetadata {
                 tenant_id: "t".into(),
                 user_id: "u".into(),

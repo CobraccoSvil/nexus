@@ -358,6 +358,8 @@ fn from_chat_completion(
             .as_ref()
             .map(|u| u.completion_tokens)
             .unwrap_or(0),
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
     };
 
     let finish_reason = normalize_finish_reason(choice.finish_reason.as_deref());
@@ -371,6 +373,9 @@ fn from_chat_completion(
         latency_ms,
         finish_reason,
         privacy_rerouted: None,
+        // Dialetto OpenAI-compat: nessun blocco thinking nativo.
+        reasoning: None,
+        thinking_signature: None,
     })
 }
 
@@ -384,6 +389,8 @@ fn chunk_from_sse(
     let usage = chunk.usage.map(|u| LlmUsage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
     });
 
     let choice = chunk.choices.into_iter().next();
@@ -411,6 +418,7 @@ fn chunk_from_sse(
                 usage: None,
                 provider_used: Some(provider_name.to_string()),
                 model_used: Some(model_used.to_string()),
+                reasoning_delta: None,
             });
         }
     }
@@ -433,6 +441,7 @@ fn chunk_from_sse(
         usage,
         provider_used: Some(provider_name.to_string()),
         model_used: Some(model_used.to_string()),
+        reasoning_delta: None,
     })
 }
 
@@ -633,12 +642,14 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
                 name: None,
+                thinking_signature: None,
             }],
             temperature: Some(0.5),
             max_tokens: Some(256),
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: RequestMetadata {
                 tenant_id: "t".to_string(),
                 user_id: "u".to_string(),

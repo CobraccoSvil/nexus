@@ -80,6 +80,13 @@ pub struct LlmMessage {
     pub tool_calls: Option<Vec<LlmToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Firma opaca del blocco `thinking` di un turno assistant precedente
+    /// (extended thinking Anthropic). Quando presente su un messaggio
+    /// `assistant`, il provider la re-include come block `thinking` con
+    /// `signature` nei turni con tool (l'API Anthropic la richiede, altrimenti
+    /// HTTP 400). Retrocompatibile: assente/`None` per tutti gli altri provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_signature: Option<String>,
 }
 
 /// Metadati di tracciamento e tenancy della richiesta (`RequestMetadata`).
@@ -108,7 +115,21 @@ pub struct LlmRequest {
     pub response_format: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Configurazione extended thinking richiesta dal chiamante. Quando
+    /// `enabled` e' true il provider (oggi solo Anthropic) attiva la modalita'
+    /// thinking. Retrocompatibile: `None` = nessuna richiesta di thinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
     pub metadata: RequestMetadata,
+}
+
+/// Configurazione extended thinking (`thinking` di `LLMRequest`). `budget_tokens`
+/// opzionale: se assente il provider usa il budget dai settings DB (regola G).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 /// Conteggio token consumati.
@@ -116,6 +137,13 @@ pub struct LlmRequest {
 pub struct LlmUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Token serviti da cache (prompt caching). Valorizzati nel passo cache;
+    /// retrocompatibile: `None` finche' il provider non li riporta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    /// Token scritti in cache (creazione voce cache). Vedi sopra.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
 }
 
 /// Informazioni sul re-routing per privacy (`privacy_rerouted`).
@@ -139,6 +167,15 @@ pub struct LlmResponse {
     pub finish_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub privacy_rerouted: Option<PrivacyRerouted>,
+    /// Testo del ragionamento (extended thinking) visibile, quando il provider
+    /// lo emette. Retrocompatibile: `None` se non disponibile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Firma opaca del blocco `thinking` da ri-passare nei turni successivi con
+    /// tool (Anthropic). Il chiamante la rispedisce via
+    /// [`LlmMessage::thinking_signature`]. Retrocompatibile: `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_signature: Option<String>,
 }
 
 /// Delta di tool-call durante lo streaming.
@@ -173,6 +210,10 @@ pub struct LlmStreamChunk {
     pub provider_used: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_used: Option<String>,
+    /// Delta del testo di reasoning (extended thinking) durante lo streaming.
+    /// Retrocompatibile: `None` sui chunk che non portano thinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_delta: Option<String>,
 }
 
 /// Stato di salute di un provider (`ProviderStatus`).

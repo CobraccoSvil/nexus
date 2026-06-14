@@ -125,14 +125,20 @@ impl ProviderKeys {
 /// Costruisce la lista dei provider abilitati a partire dalle chiavi. Ritorna
 /// SOLO i provider effettivamente configurati. Niente segreti nel log (regola F):
 /// si logga la lista dei nomi abilitati, mai le chiavi.
-fn build_providers(http: &Client, keys: &ProviderKeys) -> Vec<Arc<dyn LlmProvider>> {
+fn build_providers(db: &PgPool, http: &Client, keys: &ProviderKeys) -> Vec<Arc<dyn LlmProvider>> {
     let mut providers: Vec<Arc<dyn LlmProvider>> = Vec::new();
 
     if let Some(k) = &keys.openai {
         providers.push(Arc::new(OpenAiProvider::new(http.clone(), k.clone(), None)));
     }
     if let Some(k) = &keys.anthropic {
-        providers.push(Arc::new(AnthropicProvider::new(http.clone(), k.clone(), None)));
+        // DB passato per leggere il budget thinking dai settings (regola G).
+        providers.push(Arc::new(AnthropicProvider::with_db(
+            http.clone(),
+            k.clone(),
+            None,
+            Some(db.clone()),
+        )));
     }
     if let Some(k) = &keys.mistral {
         providers.push(Arc::new(MistralProvider::new(http.clone(), k.clone(), None)));
@@ -164,7 +170,7 @@ pub async fn build_runtime(
     config: GatewayConfig,
 ) -> Result<RuntimeState> {
     let keys = ProviderKeys::load(db).await;
-    let providers = build_providers(http, &keys);
+    let providers = build_providers(db, http, &keys);
 
     let policy = PolicyEngine::from_yaml_file(&config.policy_file)
         .with_context(|| format!("policy file '{}'", config.policy_file))?;

@@ -17,12 +17,14 @@
 //! loggare prompt/response in chiaro.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use nexus_cache::TtlCache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::provider::{ChunkStream, LlmProvider};
@@ -40,34 +42,91 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 /// Versione API Messages richiesta dall'header `anthropic-version`.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Beta header richiesto dall'extended thinking interleaved (parita' col Python,
+/// `betas = ["interleaved-thinking-2025-05-14"]`). Inviato via `anthropic-beta`
+/// solo quando il thinking e' attivo per la richiesta.
+const THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
 /// `max_tokens` di default quando la request non lo specifica. Non e' un nome di
 /// modello (regola G): e' il tetto di generazione richiesto obbligatoriamente
 /// dall'API Messages, allineato al `?? 4096` del TS.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// Provider Anthropic. Mantiene un client HTTP dedicato e l'ultimo errore di
-/// billing rilevato (per riportarlo nello healthcheck senza riconsumare crediti).
+/// Chiave settings (regola G) del budget di extended thinking. TEXT nel DB,
+/// interpretato come numero di token.
+const THINKING_BUDGET_SETTING: &str = "anthropic_thinking_budget";
+
+/// Budget thinking usato SOLO se il DB e' irraggiungibile e la richiesta ha
+/// thinking abilitato (fallback graceful documentato, regola G). Non e' un
+/// "magic default" per il routing: e' il tetto di sicurezza del solo budget
+/// thinking quando i settings non sono leggibili.
+const THINKING_BUDGET_DB_DOWN_FALLBACK: u32 = 2048;
+
+/// TTL della cache settings (60s, come `policy_engine`/`cooldown`).
+const SETTINGS_TTL: Duration = Duration::from_secs(60);
+
+/// Provider Anthropic. Mantiene un client HTTP dedicato. Il budget di extended
+/// thinking e' letto dai settings DB con cache TTL (punto unico `TtlCache`,
+/// regola L). Il `PgPool` e' opzionale: assente nei test che esercitano solo la
+/// mappatura request/response senza rete ne' DB.
 pub struct AnthropicProvider {
     http: Client,
     base_url: String,
     api_key: String,
+    db: Option<PgPool>,
+    thinking_budget: TtlCache<(), u32>,
 }
 
 impl AnthropicProvider {
-    /// Costruisce il provider. `base_url` opzionale (default Anthropic ufficiale);
-    /// `api_key` iniettata dal chiamante (regola F: niente segreti nel codice).
+    /// Costruisce il provider senza accesso DB (test di mappatura). Il budget
+    /// thinking non sara' leggibile dai settings: il thinking resta disattivo a
+    /// meno che la request non porti un `budget_tokens` esplicito.
     pub fn new(http: Client, api_key: impl Into<String>, base_url: Option<String>) -> Self {
+        Self::with_db(http, api_key, base_url, None)
+    }
+
+    /// Costruisce il provider con accesso DB per leggere il budget thinking dai
+    /// settings (regola G). `base_url` opzionale (default Anthropic ufficiale);
+    /// `api_key` iniettata dal chiamante (regola F: niente segreti nel codice).
+    pub fn with_db(
+        http: Client,
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        db: Option<PgPool>,
+    ) -> Self {
         let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {
             http,
             base_url,
             api_key: api_key.into(),
+            db,
+            thinking_budget: TtlCache::new(SETTINGS_TTL),
         }
     }
 
     fn endpoint(&self) -> String {
         format!("{}/messages", self.base_url)
+    }
+
+    /// Budget thinking corrente dai settings (cache TTL 60s). Se il DB e'
+    /// irraggiungibile o la chiave assente, ricade su un budget di sicurezza
+    /// documentato (`THINKING_BUDGET_DB_DOWN_FALLBACK`). Il valore viene comunque
+    /// validato a valle (`resolve_thinking_budget`): se >= max_tokens il thinking
+    /// resta disattivato.
+    async fn configured_thinking_budget(&self) -> u32 {
+        if let Some(b) = self.thinking_budget.get(&()) {
+            return b;
+        }
+        let Some(db) = self.db.as_ref() else {
+            return THINKING_BUDGET_DB_DOWN_FALLBACK;
+        };
+        let parsed = nexus_auth::get_setting(db, THINKING_BUDGET_SETTING)
+            .await
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        let budget = parsed.unwrap_or(THINKING_BUDGET_DB_DOWN_FALLBACK);
+        self.thinking_budget.insert((), budget);
+        budget
     }
 }
 
@@ -94,17 +153,20 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
-        let body = build_request_body(req, false);
+        let configured = self.configured_thinking_budget().await;
+        let thinking_budget = resolve_thinking_budget(req, configured);
+        let body = build_request_body(req, false, thinking_budget);
         let start = Instant::now();
 
-        let resp = self
+        let mut builder = self
             .http
             .post(self.endpoint())
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body)
-            .send()
-            .await?;
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        if thinking_budget.is_some() {
+            builder = builder.header("anthropic-beta", THINKING_BETA);
+        }
+        let resp = builder.json(&body).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -121,16 +183,19 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn stream(&self, req: &LlmRequest) -> anyhow::Result<ChunkStream> {
-        let body = build_request_body(req, true);
+        let configured = self.configured_thinking_budget().await;
+        let thinking_budget = resolve_thinking_budget(req, configured);
+        let body = build_request_body(req, true, thinking_budget);
 
-        let resp = self
+        let mut builder = self
             .http
             .post(self.endpoint())
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body)
-            .send()
-            .await?;
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        if thinking_budget.is_some() {
+            builder = builder.header("anthropic-beta", THINKING_BETA);
+        }
+        let resp = builder.json(&body).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -196,8 +261,39 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+/// Budget thinking effettivo per la richiesta. `Some(budget)` => extended
+/// thinking attivo con quel budget; `None` => disattivato. Il budget e' risolto
+/// a monte (settings DB, regola G) dal provider, non hardcoded qui.
+///
+/// Replica la guardia del Python (`max_tokens > thinking_budget`): un budget
+/// >= `max_tokens` produrrebbe HTTP 400, quindi in quel caso il thinking resta
+/// disattivato.
+fn resolve_thinking_budget(req: &LlmRequest, configured_budget: u32) -> Option<u32> {
+    let enabled = req.thinking.as_ref().is_some_and(|t| t.enabled);
+    if !enabled {
+        return None;
+    }
+    // Budget esplicito nella request ha priorita' su quello configurato.
+    let budget = req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.budget_tokens)
+        .unwrap_or(configured_budget);
+    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    if budget == 0 || budget >= max_tokens {
+        return None;
+    }
+    Some(budget)
+}
+
 /// Costruisce il corpo JSON della request Messages a partire dal contratto LLM.
-fn build_request_body(req: &LlmRequest, stream: bool) -> AnthropicRequest {
+/// `thinking_budget` e' il budget effettivo gia' risolto (vedi
+/// [`resolve_thinking_budget`]): `Some` => blocco thinking nel body.
+fn build_request_body(
+    req: &LlmRequest,
+    stream: bool,
+    thinking_budget: Option<u32>,
+) -> AnthropicRequest {
     let (system, messages) = to_anthropic_messages(req);
 
     let tools = req.tools.as_ref().map(|tools| {
@@ -219,6 +315,10 @@ fn build_request_body(req: &LlmRequest, stream: bool) -> AnthropicRequest {
         messages,
         tools,
         stream: if stream { Some(true) } else { None },
+        thinking: thinking_budget.map(|budget_tokens| AnthropicThinking {
+            kind: "enabled".to_string(),
+            budget_tokens,
+        }),
     }
 }
 
@@ -246,6 +346,19 @@ fn to_anthropic_messages(req: &LlmRequest) -> (Option<String>, Vec<AnthropicMess
             }
             "assistant" if msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) => {
                 let mut blocks: Vec<AnthropicBlock> = Vec::new();
+                // RI-PASSAGGIO extended thinking: se il turno assistant porta una
+                // signature, il blocco `thinking` (anche con testo vuoto) va in
+                // TESTA al content, prima dei tool_use. L'API Anthropic lo richiede
+                // nei turni con tool, altrimenti HTTP 400 (parita' col Python
+                // ~509-521, che mette il blocco thinking in testa a response.content).
+                if let Some(signature) = &msg.thinking_signature {
+                    if !signature.is_empty() {
+                        blocks.push(AnthropicBlock::Thinking {
+                            thinking: String::new(),
+                            signature: signature.clone(),
+                        });
+                    }
+                }
                 if let Some(text) = assistant_text(&msg.content) {
                     if !text.is_empty() {
                         blocks.push(AnthropicBlock::Text { text });
@@ -310,10 +423,21 @@ fn from_anthropic_message(
 ) -> LlmResponse {
     let mut text = String::new();
     let mut tool_calls: Vec<LlmToolCall> = Vec::new();
+    let mut reasoning = String::new();
+    let mut thinking_signature: Option<String> = None;
 
     for block in resp.content {
         match block {
             AnthropicRespBlock::Text { text: t } => text.push_str(&t),
+            AnthropicRespBlock::Thinking { thinking, signature } => {
+                // Extended thinking: concatena il testo del ragionamento e
+                // cattura la signature opaca (l'ultima vince) per il ri-passaggio
+                // nei turni con tool (parita' col Python ~489-521).
+                reasoning.push_str(&thinking);
+                if signature.is_some() {
+                    thinking_signature = signature;
+                }
+            }
             AnthropicRespBlock::ToolUse { id, name, input } => {
                 tool_calls.push(LlmToolCall {
                     id,
@@ -338,12 +462,20 @@ fn from_anthropic_message(
         usage: LlmUsage {
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
+            cache_read_tokens: resp.usage.cache_read_input_tokens,
+            cache_creation_tokens: resp.usage.cache_creation_input_tokens,
         },
         model_used,
         provider_used: "anthropic".to_string(),
         latency_ms,
         finish_reason: map_stop_reason(resp.stop_reason.as_deref()),
         privacy_rerouted: None,
+        reasoning: if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
+        thinking_signature,
     }
 }
 
@@ -387,7 +519,13 @@ struct AnthropicSseParser {
     model_used: String,
     input_tokens: u32,
     output_tokens: u32,
+    cache_read_tokens: Option<u32>,
+    cache_creation_tokens: Option<u32>,
     finish_reason: Option<String>,
+    /// Signature opaca del blocco thinking, catturata dai `signature_delta`. Non
+    /// viaggia nei chunk (lo stream non porta la signature al client), ma resta
+    /// disponibile per usi futuri / asserzioni di test.
+    thinking_signature: Option<String>,
 }
 
 impl AnthropicSseParser {
@@ -398,7 +536,10 @@ impl AnthropicSseParser {
             model_used,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
             finish_reason: None,
+            thinking_signature: None,
         }
     }
 
@@ -445,24 +586,60 @@ impl AnthropicSseParser {
                 if let Some(msg) = event.message {
                     if let Some(u) = msg.usage {
                         self.input_tokens = u.input_tokens;
+                        if u.cache_read_input_tokens.is_some() {
+                            self.cache_read_tokens = u.cache_read_input_tokens;
+                        }
+                        if u.cache_creation_input_tokens.is_some() {
+                            self.cache_creation_tokens = u.cache_creation_input_tokens;
+                        }
                     }
                 }
             }
             "content_block_delta" => {
                 if let Some(delta) = event.delta {
-                    if delta.kind.as_deref() == Some("text_delta") {
-                        if let Some(text) = delta.text {
-                            if !text.is_empty() {
-                                self.pending.push_back(LlmStreamChunk {
-                                    delta: text,
-                                    tool_call_delta: None,
-                                    finish_reason: None,
-                                    usage: None,
-                                    provider_used: Some("anthropic".to_string()),
-                                    model_used: Some(self.model_used.clone()),
-                                });
+                    match delta.kind.as_deref() {
+                        Some("text_delta") => {
+                            if let Some(text) = delta.text {
+                                if !text.is_empty() {
+                                    self.pending.push_back(LlmStreamChunk {
+                                        delta: text,
+                                        tool_call_delta: None,
+                                        finish_reason: None,
+                                        usage: None,
+                                        provider_used: Some("anthropic".to_string()),
+                                        model_used: Some(self.model_used.clone()),
+                                        reasoning_delta: None,
+                                    });
+                                }
                             }
                         }
+                        Some("thinking_delta") => {
+                            // Extended thinking: il ragionamento viaggia in
+                            // `reasoning_delta` (parita' col Python ~712-713).
+                            if let Some(thinking) = delta.thinking {
+                                if !thinking.is_empty() {
+                                    self.pending.push_back(LlmStreamChunk {
+                                        delta: String::new(),
+                                        tool_call_delta: None,
+                                        finish_reason: None,
+                                        usage: None,
+                                        provider_used: Some("anthropic".to_string()),
+                                        model_used: Some(self.model_used.clone()),
+                                        reasoning_delta: Some(thinking),
+                                    });
+                                }
+                            }
+                        }
+                        Some("signature_delta") => {
+                            // La signature del blocco thinking arriva a fine
+                            // ragionamento: la conserviamo per il chunk finale.
+                            if let Some(sig) = delta.signature {
+                                if !sig.is_empty() {
+                                    self.thinking_signature = Some(sig);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -484,9 +661,12 @@ impl AnthropicSseParser {
                     usage: Some(LlmUsage {
                         input_tokens: self.input_tokens,
                         output_tokens: self.output_tokens,
+                        cache_read_tokens: self.cache_read_tokens,
+                        cache_creation_tokens: self.cache_creation_tokens,
                     }),
                     provider_used: Some("anthropic".to_string()),
                     model_used: Some(self.model_used.clone()),
+                    reasoning_delta: None,
                 });
             }
             _ => {}
@@ -512,6 +692,18 @@ struct AnthropicRequest {
     tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Blocco extended thinking (`{type:"enabled", budget_tokens}`). Presente
+    /// solo quando il thinking e' attivo per la richiesta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+}
+
+/// Configurazione thinking nel body Anthropic.
+#[derive(Debug, Serialize)]
+struct AnthropicThinking {
+    #[serde(rename = "type")]
+    kind: String,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -533,6 +725,14 @@ enum AnthropicContent {
 enum AnthropicBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    /// Blocco thinking ri-passato in un turno assistant precedente. Anthropic
+    /// richiede `thinking` (puo' essere vuoto) + `signature` opaca; senza la
+    /// signature l'API ritorna HTTP 400 nei turni con tool.
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -562,13 +762,22 @@ struct AnthropicMessage {
     usage: AnthropicUsage,
 }
 
-/// Block della risposta. `Other` cattura tipi non gestiti (es. `thinking`)
-/// senza far fallire la deserializzazione.
+/// Block della risposta. `Other` cattura tipi non gestiti (es.
+/// `redacted_thinking`) senza far fallire la deserializzazione.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum AnthropicRespBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    /// Blocco di extended thinking: testo del ragionamento + signature opaca
+    /// (entrambi necessari per il ri-passaggio nei turni con tool).
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default)]
+        signature: Option<String>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -586,6 +795,12 @@ struct AnthropicUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// Token serviti da prompt cache (presenti solo con prompt caching attivo).
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    /// Token scritti in cache (creazione voce).
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
 }
 
 /// Evento SSE generico: `type` discrimina, gli altri campi sono opzionali in
@@ -615,6 +830,12 @@ struct AnthropicStreamDelta {
     kind: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    /// Delta del testo di extended thinking (`thinking_delta`).
+    #[serde(default)]
+    thinking: Option<String>,
+    /// Signature opaca del blocco thinking (`signature_delta`).
+    #[serde(default)]
+    signature: Option<String>,
     #[serde(default)]
     stop_reason: Option<String>,
 }
@@ -641,6 +862,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             name: None,
+            thinking_signature: None,
         }
     }
 
@@ -664,9 +886,10 @@ mod tests {
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: metadata(),
         };
-        let body = build_request_body(&req, false);
+        let body = build_request_body(&req, false, None);
         let json = serde_json::to_value(&body).unwrap();
 
         // system NON e' tra i messages, ma campo a se'.
@@ -692,9 +915,10 @@ mod tests {
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, false)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
 
         let m = &json["messages"][0];
         assert_eq!(m["role"], "user");
@@ -722,9 +946,10 @@ mod tests {
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, false)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
 
         let m = &json["messages"][0];
         assert_eq!(m["role"], "assistant");
@@ -753,9 +978,10 @@ mod tests {
             }]),
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, false)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
 
         let t = &json["tools"][0];
         assert_eq!(t["name"], "search");
@@ -886,5 +1112,180 @@ mod tests {
         // Pattern generico ancora riconosciuto via delega.
         assert!(is_anthropic_billing_error("insufficient_quota"));
         assert!(!is_anthropic_billing_error("rate limit exceeded"));
+    }
+
+    // --- Extended thinking (passo 1) ---------------------------------------
+
+    fn req_thinking(enabled: bool, budget: Option<u32>, max_tokens: Option<u32>) -> LlmRequest {
+        LlmRequest {
+            model: "claude-x".to_string(),
+            messages: vec![msg("user", "ciao")],
+            temperature: None,
+            max_tokens,
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: Some(crate::types::ThinkingConfig {
+                enabled,
+                budget_tokens: budget,
+            }),
+            metadata: metadata(),
+        }
+    }
+
+    #[test]
+    fn request_con_thinking_aggiunge_blocco_enabled() {
+        // budget esplicito 1024 < max_tokens 8000 -> thinking attivo.
+        let req = req_thinking(true, Some(1024), Some(8000));
+        let budget = resolve_thinking_budget(&req, 2048);
+        assert_eq!(budget, Some(1024));
+        let json = serde_json::to_value(build_request_body(&req, false, budget)).unwrap();
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["thinking"]["budget_tokens"], 1024);
+    }
+
+    #[test]
+    fn request_senza_thinking_non_aggiunge_blocco() {
+        let req = req_thinking(false, Some(1024), Some(8000));
+        let budget = resolve_thinking_budget(&req, 2048);
+        assert_eq!(budget, None);
+        let json = serde_json::to_value(build_request_body(&req, false, budget)).unwrap();
+        assert!(json.get("thinking").is_none());
+    }
+
+    #[test]
+    fn budget_thinking_oltre_max_tokens_disattiva() {
+        // Guardia del Python (max_tokens > thinking_budget): budget >= max_tokens
+        // -> thinking disattivato per evitare HTTP 400.
+        let req = req_thinking(true, Some(5000), Some(4000));
+        assert_eq!(resolve_thinking_budget(&req, 2048), None);
+        // Budget configurato usato quando la request non lo specifica.
+        let req2 = req_thinking(true, None, Some(8000));
+        assert_eq!(resolve_thinking_budget(&req2, 2048), Some(2048));
+    }
+
+    #[test]
+    fn deserializza_response_con_thinking_e_signature() {
+        let raw = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "rifletto sul problema", "signature": "sig-abc123"},
+                {"type": "text", "text": "ecco la risposta"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 4, "cache_read_input_tokens": 6}
+        }"#;
+        let parsed: AnthropicMessage = serde_json::from_str(raw).unwrap();
+        let resp = from_anthropic_message(parsed, "claude-x".to_string(), 7);
+
+        assert_eq!(resp.content, "ecco la risposta");
+        assert_eq!(resp.reasoning.as_deref(), Some("rifletto sul problema"));
+        assert_eq!(resp.thinking_signature.as_deref(), Some("sig-abc123"));
+        assert_eq!(resp.usage.cache_read_tokens, Some(6));
+        // I cache_creation non presenti -> None.
+        assert_eq!(resp.usage.cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn response_senza_thinking_ha_reasoning_none() {
+        let raw = r#"{
+            "content": [{"type": "text", "text": "solo testo"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }"#;
+        let parsed: AnthropicMessage = serde_json::from_str(raw).unwrap();
+        let resp = from_anthropic_message(parsed, "m".to_string(), 0);
+        assert!(resp.reasoning.is_none());
+        assert!(resp.thinking_signature.is_none());
+    }
+
+    #[test]
+    fn sse_thinking_delta_emette_reasoning_delta() {
+        let mut p = AnthropicSseParser::new("m".to_string());
+        p.parse_line(
+            r#"data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"penso..."}}"#,
+        );
+        assert_eq!(p.pending.len(), 1);
+        assert_eq!(p.pending[0].reasoning_delta.as_deref(), Some("penso..."));
+        // Il delta testuale resta vuoto sul chunk di reasoning.
+        assert_eq!(p.pending[0].delta, "");
+    }
+
+    #[test]
+    fn sse_signature_delta_catturata_non_emette_chunk() {
+        let mut p = AnthropicSseParser::new("m".to_string());
+        p.parse_line(
+            r#"data: {"type":"content_block_delta","delta":{"type":"signature_delta","signature":"sig-stream"}}"#,
+        );
+        // La signature non viaggia in un chunk, ma e' conservata nel parser.
+        assert_eq!(p.pending.len(), 0);
+        assert_eq!(p.thinking_signature.as_deref(), Some("sig-stream"));
+    }
+
+    #[test]
+    fn round_trip_signature_assistant_la_reinclude() {
+        // Un turno assistant con thinking_signature + tool_call deve produrre il
+        // block `thinking` (con signature) in TESTA al content, prima del tool_use.
+        let mut a = msg("assistant", "");
+        a.thinking_signature = Some("sig-round-trip".to_string());
+        a.tool_calls = Some(vec![LlmToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: ToolFunctionCall {
+                name: "do_thing".to_string(),
+                arguments: r#"{"a":1}"#.to_string(),
+            },
+        }]);
+        let req = LlmRequest {
+            model: "claude-x".to_string(),
+            messages: vec![a],
+            temperature: None,
+            max_tokens: Some(100),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            metadata: metadata(),
+        };
+        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
+
+        let m = &json["messages"][0];
+        assert_eq!(m["role"], "assistant");
+        // Primo block: thinking con la signature ri-passata.
+        assert_eq!(m["content"][0]["type"], "thinking");
+        assert_eq!(m["content"][0]["signature"], "sig-round-trip");
+        assert_eq!(m["content"][0]["thinking"], "");
+        // Secondo block: il tool_use.
+        assert_eq!(m["content"][1]["type"], "tool_use");
+        assert_eq!(m["content"][1]["id"], "call_1");
+    }
+
+    #[test]
+    fn assistant_senza_signature_non_reinclude_thinking() {
+        // Round-trip no-op: assente la signature, nessun block thinking spurio.
+        let mut a = msg("assistant", "testo");
+        a.tool_calls = Some(vec![LlmToolCall {
+            id: "c1".to_string(),
+            kind: "function".to_string(),
+            function: ToolFunctionCall {
+                name: "f".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        let req = LlmRequest {
+            model: "claude-x".to_string(),
+            messages: vec![a],
+            temperature: None,
+            max_tokens: Some(100),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            metadata: metadata(),
+        };
+        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
+        let m = &json["messages"][0];
+        // Primo block e' il testo (non un thinking).
+        assert_eq!(m["content"][0]["type"], "text");
+        assert_eq!(m["content"][1]["type"], "tool_use");
     }
 }

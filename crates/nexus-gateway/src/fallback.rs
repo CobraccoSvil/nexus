@@ -176,12 +176,16 @@ mod tests {
                     usage: LlmUsage {
                         input_tokens: 1,
                         output_tokens: 1,
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
                     },
                     model_used: "m".to_string(),
                     provider_used: self.name.clone(),
                     latency_ms: 0,
                     finish_reason: "stop".to_string(),
                     privacy_rerouted: None,
+                    reasoning: None,
+                    thinking_signature: None,
                 }),
                 Behaviour::ErrBilling => {
                     anyhow::bail!("openai HTTP 402: insufficient_quota for org")
@@ -206,6 +210,7 @@ mod tests {
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: RequestMetadata {
                 tenant_id: "t".to_string(),
                 user_id: "u".to_string(),

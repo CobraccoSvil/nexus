@@ -268,10 +268,14 @@ fn from_generate_response(
         .map(|u| LlmUsage {
             input_tokens: u.prompt_token_count,
             output_tokens: u.candidates_token_count,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
         })
         .unwrap_or(LlmUsage {
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
         });
 
     LlmResponse {
@@ -287,6 +291,8 @@ fn from_generate_response(
         latency_ms,
         finish_reason,
         privacy_rerouted: None,
+        reasoning: None,
+        thinking_signature: None,
     }
 }
 
@@ -375,6 +381,8 @@ impl GoogleSseParser {
         let usage = resp.usage_metadata.as_ref().map(|u| LlmUsage {
             input_tokens: u.prompt_token_count,
             output_tokens: u.candidates_token_count,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
         });
 
         // Chunk vuoto (nessun delta, nessun finish, nessun usage): salta.
@@ -392,6 +400,7 @@ impl GoogleSseParser {
             usage,
             provider_used: Some("google".to_string()),
             model_used: Some(self.model_used.clone()),
+            reasoning_delta: None,
         })
     }
 }
@@ -487,6 +496,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             name: None,
+            thinking_signature: None,
         }
     }
 
@@ -518,6 +528,7 @@ mod tests {
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: metadata(),
         };
         let json = serde_json::to_value(build_request_body(&req)).unwrap();
@@ -541,6 +552,7 @@ mod tests {
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: metadata(),
         };
         let json = serde_json::to_value(build_request_body(&req)).unwrap();

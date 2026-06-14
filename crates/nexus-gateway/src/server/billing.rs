@@ -328,6 +328,7 @@ mod tests {
                     tool_call_id: None,
                     tool_calls: None,
                     name: None,
+                    thinking_signature: None,
                 })
                 .collect(),
             temperature: None,
@@ -335,6 +336,7 @@ mod tests {
             tools: None,
             response_format: None,
             stream: None,
+            thinking: None,
             metadata: RequestMetadata {
                 tenant_id: "t".into(),
                 user_id: "u".into(),
