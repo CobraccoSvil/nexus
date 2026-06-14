@@ -219,13 +219,13 @@ async fn run_cycle(
             .last_recovery_attempt
             .store(now_ts, Ordering::Relaxed);
         if !qdrant_result.healthy {
-            attempt_recovery("qdrant", &qdrant_result).await;
+            attempt_recovery(db, "qdrant", &qdrant_result).await;
         }
         if !embedder_result.healthy {
-            attempt_recovery("embedder", &embedder_result).await;
+            attempt_recovery(db, "embedder", &embedder_result).await;
         }
         if !gateway_result.healthy {
-            attempt_recovery("gateway", &gateway_result).await;
+            attempt_recovery(db, "gateway", &gateway_result).await;
         }
     }
 
@@ -242,7 +242,7 @@ async fn run_cycle(
 
 // ── Auto-recovery ───────────────────────────────────────────────────────────
 
-async fn attempt_recovery(service: &str, probe: &ProbeResult) {
+async fn attempt_recovery(db: &PgPool, service: &str, probe: &ProbeResult) {
     let kind = probe.error_kind.as_deref().unwrap_or("unknown");
     tracing::info!("task_watchdog: tentativo auto-recovery per {service} (errore: {kind})");
 
@@ -257,11 +257,11 @@ async fn attempt_recovery(service: &str, probe: &ProbeResult) {
         }
         ("embedder", "timeout") => {
             // Il brain gRPC potrebbe avere il canale bloccato — restart del processo
-            try_restart_systemd_or_process("brain").await;
+            try_restart_systemd_or_process(db, "brain").await;
         }
         ("embedder", "embed_error") => {
             // Errore nell'embedding — potrebbe essere un crash parziale del modello
-            try_restart_systemd_or_process("brain").await;
+            try_restart_systemd_or_process(db, "brain").await;
         }
         ("gateway", _) => {
             // Fix M48: gateway Node.js cade ripetutamente, lo riavvia.
@@ -418,37 +418,33 @@ async fn try_restart_container(name_hint: &str) {
     }
 }
 
-async fn try_restart_systemd_or_process(name_hint: &str) {
-    // Tenta restart via systemd (servizio utente)
-    let systemd_result = tokio::process::Command::new("systemctl")
-        .args(["--user", "restart", &format!("nexus-{name_hint}.service")])
-        .output()
-        .await;
-
-    match systemd_result {
-        Ok(o) if o.status.success() => {
-            tracing::info!("task_watchdog: recovery {name_hint}: riavviato via systemctl --user");
-            return;
-        }
-        _ => {}
-    }
-
-    // Fallback: cerca il processo e invia SIGHUP per forzare un reload
-    let pgrep = tokio::process::Command::new("pgrep")
-        .args(["-f", name_hint])
-        .output()
-        .await;
-
-    if let Ok(o) = pgrep {
-        if o.status.success() {
-            let pids = String::from_utf8_lossy(&o.stdout);
-            let pid_count = pids.lines().count();
+/// Auto-recovery di un servizio core Nexus (es. brain) tramite il Sudo Manager
+/// (regola L: unico canale privilegiato verso root, mig 0289). Dopo ADR 0028 L3 i
+/// servizi core sono unit systemd --SYSTEM: il restart richiede root, ottenuto via
+/// il purpose sudo `<name_hint>-restart` (es. `brain-restart` -> `systemctl restart
+/// nexus-brain.service`, mig 0416). Il vecchio `systemctl --user restart` non
+/// toccava piu' il servizio giusto e il fallback (pgrep + log) non riavviava nulla.
+/// Best-effort: se il Sudo Manager non e' configurato logga WARN, non solleva mai;
+/// il safety net resta systemd (Restart=always) per le uscite del processo.
+async fn try_restart_systemd_or_process(db: &PgPool, name_hint: &str) {
+    let purpose = format!("{name_hint}-restart");
+    match crate::sudo_manager::execute(db, &purpose).await {
+        Ok(outcome) if outcome.success => {
             tracing::info!(
-                "task_watchdog: recovery {name_hint}: processo attivo ({pid_count} pid), il servizio gira ma non risponde al probe"
+                "task_watchdog: recovery {name_hint}: riavviato via sudo_manager ({purpose}, {}ms)",
+                outcome.duration_ms
             );
-        } else {
+        }
+        Ok(outcome) => {
             tracing::warn!(
-                "task_watchdog: recovery {name_hint}: nessun processo trovato, il servizio potrebbe essere completamente fermo"
+                "task_watchdog: recovery {name_hint}: purpose {purpose} exit={} stderr={}",
+                outcome.exit_code,
+                outcome.stderr.trim()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "task_watchdog: recovery {name_hint}: sudo_manager non disponibile per {purpose} ({e}); il servizio resta sotto gestione systemd (Restart=always)"
             );
         }
     }

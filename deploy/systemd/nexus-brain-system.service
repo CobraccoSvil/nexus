@@ -10,12 +10,23 @@
 # logind/sessioni/linger, quindi il brain sopravvive alla caduta della
 # sessione utente.
 #
+# Restart=always (non on-failure): quando la VM WSL viene sospesa/congelata
+# (PC in sleep, instabilita' 9p) i processi ricevono SIGTERM dall'esterno e
+# l'handler graceful esce con codice 0. systemd registra "Deactivated
+# successfully" e con on-failure NON riavvia (exit 0 = successo) -> il servizio
+# resta giu' al risveglio (freeze != reboot, quindi WantedBy non lo rilancia).
+# always copre anche l'exit 0; i `systemctl stop/restart` espliciti del deploy
+# restano rispettati (always non riavvia su stop comandato). StartLimit fa da
+# safety net contro un crash-loop reale (config rotta): max 5 riavvii in 60s.
+#
 # Installata da deploy/install-system-units.sh (sostituisce __USER__/__UID__).
 
 [Unit]
 Description=Nexus Neural Core (brain Python) [system-level, ADR 0028 L3]
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -26,7 +37,7 @@ EnvironmentFile=-/home/__USER__/ideai/.env
 Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 ExecStart=/usr/bin/python3 -m brain.grpc_server.main --rest
-Restart=on-failure
+Restart=always
 RestartSec=5
 StandardOutput=append:/tmp/nexus-neural.log
 StandardError=append:/tmp/nexus-neural.log

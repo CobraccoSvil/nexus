@@ -58,6 +58,18 @@ async fn read_comm(pid: u32) -> Option<String> {
     Some(raw.trim().to_string())
 }
 
+/// Legge /proc/{pid}/cmdline (argomenti NUL-separati) come stringa con spazi.
+/// Serve a riconoscere i servizi Nexus il cui `comm` e' il runtime generico
+/// (brain == "python3", web-ide == "node"): il modulo/entrypoint compare solo
+/// nella cmdline completa. None se illeggibile o vuoto (kernel thread / pid morto).
+async fn read_cmdline(pid: u32) -> Option<String> {
+    let raw = tokio::fs::read(format!("/proc/{pid}/cmdline")).await.ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_string())
+}
+
 /// Scansiona /proc e ritorna i `(pid, comm)` dei processi il cui process group
 /// (`pgrp`) coincide con `pgid` e il cui `comm` appartiene all'infrastruttura
 /// Nexus (mcp-core, brain, gateway, microservizi). Difesa-in-profondita' per
@@ -67,17 +79,6 @@ async fn read_comm(pid: u32) -> Option<String> {
 /// qualunque servizio Nexus condivida il gruppo bersaglio (regola E: mai abbattere
 /// l'infrastruttura).
 async fn nexus_processes_in_group(pgid: u32) -> Vec<(u32, String)> {
-    const NEXUS_COMMS: &[&str] = &[
-        "mcp-core",
-        "brain",
-        "nexus-gateway",
-        "admin-service",
-        "chat-service",
-        "doc-service",
-        "billing-service",
-        "plugin-service",
-        "browser-bridge",
-    ];
     let mut hits = Vec::new();
     let mut entries = match tokio::fs::read_dir("/proc").await {
         Ok(e) => e,
@@ -91,14 +92,49 @@ async fn nexus_processes_in_group(pgid: u32) -> Vec<(u32, String)> {
         if read_pgid(pid).await != Some(pgid) {
             continue;
         }
-        if let Some(comm) = read_comm(pid).await {
-            let c = comm.to_lowercase();
-            if NEXUS_COMMS.iter().any(|n| c.contains(n)) {
-                hits.push((pid, comm));
-            }
+        let comm = read_comm(pid).await;
+        // La cmdline si legge solo se il comm non basta gia' a decidere: i servizi
+        // il cui comm e' il runtime generico (brain == "python3", web-ide == "node")
+        // richiedono il match sull'entrypoint completo.
+        let cmdline = read_cmdline(pid).await;
+        if is_nexus_process(comm.as_deref(), cmdline.as_deref()) {
+            hits.push((pid, comm.or(cmdline).unwrap_or_default()));
         }
     }
     hits
+}
+
+/// Punto unico (regola L) testabile senza /proc reale: decide se un processo
+/// appartiene all'infrastruttura Nexus dato il suo `comm` e/o la sua `cmdline`.
+/// Il `comm` e' il match primario; la cmdline copre i servizi il cui comm e' il
+/// runtime generico (brain == "python3", web-ide == "node"), che NON comparirebbero
+/// in NEXUS_COMMS — gap che lasciava il brain scoperto dal check #4 anti-suicidio.
+fn is_nexus_process(comm: Option<&str>, cmdline: Option<&str>) -> bool {
+    const NEXUS_COMMS: &[&str] = &[
+        "mcp-core",
+        "brain",
+        "nexus-gateway",
+        "admin-service",
+        "chat-service",
+        "doc-service",
+        "billing-service",
+        "plugin-service",
+        "browser-bridge",
+    ];
+    const NEXUS_CMDLINE: &[&str] = &["brain.grpc_server", "apps/web-ide/server.js"];
+    if let Some(comm) = comm {
+        let c = comm.to_lowercase();
+        if NEXUS_COMMS.iter().any(|n| c.contains(n)) {
+            return true;
+        }
+    }
+    if let Some(cmdline) = cmdline {
+        let cl = cmdline.to_lowercase();
+        if NEXUS_CMDLINE.iter().any(|n| cl.contains(n)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Termina l'intero PROCESS GROUP di `pid` (SIGTERM, poi SIGKILL dopo 500ms se
@@ -345,4 +381,47 @@ pub async fn kill_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<u32> {
         killed.push(pid);
     }
     killed
+}
+
+#[cfg(test)]
+mod is_nexus_process_tests {
+    use super::is_nexus_process;
+
+    #[test]
+    fn comm_match_diretto() {
+        assert!(is_nexus_process(Some("mcp-core"), None));
+        assert!(is_nexus_process(Some("nexus-gateway"), Some("/usr/bin/nexus-gateway")));
+    }
+
+    /// Regressione: il brain gira come `python3 -m brain.grpc_server.main`, quindi
+    /// /proc/<pid>/comm == "python3" (NON "brain"). Il match deve scattare sulla
+    /// cmdline, altrimenti il check #4 anti-suicidio non lo protegge dal kill.
+    #[test]
+    fn brain_riconosciuto_via_cmdline_non_comm() {
+        assert!(!is_nexus_process(Some("python3"), None));
+        assert!(is_nexus_process(
+            Some("python3"),
+            Some("/usr/bin/python3 -m brain.grpc_server.main --rest")
+        ));
+    }
+
+    /// Il web-ide Next standalone gira come `node .../server.js` (comm == "node").
+    #[test]
+    fn web_ide_riconosciuto_via_cmdline() {
+        assert!(is_nexus_process(
+            Some("node"),
+            Some("/usr/bin/node /home/administrator/ideai/apps/web-ide/server.js")
+        ));
+    }
+
+    /// Un dev-server di progetto (es. vite) NON e' infrastruttura Nexus: deve
+    /// restare uccidibile dal cleanup, altrimenti il GC delle porte non funziona.
+    #[test]
+    fn dev_server_progetto_non_e_nexus() {
+        assert!(!is_nexus_process(
+            Some("node"),
+            Some("node /home/administrator/projects/beauty-book/node_modules/.bin/vite")
+        ));
+        assert!(!is_nexus_process(None, None));
+    }
 }

@@ -13,7 +13,12 @@
 # After=nexus-brain: mcp-core attende il brain (gRPC 50051). Non avendo Docker
 # un docker.service (Docker Desktop -> container come .scope), la dipendenza dal
 # DB Postgres e' coperta dal retry-loop interno (RoutingMatrixCache 5x5s) +
-# Restart=on-failure come safety net se il DB non e' ancora pronto al boot.
+# Restart=always come safety net se il DB non e' ancora pronto al boot.
+#
+# Restart=always (vedi nexus-brain-system.service per il razionale): la VM WSL
+# sospesa manda SIGTERM ai processi -> exit 0 graceful -> on-failure NON
+# riavviava. always riavvia anche su exit 0, lasciando intatti i `systemctl
+# stop/restart` del deploy. StartLimit: max 5 riavvii in 60s contro crash-loop.
 #
 # XDG_RUNTIME_DIR: mcp-core gestisce i servizi --user dei progetti utente
 # (es. beauty-book-*) via systemctl --user e li risuscita tramite il sudo-runner
@@ -25,6 +30,8 @@
 Description=Nexus mcp-core (routing AI, agent runner, ToolRunner gRPC) [system-level, ADR 0028 L3]
 After=network-online.target nexus-brain.service
 Wants=network-online.target nexus-brain.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -34,7 +41,7 @@ WorkingDirectory=/home/__USER__/ideai
 EnvironmentFile=-/home/__USER__/ideai/.env
 Environment=XDG_RUNTIME_DIR=/run/user/__UID__
 ExecStart=/home/__USER__/ideai/target/nexus-current/mcp-core
-Restart=on-failure
+Restart=always
 RestartSec=3
 TimeoutStopSec=15
 StandardOutput=append:/tmp/nexus-mcp-core.log

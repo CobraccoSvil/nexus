@@ -62,7 +62,7 @@ chown root:root /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-webide.
 chmod 644 /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-webide.log
 
 # 3bis. Disabilita i meccanismi di auto-restart APPLICATIVI di mcp-core: con i
-#   servizi a --system il restart e' gia' garantito da systemd (Restart=on-failure),
+#   servizi a --system il restart e' gia' garantito da systemd (Restart=always),
 #   quindi sono ridondanti E conflittuali. ensure_user_manager risuscitava il
 #   manager --user instabile (-> deactivate del core a ~2min); services_watchdog
 #   riavviava il web-ide via deploy-local.sh -> processo nohup in conflitto con la

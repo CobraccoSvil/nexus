@@ -14,6 +14,8 @@
 Description=Nexus web-ide (Next.js frontend) [system-level, ADR 0028 L3]
 After=network-online.target nexus-mcp-core.service
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -27,8 +29,11 @@ WorkingDirectory=/home/__USER__/ideai
 # (regola G, niente default hardcoded). Stessa fonte di brain/mcp-core.
 EnvironmentFile=-/home/__USER__/ideai/.env
 Environment=NODE_ENV=production
+# Restart=always (vedi nexus-brain-system.service per il razionale): copre
+# l'exit 0 da SIGTERM esterno (VM WSL sospesa/congelata), che on-failure
+# ignorava lasciando il frontend giu' al risveglio. StartLimit: 5 riavvii/60s.
 ExecStart=/usr/bin/node /home/__USER__/ideai/apps/web-ide/server.js
-Restart=on-failure
+Restart=always
 RestartSec=3
 StandardOutput=append:/tmp/nexus-webide.log
 StandardError=append:/tmp/nexus-webide.log
