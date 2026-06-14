@@ -1151,10 +1151,23 @@ export function MessageList({
                     {message.provider}/{message.model}
                   </span>
                 )}
-                <span>{(message.totalTokens ?? 0).toLocaleString("it-IT")} token</span>
-                {(message.promptTokens ?? 0) > 0 && (
-                  <span>({(message.promptTokens ?? 0).toLocaleString("it-IT")} in / {(message.completionTokens ?? 0).toLocaleString("it-IT")} out)</span>
-                )}
+                {(() => {
+                  const total = message.totalTokens ?? 0;
+                  const lastIn = message.promptTokens ?? 0;
+                  const lastOut = message.completionTokens ?? 0;
+                  // total e' cumulativo sull'intero run (tutte le iterazioni),
+                  // mentre in/out sono dell'ULTIMA chiamata: senza etichetta
+                  // "212K (47K in / 332 out)" sembra incongruente (47K+332 != 212K).
+                  const cumulative = total > lastIn + lastOut + 50;
+                  return (
+                    <>
+                      <span>{total.toLocaleString("it-IT")} token{cumulative ? " totali" : ""}</span>
+                      {lastIn > 0 && (
+                        <span>({cumulative ? "ultima chiamata: " : ""}{lastIn.toLocaleString("it-IT")} in / {lastOut.toLocaleString("it-IT")} out)</span>
+                      )}
+                    </>
+                  );
+                })()}
                 {(message.totalCost ?? 0) > 0 && (
                   <span style={{ color: tc.warning }}>
                     ${message.totalCost!.toFixed(4)} {message.currency ?? "USD"}

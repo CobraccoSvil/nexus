@@ -508,8 +508,8 @@ export function Composer({
             ) : (
               <IconButton
                 type="submit"
-                label={hasRunningServices ? "Servizio in background attivo — fermalo prima di inviare" : t("chat.send")}
-                disabled={isLoading || (!input.trim() && attachments.length === 0) || !hasProject || hasRunningServices}
+                label={hasRunningServices ? "Ci sono servizi attivi (puoi comunque inviare)" : t("chat.send")}
+                disabled={isLoading || (!input.trim() && attachments.length === 0) || !hasProject}
                 variant="primary"
                 style={{ borderRadius: 7, fontSize: 13 }}
               >
