@@ -718,6 +718,30 @@ async def router_node(state: AgentState) -> dict[str, Any]:
 
     behavior_mode = state.get("behavior_mode", "bilanciata")
 
+    # ── Escalation per difficolta' (low-cost-first) ──────────────────────────
+    # Direttiva: l'orchestratore usa il modello in base alla DIFFICOLTA' della
+    # domanda, partendo dai modelli a piu' basso costo. Quando la modalita' e'
+    # quella di default ("auto"/"bilanciata", cioe' l'utente non ha forzato un
+    # tier preciso), la deriviamo dalla complessita' stimata dal classifier:
+    #   low    -> economica   (modello piu' economico)
+    #   medium -> bilanciata
+    #   high   -> approfondita (modello piu' capace)
+    # Il routing esistente (intent x behavior_mode -> modello) parte cosi' dal
+    # tier giusto, senza sprecare credito su modelli reasoning per task facili.
+    # I mode forzati dall'utente (economica/veloce/approfondita) sono rispettati.
+    if behavior_mode in ("auto", "bilanciata") and task_complexity in ("low", "medium", "high"):
+        _derived_mode = {
+            "low": "economica",
+            "medium": "bilanciata",
+            "high": "approfondita",
+        }[task_complexity]
+        if _derived_mode != behavior_mode:
+            logger.info(
+                "router_node: behavior_mode '%s' -> '%s' (escalation per difficolta', complexity=%s)",
+                behavior_mode, _derived_mode, task_complexity,
+            )
+        behavior_mode = _derived_mode
+
     # Boost token_budget per intent complessi che richiedono piu' output
     # (generazione documenti, analisi codice, fix estesi). Inclusi anche gli
     # intent "attivi" che usano tool e producono output reale (file_ops,
