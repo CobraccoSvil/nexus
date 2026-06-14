@@ -1,0 +1,46 @@
+[package]
+name = "nexus-gateway"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# Il crate e' sia LIBRERIA (moduli Fase 0-4 riusati da mcp-core) sia BINARIO
+# (server della Fase 5). Il binario NON viene avviato in produzione finche' la
+# parita' col gateway Node non e' validata (Fase 6): qui si compila e si testa.
+[lib]
+name = "nexus_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexus-gateway"
+path = "src/bin/server.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+uuid.workspace = true
+jsonwebtoken.workspace = true
+regex.workspace = true
+dotenvy.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+async-trait = "0.1"
+serde_yaml = "0.9"
+thiserror = "1.0"
+nexus-cache = { path = "../nexus-cache" }
+nexus-auth = { path = "../nexus-auth" }

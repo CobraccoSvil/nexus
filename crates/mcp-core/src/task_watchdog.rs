@@ -330,25 +330,32 @@ async fn probe_gateway() -> ProbeResult {
 async fn try_restart_gateway() {
     let root = std::env::var("NEXUS_REPO_ROOT")
         .unwrap_or_else(|_| "/home/administrator/ideai".to_string());
-    let server_js = format!("{}/apps/nexus-gateway/dist/server.js", root);
-    if !std::path::Path::new(&server_js).exists() {
+    // Migrazione Fase 6: il gateway LLM e' ora il binario Rust (crate
+    // nexus-gateway), non piu' il vecchio server Node (eliminato). Il watchdog
+    // supervisiona il binario Rust, garantendone il riavvio se cade.
+    let bin = format!("{}/target/debug/nexus-gateway", root);
+    if !std::path::Path::new(&bin).exists() {
         tracing::warn!(
-            "task_watchdog: recovery gateway: {} non trovato, skip",
-            server_js
+            "task_watchdog: recovery gateway: binario {} non trovato, skip",
+            bin
         );
         return;
     }
-    // Verifica che non sia gia stato avviato di recente (gestisce race con stop precedente).
+    // Pulisce un'eventuale istanza precedente (gestisce race con stop precedente).
+    // Pattern col path completo per non toccare apps/nexus-gateway (Node legacy).
     let _ = tokio::process::Command::new("pkill")
-        .args(["-f", "apps/nexus-gateway/dist/server.js"])
+        .args(["-f", "target/debug/nexus-gateway"])
         .output()
         .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    // setsid nohup node ... > /tmp/nexus-gateway.log 2>&1 < /dev/null &
+    // setsid nohup <binario rust> ... > /tmp/nexus-gateway-rust.log 2>&1 < /dev/null &
+    // cwd = root: il bootstrap del gateway risolve i config con path relativi
+    // (config/policies, config/model-aliases.yaml).
     let shell = format!(
-        "setsid nohup env NODE_ENV=production NEXUS_GATEWAY_PORT={} node '{}' > /tmp/nexus-gateway.log 2>&1 < /dev/null &",
+        "cd '{}' && setsid nohup env NEXUS_GATEWAY_PORT={} '{}' > /tmp/nexus-gateway-rust.log 2>&1 < /dev/null &",
+        root,
         std::env::var("NEXUS_GATEWAY_PORT").unwrap_or_else(|_| "4060".into()),
-        server_js
+        bin
     );
     match tokio::process::Command::new("sh")
         .args(["-c", &shell])

@@ -21,7 +21,7 @@ members = [
   "crates/doc-service",
   "crates/chat-service",
   "crates/plugin-service"
-, "crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events", "crates/nexus-sudo-runner", "crates/nexus-mcp-client"]
+, "crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events", "crates/nexus-sudo-runner", "crates/nexus-mcp-client", "crates/nexus-gateway"]
 resolver = "2"
 
 [workspace.package]

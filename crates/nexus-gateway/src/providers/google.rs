@@ -1,0 +1,613 @@
+//! Provider Google (Generative Language REST nativo).
+//!
+//! Il TS (`providers/google.ts`, 34 righe) instrada Gemini attraverso l'endpoint
+//! OpenAI-compatibile di Google delegando a `OpenAIProvider`. Qui implementiamo
+//! invece il formato REST NATIVO `generateContent`/`streamGenerateContent`, piu'
+//! fedele all'API e testabile in isolamento:
+//!   - i messaggi diventano `contents[]` con `role` (`user`/`model`) e `parts[]`;
+//!   - il `system` prompt e' un campo separato `systemInstruction`;
+//!   - la API key viaggia come query param `?key=...` (convenzione Google);
+//!   - lo streaming usa `?alt=sse` con eventi `data: {GenerateContentResponse}`.
+//!
+//! Regola G: nessun modello hardcoded (arriva da `req.model`, finisce nel path
+//! URL). Regola F: mai loggare prompt/response in chiaro.
+
+use std::collections::VecDeque;
+use std::time::Instant;
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::provider::{ChunkStream, LlmProvider};
+use crate::types::{
+    LlmRequest, LlmResponse, LlmStreamChunk, LlmUsage, MessageContent, SensitivityTier,
+};
+
+/// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
+const TIERS: &[SensitivityTier] = &[0, 1, 2];
+
+/// Endpoint REST nativo di Generative Language (override via costruttore).
+const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+pub struct GoogleProvider {
+    http: Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl GoogleProvider {
+    /// Costruisce il provider. `base_url` opzionale (default Google ufficiale);
+    /// `api_key` iniettata dal chiamante (regola F: niente segreti nel codice).
+    pub fn new(http: Client, api_key: impl Into<String>, base_url: Option<String>) -> Self {
+        let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let base_url = base_url.trim_end_matches('/').to_string();
+        Self {
+            http,
+            base_url,
+            api_key: api_key.into(),
+        }
+    }
+
+    /// URL dell'azione per il modello richiesto. `stream=true` usa
+    /// `streamGenerateContent?alt=sse`, altrimenti `generateContent`.
+    fn endpoint(&self, model: &str, stream: bool) -> String {
+        let action = if stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
+        let mut url = format!("{}/models/{}:{}", self.base_url, model, action);
+        if stream {
+            url.push_str("?alt=sse");
+        }
+        url
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GoogleProvider {
+    fn name(&self) -> &str {
+        "google"
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn max_context_tokens(&self) -> u32 {
+        1_000_000
+    }
+
+    fn tier_compatibility(&self) -> &[SensitivityTier] {
+        TIERS
+    }
+
+    async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
+        let body = build_request_body(req);
+        let start = Instant::now();
+
+        let resp = self
+            .http
+            .post(self.endpoint(&req.model, false))
+            .query(&[("key", &self.api_key)])
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // Regola F: body d'errore propagato al caller (cooldown Fase 3 lo
+            // classifica via is_billing_error), non loggato qui in chiaro.
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+        }
+
+        let parsed: GenerateContentResponse = resp.json().await?;
+        let latency_ms = start.elapsed().as_millis() as u64;
+        Ok(from_generate_response(parsed, req.model.clone(), latency_ms))
+    }
+
+    async fn stream(&self, req: &LlmRequest) -> anyhow::Result<ChunkStream> {
+        let body = build_request_body(req);
+
+        let resp = self
+            .http
+            .post(self.endpoint(&req.model, true))
+            .query(&[("key", &self.api_key)])
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+        }
+
+        let model_used = req.model.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<LlmStreamChunk>>(32);
+
+        tokio::spawn(async move {
+            let mut bytes = resp.bytes_stream();
+            let mut parser = GoogleSseParser::new(model_used);
+
+            loop {
+                match bytes.next().await {
+                    Some(Ok(buf)) => parser.push_bytes(&String::from_utf8_lossy(&buf)),
+                    Some(Err(e)) => {
+                        let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                        return;
+                    }
+                    None => {
+                        parser.flush_leftover();
+                        while let Some(chunk) = parser.pending.pop_front() {
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                while let Some(chunk) = parser.pending.pop_front() {
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(ReceiverStream::new(rx).boxed())
+    }
+
+    async fn healthcheck(&self) -> bool {
+        // GET /models: 2xx => raggiungibile. Usato anche dal re-probe del cooldown.
+        let url = format!("{}/models", self.base_url);
+        match self
+            .http
+            .get(url)
+            .query(&[("key", &self.api_key)])
+            .send()
+            .await
+        {
+            Ok(r) => r.status().is_success(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Costruisce il corpo `GenerateContentRequest`: separa il system come
+/// `systemInstruction`, mappa i ruoli (`assistant`->`model`) e impacchetta i
+/// parametri di generazione in `generationConfig`.
+fn build_request_body(req: &LlmRequest) -> GenerateContentRequest {
+    let mut system_instruction: Option<GoogleContent> = None;
+    let mut contents: Vec<GoogleContent> = Vec::new();
+
+    for msg in &req.messages {
+        let text = content_to_string(&msg.content);
+        match msg.role.as_str() {
+            "system" => {
+                system_instruction = Some(GoogleContent {
+                    role: None,
+                    parts: vec![GooglePart { text }],
+                });
+            }
+            role => {
+                contents.push(GoogleContent {
+                    role: Some(map_role(role).to_string()),
+                    parts: vec![GooglePart { text }],
+                });
+            }
+        }
+    }
+
+    let generation_config = if req.temperature.is_some() || req.max_tokens.is_some() {
+        Some(GenerationConfig {
+            temperature: req.temperature,
+            max_output_tokens: req.max_tokens,
+        })
+    } else {
+        None
+    };
+
+    GenerateContentRequest {
+        contents,
+        system_instruction,
+        generation_config,
+    }
+}
+
+/// Mappa il ruolo del contratto al ruolo Google: `assistant` -> `model`, tutto
+/// il resto (`user`, `tool`) -> `user` (Google non distingue il tool come ruolo
+/// separato nel formato base).
+fn map_role(role: &str) -> &str {
+    match role {
+        "assistant" | "model" => "model",
+        _ => "user",
+    }
+}
+
+fn content_to_string(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(s) => s.clone(),
+        MessageContent::Blocks(blocks) => serde_json::to_string(blocks).unwrap_or_default(),
+    }
+}
+
+/// Mappa una `GenerateContentResponse` nel contratto [`LlmResponse`]: concatena
+/// le `parts[].text` del primo candidate e normalizza il `finishReason`.
+fn from_generate_response(
+    resp: GenerateContentResponse,
+    model_used: String,
+    latency_ms: u64,
+) -> LlmResponse {
+    let candidate = resp.candidates.into_iter().next();
+
+    let content = candidate
+        .as_ref()
+        .map(|c| {
+            c.content
+                .parts
+                .iter()
+                .filter_map(|p| p.text.clone())
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+
+    let finish_reason = map_finish_reason(candidate.as_ref().and_then(|c| c.finish_reason.as_deref()));
+
+    let usage = resp
+        .usage_metadata
+        .map(|u| LlmUsage {
+            input_tokens: u.prompt_token_count,
+            output_tokens: u.candidates_token_count,
+        })
+        .unwrap_or(LlmUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        });
+
+    LlmResponse {
+        content,
+        // Il formato base mappato non emette function-call: tool su Google
+        // richiederebbe il blocco functionDeclarations, fuori scope di questa
+        // implementazione REST minimale (parita' funzionale col TS, che a sua
+        // volta delega senza supporto tool nativo nel formato Google).
+        tool_calls: None,
+        usage,
+        model_used,
+        provider_used: "google".to_string(),
+        latency_ms,
+        finish_reason,
+        privacy_rerouted: None,
+    }
+}
+
+/// Mappa il `finishReason` Google ai valori canonici del contratto. `STOP` e i
+/// valori non noti collassano a `stop`.
+fn map_finish_reason(raw: Option<&str>) -> String {
+    match raw.unwrap_or("STOP") {
+        "MAX_TOKENS" => "length",
+        "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" => "content_filter",
+        _ => "stop",
+    }
+    .to_string()
+}
+
+/// Parser SSE Google (`?alt=sse`): ogni riga `data: {GenerateContentResponse}`
+/// porta un delta incrementale; l'ultimo evento contiene `usageMetadata` e il
+/// `finishReason`. Stateful, testabile senza rete.
+struct GoogleSseParser {
+    line_buf: String,
+    pending: VecDeque<LlmStreamChunk>,
+    model_used: String,
+}
+
+impl GoogleSseParser {
+    fn new(model_used: String) -> Self {
+        Self {
+            line_buf: String::new(),
+            pending: VecDeque::new(),
+            model_used,
+        }
+    }
+
+    fn push_bytes(&mut self, s: &str) {
+        self.line_buf.push_str(s);
+        while let Some(idx) = self.line_buf.find('\n') {
+            let line = self.line_buf[..idx].to_string();
+            self.line_buf.drain(..=idx);
+            self.parse_line(&line);
+        }
+    }
+
+    fn flush_leftover(&mut self) {
+        let leftover = std::mem::take(&mut self.line_buf);
+        for line in leftover.lines() {
+            self.parse_line(line);
+        }
+    }
+
+    fn parse_line(&mut self, line: &str) {
+        let line = line.trim_end_matches('\r');
+        let payload = match line.strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => return,
+        };
+        if payload.is_empty() {
+            return;
+        }
+        let resp: GenerateContentResponse = match serde_json::from_str(payload) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if let Some(chunk) = self.chunk_from_response(resp) {
+            self.pending.push_back(chunk);
+        }
+    }
+
+    fn chunk_from_response(&self, resp: GenerateContentResponse) -> Option<LlmStreamChunk> {
+        let candidate = resp.candidates.into_iter().next();
+
+        let delta = candidate
+            .as_ref()
+            .map(|c| {
+                c.content
+                    .parts
+                    .iter()
+                    .filter_map(|p| p.text.clone())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+
+        let finish_reason = candidate
+            .as_ref()
+            .and_then(|c| c.finish_reason.as_deref())
+            .map(|r| map_finish_reason(Some(r)));
+
+        let usage = resp.usage_metadata.as_ref().map(|u| LlmUsage {
+            input_tokens: u.prompt_token_count,
+            output_tokens: u.candidates_token_count,
+        });
+
+        // Chunk vuoto (nessun delta, nessun finish, nessun usage): salta.
+        if delta.is_empty() && finish_reason.is_none() && usage.is_none() {
+            return None;
+        }
+
+        // L'usage va riportato solo sul chunk finale (quando c'e' finish).
+        let usage = if finish_reason.is_some() { usage } else { None };
+
+        Some(LlmStreamChunk {
+            delta,
+            tool_call_delta: None,
+            finish_reason,
+            usage,
+            provider_used: Some("google".to_string()),
+            model_used: Some(self.model_used.clone()),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tipi wire (formato Generative Language). Separati dal contratto del gateway.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct GenerateContentRequest {
+    contents: Vec<GoogleContent>,
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GoogleContent>,
+    #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GenerationConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct GoogleContent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    parts: Vec<GooglePart>,
+}
+
+#[derive(Debug, Serialize)]
+struct GooglePart {
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerateContentResponse {
+    #[serde(default)]
+    candidates: Vec<GoogleCandidate>,
+    #[serde(rename = "usageMetadata", default)]
+    usage_metadata: Option<GoogleUsageMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleCandidate {
+    #[serde(default)]
+    content: GoogleRespContent,
+    #[serde(rename = "finishReason", default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GoogleRespContent {
+    #[serde(default)]
+    parts: Vec<GoogleRespPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleRespPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleUsageMetadata {
+    #[serde(rename = "promptTokenCount", default)]
+    prompt_token_count: u32,
+    #[serde(rename = "candidatesTokenCount", default)]
+    candidates_token_count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{LlmMessage, RequestMetadata};
+
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            tenant_id: "t".to_string(),
+            user_id: "u".to_string(),
+            request_id: "r".to_string(),
+            sensitivity_tier: 0,
+            feature: "f".to_string(),
+        }
+    }
+
+    fn msg(role: &str, text: &str) -> LlmMessage {
+        LlmMessage {
+            role: role.to_string(),
+            content: MessageContent::Text(text.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn capacita_dichiarate() {
+        let p = GoogleProvider::new(Client::new(), "key", None);
+        assert_eq!(p.name(), "google");
+        assert!(p.supports_streaming());
+        assert_eq!(p.max_context_tokens(), 1_000_000);
+        assert_eq!(p.tier_compatibility(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn endpoint_streaming_aggiunge_alt_sse() {
+        let p = GoogleProvider::new(Client::new(), "key", None);
+        let url = p.endpoint("gemini-x", true);
+        assert!(url.ends_with("/models/gemini-x:streamGenerateContent?alt=sse"));
+        let url2 = p.endpoint("gemini-x", false);
+        assert!(url2.ends_with("/models/gemini-x:generateContent"));
+    }
+
+    #[test]
+    fn system_estratto_in_system_instruction() {
+        let req = LlmRequest {
+            model: "gemini-x".to_string(),
+            messages: vec![msg("system", "istruzione"), msg("user", "domanda")],
+            temperature: Some(0.5),
+            max_tokens: Some(500),
+            tools: None,
+            response_format: None,
+            stream: None,
+            metadata: metadata(),
+        };
+        let json = serde_json::to_value(build_request_body(&req)).unwrap();
+
+        assert_eq!(json["systemInstruction"]["parts"][0]["text"], "istruzione");
+        // Solo lo user finisce in contents.
+        assert_eq!(json["contents"].as_array().unwrap().len(), 1);
+        assert_eq!(json["contents"][0]["role"], "user");
+        assert_eq!(json["contents"][0]["parts"][0]["text"], "domanda");
+        assert_eq!(json["generationConfig"]["temperature"], 0.5);
+        assert_eq!(json["generationConfig"]["maxOutputTokens"], 500);
+    }
+
+    #[test]
+    fn assistant_mappato_su_model() {
+        let req = LlmRequest {
+            model: "gemini-x".to_string(),
+            messages: vec![msg("assistant", "risposta precedente")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: None,
+            stream: None,
+            metadata: metadata(),
+        };
+        let json = serde_json::to_value(build_request_body(&req)).unwrap();
+        assert_eq!(json["contents"][0]["role"], "model");
+        // Nessun parametro di generazione -> generationConfig assente.
+        assert!(json.get("generationConfig").is_none());
+    }
+
+    #[test]
+    fn deserializza_response() {
+        let raw = r#"{
+            "candidates": [{
+                "content": {"parts": [{"text": "Ciao "}, {"text": "mondo"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 4}
+        }"#;
+        let parsed: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let resp = from_generate_response(parsed, "gemini-x".to_string(), 33);
+
+        assert_eq!(resp.content, "Ciao mondo");
+        assert_eq!(resp.finish_reason, "stop");
+        assert_eq!(resp.usage.input_tokens, 11);
+        assert_eq!(resp.usage.output_tokens, 4);
+        assert_eq!(resp.provider_used, "google");
+    }
+
+    #[test]
+    fn finish_reason_mappato() {
+        assert_eq!(map_finish_reason(Some("STOP")), "stop");
+        assert_eq!(map_finish_reason(Some("MAX_TOKENS")), "length");
+        assert_eq!(map_finish_reason(Some("SAFETY")), "content_filter");
+        assert_eq!(map_finish_reason(Some("boh")), "stop");
+        assert_eq!(map_finish_reason(None), "stop");
+    }
+
+    #[test]
+    fn sse_delta_emette_chunk() {
+        let mut p = GoogleSseParser::new("gemini-x".to_string());
+        p.parse_line(r#"data: {"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}"#);
+        assert_eq!(p.pending.len(), 1);
+        assert_eq!(p.pending[0].delta, "Hel");
+        assert!(p.pending[0].finish_reason.is_none());
+        assert_eq!(p.pending[0].provider_used.as_deref(), Some("google"));
+    }
+
+    #[test]
+    fn sse_chunk_finale_riporta_usage() {
+        let mut p = GoogleSseParser::new("gemini-x".to_string());
+        p.parse_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":2}}"#,
+        );
+        let chunk = p.pending.pop_back().expect("chunk finale");
+        assert_eq!(chunk.delta, ".");
+        assert_eq!(chunk.finish_reason.as_deref(), Some("stop"));
+        let usage = chunk.usage.expect("usage finale");
+        assert_eq!(usage.input_tokens, 9);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn sse_riga_parziale_gestita() {
+        let mut p = GoogleSseParser::new("gemini-x".to_string());
+        p.push_bytes(r#"data: {"candidates":[{"content":{"parts":[{"te"#);
+        assert_eq!(p.pending.len(), 0);
+        p.push_bytes("xt\":\"ok\"}]}}]}\n");
+        assert_eq!(p.pending.len(), 1);
+        assert_eq!(p.pending[0].delta, "ok");
+    }
+}

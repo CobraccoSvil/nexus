@@ -355,34 +355,32 @@ start_brain() {
 }
 
 stop_gateway() {
+    # Migrazione Fase 6: il gateway e' il binario Rust (nexus-gateway). Ferma il
+    # Rust e pulisce eventuali residui del vecchio server Node (eliminato).
+    pkill -f 'target/debug/nexus-gateway' 2>/dev/null || true
     pkill -f 'apps/nexus-gateway/dist/server\.js' 2>/dev/null || true
     sleep 1
 }
 
 build_gateway() {
-    # Il gateway e' TypeScript: senza questo build dist/server.js non esiste e
-    # start_gateway fallisce con "file non trovato". turbo builda anche le
-    # dipendenze workspace (@nexus/shared, @nexus/llm-gateway, @nexus/audit).
-    log "Build nexus-gateway (TypeScript)..."
-    pnpm exec turbo run build --filter=@ideai/nexus-gateway-server
+    # Migrazione Fase 6: il gateway e' ora il binario Rust del crate
+    # nexus-gateway (il vecchio gateway TypeScript/Node e' stato eliminato).
+    # Build in debug su WSL (dev/test), coerente con gli altri crate Rust.
+    log "Build nexus-gateway (Rust)..."
+    cargo build -p nexus-gateway --bin nexus-gateway
 }
 
 start_gateway() {
-    local logfile="/tmp/nexus-gateway.log"
-    # Niente NEXUS_GATEWAY_PORT (regola G): il gateway risolve nexus_gateway_port
-    # dal DB all'avvio. Qui solo le credenziali DB e i file di config.
-    setsid nohup env \
-        NODE_ENV=production \
+    local logfile="/tmp/nexus-gateway-rust.log"
+    # Migrazione Fase 6: gateway = binario Rust. Porta e config (policy/alias/
+    # chiavi) risolte dal DB all'avvio (regola G). cwd = ROOT cosi' il bootstrap
+    # trova i file config relativi (config/policies, config/model-aliases.yaml).
+    ( cd "${ROOT}" && setsid nohup env \
         DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
         POSTGRES_URL="${POSTGRES_URL:-${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}}" \
-        NEXUS_LLM_POLICY_FILE="${NEXUS_LLM_POLICY_FILE:-${ROOT}/config/policies/default.yaml}" \
-        NEXUS_MODEL_ALIASES_FILE="${NEXUS_MODEL_ALIASES_FILE:-${ROOT}/config/model-aliases.yaml}" \
-        JWT_SECRET="${JWT_SECRET:-}" \
-        node "${ROOT}/apps/nexus-gateway/dist/server.js" \
-        > "$logfile" 2>&1 < /dev/null &
-    local pid=$!
-    disown || true
-    echo "  nexus-gateway PID=${pid} log=${logfile}"
+        "${ROOT}/target/debug/nexus-gateway" \
+        > "$logfile" 2>&1 < /dev/null & )
+    echo "  nexus-gateway (Rust) log=${logfile}"
 }
 
 # Ritorna il `kind` di un servizio (rust|brain|gateway|web-ide|builtin) o
