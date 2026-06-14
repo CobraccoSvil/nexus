@@ -129,7 +129,13 @@ fn build_providers(db: &PgPool, http: &Client, keys: &ProviderKeys) -> Vec<Arc<d
     let mut providers: Vec<Arc<dyn LlmProvider>> = Vec::new();
 
     if let Some(k) = &keys.openai {
-        providers.push(Arc::new(OpenAiProvider::new(http.clone(), k.clone(), None)));
+        // DB passato per leggere il reasoning_effort o-series dai settings (regola G).
+        providers.push(Arc::new(OpenAiProvider::with_db(
+            http.clone(),
+            k.clone(),
+            None,
+            Some(db.clone()),
+        )));
     }
     if let Some(k) = &keys.anthropic {
         // DB passato per leggere il budget thinking dai settings (regola G).
@@ -147,7 +153,13 @@ fn build_providers(db: &PgPool, http: &Client, keys: &ProviderKeys) -> Vec<Arc<d
         providers.push(Arc::new(DeepSeekProvider::new(http.clone(), k.clone(), None)));
     }
     if let Some(k) = &keys.google {
-        providers.push(Arc::new(GoogleProvider::new(http.clone(), k.clone(), None)));
+        // DB passato per leggere il budget thinking dai settings (regola G).
+        providers.push(Arc::new(GoogleProvider::with_db(
+            http.clone(),
+            k.clone(),
+            None,
+            Some(db.clone()),
+        )));
     }
     if let Some(base_url) = &keys.vllm_base_url {
         providers.push(Arc::new(VllmProvider::new(

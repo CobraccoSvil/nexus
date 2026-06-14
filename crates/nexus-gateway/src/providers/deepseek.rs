@@ -1,12 +1,18 @@
-//! Provider DeepSeek (OpenAI-compatibile) con fix XML tool-call.
+//! Provider DeepSeek (OpenAI-compatibile) con fix XML tool-call + reasoning.
 //!
-//! Porting di `packages/llm-gateway/src/providers/deepseek.ts`. DeepSeek a volte
-//! emette le tool-call in formato XML Anthropic-style dentro il campo `content`
-//! invece del formato strutturato OpenAI `tool_calls`. Questo modulo intercetta
-//! il blocco `<tool_calls>...</tool_calls>`, lo converte in [`LlmToolCall`]
-//! strutturati e ripulisce il content.
+//! Porting di `packages/llm-gateway/src/providers/deepseek.ts` + parita' con
+//! `brain/providers/deepseek_provider.py`. DeepSeek a volte emette le tool-call
+//! in formato XML Anthropic-style dentro il campo `content` invece del formato
+//! strutturato OpenAI `tool_calls`. Questo modulo intercetta il blocco
+//! `<tool_calls>...</tool_calls>`, lo converte in [`LlmToolCall`] strutturati e
+//! ripulisce il content.
 //!
-//! La logica di parsing e' un punto unico ([`parse_xml_tool_calls`] /
+//! Reasoning: i dual-mode V4 girano in thinking mode di default; il thinking si
+//! governa col parametro ufficiale `extra_body.thinking.type` (enabled/disabled)
+//! e il reasoning torna nel campo separato `reasoning_content` (response/stream),
+//! mappato in `reasoning`/`reasoning_delta` dal client compat (punto unico).
+//!
+//! La logica di parsing XML e' un punto unico ([`parse_xml_tool_calls`] /
 //! [`strip_xml_tool_calls`]) riusata sia da `complete` (post-processing) sia da
 //! `stream` (accumulo + emissione tool-call al termine).
 
@@ -19,7 +25,7 @@ use regex::Regex;
 use reqwest::Client;
 
 use crate::provider::{ChunkStream, LlmProvider};
-use crate::providers::openai_compat::OpenAiCompatClient;
+use crate::providers::openai_compat::{OpenAiCompatClient, ReasoningDialect, ResolvedReasoning};
 use crate::types::{
     LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, SensitivityTier, ToolCallDelta,
     ToolCallDeltaFunction, ToolFunctionCall,
@@ -108,6 +114,26 @@ fn strip_xml_tool_calls(content: &str) -> String {
     TOOL_CALLS_BLOCK_RE.replace(content, "").trim().to_string()
 }
 
+/// Risolve il dialetto reasoning per la richiesta.
+///
+/// Inviamo `extra_body.thinking.type` SOLO quando il chiamante esprime una
+/// preferenza esplicita via `req.thinking` (regola: il gateway non conosce le
+/// capability del modello, non deve indovinare). Senza preferenza, DeepSeek usa
+/// il suo default (thinking ON sui dual-mode V4) -> dialetto base, niente
+/// extra_body. Con `req.thinking.enabled` => `enabled`; con false => `disabled`
+/// (parita' funzionale con `should_disable_thinking` del brain, qui guidato dal
+/// contratto invece che dalla capability).
+fn resolve_reasoning(req: &LlmRequest) -> ResolvedReasoning {
+    match req.thinking.as_ref() {
+        Some(t) => ResolvedReasoning {
+            dialect: ReasoningDialect::DeepSeek,
+            enabled: t.enabled,
+            effort: None,
+        },
+        None => ResolvedReasoning::none(),
+    }
+}
+
 /// Post-processa una risposta DeepSeek: converte eventuali tool-call XML se la
 /// risposta non ne ha gia' di native.
 fn fixup_response(mut resp: LlmResponse) -> LlmResponse {
@@ -162,15 +188,18 @@ impl LlmProvider for DeepSeekProvider {
     }
 
     async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
-        let resp = self.client.complete(req).await?;
+        let reasoning = resolve_reasoning(req);
+        let resp = self.client.complete_with_reasoning(req, &reasoning).await?;
         Ok(fixup_response(resp))
     }
 
     /// Streaming con detection XML: accumula i chunk; se al termine non ci sono
     /// tool-call native ma il content contiene XML, le emette come delta
-    /// strutturati (parita' col generatore TS).
+    /// strutturati (parita' col generatore TS). I chunk di reasoning
+    /// (`reasoning_delta`) viaggiano invariati nel ramo normale.
     async fn stream(&self, req: &LlmRequest) -> anyhow::Result<ChunkStream> {
-        let mut inner = self.client.stream(req).await?;
+        let reasoning = resolve_reasoning(req);
+        let mut inner = self.client.stream_with_reasoning(req, &reasoning).await?;
 
         let mut accumulated = String::new();
         let mut has_native_tool_calls = false;
@@ -258,7 +287,7 @@ impl LlmProvider for DeepSeekProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LlmUsage;
+    use crate::types::{LlmMessage, LlmUsage, MessageContent, RequestMetadata, ThinkingConfig};
 
     fn base_response(content: &str) -> LlmResponse {
         LlmResponse {
@@ -280,12 +309,66 @@ mod tests {
         }
     }
 
+    fn req_with_thinking(thinking: Option<ThinkingConfig>) -> LlmRequest {
+        LlmRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![LlmMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("ciao".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+            }],
+            temperature: None,
+            max_tokens: Some(1024),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking,
+            metadata: RequestMetadata {
+                tenant_id: "t".to_string(),
+                user_id: "u".to_string(),
+                request_id: "r".to_string(),
+                sensitivity_tier: 0,
+                feature: "f".to_string(),
+            },
+        }
+    }
+
     #[test]
     fn capacita_dichiarate() {
         let p = DeepSeekProvider::new(Client::new(), "k", None);
         assert_eq!(p.name(), "deepseek");
         assert_eq!(p.max_context_tokens(), 65_536);
         assert_eq!(p.tier_compatibility(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn reasoning_assente_senza_preferenza() {
+        // Nessun req.thinking -> dialetto base, niente extra_body (default DeepSeek).
+        let r = resolve_reasoning(&req_with_thinking(None));
+        assert_eq!(r.dialect, ReasoningDialect::None);
+    }
+
+    #[test]
+    fn reasoning_enabled_invia_dialetto_deepseek() {
+        let r = resolve_reasoning(&req_with_thinking(Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+        })));
+        assert_eq!(r.dialect, ReasoningDialect::DeepSeek);
+        assert!(r.enabled);
+    }
+
+    #[test]
+    fn reasoning_disabled_invia_dialetto_deepseek_off() {
+        let r = resolve_reasoning(&req_with_thinking(Some(ThinkingConfig {
+            enabled: false,
+            budget_tokens: None,
+        })));
+        assert_eq!(r.dialect, ReasoningDialect::DeepSeek);
+        assert!(!r.enabled);
     }
 
     #[test]
@@ -336,6 +419,15 @@ mod tests {
         let calls = out.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "native_1");
+    }
+
+    #[test]
+    fn fixup_preserva_reasoning() {
+        // Il fixup XML non deve perdere il reasoning gia' estratto dal content.
+        let mut resp = base_response("risposta normale");
+        resp.reasoning = Some("ho ragionato".to_string());
+        let out = fixup_response(resp);
+        assert_eq!(out.reasoning.as_deref(), Some("ho ragionato"));
     }
 
     #[test]

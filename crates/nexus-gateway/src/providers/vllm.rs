@@ -4,6 +4,12 @@
 //! Fase 0, attivato in Fase 7. A differenza dei provider cloud ammette anche il
 //! tier 3 (dato che gira on-premise) e ha context window e api_key configurabili
 //! (alcuni deployment vLLM non richiedono chiave: si passa un placeholder).
+//!
+//! REASONING (best-effort): il reasoning dipende dal modello servito. Non
+//! inviamo parametri speciali (delega a `OpenAiCompatClient::complete`/`stream`
+//! standard, dialetto `None`), ma il client compat legge comunque un eventuale
+//! `reasoning_content` emesso dal modello e lo mappa in `reasoning`/
+//! `reasoning_delta`. Nessuna logica obbligatoria, niente assunzioni sul modello.
 
 use async_trait::async_trait;
 use reqwest::Client;

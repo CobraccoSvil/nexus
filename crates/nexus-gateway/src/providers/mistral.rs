@@ -1,9 +1,17 @@
 //! Provider Mistral.
 //!
-//! Porting di `packages/llm-gateway/src/providers/mistral.ts`: thin wrapper
-//! OpenAI-compatibile con `base_url` Mistral. Il `provider_used` riportato dal
-//! client e' "mistral" (passato al costruttore del client condiviso), quindi
-//! non serve rimappare la risposta come fa il TS.
+//! Porting di `packages/llm-gateway/src/providers/mistral.ts` + parita' con
+//! `brain/providers/mistral_provider.py`: thin wrapper OpenAI-compatibile con
+//! `base_url` Mistral. Il `provider_used` riportato dal client e' "mistral"
+//! (passato al costruttore del client condiviso), quindi non serve rimappare la
+//! risposta come fa il TS.
+//!
+//! REASONING: Mistral NON riceve alcun parametro reasoning. I `magistral`
+//! restituiscono HTTP 400 se ricevono `reasoning_effort` (storia repo, mig 0381),
+//! e il provider Python non invia nulla di reasoning. Per questo Mistral delega a
+//! `OpenAiCompatClient::complete`/`stream` standard (dialetto reasoning `None`):
+//! niente `reasoning_effort`, niente `extra_body.thinking`. Eventuale reasoning
+//! inline nel content viene lasciato passthrough senza rompere il flusso.
 
 use async_trait::async_trait;
 use reqwest::Client;
