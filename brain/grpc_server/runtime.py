@@ -432,63 +432,6 @@ def _get_agent_graph() -> object:
     return _agent_graph
 
 
-async def _warmup_google_provider() -> None:
-    """Inizializza il client Google genai (Vertex SA + httpx pool) con una
-    chiamata sintetica count_tokens. Cold start eliminato per i call utente.
-
-    Best-effort: ogni errore loggato come INFO, mai propagato.
-    """
-    import asyncio as _aio
-
-    try:
-        from brain.providers.google_provider import GoogleProvider
-
-        provider = GoogleProvider()
-        ok, reason = provider._is_configured()
-        if not ok:
-            logger.info("Vertex warmup: provider google non configurato (%s), skip", reason)
-            return
-
-        # Regola G: niente nome modello in codice. Risolvi un modello google
-        # qualsiasi enabled dal catalog per il warmup (e' una chiamata tecnica
-        # di pre-warm del client SDK, non una scelta di routing).
-        def _resolve_warmup_model() -> str | None:
-            try:
-                from brain.utils.db_pool import connect as _db_connect
-                with _db_connect() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT model FROM ai_price_catalog "
-                            "WHERE provider = 'google' AND is_enabled = TRUE "
-                            "ORDER BY is_featured DESC, input_cost_per_million_tokens ASC NULLS LAST "
-                            "LIMIT 1"
-                        )
-                        row = cur.fetchone()
-                        return row[0] if row else None
-            except Exception as exc:
-                logger.info("Vertex warmup: risoluzione modello fallita (%s)", exc)
-                return None
-
-        warmup_model = _resolve_warmup_model()
-        if not warmup_model:
-            logger.info("Vertex warmup: nessun modello google enabled nel catalog, skip")
-            return
-
-        def _do_warmup() -> int:
-            client = provider._get_client()
-            response = client.models.count_tokens(model=warmup_model, contents="warmup")
-            return int(getattr(response, "total_tokens", 0))
-
-        loop = _aio.get_running_loop()
-        tokens = await loop.run_in_executor(None, _do_warmup)
-        logger.info(
-            "Vertex warmup OK: client genai pre-inizializzato (model=%s, total_tokens=%d)",
-            warmup_model, tokens,
-        )
-    except Exception as exc:
-        logger.info("Vertex warmup: skipped (%s)", exc)
-
-
 def _apply_dns_override(dns_servers: list[str]) -> None:
     """Override del resolver DNS di sistema con nameserver personalizzati.
     Usa dnspython per risolvere i hostname prima di passarli a socket.getaddrinfo.

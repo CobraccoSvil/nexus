@@ -1303,9 +1303,67 @@ class ProviderRegistry:
         return await p.generate(wire_model, prompt, **kwargs)
 
     async def test_connection_async(self, provider: str) -> dict[str, Any]:
+        """Health-check del provider via gateway Rust (punto unico, regola L).
+
+        Non parla piu' con gli SDK dei vendor: interroga il gateway su
+        ``GET {gateway}/v1/models/{provider}`` (autodiscovery live, nessuna
+        completion fatturata). Mapping verso il dict di output storico (firma
+        invariata per i chiamanti: ``/providers/{provider}/health``, CLI, mcp-core):
+          - HTTP 200 con lista modelli non vuota -> ``status="ready"``
+          - HTTP 200 con lista vuota             -> ``status="error"``
+          - HTTP != 2xx / timeout / connessione  -> ``status="error"`` col
+            messaggio classificato (``reason`` + ``error_class``).
+        Gli stati ``disabled`` (provider spento lato brain) e ``unknown``
+        (provider non costruito) restano gestiti qui, prima di toccare il gateway.
+        """
         if not self.is_enabled(provider):
             return {"provider": provider, "status": "disabled"}
-        p = self._providers.get(provider)
-        if p is None:
+        if self._providers.get(provider) is None:
             return {"provider": provider, "status": "unknown"}
-        return await p.test_connection()
+
+        import httpx
+
+        from .gateway_provider import (
+            _gateway_url,
+            _service_token,
+        )
+
+        url = f"{_gateway_url()}/v1/models/{provider}"
+        headers = {"Authorization": f"Bearer {_service_token()}"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = data.get("models") or []
+                if models:
+                    return {"provider": provider, "status": "ready"}
+                return {
+                    "provider": provider,
+                    "status": "error",
+                    "reason": "Il gateway non ha restituito modelli per il provider.",
+                    "error_class": "provider_error",
+                }
+            # status != 200: il gateway riporta {error} (404 non configurato,
+            # 502 API del provider fallita). Regola F: solo lo status + il
+            # messaggio del gateway, nessun body grezzo non sanitizzato.
+            try:
+                err = (resp.json() or {}).get("error")
+            except Exception:  # noqa: BLE001
+                err = None
+            reason = err or f"gateway models HTTP {resp.status_code}"
+            return {
+                "provider": provider,
+                "status": "error",
+                "reason": reason,
+                "error_class": "provider_error",
+            }
+        except Exception as exc:  # noqa: BLE001
+            from .error_handler import classify_error
+            info = classify_error(exc, provider)
+            return {
+                "provider": provider,
+                "status": "error",
+                "reason": info["message"],
+                "error_class": info["stop_reason"],
+            }

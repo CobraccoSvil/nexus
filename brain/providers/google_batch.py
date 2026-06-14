@@ -1,4 +1,15 @@
-"""Google Gemini Batch API client for deep file review."""
+"""Google Gemini Batch API client for deep file review.
+
+ECCEZIONE SDK LEGITTIMA (regole G/L, migrazione gateway 2026-06-14): tutte le
+chiamate LLM del brain passano dal gateway Rust, TRANNE questo batch Vertex.
+Motivo: il flusso usa upload/download di file via Vertex Files API
+(files.upload -> batches.create -> batches.get -> files.download), non riducibile
+a REST pulita come il batch Anthropic. Il gateway ritorna 501 di proposito
+(crates/nexus-gateway/src/batch.rs). Migrarlo richiederebbe ~600-800 righe Rust
+(streaming multipart + resumable upload) con rischio alto: rimane in Python come
+caso "SDK piu' avanzato del REST puro", finche' non esiste una soluzione Rust
+robusta per il file-transfer Vertex.
+"""
 
 from google import genai
 

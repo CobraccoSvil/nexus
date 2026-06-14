@@ -1,8 +1,8 @@
 """Costruzione dell'app FastAPI del Neural Core (debug/health + endpoint REST).
 
 Concentra: creazione dell'istanza `app`, middleware CORS, eventi di
-startup/shutdown (checkpointer PostgreSQL + warmup Vertex) e l'inclusione dei
-router suddivisi per responsabilita' (core, vision, agent, terminal).
+startup/shutdown (checkpointer PostgreSQL) e l'inclusione dei router suddivisi
+per responsabilita' (core, vision, agent, terminal).
 
 Lo stato condiviso vive in `brain.grpc_server.runtime`.
 """
@@ -43,13 +43,6 @@ async def startup_event() -> None:
     except Exception as exc:
         logger.error("Errore durante l'inizializzazione del checkpointer: %s", exc)
         raise
-
-    # Pre-warming Google Vertex (fix #77): il client genai e' lazy-init al primo
-    # call; con SA dal DB il cold start carica JSON + AFC init, superando i 5s
-    # di timeout del classifier. Lo facciamo in background per non bloccare
-    # lo startup, ogni errore loggato come INFO e mai propagato.
-    import asyncio as _aio
-    _aio.create_task(runtime._warmup_google_provider())
 
 
 @app.on_event("shutdown")

@@ -8,7 +8,7 @@ dentro `brain/grpc_server/` mantenendo identico il comportamento:
   - runtime.py        : stato condiviso (router, embeddings, providers,
                         classifier, grafo, checkpointer, client gRPC) e helper
                         condivisi (settings cache, sicurezza terminale, reload
-                        chiavi/DNS, warmup Vertex).
+                        chiavi/DNS).
   - app.py            : factory FastAPI + middleware + startup/shutdown +
                         inclusione router.
   - routes/core.py    : health, classify, route-model, embed, search,
@@ -84,7 +84,6 @@ from brain.grpc_server.runtime import (  # noqa: F401  (re-export pubblico)
     _load_keys_from_db,
     _prepare_shell_command,
     _verify_terminal_token,
-    _warmup_google_provider,
 )
 
 logger = logging.getLogger(__name__)
