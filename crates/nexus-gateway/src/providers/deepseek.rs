@@ -326,6 +326,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking,
+            pin_provider: None,
             metadata: RequestMetadata {
                 tenant_id: "t".to_string(),
                 user_id: "u".to_string(),

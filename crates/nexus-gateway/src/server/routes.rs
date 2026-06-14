@@ -106,30 +106,38 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
         .policy
         .validate_tier_claim(req.metadata.sensitivity_tier, effective_tier);
 
-    let decision = runtime
-        .policy
-        .decide(effective_tier, &req.metadata.feature, &HashMap::new());
-    if decision.blocked {
-        return Err(PipelineError::blocked(
-            decision
-                .reason
-                .unwrap_or_else(|| "routing bloccato dalla policy".to_string()),
-        ));
-    }
+    // Pin esplicito: bypassa policy.decide + resolve_providers e costruisce una
+    // chain di UN solo provider. La policy DLP (classify/validate_tier_claim/
+    // redaction) resta attiva: il pin salta SOLO il routing, non la sicurezza.
+    let resolved: Vec<ResolvedProvider> = if let Some(pin) = req.pin_provider.as_deref() {
+        vec![resolve_pinned_provider(pin, &runtime.providers, &req.model)?]
+    } else {
+        let decision = runtime
+            .policy
+            .decide(effective_tier, &req.metadata.feature, &HashMap::new());
+        if decision.blocked {
+            return Err(PipelineError::blocked(
+                decision
+                    .reason
+                    .unwrap_or_else(|| "routing bloccato dalla policy".to_string()),
+            ));
+        }
 
-    // Accoppia ogni nome-provider deciso col provider costruito + modello risolto.
-    let resolved = resolve_providers(
-        &decision.providers,
-        &runtime.providers,
-        &runtime.aliases,
-        &req.model,
-        effective_tier,
-    );
-    if resolved.is_empty() {
-        return Err(PipelineError::blocked(
-            "nessun provider configurato/risolvibile per il tier richiesto",
-        ));
-    }
+        // Accoppia ogni nome-provider deciso col provider costruito + modello risolto.
+        let resolved = resolve_providers(
+            &decision.providers,
+            &runtime.providers,
+            &runtime.aliases,
+            &req.model,
+            effective_tier,
+        );
+        if resolved.is_empty() {
+            return Err(PipelineError::blocked(
+                "nessun provider configurato/risolvibile per il tier richiesto",
+            ));
+        }
+        resolved
+    };
 
     // Redaction pre-flight: strict mode quando il tier e' elevato (>=2) e il
     // provider scelto e' cloud. La mappa serve per la reidratazione post-flight.
@@ -210,6 +218,40 @@ fn resolve_providers(
         }
     }
     out
+}
+
+/// Costruisce la chain pinnata di UN SOLO elemento per il provider esplicito
+/// (`req.pin_provider`). Bypassa `policy.decide` e `resolve_providers`: nessun
+/// alias logico, nessun fallback cross-provider. Il modello e' quello della
+/// richiesta, strippato dell'eventuale prefisso `provider/`. Errore chiaro (non
+/// fallback) se il provider pinnato non e' tra quelli configurati (regola G:
+/// niente ripiego silenzioso). Punto unico del pin per i due path (regola L).
+fn resolve_pinned_provider(
+    pin: &str,
+    built: &[Arc<dyn LlmProvider>],
+    logical_model: &str,
+) -> Result<ResolvedProvider, PipelineError> {
+    let Some(provider) = built.iter().find(|p| p.name() == pin) else {
+        return Err(PipelineError::provider(format!(
+            "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
+        )));
+    };
+    Ok(ResolvedProvider {
+        provider: provider.clone(),
+        // Strip del prefisso "provider/" se presente; modello as-is altrimenti.
+        model: strip_model_prefix(logical_model),
+    })
+}
+
+/// Rimuove il prefisso `provider/` da `provider/modello`, ritornando tutto cio'
+/// che segue il primo `/`. Senza `/` ritorna la stringa invariata. Allineato a
+/// `strip_provider_prefix` del resolver alias, qui in locale per il path pin
+/// (non passa dall'alias resolver).
+fn strip_model_prefix(model: &str) -> String {
+    match model.split_once('/') {
+        Some((_, rest)) => rest.to_string(),
+        None => model.to_string(),
+    }
 }
 
 /// Esegue il fallback sui provider risolti: salta i cooldown, prova in ordine,
@@ -370,27 +412,45 @@ async fn build_sse_stream(
         let classifier = SensitivityClassifier::new(runtime.presidio.clone());
         let classification = classifier.classify(&body.messages).await;
         let tier = classification.tier.max(body.metadata.sensitivity_tier);
-        let decision = runtime.policy.decide(tier, &body.metadata.feature, &HashMap::new());
 
-        if decision.blocked {
-            let _ = tx
-                .send(Ok(Event::default().data(
-                    json!({ "error": decision.reason.unwrap_or_default() }).to_string(),
-                )))
-                .await;
-            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-            return;
-        }
+        // Pin esplicito: chain di UN solo provider, niente policy.decide ne'
+        // fallback cross-provider (parita' col path non-streaming). La DLP
+        // (classify/redaction) resta a monte; qui si salta solo il routing.
+        let resolved: Vec<ResolvedProvider> = if let Some(pin) = body.pin_provider.as_deref() {
+            match resolve_pinned_provider(pin, &runtime.providers, &body.model) {
+                Ok(rp) => vec![rp],
+                Err(e) => {
+                    let _ = tx
+                        .send(Ok(Event::default()
+                            .data(json!({ "error": e.message }).to_string())))
+                        .await;
+                    let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    return;
+                }
+            }
+        } else {
+            let decision = runtime.policy.decide(tier, &body.metadata.feature, &HashMap::new());
+            if decision.blocked {
+                let _ = tx
+                    .send(Ok(Event::default().data(
+                        json!({ "error": decision.reason.unwrap_or_default() }).to_string(),
+                    )))
+                    .await;
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                return;
+            }
+            resolve_providers(
+                &decision.providers,
+                &runtime.providers,
+                &runtime.aliases,
+                &body.model,
+                tier,
+            )
+        };
 
-        let resolved = resolve_providers(
-            &decision.providers,
-            &runtime.providers,
-            &runtime.aliases,
-            &body.model,
-            tier,
-        );
-
-        // Primo provider non in cooldown.
+        // Primo provider non in cooldown. Con pin la chain ha un solo elemento:
+        // se quel provider e' in cooldown non c'e' alcun ripiego (errore), come
+        // richiesto dalla semantica pin.
         let Some(rp) = resolved
             .iter()
             .find(|rp| !state.cooldown.is_in_cooldown(rp.provider.name()))
@@ -602,6 +662,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: RequestMetadata {
                 tenant_id: "t".into(),
                 user_id: "u".into(),
@@ -679,5 +740,94 @@ mod tests {
         let err = run_fallback(&resolved, &cooldown, &req()).await.err().unwrap();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("openai"));
+    }
+
+    // ── Pin provider (bypass routing) ────────────────────────────────────────
+
+    #[test]
+    fn pin_provider_costruisce_chain_di_un_solo_provider_con_strip_prefisso() {
+        // Tra i provider configurati ci sono sia openai che anthropic; il pin
+        // su anthropic deve produrre SOLO anthropic, ignorando openai.
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let anthropic: Arc<dyn LlmProvider> = FakeProvider::new("anthropic", Behaviour::Ok);
+        let built = vec![openai, anthropic];
+
+        let rp = resolve_pinned_provider("anthropic", &built, "anthropic/claude-x")
+            .expect("provider pinnato configurato");
+        assert_eq!(rp.provider.name(), "anthropic");
+        // Strip del prefisso "provider/": resta solo il nome modello.
+        assert_eq!(rp.model, "claude-x");
+    }
+
+    #[test]
+    fn pin_provider_strip_prefisso_solo_prima_componente() {
+        let google: Arc<dyn LlmProvider> = FakeProvider::new("google", Behaviour::Ok);
+        let built = vec![google];
+        // Modello senza prefisso provider: usato as-is sul provider pinnato.
+        let rp = resolve_pinned_provider("google", &built, "gemini-2.5-flash").unwrap();
+        assert_eq!(rp.provider.name(), "google");
+        assert_eq!(rp.model, "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn pin_provider_non_configurato_e_errore_non_fallback() {
+        // Solo openai e' configurato; il pin su un provider assente deve dare
+        // errore esplicito, non ripiegare su openai (regola G).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let built = vec![openai];
+        // ResolvedProvider non implementa Debug (contiene un trait object), quindi
+        // non si usa expect_err qui: si destruttura il Result a mano.
+        let Err(err) = resolve_pinned_provider("anthropic", &built, "anthropic/claude-x") else {
+            panic!("provider non configurato deve fallire");
+        };
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("anthropic"));
+    }
+
+    #[tokio::test]
+    async fn pin_provider_in_cooldown_errore_senza_fallback_cross_provider() {
+        // anthropic pinnato + in cooldown ("unhealthy"); openai sano e' tra i
+        // built ma NON nella chain pinnata -> NON deve essere eseguito.
+        let openai = FakeProvider::new("openai", Behaviour::Ok);
+        let anthropic = FakeProvider::new("anthropic", Behaviour::Ok);
+        let built: Vec<Arc<dyn LlmProvider>> = vec![openai.clone(), anthropic.clone()];
+
+        // Chain pinnata = solo anthropic (come fa run_complete con pin_provider).
+        let rp = resolve_pinned_provider("anthropic", &built, "anthropic/claude-x").unwrap();
+        let resolved = vec![rp];
+
+        let cooldown = CooldownManager::new();
+        cooldown.mark_billing("anthropic", Some("credit balance too low".into()));
+
+        let err = run_fallback(&resolved, &cooldown, &req())
+            .await
+            .expect_err("provider pinnato in cooldown deve fallire");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("anthropic"));
+        // Nessun altro provider eseguito: openai mai chiamato (no fallback).
+        assert_eq!(openai.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(anthropic.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pin_provider_che_fallisce_non_ripiega_su_altro_provider() {
+        // anthropic pinnato ma fallisce (billing): openai sano resta inutilizzato.
+        let openai = FakeProvider::new("openai", Behaviour::Ok);
+        let anthropic = FakeProvider::new("anthropic", Behaviour::ErrBilling);
+        let built: Vec<Arc<dyn LlmProvider>> = vec![openai.clone(), anthropic.clone()];
+
+        let rp = resolve_pinned_provider("anthropic", &built, "anthropic/claude-x").unwrap();
+        let resolved = vec![rp];
+
+        let cooldown = CooldownManager::new();
+        let err = run_fallback(&resolved, &cooldown, &req())
+            .await
+            .expect_err("provider pinnato fallito deve dare errore, non fallback");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        // anthropic provato 1 volta, openai MAI (niente fallback cross-provider).
+        assert_eq!(anthropic.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(openai.calls.load(Ordering::SeqCst), 0);
+        // Il fallimento ha marcato anthropic in cooldown (billing).
+        assert!(cooldown.is_in_cooldown("anthropic"));
     }
 }

@@ -1215,6 +1215,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: metadata(),
         };
         let body = build_request_body(&req, false, None, CacheTtl::Off);
@@ -1244,6 +1245,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: metadata(),
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
@@ -1275,6 +1277,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: metadata(),
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
@@ -1307,6 +1310,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: metadata(),
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
@@ -1457,6 +1461,7 @@ mod tests {
                 enabled,
                 budget_tokens: budget,
             }),
+            pin_provider: None,
             metadata: metadata(),
         }
     }
@@ -1572,6 +1577,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: metadata(),
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
@@ -1608,6 +1614,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: metadata(),
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
@@ -1655,6 +1662,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: metadata(),
         }
     }

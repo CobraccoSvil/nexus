@@ -251,6 +251,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            pin_provider: None,
             metadata: meta(request_id),
         }
     }

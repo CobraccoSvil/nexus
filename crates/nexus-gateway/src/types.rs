@@ -120,6 +120,17 @@ pub struct LlmRequest {
     /// thinking. Retrocompatibile: `None` = nessuna richiesta di thinking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    /// Pin esplicito del provider da eseguire (bypass routing). Quando `Some`,
+    /// il gateway esegue ESATTAMENTE quel provider col `model` indicato
+    /// (strippato dell'eventuale prefisso `provider/`), SENZA `policy.decide` e
+    /// SENZA fallback cross-provider: se il provider e' in cooldown o non e'
+    /// configurato, la richiesta fallisce (nessun ripiego su un altro provider).
+    /// Serve al chiamante (mcp-core) che ha gia' deciso provider+modello via
+    /// routing matrix DB, per evitare un secondo routing divergente nel gateway.
+    /// Retrocompatibile: `None` = routing per tier + fallback (comportamento
+    /// storico invariato).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
     pub metadata: RequestMetadata,
 }
 
