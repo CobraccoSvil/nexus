@@ -41,7 +41,12 @@ USER_WANTS="$HOME_DIR/.config/systemd/user/default.target.wants"
 rm -f "$USER_WANTS/nexus-mcp-core.service" "$USER_WANTS/nexus-brain.service"
 runuser -l "$USER_NAME" -c "XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user stop nexus-mcp-core.service nexus-brain.service" 2>/dev/null || true
 pkill -f "apps/web-ide/server.js" 2>/dev/null || true
-echo "  unit --user disabilitate, web-ide legacy fermato"
+# Ferma anche il gateway LLM avviato via nohup legacy (pre-systemd): libera la
+# 4060 per la unit systemd. Il watchdog del binario nuovo non lo rilancia; se per
+# race il primo start della unit trovasse la porta ancora occupata, Restart=always
+# riprova e a quel punto la 4060 e' libera.
+pkill -x nexus-gateway 2>/dev/null || true
+echo "  unit --user disabilitate, web-ide + gateway nohup legacy fermati"
 
 # 2. Genera e installa le unit --system dai template.
 for svc in nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide; do
