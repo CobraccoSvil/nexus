@@ -264,8 +264,13 @@ async fn attempt_recovery(db: &PgPool, service: &str, probe: &ProbeResult) {
             try_restart_systemd_or_process(db, "brain").await;
         }
         ("gateway", _) => {
-            // Fix M48: gateway Node.js cade ripetutamente, lo riavvia.
-            try_restart_gateway().await;
+            // ADR 0028 L3: il gateway e' ora una unit systemd --system con
+            // Restart=always (deploy/systemd/nexus-gateway-system.service). Il
+            // riavvio e' garantito da PID 1: il watchdog NON deve rilanciarlo a
+            // mano (un secondo nohup creerebbe conflitto di porta col processo che
+            // systemd sta gia' rilanciando). Si limita a loggare; il probe sopra
+            // ha gia' persistito lo stato DOWN in nexus_dependency_health.
+            note_gateway_down_systemd_recovers(kind);
         }
         _ => {
             tracing::debug!("task_watchdog: nessuna strategia di recovery per {service}/{kind}");
@@ -324,56 +329,21 @@ async fn probe_gateway() -> ProbeResult {
     }
 }
 
-/// Fix M48: riavvia il nexus-gateway (Node.js) se cade. Usa lo stesso comando
-/// di deploy-local.sh (setsid nohup node dist/server.js). Best-effort: errori
-/// solo loggati. Cooldown 5 min gestito dal chiamante.
-async fn try_restart_gateway() {
-    let root = std::env::var("NEXUS_REPO_ROOT")
-        .unwrap_or_else(|_| "/home/administrator/ideai".to_string());
-    // Migrazione Fase 6: il gateway LLM e' ora il binario Rust (crate
-    // nexus-gateway), non piu' il vecchio server Node (eliminato). Il watchdog
-    // supervisiona il binario Rust, garantendone il riavvio se cade.
-    let bin = format!("{}/target/debug/nexus-gateway", root);
-    if !std::path::Path::new(&bin).exists() {
-        tracing::warn!(
-            "task_watchdog: recovery gateway: binario {} non trovato, skip",
-            bin
-        );
-        return;
-    }
-    // Pulisce un'eventuale istanza precedente (gestisce race con stop precedente).
-    // Pattern col path completo per non toccare apps/nexus-gateway (Node legacy).
-    let _ = tokio::process::Command::new("pkill")
-        .args(["-f", "target/debug/nexus-gateway"])
-        .output()
-        .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    // setsid nohup <binario rust> ... > /tmp/nexus-gateway-rust.log 2>&1 < /dev/null &
-    // cwd = root: il bootstrap del gateway risolve i config con path relativi
-    // (config/policies, config/model-aliases.yaml).
-    let shell = format!(
-        "cd '{}' && setsid nohup env NEXUS_GATEWAY_PORT={} '{}' > /tmp/nexus-gateway-rust.log 2>&1 < /dev/null &",
-        root,
-        std::env::var("NEXUS_GATEWAY_PORT").unwrap_or_else(|_| "4060".into()),
-        bin
+/// ADR 0028 L3: il gateway LLM (binario Rust, crate `nexus-gateway`) e' ora una
+/// unit systemd --system con `Restart=always`
+/// (deploy/systemd/nexus-gateway-system.service). Il riavvio quando cade e'
+/// garantito da PID 1.
+///
+/// Storia: con il vecchio avvio `setsid nohup` il watchdog rilanciava sempre la
+/// stessa build (target/debug/nexus-gateway non aggiornato ai commit) -> il
+/// gateway non si aggiornava col deploy e un secondo spawn poteva collidere
+/// sulla porta. Sotto systemd il watchdog NON deve piu' rilanciare il processo:
+/// si limita a registrare il DOWN (il probe ha gia' persistito lo stato in
+/// `nexus_dependency_health`); systemd ripristina il servizio entro RestartSec.
+fn note_gateway_down_systemd_recovers(error_kind: &str) {
+    tracing::warn!(
+        "task_watchdog: nexus-gateway DOWN (errore: {error_kind}) — riavvio delegato a systemd (Restart=always, unit nexus-gateway.service). Nessun rilancio manuale per evitare conflitto di porta."
     );
-    match tokio::process::Command::new("sh")
-        .args(["-c", &shell])
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => {
-            tracing::info!("task_watchdog: recovery gateway: spawn node OK");
-        }
-        Ok(o) => {
-            tracing::warn!(
-                "task_watchdog: recovery gateway: spawn fallito ({}): {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        Err(e) => tracing::warn!("task_watchdog: recovery gateway: shell exec fallito: {}", e),
-    }
 }
 
 async fn try_restart_container(name_hint: &str) {

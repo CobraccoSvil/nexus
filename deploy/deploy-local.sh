@@ -357,6 +357,11 @@ start_brain() {
 stop_gateway() {
     # Migrazione Fase 6: il gateway e' il binario Rust (nexus-gateway). Ferma il
     # Rust e pulisce eventuali residui del vecchio server Node (eliminato).
+    # ADR 0028 L3: se la unit --system e' installata, lo stop passa da systemd
+    # (Restart=always lo rilancerebbe se lo killassimo a mano).
+    if [ -f "/etc/systemd/system/nexus-gateway.service" ]; then
+        sudo systemctl stop nexus-gateway.service 2>/dev/null || true
+    fi
     pkill -f 'target/debug/nexus-gateway' 2>/dev/null || true
     pkill -f 'apps/nexus-gateway/dist/server\.js' 2>/dev/null || true
     sleep 1
@@ -371,16 +376,29 @@ build_gateway() {
 }
 
 start_gateway() {
+    local bin="${ROOT}/target/debug/nexus-gateway"
     local logfile="/tmp/nexus-gateway-rust.log"
-    # Migrazione Fase 6: gateway = binario Rust. Porta e config (policy/alias/
+    # ADR 0028 L3: se la unit --system e' installata (deploy/install-system-units.sh)
+    # ha la precedenza — il gateway gira sotto PID 1, immune alla caduta del
+    # manager --user in WSL, e deploy-local.sh aggiorna sempre la build (il vecchio
+    # avvio nohup non si aggiornava ai commit). Aggiorna il symlink stabile usato
+    # dalla unit (target/nexus-current/nexus-gateway) e riavvia il servizio.
+    if [ -f "$bin" ] && [ -f "/etc/systemd/system/nexus-gateway.service" ]; then
+        mkdir -p "${ROOT}/target/nexus-current"
+        ln -sfn "$bin" "${ROOT}/target/nexus-current/nexus-gateway"
+        sudo systemctl restart nexus-gateway.service
+        echo "  nexus-gateway via systemd --system nexus-gateway.service (PID1, ADR 0028 L3) log=/tmp/nexus-gateway.log"
+        return
+    fi
+    # Fallback nohup legacy (unit non installata). Porta e config (policy/alias/
     # chiavi) risolte dal DB all'avvio (regola G). cwd = ROOT cosi' il bootstrap
     # trova i file config relativi (config/policies, config/model-aliases.yaml).
     ( cd "${ROOT}" && setsid nohup env \
         DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
         POSTGRES_URL="${POSTGRES_URL:-${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}}" \
-        "${ROOT}/target/debug/nexus-gateway" \
+        "$bin" \
         > "$logfile" 2>&1 < /dev/null & )
-    echo "  nexus-gateway (Rust) log=${logfile}"
+    echo "  nexus-gateway (Rust, nohup legacy: installa l'auto-restart con deploy/install-system-units.sh) log=${logfile}"
 }
 
 # Ritorna il `kind` di un servizio (rust|brain|gateway|web-ide|builtin) o

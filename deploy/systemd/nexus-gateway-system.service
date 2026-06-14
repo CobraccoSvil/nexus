@@ -1,0 +1,51 @@
+# nexus-gateway.service — Gateway LLM di Nexus (binario Rust) come unit systemd --SYSTEM.
+#
+# ADR 0028 livello 3. Il gateway LLM (porta :4060) instrada le chiamate ai
+# provider AI. Storicamente veniva avviato da deploy-local.sh e supervisionato
+# dal task_watchdog di mcp-core via `setsid nohup`: questo significava che il
+# binario non si aggiornava ai commit (il watchdog rilanciava sempre la stessa
+# build vecchia) -> brain-nuovo parlava con gateway-vecchio -> LED provider
+# rossi. Sotto systemd --system il restart e' garantito da PID 1 (immune alla
+# caduta del manager --user in WSL) e deploy-local.sh aggiorna sempre la build.
+#
+# ExecStart usa il symlink stabile target/nexus-current/nexus-gateway,
+# aggiornato da deploy-local.sh a ogni build: la unit esegue sempre l'ultima
+# build.
+#
+# After=nexus-mcp-core: il gateway parte dopo mcp-core (che a sua volta attende
+# il brain). La dipendenza dal DB Postgres e' coperta dal bootstrap interno del
+# gateway (config/policy/chiavi risolte dal DB) + Restart=always come safety net
+# se il DB non e' ancora pronto al boot.
+#
+# Restart=always (vedi nexus-mcp-core-system.service per il razionale): la VM
+# WSL sospesa manda SIGTERM ai processi -> exit 0 graceful -> on-failure NON
+# riavviava. always riavvia anche su exit 0, lasciando intatti i `systemctl
+# stop/restart` del deploy. StartLimit: max 5 riavvii in 60s contro crash-loop.
+#
+# WorkingDirectory=ROOT: il bootstrap del gateway risolve i config con path
+# relativi (config/policies, config/model-aliases.yaml).
+#
+# Installata da deploy/install-system-units.sh (sostituisce __USER__/__UID__).
+
+[Unit]
+Description=Nexus Gateway LLM (instradamento provider AI, porta 4060) [system-level, ADR 0028 L3]
+After=network-online.target nexus-mcp-core.service
+Wants=network-online.target nexus-mcp-core.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=/home/__USER__/ideai
+EnvironmentFile=-/home/__USER__/ideai/.env
+Environment=NEXUS_GATEWAY_PORT=4060
+ExecStart=/home/__USER__/ideai/target/nexus-current/nexus-gateway
+Restart=always
+RestartSec=3
+StandardOutput=append:/tmp/nexus-gateway.log
+StandardError=append:/tmp/nexus-gateway.log
+
+[Install]
+WantedBy=multi-user.target
