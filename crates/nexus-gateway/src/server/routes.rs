@@ -31,6 +31,11 @@ use axum::{
 use futures::stream::Stream;
 use serde_json::{json, Value};
 
+use crate::batch::{
+    anthropic_batch_url, anthropic_batches_url, anthropic_headers, anthropic_results_url,
+    build_anthropic_batch_body, parse_anthropic_batch_id, parse_anthropic_results,
+    parse_anthropic_status, BatchStatusResponse, CreateBatchBody, CreateBatchResponse,
+};
 use crate::cooldown::CooldownManager;
 use crate::model_alias_resolver::ModelAliasResolver;
 use crate::provider::LlmProvider;
@@ -599,6 +604,266 @@ async fn build_sse_stream(
     });
 
     tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+// ── Batch API ────────────────────────────────────────────────────────────────
+
+/// Base URL Anthropic per le chiamate batch. Allineata al provider non-batch
+/// (`DEFAULT_BASE_URL`); override-abile via setting `anthropic_base_url` (regola
+/// G: nessun valore di business hardcoded oltre al default ufficiale).
+const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
+
+/// Risolve la base URL Anthropic dal DB (setting `anthropic_base_url`), con
+/// fallback all'endpoint ufficiale. Punto unico della risoluzione base URL per i
+/// due handler batch (regola L).
+async fn anthropic_base_url(state: &AppState) -> String {
+    nexus_auth::get_setting(&state.db, "anthropic_base_url")
+        .await
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| ANTHROPIC_DEFAULT_BASE_URL.to_string())
+}
+
+/// Risolve la chiave Anthropic dal DB, rispettando il flag `anthropic_enabled`
+/// (parita' col bootstrap). `None` se il provider e' disabilitato o senza chiave.
+async fn anthropic_api_key(state: &AppState) -> Option<String> {
+    let enabled = nexus_auth::get_bool_setting(&state.db, "anthropic_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    nexus_auth::get_setting(&state.db, "anthropic_api_key")
+        .await
+        .filter(|k| !k.trim().is_empty())
+}
+
+/// `POST /v1/batch` (auth richiesta): crea un batch sul provider indicato.
+/// Body: `{ provider, requests: [{ custom_id, ...LlmRequest }] }`.
+/// Ritorna `{ batch_id, status }`.
+///
+/// ANTHROPIC: completo (Message Batches API). GOOGLE: 501 documentato (vedi
+/// `create_batch_google`). Provider sconosciuto: 400.
+pub async fn create_batch(State(state): State<AppState>, Json(body): Json<CreateBatchBody>) -> Response {
+    if body.requests.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "requests required" })),
+        )
+            .into_response();
+    }
+    match body.provider.as_str() {
+        "anthropic" => create_batch_anthropic(&state, &body).await,
+        "google" => create_batch_google(),
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("provider '{other}' non supportato per batch") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Crea il batch Anthropic: serializza le richieste (punto unico
+/// `build_anthropic_batch_body`), POST su `/messages/batches`, estrae l'id.
+async fn create_batch_anthropic(state: &AppState, body: &CreateBatchBody) -> Response {
+    let Some(api_key) = anthropic_api_key(state).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "provider anthropic non configurato/abilitato" })),
+        )
+            .into_response();
+    };
+    let base_url = anthropic_base_url(state).await;
+    let payload = build_anthropic_batch_body(&body.requests);
+
+    let mut builder = reqwest::Client::new().post(anthropic_batches_url(&base_url));
+    for (k, v) in anthropic_headers(&api_key) {
+        builder = builder.header(k, v);
+    }
+    let resp = match builder.json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("gateway batch: submit Anthropic fallito");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("submit batch fallito: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        // Regola F: il body d'errore non contiene prompt utente; lo propaghiamo.
+        let text = resp.text().await.unwrap_or_default();
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("anthropic HTTP {}: {}", status.as_u16(), text) })),
+        )
+            .into_response();
+    }
+    let parsed: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("risposta submit non valida: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    match parse_anthropic_batch_id(&parsed) {
+        Ok(batch_id) => {
+            tracing::info!(
+                provider = "anthropic",
+                requests = body.requests.len(),
+                "gateway batch: creato"
+            );
+            Json(CreateBatchResponse {
+                batch_id,
+                status: crate::batch::map_anthropic_status(
+                    parsed
+                        .get("processing_status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("in_progress"),
+                ),
+            })
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Crea il batch Google: 501 documentato. Il flusso Vertex Batch richiede
+/// `files.upload` di un JSONL + `batches.create(src=...)` + `files.download` dei
+/// risultati: upload/download di file (Cloud Storage / files endpoint) non
+/// riducibile a una chiamata REST pulita in questo passo. Un'implementazione a
+/// meta' (solo submit senza recupero) sarebbe fragile (regola H: niente toppe),
+/// quindi si ritorna 501 esplicito col motivo finche' il flusso file non e'
+/// completato. L'auth Vertex (`gcp_auth::VertexAuth`) e' gia' pronta per quando
+/// si chiudera' il pezzo.
+fn create_batch_google() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "batch Google non ancora implementato",
+            "reason": "il flusso Vertex Batch richiede files.upload (JSONL) + batches.create(src=...) + files.download dei risultati: upload/download file non riducibile a REST pulita in questo passo. Auth Vertex (gcp_auth) gia' pronta; manca il trasporto file."
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /v1/batch/{provider}/{batch_id}` (auth richiesta): stato del batch e, se
+/// terminato, i risultati per `custom_id`.
+/// Ritorna `{ status, request_counts, results: [{ custom_id, response|error }] }`.
+pub async fn get_batch(
+    State(state): State<AppState>,
+    axum::extract::Path((provider, batch_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    match provider.as_str() {
+        "anthropic" => get_batch_anthropic(&state, &batch_id).await,
+        "google" => create_batch_google(), // stesso 501 documentato
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("provider '{other}' non supportato per batch") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Stato + risultati di un batch Anthropic. Retrieve dello stato; se `ended`,
+/// scarica e parsa il file risultati JSONL (punto unico `parse_anthropic_results`).
+async fn get_batch_anthropic(state: &AppState, batch_id: &str) -> Response {
+    let Some(api_key) = anthropic_api_key(state).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "provider anthropic non configurato/abilitato" })),
+        )
+            .into_response();
+    };
+    let base_url = anthropic_base_url(state).await;
+    let client = reqwest::Client::new();
+
+    // 1) retrieve stato.
+    let mut builder = client.get(anthropic_batch_url(&base_url, batch_id));
+    for (k, v) in anthropic_headers(&api_key) {
+        builder = builder.header(k, v);
+    }
+    let resp = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("retrieve batch fallito: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("anthropic HTTP {}: {}", status.as_u16(), text) })),
+        )
+            .into_response();
+    }
+    let info_json: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("risposta retrieve non valida: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    let mut out: BatchStatusResponse = match parse_anthropic_status(&info_json) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+
+    // 2) se terminato, scarica i risultati (JSONL).
+    if out.status.is_ended() {
+        let mut rb = client.get(anthropic_results_url(&base_url, batch_id));
+        for (k, v) in anthropic_headers(&api_key) {
+            rb = rb.header(k, v);
+        }
+        match rb.send().await {
+            Ok(r) if r.status().is_success() => {
+                let jsonl = r.text().await.unwrap_or_default();
+                out.results = parse_anthropic_results(&jsonl);
+            }
+            Ok(r) => {
+                let code = r.status().as_u16();
+                let text = r.text().await.unwrap_or_default();
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": format!("results HTTP {code}: {text}") })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": format!("download results fallito: {e}") })),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    Json(out).into_response()
 }
 
 // ── Admin reload ─────────────────────────────────────────────────────────────

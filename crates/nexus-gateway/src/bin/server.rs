@@ -69,6 +69,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models/:provider", get(routes::models_for_provider))
         .route("/v1/complete", post(routes::complete))
         .route("/v1/stream", post(routes::stream))
+        .route("/v1/batch", post(routes::create_batch))
+        .route("/v1/batch/:provider/:batch_id", get(routes::get_batch))
         .route("/admin/reload", post(routes::admin_reload))
         // Auth middleware: esenta /health e /providers (vedi `auth::require_auth`).
         .layer(axum::middleware::from_fn_with_state(

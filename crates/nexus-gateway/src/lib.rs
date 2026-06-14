@@ -11,6 +11,7 @@
 //! finche' la parita' non e' validata (Fase 6). I moduli vengono aggiunti
 //! una fase alla volta, sempre mantenendo `cargo check` verde.
 
+pub mod batch;
 pub mod cooldown;
 pub mod fallback;
 pub mod model_alias_resolver;

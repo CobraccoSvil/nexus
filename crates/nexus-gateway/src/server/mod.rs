@@ -8,6 +8,8 @@
 //!   - `GET  /v1/models/{provider}` autodiscovery live del singolo provider;
 //!   - `POST /v1/complete` completion non-streaming;
 //!   - `POST /v1/stream`   completion SSE;
+//!   - `POST /v1/batch`    crea un batch (Anthropic completo, Google 501);
+//!   - `GET  /v1/batch/{provider}/{batch_id}` stato + risultati del batch;
 //!   - `POST /admin/reload` ricarica chiavi/policy dal DB.
 //!
 //! VINCOLO di migrazione (vedi `lib.rs`): a runtime il gateway Node resta
