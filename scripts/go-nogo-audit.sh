@@ -34,10 +34,12 @@ echo "── A. Architettura ──"
 dep "A1" "test cross-profilo su 3 profili — richiede deploy hybrid+onprem"
 dep "A2" "zero modifiche al codice — verificabile solo a deploy time"
 dep "A3" "VLLMProvider contro endpoint vLLM reale — vedi Fase 6.5"
-if has_file packages/llm-gateway/src/router; then
-  ok "A4" "model alias resolver: packages/llm-gateway/src/router presente"
+# Migrazione gateway a Rust: il model alias resolver vive ora nel crate
+# crates/nexus-gateway (il vecchio packages/llm-gateway TS e' stato eliminato).
+if has_file crates/nexus-gateway/src/model_alias_resolver.rs; then
+  ok "A4" "model alias resolver: crates/nexus-gateway/src/model_alias_resolver.rs presente"
 else
-  miss "A4" "router dir mancante in packages/llm-gateway/src"
+  miss "A4" "model_alias_resolver.rs mancante in crates/nexus-gateway/src"
 fi
 if has_file scripts/onprem-smoke.sh && has_file scripts/onprem-preflight.sh; then
   ok "A5" "smoke + preflight script presenti (Fase 7)"
@@ -48,10 +50,13 @@ fi
 # ── B. Sicurezza ───────────────────────────────────────────────────────────
 echo ""
 echo "── B. Sicurezza ──"
-if has_file tests/red-team.test.ts || has_file packages/llm-gateway/tests/red-team.test.ts; then
-  ok "B1" "red-team test file presente"
+# Migrazione gateway a Rust: i test red-team del vecchio gateway TS sono stati
+# eliminati con apps/nexus-gateway. La copertura va riportata come test Rust del
+# crate nexus-gateway (tests/ o #[cfg(test)]).
+if has_file tests/red-team.test.ts || has_grep "red.team|red_team" crates/nexus-gateway/; then
+  ok "B1" "red-team coverage presente (test)"
 else
-  miss "B1" "tests/red-team.test.ts non trovato"
+  miss "B1" "red-team coverage assente — da riportare come test Rust in crates/nexus-gateway"
 fi
 if has_grep "DLPScanner" packages/audit/src/; then
   ok "B2" "DLPScanner implementato (packages/audit/src/dlp-scanner.ts)"
@@ -104,10 +109,13 @@ if has_grep "FORCE ROW LEVEL SECURITY" infra/sql/rls-policies.sql; then
 else
   miss "C2" "FORCE ROW LEVEL SECURITY non presente"
 fi
-if has_file packages/llm-gateway/tests/tenant-isolation.test.ts; then
-  ok "C3" "tenant-isolation test presente"
+# Migrazione gateway a Rust: il test tenant-isolation del vecchio gateway TS e'
+# stato eliminato con packages/llm-gateway. La copertura va riportata come test
+# Rust del crate nexus-gateway.
+if has_grep "tenant.isolation|tenant_isolation" crates/nexus-gateway/; then
+  ok "C3" "tenant-isolation coverage presente (test Rust)"
 else
-  miss "C3" "tenant-isolation test mancante"
+  miss "C3" "tenant-isolation coverage assente — da riportare come test Rust in crates/nexus-gateway"
 fi
 if has_grep "shredTenant|crypto.shred|crypto_shred" packages/ infra/; then
   ok "C4" "crypto-shredding implementato"
@@ -144,8 +152,9 @@ if has_grep "request_id|tenant_id" packages/audit/src/logger.ts; then
 else
   miss "D5" "logger structured mancante"
 fi
-if has_grep "/health" packages/llm-gateway/src/; then
-  ok "D6" "/health endpoint implementato in gateway"
+# Migrazione gateway a Rust: l'endpoint /health vive nel crate nexus-gateway.
+if has_grep "/health" crates/nexus-gateway/src/; then
+  ok "D6" "/health endpoint implementato in gateway (crates/nexus-gateway)"
 else
   miss "D6" "endpoint /health non trovato"
 fi

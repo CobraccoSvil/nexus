@@ -25,18 +25,22 @@ log "Docker infra"
 docker compose -f docker-compose.local.yml up -d 2>/dev/null || true
 
 log "Stop processi Nexus"
+# Migrazione gateway a Rust: il gateway e' il binario `nexus-gateway`
+# (target/debug). Il vecchio server Node (apps/nexus-gateway/dist/server.js)
+# e' stato eliminato; manteniamo solo il pattern Rust nello stop.
 for x in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp \
-  brain.grpc_server.main apps/nexus-gateway/dist/server.js "pnpm.*web-ide"; do
+  brain.grpc_server.main target/debug/nexus-gateway target/release/nexus-gateway "pnpm.*web-ide"; do
   stop "$x"
 done
-pkill -f "node.*dist/server.js" 2>/dev/null || true
 pkill -f "next-server" 2>/dev/null || true
 pkill -f "next start" 2>/dev/null || true
-pkill -f "apps/nexus-gateway" 2>/dev/null || true
 sleep 2
 
 log "Build mcp-core release"
 cargo build --release -p mcp-core
+
+log "Build nexus-gateway release (Rust)"
+cargo build --release -p nexus-gateway --bin nexus-gateway
 
 log "Neural Core"
 setsid nohup env DATABASE_URL="$DATABASE_URL" NEXUS_BRAIN_BILLING="${NEXUS_BRAIN_BILLING:-off}" \
@@ -44,13 +48,14 @@ setsid nohup env DATABASE_URL="$DATABASE_URL" NEXUS_BRAIN_BILLING="${NEXUS_BRAIN
 sleep 5
 
 GW_PORT="${NEXUS_GATEWAY_PORT:-4060}"
-log "Nexus Gateway :${GW_PORT}"
-setsid nohup env NODE_ENV=production DATABASE_URL="$DATABASE_URL" POSTGRES_URL="$POSTGRES_URL" \
+log "Nexus Gateway :${GW_PORT} (Rust)"
+# Migrazione Fase 6: il gateway e' il binario Rust del crate nexus-gateway. Le
+# config (policy/alias/chiavi) sono risolte dal DB all'avvio (regola G), quindi
+# non servono piu' le env *_FILE del vecchio server Node. cwd = ROOT cosi' il
+# bootstrap trova eventuali file config relativi.
+( cd "${ROOT}" && setsid nohup env DATABASE_URL="$DATABASE_URL" POSTGRES_URL="$POSTGRES_URL" \
   NEXUS_GATEWAY_PORT="$GW_PORT" \
-  NEXUS_LLM_POLICY_FILE="${NEXUS_LLM_POLICY_FILE:-${ROOT}/config/policies/default.yaml}" \
-  NEXUS_MODEL_ALIASES_FILE="${NEXUS_MODEL_ALIASES_FILE:-${ROOT}/config/model-aliases.yaml}" \
-  JWT_SECRET="${JWT_SECRET:-}" \
-  node "${ROOT}/apps/nexus-gateway/dist/server.js" > /tmp/nexus-gateway.log 2>&1 < /dev/null &
+  "${ROOT}/target/release/nexus-gateway" > /tmp/nexus-gateway.log 2>&1 < /dev/null & )
 sleep 2
 
 RELEASE="${ROOT}/target/release"

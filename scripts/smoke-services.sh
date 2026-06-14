@@ -44,7 +44,15 @@ check_port() {
 }
 
 echo "==> smoke: avvio nexus-gateway (porta ${NEXUS_GATEWAY_PORT})"
-(cd apps/nexus-gateway && PORT="$NEXUS_GATEWAY_PORT" pnpm exec tsx src/server.ts >/tmp/smoke-nexus.log 2>&1) &
+# Migrazione gateway a Rust: il gateway e' il binario `nexus-gateway` (crate
+# crates/nexus-gateway), gia' compilato in target/debug. Il vecchio server Node
+# (apps/nexus-gateway) e' stato eliminato.
+GATEWAY_BIN="${ROOT_DIR}/target/debug/nexus-gateway"
+if [[ ! -x "$GATEWAY_BIN" ]]; then
+    echo "==> smoke: build nexus-gateway (Rust) mancante, compilo..."
+    cargo build -p nexus-gateway --bin nexus-gateway >/tmp/smoke-nexus-build.log 2>&1 || true
+fi
+(NEXUS_GATEWAY_PORT="$NEXUS_GATEWAY_PORT" "$GATEWAY_BIN" >/tmp/smoke-nexus.log 2>&1) &
 PIDS+=("$!")
 
 echo "==> smoke: avvio admin-service (porta ${ADMIN_SERVICE_PORT})"

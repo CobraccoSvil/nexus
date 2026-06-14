@@ -15,7 +15,7 @@
 #   --rust       Rebuild Rust (mcp-core + microservizi)
 #   --web        Rebuild web-ide (Next.js)
 #   --brain      Pip install brain (Python)
-#   --gateway    Rebuild nexus-gateway (Node)
+#   --gateway    Rebuild nexus-gateway (Rust)
 #   --all        Tutti i precedenti
 #
 # Altre opzioni:
@@ -103,7 +103,7 @@ units_to_restart=""
 [ "$BUILD_RUST" -eq 1 ] && units_to_restart="$units_to_restart nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins"
 [ "$BUILD_WEB" -eq 1 ]  && units_to_restart="$units_to_restart nexus-webide"
 [ "$BUILD_BRAIN" -eq 1 ] && units_to_restart="$units_to_restart nexus-neural"
-[ "$BUILD_GATEWAY" -eq 1 ] && units_to_restart="$units_to_restart nexus-gateway-node"
+[ "$BUILD_GATEWAY" -eq 1 ] && units_to_restart="$units_to_restart nexus-gateway"
 
 log "Acquisisco lock $LOCKFILE su $PROD_HOST"
 log "Build e restart in corso..."
@@ -151,10 +151,13 @@ if [ "$R_WEB" -eq 1 ] && [ "$R_SKIP_BUILD" -eq 0 ]; then
     pnpm --filter @ai-orchestrator/web-ide build 2>&1 | tail -5
 fi
 
-# === Build Gateway ===
+# === Build Gateway (Rust) ===
+# Migrazione Fase 6: il gateway e' il binario Rust del crate nexus-gateway. Il
+# vecchio server Node (apps/nexus-gateway) e' stato eliminato.
 if [ "$R_GATEWAY" -eq 1 ] && [ "$R_SKIP_BUILD" -eq 0 ]; then
-    echo "[build] pnpm build nexus-gateway ..."
-    pnpm --filter @ai-orchestrator/nexus-gateway build 2>&1 | tail -3 || true
+    echo "[build] cargo build --release -p nexus-gateway ..."
+    ~/.cargo/bin/cargo build --release -p nexus-gateway --bin nexus-gateway 2>&1 | tail -5
+    cp -f target/release/nexus-gateway bin/
 fi
 
 # === Build Brain (Python) ===

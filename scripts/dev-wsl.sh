@@ -194,13 +194,20 @@ start_rust_svc "plugin-service"
 start_rust_svc "browser-bridge-mcp" BROWSER_BRIDGE_BIND_HOST="0.0.0.0" BROWSER_BRIDGE_PUBLIC_HOST="127.0.0.1"
 sleep 3
 
-# ── Nexus Gateway (Node.js/TypeScript, :4060) ─────────────────────────────────
+# ── Nexus Gateway (Rust, :4060) ───────────────────────────────────────────────
 info "Avvio Nexus LLM Gateway (:4060)..."
-pkill -f "$REPO_ROOT/apps/nexus-gateway/src/server.ts" 2>/dev/null || true
+# Migrazione Fase 6: il gateway e' il binario Rust del crate nexus-gateway. Il
+# vecchio server Node/TypeScript (apps/nexus-gateway) e' stato eliminato.
+pkill -f "$REPO_ROOT/target/debug/nexus-gateway" 2>/dev/null || true
 sleep 0.5
-# In background affidabile: evitiamo watcher e --env-file (che può fallire con interop Windows/WSL).
-# Carichiamo `.env` in bash e avviamo il server una volta (hot-reload non necessario in dev quotidiano).
-setsid bash -lc "set -a && source \"$REPO_ROOT/.env\" && set +a && exec \"$REPO_ROOT/apps/nexus-gateway/node_modules/.bin/tsx\" \"$REPO_ROOT/apps/nexus-gateway/src/server.ts\" > \"$LOG_DIR/nexus-gateway.log\" 2>&1" &
+GATEWAY_BIN="$REPO_ROOT/target/debug/nexus-gateway"
+if [ ! -x "$GATEWAY_BIN" ]; then
+    info "Build nexus-gateway (Rust) mancante, compilo..."
+    ( cd "$REPO_ROOT" && cargo build -p nexus-gateway --bin nexus-gateway ) >> "$LOG_DIR/nexus-gateway.log" 2>&1 || warn "build nexus-gateway fallita"
+fi
+# Carichiamo `.env` in bash; le config (policy/alias/chiavi) sono risolte dal DB
+# all'avvio (regola G). cwd = REPO_ROOT per i file config relativi.
+setsid bash -lc "set -a && source \"$REPO_ROOT/.env\" && set +a && cd \"$REPO_ROOT\" && exec \"$GATEWAY_BIN\" > \"$LOG_DIR/nexus-gateway.log\" 2>&1" &
 echo $! > "$LOG_DIR/nexus-gateway.pid"
 
 # Smoke check porta

@@ -62,7 +62,7 @@ fi
 log "Stop e disable systemd units"
 remote_exec "$PROXY_HOST" "
     for unit in nexus-core nexus-admin nexus-chat nexus-billing nexus-docs \
-                nexus-plugins nexus-webide nexus-neural nexus-gateway-node; do
+                nexus-plugins nexus-webide nexus-neural nexus-gateway nexus-gateway-node; do
         if systemctl list-unit-files 2>/dev/null | grep -q \"^\${unit}.service\"; then
             sudo systemctl disable --now \$unit 2>/dev/null || true
             echo \"  disabled: \$unit\"
