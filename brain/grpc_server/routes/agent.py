@@ -1,6 +1,6 @@
 """Endpoint agente LangGraph e correlati: project-analyze, sub-agent,
-clarifying questions HITL, batch-analyze (Anthropic), e gli endpoint del grafo
-(run/approve/state/feedback/stats) inclusi gli streaming SSE.
+clarifying questions HITL, batch-analyze (Anthropic, via gateway LLM Rust), e gli
+endpoint del grafo (run/approve/state/feedback/stats) inclusi gli streaming SSE.
 
 Lo stato condiviso (grafo, provider registry, reload chiavi) vive in
 `brain.grpc_server.runtime` e viene letto via attributo di modulo.
@@ -534,24 +534,23 @@ class BatchAnalyzeRequest(BaseModel):
 
 @router.post("/batch-analyze/submit")
 async def batch_analyze_submit(body: BatchAnalyzeRequest) -> dict[str, str]:
-    # Ricaricare le credenziali dal DB per assicurarsi che siano aggiornate
-    runtime._load_keys_from_db()
-
-    from brain.providers.anthropic_batch import AnthropicBatchClient
-    batch_id = await AnthropicBatchClient().submit_batch(body.requests, body.model, body.max_tokens)
+    # Batch ANTHROPIC delegato al gateway LLM Rust (POST /v1/batch). Le credenziali
+    # del provider vivono nel gateway: niente piu' reload chiavi nel brain.
+    from brain.providers.gateway_batch import GatewayBatchClient
+    batch_id = await GatewayBatchClient().submit_batch(body.requests, body.model, body.max_tokens)
     return {"batch_id": batch_id}
 
 
 @router.get("/batch-analyze/{batch_id}/status")
 async def batch_analyze_status(batch_id: str) -> dict[str, object]:
-    from brain.providers.anthropic_batch import AnthropicBatchClient
-    return await AnthropicBatchClient().poll_status(batch_id)
+    from brain.providers.gateway_batch import GatewayBatchClient
+    return await GatewayBatchClient().poll_status(batch_id)
 
 
 @router.get("/batch-analyze/{batch_id}/results")
 async def batch_analyze_results(batch_id: str) -> list:
-    from brain.providers.anthropic_batch import AnthropicBatchClient
-    return await AnthropicBatchClient().get_results(batch_id)
+    from brain.providers.gateway_batch import GatewayBatchClient
+    return await GatewayBatchClient().get_results(batch_id)
 
 
 # ── LangGraph Agent Endpoints ─────────────────────────────────────────────────
