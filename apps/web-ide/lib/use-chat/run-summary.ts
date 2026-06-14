@@ -153,7 +153,7 @@ export function createTerminalMessage(
   // reale: l'epitaffio del run formatters letto come risposta all'error-fix).
   // Etichetta basata sul FATTO strutturale run.status — mai sul testo.
   if (run.status === "cancelled") {
-    baseContent = `> **Run precedente interrotto** — questo e' l'esito del lavoro precedente, non la risposta al tuo ultimo messaggio.\n\n${baseContent}`;
+    baseContent = `> **Attività precedente interrotta** — è il riepilogo di un lavoro che era già in corso e si è interrotto perché nel frattempo è partito un nuovo turno (un tuo nuovo messaggio, oppure un comando in background che si è concluso e ha risvegliato l'agente). **Non è la risposta al tuo ultimo messaggio**: se è rimasto incompleto, richiedilo di nuovo.\n\n${baseContent}`;
   }
 
   // Prependi l'avviso privacy se il provider non e' EU/locale

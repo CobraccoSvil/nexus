@@ -71,6 +71,36 @@ static PROVIDER_COOLDOWN: OnceLock<Mutex<HashMap<String, std::time::Instant>>> =
 static PROVIDER_FAILURES: OnceLock<Mutex<HashMap<String, Vec<std::time::Instant>>>> =
     OnceLock::new();
 
+/// Intervallo di ri-probe per i provider ancora in cooldown BILLING: il credito
+/// puo' tornare con una ricarica imprevedibile, quindi non si aspetta la scadenza
+/// del cooldown lungo (6h) ma si riprova ogni 10 minuti.
+const BILLING_REPROBE_INTERVAL_S: u64 = 600;
+
+/// Ultimo istante in cui il recovery loop ha ri-probato un provider ancora in
+/// cooldown. Limita la frequenza dei re-probe (vedi BILLING_REPROBE_INTERVAL_S),
+/// cosi' il probe periodico non martella il provider ad ogni giro del loop.
+static LAST_RECOVERY_PROBE: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+
+/// True se il provider in cooldown va ri-probato adesso (mai probato, o ultimo
+/// probe piu' vecchio di `interval`); in tal caso aggiorna il timestamp.
+fn should_reprobe_cooldown(provider: &str, interval: std::time::Duration) -> bool {
+    let store = LAST_RECOVERY_PROBE.get_or_init(|| Mutex::new(HashMap::new()));
+    match store.lock() {
+        Ok(mut map) => {
+            let now = std::time::Instant::now();
+            let due = map
+                .get(provider)
+                .map(|last| now.duration_since(*last) >= interval)
+                .unwrap_or(true);
+            if due {
+                map.insert(provider.to_string(), now);
+            }
+            due
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn is_provider_in_cooldown(provider: &str) -> bool {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(map) = store.lock() {
@@ -391,11 +421,22 @@ pub async fn billing_cooldown_recovery_loop(
         };
 
         for provider in providers_disabled {
-            if is_provider_in_cooldown(&provider) {
+            // Cooldown ancora attivo: di norma si aspetta la scadenza. MA per i
+            // billing-cooldown (6h) la ricarica del credito e' un evento esterno
+            // imprevedibile: ri-proviamo a intervalli regolari (BILLING_REPROBE_
+            // INTERVAL_S) invece di tenere il provider giu' per ore dopo che
+            // l'utente ha gia' ricaricato.
+            if is_provider_in_cooldown(&provider)
+                && !should_reprobe_cooldown(
+                    &provider,
+                    std::time::Duration::from_secs(BILLING_REPROBE_INTERVAL_S),
+                )
+            {
                 continue;
             }
-            // Probe-then-reenable: il cooldown e' scaduto ma prima di riabilitare
-            // accertiamo che il provider sia DAVVERO tornato operativo.
+            // Probe-then-reenable: il cooldown e' scaduto (o e' ora di ri-provare)
+            // ma prima di riabilitare accertiamo che il provider sia DAVVERO
+            // tornato operativo.
             let probe_timeout = provider_health_timings().recovery_probe_timeout_s;
             match crate::provider_health_probe::probe_provider_once(
                 &orchestrator,
@@ -408,8 +449,11 @@ pub async fn billing_cooldown_recovery_loop(
                     tracing::info!(
                         target: "provider_cooldown",
                         provider = %provider,
-                        "probe-then-reenable: provider sano, riabilito nel DB"
+                        "probe-then-reenable: provider sano, esco dal cooldown e riabilito nel DB"
                     );
+                    // Esce SUBITO dal cooldown (anche se non ancora scaduto): il
+                    // re-probe periodico ha rilevato che il credito e' tornato.
+                    remove_cooldown(&provider);
                     propagate_billing_reenable_to_db(&db, &provider).await;
                 }
                 crate::provider_health_probe::ProbeOutcome::Billing(kind) => {
