@@ -301,10 +301,7 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
             "system" => {
                 system_instruction = Some(GoogleContent {
                     role: None,
-                    parts: vec![GooglePart {
-                        text: content_to_string(&msg.content),
-                        thought_signature: None,
-                    }],
+                    parts: vec![GooglePart::text(content_to_string(&msg.content))],
                 });
             }
             role => {
@@ -317,12 +314,15 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
                 } else {
                     None
                 };
+                let mut parts = content_to_parts(&msg.content);
+                // La signature si attacca alla PRIMA part del turno (vuota se
+                // assente). `content_to_parts` garantisce almeno una part.
+                if let Some(first) = parts.first_mut() {
+                    first.thought_signature = signature;
+                }
                 contents.push(GoogleContent {
                     role: Some(map_role(role).to_string()),
-                    parts: vec![GooglePart {
-                        text: content_to_string(&msg.content),
-                        thought_signature: signature,
-                    }],
+                    parts,
                 });
             }
         }
@@ -373,6 +373,102 @@ fn content_to_string(content: &MessageContent) -> String {
         MessageContent::Text(s) => s.clone(),
         MessageContent::Blocks(blocks) => serde_json::to_string(blocks).unwrap_or_default(),
     }
+}
+
+/// Mappa il content di un messaggio nelle `parts[]` Google. Caso semplice:
+/// una sola part di testo. Con blocchi immagine (`image_url`) emette una part
+/// `inlineData` (per i data URI base64) o `fileData` (per le URL http), cosi'
+/// la capability vision e' preservata (parita' col formato nativo che il brain
+/// usa via `Part.from_bytes`). I blocchi non-immagine restano testo.
+///
+/// Garantisce SEMPRE almeno una part (eventualmente testo vuoto): la signature
+/// del thinking va riattaccata alla prima part del turno.
+fn content_to_parts(content: &MessageContent) -> Vec<GooglePart> {
+    match content {
+        MessageContent::Text(s) => vec![GooglePart::text(s.clone())],
+        MessageContent::Blocks(blocks) => {
+            let has_image = blocks.iter().any(|b| b.kind == "image_url");
+            if !has_image {
+                // Nessuna immagine: testo serializzato (parita' col TS).
+                return vec![GooglePart::text(content_to_string(content))];
+            }
+            let mut parts: Vec<GooglePart> = Vec::new();
+            for b in blocks {
+                match b.kind.as_str() {
+                    "image_url" => {
+                        if let Some(url) = b
+                            .image_url
+                            .as_ref()
+                            .and_then(|iu| iu.get("url"))
+                            .and_then(|u| u.as_str())
+                        {
+                            parts.push(image_url_to_part(url));
+                        }
+                    }
+                    "text" => {
+                        if let Some(t) = &b.text {
+                            parts.push(GooglePart::text(t.clone()));
+                        }
+                    }
+                    _ => {
+                        if let Some(c) = &b.content {
+                            parts.push(GooglePart::text(c.clone()));
+                        }
+                    }
+                }
+            }
+            if parts.is_empty() {
+                parts.push(GooglePart::text(String::new()));
+            }
+            parts
+        }
+    }
+}
+
+/// Converte una `url` di un blocco immagine in una part Google:
+///   - `data:<mime>;base64,<dati>` -> `inlineData{mimeType, data}` (base64);
+///   - qualunque altra URL (http/https/gs) -> `fileData{mimeType, fileUri}`.
+/// Per i data URI malformati ricade su `fileData` con la URL grezza, senza
+/// rompere la richiesta.
+fn image_url_to_part(url: &str) -> GooglePart {
+    if let Some((mime, data)) = parse_data_uri(url) {
+        GooglePart::inline_data(mime, data)
+    } else {
+        // URL remota: Google la scarica via fileData. Il mimeType non e'
+        // sempre deducibile dalla URL; quando ignoto si omette (l'API lo
+        // inferisce dal contenuto scaricato).
+        GooglePart::file_data(mime_from_url(url), url.to_string())
+    }
+}
+
+/// Estrae `(mime, base64)` da un data URI `data:<mime>;base64,<dati>`. Ritorna
+/// `None` se non e' un data URI base64 ben formato.
+fn parse_data_uri(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let meta = meta.strip_suffix(";base64")?;
+    if meta.is_empty() {
+        return None;
+    }
+    Some((meta.to_string(), data.to_string()))
+}
+
+/// Best-effort del mime da estensione URL (solo per `fileData`). `None` se non
+/// riconosciuto: l'API Google inferisce comunque dal contenuto.
+fn mime_from_url(url: &str) -> Option<String> {
+    let lower = url.split('?').next().unwrap_or(url).to_lowercase();
+    let mime = if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else {
+        return None;
+    };
+    Some(mime.to_string())
 }
 
 /// Mappa una `GenerateContentResponse` nel contratto [`LlmResponse`]: concatena
@@ -590,13 +686,73 @@ struct GoogleContent {
     parts: Vec<GooglePart>,
 }
 
+/// Part di un messaggio Google. Esattamente uno tra `text`, `inline_data`,
+/// `file_data` e' valorizzato (gli altri sono omessi dal wire). La
+/// `thought_signature` si attacca alla prima part del turno `model`.
 #[derive(Debug, Serialize)]
 struct GooglePart {
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    /// Immagine inline base64 (`{mimeType, data}`), per i data URI.
+    #[serde(rename = "inlineData", skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GoogleInlineData>,
+    /// Riferimento a file remoto (`{mimeType?, fileUri}`), per le URL http.
+    #[serde(rename = "fileData", skip_serializing_if = "Option::is_none")]
+    file_data: Option<GoogleFileData>,
     /// Firma opaca del thinking (base64) ri-passata nei turni successivi. Sul
     /// wire e' `thoughtSignature`; assente quando il turno non la porta.
     #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
     thought_signature: Option<String>,
+}
+
+impl GooglePart {
+    fn text(text: String) -> Self {
+        Self {
+            text: Some(text),
+            inline_data: None,
+            file_data: None,
+            thought_signature: None,
+        }
+    }
+
+    fn inline_data(mime_type: String, data: String) -> Self {
+        Self {
+            text: None,
+            inline_data: Some(GoogleInlineData { mime_type, data }),
+            file_data: None,
+            thought_signature: None,
+        }
+    }
+
+    fn file_data(mime_type: Option<String>, file_uri: String) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            file_data: Some(GoogleFileData {
+                mime_type,
+                file_uri,
+            }),
+            thought_signature: None,
+        }
+    }
+}
+
+/// Immagine inline base64 nel formato Gemini (`inlineData`).
+#[derive(Debug, Serialize)]
+struct GoogleInlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
+}
+
+/// Riferimento a file remoto nel formato Gemini (`fileData`). Il `mimeType` e'
+/// opzionale: l'API lo inferisce dal contenuto quando assente.
+#[derive(Debug, Serialize)]
+struct GoogleFileData {
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(rename = "fileUri")]
+    file_uri: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -972,5 +1128,96 @@ mod tests {
         assert_eq!(p.pending[0].reasoning_delta.as_deref(), Some("penso..."));
         // Il delta testuale resta vuoto sul chunk di reasoning.
         assert_eq!(p.pending[0].delta, "");
+    }
+
+    // --- Vision: parts inlineData / fileData (passo 3) ---------------------
+
+    fn image_block(url: &str) -> LlmMessage {
+        LlmMessage {
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![
+                crate::types::LlmContentBlock {
+                    kind: "text".to_string(),
+                    text: Some("descrivi".to_string()),
+                    image_url: None,
+                    tool_use_id: None,
+                    content: None,
+                },
+                crate::types::LlmContentBlock {
+                    kind: "image_url".to_string(),
+                    text: None,
+                    image_url: Some(serde_json::json!({ "url": url })),
+                    tool_use_id: None,
+                    content: None,
+                },
+            ]),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+        }
+    }
+
+    fn req_with(msg: LlmMessage) -> LlmRequest {
+        LlmRequest {
+            model: "gemini-x".to_string(),
+            messages: vec![msg],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            metadata: metadata(),
+        }
+    }
+
+    #[test]
+    fn vision_data_uri_diventa_inline_data() {
+        let req = req_with(image_block("data:image/png;base64,QUJD"));
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let parts = json["contents"][0]["parts"].as_array().unwrap();
+        // Prima part: testo; seconda: inlineData con mimeType+data.
+        assert_eq!(parts[0]["text"], "descrivi");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "QUJD");
+        // Niente text spurio sulla part immagine.
+        assert!(parts[1].get("text").is_none());
+    }
+
+    #[test]
+    fn vision_url_http_diventa_file_data() {
+        let req = req_with(image_block("https://example.com/foto.jpg"));
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let parts = json["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts[1]["fileData"]["fileUri"], "https://example.com/foto.jpg");
+        assert_eq!(parts[1]["fileData"]["mimeType"], "image/jpeg");
+        assert!(parts[1].get("inlineData").is_none());
+    }
+
+    #[test]
+    fn parse_data_uri_estrae_mime_e_dati() {
+        assert_eq!(
+            parse_data_uri("data:image/webp;base64,XYZ"),
+            Some(("image/webp".to_string(), "XYZ".to_string()))
+        );
+        // Non base64 / non data URI -> None.
+        assert!(parse_data_uri("https://x/y.png").is_none());
+        assert!(parse_data_uri("data:image/png,raw").is_none());
+    }
+
+    #[test]
+    fn vision_signature_su_prima_part_con_immagine() {
+        // La signature del thinking si attacca alla PRIMA part anche quando il
+        // turno e' multimodale (testo + immagine).
+        let mut msg = image_block("data:image/png;base64,QUJD");
+        msg.role = "assistant".to_string();
+        msg.thinking_signature = Some("c2ln".to_string());
+        let req = req_with(msg);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let parts = json["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(json["contents"][0]["role"], "model");
+        assert_eq!(parts[0]["thoughtSignature"], "c2ln");
+        assert!(parts[1].get("thoughtSignature").is_none());
     }
 }

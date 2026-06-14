@@ -388,16 +388,30 @@ fn build_request_body(
 
 /// Converte un [`crate::types::LlmMessage`] nel formato wire OpenAI.
 ///
-/// Il `content` viene serializzato a stringa quando e' una lista di blocchi
-/// (parita' col TS che fa `JSON.stringify`). Per i messaggi `assistant` con
-/// tool-call il content puo' essere `null`.
+/// Il content e' una stringa nel caso semplice. Quando e' una lista di blocchi
+/// (`MessageContent::Blocks`):
+///   - se contiene blocchi immagine (`image_url`) si emette un content ARRAY
+///     nativo OpenAI (`[{type:"text",...}, {type:"image_url", image_url:{url}}]`)
+///     cosi' la capability vision e' preservata (regola: il gateway non deve
+///     perdere le immagini quando elimineremo `brain/providers`);
+///   - altrimenti (solo testo / tool_result) si ricade sulla serializzazione a
+///     stringa (parita' col TS che fa `JSON.stringify`).
+/// Per i messaggi `assistant` con tool-call il content puo' essere `null`.
 fn to_wire_message(msg: &crate::types::LlmMessage) -> WireMessage {
     use crate::types::MessageContent;
 
-    let content_str = match &msg.content {
-        MessageContent::Text(s) => Some(s.clone()),
+    let content_value = match &msg.content {
+        MessageContent::Text(s) => Some(WireContent::Text(s.clone())),
         MessageContent::Blocks(blocks) => {
-            serde_json::to_string(blocks).ok().or(Some(String::new()))
+            if blocks.iter().any(|b| b.kind == "image_url") {
+                Some(WireContent::Parts(blocks_to_openai_parts(blocks)))
+            } else {
+                // Nessuna immagine: parita' col TS (JSON.stringify dei blocchi).
+                serde_json::to_string(blocks)
+                    .ok()
+                    .map(WireContent::Text)
+                    .or(Some(WireContent::Text(String::new())))
+            }
         }
     };
 
@@ -418,11 +432,11 @@ fn to_wire_message(msg: &crate::types::LlmMessage) -> WireMessage {
     // assistant con tool_calls: content puo' essere null (parita' TS).
     let content = if msg.role == "assistant" && tool_calls.is_some() {
         match &msg.content {
-            MessageContent::Text(s) if !s.is_empty() => Some(s.clone()),
+            MessageContent::Text(s) if !s.is_empty() => Some(WireContent::Text(s.clone())),
             _ => None,
         }
     } else {
-        content_str
+        content_value
     };
 
     WireMessage {
@@ -432,6 +446,31 @@ fn to_wire_message(msg: &crate::types::LlmMessage) -> WireMessage {
         tool_calls,
         name: msg.name.clone(),
     }
+}
+
+/// Mappa i blocchi del contratto nel content array nativo OpenAI. I blocchi
+/// `image_url` mantengono il formato OpenAI nativo (`{type:"image_url",
+/// image_url:{url, detail?}}`, dove `url` puo' essere `http(s)` o
+/// `data:<mime>;base64,<...>`). I blocchi testuali diventano
+/// `{type:"text", text}`. I blocchi `tool_result` (qui inattesi nel content
+/// array) sono serializzati come testo per non perderne il payload.
+fn blocks_to_openai_parts(blocks: &[crate::types::LlmContentBlock]) -> Vec<serde_json::Value> {
+    blocks
+        .iter()
+        .filter_map(|b| match b.kind.as_str() {
+            "image_url" => b
+                .image_url
+                .as_ref()
+                .map(|iu| serde_json::json!({"type": "image_url", "image_url": iu})),
+            "text" => Some(serde_json::json!({
+                "type": "text",
+                "text": b.text.clone().unwrap_or_default(),
+            })),
+            _ => b.content.as_ref().map(|c| {
+                serde_json::json!({"type": "text", "text": c})
+            }),
+        })
+        .collect()
 }
 
 /// Mappa una [`ChatCompletion`] non-streaming in [`LlmResponse`].
@@ -649,13 +688,23 @@ struct WireMessage {
     role: String,
     // Serializziamo sempre `content` (anche null) per i messaggi assistant con
     // tool-call, dove l'API richiede esplicitamente `content: null`.
-    content: Option<String>,
+    content: Option<WireContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<WireToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+}
+
+/// Content di un messaggio nel wire OpenAI: stringa (caso semplice) o array di
+/// parti tipizzate (testo + immagini, per le richieste vision). L'enum untagged
+/// serializza direttamente al valore JSON (stringa o array) atteso dall'API.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WireContent {
+    Text(String),
+    Parts(Vec<serde_json::Value>),
 }
 
 #[derive(Debug, Serialize)]
@@ -1133,6 +1182,70 @@ mod tests {
         assert_eq!(normalize_finish_reason(None), "stop");
         assert_eq!(normalize_finish_reason(Some("length")), "length");
         assert_eq!(normalize_finish_reason(Some("tool_calls")), "tool_calls");
+    }
+
+    // --- Vision: blocchi immagine nel content array (passo 3) --------------
+
+    fn image_block(url: &str) -> crate::types::LlmContentBlock {
+        crate::types::LlmContentBlock {
+            kind: "image_url".to_string(),
+            text: None,
+            image_url: Some(serde_json::json!({ "url": url })),
+            tool_use_id: None,
+            content: None,
+        }
+    }
+
+    fn text_block(text: &str) -> crate::types::LlmContentBlock {
+        crate::types::LlmContentBlock {
+            kind: "text".to_string(),
+            text: Some(text.to_string()),
+            image_url: None,
+            tool_use_id: None,
+            content: None,
+        }
+    }
+
+    #[test]
+    fn vision_blocco_immagine_diventa_content_array_nativo() {
+        let mut req = sample_request();
+        req.messages[0].content = MessageContent::Blocks(vec![
+            text_block("descrivi"),
+            image_block("data:image/png;base64,AAAA"),
+        ]);
+        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+            .unwrap();
+
+        let content = &json["messages"][0]["content"];
+        // Il content e' un ARRAY (formato OpenAI vision), non una stringa.
+        let arr = content.as_array().expect("content array per vision");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "descrivi");
+        assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(arr[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn vision_url_http_preservato() {
+        let mut req = sample_request();
+        req.messages[0].content =
+            MessageContent::Blocks(vec![image_block("https://example.com/x.png")]);
+        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+            .unwrap();
+        let arr = json["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(arr[0]["type"], "image_url");
+        assert_eq!(arr[0]["image_url"]["url"], "https://example.com/x.png");
+    }
+
+    #[test]
+    fn blocchi_senza_immagine_restano_stringa() {
+        // Nessuna immagine -> parita' col TS (content serializzato a stringa).
+        let mut req = sample_request();
+        req.messages[0].content = MessageContent::Blocks(vec![text_block("solo testo")]);
+        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+            .unwrap();
+        assert!(json["messages"][0]["content"].is_string());
     }
 
     #[test]

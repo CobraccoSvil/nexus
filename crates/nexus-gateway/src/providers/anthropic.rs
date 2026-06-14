@@ -47,6 +47,27 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// solo quando il thinking e' attivo per la richiesta.
 const THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
+/// Beta header richiesto dal TTL cache esteso a 1h (parita' col Python
+/// `_system_cache_control`, commento ~124). Inviato via `anthropic-beta` solo
+/// quando il caching e' attivo con TTL 1h.
+const EXTENDED_CACHE_BETA: &str = "extended-cache-ttl-2025-04-11";
+
+/// Chiave settings (regola G/L) del TTL della prompt cache di sistema Anthropic.
+/// Unica fonte di verita' condivisa col brain Python (mig 0125): valori `5m`,
+/// `1h` (default) o `off` per disattivare il caching. Il gateway Rust segue la
+/// regola G stretta: nessun override env, solo DB.
+const CACHE_TTL_SETTING: &str = "anthropic_system_cache_ttl";
+
+/// TTL cache usato SOLO se il DB e' irraggiungibile (fallback graceful
+/// documentato, regola G). Allineato al default `1h` della mig 0125: il system
+/// prompt cambia raramente, 1h massimizza il cache hit fra turni distanti.
+const CACHE_TTL_DB_DOWN_FALLBACK: &str = "1h";
+
+/// Numero minimo di messaggi nella history sotto cui non si applica il
+/// breakpoint cache sulla history (parita' col Python ~370: `>= 6`). Sotto
+/// questa soglia la cache del solo system gia' copre il prefisso stabile.
+const CACHE_HISTORY_MIN_MESSAGES: usize = 6;
+
 /// `max_tokens` di default quando la request non lo specifica. Non e' un nome di
 /// modello (regola G): e' il tetto di generazione richiesto obbligatoriamente
 /// dall'API Messages, allineato al `?? 4096` del TS.
@@ -75,6 +96,62 @@ pub struct AnthropicProvider {
     api_key: String,
     db: Option<PgPool>,
     thinking_budget: TtlCache<(), u32>,
+    cache_ttl: TtlCache<(), CacheTtl>,
+}
+
+/// Stato della prompt cache di sistema, risolto dal setting
+/// `anthropic_system_cache_ttl` (regola G). `Off` = caching disattivato:
+/// nessun `cache_control` sui blocchi (parita' col brain quando il setting non
+/// abilita il caching).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    /// Caching disattivato: niente `cache_control`.
+    Off,
+    /// Cache ephemeral con TTL default Anthropic (5 minuti).
+    FiveMinutes,
+    /// Cache ephemeral con TTL esteso 1 ora (richiede il beta header).
+    OneHour,
+}
+
+impl CacheTtl {
+    /// Mappa il valore testuale del setting (`5m`/`1h`/`off`) a [`CacheTtl`].
+    /// Valori non riconosciuti collassano su `Off` per non attivare il caching
+    /// con parametri ignoti (fail-safe, niente magic default attivante).
+    fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "5m" => CacheTtl::FiveMinutes,
+            "1h" => CacheTtl::OneHour,
+            _ => CacheTtl::Off,
+        }
+    }
+
+    /// `true` se il caching e' attivo (un breakpoint va emesso).
+    fn is_active(self) -> bool {
+        !matches!(self, CacheTtl::Off)
+    }
+
+    /// Blocco `cache_control` per il SYSTEM prompt: il TTL 1h aggiunge il campo
+    /// `ttl:"1h"` (parita' col Python `_system_cache_control`). `None` se il
+    /// caching e' spento.
+    fn system_cache_control(self) -> Option<serde_json::Value> {
+        match self {
+            CacheTtl::Off => None,
+            CacheTtl::FiveMinutes => Some(serde_json::json!({ "type": "ephemeral" })),
+            CacheTtl::OneHour => {
+                Some(serde_json::json!({ "type": "ephemeral", "ttl": "1h" }))
+            }
+        }
+    }
+
+    /// `cache_control` per i breakpoint sulla HISTORY: sempre ephemeral 5m
+    /// (la storia muta ad ogni turno, parita' col Python ~383). `None` se spento.
+    fn history_cache_control(self) -> Option<serde_json::Value> {
+        if self.is_active() {
+            Some(serde_json::json!({ "type": "ephemeral" }))
+        } else {
+            None
+        }
+    }
 }
 
 impl AnthropicProvider {
@@ -102,6 +179,7 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             db,
             thinking_budget: TtlCache::new(SETTINGS_TTL),
+            cache_ttl: TtlCache::new(SETTINGS_TTL),
         }
     }
 
@@ -127,6 +205,25 @@ impl AnthropicProvider {
         let budget = parsed.unwrap_or(THINKING_BUDGET_DB_DOWN_FALLBACK);
         self.thinking_budget.insert((), budget);
         budget
+    }
+
+    /// TTL della prompt cache di sistema dai settings (cache TTL 60s, regola
+    /// G/L). Se il DB e' irraggiungibile ricade sul fallback documentato
+    /// (`CACHE_TTL_DB_DOWN_FALLBACK`). Senza accesso DB (test di mappatura) il
+    /// caching resta `Off`: i test costruiscono lo stato cache esplicitamente.
+    async fn configured_cache_ttl(&self) -> CacheTtl {
+        if let Some(c) = self.cache_ttl.get(&()) {
+            return c;
+        }
+        let Some(db) = self.db.as_ref() else {
+            return CacheTtl::Off;
+        };
+        let raw = nexus_auth::get_setting(db, CACHE_TTL_SETTING)
+            .await
+            .unwrap_or_else(|| CACHE_TTL_DB_DOWN_FALLBACK.to_string());
+        let ttl = CacheTtl::parse(&raw);
+        self.cache_ttl.insert((), ttl);
+        ttl
     }
 }
 
@@ -155,7 +252,8 @@ impl LlmProvider for AnthropicProvider {
     async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
         let configured = self.configured_thinking_budget().await;
         let thinking_budget = resolve_thinking_budget(req, configured);
-        let body = build_request_body(req, false, thinking_budget);
+        let cache_ttl = self.configured_cache_ttl().await;
+        let body = build_request_body(req, false, thinking_budget, cache_ttl);
         let start = Instant::now();
 
         let mut builder = self
@@ -163,8 +261,8 @@ impl LlmProvider for AnthropicProvider {
             .post(self.endpoint())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION);
-        if thinking_budget.is_some() {
-            builder = builder.header("anthropic-beta", THINKING_BETA);
+        if let Some(beta) = beta_header(thinking_budget.is_some(), cache_ttl) {
+            builder = builder.header("anthropic-beta", beta);
         }
         let resp = builder.json(&body).send().await?;
 
@@ -185,15 +283,16 @@ impl LlmProvider for AnthropicProvider {
     async fn stream(&self, req: &LlmRequest) -> anyhow::Result<ChunkStream> {
         let configured = self.configured_thinking_budget().await;
         let thinking_budget = resolve_thinking_budget(req, configured);
-        let body = build_request_body(req, true, thinking_budget);
+        let cache_ttl = self.configured_cache_ttl().await;
+        let body = build_request_body(req, true, thinking_budget, cache_ttl);
 
         let mut builder = self
             .http
             .post(self.endpoint())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION);
-        if thinking_budget.is_some() {
-            builder = builder.header("anthropic-beta", THINKING_BETA);
+        if let Some(beta) = beta_header(thinking_budget.is_some(), cache_ttl) {
+            builder = builder.header("anthropic-beta", beta);
         }
         let resp = builder.json(&body).send().await?;
 
@@ -286,15 +385,49 @@ fn resolve_thinking_budget(req: &LlmRequest, configured_budget: u32) -> Option<u
     Some(budget)
 }
 
+/// Valore dell'header `anthropic-beta` da inviare: cumula i beta necessari
+/// separati da virgola. `None` se non serve alcun beta. Il thinking richiede
+/// `interleaved-thinking`; il caching con TTL 1h richiede `extended-cache-ttl`.
+fn beta_header(thinking_active: bool, cache_ttl: CacheTtl) -> Option<String> {
+    let mut betas: Vec<&str> = Vec::new();
+    if thinking_active {
+        betas.push(THINKING_BETA);
+    }
+    if cache_ttl == CacheTtl::OneHour {
+        betas.push(EXTENDED_CACHE_BETA);
+    }
+    if betas.is_empty() {
+        None
+    } else {
+        Some(betas.join(","))
+    }
+}
+
 /// Costruisce il corpo JSON della request Messages a partire dal contratto LLM.
 /// `thinking_budget` e' il budget effettivo gia' risolto (vedi
 /// [`resolve_thinking_budget`]): `Some` => blocco thinking nel body.
+/// `cache_ttl` governa i breakpoint di prompt cache (regola G): quando attivo,
+/// il system prompt e l'ultimo blocco stabile della history portano
+/// `cache_control`.
 fn build_request_body(
     req: &LlmRequest,
     stream: bool,
     thinking_budget: Option<u32>,
+    cache_ttl: CacheTtl,
 ) -> AnthropicRequest {
-    let (system, messages) = to_anthropic_messages(req);
+    let (system_text, mut messages) = to_anthropic_messages(req);
+
+    // Breakpoint cache su SYSTEM: blocco text strutturato con cache_control
+    // (parita' col Python ~263-270). Guardia HTTP 400: niente cache_control su
+    // testo vuoto -> in quel caso il system resta una stringa semplice.
+    let system = build_system_field(system_text, cache_ttl);
+
+    // Breakpoint cache su HISTORY: l'ultimo blocco stabile (ultimo messaggio
+    // `user`) riceve cache_control ephemeral, solo se la history e' abbastanza
+    // lunga da giustificarlo (parita' col Python ~370 `>= 6`).
+    if cache_ttl.is_active() {
+        apply_history_cache_breakpoint(&mut messages, cache_ttl);
+    }
 
     let tools = req.tools.as_ref().map(|tools| {
         tools
@@ -319,6 +452,72 @@ fn build_request_body(
             kind: "enabled".to_string(),
             budget_tokens,
         }),
+    }
+}
+
+/// Costruisce il campo `system` della request. Quando il caching e' attivo e il
+/// system non e' vuoto, lo avvolge in un blocco text con `cache_control` (array
+/// di blocchi, formato accettato da Anthropic). Altrimenti resta una stringa
+/// semplice (o `None` se assente). Guardia: niente `cache_control` su testo
+/// vuoto (Anthropic ritorna HTTP 400).
+fn build_system_field(system_text: Option<String>, cache_ttl: CacheTtl) -> Option<AnthropicSystem> {
+    let text = system_text?;
+    match cache_ttl.system_cache_control() {
+        Some(cc) if !text.is_empty() => Some(AnthropicSystem::Blocks(vec![AnthropicSystemBlock {
+            kind: "text".to_string(),
+            text,
+            cache_control: Some(cc),
+        }])),
+        _ => Some(AnthropicSystem::Text(text)),
+    }
+}
+
+/// Applica il breakpoint cache all'ultimo blocco STABILE della history. Il
+/// breakpoint va su un messaggio `user` che si ripeta identico tra turni
+/// successivi: il terzultimo `user` quando disponibile (parita' col Python
+/// `_apply_cache_breakpoint`, ~398), con fallback all'ultimo `user` se ce ne
+/// sono meno di tre. Mettere il breakpoint sul terzultimo (non sull'ultimo, che
+/// e' il turno corrente mutevole) massimizza il cache hit rate.
+///
+/// Il `cache_control` ephemeral va sull'ULTIMO content block del messaggio. I
+/// messaggi a content stringa vengono promossi a blocco text con cache_control
+/// (saltando quelli vuoti, guardia HTTP 400).
+fn apply_history_cache_breakpoint(messages: &mut [AnthropicMessageParam], cache_ttl: CacheTtl) {
+    if messages.len() < CACHE_HISTORY_MIN_MESSAGES {
+        return;
+    }
+    let Some(cc) = cache_ttl.history_cache_control() else {
+        return;
+    };
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .map(|(i, _)| i)
+        .collect();
+    // Terzultimo user (blocco stabile); fallback all'ultimo se < 3 user.
+    let idx = if user_indices.len() >= 3 {
+        user_indices[user_indices.len() - 3]
+    } else if let Some(&last) = user_indices.last() {
+        last
+    } else {
+        return;
+    };
+    match &mut messages[idx].content {
+        AnthropicContent::Text(s) => {
+            if !s.is_empty() {
+                let text = std::mem::take(s);
+                messages[idx].content = AnthropicContent::Blocks(vec![AnthropicBlock::Text {
+                    text,
+                    cache_control: Some(cc),
+                }]);
+            }
+        }
+        AnthropicContent::Blocks(blocks) => {
+            if let Some(last) = blocks.last_mut() {
+                last.set_cache_control(cc);
+            }
+        }
     }
 }
 
@@ -361,7 +560,10 @@ fn to_anthropic_messages(req: &LlmRequest) -> (Option<String>, Vec<AnthropicMess
                 }
                 if let Some(text) = assistant_text(&msg.content) {
                     if !text.is_empty() {
-                        blocks.push(AnthropicBlock::Text { text });
+                        blocks.push(AnthropicBlock::Text {
+                            text,
+                            cache_control: None,
+                        });
                     }
                 }
                 if let Some(calls) = &msg.tool_calls {
@@ -383,15 +585,93 @@ fn to_anthropic_messages(req: &LlmRequest) -> (Option<String>, Vec<AnthropicMess
                 });
             }
             _ => {
+                // Messaggi user/altro: se il content porta blocchi immagine, li
+                // mappiamo nel formato nativo Anthropic (block `image`), cosi' la
+                // capability vision e' preservata. Altrimenti content stringa.
+                let content = match &msg.content {
+                    MessageContent::Blocks(blocks)
+                        if blocks.iter().any(|b| b.kind == "image_url") =>
+                    {
+                        AnthropicContent::Blocks(blocks_to_anthropic(blocks))
+                    }
+                    other => AnthropicContent::Text(content_to_string(other)),
+                };
                 messages.push(AnthropicMessageParam {
                     role: msg.role.clone(),
-                    content: AnthropicContent::Text(content_to_string(&msg.content)),
+                    content,
                 });
             }
         }
     }
 
     (system, messages)
+}
+
+/// Mappa i blocchi del contratto nei block Anthropic. I blocchi `image_url`
+/// diventano block `image` con `source` nativo:
+///   - data URI `data:<mime>;base64,<dati>` -> `{type:"base64", media_type, data}`;
+///   - URL http/https -> `{type:"url", url}`.
+/// I blocchi testuali diventano block `text`. I `tool_result` qui inattesi nel
+/// content vengono resi come testo per non perderne il payload.
+fn blocks_to_anthropic(blocks: &[crate::types::LlmContentBlock]) -> Vec<AnthropicBlock> {
+    let mut out: Vec<AnthropicBlock> = Vec::new();
+    for b in blocks {
+        match b.kind.as_str() {
+            "image_url" => {
+                if let Some(url) = b
+                    .image_url
+                    .as_ref()
+                    .and_then(|iu| iu.get("url"))
+                    .and_then(|u| u.as_str())
+                {
+                    out.push(AnthropicBlock::Image {
+                        source: image_url_to_source(url),
+                        cache_control: None,
+                    });
+                }
+            }
+            "text" => out.push(AnthropicBlock::Text {
+                text: b.text.clone().unwrap_or_default(),
+                cache_control: None,
+            }),
+            _ => {
+                if let Some(c) = &b.content {
+                    out.push(AnthropicBlock::Text {
+                        text: c.clone(),
+                        cache_control: None,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Converte la `url` di un blocco immagine nel `source` Anthropic. Data URI
+/// base64 -> source `base64`; qualunque altra URL -> source `url` (l'API
+/// Anthropic scarica l'immagine). Data URI malformato -> source `url` grezza.
+fn image_url_to_source(url: &str) -> serde_json::Value {
+    if let Some((media_type, data)) = parse_data_uri(url) {
+        serde_json::json!({
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        })
+    } else {
+        serde_json::json!({ "type": "url", "url": url })
+    }
+}
+
+/// Estrae `(media_type, base64)` da un data URI `data:<mime>;base64,<dati>`.
+/// `None` se non e' un data URI base64 ben formato.
+fn parse_data_uri(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let meta = meta.strip_suffix(";base64")?;
+    if meta.is_empty() {
+        return None;
+    }
+    Some((meta.to_string(), data.to_string()))
 }
 
 /// Estrae il testo "puro" di un messaggio assistant per il block `text`
@@ -686,7 +966,7 @@ struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<AnthropicSystem>,
     messages: Vec<AnthropicMessageParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicTool>>,
@@ -704,6 +984,27 @@ struct AnthropicThinking {
     #[serde(rename = "type")]
     kind: String,
     budget_tokens: u32,
+}
+
+/// Campo `system` della request: stringa semplice o array di blocchi text con
+/// `cache_control` (prompt caching). L'enum untagged serializza al valore JSON
+/// atteso (stringa o array).
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum AnthropicSystem {
+    Text(String),
+    Blocks(Vec<AnthropicSystemBlock>),
+}
+
+/// Blocco text del campo `system` con eventuale `cache_control` (breakpoint
+/// prompt cache sul system prompt).
+#[derive(Debug, Serialize)]
+struct AnthropicSystemBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -724,7 +1025,21 @@ enum AnthropicContent {
 #[serde(tag = "type")]
 enum AnthropicBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        /// Breakpoint prompt cache su questo blocco (ephemeral). Omesso quando
+        /// assente.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
+    },
+    /// Blocco immagine nel formato nativo Anthropic. `source` e' base64
+    /// (`{type:"base64", media_type, data}`) o url (`{type:"url", url}`).
+    #[serde(rename = "image")]
+    Image {
+        source: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
+    },
     /// Blocco thinking ri-passato in un turno assistant precedente. Anthropic
     /// richiede `thinking` (puo' essere vuoto) + `signature` opaca; senza la
     /// signature l'API ritorna HTTP 400 nei turni con tool.
@@ -744,6 +1059,19 @@ enum AnthropicBlock {
         tool_use_id: String,
         content: String,
     },
+}
+
+impl AnthropicBlock {
+    /// Imposta il `cache_control` sui block che lo supportano (text/image). Sui
+    /// block thinking/tool_use/tool_result e' un no-op (Anthropic non vi accetta
+    /// breakpoint cache).
+    fn set_cache_control(&mut self, cc: serde_json::Value) {
+        match self {
+            AnthropicBlock::Text { cache_control, .. }
+            | AnthropicBlock::Image { cache_control, .. } => *cache_control = Some(cc),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -889,7 +1217,7 @@ mod tests {
             thinking: None,
             metadata: metadata(),
         };
-        let body = build_request_body(&req, false, None);
+        let body = build_request_body(&req, false, None, CacheTtl::Off);
         let json = serde_json::to_value(&body).unwrap();
 
         // system NON e' tra i messages, ma campo a se'.
@@ -918,7 +1246,7 @@ mod tests {
             thinking: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
         let m = &json["messages"][0];
         assert_eq!(m["role"], "user");
@@ -949,7 +1277,7 @@ mod tests {
             thinking: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
         let m = &json["messages"][0];
         assert_eq!(m["role"], "assistant");
@@ -981,7 +1309,7 @@ mod tests {
             thinking: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
         let t = &json["tools"][0];
         assert_eq!(t["name"], "search");
@@ -1139,7 +1467,7 @@ mod tests {
         let req = req_thinking(true, Some(1024), Some(8000));
         let budget = resolve_thinking_budget(&req, 2048);
         assert_eq!(budget, Some(1024));
-        let json = serde_json::to_value(build_request_body(&req, false, budget)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, budget, CacheTtl::Off)).unwrap();
         assert_eq!(json["thinking"]["type"], "enabled");
         assert_eq!(json["thinking"]["budget_tokens"], 1024);
     }
@@ -1149,7 +1477,7 @@ mod tests {
         let req = req_thinking(false, Some(1024), Some(8000));
         let budget = resolve_thinking_budget(&req, 2048);
         assert_eq!(budget, None);
-        let json = serde_json::to_value(build_request_body(&req, false, budget)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, budget, CacheTtl::Off)).unwrap();
         assert!(json.get("thinking").is_none());
     }
 
@@ -1246,7 +1574,7 @@ mod tests {
             thinking: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
         let m = &json["messages"][0];
         assert_eq!(m["role"], "assistant");
@@ -1282,10 +1610,218 @@ mod tests {
             thinking: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, false, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
         let m = &json["messages"][0];
         // Primo block e' il testo (non un thinking).
         assert_eq!(m["content"][0]["type"], "text");
         assert_eq!(m["content"][1]["type"], "tool_use");
+    }
+
+    // --- Vision: block immagine nativo (passo 3) ---------------------------
+
+    fn user_image(url: &str) -> LlmMessage {
+        LlmMessage {
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![
+                crate::types::LlmContentBlock {
+                    kind: "text".to_string(),
+                    text: Some("descrivi".to_string()),
+                    image_url: None,
+                    tool_use_id: None,
+                    content: None,
+                },
+                crate::types::LlmContentBlock {
+                    kind: "image_url".to_string(),
+                    text: None,
+                    image_url: Some(serde_json::json!({ "url": url })),
+                    tool_use_id: None,
+                    content: None,
+                },
+            ]),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+        }
+    }
+
+    fn req_msgs(messages: Vec<LlmMessage>) -> LlmRequest {
+        LlmRequest {
+            model: "claude-x".to_string(),
+            messages,
+            temperature: None,
+            max_tokens: Some(1024),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            metadata: metadata(),
+        }
+    }
+
+    #[test]
+    fn vision_data_uri_diventa_source_base64() {
+        let req = req_msgs(vec![user_image("data:image/png;base64,QUJD")]);
+        let json =
+            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let blocks = json["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "descrivi");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "QUJD");
+    }
+
+    #[test]
+    fn vision_url_http_diventa_source_url() {
+        let req = req_msgs(vec![user_image("https://example.com/x.webp")]);
+        let json =
+            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        let blocks = json["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "url");
+        assert_eq!(blocks[1]["source"]["url"], "https://example.com/x.webp");
+    }
+
+    #[test]
+    fn parse_data_uri_anthropic() {
+        assert_eq!(
+            parse_data_uri("data:image/jpeg;base64,ZZZ"),
+            Some(("image/jpeg".to_string(), "ZZZ".to_string()))
+        );
+        assert!(parse_data_uri("https://x/y").is_none());
+    }
+
+    // --- Prompt cache: cache_control sui breakpoint (passo 3) --------------
+
+    #[test]
+    fn cache_off_nessun_cache_control_sul_system() {
+        let req = req_msgs(vec![msg("system", "istruzioni di sistema"), msg("user", "ciao")]);
+        let json =
+            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        // Caching spento: system resta una stringa semplice, niente cache_control.
+        assert_eq!(json["system"], "istruzioni di sistema");
+    }
+
+    #[test]
+    fn cache_5m_system_blocco_con_cache_control() {
+        let req = req_msgs(vec![msg("system", "istruzioni di sistema"), msg("user", "ciao")]);
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            None,
+            CacheTtl::FiveMinutes,
+        ))
+        .unwrap();
+        // System promosso a array di blocchi text con cache_control ephemeral.
+        let sys = json["system"].as_array().expect("system come array di blocchi");
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["text"], "istruzioni di sistema");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        // TTL 5m: nessun campo ttl.
+        assert!(sys[0]["cache_control"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn cache_1h_system_aggiunge_ttl() {
+        let req = req_msgs(vec![msg("system", "istruzioni"), msg("user", "ciao")]);
+        let json =
+            serde_json::to_value(build_request_body(&req, false, None, CacheTtl::OneHour)).unwrap();
+        let sys = json["system"].as_array().unwrap();
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys[0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn cache_system_vuoto_non_aggiunge_cache_control() {
+        // Guardia HTTP 400: cache_control su testo vuoto e' vietato.
+        let req = req_msgs(vec![msg("system", ""), msg("user", "ciao")]);
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            None,
+            CacheTtl::FiveMinutes,
+        ))
+        .unwrap();
+        // System vuoto: resta stringa, nessun blocco con cache_control.
+        assert_eq!(json["system"], "");
+    }
+
+    #[test]
+    fn cache_breakpoint_history_su_terzultimo_user() {
+        // History >= 6 messaggi, 4 user: il breakpoint va sul TERZULTIMO user
+        // (m2), il blocco stabile che si ripete fra turni, non sull'ultimo
+        // (turno corrente mutevole).
+        let req = req_msgs(vec![
+            msg("user", "m1"),
+            msg("assistant", "r1"),
+            msg("user", "m2"),
+            msg("assistant", "r2"),
+            msg("user", "m3"),
+            msg("assistant", "r3"),
+            msg("user", "turno corrente"),
+        ]);
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            None,
+            CacheTtl::FiveMinutes,
+        ))
+        .unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        // Il terzultimo user ("m2") ha il cache_control.
+        let m2 = &messages[2];
+        assert_eq!(m2["role"], "user");
+        let blocks = m2["content"].as_array().expect("m2 a blocchi");
+        assert_eq!(blocks[0]["text"], "m2");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        // L'ultimo user (turno corrente) resta una stringa semplice.
+        let last_user = messages.last().unwrap();
+        assert_eq!(last_user["content"], "turno corrente");
+    }
+
+    #[test]
+    fn cache_history_breakpoint_assente_se_pochi_messaggi() {
+        // Sotto la soglia minima: nessun breakpoint sulla history.
+        let req = req_msgs(vec![msg("user", "ciao"), msg("assistant", "ehi")]);
+        let json = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            None,
+            CacheTtl::FiveMinutes,
+        ))
+        .unwrap();
+        // Pochi messaggi: l'user resta una stringa semplice.
+        assert_eq!(json["messages"][0]["content"], "ciao");
+    }
+
+    #[test]
+    fn beta_header_cumula_thinking_e_cache_estesa() {
+        // Solo cache 1h.
+        assert_eq!(
+            beta_header(false, CacheTtl::OneHour).as_deref(),
+            Some(EXTENDED_CACHE_BETA)
+        );
+        // Solo thinking.
+        assert_eq!(
+            beta_header(true, CacheTtl::FiveMinutes).as_deref(),
+            Some(THINKING_BETA)
+        );
+        // Entrambi: cumulati con virgola.
+        let both = beta_header(true, CacheTtl::OneHour).unwrap();
+        assert!(both.contains(THINKING_BETA));
+        assert!(both.contains(EXTENDED_CACHE_BETA));
+        // Niente beta: cache 5m senza thinking.
+        assert!(beta_header(false, CacheTtl::FiveMinutes).is_none());
+        assert!(beta_header(false, CacheTtl::Off).is_none());
+    }
+
+    #[test]
+    fn cache_ttl_parse() {
+        assert_eq!(CacheTtl::parse("5m"), CacheTtl::FiveMinutes);
+        assert_eq!(CacheTtl::parse("1h"), CacheTtl::OneHour);
+        assert_eq!(CacheTtl::parse("off"), CacheTtl::Off);
+        assert_eq!(CacheTtl::parse("boh"), CacheTtl::Off);
     }
 }
