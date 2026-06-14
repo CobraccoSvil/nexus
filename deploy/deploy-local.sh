@@ -1,13 +1,15 @@
 #!/bin/bash
 # Deploy IDEAI in locale su WSL.
-# Uso: ./deploy/deploy-local.sh [--rust] [--web] [--service <nome>] [--menu] [--debug] [--sync]
+# Uso: ./deploy/deploy-local.sh [--rust] [--web] [--service <nome>] [--menu] [--release] [--sync]
 #
 #   --rust              build + restart solo backend Rust
 #   --web               build + restart solo web-ide (Next.js)
 #   --service <nome>    restart solo il servizio indicato (es. mcp-core, brain, nexus-gateway, web-ide)
 #   --menu              mostra menu interattivo per scegliere il servizio
 #                       (equivalente a --service senza nome)
-#   --debug             compila Rust in debug (stacktrace completi, compilazione rapida)
+#   --debug             (DEFAULT su WSL) compila Rust in debug: stacktrace completi,
+#                       compilazione rapida. WSL e' ambiente dev/test (vedi CLAUDE.md).
+#   --release           opt-in build ottimizzata (lenta): solo se serve un profilo prod
 #   --clean             forza la purge di .next/.turbo prima del build web (di
 #                       default la cache viene riusata; serve solo dopo merge/stash)
 #   --list-services     elenca i servizi disponibili e esce
@@ -60,7 +62,10 @@ SHOW_MENU=false
 LIST_SERVICES=false
 DO_SYNC=false
 SYNC_ONLY=false
-DEBUG_BUILD=false
+# WSL e' ambiente di sviluppo/test (vedi CLAUDE.md "Esecuzione locale canonica"):
+# build in DEBUG di default (compilazione rapida, stacktrace completi). La release
+# qui sarebbe solo build lente senza beneficio. `--release` e' opt-in esplicito.
+DEBUG_BUILD=true
 
 # ─── Catalogo servizi gestibili via --service ────────────────────────────────
 # Formato: nome|kind|descrizione
@@ -136,6 +141,7 @@ while [ $# -gt 0 ]; do
         --menu)            SHOW_MENU=true ;;
         --list-services)   LIST_SERVICES=true ;;
         --debug)           DEBUG_BUILD=true ;;
+        --release)         DEBUG_BUILD=false ;;
         --clean)           CLEAN_BUILD=true ;;
         --sync)            DO_SYNC=true ;;
         --sync-only)       SYNC_ONLY=true; DO_SYNC=true ;;
