@@ -108,6 +108,42 @@ impl NexusGatewayClient {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
+
+    /// Autodiscovery dei modelli live di un provider via gateway
+    /// (`GET /v1/models/{provider}`). Il gateway e' la via UNICA per la
+    /// discovery: incapsula l'auth di ogni provider (incluso Vertex con
+    /// Service Account), cosi' il worker catalog non deve replicare le
+    /// chiamate dirette ne' delegare al brain per Google (regola L).
+    /// Ritorna la lista dei model id esposti dal provider.
+    pub async fn list_models(&self, provider: &str) -> Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/models/{provider}", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.service_token))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Nexus Gateway {status}: {body}");
+        }
+
+        resp.json::<GwModelsResponse>()
+            .await
+            .map(|r| r.models)
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway models parse: {e}"))
+    }
+}
+
+/// Risposta di `GET /v1/models/{provider}` del gateway.
+#[derive(Deserialize, Debug)]
+struct GwModelsResponse {
+    #[allow(dead_code)]
+    provider: String,
+    models: Vec<String>,
 }
 
 /// Mappa intent + behavior_mode all'alias definito in config/model-aliases.yaml.
@@ -124,4 +160,38 @@ pub fn intent_to_alias(intent: &str, behavior_mode: &str, forced_model: Option<&
         _ => "coder-small",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_models_response_per_provider() {
+        // Forma di GET /v1/models/{provider}: {"provider":"...","models":[...]}.
+        let raw = r#"{"provider":"openai","models":["gpt-4o","gpt-4o-mini","o3"]}"#;
+        let parsed: GwModelsResponse = serde_json::from_str(raw).expect("parse models response");
+        assert_eq!(parsed.provider, "openai");
+        assert_eq!(parsed.models, vec!["gpt-4o", "gpt-4o-mini", "o3"]);
+    }
+
+    #[test]
+    fn parse_models_response_lista_vuota() {
+        // Provider configurato ma senza modelli: lista vuota valida (il worker
+        // tratta poi la lista vuota come skip-per-safety).
+        let raw = r#"{"provider":"deepseek","models":[]}"#;
+        let parsed: GwModelsResponse = serde_json::from_str(raw).expect("parse empty models");
+        assert_eq!(parsed.provider, "deepseek");
+        assert!(parsed.models.is_empty());
+    }
+
+    #[test]
+    fn parse_models_response_google_via_gateway() {
+        // Google passa per il gateway come tutti gli altri (auth Vertex inclusa
+        // nel gateway): nessuna forma speciale lato mcp-core.
+        let raw = r#"{"provider":"google","models":["gemini-2.5-pro","gemini-2.5-flash"]}"#;
+        let parsed: GwModelsResponse = serde_json::from_str(raw).expect("parse google models");
+        assert_eq!(parsed.models.len(), 2);
+        assert!(parsed.models.contains(&"gemini-2.5-pro".to_string()));
+    }
 }

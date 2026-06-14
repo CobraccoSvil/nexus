@@ -8,26 +8,25 @@
 //!
 //! Flusso ogni N ore (settings `catalog_sync.interval_hours`, default 6):
 //!   1. Lista provider da `catalog_sync.providers` (CSV)
-//!   2. Per ogni provider con `{provider}_api_key` nelle settings:
-//!      - GET https://api.{provider}.com/v1/models (formato OpenAI-compatible
-//!        per openai/mistral/deepseek; Anthropic ha header speciale)
-//!      - Confronta con catalog: INSERT nuovi (is_enabled=false, prezzi 0
-//!        da raffinare manualmente), DISABLE modelli non piu' esposti
+//!   2. Per ogni provider: GET {gateway}/v1/models/{provider} (via UNICA per
+//!      la discovery — il gateway incapsula l'auth di ogni provider, Vertex
+//!      Service Account incluso). Poi confronta con catalog: INSERT nuovi
+//!      (is_enabled=false, prezzi 0 da raffinare manualmente), DISABLE modelli
+//!      non piu' esposti.
 //!   3. Audit ogni delta in `ai_price_catalog_audit`
 //!   4. Emit notification dispatcher 'CatalogModelChanged' per admin
 //!
-//! Provider Google: sync via brain REST (`/providers/google/models/live`) che
-//! gira il SDK Python google-genai con Service Account dal DB (Vertex) o API
-//! key (Gemini direct). Il worker Rust non puo' parlare Vertex direct perche'
-//! l'auth Google richiede google-auth con private_key RSA — meglio centralizzare
-//! il client nel brain dove e' gia' implementato (vedi google_provider.py).
+//! Sorgente UNICA dei modelli live: il Nexus Gateway (regola L). Il worker NON
+//! chiama piu' direttamente gli endpoint `api.{provider}.com/v1/models` ne'
+//! delega al brain per Google: tutta l'auth (API key cloud, Vertex Service
+//! Account) e' gia' nel gateway, che espone `GET /v1/models/{provider}` per
+//! tutti i provider. Vedi `NexusGatewayClient::list_models`.
 //!
 //! Provider locali (ollama/vllm): skipped, catalog manuale per setup custom.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
@@ -35,7 +34,6 @@ use crate::model_health_probe::{probe_model_on_insert, ProbeOnInsertResult};
 use crate::orchestrator::Orchestrator;
 use crate::settings::get_setting;
 
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_INTERVAL_HOURS: u64 = 6;
 
 /// Filtro chat-compatibilita': i provider espongono nelle loro `/v1/models` API
@@ -663,21 +661,12 @@ async fn sync_provider(
     insert_new_disabled: bool,
     orchestrator: Option<&Orchestrator>,
 ) -> anyhow::Result<(u32, u32, u32)> {
-    // Caso Google: il sync passa per il brain (Vertex SDK con Service Account
-    // dal DB). Non serve api_key qui — il brain risolve autonomamente backend
-    // gemini/vertex e auth via google_provider_backend setting.
-    let api_key = if provider == "google" {
-        String::new()
-    } else {
-        get_setting(db, &format!("{}_api_key", provider))
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("api_key non configurata"))?
-    };
-
-    // Fetch modelli dall'API provider.
-    let api_models = fetch_provider_models(provider, &api_key).await?;
+    // Fetch modelli live dal gateway (via UNICA per la discovery: il gateway
+    // incapsula l'auth di ogni provider, Vertex Service Account incluso, quindi
+    // non servono api_key qui ne' la delega al brain per Google — regola L).
+    let api_models = fetch_provider_models(orchestrator, provider).await?;
     if api_models.is_empty() {
-        anyhow::bail!("API ha ritornato lista vuota (sospetto, skip per safety)");
+        anyhow::bail!("gateway ha ritornato lista vuota (sospetto, skip per safety)");
     }
 
     // Carica modelli del catalog locale per questo provider.
@@ -1250,80 +1239,27 @@ async fn audit_log(db: &PgPool, provider: &str, model: &str, action: &str, detai
     .await;
 }
 
-/// Chiama l'endpoint /v1/models del provider e ritorna la lista di model id.
+/// Discovery dei modelli live di un provider tramite il Nexus Gateway
+/// (`GET /v1/models/{provider}`), via UNICA per l'autodiscovery (regola L).
 ///
-/// Per Google passa per il brain REST (`/providers/google/models/live`) che
-/// usa il SDK Python google-genai con Service Account dal DB (Vertex) o API
-/// key (Gemini direct). Per gli altri provider chiama direttamente l'endpoint
-/// OpenAI-compatible del provider con la api_key dal DB.
-async fn fetch_provider_models(provider: &str, api_key: &str) -> anyhow::Result<Vec<String>> {
-    let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
-
-    // Caso speciale: Google → bridge via brain REST (vedi google_provider.py).
-    if provider == "google" {
-        let brain_url =
-            std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        let url = format!(
-            "{}/providers/google/models/live",
-            brain_url.trim_end_matches('/')
-        );
-        let resp = client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("brain {url} status={status}: {body_text}");
-        }
-        #[derive(Debug, Deserialize)]
-        struct BrainModelsResponse {
-            models: Vec<String>,
-        }
-        let body: BrainModelsResponse = resp.json().await?;
-        return Ok(body.models);
-    }
-
-    let (url, builder) = match provider {
-        "anthropic" => {
-            let url = "https://api.anthropic.com/v1/models";
-            (
-                url,
-                client
-                    .get(url)
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01"),
-            )
-        }
-        "openai" => {
-            let url = "https://api.openai.com/v1/models";
-            (url, client.get(url).bearer_auth(api_key))
-        }
-        "mistral" => {
-            let url = "https://api.mistral.ai/v1/models";
-            (url, client.get(url).bearer_auth(api_key))
-        }
-        "deepseek" => {
-            let url = "https://api.deepseek.com/v1/models";
-            (url, client.get(url).bearer_auth(api_key))
-        }
-        _ => anyhow::bail!("provider non supportato per autodiscovery: {}", provider),
-    };
-
-    let resp = builder.send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("API {} ha risposto status {}", url, resp.status());
-    }
-    let body: ModelsListResponse = resp.json().await?;
-    let models: Vec<String> = body.data.into_iter().map(|m| m.id).collect();
-    Ok(models)
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelsListResponse {
-    data: Vec<ModelEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelEntry {
-    id: String,
+/// Il gateway incapsula l'auth di OGNI provider — incluso Vertex con Service
+/// Account — quindi qui non servono api_key ne' la vecchia delega al brain per
+/// Google (`/providers/google/models/live`): un solo punto di accesso HTTP
+/// (`NexusGatewayClient::list_models`) sostituisce le chiamate dirette agli
+/// endpoint `api.{provider}.com/v1/models`.
+///
+/// La logica a valle (filtro chat-compat, infer capabilities/tier, classify,
+/// upsert) resta invariata: cambia solo la SORGENTE della lista nomi modello.
+async fn fetch_provider_models(
+    orchestrator: Option<&Orchestrator>,
+    provider: &str,
+) -> anyhow::Result<Vec<String>> {
+    let gateway = orchestrator
+        .and_then(|orch| orch.nexus_gateway.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Nexus Gateway non disponibile: autodiscovery modelli impossibile")
+        })?;
+    gateway.list_models(provider).await
 }
 
 #[cfg(test)]
