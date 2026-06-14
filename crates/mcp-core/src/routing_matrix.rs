@@ -138,6 +138,11 @@ impl RoutingMatrix {
     /// Mantenere allineata col seed in `db/migrations/0101_routing_model_registry.sql`
     /// quando si cambia la matrice di produzione.
     #[cfg(test)]
+    /// Matrice cablata usata SOLO dai test come mock (niente DB). NON e' un
+    /// fallback di produzione: a runtime `init()` panica se il DB non risponde
+    /// (regola G, "una via sola"). `#[cfg(test)]` la esclude dal binario di
+    /// produzione cosi' non esiste alcuna alternativa hardcoded chiamabile.
+    #[cfg(test)]
     pub fn fallback_safe() -> Self {
         let mut by_intent_mode = HashMap::new();
         let entries: &[(&str, &str, &str, &str)] = &[
