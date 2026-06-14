@@ -13,16 +13,21 @@
 //! URL). Regola F: mai loggare prompt/response in chiaro.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use nexus_cache::TtlCache;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::gcp_auth::{
+    vertex_endpoint, VertexAuth, SETTING_BACKEND, SETTING_VERTEX_CREDENTIALS_JSON,
+    SETTING_VERTEX_LOCATION, SETTING_VERTEX_PROJECT,
+};
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::types::{
     LlmRequest, LlmResponse, LlmStreamChunk, LlmUsage, MessageContent, SensitivityTier,
@@ -56,12 +61,38 @@ const THINKING_BUDGET_FLOOR: u32 = 128;
 /// TTL della cache settings (60s, come gli altri provider).
 const SETTINGS_TTL: Duration = Duration::from_secs(60);
 
+/// Location Vertex usata se `google_vertex_location` e' assente in DB. Parita'
+/// col brain (`google_provider.py` ~97: default "europe-west4"). NON e' un
+/// "magic default" di routing (regola G): e' solo la region geografica di
+/// fallback quando l'admin non ne specifica una; project e credenziali restano
+/// obbligatori dal DB.
+const VERTEX_DEFAULT_LOCATION: &str = "europe-west4";
+
+/// Backend Google risolto dai settings (regola G). `Gemini` usa l'API key in
+/// query param (`?key=...`); `Vertex` usa OAuth2 Service Account + endpoint
+/// regionale aiplatform.
+#[derive(Clone)]
+enum GoogleBackend {
+    /// API key direct (generativelanguage.googleapis.com).
+    Gemini,
+    /// Vertex AI: project/location + auth Service Account condivisa.
+    Vertex {
+        project: String,
+        location: String,
+        auth: Arc<VertexAuth>,
+    },
+}
+
 pub struct GoogleProvider {
     http: Client,
     base_url: String,
     api_key: String,
     db: Option<PgPool>,
     thinking_budget: TtlCache<(), u32>,
+    /// Backend risolto dai settings (cache TTL 60s). La cache memorizza un
+    /// `Arc<GoogleBackend>` cosi' il `VertexAuth` (e la sua cache token) e'
+    /// condiviso tra le richieste invece di ricreare l'auth ad ogni chiamata.
+    backend: TtlCache<(), Arc<GoogleBackend>>,
 }
 
 impl GoogleProvider {
@@ -89,6 +120,7 @@ impl GoogleProvider {
             api_key: api_key.into(),
             db,
             thinking_budget: TtlCache::new(SETTINGS_TTL),
+            backend: TtlCache::new(SETTINGS_TTL),
         }
     }
 
@@ -109,6 +141,104 @@ impl GoogleProvider {
         let budget = parsed.unwrap_or(THINKING_BUDGET_DB_DOWN_FALLBACK);
         self.thinking_budget.insert((), budget);
         budget
+    }
+
+    /// Risolve il backend Google dai settings (regola G), con cache TTL 60s.
+    ///
+    /// `google_provider_backend`: "vertex" => Service Account OAuth2; qualunque
+    /// altro valore (incluso assente) => "gemini" (API key direct), come il brain
+    /// che fa fallback a "gemini" su valori invalidi.
+    ///
+    /// Per "vertex" legge project/location/credentials dal DB e costruisce un
+    /// [`VertexAuth`] condiviso (cache token interna). Se project o credenziali
+    /// mancano/sono invalidi, propaga errore (regola G: niente fallback nascosto
+    /// ad ADC/env; il chiamante vedra' l'errore e il cooldown lo gestira').
+    async fn resolved_backend(&self) -> anyhow::Result<Arc<GoogleBackend>> {
+        if let Some(b) = self.backend.get(&()) {
+            return Ok(b);
+        }
+        let Some(db) = self.db.as_ref() else {
+            // Senza DB (test di mappatura) il backend e' sempre Gemini con la
+            // api_key iniettata.
+            let b = Arc::new(GoogleBackend::Gemini);
+            self.backend.insert((), b.clone());
+            return Ok(b);
+        };
+
+        let raw = nexus_auth::get_setting(db, SETTING_BACKEND)
+            .await
+            .unwrap_or_default();
+        let backend = if raw.trim().eq_ignore_ascii_case("vertex") {
+            let project = nexus_auth::get_setting(db, SETTING_VERTEX_PROJECT)
+                .await
+                .unwrap_or_default();
+            if project.trim().is_empty() {
+                anyhow::bail!(
+                    "backend Vertex selezionato ma '{}' vuoto in DB",
+                    SETTING_VERTEX_PROJECT
+                );
+            }
+            let location = nexus_auth::get_setting(db, SETTING_VERTEX_LOCATION)
+                .await
+                .unwrap_or_default();
+            let location = if location.trim().is_empty() {
+                VERTEX_DEFAULT_LOCATION.to_string()
+            } else {
+                location.trim().to_string()
+            };
+            let credentials = nexus_auth::get_setting(db, SETTING_VERTEX_CREDENTIALS_JSON)
+                .await
+                .unwrap_or_default();
+            if credentials.trim().is_empty() {
+                anyhow::bail!(
+                    "backend Vertex selezionato ma '{}' vuoto in DB",
+                    SETTING_VERTEX_CREDENTIALS_JSON
+                );
+            }
+            let auth = VertexAuth::from_credentials_json(self.http.clone(), &credentials)?;
+            tracing::info!(
+                project = %project,
+                location = %location,
+                "google provider: backend vertex"
+            );
+            GoogleBackend::Vertex {
+                project: project.trim().to_string(),
+                location,
+                auth: Arc::new(auth),
+            }
+        } else {
+            GoogleBackend::Gemini
+        };
+        let backend = Arc::new(backend);
+        self.backend.insert((), backend.clone());
+        Ok(backend)
+    }
+
+    /// Costruisce la `RequestBuilder` POST verso l'endpoint corretto in base al
+    /// backend, con l'auth appropriata (query param `?key=` per Gemini, header
+    /// `Authorization: Bearer` per Vertex). Punto unico per `complete`/`stream`
+    /// (regola L): l'unico bivio gemini/vertex e' qui.
+    async fn build_post(
+        &self,
+        backend: &GoogleBackend,
+        model: &str,
+        stream: bool,
+    ) -> anyhow::Result<RequestBuilder> {
+        match backend {
+            GoogleBackend::Gemini => Ok(self
+                .http
+                .post(self.endpoint(model, stream))
+                .query(&[("key", &self.api_key)])),
+            GoogleBackend::Vertex {
+                project,
+                location,
+                auth,
+            } => {
+                let token = auth.access_token().await?;
+                let url = vertex_endpoint(project, location, model, stream);
+                Ok(self.http.post(url).bearer_auth(token))
+            }
+        }
     }
 
     /// URL dell'azione per il modello richiesto. `stream=true` usa
@@ -150,15 +280,15 @@ impl LlmProvider for GoogleProvider {
     }
 
     async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
+        let backend = self.resolved_backend().await?;
         let configured = self.configured_thinking_budget().await;
         let thinking = resolve_thinking(req, configured);
         let body = build_request_body(req, thinking);
         let start = Instant::now();
 
         let resp = self
-            .http
-            .post(self.endpoint(&req.model, false))
-            .query(&[("key", &self.api_key)])
+            .build_post(&backend, &req.model, false)
+            .await?
             .json(&body)
             .send()
             .await?;
@@ -177,14 +307,14 @@ impl LlmProvider for GoogleProvider {
     }
 
     async fn stream(&self, req: &LlmRequest) -> anyhow::Result<ChunkStream> {
+        let backend = self.resolved_backend().await?;
         let configured = self.configured_thinking_budget().await;
         let thinking = resolve_thinking(req, configured);
         let body = build_request_body(req, thinking);
 
         let resp = self
-            .http
-            .post(self.endpoint(&req.model, true))
-            .query(&[("key", &self.api_key)])
+            .build_post(&backend, &req.model, true)
+            .await?
             .json(&body)
             .send()
             .await?;
@@ -233,14 +363,34 @@ impl LlmProvider for GoogleProvider {
 
     async fn healthcheck(&self) -> bool {
         // GET /models: 2xx => raggiungibile. Usato anche dal re-probe del cooldown.
-        let url = format!("{}/models", self.base_url);
-        match self
-            .http
-            .get(url)
-            .query(&[("key", &self.api_key)])
-            .send()
-            .await
-        {
+        // Per Vertex serve l'auth Bearer e l'endpoint regionale; per Gemini la
+        // API key in query param. Se il backend non si risolve (config Vertex
+        // mancante/invalida) il provider e' di fatto non operativo => unhealthy.
+        let backend = match self.resolved_backend().await {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let req = match backend.as_ref() {
+            GoogleBackend::Gemini => self
+                .http
+                .get(format!("{}/models", self.base_url))
+                .query(&[("key", &self.api_key)]),
+            GoogleBackend::Vertex {
+                project,
+                location,
+                auth,
+            } => {
+                let token = match auth.access_token().await {
+                    Ok(t) => t,
+                    Err(_) => return false,
+                };
+                let url = format!(
+                    "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models"
+                );
+                self.http.get(url).bearer_auth(token)
+            }
+        };
+        match req.send().await {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
@@ -867,6 +1017,15 @@ mod tests {
         assert!(url.ends_with("/models/gemini-x:streamGenerateContent?alt=sse"));
         let url2 = p.endpoint("gemini-x", false);
         assert!(url2.ends_with("/models/gemini-x:generateContent"));
+    }
+
+    #[tokio::test]
+    async fn backend_senza_db_e_sempre_gemini() {
+        // Senza DB (costruttore `new`) il backend non e' configurabile e ricade
+        // su Gemini con la api_key iniettata: la build_post deve usare ?key=.
+        let p = GoogleProvider::new(Client::new(), "k", None);
+        let backend = p.resolved_backend().await.expect("backend gemini");
+        assert!(matches!(*backend, GoogleBackend::Gemini));
     }
 
     #[test]

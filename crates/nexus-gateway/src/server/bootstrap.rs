@@ -88,6 +88,10 @@ struct ProviderKeys {
     mistral: Option<String>,
     deepseek: Option<String>,
     google: Option<String>,
+    /// True se il backend Google e' "vertex" con project+credenziali presenti in
+    /// DB: in tal caso il provider Google va istanziato anche SENZA api_key
+    /// Gemini (l'auth e' via Service Account, non query param).
+    google_vertex_configured: bool,
     vllm_base_url: Option<String>,
 }
 
@@ -110,12 +114,33 @@ impl ProviderKeys {
             nexus_auth::get_setting(db, key_setting).await
         }
 
+        // Backend Vertex configurato? (regola G): backend=="vertex" e
+        // project+credenziali presenti. Permette di abilitare Google senza
+        // api_key Gemini quando si usa il Service Account.
+        let google_vertex_configured = {
+            let backend = nexus_auth::get_setting(db, "google_provider_backend")
+                .await
+                .unwrap_or_default();
+            if backend.trim().eq_ignore_ascii_case("vertex") {
+                let project = nexus_auth::get_setting(db, "google_vertex_project")
+                    .await
+                    .unwrap_or_default();
+                let creds = nexus_auth::get_setting(db, "google_vertex_credentials_json")
+                    .await
+                    .unwrap_or_default();
+                !project.trim().is_empty() && !creds.trim().is_empty()
+            } else {
+                false
+            }
+        };
+
         Self {
             openai: keyed(db, "openai_api_key", "openai_enabled").await,
             anthropic: keyed(db, "anthropic_api_key", "anthropic_enabled").await,
             mistral: keyed(db, "mistral_api_key", "mistral_enabled").await,
             deepseek: keyed(db, "deepseek_api_key", "deepseek_enabled").await,
             google: keyed(db, "google_api_key", "google_enabled").await,
+            google_vertex_configured,
             // vLLM (onprem): la chiave non e' obbligatoria; serve la base_url.
             vllm_base_url: nexus_auth::get_setting(db, "vllm_base_url").await,
         }
@@ -152,11 +177,16 @@ fn build_providers(db: &PgPool, http: &Client, keys: &ProviderKeys) -> Vec<Arc<d
     if let Some(k) = &keys.deepseek {
         providers.push(Arc::new(DeepSeekProvider::new(http.clone(), k.clone(), None)));
     }
-    if let Some(k) = &keys.google {
-        // DB passato per leggere il budget thinking dai settings (regola G).
+    // Google: istanziato se c'e' la api_key Gemini OPPURE se il backend Vertex e'
+    // configurato (Service Account, nessuna api_key richiesta). Il backend
+    // effettivo (gemini/vertex) e' risolto a runtime dal provider via settings.
+    if keys.google.is_some() || keys.google_vertex_configured {
+        // DB passato per: budget thinking, backend gemini/vertex, credenziali
+        // Service Account (regola G). api_key vuota se si usa solo Vertex.
+        let api_key = keys.google.clone().unwrap_or_default();
         providers.push(Arc::new(GoogleProvider::with_db(
             http.clone(),
-            k.clone(),
+            api_key,
             None,
             Some(db.clone()),
         )));

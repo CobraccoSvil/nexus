@@ -44,3 +44,7 @@ serde_yaml = "0.9"
 thiserror = "1.0"
 nexus-cache = { path = "../nexus-cache" }
 nexus-auth = { path = "../nexus-auth" }
+
+[dev-dependencies]
+# Decodifica i segmenti del JWT (header/payload) nei test di gcp_auth, senza rete.
+base64.workspace = true

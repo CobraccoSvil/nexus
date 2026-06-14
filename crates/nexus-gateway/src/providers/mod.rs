@@ -9,6 +9,7 @@ pub mod openai_compat;
 
 pub mod anthropic;
 pub mod deepseek;
+pub mod gcp_auth;
 pub mod google;
 pub mod mistral;
 pub mod openai;
