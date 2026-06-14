@@ -9,8 +9,13 @@ import type { ChatMessage } from "../api-client";
  */
 export function upsertSyntheticAssistantMessage(
   current: ChatMessage[],
-  message: ChatMessage,
+  message: ChatMessage | null,
 ): ChatMessage[] {
+  // message null: il run terminale non ha prodotto un messaggio da mostrare
+  // (es. run cancellato senza risposta reale, vedi createTerminalMessage). No-op.
+  if (!message) {
+    return current;
+  }
   const index = current.findIndex((item) => item.id === message.id);
   if (index >= 0) {
     const next = [...current];

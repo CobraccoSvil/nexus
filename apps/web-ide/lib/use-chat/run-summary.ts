@@ -131,7 +131,7 @@ export function createTerminalMessage(
   run: AgentRunInfo,
   pid: string,
   lastStreamingText?: string,
-): ChatMessage {
+): ChatMessage | null {
   const statusSummary = buildTerminalRunSummary(run);
   const semanticDetail = buildSemanticDetail(run);
 
@@ -153,7 +153,19 @@ export function createTerminalMessage(
   // reale: l'epitaffio del run formatters letto come risposta all'error-fix).
   // Etichetta basata sul FATTO strutturale run.status — mai sul testo.
   if (run.status === "cancelled") {
-    baseContent = `> **Attività precedente interrotta** — è il riepilogo di un lavoro che era già in corso e si è interrotto perché nel frattempo è partito un nuovo turno (un tuo nuovo messaggio, oppure un comando in background che si è concluso e ha risvegliato l'agente). **Non è la risposta al tuo ultimo messaggio**: se è rimasto incompleto, richiedilo di nuovo.\n\n${baseContent}`;
+    const fa = (run.finalAnswer ?? "").trim();
+    const hasRealAnswer =
+      fa.length > 0 && fa !== "Superato da un nuovo run." && fa !== "Operazione annullata.";
+    if (!hasRealAnswer) {
+      // Run superato/annullato SENZA una risposta vera: l'unico contenuto sarebbe
+      // l'epitaffio ("Superato da un nuovo run") o lo status grezzo — ambiguo e
+      // senza valore per l'utente. Non creare alcun messaggio in chat: il lavoro
+      // svolto resta comunque negli step del run e nel worklog di sessione.
+      return null;
+    }
+    // C'e' una risposta reale (il run aveva gia' prodotto un esito prima del
+    // supersede): la mostriamo, ma con un'intestazione che chiarisce il contesto.
+    baseContent = `> **Attività precedente interrotta** — è il riepilogo di un lavoro che era già in corso e si è interrotto perché nel frattempo è partito un nuovo turno (un tuo nuovo messaggio o un comando in background concluso). **Non è la risposta al tuo ultimo messaggio**: se è rimasto incompleto, richiedilo di nuovo.\n\n${baseContent}`;
   }
 
   // Prependi l'avviso privacy se il provider non e' EU/locale

@@ -5,6 +5,7 @@ import { useEventOfKind } from "../../lib/project-dispatcher/hooks";
 import { useThemeColors } from "../../lib/theme";
 import { ProviderBadge } from "./provider-badge";
 import { toolLabel } from "./tool-labels";
+import { MarkdownBlock } from "./markdown-renderer";
 
 /**
  * Card collassabile per visualizzare i meta-step semantici pubblicati dal
@@ -267,7 +268,11 @@ function renderPayload(
   }
   if (kind === "reflection") {
     const summary = String(payload.summary ?? "");
-    return <p style={{ margin: 0, fontSize: 12, lineHeight: 1.4 }}>{summary}</p>;
+    return (
+      <div style={{ fontSize: 12, lineHeight: 1.4 }}>
+        <MarkdownBlock content={summary} />
+      </div>
+    );
   }
   if (kind === "tool_executed") {
     const tool = String(payload.tool ?? "");

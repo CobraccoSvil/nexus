@@ -415,7 +415,7 @@ export function useChat(
                 try {
                   const usage = await getSessionUsage(sid);
                   setTokenUsage({ totalTokens: usage.totalTokens, totalCostUsd: usage.totalCostUsd });
-                  if (usage.totalTokens > 0) {
+                  if (usage.totalTokens > 0 && syntheticMsg) {
                     setMessages((current) =>
                       current.map((m) =>
                         m.id === syntheticMsg.id
