@@ -5,6 +5,7 @@ import type { AgentRunInfo, AgentStep } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { AgentMetaStepCard, type AgentMetaStepData } from "./agent-meta-step-card";
 import { MarkdownBlock } from "./markdown-renderer";
+import { toolLabel } from "./tool-labels";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -480,7 +481,7 @@ function SingleRunPanel({
                         supervisore
                       </span>
                     ) : (
-                      <span style={{ fontFamily: "monospace" }}>{step.toolName}</span>
+                      <span>{toolLabel(step.toolName)}</span>
                     )}
 
                     {step.status === "running" && <span style={{ opacity: 0.6 }}>...</span>}

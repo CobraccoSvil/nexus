@@ -4,6 +4,7 @@ import { useState, type CSSProperties } from "react";
 import { useEventOfKind } from "../../lib/project-dispatcher/hooks";
 import { useThemeColors } from "../../lib/theme";
 import { ProviderBadge } from "./provider-badge";
+import { toolLabel } from "./tool-labels";
 
 /**
  * Card collassabile per visualizzare i meta-step semantici pubblicati dal
@@ -274,7 +275,7 @@ function renderPayload(
     const isErr = Boolean(payload.is_error);
     return (
       <div style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 8, lineHeight: 1.4, flexWrap: "wrap" }}>
-        <code style={{ fontFamily: "monospace", color: isErr ? tc.error : tc.text }}>{tool}</code>
+        <span style={{ fontWeight: 500, color: isErr ? tc.error : tc.text }}>{toolLabel(tool)}</span>
         {target && <span style={{ opacity: 0.7, wordBreak: "break-all" }}>{target}</span>}
         {isErr && <span style={{ color: tc.error, fontWeight: 600 }}>errore</span>}
       </div>

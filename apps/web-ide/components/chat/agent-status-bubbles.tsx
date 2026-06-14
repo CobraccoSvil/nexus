@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { AgentStep } from "../../lib/api-client";
+import { toolLabel } from "./tool-labels";
 
 /* ------------------------------------------------------------------ */
 /* AgentPreparingBubble  (P1)                                          */
@@ -169,21 +170,7 @@ export function AgentProgressInline({
   const currentStep = steps[steps.length - 1];
   const recentDone = steps.filter((s) => s.status === "completed" || s.status === "failed").slice(-3);
 
-  const toolLabel = (name: string) => {
-    const labels: Record<string, string> = {
-      write_file: "Scrittura file",
-      edit_file: "Modifica file",
-      create_file: "Creazione file",
-      patch_file: "Patch file",
-      read_file: "Lettura file",
-      run_in_terminal: "Comando terminale",
-      run_command: "Comando terminale",
-      search_in_files: "Ricerca nel codice",
-      search_files: "Ricerca file",
-      supervisor_check: "Verifica supervisore",
-    };
-    return labels[name] || name.replace(/_/g, " ");
-  };
+  // toolLabel: punto unico in ./tool-labels (regola L).
 
   const statusIcon = (status: string) => {
     if (status === "completed") return "✓";
