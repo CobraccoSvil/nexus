@@ -395,6 +395,74 @@ impl LlmProvider for GoogleProvider {
             Err(_) => false,
         }
     }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // Autodiscovery live per entrambi i backend:
+        //   - Gemini: `GET {base_url}/models?key=...`
+        //     -> `{ "models": [{ "name": "models/gemini-..." }] }`;
+        //   - Vertex: token Bearer su
+        //     `GET https://{location}-aiplatform.googleapis.com/v1beta1/publishers/google/models`
+        //     -> `{ "publisherModels": [{ "name": "publishers/google/models/gemini-..." }] }`.
+        // Il bivio gemini/vertex e' qui (l'auth Vertex riusa `gcp_auth`, regola L);
+        // la normalizzazione a basename e' delegata al parser puro
+        // [`parse_google_models_response`] (parita' col brain `list_models_live`).
+        let backend = self.resolved_backend().await?;
+        let req = match backend.as_ref() {
+            GoogleBackend::Gemini => self
+                .http
+                .get(format!("{}/models", self.base_url))
+                .query(&[("key", &self.api_key)]),
+            GoogleBackend::Vertex {
+                project: _project,
+                location,
+                auth,
+            } => {
+                let token = auth.access_token().await?;
+                let url = format!(
+                    "https://{location}-aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                );
+                self.http.get(url).bearer_auth(token)
+            }
+        };
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Regola F: il body d'errore non contiene prompt/response utente.
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("google GET models HTTP {}: {}", status.as_u16(), text);
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(parse_google_models_response(&body))
+    }
+}
+
+/// Estrae i nomi modello dalla risposta `models.list` di Google e li normalizza
+/// a basename. Funzione PURA (regola L, testabile senza rete): gestisce entrambe
+/// le forme di risposta, leggendo il campo `name` da:
+///   - `models[]` (Gemini direct, es. `"models/gemini-2.5-flash"`);
+///   - `publisherModels[]` (Vertex AI, es. `"publishers/google/models/gemini-2.5-flash"`).
+/// Normalizza ogni nome al basename (`rsplit('/').next()`), come il brain
+/// `list_models_live`; deduplica e ordina per output deterministico.
+pub fn parse_google_models_response(body: &serde_json::Value) -> Vec<String> {
+    let items = body
+        .get("models")
+        .and_then(|m| m.as_array())
+        .or_else(|| body.get("publisherModels").and_then(|m| m.as_array()));
+    let mut names: Vec<String> = items
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("name").and_then(|v| v.as_str()))
+                // Normalizza a basename: "publishers/google/models/X" -> "X",
+                // "models/X" -> "X", "X" -> "X".
+                .filter_map(|name| name.rsplit('/').next())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Esito della risoluzione del thinking Gemini per una richiesta. `None` =
@@ -1008,6 +1076,50 @@ mod tests {
         assert!(p.supports_streaming());
         assert_eq!(p.max_context_tokens(), 1_000_000);
         assert_eq!(p.tier_compatibility(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn parse_models_gemini_normalizza_basename() {
+        // Forma Gemini direct: `models[]` con name "models/<id>".
+        let body = serde_json::json!({
+            "models": [
+                { "name": "models/gemini-2.5-flash" },
+                { "name": "models/gemini-2.5-pro" },
+                { "name": "models/gemini-2.5-flash" }, // duplicato
+            ]
+        });
+        let models = parse_google_models_response(&body);
+        assert_eq!(models, vec!["gemini-2.5-flash", "gemini-2.5-pro"]);
+    }
+
+    #[test]
+    fn parse_models_vertex_normalizza_basename() {
+        // Forma Vertex: `publisherModels[]` con name "publishers/google/models/<id>".
+        let body = serde_json::json!({
+            "publisherModels": [
+                { "name": "publishers/google/models/gemini-2.0-flash-exp" },
+                { "name": "publishers/google/models/gemini-2.5-pro" },
+            ]
+        });
+        let models = parse_google_models_response(&body);
+        assert_eq!(models, vec!["gemini-2.0-flash-exp", "gemini-2.5-pro"]);
+    }
+
+    #[test]
+    fn parse_models_google_gestisce_assenze() {
+        // Niente `models` ne' `publisherModels`: lista vuota, non panico.
+        let vuoto = serde_json::json!({ "nextPageToken": "abc" });
+        assert!(parse_google_models_response(&vuoto).is_empty());
+
+        // Name assente/vuoto: scartato.
+        let body = serde_json::json!({
+            "models": [
+                { "name": "models/gemini-x" },
+                { "object": "model" },
+                { "name": "" },
+            ]
+        });
+        assert_eq!(parse_google_models_response(&body), vec!["gemini-x"]);
     }
 
     #[test]

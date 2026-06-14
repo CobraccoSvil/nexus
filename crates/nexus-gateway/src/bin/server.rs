@@ -65,6 +65,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(routes::health))
         .route("/providers", get(routes::providers))
+        .route("/v1/models", get(routes::models))
+        .route("/v1/models/:provider", get(routes::models_for_provider))
         .route("/v1/complete", post(routes::complete))
         .route("/v1/stream", post(routes::stream))
         .route("/admin/reload", post(routes::admin_reload))

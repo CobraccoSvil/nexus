@@ -28,6 +28,7 @@ use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::provider::{ChunkStream, LlmProvider};
+use crate::providers::openai_compat::parse_models_response;
 use crate::types::{
     LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage, MessageContent,
     SensitivityTier, ToolFunctionCall,
@@ -357,6 +358,29 @@ impl LlmProvider for AnthropicProvider {
             Ok(r) => r.status().is_success(),
             Err(_) => false,
         }
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // Anthropic: `GET {base_url}/models` con header `x-api-key` +
+        // `anthropic-version` (non Bearer). La risposta ha la stessa forma del
+        // dialetto OpenAI (`{ "data": [{ "id": ... }] }`), quindi il parsing
+        // delega al punto unico `parse_models_response` (regola L).
+        let url = format!("{}/models", self.base_url);
+        let resp = self
+            .http
+            .get(url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Regola F: il body d'errore non contiene prompt/response utente.
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("anthropic GET /models HTTP {}: {}", status.as_u16(), text);
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(parse_models_response(&body))
     }
 }
 

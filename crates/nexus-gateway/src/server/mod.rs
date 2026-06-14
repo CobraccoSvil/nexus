@@ -4,6 +4,8 @@
 //! lo stesso contratto del gateway Node:
 //!   - `GET  /health`     stato profilo + provider (proxy mcp-core, fallback cooldown);
 //!   - `GET  /providers`  stato provider;
+//!   - `GET  /v1/models`  autodiscovery live aggregato di tutti i provider;
+//!   - `GET  /v1/models/{provider}` autodiscovery live del singolo provider;
 //!   - `POST /v1/complete` completion non-streaming;
 //!   - `POST /v1/stream`   completion SSE;
 //!   - `POST /admin/reload` ricarica chiavi/policy dal DB.

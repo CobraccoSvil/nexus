@@ -82,6 +82,10 @@ impl LlmProvider for VllmProvider {
     async fn healthcheck(&self) -> bool {
         self.client.healthcheck().await
     }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        self.client.list_models().await
+    }
 }
 
 #[cfg(test)]

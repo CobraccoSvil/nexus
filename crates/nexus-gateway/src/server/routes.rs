@@ -355,6 +355,68 @@ pub async fn providers(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "providers": providers }))
 }
 
+// ── Autodiscovery modelli (catalog live) ─────────────────────────────────────
+
+/// Aggrega l'autodiscovery live di tutti i provider passati. PUNTO UNICO (regola
+/// L) dell'aggregazione, condiviso dai due handler e testabile senza rete: per
+/// ogni provider chiama `list_models()` ed e' BEST-EFFORT: un fallimento finisce
+/// nella mappa `errors` (chiave = nome provider) senza far fallire l'intera
+/// risposta. Il JSON ritornato e' `{ "providers": {<name>: [..]}, "errors": {..} }`.
+async fn aggregate_models(providers: &[Arc<dyn LlmProvider>]) -> Value {
+    let mut by_provider = serde_json::Map::new();
+    let mut errors = serde_json::Map::new();
+    for p in providers {
+        match p.list_models().await {
+            Ok(models) => {
+                by_provider.insert(p.name().to_string(), json!(models));
+            }
+            Err(e) => {
+                // Regola F: il messaggio d'errore non contiene prompt/response.
+                tracing::warn!(provider = p.name(), "gateway: list_models fallita");
+                errors.insert(p.name().to_string(), json!(e.to_string()));
+            }
+        }
+    }
+    json!({ "providers": by_provider, "errors": errors })
+}
+
+/// `GET /v1/models` (auth richiesta): autodiscovery live aggregato di tutti i
+/// provider configurati. Sostituisce il mix attuale (mcp-core chiama `/v1/models`
+/// dei singoli provider + delega al brain per Google): il gateway lista TUTTI i
+/// provider, Vertex incluso (auth Service Account gia' in `gcp_auth`).
+pub async fn models(State(state): State<AppState>) -> Json<Value> {
+    let providers = state.runtime_snapshot().await.providers;
+    Json(aggregate_models(&providers).await)
+}
+
+/// `GET /v1/models/{provider}` (auth richiesta): autodiscovery live del singolo
+/// provider. Sostituisce `/providers/{p}/models/live` del brain. 404 se il
+/// provider non e' configurato; 502 se l'API del provider fallisce.
+pub async fn models_for_provider(
+    State(state): State<AppState>,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+) -> Response {
+    let providers = state.runtime_snapshot().await.providers;
+    let Some(p) = providers.iter().find(|p| p.name() == provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("provider '{provider}' non configurato") })),
+        )
+            .into_response();
+    };
+    match p.list_models().await {
+        Ok(models) => Json(json!({ "provider": provider, "models": models })).into_response(),
+        Err(e) => {
+            tracing::warn!(provider = %provider, "gateway: list_models singolo fallita");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "provider": provider, "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
 // ── Completion ───────────────────────────────────────────────────────────────
 
 /// `POST /v1/complete`: completion non-streaming (auth richiesta).
@@ -585,6 +647,9 @@ mod tests {
         name: String,
         behaviour: Behaviour,
         calls: AtomicUsize,
+        /// Esito di `list_models`: `Some(Ok(..))` lista live, `Some(Err(..))`
+        /// fallimento simulato, `None` => default del trait (lista vuota).
+        models_result: Option<Result<Vec<String>, String>>,
     }
 
     impl FakeProvider {
@@ -593,6 +658,17 @@ mod tests {
                 name: name.to_string(),
                 behaviour,
                 calls: AtomicUsize::new(0),
+                models_result: None,
+            })
+        }
+
+        /// Variante per i test di autodiscovery: fissa l'esito di `list_models`.
+        fn with_models(name: &str, models_result: Result<Vec<String>, String>) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                behaviour: Behaviour::Ok,
+                calls: AtomicUsize::new(0),
+                models_result: Some(models_result),
             })
         }
     }
@@ -642,6 +718,13 @@ mod tests {
         }
         async fn healthcheck(&self) -> bool {
             true
+        }
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            match &self.models_result {
+                Some(Ok(m)) => Ok(m.clone()),
+                Some(Err(e)) => anyhow::bail!("{e}"),
+                None => Ok(vec![]),
+            }
         }
     }
 
@@ -727,6 +810,34 @@ mod tests {
         let resp = run_fallback(&resolved, &cooldown, &req()).await.unwrap();
         assert_eq!(resp.provider_used, "mistral");
         assert!(cooldown.is_in_cooldown("openai"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_models_best_effort_un_provider_in_errore() {
+        // Due provider sani + uno che fallisce: i sani finiscono in `providers`,
+        // il rotto in `errors`, senza far fallire l'aggregazione (best-effort).
+        let ok1: Arc<dyn LlmProvider> =
+            FakeProvider::with_models("openai", Ok(vec!["gpt-4o".into(), "gpt-4o-mini".into()]));
+        let ok2: Arc<dyn LlmProvider> =
+            FakeProvider::with_models("google", Ok(vec!["gemini-2.5-flash".into()]));
+        let ko: Arc<dyn LlmProvider> =
+            FakeProvider::with_models("anthropic", Err("HTTP 402 insufficient_quota".into()));
+        let providers = vec![ok1, ok2, ko];
+
+        let out = aggregate_models(&providers).await;
+
+        // Provider sani presenti con le loro liste.
+        assert_eq!(
+            out["providers"]["openai"],
+            json!(["gpt-4o", "gpt-4o-mini"])
+        );
+        assert_eq!(out["providers"]["google"], json!(["gemini-2.5-flash"]));
+        // Il provider rotto NON e' in `providers` ma in `errors`.
+        assert!(out["providers"].get("anthropic").is_none());
+        assert!(out["errors"]["anthropic"]
+            .as_str()
+            .unwrap()
+            .contains("insufficient_quota"));
     }
 
     #[tokio::test]

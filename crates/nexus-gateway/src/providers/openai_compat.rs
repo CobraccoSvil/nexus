@@ -253,6 +253,51 @@ impl OpenAiCompatClient {
             Err(_) => false,
         }
     }
+
+    /// Autodiscovery live: `GET {base_url}/models` (Bearer) ed estrae `data[].id`.
+    /// Dialetto OpenAI condiviso da OpenAI/Mistral/DeepSeek/vLLM (punto unico,
+    /// regola L). Il parsing della risposta e' delegato a [`parse_models_response`]
+    /// (puro, testabile senza rete).
+    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let url = format!("{}/models", self.base_url);
+        let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Regola F: il body d'errore non contiene prompt/response utente; lo
+            // propaghiamo al caller, che aggrega best-effort, senza loggarlo qui.
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "{} GET /models HTTP {}: {}",
+                self.provider_name,
+                status.as_u16(),
+                text
+            );
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(parse_models_response(&body))
+    }
+}
+
+/// Estrae i nomi modello dalla risposta `GET /models` del dialetto OpenAI:
+/// `{ "data": [{ "id": "..." }, ...] }`. Funzione PURA (regola L, testabile
+/// senza rete): salta gli elementi senza `id` non-vuoto, deduplica e ordina per
+/// output deterministico (parita' col brain `list_models_live`).
+pub fn parse_models_response(body: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Parser SSE riusabile: accumula righe, le decodifica in [`LlmStreamChunk`] e
@@ -886,6 +931,40 @@ mod tests {
                 feature: "f".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn parse_models_estrae_id_ordina_e_deduplica() {
+        // Forma canonica della risposta `GET /models` (OpenAI/Mistral/DeepSeek/vLLM).
+        let body = serde_json::json!({
+            "object": "list",
+            "data": [
+                { "id": "gpt-4o", "object": "model" },
+                { "id": "gpt-4o-mini", "object": "model" },
+                { "id": "gpt-4o", "object": "model" }, // duplicato
+            ]
+        });
+        let models = parse_models_response(&body);
+        // Ordinato e deduplicato.
+        assert_eq!(models, vec!["gpt-4o", "gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn parse_models_salta_id_assenti_o_vuoti_e_gestisce_data_mancante() {
+        let body = serde_json::json!({
+            "data": [
+                { "id": "deepseek-chat" },
+                { "object": "model" },          // niente id
+                { "id": "" },                    // id vuoto
+                { "id": "  mistral-small  " },   // trimmato
+            ]
+        });
+        let models = parse_models_response(&body);
+        assert_eq!(models, vec!["deepseek-chat", "mistral-small"]);
+
+        // Risposta senza `data`: lista vuota, non panico.
+        let vuoto = serde_json::json!({ "object": "list" });
+        assert!(parse_models_response(&vuoto).is_empty());
     }
 
     #[test]

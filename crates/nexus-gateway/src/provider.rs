@@ -42,4 +42,18 @@ pub trait LlmProvider: Send + Sync {
 
     /// Probe di salute: `false` se il provider e' down o in billing error.
     async fn healthcheck(&self) -> bool;
+
+    /// Autodiscovery live: lista dei nomi modello esposti dall'API del provider
+    /// in questo momento. Diverso dal catalog DB (`ai_price_catalog`): interroga
+    /// l'API live. Usato dall'unificazione del catalog sync sul gateway (punto
+    /// unico, regola L): il gateway puo' listare TUTTI i provider, Vertex incluso
+    /// (ha gia' l'auth Service Account in `gcp_auth`), eliminando la delega al
+    /// brain per Google.
+    ///
+    /// Default impl: `Ok(vec![])` per i provider che non espongono un endpoint di
+    /// listing (es. onprem statici); chi lo supporta lo sovrascrive. Su errore di
+    /// rete/auth ritorna `Err` (il chiamante aggrega best-effort).
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec![])
+    }
 }
