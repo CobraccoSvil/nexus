@@ -7,6 +7,7 @@ import { getAgentRun, getAgentRunNextActions, getAttachmentRawUrl } from "../../
 import type { useThemeColors } from "../../lib/theme";
 import { MarkdownBlock } from "./markdown-renderer";
 import { NextActionsButtons, type NextActionChoice } from "./agent-meta-step-card";
+import { toolLabel } from "./tool-labels";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -569,8 +570,8 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
                         {isExp ? "▼" : "▶"}
                       </span>
                     )}
-                    <span style={{ fontFamily: "monospace", fontSize: 11, color: tc.text }}>
-                      {step.toolName}
+                    <span style={{ fontSize: 11, color: tc.text }}>
+                      {toolLabel(step.toolName)}
                     </span>
                     <StepStatusBadge status={step.status} tc={tc} />
                   </div>
