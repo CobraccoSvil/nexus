@@ -670,27 +670,6 @@ def _close_loop_safely(loop: "asyncio.AbstractEventLoop", provider_obj: object |
     loop.close()
 
 
-def _use_gateway_provider() -> bool:
-    """Feature flag (regola G): quando True il registry usa il GatewayProvider
-    come TRASPORTO al posto degli adapter SDK, mantenendo invariati routing,
-    cooldown e cascade-fallback del brain (la selezione (provider, model) resta
-    qui; il gateway riceve il model nel formato ``provider/model`` che il
-    GatewayProvider traduce in ``pin_provider``+``model`` concreto, cosi' il
-    gateway esegue ESATTAMENTE il provider deciso dal brain senza rifare il
-    routing per-tier ne' il fallback cross-provider).
-
-    Default False (comportamento attuale, SDK). Letto dalla tabella ``settings``
-    chiave ``brain.use_gateway_provider``; best-effort: se il DB e' down resta
-    False (nessun cambio di trasporto silenzioso). Rollback immediato spegnendo
-    il flag in DB (cache 60s del settings cached loader).
-    """
-    try:
-        from brain.utils.settings_db import get_bool_setting_cached
-        return get_bool_setting_cached("brain.use_gateway_provider", False)
-    except Exception:
-        return False
-
-
 class ProviderRegistry:
     def __init__(self) -> None:
         self._providers: dict[str, BaseProvider] = {
@@ -704,9 +683,13 @@ class ProviderRegistry:
         }
         # Tutti i provider abilitati di default; _load_keys_from_db() può sovrascrivere
         self._disabled: set[str] = set()
-        # Trasporto gateway (lazy): istanziato solo quando il flag e' acceso, cosi'
-        # con flag OFF il GatewayProvider non viene neppure costruito. E' solo il
-        # TRASPORTO: il routing/cooldown/cascade restano in questo registry.
+        # Trasporto unico delle CHIAMATE LLM: il GatewayProvider delega al gateway
+        # Rust (crates/nexus-gateway). Gli adapter SDK in ``self._providers`` NON
+        # eseguono piu' le chiamate (generate / agent turn / completion) — quel
+        # ruolo e' del gateway, fonte unica di trasporto (regola L). Restano
+        # costruiti perche' i loro metodi NON-chiamata (list_models /
+        # test_connection / _get_client per vision/batch/warmup/catalog-sync) sono
+        # ancora usati fuori dal registry e non sono coperti dal gateway.
         self._gateway_provider: BaseProvider | None = None
 
     def _gateway(self) -> BaseProvider:
@@ -716,33 +699,32 @@ class ProviderRegistry:
             self._gateway_provider = GatewayProvider()
         return self._gateway_provider
 
-    def _transport_for(self, provider_name: str) -> BaseProvider | None:
-        """Ritorna il provider da usare come TRASPORTO per ``provider_name``.
+    def _transport_for(self, provider_name: str) -> BaseProvider | None:  # noqa: ARG002
+        """Ritorna il TRASPORTO per le chiamate LLM: sempre il GatewayProvider.
 
-        Flag ON  -> GatewayProvider (delega al gateway Rust). Flag OFF -> adapter
-        SDK registrato. Punto unico del bivio trasporto (regola L): tutti i path
-        di esecuzione (generate / agent turn) passano da qui, cosi' il flag
-        governa l'intero registry da un solo posto.
+        Punto unico del trasporto (regola L): tutti i path di esecuzione del
+        registry (generate / agent turn / completion) passano da qui e delegano
+        al gateway Rust. La selezione (provider, model) resta decisa qui dal
+        brain (routing/cooldown/cascade) e viaggia al gateway come prefisso
+        ``provider/model`` (vedi ``_transport_model``), cosi' il gateway esegue
+        ESATTAMENTE quel provider senza rifare il routing per-tier ne' il
+        fallback cross-provider. ``provider_name`` non seleziona piu' un adapter
+        SDK (gli adapter non eseguono chiamate); resta nella firma come contesto.
         """
-        if _use_gateway_provider():
-            return self._gateway()
-        return self._providers.get(provider_name)
+        return self._gateway()
 
     @staticmethod
     def _transport_model(provider_name: str, model: str) -> str:
-        """Model da inviare al trasporto.
+        """Model da inviare al trasporto (gateway).
 
-        Con il GatewayProvider il routing/provider e' gia' deciso dal brain:
-        passiamo il model prefissato ``provider/model``. Il GatewayProvider lo
-        splitta in ``pin_provider``+``model`` concreto (vedi
+        Il routing/provider e' gia' deciso dal brain: passiamo il model
+        prefissato ``provider/model``. Il GatewayProvider lo splitta in
+        ``pin_provider``+``model`` concreto (vedi
         ``gateway_provider._split_pin_provider``), cosi' il gateway esegue
         ESATTAMENTE quel provider (path pin) SENZA rifare il routing per-tier ne'
         il fallback cross-provider. Se il model e' gia' prefissato non lo
-        raddoppia. Con gli adapter SDK il prefisso non serve (ogni adapter parla
-        col proprio vendor) e il model resta invariato.
+        raddoppia.
         """
-        if not _use_gateway_provider():
-            return model
         if "/" in model:
             return model
         return f"{provider_name}/{model}"
@@ -810,9 +792,9 @@ class ProviderRegistry:
                 content=f"[Provider '{provider}' è disabilitato]",
                 metadata={"error": "provider_disabled"},
             )
-        # Bivio trasporto (flag brain.use_gateway_provider): SDK o gateway.
-        # Il (provider, model) e' gia' scelto dal chiamante; qui si decide solo il
-        # trasporto. Con il gateway il model viaggia come "provider/model".
+        # Trasporto unico (regola L): la chiamata passa dal gateway. Il
+        # (provider, model) e' gia' scelto dal chiamante; qui si decide solo
+        # il trasporto. Il model viaggia al gateway come "provider/model".
         p = self._transport_for(provider)
         wire_model = self._transport_model(provider, model)
         if p is None:
@@ -1039,9 +1021,9 @@ class ProviderRegistry:
                 metadata={"error": "agent_turn_not_supported"},
             )
         def _run_agent_turn(prov_name: str, prov_model: str) -> ProviderResult:
-            # Bivio trasporto (flag brain.use_gateway_provider): SDK o gateway.
-            # Il routing ha gia' scelto (prov_name, prov_model); qui si decide solo
-            # COME eseguire la chiamata. Con il gateway il model viaggia come
+            # Trasporto unico (regola L): la chiamata passa dal gateway. Il
+            # routing ha gia' scelto (prov_name, prov_model); qui si decide solo
+            # COME eseguire la chiamata. Il model viaggia al gateway come
             # "provider/model" (vedi _transport_model) per non rifare il routing.
             prov = self._transport_for(prov_name)
             wire_model = self._transport_model(prov_name, prov_model)
@@ -1307,14 +1289,18 @@ class ProviderRegistry:
                 content=f"[Provider '{provider}' è disabilitato]",
                 metadata={"error": "provider_disabled"},
             )
-        p = self._providers.get(provider)
+        # Trasporto unico (regola L): la chiamata LLM passa dal gateway, come gli
+        # altri path (generate_completion / agent turn). Il (provider, model) e'
+        # gia' scelto dal chiamante; il model viaggia come "provider/model".
+        p = self._transport_for(provider)
+        wire_model = self._transport_model(provider, model)
         if p is None:
             return ProviderResult(
                 provider=provider, model=model,
                 content=f"[Provider '{provider}' not found]",
                 metadata={"error": "unknown_provider"},
             )
-        return await p.generate(model, prompt, **kwargs)
+        return await p.generate(wire_model, prompt, **kwargs)
 
     async def test_connection_async(self, provider: str) -> dict[str, Any]:
         if not self.is_enabled(provider):

@@ -6,8 +6,11 @@ cooldown e privacy. E' il primo passo della migrazione che, a regime, sostituira
 gli adapter SDK Python (deepseek/mistral/openai/anthropic/google) eliminando la
 duplicazione provider Python<->Rust.
 
-Stato: il GatewayProvider ESISTE ed e' costruibile/testabile, ma il registry NON
-lo usa di default (nessuno switch in questa fase).
+Stato: il GatewayProvider e' il TRASPORTO UNICO delle chiamate LLM del registry
+(generate / generate_agent_turn / generate_completion). Gli adapter SDK Python
+restano costruiti solo per i metodi NON-chiamata ancora non coperti dal gateway
+(list_models / test_connection / client SDK diretto per vision, batch, warmup
+Vertex, catalog-sync live).
 
 Contratto del gateway (vedi crates/nexus-gateway/src/types.rs):
   - POST /v1/complete -> LlmResponse{content, reasoning?, thinking_signature?,
