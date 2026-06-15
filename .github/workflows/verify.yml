@@ -58,6 +58,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Il crate mcp-proto usa prost-build, che richiede il compilatore protobuf
+      # `protoc` a build time. Senza, `cargo check/clippy/test` (dentro pnpm
+      # verify) fallisce subito con "Could not find protoc". ci.yml non ne ha
+      # bisogno perche' non compila Rust.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Run pnpm verify
         # Il pytest del brain e' coperto dal job dedicato `brain-tests` (che
         # installa torch + le deps Python). Questo job NON le installa, quindi la
