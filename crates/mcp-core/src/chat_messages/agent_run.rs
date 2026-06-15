@@ -100,6 +100,24 @@ fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
     Some(out)
 }
 
+/// Riepilogo conciso SEMPRE in coda alla risposta: conteggi REALI dagli step
+/// (file modificati, azioni eseguite), indipendenti dalla narrativa dell'agente.
+/// Cosi' l'utente capisce a colpo d'occhio cosa e' stato fatto anche quando la
+/// risposta e' interlocutoria/confusa o troncata. Lo stato del turno
+/// (completato/fallito) e' gia' nel badge; qui i fatti che lo completano. `None`
+/// se non c'e' alcuna azione concreta (es. turno conversazionale).
+fn outcome_summary(steps: &[AgentStep]) -> Option<String> {
+    let (lines, files) = collect_actions(steps);
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\n---\n_Riepilogo esecuzione: {} file modificati, {} azioni eseguite._",
+        files.len(),
+        lines.len()
+    ))
+}
+
 /// Footer da appendere a un `final_answer` NON conclusivo (es. frase
 /// interlocutoria "Ora elenco i file...") che NON riflette il lavoro svolto:
 /// l'agente ha modificato file ma la risposta non li menziona, lasciando
@@ -2639,6 +2657,13 @@ pub(crate) async fn spawn_agent_run(
                     )
                 } else {
                     answer.clone()
+                };
+                // Riepilogo esecuzione SEMPRE in coda (numeri reali dagli step):
+                // l'utente vede cosa e' stato fatto anche se la risposta e'
+                // interlocutoria/confusa. None per i turni senza azioni.
+                let effective_answer = match outcome_summary(&result.steps) {
+                    Some(s) => format!("{effective_answer}{s}"),
+                    None => effective_answer,
                 };
                 let meta = json!({
                     "provider": &result.provider,

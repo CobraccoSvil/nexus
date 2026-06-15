@@ -598,6 +598,18 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
         logger.info("clarify_or_expand: disabilitato via settings, skip")
         return {}
 
+    # Disambiguazione gia' risolta (l'utente ha risposto A/B): mcp-core imposta
+    # intent_hint (+ confidence=1.0) e il router_node lo usa al posto di
+    # ri-classificare. Senza questa guardia, clarify ri-valuta la confidence
+    # (ancora bassa dal turno ambiguo) e RIPROPONE la stessa domanda A/B. Punto
+    # unico (regola L) che impedisce di richiedere il chiarimento dopo la risposta.
+    if state.get("intent_hint"):
+        logger.info(
+            "clarify_or_expand: intent_hint=%s gia' risolto (disambiguazione mcp-core) -> skip",
+            state.get("intent_hint"),
+        )
+        return {}
+
     # Intent CONVERSAZIONALE: una richiesta di chiacchierata/discussione NON e'
     # una richiesta operativa ambigua da chiarire. Per chat/general_chat si
     # risponde direttamente (coerente col router_node che azzera i tool): niente
