@@ -122,6 +122,13 @@ def _build_prompt(task_input: str, result: str) -> str:
         "poter procedere, chiede all'utente di fare lui, o promette un'azione "
         "futura non ancora svolta NON e' compiuta. Una risposta che riporta un "
         "lavoro effettivamente svolto (anche con limiti dichiarati) e' compiuta.\n\n"
+        "REGOLA AGGIUNTIVA: una risposta che ELENCA esplicitamente passi ANCORA "
+        "da svolgere come parte del compito richiesto (es. una sezione \"Prossimi "
+        "passi necessari\", \"Next steps\", \"Remaining steps\", \"Da fare\", "
+        "\"TODO\" con due o piu' item numerati o puntati) NON e' compiuta, anche "
+        "se descrive lavoro gia' svolto: il task resta APERTO finche' quei passi "
+        "non sono eseguiti. Solo passi opzionali / di follow-up extra (chiaramente "
+        "etichettati come tali, non parte del compito richiesto) non bloccano.\n\n"
         "Rispondi ESCLUSIVAMENTE con un oggetto JSON, senza testo attorno:\n"
         '{"fulfilled": true|false, "reason": "<max 12 parole>"}\n\n'
         f"RICHIESTA:\n{task_trunc}\n\n"

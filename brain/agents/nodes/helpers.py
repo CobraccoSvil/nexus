@@ -1368,6 +1368,173 @@ def _detect_polling_wait(text: str | None) -> bool:
     return any(p in tail for p in _POLLING_WAIT_PATTERNS)
 
 
+# ── Segnale STRUTTURALE "report con passi pendenti" (mig 0430) ───────────────
+# Causa radice "Continuo non riprende dopo report": il modello chiude il turno
+# con un resoconto strutturato del tipo:
+#
+#   Stato attuale: ...
+#   Prossimi passi necessari:
+#   1. Verificare X
+#   2. Eseguire Y
+#
+# La risposta DESCRIVE il task come ancora aperto (elenca passi da fare) ma
+# sfugge a tutti i segnali esistenti: declared_outcome assente, intenzione
+# narrata in forma INFINITA/IMPERATIVA (non 1a persona), nessun "attendo".
+# _detect_unfulfilled_intent NON matcha; il guard "azioni produttive +
+# !unfulfilled" in route_after_executor chiude come "resoconto finale legittimo".
+# In modalita' continuous/automatic significa che la chat NON riprende.
+#
+# Soluzione strutturale (de-lessicalizzazione, regola H): identifichiamo la
+# STRUTTURA report-con-TODO indipendente dai verbi:
+#   (a) etichetta-trigger di elenco passi pendenti (es. "Prossimi passi",
+#       "Next steps", "TODO", "Da fare", "Remaining steps") — pochi marker
+#       strutturali stabili, non una blacklist di frasi;
+#   (b) almeno N item (default 2) introdotti da numeratori "1." / "2." o
+#       bullet "- " / "* " subito sotto l'etichetta.
+#
+# Funzione PURA deterministica, idempotente. Niente side-effect, falso positivo
+# = al peggio un re-route extra protetto dal cap g1_reroute_count.
+#
+# Etichette multilingua (IT, EN, ES, FR, DE — copertura principale).
+_PENDING_STEPS_LABELS: tuple[str, ...] = (
+    # Italiano
+    "prossimi passi necessari", "prossimi passi", "prossimi step",
+    "passi successivi", "passi rimanenti", "passi da svolgere",
+    "passi da completare", "passi da fare", "step successivi",
+    "step rimanenti", "step da fare", "cosa manca", "cosa resta da fare",
+    "lavoro rimanente", "azioni rimanenti", "azioni da svolgere",
+    "azioni da completare", "azioni necessarie", "da fare", "todo",
+    "to do", "to-do",
+    # Inglese
+    "next steps", "next step", "remaining steps", "remaining work",
+    "remaining tasks", "pending steps", "pending tasks", "outstanding tasks",
+    "outstanding work", "to be done", "still to do", "things to do",
+    "what's left", "whats left", "what remains", "follow-up actions",
+    "follow up actions", "action items",
+    # Spagnolo
+    "próximos pasos", "proximos pasos", "pasos siguientes", "pasos restantes",
+    "pendientes", "por hacer", "queda por hacer",
+    # Francese
+    "prochaines étapes", "prochaines etapes", "étapes suivantes",
+    "etapes suivantes", "étapes restantes", "etapes restantes", "à faire",
+    "a faire", "reste à faire", "reste a faire",
+    # Tedesco
+    "nächste schritte", "naechste schritte", "verbleibende schritte",
+    "noch zu tun", "offene aufgaben",
+)
+
+# Item dell'elenco: numerato "1." / "1)" / bullet "- " / "* " / "• ".
+# Regex catturante: usata in detect_pending_steps_report per contare gli item
+# che seguono l'etichetta-trigger.
+_PENDING_ITEM_RE = re.compile(
+    r"^\s*(?:[0-9]{1,2}[.)]|[-*+•])\s+\S",
+    re.MULTILINE,
+)
+
+
+# Cache 60s del config DB-driven (settings agent.closure.pending_steps_*).
+_PENDING_CFG_CACHE: dict[str, Any] | None = None
+_PENDING_CFG_TS: float = 0.0
+_PENDING_CFG_TTL_SEC = 60.0
+_PENDING_CFG_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "min_items": 2,
+}
+
+
+def _load_pending_steps_config() -> dict[str, Any]:
+    """Legge i due setting agent.closure.pending_steps_* dal DB con cache 60s.
+    Fail-safe: su errore mantiene l'ultima cache valida o i default."""
+    global _PENDING_CFG_CACHE, _PENDING_CFG_TS
+
+    now = time.monotonic()
+    if _PENDING_CFG_CACHE is not None and now - _PENDING_CFG_TS < _PENDING_CFG_TTL_SEC:
+        return _PENDING_CFG_CACHE
+
+    if not os.environ.get("DATABASE_URL"):
+        return dict(_PENDING_CFG_DEFAULTS)
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT key, value FROM settings WHERE key IN "
+                "('agent.closure.pending_steps_detection_enabled',"
+                " 'agent.closure.pending_steps_min_items')"
+            )
+            rows = dict(cur.fetchall())
+        cfg = {
+            "enabled": str(
+                rows.get("agent.closure.pending_steps_detection_enabled", "true")
+            ).strip().lower() != "false",
+            "min_items": max(
+                1,
+                int(rows.get("agent.closure.pending_steps_min_items", "2") or "2"),
+            ),
+        }
+    except Exception as exc:  # pragma: no cover - difensivo
+        logger.debug(
+            "pending_steps_config: lettura fallita (%s), uso cache/default", exc
+        )
+        return dict(_PENDING_CFG_CACHE) if _PENDING_CFG_CACHE is not None else dict(_PENDING_CFG_DEFAULTS)
+
+    _PENDING_CFG_CACHE = cfg
+    _PENDING_CFG_TS = now
+    return cfg
+
+
+def detect_pending_steps_report(
+    text: str | None,
+    *,
+    min_items: int | None = None,
+) -> bool:
+    """True se `text` e' un REPORT con elenco esplicito di passi ancora da
+    svolgere (es. "Prossimi passi necessari:\\n1. ...\\n2. ..."): l'agente
+    sta dichiarando il task come ANCORA APERTO mentre chiude il turno.
+
+    Algoritmo (deterministico, language-independent quanto basta — 5 lingue):
+      1. Cerca un'etichetta-trigger in `_PENDING_STEPS_LABELS` (lower-case).
+         Ammettiamo qualsiasi posizione nel testo: il pattern reale e'
+         "Stato attuale: ... Prossimi passi necessari: ...", e il blocco
+         interessante e' SOTTO l'etichetta.
+      2. Dal carattere successivo all'etichetta, conta gli item dell'elenco
+         (`_PENDING_ITEM_RE`, numerato 1./2. o bullet -/*) entro le prime
+         ~1500 char dopo l'etichetta (taglio per evitare falsi positivi su
+         testo lungo non collegato).
+      3. >= `min_items` (default config DB, fallback 2) -> True.
+
+    NON e' una blacklist di frasi: identifica la STRUTTURA "report con TODO".
+    Pura, idempotente: stesso input -> stesso output.
+    """
+    if not text or not text.strip():
+        return False
+    if min_items is None:
+        try:
+            cfg = _load_pending_steps_config()
+            if not cfg.get("enabled", True):
+                return False
+            min_items = int(cfg.get("min_items", 2))
+        except Exception:
+            min_items = 2
+    if min_items < 1:
+        min_items = 1
+
+    lower = text.lower()
+    # Trova la PRIMA etichetta-trigger e analizza l'elenco subito sotto.
+    for label in _PENDING_STEPS_LABELS:
+        idx = lower.find(label)
+        if idx < 0:
+            continue
+        # Salta l'etichetta + eventuale ":" e prendi una finestra ragionevole
+        # subito sotto. Tetto 1500 char: l'elenco di TODO sta nel blocco
+        # immediato, oltre rischia di catturare bullet non correlati.
+        start = idx + len(label)
+        window = text[start:start + 1500]
+        # Niente lookahead aggressivo: contiamo gli item nella finestra.
+        matches = _PENDING_ITEM_RE.findall(window)
+        if len(matches) >= min_items:
+            return True
+    return False
+
+
 def build_unfulfilled_report(result_text: str | None, messages: list | None) -> str:
     """Resoconto onesto quando il turno chiude con un'intenzione non eseguita e
     NON si fa auto-restart (modalita' confirm o cap raggiunto).

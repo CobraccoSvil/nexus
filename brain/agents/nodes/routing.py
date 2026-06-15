@@ -17,6 +17,7 @@ from .helpers import (
     _detect_unfulfilled_intent,
     _load_g1_max_nudges,
     _load_tool_choice_forcing_config,
+    detect_pending_steps_report,
     has_productive_action_in_history,
     structural_unfulfilled_signal,
     turn_action_oriented,
@@ -38,18 +39,40 @@ def _unfulfilled_lexical(result: str | None) -> bool:
 
 
 def _unfulfilled_signal(state: AgentState) -> bool:
-    """Segnale SEMANTICO "esito non compiuto" con gerarchia de-lessicalizzata
-    (mig 0422): (1) verdetto del closure_judge (LLM) se presente nello state
-    (l'executor_node lo scrive a fine turno quando agent.closure_judge.active)
-    -> `not fulfilled`; (2) fallback alla blacklist lessicale
-    `_detect_unfulfilled_intent` SOLO quando il judge si e' astenuto/disattivato
-    (cosi' `lexical_fallback_used` misura esattamente i casi di astensione).
-    Il `declared_outcome` (task_complete) e' valutato a monte dal chiamante e ha
-    priorita' su entrambi (segnale PRIMARIO)."""
+    """Segnale SEMANTICO "esito non compiuto" con gerarchia de-lessicalizzata.
+
+    Ordine di valutazione (mig 0422 + 0430):
+      1. verdetto del closure_judge (LLM, scritto dall'executor_node a fine
+         turno quando `agent.closure_judge.active`): se presente e bool reale,
+         decide -> `not fulfilled`.
+      2. segnale STRUTTURALE `detect_pending_steps_report`: una risposta che
+         elenca esplicitamente passi ancora da svolgere ("Prossimi passi
+         necessari: 1. ... 2. ...") e' per definizione UN TASK NON COMPIUTO,
+         indipendentemente dai verbi/lingua. Risolve il caso "Continuo non
+         riprende dopo report" (mig 0430).
+      3. fallback alla blacklist lessicale `_detect_unfulfilled_intent` SOLO
+         quando i due sopra si sono astenuti: cosi' `lexical_fallback_used`
+         misura esattamente i casi di astensione.
+
+    Il `declared_outcome` (task_complete) e' valutato a monte dal chiamante e
+    ha priorita' su tutti i tre (segnale PRIMARIO)."""
     verdict = state.get("closure_verdict")
     if isinstance(verdict, dict) and isinstance(verdict.get("fulfilled"), bool):
         return not verdict["fulfilled"]
-    return _unfulfilled_lexical(state.get("result"))
+    result = state.get("result")
+    # (2) Segnale strutturale "report con passi pendenti" (mig 0430): DB-driven
+    # via `agent.closure.pending_steps_*`; idempotente, deterministico.
+    try:
+        if detect_pending_steps_report(result):
+            logger.info(
+                "route_after_executor: segnale strutturale pending_steps_report "
+                "(report con elenco passi da svolgere) -> unfulfilled"
+            )
+            return True
+    except Exception as exc:  # pragma: no cover - difensivo
+        logger.debug("_unfulfilled_signal: pending_steps skip (%s)", exc)
+    # (3) Fallback lessicale.
+    return _unfulfilled_lexical(result)
 
 
 def _final_gate_eligible(state: AgentState) -> bool:
