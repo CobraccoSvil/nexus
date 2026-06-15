@@ -401,6 +401,12 @@ async def extract_via_llm(assistant_text: str, providers: Any) -> list[dict[str,
 
     prompt = _build_extractor_prompt(assistant_text)
     try:
+        # Clamp difensivo (punto unico, regola L): se l'assistant_text e' enorme
+        # (run lungo, riassunto verboso) evitiamo di mandare al provider piu' del
+        # 55% del window. Il prompt resta head+tail con marker esplicito.
+        from brain.agents.context_brake import clamp_single_prompt
+
+        prompt = clamp_single_prompt(prompt, model)
         result = await providers.generate_completion_async(
             provider, model, prompt, internal_task=True,
         )

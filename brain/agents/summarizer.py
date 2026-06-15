@@ -185,6 +185,12 @@ async def summarize_old_messages(
             return None
 
     full_prompt = f"{_SUMMARIZE_SYSTEM}\n\n{user_prompt}"
+    # Clamp difensivo (punto unico, regola L): il summarizer riceve l'intera
+    # history serializzata come user_prompt -> il prompt full puo' superare il
+    # window del modello scelto. Cap a max_context_ratio * window con head+tail.
+    from brain.agents.context_brake import clamp_single_prompt
+
+    full_prompt = clamp_single_prompt(full_prompt, use_model)
     t0 = time.monotonic()
     try:
         result = await asyncio.wait_for(

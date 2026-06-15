@@ -354,6 +354,11 @@ async def _run_exploratory_check(
         "Altrimenti scrivi 'PROBLEMA: <descrizione sintetica>'."
     )
     try:
+        # Clamp difensivo (punto unico, regola L): il prompt include task +
+        # criteri + past_failures (memoria), puo' crescere su run lunghi.
+        from brain.agents.context_brake import clamp_single_prompt
+
+        prompt = clamp_single_prompt(prompt, model)
         result = await __import__("asyncio").to_thread(
             _providers.generate_completion, provider, model, prompt
         )

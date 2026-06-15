@@ -182,6 +182,11 @@ async def understanding_node(state: AgentState) -> dict[str, Any]:
                     "vincoli noti, file/punti rilevanti.\n\n"
                     f"Task: {query}\n\n{raw_brief}"
                 )
+                # Clamp difensivo (punto unico, regola L): raw_brief concatena
+                # grounding + explore -> puo' essere enorme su progetti grandi.
+                from brain.agents.context_brake import clamp_single_prompt
+
+                prompt = clamp_single_prompt(prompt, model)
                 result = await asyncio.to_thread(
                     _providers.generate_completion, provider, model, prompt
                 )

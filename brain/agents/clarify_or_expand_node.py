@@ -312,6 +312,11 @@ def _intake_gate(state: AgentState, user_msg: str, cfg: dict) -> dict | None:
     }]
     user_block = f"NUOVA RICHIESTA:\n{user_msg}\n\nNOTE ESISTENTI:\n{cand_text}"
     try:
+        # Clamp difensivo del single prompt (punto unico, regola L):
+        # cand_text concatena tutte le note esistenti -> puo' diventare grande.
+        from brain.agents.context_brake import clamp_single_prompt
+
+        user_block = clamp_single_prompt(user_block, model)
         result = _providers.generate_agent_turn_sync(
             provider, model, [{"role": "user", "content": user_block}], tools_json,
             max_tokens=400, system_text=system_text,
@@ -779,7 +784,12 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
         },
     }]
 
-    anth_messages = [{"role": "user", "content": user_msg}]
+    # Clamp difensivo del single prompt (punto unico, regola L): l'user_msg
+    # qui e' il primo messaggio dell'utente, puo' includere allegati incollati.
+    from brain.agents.context_brake import clamp_single_prompt
+
+    clamped_user_msg = clamp_single_prompt(user_msg, model)
+    anth_messages = [{"role": "user", "content": clamped_user_msg}]
     try:
         import asyncio as _aio
         result = await _aio.to_thread(

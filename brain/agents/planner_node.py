@@ -352,6 +352,13 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
     # ── LLM call attraverso registry sync (riusa cascade M60) ───────────────
     import asyncio as _asyncio
     try:
+        # Freno di contesto (punto unico, regola L): dedup tool_results +
+        # drop base64 + rolling + token brake. Senza questa chiamata il planner
+        # spedirebbe al provider la history grezza (es. 254K token su sub-agent
+        # Mistral) bypassando le soglie applicate da executor_node.
+        from brain.agents.context_brake import apply_context_reduction
+
+        messages = apply_context_reduction(messages, planner_model, iteration=0)
         anth_messages = _langchain_to_anthropic_messages_local(messages)
         prov_result = await _asyncio.to_thread(
             _providers.generate_agent_turn_sync,
@@ -407,9 +414,16 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
                 used_provider, used_model, fb_provider, fb_model,
             )
             try:
+                # Freno di contesto anche sul fallback: il modello cambia
+                # (fb_model) -> window potenzialmente diversa. Riusiamo la stessa
+                # pipeline (idempotente, no-op se gia' compresso col primario).
+                from brain.agents.context_brake import apply_context_reduction as _apply_brake
+
+                fb_messages = _apply_brake(messages, fb_model, iteration=0)
+                fb_anth_messages = _langchain_to_anthropic_messages_local(fb_messages)
                 fb_result = await _asyncio.to_thread(
                     _providers.generate_agent_turn_sync,
-                    fb_provider, fb_model, anth_messages, tools_json,
+                    fb_provider, fb_model, fb_anth_messages, tools_json,
                     max_tokens=4096, system_text=hinted_system,
                     soft_failure_fallback=False,  # ADR 0025: vedi sopra
                 )
@@ -799,8 +813,14 @@ async def _detect_clarifications(state: AgentState, cfg: dict) -> dict[str, Any]
     }]
     import asyncio as _aio
     try:
+        # Clamp difensivo del single prompt (punto unico, regola L): se il
+        # messaggio utente e' enorme (es. incolla 200K di log) tronchiamo a
+        # max_context_ratio * window mantenendo head+tail.
+        from brain.agents.context_brake import clamp_single_prompt
+
+        clamped_user_msg = clamp_single_prompt(user_msg, model)
         anth_messages = _langchain_to_anthropic_messages_local([
-            type("M", (), {"type": "human", "content": user_msg, "additional_kwargs": {}})(),
+            type("M", (), {"type": "human", "content": clamped_user_msg, "additional_kwargs": {}})(),
         ])
         result = await _aio.to_thread(
             _providers.generate_agent_turn_sync,
