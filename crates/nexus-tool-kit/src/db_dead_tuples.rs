@@ -16,7 +16,7 @@ impl NexusToolHandler for DbDeadTuplesTool {
         let limit = db_helper::limit_arg(args, 20, 200);
         let q = "SELECT schemaname, relname AS table, n_live_tup, n_dead_tup, last_autovacuum::text AS last_autovacuum \
                  FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT $1";
-        let items = match db_helper::list_catalog_rows(
+        db_helper::list_tables_response(
             q,
             CatalogBind::Int(limit),
             &[
@@ -28,11 +28,6 @@ impl NexusToolHandler for DbDeadTuplesTool {
             ],
         )
         .await
-        {
-            Ok(v) => v,
-            Err(e) => return Ok(e),
-        };
-        Ok(json!({"ok": true, "count": items.len(), "tables": items}))
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"limit":{"type":"integer"}}})

@@ -126,3 +126,42 @@ pub async fn delete_pattern_core(db: &PgPool, id: uuid::Uuid) -> ApiResult {
 
     Ok(Json(json!({ "ok": true })))
 }
+
+/// Genera i 4 wrapper axum (`list/create/update/delete_pattern`) per gli endpoint
+/// long_running_patterns, parametrizzati sul tipo State del crate chiamante (che
+/// deve esporre un campo `db: PgPool`). Punto unico (regola L) del boilerplate axum
+/// prima duplicato pari-pari in `mcp-core` e `admin-service`: la logica vive nei
+/// `*_core` sopra, questa macro elimina anche la delega ripetuta. Richiede `axum` e
+/// `uuid` fra le dipendenze del crate chiamante (gia' presenti).
+#[macro_export]
+macro_rules! long_running_axum_handlers {
+    ($state:ty) => {
+        pub async fn list_patterns(
+            axum::extract::State(state): axum::extract::State<$state>,
+        ) -> $crate::ApiResult {
+            $crate::long_running_dto::list_patterns_core(&state.db).await
+        }
+
+        pub async fn create_pattern(
+            axum::extract::State(state): axum::extract::State<$state>,
+            axum::Json(body): axum::Json<$crate::long_running_dto::CreatePatternRequest>,
+        ) -> $crate::ApiResult {
+            $crate::long_running_dto::create_pattern_core(&state.db, body).await
+        }
+
+        pub async fn update_pattern(
+            axum::extract::State(state): axum::extract::State<$state>,
+            axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+            axum::Json(body): axum::Json<$crate::long_running_dto::UpdatePatternRequest>,
+        ) -> $crate::ApiResult {
+            $crate::long_running_dto::update_pattern_core(&state.db, id, body).await
+        }
+
+        pub async fn delete_pattern(
+            axum::extract::State(state): axum::extract::State<$state>,
+            axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+        ) -> $crate::ApiResult {
+            $crate::long_running_dto::delete_pattern_core(&state.db, id).await
+        }
+    };
+}

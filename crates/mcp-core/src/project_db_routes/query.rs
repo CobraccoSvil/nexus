@@ -298,20 +298,8 @@ pub async fn import_project_db_schema(
     AxumPath(project_id): AxumPath<Uuid>,
     Json(body): Json<ImportSchemaBody>,
 ) -> ApiResult {
-    let owner: Option<Uuid> = sqlx::query_scalar("SELECT owner_user_id FROM projects WHERE id=$1")
-        .bind(project_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let caller_uuid = Uuid::parse_str(&claims.sub)
-        .map_err(|_| api_err(StatusCode::BAD_REQUEST, "Token utente non valido"))?;
-    match owner {
-        None => return Err(api_err(StatusCode::NOT_FOUND, "Progetto non trovato")),
-        Some(uid) if uid != caller_uuid => {
-            return Err(api_err(StatusCode::FORBIDDEN, "Accesso negato"))
-        }
-        _ => {}
-    }
+    // Owner check (punto unico, regola L).
+    super::shared::ensure_project_owner(&state.db, project_id, &claims).await?;
 
     let root = project_root_path(&state.db, project_id).await?;
     let connection = body.connection.as_deref();

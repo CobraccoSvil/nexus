@@ -177,6 +177,45 @@ fn row_to_json(r: &sqlx::postgres::PgRow) -> Value {
     })
 }
 
+/// Mappa una riga `mcp_servers` (id, name, description, transport, scope, enabled)
+/// al JSON degli endpoint MCP-server dei profili. Punto unico (regola L) per
+/// `admin_get_profile_mcp_servers` e `admin_list_global_mcp_servers`.
+fn mcp_server_row_to_json(r: &sqlx::postgres::PgRow) -> Value {
+    json!({
+        "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
+        "name": r.try_get::<String, _>("name").unwrap_or_default(),
+        "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
+        "transport": r.try_get::<String, _>("transport").unwrap_or_default(),
+        "scope": r.try_get::<String, _>("scope").unwrap_or_default(),
+        "enabled": r.try_get::<bool, _>("enabled").unwrap_or(true),
+    })
+}
+
+/// Valida il nome (obbligatorio) e costruisce i bind comuni dell'INSERT profilo.
+/// Punto unico (regola L) per `create_profile` e `admin_create_profile`: la query
+/// INSERT resta distinta (user vs system), ma validazione-nome + costruzione binds
+/// erano duplicate pari-pari.
+fn prepare_profile_insert(
+    body: &CreateProfileRequest,
+) -> Result<(String, ProfileInsertBinds<'_>), ApiError> {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il nome del profilo e' obbligatorio",
+        ));
+    }
+    let binds = ProfileInsertBinds::from_fields(
+        body.description.as_ref(),
+        body.avatar_emoji.as_ref(),
+        body.system_prompt.as_ref(),
+        body.default_provider.as_ref(),
+        body.default_model.as_ref(),
+        body.default_automation.as_ref(),
+    );
+    Ok((name, binds))
+}
+
 // ── Handlers ───────────────────────────────────────────────────────────────
 
 /// GET /api/profiles — lista profili utente + profili di sistema (condivisi)
@@ -208,21 +247,7 @@ pub async fn create_profile(
     Json(body): Json<CreateProfileRequest>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
-    let name = body.name.trim().to_string();
-    if name.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il nome del profilo e' obbligatorio",
-        ));
-    }
-    let binds = ProfileInsertBinds::from_fields(
-        body.description.as_ref(),
-        body.avatar_emoji.as_ref(),
-        body.system_prompt.as_ref(),
-        body.default_provider.as_ref(),
-        body.default_model.as_ref(),
-        body.default_automation.as_ref(),
-    );
+    let (name, binds) = prepare_profile_insert(&body)?;
     let row = sqlx::query(
         r#"
         INSERT INTO user_profiles
@@ -620,21 +645,7 @@ pub async fn admin_create_profile(
     Extension(_claims): Extension<Claims>,
     Json(body): Json<CreateProfileRequest>,
 ) -> ApiResult {
-    let name = body.name.trim().to_string();
-    if name.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il nome del profilo e' obbligatorio",
-        ));
-    }
-    let binds = ProfileInsertBinds::from_fields(
-        body.description.as_ref(),
-        body.avatar_emoji.as_ref(),
-        body.system_prompt.as_ref(),
-        body.default_provider.as_ref(),
-        body.default_model.as_ref(),
-        body.default_automation.as_ref(),
-    );
+    let (name, binds) = prepare_profile_insert(&body)?;
     let row = sqlx::query(
         r#"
         INSERT INTO user_profiles
@@ -784,19 +795,7 @@ pub async fn admin_get_profile_mcp_servers(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let servers: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
-                "name": r.try_get::<String, _>("name").unwrap_or_default(),
-                "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
-                "transport": r.try_get::<String, _>("transport").unwrap_or_default(),
-                "scope": r.try_get::<String, _>("scope").unwrap_or_default(),
-                "enabled": r.try_get::<bool, _>("enabled").unwrap_or(true),
-            })
-        })
-        .collect();
+    let servers: Vec<Value> = rows.iter().map(mcp_server_row_to_json).collect();
 
     Ok(Json(json!({ "servers": servers })))
 }
@@ -864,19 +863,7 @@ pub async fn admin_list_global_mcp_servers(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let servers: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
-                "name": r.try_get::<String, _>("name").unwrap_or_default(),
-                "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
-                "transport": r.try_get::<String, _>("transport").unwrap_or_default(),
-                "scope": r.try_get::<String, _>("scope").unwrap_or_default(),
-                "enabled": r.try_get::<bool, _>("enabled").unwrap_or(true),
-            })
-        })
-        .collect();
+    let servers: Vec<Value> = rows.iter().map(mcp_server_row_to_json).collect();
 
     Ok(Json(json!({ "servers": servers })))
 }

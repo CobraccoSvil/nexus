@@ -50,6 +50,33 @@ async fn fetch_agent_steps_json(
     .collect())
 }
 
+/// Carica una riga `agent_runs` eseguendo `sql` (che DEVE selezionare `user_id` e
+/// avere `WHERE id = $1`), poi verifica esistenza (404) e ownership (403) rispetto
+/// a `user_id`. Punto unico (regola L) per la verifica esistenza+ownership di un
+/// run condivisa dagli handler `get_agent_run` / `confirm_agent_run` / `cancel_agent_run`.
+async fn fetch_owned_run_row(
+    db: &sqlx::PgPool,
+    sql: &str,
+    run_id: Uuid,
+    user_id: Uuid,
+) -> Result<sqlx::postgres::PgRow, ApiError> {
+    let run_row = sqlx::query(sql)
+        .bind(run_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(run) = run_row else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Agent run non trovato"));
+    };
+
+    let owner: Uuid = run.try_get("user_id").unwrap_or(Uuid::nil());
+    if owner != user_id {
+        return Err(api_error(StatusCode::FORBIDDEN, "Run non accessibile"));
+    }
+    Ok(run)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmAgentRunRequest {
@@ -288,25 +315,16 @@ pub async fn get_agent_run(
     let run_id = Uuid::parse_str(&run_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
-    let run_row = sqlx::query(
+    let run = fetch_owned_run_row(
+        &state.db,
         "SELECT id, session_id, project_id, user_id, status, automation_mode, provider, model,
                 iteration_count, final_answer, pending_actions_json, created_at, completed_at,
                 prompt_tokens, completion_tokens, total_tokens, total_cost
          FROM agent_runs WHERE id = $1",
+        run_id,
+        user_id,
     )
-    .bind(run_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let Some(run) = run_row else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Agent run non trovato"));
-    };
-
-    let owner: Uuid = run.try_get("user_id").unwrap_or(Uuid::nil());
-    if owner != user_id {
-        return Err(api_error(StatusCode::FORBIDDEN, "Run non accessibile"));
-    }
+    .await?;
 
     // Fix S85: propaga errore SQL invece di mascherarlo come "0 steps".
     let steps = fetch_agent_steps_json(&state.db, run_id)
@@ -454,24 +472,15 @@ pub async fn confirm_agent_run(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
     // Verifica ownership e stato atteso
-    let run_row = sqlx::query(
+    let run = fetch_owned_run_row(
+        &state.db,
         "SELECT user_id, status, session_id, project_id, provider, model,
                 pending_actions_json, run_message_id, automation_mode
          FROM agent_runs WHERE id = $1",
+        run_id,
+        user_id,
     )
-    .bind(run_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let Some(run) = run_row else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Agent run non trovato"));
-    };
-
-    let owner: Uuid = run.try_get("user_id").unwrap_or(Uuid::nil());
-    if owner != user_id {
-        return Err(api_error(StatusCode::FORBIDDEN, "Run non accessibile"));
-    }
+    .await?;
 
     let status: String = run.try_get("status").unwrap_or_default();
     if status != "awaiting_confirmation" {
@@ -550,20 +559,13 @@ pub async fn cancel_agent_run(
     let run_id = Uuid::parse_str(&run_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
-    let run_row = sqlx::query("SELECT user_id, session_id, status FROM agent_runs WHERE id = $1")
-        .bind(run_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let Some(run) = run_row else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Agent run non trovato"));
-    };
-
-    let owner: Uuid = run.get::<Uuid, _>("user_id");
-    if owner != user_id {
-        return Err(api_error(StatusCode::FORBIDDEN, "Run non accessibile"));
-    }
+    let run = fetch_owned_run_row(
+        &state.db,
+        "SELECT user_id, session_id, status FROM agent_runs WHERE id = $1",
+        run_id,
+        user_id,
+    )
+    .await?;
 
     let session_id: Uuid = run.get::<Uuid, _>("session_id");
     let status: String = run.get::<String, _>("status");

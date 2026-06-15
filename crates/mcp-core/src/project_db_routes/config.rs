@@ -18,7 +18,6 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::shared::{api_err, ApiResult};
-type ApiError = (StatusCode, Json<Value>);
 use crate::{auth::Claims, AppState};
 
 // ── Corpi richiesta ──────────────────────────────────────────────────────────
@@ -128,7 +127,7 @@ pub async fn set_project_db_config(
     Json(body): Json<SetDbConfigBody>,
 ) -> ApiResult {
     // Verifica che il progetto esista e appartenga all'utente
-    ensure_project_owner(&state, &claims, project_id).await?;
+    super::shared::ensure_project_owner(&state.db, project_id, &claims).await?;
 
     // Cifra connection_string (uso base64 come placeholder — in prod usare la key manager)
     let secret_bytes: Option<Vec<u8>> = body.connection_string.as_deref().map(|s| {
@@ -394,7 +393,7 @@ pub async fn list_project_db_connections(
     Extension(claims): Extension<Claims>,
     AxumPath(project_id): AxumPath<Uuid>,
 ) -> ApiResult {
-    ensure_project_owner(&state, &claims, project_id).await?;
+    super::shared::ensure_project_owner(&state.db, project_id, &claims).await?;
 
     // NB: NON filtriamo per hosting_mode. I DB 'internal' sono quelli
     // auto-provisionati da Nexus (es. <slug>_app sul container postgres-app
@@ -434,28 +433,6 @@ pub async fn list_project_db_connections(
     Ok(Json(json!({ "connections": connections })))
 }
 
-/// Verifica che `claims.sub` sia il proprietario del progetto.
-/// Punto unico (regola L, S55) per il pattern duplicato in set_primary +
-/// delete connection handlers.
-async fn ensure_project_owner(
-    state: &AppState,
-    claims: &Claims,
-    project_id: Uuid,
-) -> Result<(), ApiError> {
-    let owner: Option<Uuid> = sqlx::query_scalar("SELECT owner_user_id FROM projects WHERE id=$1")
-        .bind(project_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let caller_uuid = Uuid::parse_str(&claims.sub)
-        .map_err(|_| api_err(StatusCode::BAD_REQUEST, "Token utente non valido"))?;
-    match owner {
-        None => Err(api_err(StatusCode::NOT_FOUND, "Progetto non trovato")),
-        Some(uid) if uid != caller_uuid => Err(api_err(StatusCode::FORBIDDEN, "Accesso negato")),
-        _ => Ok(()),
-    }
-}
-
 // ── POST /api/projects/:id/db/connections/:conn_id/set-primary ───────────────
 
 pub async fn set_primary_project_db_connection(
@@ -463,7 +440,7 @@ pub async fn set_primary_project_db_connection(
     Extension(claims): Extension<Claims>,
     AxumPath((project_id, conn_id)): AxumPath<(Uuid, Uuid)>,
 ) -> ApiResult {
-    ensure_project_owner(&state, &claims, project_id).await?;
+    super::shared::ensure_project_owner(&state.db, project_id, &claims).await?;
 
     let mut tx = state
         .db
@@ -504,7 +481,7 @@ pub async fn delete_project_db_connection(
     Extension(claims): Extension<Claims>,
     AxumPath((project_id, conn_id)): AxumPath<(Uuid, Uuid)>,
 ) -> ApiResult {
-    ensure_project_owner(&state, &claims, project_id).await?;
+    super::shared::ensure_project_owner(&state.db, project_id, &claims).await?;
 
     // Impedisci di eliminare la primaria se esiste altra connessione non primaria.
     let is_primary: Option<bool> = sqlx::query_scalar(

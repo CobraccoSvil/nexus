@@ -9,6 +9,68 @@ const RUN_COMMAND_PROBE_SECS: u64 = 10;
 const RUN_TESTS_DEFAULT_TIMEOUT: u64 = 120;
 const RUN_TESTS_MAX_TIMEOUT: u64 = 300;
 
+/// Drena stdout/stderr di un processo figlio IN PARALLELO a `child.wait()` per
+/// evitare il deadlock del buffer pipe Linux (~64 KB): comandi che producono
+/// >64KB (playwright test, npm install verbose) bloccherebbero la pipe e
+/// `child.wait()` non ritornerebbe mai. Ritorna i due task tokio che accumulano
+/// i byte; vanno awaited DOPO `child.wait()`. Punto unico (regola L): usato da
+/// `tool_run_command` e `tool_run_tests`.
+fn spawn_output_drainers(
+    child: &mut tokio::process::Child,
+) -> (
+    tokio::task::JoinHandle<Vec<u8>>,
+    tokio::task::JoinHandle<Vec<u8>>,
+) {
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout_handle {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut err) = stderr_handle {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+        }
+        buf
+    });
+    (stdout_task, stderr_task)
+}
+
+/// Registra l'esito di una run Playwright nella tabella `jobs` (fire-and-forget).
+/// No-op se `command` non e' una run Playwright. Punto unico (regola L): usato da
+/// `tool_run_command` e `tool_run_tests`.
+fn record_playwright_job(
+    ctx: &AgentToolContext,
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+) {
+    if !command.contains("playwright") {
+        return;
+    }
+    let summary = parse_playwright_summary(stdout, stderr, exit_code);
+    let db = ctx.db.clone();
+    let pid = ctx.project_id;
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO jobs (project_id, kind, status, input) VALUES ($1, 'playwright_test', $2, $3)",
+        )
+        .bind(pid)
+        .bind(if exit_code == 0 { "passed" } else { "failed" })
+        .bind(serde_json::json!({
+            "label": summary.label,
+            "message": summary.message,
+        }))
+        .execute(&*db)
+        .await;
+    });
+}
+
 /// Progetto con DB registrato e `allow_ddl_override = false` (default): schema change solo via migration.
 async fn strict_migration_only_project(ctx: &AgentToolContext) -> bool {
     matches!(
@@ -180,26 +242,8 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         Err(e) => return format!("[Errore avvio comando '{}': {}]", command, e),
     };
 
-    // Drain stdout/stderr IN PARALLELO con child.wait() per evitare deadlock
-    // del buffer pipe Linux (~64 KB). Senza questo, comandi che producono >64KB
-    // di output (es. playwright test, npm install verbose) bloccano la pipe
-    // e child.wait() non ritorna mai.
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut out) = stdout_handle {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut err) = stderr_handle {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
-        }
-        buf
-    });
+    // Drain stdout/stderr IN PARALLELO con child.wait() (evita deadlock pipe ~64KB).
+    let (stdout_task, stderr_task) = spawn_output_drainers(&mut child);
 
     // Probe: aspetta 10 secondi. Se finisce, ritorna output. Se no, killa e re-route.
     let probe = tokio::time::timeout(
@@ -231,24 +275,7 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
                 String::new()
             };
             // Registra risultati Playwright nella tabella jobs (fire-and-forget)
-            if command.contains("playwright") {
-                let summary = parse_playwright_summary(&stdout, &stderr, exit_code);
-                let db = ctx.db.clone();
-                let pid = ctx.project_id;
-                tokio::spawn(async move {
-                    let _ = sqlx::query(
-                        "INSERT INTO jobs (project_id, kind, status, input) VALUES ($1, 'playwright_test', $2, $3)"
-                    )
-                    .bind(pid)
-                    .bind(if exit_code == 0 { "passed" } else { "failed" })
-                    .bind(serde_json::json!({
-                        "label": summary.label,
-                        "message": summary.message,
-                    }))
-                    .execute(&*db)
-                    .await;
-                });
-            }
+            record_playwright_job(ctx, &command, &stdout, &stderr, exit_code);
 
             let combined = format!(
                 "{}EXIT CODE: {}\nSTDOUT:\n{}\nSTDERR:\n{}{}",
@@ -352,22 +379,7 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> Str
     };
 
     // Drain stdout/stderr in parallelo con child.wait() per evitare deadlock pipe (~64KB).
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut out) = stdout_handle {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut err) = stderr_handle {
-            let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
-        }
-        buf
-    });
+    let (stdout_task, stderr_task) = spawn_output_drainers(&mut child);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait()).await;
 
@@ -384,24 +396,7 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> Str
             let truncated_stderr = smart_truncate_test_output(&stderr, 2000);
 
             // Registra risultati Playwright nella tabella jobs
-            if command.contains("playwright") {
-                let summary = parse_playwright_summary(&stdout, &stderr, exit_code);
-                let db = ctx.db.clone();
-                let pid = ctx.project_id;
-                tokio::spawn(async move {
-                    let _ = sqlx::query(
-                        "INSERT INTO jobs (project_id, kind, status, input) VALUES ($1, 'playwright_test', $2, $3)"
-                    )
-                    .bind(pid)
-                    .bind(if exit_code == 0 { "passed" } else { "failed" })
-                    .bind(serde_json::json!({
-                        "label": summary.label,
-                        "message": summary.message,
-                    }))
-                    .execute(&*db)
-                    .await;
-                });
-            }
+            record_playwright_job(ctx, &command, &stdout, &stderr, exit_code);
 
             let status_label = if exit_code == 0 {
                 "TUTTI I TEST PASSATI"

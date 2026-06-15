@@ -149,6 +149,22 @@ pub async fn list_catalog_rows(
         .collect())
 }
 
+/// Esegue una query di catalogo che proietta una lista di tabelle e ne incapsula
+/// l'esito nel JSON standard `{ok, count, tables}`. Punto unico (regola L) per i
+/// tool `db_bloat_check` / `db_dead_tuples`, che condividevano lo stesso wrapping
+/// `match list_catalog_rows { ... } -> Ok(json!(...))`.
+pub async fn list_tables_response(
+    sql: &str,
+    bind: CatalogBind,
+    cols: &[CatalogCol],
+) -> Result<Value, NexusToolError> {
+    let items = match list_catalog_rows(sql, bind, cols).await {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    Ok(json!({"ok": true, "count": items.len(), "tables": items}))
+}
+
 /// Introspezione tabelle+colonne via `information_schema` su un pool gia'
 /// aperto. Con `with_defaults_and_estimates` aggiunge `column_default` per
 /// colonna e `estimated_row_count` per tabella (variante project_db_schema).

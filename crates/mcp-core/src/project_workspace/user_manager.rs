@@ -18,6 +18,8 @@ use sqlx::PgPool;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::db_settings::{read_bool, read_u64};
+
 /// Floor HARDCODED non bypassabile tra due tentativi di risurrezione, anche se
 /// il setting DB e' inferiore (o zero): evita di martellare root come se il
 /// manager utente fosse in crash-loop.
@@ -102,28 +104,6 @@ pub async fn ensure_user_manager(db: &PgPool) {
             );
         }
     }
-}
-
-async fn read_bool(db: &PgPool, key: &str, default: bool) -> bool {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(default)
-}
-
-async fn read_u64(db: &PgPool, key: &str, default: u64) -> u64 {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(default)
 }
 
 #[cfg(test)]

@@ -13,6 +13,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
+use crate::db_settings::{read_bool, read_text, read_u64};
+
 /// Risultato lookup: payload + ref id se la chiave esiste e non e' scaduta.
 pub struct CacheHit {
     pub payload: String,
@@ -110,39 +112,6 @@ pub async fn invalidate_readers(db: &PgPool, readers: &[String]) -> u64 {
         .await
         .map(|r| r.rows_affected())
         .unwrap_or(0)
-}
-
-async fn read_bool(db: &PgPool, key: &str, default: bool) -> bool {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(default)
-}
-
-async fn read_u64(db: &PgPool, key: &str, default: u64) -> u64 {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-async fn read_text(db: &PgPool, key: &str, default: &str) -> String {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_string())
 }
 
 /// Calcola la cache key per (tool_name, args). Canonicalizza l'ordine chiavi

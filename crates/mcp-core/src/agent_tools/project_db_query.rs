@@ -143,8 +143,13 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
     }
 }
 
-/// Tool `nexus_db_tables`: lista tabelle + righe stimate dello schema.
-pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) -> String {
+/// Estrae `schema` (default "public") + `connection` opzionale dall'input, risolve
+/// la connessione del progetto e apre il pool. Punto unico (regola L) per i tool
+/// `nexus_db_tables` / `nexus_db_describe`: prima il blocco era duplicato pari-pari.
+async fn resolve_schema_and_pool(
+    ctx: &AgentToolContext,
+    input: &Value,
+) -> Result<(String, sqlx::PgPool), String> {
     let schema = input
         .get("schema")
         .and_then(Value::as_str)
@@ -155,13 +160,15 @@ pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) 
         .and_then(Value::as_str)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let conn = resolve_project_conn(&ctx.db, ctx.project_id, connection.as_deref()).await?;
+    let pool = open_pool(&conn).await?;
+    Ok((schema, pool))
+}
 
-    let conn = match resolve_project_conn(&ctx.db, ctx.project_id, connection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return json!({"error": e}).to_string(),
-    };
-    let pool = match open_pool(&conn).await {
-        Ok(p) => p,
+/// Tool `nexus_db_tables`: lista tabelle + righe stimate dello schema.
+pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) -> String {
+    let (schema, pool) = match resolve_schema_and_pool(ctx, input).await {
+        Ok(v) => v,
         Err(e) => return json!({"error": e}).to_string(),
     };
 
@@ -202,23 +209,8 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return json!({"error": "Parametro 'table' obbligatorio."}).to_string(),
     };
-    let schema = input
-        .get("schema")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "public".to_string());
-    let connection = input
-        .get("connection")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let conn = match resolve_project_conn(&ctx.db, ctx.project_id, connection.as_deref()).await {
-        Ok(c) => c,
-        Err(e) => return json!({"error": e}).to_string(),
-    };
-    let pool = match open_pool(&conn).await {
-        Ok(p) => p,
+    let (schema, pool) = match resolve_schema_and_pool(ctx, input).await {
+        Ok(v) => v,
         Err(e) => return json!({"error": e}).to_string(),
     };
 

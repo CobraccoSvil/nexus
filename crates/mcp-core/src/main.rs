@@ -20,6 +20,7 @@ mod chat_sessions;
 mod claude_agents;
 mod context_settings;
 mod db;
+mod db_settings;
 mod deepseek_balance_sync;
 mod dispatcher_routes;
 mod dlp;

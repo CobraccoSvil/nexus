@@ -5,12 +5,40 @@
 
 use axum::{http::StatusCode, Json};
 use serde_json::{json, Value};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::auth::Claims;
 
 pub(crate) type ApiError = (StatusCode, Json<Value>);
 pub(crate) type ApiResult = Result<Json<Value>, ApiError>;
 
 pub(crate) fn api_err(code: StatusCode, msg: impl Into<String>) -> ApiError {
     (code, Json(json!({ "error": msg.into() })))
+}
+
+/// Verifica che il chiamante (`claims.sub`) sia l'owner del progetto `project_id`.
+/// Punto unico (regola L) del check ripetuto identico negli handler project_db
+/// (`provision_project_db`, `import_project_db_schema`, `set_project_db_config`).
+/// `Ok(())` se autorizzato; altrimenti 404 (progetto assente) / 403 (non owner) /
+/// 400 (token non valido) / 500 (errore DB).
+pub(crate) async fn ensure_project_owner(
+    db: &PgPool,
+    project_id: Uuid,
+    claims: &Claims,
+) -> Result<(), ApiError> {
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT owner_user_id FROM projects WHERE id=$1")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let caller_uuid = Uuid::parse_str(&claims.sub)
+        .map_err(|_| api_err(StatusCode::BAD_REQUEST, "Token utente non valido"))?;
+    match owner {
+        None => Err(api_err(StatusCode::NOT_FOUND, "Progetto non trovato")),
+        Some(uid) if uid != caller_uuid => Err(api_err(StatusCode::FORBIDDEN, "Accesso negato")),
+        _ => Ok(()),
+    }
 }
 
 /// Converte una stringa di connessione in formato ADO.NET/Npgsql

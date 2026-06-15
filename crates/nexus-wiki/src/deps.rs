@@ -44,3 +44,31 @@ pub struct WikiDeps {
     pub template_cache: TemplateCache,
     pub ai: Arc<dyn WikiAiServices>,
 }
+
+/// Estrae `(input_tokens, output_tokens)` dal payload di `generate_completion`,
+/// tollerando le varianti di naming dei provider (`prompt_tokens`/`input_tokens`
+/// e annidamento sotto `usage`). Punto unico (regola L) per i worker wiki che
+/// contabilizzano i token (`title_gen`, `triple_extractor`).
+pub fn extract_usage_tokens(resp: &Value) -> (i64, i64) {
+    let input = resp
+        .get("prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .or_else(|| resp.get("input_tokens").and_then(|v| v.as_i64()))
+        .or_else(|| {
+            resp.get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
+    let output = resp
+        .get("completion_tokens")
+        .and_then(|v| v.as_i64())
+        .or_else(|| resp.get("output_tokens").and_then(|v| v.as_i64()))
+        .or_else(|| {
+            resp.get("usage")
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
+    (input, output)
+}

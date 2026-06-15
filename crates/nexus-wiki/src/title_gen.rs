@@ -392,26 +392,9 @@ pub async fn generate_title_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<Ti
         }
     };
 
-    report.llm_tokens_input = resp
-        .get("prompt_tokens")
-        .and_then(|v| v.as_i64())
-        .or_else(|| resp.get("input_tokens").and_then(|v| v.as_i64()))
-        .or_else(|| {
-            resp.get("usage")
-                .and_then(|u| u.get("prompt_tokens"))
-                .and_then(|v| v.as_i64())
-        })
-        .unwrap_or(0);
-    report.llm_tokens_output = resp
-        .get("completion_tokens")
-        .and_then(|v| v.as_i64())
-        .or_else(|| resp.get("output_tokens").and_then(|v| v.as_i64()))
-        .or_else(|| {
-            resp.get("usage")
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(|v| v.as_i64())
-        })
-        .unwrap_or(0);
+    let (tok_in, tok_out) = crate::deps::extract_usage_tokens(&resp);
+    report.llm_tokens_input = tok_in;
+    report.llm_tokens_output = tok_out;
 
     let content = resp
         .get("content")

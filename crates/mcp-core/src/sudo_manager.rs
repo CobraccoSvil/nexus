@@ -17,6 +17,8 @@ use anyhow::{anyhow, Context, Result};
 use sqlx::PgPool;
 use tokio::process::Command;
 
+use crate::db_settings::{read_bool, read_text};
+
 /// Outcome di una chiamata sudo_manager::execute.
 #[derive(Debug, Clone)]
 pub struct SudoOutcome {
@@ -48,28 +50,6 @@ impl SudoConfig {
             runner_path,
         }
     }
-}
-
-async fn read_bool(db: &PgPool, key: &str, default: bool) -> bool {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(default)
-}
-
-async fn read_text(db: &PgPool, key: &str, default: &str) -> String {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_string())
 }
 
 /// Esegue un purpose whitelistato. Errore se:

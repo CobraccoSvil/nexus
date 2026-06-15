@@ -18,7 +18,7 @@ impl NexusToolHandler for DbBloatCheckTool {
                         CASE WHEN n_live_tup>0 THEN (n_dead_tup::float / n_live_tup::float) ELSE 0 END AS ratio \
                  FROM pg_stat_user_tables WHERE n_live_tup > 0 \
                  ORDER BY ratio DESC LIMIT $1";
-        let items = match db_helper::list_catalog_rows(
+        db_helper::list_tables_response(
             q,
             CatalogBind::Int(limit),
             &[
@@ -30,11 +30,6 @@ impl NexusToolHandler for DbBloatCheckTool {
             ],
         )
         .await
-        {
-            Ok(v) => v,
-            Err(e) => return Ok(e),
-        };
-        Ok(json!({"ok": true, "count": items.len(), "tables": items}))
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"limit":{"type":"integer"}}})
