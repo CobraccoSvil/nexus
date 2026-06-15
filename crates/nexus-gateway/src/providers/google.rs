@@ -30,7 +30,8 @@ use super::gcp_auth::{
 };
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::types::{
-    LlmRequest, LlmResponse, LlmStreamChunk, LlmUsage, MessageContent, SensitivityTier,
+    LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage, MessageContent,
+    SensitivityTier, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -502,6 +503,43 @@ fn resolve_thinking(req: &LlmRequest, configured_budget: u32) -> GoogleThinking 
     Some(budget)
 }
 
+/// Rimuove ricorsivamente le chiavi JSON-Schema non supportate da Gemini
+/// (parita' col brain `_clean_schema_for_google` -> `compress_schema`,
+/// `_SKIP_KEYS` in `brain/providers/_schema_utils.py`). Gemini rifiuta con 400
+/// INVALID_ARGUMENT le chiavi di vocabolario JSON-Schema che non implementa
+/// (`additionalProperties`, `$schema`, `$defs`, `definitions`, `title`,
+/// `default`, `examples`). La ricorsione e' uniforme su `Object`/`Array`, cosi'
+/// copre `properties`/`items`/`anyOf`/`oneOf`/`allOf` senza casistica esplicita.
+/// Funzione PURA (regola L: nessun equivalente esiste nel gateway), testabile
+/// senza rete.
+fn clean_schema_for_google(schema: &serde_json::Value) -> serde_json::Value {
+    const SKIP: &[&str] = &[
+        "additionalProperties",
+        "$schema",
+        "$defs",
+        "definitions",
+        "title",
+        "default",
+        "examples",
+    ];
+    match schema {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if SKIP.contains(&k.as_str()) {
+                    continue;
+                }
+                out.insert(k.clone(), clean_schema_for_google(v));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(clean_schema_for_google).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// Costruisce il corpo `GenerateContentRequest`: separa il system come
 /// `systemInstruction`, mappa i ruoli (`assistant`->`model`) e impacchetta i
 /// parametri di generazione in `generationConfig`.
@@ -514,12 +552,73 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
     let mut system_instruction: Option<GoogleContent> = None;
     let mut contents: Vec<GoogleContent> = Vec::new();
 
+    // Mappa id->name di TUTTE le tool-call in history (parita' col Python
+    // `_convert_messages_to_google` ~769-775): Gemini vuole il NOME del tool nel
+    // functionResponse, non l'id. Costruita prima del loop cosi' un tool-result
+    // puo' risolvere il nome anche se la call e' in un turno precedente.
+    let mut id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for msg in &req.messages {
+        if let Some(calls) = &msg.tool_calls {
+            for tc in calls {
+                id_to_name.insert(tc.id.clone(), tc.function.name.clone());
+            }
+        }
+    }
+
     for msg in &req.messages {
         match msg.role.as_str() {
             "system" => {
                 system_instruction = Some(GoogleContent {
                     role: None,
                     parts: vec![GooglePart::text(content_to_string(&msg.content))],
+                });
+            }
+            // Tool-result: Gemini lo vuole come una part `functionResponse` su un
+            // messaggio role=`user` (parita' col Python ~818-842, response
+            // `{"result": ...}`). Il NOME del tool si risolve dalla mappa
+            // id->name; se l'id e' sconosciuto si ripiega sull'id grezzo (Gemini
+            // rifiuterebbe il mismatch, ma e' il fallback meno dannoso).
+            "tool" => {
+                let name = msg
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| id_to_name.get(id).cloned())
+                    .or_else(|| msg.tool_call_id.clone())
+                    .unwrap_or_default();
+                let response = serde_json::json!({ "result": content_to_string(&msg.content) });
+                contents.push(GoogleContent {
+                    role: Some("user".to_string()),
+                    parts: vec![GooglePart::function_response(name, response)],
+                });
+            }
+            // Assistant con tool-call: emette role=`model` con una part
+            // `functionCall` per ciascuna call (parita' col Python ~807-817). La
+            // thought_signature va sulla PRIMA part del turno.
+            "assistant" if msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) => {
+                let mut parts: Vec<GooglePart> = Vec::new();
+                // Eventuale testo dell'assistant prima delle call (raro).
+                if let MessageContent::Text(t) = &msg.content {
+                    if !t.is_empty() {
+                        parts.push(GooglePart::text(t.clone()));
+                    }
+                }
+                for tc in msg.tool_calls.as_ref().unwrap() {
+                    // arguments e' una stringa JSON nel contratto; Gemini vuole un
+                    // oggetto in `args` (parita' col mapping Anthropic ~606-608).
+                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    parts.push(GooglePart::function_call(tc.function.name.clone(), args));
+                }
+                if parts.is_empty() {
+                    parts.push(GooglePart::text(String::new()));
+                }
+                if let Some(first) = parts.first_mut() {
+                    first.thought_signature = msg.thinking_signature.clone();
+                }
+                contents.push(GoogleContent {
+                    role: Some("model".to_string()),
+                    parts,
                 });
             }
             role => {
@@ -569,13 +668,34 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
             None
         };
 
+    // functionDeclarations native Gemini: ogni tool del contratto OpenAI diventa
+    // una FunctionDeclaration con lo schema normalizzato al subset Google
+    // (clean_schema_for_google). Senza questo blocco, `tool_config` (mode=ANY) e'
+    // inerte e il modello emette i control-token nel testo invece di una
+    // functionCall. Parita' col brain `google_provider.py` (un solo elemento
+    // Tool contenente tutte le declarations) e con openai_compat/anthropic, che
+    // dichiarano i tool nel body. NOTA thinking+tools: la policy
+    // disable_for_tools vive nel brain (punto unico, regola L); il gateway
+    // riceve gia' `req.thinking` risolto e non aggiunge gate qui.
+    let tools = req.tools.as_ref().map(|defs| {
+        let decls: Vec<GoogleFunctionDeclaration> = defs
+            .iter()
+            .map(|t| GoogleFunctionDeclaration {
+                name: t.function.name.clone(),
+                description: t.function.description.clone().unwrap_or_default(),
+                // Schema assente/vuoto -> oggetto minimale (parita' Python:427).
+                parameters: clean_schema_for_google(&t.function.parameters),
+            })
+            .collect();
+        vec![GoogleToolDecl {
+            function_declarations: decls,
+        }]
+    });
+
     // tool_choice mappato a `tool_config.function_calling_config.mode` via il
     // punto unico (regola L). Lo iniettiamo solo quando ci sono `tools` e un
-    // vincolo riconosciuto. NOTA: questo build REST nativo non emette ancora i
-    // `functionDeclarations` (vedi `from_generate_response`: tool_calls=None),
-    // quindi `tool_config` ha effetto pratico solo quando il supporto tool
-    // nativo Google verra' aggiunto; il mapping resta corretto e pronto, e segue
-    // la stessa fonte unica degli altri provider.
+    // vincolo riconosciuto. Ora coerente: mode=ANY ha senso perche' le
+    // functionDeclarations sono effettivamente presenti nel body.
     let tool_config = req
         .tool_choice
         .as_ref()
@@ -589,6 +709,7 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
         contents,
         system_instruction,
         generation_config,
+        tools,
         tool_config,
     }
 }
@@ -722,6 +843,7 @@ fn from_generate_response(
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut thinking_signature: Option<String> = None;
+    let mut tool_calls: Vec<LlmToolCall> = Vec::new();
 
     if let Some(c) = candidate.as_ref() {
         for part in &c.content.parts {
@@ -731,6 +853,24 @@ fn from_generate_response(
                         thinking_signature = Some(sig.clone());
                     }
                 }
+            }
+            // functionCall: il modello chiede di eseguire un tool. Gemini non
+            // emette un id di tool-call, ne sintetizziamo uno stabile cosi' il
+            // brain puo' correlare il functionResponse nel round-trip (parita'
+            // col Python ~589 `toolu_{uuid}`). La part-functionCall non porta
+            // testo: passa oltre.
+            if let Some(fc) = &part.function_call {
+                tool_calls.push(LlmToolCall {
+                    id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                    kind: "function".to_string(),
+                    function: ToolFunctionCall {
+                        name: fc.name.clone(),
+                        // Il contratto vuole `arguments` come STRINGA JSON
+                        // (parita' Anthropic ~761): serializziamo l'oggetto args.
+                        arguments: function_args_to_string(&fc.args),
+                    },
+                });
+                continue;
             }
             if let Some(text) = &part.text {
                 if part.thought.unwrap_or(false) {
@@ -742,7 +882,14 @@ fn from_generate_response(
         }
     }
 
-    let finish_reason = map_finish_reason(candidate.as_ref().and_then(|c| c.finish_reason.as_deref()));
+    // Quando ci sono tool-call, Gemini segnala finishReason=STOP: per parita' col
+    // contratto (Anthropic/OpenAI usano "tool_calls"), forziamo il segnale che il
+    // brain usa per capire che deve eseguire i tool.
+    let finish_reason = if tool_calls.is_empty() {
+        map_finish_reason(candidate.as_ref().and_then(|c| c.finish_reason.as_deref()))
+    } else {
+        "tool_calls".to_string()
+    };
 
     let usage = resp
         .usage_metadata
@@ -761,11 +908,13 @@ fn from_generate_response(
 
     LlmResponse {
         content,
-        // Il formato base mappato non emette function-call: tool su Google
-        // richiederebbe il blocco functionDeclarations, fuori scope di questa
-        // implementazione REST minimale (parita' funzionale col TS, che a sua
-        // volta delega senza supporto tool nativo nel formato Google).
-        tool_calls: None,
+        // functionCall native Gemini -> tool_calls del contratto (parita' coi
+        // peer anthropic/openai_compat). `None` quando il turno non chiede tool.
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
         usage,
         model_used,
         provider_used: "google".to_string(),
@@ -779,6 +928,17 @@ fn from_generate_response(
         },
         thinking_signature,
     }
+}
+
+/// Serializza gli `args` di una functionCall Gemini nella STRINGA JSON attesa
+/// dal contratto (`ToolFunctionCall.arguments`). Gli args nulli/assenti
+/// (Gemini li omette per le funzioni senza parametri) diventano `{}`, mai la
+/// stringa `"null"` che il brain non saprebbe deserializzare.
+fn function_args_to_string(args: &serde_json::Value) -> String {
+    if args.is_null() {
+        return "{}".to_string();
+    }
+    serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Mappa il `finishReason` Google ai valori canonici del contratto. `STOP` e i
@@ -851,8 +1011,28 @@ impl GoogleSseParser {
         // `delta`, il secondo in `reasoning_delta` (parita' col Python streaming).
         let mut delta = String::new();
         let mut reasoning_delta = String::new();
+        // Gemini emette la functionCall completa dentro una part (non frammentata
+        // carattere-per-carattere come OpenAI): produciamo un singolo
+        // ToolCallDelta gia' completo, prendendo la prima functionCall della part
+        // list (parita' con openai_compat che yield-a tc[0]).
+        let mut tool_call_delta: Option<ToolCallDelta> = None;
         if let Some(c) = candidate.as_ref() {
             for part in &c.content.parts {
+                if tool_call_delta.is_none() {
+                    if let Some(fc) = &part.function_call {
+                        tool_call_delta = Some(ToolCallDelta {
+                            index: 0,
+                            id: Some(format!("call_{}", uuid::Uuid::new_v4().simple())),
+                            function: Some(ToolCallDeltaFunction {
+                                name: Some(fc.name.clone()),
+                                // arguments come stringa JSON completa in un colpo
+                                // (Gemini non frammenta gli args nello stream).
+                                arguments: Some(function_args_to_string(&fc.args)),
+                            }),
+                        });
+                        continue; // la part-functionCall non porta text
+                    }
+                }
                 if let Some(text) = &part.text {
                     if part.thought.unwrap_or(false) {
                         reasoning_delta.push_str(text);
@@ -863,10 +1043,23 @@ impl GoogleSseParser {
             }
         }
 
-        let finish_reason = candidate
-            .as_ref()
-            .and_then(|c| c.finish_reason.as_deref())
-            .map(|r| map_finish_reason(Some(r)));
+        // Quando il chunk porta una tool-call, segnaliamo "tool_calls" al consumer
+        // (parita' col mapping non-stream): Gemini puo' mandare functionCall con
+        // finishReason=STOP (o senza finish nel chunk della call).
+        let finish_reason = {
+            let mapped = candidate
+                .as_ref()
+                .and_then(|c| c.finish_reason.as_deref())
+                .map(|r| map_finish_reason(Some(r)));
+            if tool_call_delta.is_some() {
+                match mapped.as_deref() {
+                    None | Some("stop") => Some("tool_calls".to_string()),
+                    _ => mapped,
+                }
+            } else {
+                mapped
+            }
+        };
 
         let usage = resp.usage_metadata.as_ref().map(|u| LlmUsage {
             input_tokens: u.prompt_token_count,
@@ -875,9 +1068,14 @@ impl GoogleSseParser {
             cache_creation_tokens: None,
         });
 
-        // Chunk vuoto (nessun delta, nessun reasoning, nessun finish, nessun
-        // usage): salta.
-        if delta.is_empty() && reasoning_delta.is_empty() && finish_reason.is_none() && usage.is_none()
+        // Chunk vuoto (nessun delta, nessun reasoning, nessuna tool-call, nessun
+        // finish, nessun usage): salta. La tool-call va inclusa nella guardia,
+        // altrimenti un chunk con SOLA functionCall verrebbe scartato.
+        if delta.is_empty()
+            && reasoning_delta.is_empty()
+            && tool_call_delta.is_none()
+            && finish_reason.is_none()
+            && usage.is_none()
         {
             return None;
         }
@@ -887,7 +1085,7 @@ impl GoogleSseParser {
 
         Some(LlmStreamChunk {
             delta,
-            tool_call_delta: None,
+            tool_call_delta,
             finish_reason,
             usage,
             provider_used: Some("google".to_string()),
@@ -912,6 +1110,12 @@ struct GenerateContentRequest {
     system_instruction: Option<GoogleContent>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<GenerationConfig>,
+    /// Dichiarazioni di funzione (function calling nativo Gemini). Wrapper
+    /// `[{ functionDeclarations: [...] }]`. Presente solo quando `req.tools` e'
+    /// valorizzato. Senza questo campo, `toolConfig`(mode=ANY) e' inerte e il
+    /// modello emette i control-token nel testo invece di una functionCall.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GoogleToolDecl>>,
     /// Vincolo di chiamata tool (`tool_config.function_calling_config`). Presente
     /// solo quando il chiamante imposta `tool_choice` e ci sono tool.
     #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
@@ -928,6 +1132,25 @@ struct GoogleToolConfig {
     function_calling_config: serde_json::Value,
 }
 
+/// Elemento `tools[]` del body Gemini: contenitore di functionDeclarations. Il
+/// wire vuole `{ "functionDeclarations": [...] }`. Un solo elemento Tool
+/// raccoglie tutte le declarations (parita' col Python `google_provider.py`).
+#[derive(Debug, Serialize)]
+struct GoogleToolDecl {
+    #[serde(rename = "functionDeclarations")]
+    function_declarations: Vec<GoogleFunctionDeclaration>,
+}
+
+/// Singola dichiarazione di funzione (function calling nativo). `parameters` e'
+/// lo schema JSON gia' normalizzato al subset Google ([`clean_schema_for_google`]).
+#[derive(Debug, Serialize)]
+struct GoogleFunctionDeclaration {
+    name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    description: String,
+    parameters: serde_json::Value,
+}
+
 #[derive(Debug, Serialize)]
 struct GoogleContent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -936,8 +1159,9 @@ struct GoogleContent {
 }
 
 /// Part di un messaggio Google. Esattamente uno tra `text`, `inline_data`,
-/// `file_data` e' valorizzato (gli altri sono omessi dal wire). La
-/// `thought_signature` si attacca alla prima part del turno `model`.
+/// `file_data`, `function_call`, `function_response` e' valorizzato (gli altri
+/// sono omessi dal wire). La `thought_signature` si attacca alla prima part del
+/// turno `model`.
 #[derive(Debug, Serialize)]
 struct GooglePart {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -948,6 +1172,14 @@ struct GooglePart {
     /// Riferimento a file remoto (`{mimeType?, fileUri}`), per le URL http.
     #[serde(rename = "fileData", skip_serializing_if = "Option::is_none")]
     file_data: Option<GoogleFileData>,
+    /// Chiamata a funzione emessa dal modello in un turno assistant precedente,
+    /// ri-passata identica (`{name, args}`) nel round-trip. Mutuamente esclusiva
+    /// con text/inlineData/fileData.
+    #[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
+    function_call: Option<GoogleFunctionCallPart>,
+    /// Risultato di un tool (`{name, response}`), su una part di un turno `user`.
+    #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
+    function_response: Option<GoogleFunctionResponsePart>,
     /// Firma opaca del thinking (base64) ri-passata nei turni successivi. Sul
     /// wire e' `thoughtSignature`; assente quando il turno non la porta.
     #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
@@ -960,6 +1192,8 @@ impl GooglePart {
             text: Some(text),
             inline_data: None,
             file_data: None,
+            function_call: None,
+            function_response: None,
             thought_signature: None,
         }
     }
@@ -969,6 +1203,8 @@ impl GooglePart {
             text: None,
             inline_data: Some(GoogleInlineData { mime_type, data }),
             file_data: None,
+            function_call: None,
+            function_response: None,
             thought_signature: None,
         }
     }
@@ -981,9 +1217,51 @@ impl GooglePart {
                 mime_type,
                 file_uri,
             }),
+            function_call: None,
+            function_response: None,
             thought_signature: None,
         }
     }
+
+    /// Part `functionCall`: ri-passa una tool-call assistant nel round-trip.
+    fn function_call(name: String, args: serde_json::Value) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            file_data: None,
+            function_call: Some(GoogleFunctionCallPart { name, args }),
+            function_response: None,
+            thought_signature: None,
+        }
+    }
+
+    /// Part `functionResponse`: porta il risultato di un tool nel round-trip.
+    fn function_response(name: String, response: serde_json::Value) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            file_data: None,
+            function_call: None,
+            function_response: Some(GoogleFunctionResponsePart { name, response }),
+            thought_signature: None,
+        }
+    }
+}
+
+/// Part `functionCall` (invio): chiamata a funzione di un turno assistant
+/// precedente, ri-passata identica. Gemini vuole `args` come oggetto.
+#[derive(Debug, Serialize)]
+struct GoogleFunctionCallPart {
+    name: String,
+    args: serde_json::Value,
+}
+
+/// Part `functionResponse` (invio): risultato di un tool. Gemini correla il
+/// `name` alla functionCall precedente con lo stesso nome.
+#[derive(Debug, Serialize)]
+struct GoogleFunctionResponsePart {
+    name: String,
+    response: serde_json::Value,
 }
 
 /// Immagine inline base64 nel formato Gemini (`inlineData`).
@@ -1056,10 +1334,24 @@ struct GoogleRespPart {
     /// da separare dal testo utente.
     #[serde(default)]
     thought: Option<bool>,
+    /// Chiamata a funzione emessa dal modello (function calling nativo). Quando
+    /// presente, la part NON porta testo: va mappata a un [`LlmToolCall`].
+    #[serde(rename = "functionCall", default)]
+    function_call: Option<GoogleFunctionCall>,
     /// Firma opaca del thinking (base64) emessa da Gemini: va catturata e
     /// rispedita identica nei turni successivi.
     #[serde(rename = "thoughtSignature", default)]
     thought_signature: Option<String>,
+}
+
+/// `functionCall` emessa da Gemini nella risposta (`{name, args}`). Gli `args`
+/// arrivano gia' come oggetto JSON strutturato (non stringa come OpenAI).
+#[derive(Debug, Deserialize)]
+struct GoogleFunctionCall {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    args: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1600,5 +1892,292 @@ mod tests {
         assert_eq!(json["contents"][0]["role"], "model");
         assert_eq!(parts[0]["thoughtSignature"], "c2ln");
         assert!(parts[1].get("thoughtSignature").is_none());
+    }
+
+    // --- Function calling nativo (passo tool) ------------------------------
+
+    fn read_file_tool() -> crate::types::LlmToolDefinition {
+        crate::types::LlmToolDefinition {
+            kind: "function".to_string(),
+            function: crate::types::ToolFunctionDef {
+                name: "read_file".to_string(),
+                description: Some("legge un file".to_string()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "title": "ReadFileArgs",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "title": "Path",
+                            "default": "."
+                        },
+                        "lines": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": { "n": { "type": "integer" } }
+                            }
+                        }
+                    },
+                    "required": ["path"]
+                }),
+                strict: None,
+            },
+        }
+    }
+
+    fn req_with_tools(messages: Vec<LlmMessage>, tools: bool) -> LlmRequest {
+        LlmRequest {
+            model: "gemini-2.5-pro".to_string(),
+            messages,
+            temperature: None,
+            max_tokens: Some(1024),
+            tools: if tools {
+                Some(vec![read_file_tool()])
+            } else {
+                None
+            },
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: metadata(),
+        }
+    }
+
+    #[test]
+    fn tools_diventano_function_declarations() {
+        // I tool del contratto finiscono in tools[0].functionDeclarations con
+        // nome/descrizione/parametri (parita' coi peer openai_compat/anthropic).
+        let req = req_with_tools(vec![msg("user", "leggi x")], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let decls = &json["tools"][0]["functionDeclarations"];
+        assert_eq!(decls[0]["name"], "read_file");
+        assert_eq!(decls[0]["description"], "legge un file");
+        assert_eq!(decls[0]["parameters"]["type"], "object");
+        assert_eq!(decls[0]["parameters"]["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn schema_pulito_rimuove_chiavi_non_supportate() {
+        // Le chiavi JSON-Schema non supportate da Gemini vengono rimosse a TUTTI
+        // i livelli di annidamento (properties + items), non solo alla radice.
+        let req = req_with_tools(vec![msg("user", "leggi x")], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let params = &json["tools"][0]["functionDeclarations"][0]["parameters"];
+        // Radice ripulita.
+        assert!(params.get("$schema").is_none());
+        assert!(params.get("title").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        // Property annidata ripulita (title/default rimossi, type preservato).
+        let path = &params["properties"]["path"];
+        assert_eq!(path["type"], "string");
+        assert!(path.get("title").is_none());
+        assert!(path.get("default").is_none());
+        // items annidato in array ripulito.
+        let nested = &params["properties"]["lines"]["items"];
+        assert!(nested.get("additionalProperties").is_none());
+        assert_eq!(nested["properties"]["n"]["type"], "integer");
+        // required (vocabolario supportato) preservato.
+        assert_eq!(params["required"][0], "path");
+    }
+
+    #[test]
+    fn clean_schema_funzione_pura() {
+        // Test diretto della funzione pura: chiavi note rimosse, struttura
+        // preservata.
+        let raw = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "$defs": { "X": {} },
+            "definitions": { "Y": {} },
+            "examples": [1, 2],
+            "properties": {
+                "a": { "type": "string", "default": "z" }
+            }
+        });
+        let cleaned = clean_schema_for_google(&raw);
+        assert_eq!(cleaned["type"], "object");
+        assert!(cleaned.get("additionalProperties").is_none());
+        assert!(cleaned.get("$defs").is_none());
+        assert!(cleaned.get("definitions").is_none());
+        assert!(cleaned.get("examples").is_none());
+        assert_eq!(cleaned["properties"]["a"]["type"], "string");
+        assert!(cleaned["properties"]["a"].get("default").is_none());
+    }
+
+    #[test]
+    fn tool_choice_required_con_tools_emette_sia_tool_config_sia_tools() {
+        // Rafforza il test storico: con tool_choice="required" + tools, ora il
+        // body porta SIA toolConfig(mode=ANY) SIA le functionDeclarations (prima
+        // le declarations mancavano e mode=ANY era inerte).
+        let mut req = req_with_tools(vec![msg("user", "trova")], true);
+        req.tool_choice = Some(serde_json::json!("required"));
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+        assert_eq!(
+            json["tools"][0]["functionDeclarations"][0]["name"],
+            "read_file"
+        );
+    }
+
+    #[test]
+    fn senza_tools_niente_campo_tools() {
+        let req = req_with_tools(vec![msg("user", "ciao")], false);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn response_function_call_diventa_tool_calls() {
+        // Una part functionCall nella risposta -> tool_calls valorizzato, args
+        // serializzati a stringa JSON, finish_reason forzato a "tool_calls".
+        let raw = r#"{
+            "candidates": [{
+                "content": {"parts": [
+                    {"functionCall": {"name": "read_file", "args": {"path": "src/main.rs"}}}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3}
+        }"#;
+        let parsed: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let resp = from_generate_response(parsed, "gemini-2.5-pro".to_string(), 12);
+
+        assert_eq!(resp.finish_reason, "tool_calls");
+        let calls = resp.tool_calls.expect("tool_calls valorizzato");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].kind, "function");
+        assert!(calls[0].id.starts_with("call_"));
+        // arguments e' una STRINGA JSON deserializzabile.
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "src/main.rs");
+        // Nessun testo: content vuoto.
+        assert_eq!(resp.content, "");
+    }
+
+    #[test]
+    fn response_function_call_senza_args_diventa_oggetto_vuoto() {
+        // Funzione senza parametri: args assente -> arguments "{}".
+        let raw = r#"{
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "ping"}}]},
+                "finishReason": "STOP"
+            }]
+        }"#;
+        let parsed: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let resp = from_generate_response(parsed, "m".to_string(), 0);
+        let calls = resp.tool_calls.expect("tool_calls");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn sse_function_call_emette_tool_call_delta() {
+        // Stream: una part functionCall in un evento SSE produce un
+        // tool_call_delta completo + finish_reason "tool_calls".
+        let mut p = GoogleSseParser::new("gemini-2.5-pro".to_string());
+        p.parse_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","args":{"path":"a.txt"}}}]},"finishReason":"STOP"}]}"#,
+        );
+        assert_eq!(p.pending.len(), 1);
+        let chunk = &p.pending[0];
+        let tcd = chunk.tool_call_delta.as_ref().expect("tool_call_delta");
+        assert_eq!(tcd.index, 0);
+        assert!(tcd.id.as_deref().unwrap().starts_with("call_"));
+        let f = tcd.function.as_ref().unwrap();
+        assert_eq!(f.name.as_deref(), Some("read_file"));
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["path"], "a.txt");
+        // finish forzato a tool_calls.
+        assert_eq!(chunk.finish_reason.as_deref(), Some("tool_calls"));
+        // Nessun delta testuale.
+        assert_eq!(chunk.delta, "");
+    }
+
+    #[test]
+    fn sse_solo_function_call_senza_finish_non_scartata() {
+        // Un chunk con SOLA functionCall (senza finish/text/usage) NON deve
+        // essere scartato dalla guardia chunk-vuoto.
+        let mut p = GoogleSseParser::new("m".to_string());
+        p.parse_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"f","args":{}}}]}}]}"#,
+        );
+        assert_eq!(p.pending.len(), 1);
+        assert!(p.pending[0].tool_call_delta.is_some());
+        // Senza finish nel chunk, lo forziamo comunque a tool_calls.
+        assert_eq!(p.pending[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn round_trip_assistant_tool_calls_diventa_function_call_part() {
+        // Un turno assistant con tool_calls -> role=model con part functionCall
+        // (args deserializzato da stringa a oggetto).
+        let mut a = msg("assistant", "");
+        a.tool_calls = Some(vec![LlmToolCall {
+            id: "call_x".to_string(),
+            kind: "function".to_string(),
+            function: ToolFunctionCall {
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"x.rs"}"#.to_string(),
+            },
+        }]);
+        let req = req_with_tools(vec![a], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        assert_eq!(json["contents"][0]["role"], "model");
+        let part = &json["contents"][0]["parts"][0];
+        assert_eq!(part["functionCall"]["name"], "read_file");
+        assert_eq!(part["functionCall"]["args"]["path"], "x.rs");
+        // Niente text spurio sulla part-functionCall.
+        assert!(part.get("text").is_none());
+    }
+
+    #[test]
+    fn round_trip_tool_result_diventa_function_response_con_nome_risolto() {
+        // Un turno tool (tool_call_id) -> role=user con functionResponse il cui
+        // `name` e' risolto dalla tool-call precedente (non l'id grezzo).
+        let mut a = msg("assistant", "");
+        a.tool_calls = Some(vec![LlmToolCall {
+            id: "call_x".to_string(),
+            kind: "function".to_string(),
+            function: ToolFunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        let mut tool = msg("tool", "contenuto del file");
+        tool.tool_call_id = Some("call_x".to_string());
+        let req = req_with_tools(vec![a, tool], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        // Secondo content: il tool-result.
+        let tr = &json["contents"][1];
+        assert_eq!(tr["role"], "user");
+        let part = &tr["parts"][0];
+        // name risolto a "read_file", NON "call_x".
+        assert_eq!(part["functionResponse"]["name"], "read_file");
+        assert_eq!(
+            part["functionResponse"]["response"]["result"],
+            "contenuto del file"
+        );
+    }
+
+    #[test]
+    fn round_trip_tool_result_id_sconosciuto_usa_id_grezzo() {
+        // Se l'id non e' in history, il fallback usa l'id grezzo come name
+        // (Gemini rifiuterebbe, ma e' il fallback meno dannoso: niente panico).
+        let mut tool = msg("tool", "out");
+        tool.tool_call_id = Some("call_orfano".to_string());
+        let req = req_with_tools(vec![tool], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        assert_eq!(
+            json["contents"][0]["parts"][0]["functionResponse"]["name"],
+            "call_orfano"
+        );
     }
 }
