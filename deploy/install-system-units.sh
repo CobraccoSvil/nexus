@@ -48,7 +48,7 @@ pkill -f "apps/web-ide/server.js" 2>/dev/null || true
 pkill -x nexus-gateway 2>/dev/null || true
 echo "  unit --user disabilitate, web-ide + gateway nohup legacy fermati"
 
-# 2. Genera e installa le unit --system dai template.
+# 2. Genera e installa le unit --system dei servizi CORE dai template.
 for svc in nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide; do
   src="$SRC/${svc}-system.service"
   [ -f "$src" ] || { echo "ERRORE: template mancante $src" >&2; exit 1; }
@@ -57,14 +57,51 @@ for svc in nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide; do
   echo "  installato /etc/systemd/system/${svc}.service"
 done
 
+# 2bis. Microservizi Rust (chat/admin/plugin/doc/billing): stessa governance
+#   systemd --system dei core (ADR 0028 L3, parita'). Prima giravano solo come
+#   nohup di deploy-local.sh -> non ripartivano dopo freeze/sospensione WSL.
+#
+#   Mappa "template:binario:unit":
+#     - template  = file in deploy/systemd/<template>-system.service
+#     - binario   = nome del binario in target/debug/ (legge la porta dal DB:
+#                   nexus_auth::resolve_port settings.<svc>_port, NON da env)
+#     - unit      = nome installato in /etc/systemd/system/<unit>.service
+#   Il nome unit e' nexus-<binario>.service cosi' deploy-local.sh start_service
+#   lo riconosce (ramo systemd --system, riga ~259) e fa restart via systemd
+#   invece di nohup: niente doppioni sulla stessa porta. Il pannello UI cerca
+#   nexus-chat-wsl/... ma usa port_alive come fallback, quindi li vede comunque.
+#
+#   (a) Symlink stabile target/nexus-current/<binario> -> target/debug/<binario>
+#       (stesso pattern dei core in deploy-local.sh start_service), usato come
+#       ExecStart: la unit esegue sempre l'ultima build debug.
+mkdir -p "$ROOT/target/nexus-current"
+for entry in chat:chat-service admin:admin-service plugin:plugin-service doc:doc-service billing:billing-service; do
+  tmpl="${entry%%:*}"
+  bin="${entry#*:}"
+  src="$SRC/nexus-${tmpl}-system.service"
+  binpath="$ROOT/target/debug/$bin"
+  [ -f "$src" ] || { echo "ERRORE: template mancante $src" >&2; exit 1; }
+  if [ ! -f "$binpath" ]; then
+    echo "  ATTENZIONE: binario mancante $binpath (compila con deploy-local.sh --rust); unit installata comunque, Restart=always la avviera' appena il binario esiste"
+  fi
+  ln -sfn "$binpath" "$ROOT/target/nexus-current/$bin"
+  chown -h "$USER_NAME:$USER_NAME" "$ROOT/target/nexus-current/$bin" 2>/dev/null || true
+  sed -e "s/__USER__/$USER_NAME/g" -e "s/__UID__/$USER_UID/g" "$src" \
+      > "/etc/systemd/system/nexus-${bin}.service"
+  echo "  installato /etc/systemd/system/nexus-${bin}.service (symlink -> $binpath)"
+done
+
 # 3. Log su file storici /tmp/nexus-*.log di proprieta' ROOT: fs.protected_regular
 #    (=2) impedisce a systemd (PID1=root) di aprire in append un file NON suo in
 #    una dir sticky world-writable come /tmp (errore 209/STDOUT, crash-loop). Le
 #    unit --system aprono StandardOutput come root -> i log devono essere di root
 #    (apre come owner, passa il fd al processo User=). I tail restano ok (644).
-touch /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log
-chown root:root /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log
-chmod 644 /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log
+# NB: i microservizi loggano su /tmp/nexus-<binario>.log (StandardOutput nelle
+#   loro unit), stessa logica root-owned 644.
+MICRO_LOGS="/tmp/nexus-chat-service.log /tmp/nexus-admin-service.log /tmp/nexus-plugin-service.log /tmp/nexus-doc-service.log /tmp/nexus-billing-service.log"
+touch /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
+chown root:root /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
+chmod 644 /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
 
 # 3bis. Disabilita i meccanismi di auto-restart APPLICATIVI di mcp-core: con i
 #   servizi a --system il restart e' gia' garantito da systemd (Restart=always),
@@ -78,24 +115,38 @@ docker exec -i ideai-postgres-nexus-1 psql -U nexus -d nexus -c \
 
 # 4. Avvia: brain (gRPC 50051) prima, poi mcp-core, gateway e web-ide.
 #    Il gateway dipende da mcp-core (After=) -> parte nello stesso gruppo.
+#    I microservizi dipendono da mcp-core (After=) -> partono dopo.
+MICRO_UNITS="nexus-chat-service nexus-admin-service nexus-plugin-service nexus-doc-service nexus-billing-service"
 systemctl daemon-reload
-systemctl reset-failed nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide 2>/dev/null || true
-systemctl enable nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide >/dev/null 2>&1 || true
+systemctl reset-failed nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS 2>/dev/null || true
+systemctl enable nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS >/dev/null 2>&1 || true
 systemctl start nexus-brain.service
 sleep 8
 systemctl start nexus-mcp-core.service nexus-gateway.service nexus-web-ide.service
-sleep 12
+sleep 5
+# Microservizi dopo mcp-core (leggono la porta dal DB, gia' pronto). Idempotente:
+# uno start ripetuto su unit gia' attive e' un no-op.
+# shellcheck disable=SC2086
+systemctl start $MICRO_UNITS 2>/dev/null || true
+sleep 7
 
 # 5. Verifica.
 echo "==> Stato unit:"
-systemctl is-active nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide || true
+# shellcheck disable=SC2086
+systemctl is-active nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS || true
 echo "==> Health:"
 curl -s -o /dev/null -w "  brain(8001)=%{http_code}\n" --max-time 6 http://127.0.0.1:8001/health || true
 curl -s -o /dev/null -w "  mcp-core(4000)=%{http_code}\n" --max-time 6 http://127.0.0.1:4000/health || true
 curl -s -o /dev/null -w "  gateway(4060)=%{http_code}\n" --max-time 6 http://127.0.0.1:4060/providers || true
 curl -s -o /dev/null -w "  web-ide(3000)=%{http_code}\n" --max-time 6 http://127.0.0.1:3000/ || true
+# Microservizi: porte canoniche da mig 0239 (i servizi le leggono dal DB).
+curl -s -o /dev/null -w "  chat-service(4020)=%{http_code}\n"    --max-time 6 http://127.0.0.1:4020/health || true
+curl -s -o /dev/null -w "  admin-service(4010)=%{http_code}\n"   --max-time 6 http://127.0.0.1:4010/health || true
+curl -s -o /dev/null -w "  plugin-service(4050)=%{http_code}\n"  --max-time 6 http://127.0.0.1:4050/health || true
+curl -s -o /dev/null -w "  doc-service(4030)=%{http_code}\n"     --max-time 6 http://127.0.0.1:4030/health || true
+curl -s -o /dev/null -w "  billing-service(4040)=%{http_code}\n" --max-time 6 http://127.0.0.1:4040/health || true
 
 echo
-echo "==> Fatto. Restart futuri:  sudo systemctl restart nexus-mcp-core nexus-brain nexus-gateway nexus-web-ide"
+echo "==> Fatto. Restart futuri:  sudo systemctl restart nexus-mcp-core nexus-brain nexus-gateway nexus-web-ide $MICRO_UNITS"
 echo "==> Test di stabilita' definitivo: chiudi TUTTI i terminali WSL, attendi"
 echo "    1-2 min, poi  curl http://127.0.0.1:4000/health  deve dare 200."

@@ -1,0 +1,46 @@
+# nexus-chat-service.service — chat-service di Nexus come unit systemd --SYSTEM.
+#
+# ADR 0028 livello 3 (2026-06-15). Parita' coi 4 servizi core (brain/mcp-core/
+# gateway/web-ide): la VM WSL sospesa manda SIGTERM ai processi -> il servizio
+# esce graceful (exit 0) e, girando solo come nohup di deploy-local.sh, NON
+# ripartiva. Sotto PID 1 con Restart=always riparte da solo, immune alla caduta
+# del manager systemd --user (che cade su exit.target alla chiusura della
+# sessione logind in WSL, linger inefficace). Vedi nexus-brain-system.service.
+#
+# PORTA (regola G): chat-service legge la porta ESCLUSIVAMENTE dal DB via
+# nexus_auth::resolve_port(&db, "chat_service_port") (settings, default 4020,
+# mig 0239). NON da env var: per questo la unit NON imposta Environment=PORT.
+# Cambiare la porta = UPDATE settings + restart, niente modifiche a questa unit.
+#
+# ExecStart usa il symlink stabile target/nexus-current/chat-service (aggiornato
+# da deploy-local.sh e dall'installer a ogni build): la unit esegue sempre
+# l'ultima build debug.
+#
+# After=nexus-mcp-core: il chat-service dipende da mcp-core (core_url) e dal
+# brain via mcp-core. La dipendenza dal DB Postgres e' coperta dal retry-loop
+# interno di resolve_port (5x5s) + Restart=always come safety net al boot.
+#
+# Installata da deploy/install-system-units.sh (sostituisce __USER__/__UID__).
+
+[Unit]
+Description=Nexus chat-service (chat + agent runs REST :4020) [system-level, ADR 0028 L3]
+After=network-online.target nexus-mcp-core.service
+Wants=network-online.target nexus-mcp-core.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=/home/__USER__/ideai
+EnvironmentFile=-/home/__USER__/ideai/.env
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+ExecStart=/home/__USER__/ideai/target/nexus-current/chat-service
+Restart=always
+RestartSec=3
+StandardOutput=append:/tmp/nexus-chat-service.log
+StandardError=append:/tmp/nexus-chat-service.log
+
+[Install]
+WantedBy=multi-user.target
