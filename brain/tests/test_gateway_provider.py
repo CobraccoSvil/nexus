@@ -366,6 +366,85 @@ async def test_parsing_risposta_testuale(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Recupero tool-as-text (provider a valle emette tool-call come testo nel content)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recupero_tool_as_text_execute_bash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Il provider a valle del gateway (qui google) emette la tool-call come TESTO
+    (<execute_bash> ...) invece che strutturata. Il gateway la promuove a
+    tool_use_blocks -> stop_reason tool_use, altrimenti end_turn -> abort."""
+    _install_complete_double(
+        monkeypatch,
+        {
+            "content": 'Procedo.\n<execute_bash> list_files(path="./") </execute_bash>',
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "model_used": "gemini-x",
+            "provider_used": "google",
+            "finish_reason": "end_turn",
+        },
+    )
+    tools = [{"name": "list_files", "description": "", "input_schema": {}}]
+    res = await gp.GatewayProvider().generate_agent_turn(
+        "google/gemini-x", [{"role": "user", "content": "esplora"}], tools
+    )
+    assert res.metadata["stop_reason"] == "tool_use"
+    blocks = res.metadata["tool_use_blocks"]
+    assert len(blocks) == 1
+    assert blocks[0]["name"] == "list_files"
+    assert blocks[0]["input"] == {"path": "./"}
+    assert "execute_bash" not in res.content
+
+
+@pytest.mark.asyncio
+async def test_recupero_tool_as_text_execute_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Variante <execute_tool> con tool_name + args (osservata su read_file)."""
+    _install_complete_double(
+        monkeypatch,
+        {
+            "content": "<execute_tool><tool_name>read_file</tool_name>"
+            "<args><path>x.ts</path></args></execute_tool>",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "model_used": "claude-x",
+            "provider_used": "anthropic",
+            "finish_reason": "end_turn",
+        },
+    )
+    tools = [{"name": "read_file", "description": "", "input_schema": {}}]
+    res = await gp.GatewayProvider().generate_agent_turn(
+        "anthropic/claude-x", [{"role": "user", "content": "leggi"}], tools
+    )
+    assert res.metadata["stop_reason"] == "tool_use"
+    blocks = res.metadata["tool_use_blocks"]
+    assert len(blocks) == 1
+    assert blocks[0]["name"] == "read_file"
+    assert blocks[0]["input"] == {"path": "x.ts"}
+
+
+@pytest.mark.asyncio
+async def test_risposta_testuale_genuina_non_recuperata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anti-falso-positivo: testo che MENZIONA un tool senza chiamarlo resta
+    end_turn (nessun recupero spurio, nessun cambio di stop_reason)."""
+    _install_complete_double(
+        monkeypatch,
+        {
+            "content": "Ho usato list_files per esplorare: ci sono 3 file.",
+            "usage": {"input_tokens": 8, "output_tokens": 4},
+            "model_used": "m",
+            "provider_used": "p",
+            "finish_reason": "end_turn",
+        },
+    )
+    tools = [{"name": "list_files", "description": "", "input_schema": {}}]
+    res = await gp.GatewayProvider().generate_agent_turn(
+        "m", [{"role": "user", "content": "ciao"}], tools
+    )
+    assert res.metadata["stop_reason"] == "end_turn"
+    assert res.metadata["tool_use_blocks"] == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Round-trip thinking_signature
 # ──────────────────────────────────────────────────────────────────────────────
 

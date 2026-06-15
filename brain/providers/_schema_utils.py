@@ -270,20 +270,75 @@ def _coerce_value(raw: str):
     return raw
 
 
+def _parse_function_call_args(arg_string: str) -> dict:
+    """Parsa i kwargs di una function-call testuale (es. ``tool_name(a="x", b=True)``).
+
+    Riceve SOLO la porzione interna alle parentesi. Usa ``ast`` per robustezza
+    (virgole dentro le stringhe, bool/None/numeri) senza MAI eseguire codice
+    (niente ``eval``). Gli argomenti non interpretabili come literal diventano
+    testo grezzo best-effort. Ritorna ``{}`` se vuoto o non parsabile.
+    """
+    import ast
+
+    arg_string = (arg_string or "").strip()
+    if not arg_string:
+        return {}
+    params: dict = {}
+    try:
+        node = ast.parse(f"_f({arg_string})", mode="eval")
+        call = node.body
+        if isinstance(call, ast.Call):
+            for kw in call.keywords:
+                if kw.arg is None:
+                    continue
+                try:
+                    params[kw.arg] = ast.literal_eval(kw.value)
+                except Exception:
+                    try:
+                        params[kw.arg] = ast.unparse(kw.value)
+                    except Exception:
+                        params[kw.arg] = ""
+            # argomenti posizionali eventuali ignorati: i tool Nexus usano kwargs
+            return params
+    except Exception:
+        pass
+    # Fallback regex best-effort (key=value separati da virgola)
+    import re as _re
+
+    for m in _re.finditer(
+        r"([A-Za-z_]\w*)\s*=\s*('[^']*'|\"[^\"]*\"|[^,]+)", arg_string
+    ):
+        key = m.group(1)
+        val = m.group(2).strip()
+        if (val.startswith('"') and val.endswith('"')) or (
+            val.startswith("'") and val.endswith("'")
+        ):
+            params[key] = val[1:-1]
+        else:
+            params[key] = _coerce_value(val)
+    return params
+
+
 def parse_inline_tool_invocations(
     text: str,
     known_tool_names: set[str] | None = None,
 ) -> tuple[list[dict], str]:
     """Parser di recupero per tool_call emessi come XML inline nel content.
 
-    Riconosce tre formati:
+    Riconosce cinque formati:
       1. <invoke name="X"><parameter name="Y">V</parameter></invoke>
       2. <tool_name><param>value</param></tool_name>  (formato semplificato)
       3. <functions><function><name>X</name><params><k>v</k></params></function></functions>
          (formato DeepSeek/ChatGPT-style)
+      4. <execute_tool><tool_name>X</tool_name><args><k>v</k></args></execute_tool>
+         (wrapper "execute_tool": tool_name esplicito + figli di <args>)
+      5. <execute_bash> X(k=v, ...) </execute_bash>  oppure function-call NUDA
+         X(k=v, ...)  (la nuda solo se X in `known_tool_names`)
 
-    Il formato 2 richiede `known_tool_names` per distinguere tag tool
-    da tag XML arbitrari nel testo. Se non fornito, solo i formati 1 e 3 vengono usati.
+    I formati 2 e 5b (function-call nuda) richiedono `known_tool_names` per
+    distinguere una vera invocazione da tag/parentesi arbitrarie nel testo: e'
+    il gate anti-falso-positivo. I formati 1/3/4 e il wrapper 5a (<execute_bash>)
+    sono auto-qualificati dal tag esplicito e non richiedono la whitelist.
 
     Ritorna ([], text_originale) se nessuna invocazione rilevata.
     """
@@ -393,6 +448,90 @@ def parse_inline_tool_invocations(
             })
             cleaned = cleaned.replace(m.group(0), "")
 
+    # --- Formato 4: <execute_tool><tool_name>X</tool_name><args>...</args></execute_tool> ---
+    # Wrapper esplicito (auto-qualificato): tool_name dichiarato + params dai
+    # figli di <args> (o figli diretti se <args> assente).
+    if "<execute_tool" in cleaned:
+        exec_tool_re = re.compile(
+            r"<execute_tool\s*>(?P<body>.*?)</execute_tool\s*>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        name_re = re.compile(
+            r"<tool_name\s*>(?P<name>.*?)</tool_name\s*>", re.DOTALL | re.IGNORECASE
+        )
+        args_re = re.compile(r"<args\s*>(?P<args>.*?)</args\s*>", re.DOTALL | re.IGNORECASE)
+        child_re = re.compile(
+            r"<(?P<key>[a-z_][a-z0-9_]*)>(?P<val>.*?)</(?P=key)>", re.DOTALL
+        )
+        for m in exec_tool_re.finditer(cleaned):
+            body = m.group("body") or ""
+            nm = name_re.search(body)
+            if not nm:
+                continue
+            tool_name = nm.group("name").strip()
+            params = {}
+            am = args_re.search(body)
+            args_body = am.group("args") if am else body
+            for cm in child_re.finditer(args_body):
+                key = cm.group("key")
+                if key == "tool_name":  # evita di risucchiare il tag del nome
+                    continue
+                params[key] = _coerce_value(cm.group("val").strip())
+            if tool_name:
+                blocks.append({
+                    "id": f"toolu_{_uuid.uuid4().hex[:24]}",
+                    "name": tool_name,
+                    "input": params,
+                })
+        cleaned = exec_tool_re.sub("", cleaned)
+
+    # --- Formato 5a: <execute_bash> X(k=v, ...) </execute_bash> ---
+    # Wrapper esplicito: il modello "annuncia" una tool-call con sintassi
+    # funzione dentro il tag. Auto-qualificato dal wrapper.
+    if "<execute_bash" in cleaned:
+        exec_bash_re = re.compile(
+            r"<execute_bash\s*>(?P<body>.*?)</execute_bash\s*>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        call_re = re.compile(r"(?P<name>[A-Za-z_]\w*)\s*\((?P<args>.*?)\)", re.DOTALL)
+        for m in exec_bash_re.finditer(cleaned):
+            body = m.group("body") or ""
+            cm = call_re.search(body)
+            if not cm:
+                continue
+            tool_name = cm.group("name").strip()
+            if not tool_name:
+                continue
+            params = _parse_function_call_args(cm.group("args"))
+            blocks.append({
+                "id": f"toolu_{_uuid.uuid4().hex[:24]}",
+                "name": tool_name,
+                "input": params,
+            })
+        cleaned = exec_bash_re.sub("", cleaned)
+
+    # --- Formato 5b: function-call NUDA X(k=v, ...) senza wrapper ---
+    # Gate anti-falso-positivo: matcha SOLO se il nome e' un tool noto. Cosi'
+    # prosa come "config(prod).json" o "uso list_files per..." non matcha.
+    if known_tool_names:
+        nude_names = "|".join(
+            re.escape(n) for n in sorted(known_tool_names, key=len, reverse=True)
+        )
+        if nude_names:
+            nude_call_re = re.compile(
+                rf"(?<![\w.])(?P<name>{nude_names})\s*\((?P<args>[^()]*?)\)",
+                re.DOTALL,
+            )
+            for m in nude_call_re.finditer(cleaned):
+                tool_name = m.group("name")
+                params = _parse_function_call_args(m.group("args"))
+                blocks.append({
+                    "id": f"toolu_{_uuid.uuid4().hex[:24]}",
+                    "name": tool_name,
+                    "input": params,
+                })
+            cleaned = nude_call_re.sub("", cleaned)
+
     if not blocks:
         return [], text
 
@@ -400,6 +539,7 @@ def parse_inline_tool_invocations(
     cleaned = re.sub(r"</?tool_calls\s*/?>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"</?functions\s*/?>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"</?DSML\s*/?>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?execute_(?:bash|tool)\s*/?>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
     return blocks, cleaned

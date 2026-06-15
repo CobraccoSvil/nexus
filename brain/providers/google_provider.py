@@ -592,6 +592,25 @@ class GoogleProvider(BaseProvider):
                         tool_use_blocks.append(block)
                         assistant_content.append({"type": "tool_use", **block})
 
+            # Recupero tool-as-text (punto unico, regola L): Gemini puo' emettere
+            # la tool-call come TESTO (<execute_bash>/<execute_tool>/function-call
+            # nuda) invece che come function_call strutturata, specie sotto
+            # context overflow. Senza recupero -> stop_reason end_turn ->
+            # l'agente non agisce -> abort "modello non risponde con azione".
+            # Stesso parser usato dal gateway e dai provider OpenAI-compatible.
+            if not tool_use_blocks and text_content:
+                from ._schema_utils import parse_inline_tool_invocations
+                _tool_names = {t.get("name", "") for t in (tools or []) if t.get("name")}
+                _recovered, _cleaned = parse_inline_tool_invocations(
+                    text_content, _tool_names
+                )
+                if _recovered:
+                    stop_reason = "tool_use"
+                    text_content = _cleaned
+                    for _blk in _recovered:
+                        tool_use_blocks.append(_blk)
+                        assistant_content.append({"type": "tool_use", **_blk})
+
             if not tool_use_blocks and text_content:
                 assistant_content.append({"type": "text", "text": text_content})
 

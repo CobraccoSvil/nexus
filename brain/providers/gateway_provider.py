@@ -484,7 +484,10 @@ class GatewayProvider(BaseProvider):
             # routing su retry/cascade/UPDATE agent_runs.
             return _gateway_error_to_result(exc, pin_provider or self.name, model)
 
-        return self._build_agent_result(data, model, pin_provider=pin_provider)
+        tool_names = {t.get("name", "") for t in tools if t.get("name")}
+        return self._build_agent_result(
+            data, model, pin_provider=pin_provider, tool_names=tool_names
+        )
 
     def _build_agent_result(
         self,
@@ -492,6 +495,7 @@ class GatewayProvider(BaseProvider):
         model: str,
         *,
         pin_provider: str | None = None,
+        tool_names: set[str] | None = None,
     ) -> ProviderResult:
         """Costruisce il ProviderResult del turno agentico dalla LlmResponse.
 
@@ -506,6 +510,21 @@ class GatewayProvider(BaseProvider):
         reasoning = data.get("reasoning") or ""
         signature = data.get("thinking_signature") or ""
         tool_use_blocks, tool_assistant_blocks = _tool_calls_to_blocks(data.get("tool_calls"))
+
+        # Recupero tool-as-text (punto unico, regola L): se il provider a valle
+        # del gateway (qualunque: anthropic/google/openai/mistral/deepseek) ha
+        # emesso le tool-call come TESTO nel content invece che strutturate, le
+        # promuoviamo qui. Senza questo, un content con <execute_bash>/
+        # <execute_tool>/function-call e tool_calls vuoto -> stop_reason end_turn
+        # -> l'agente non agisce -> abort "modello non risponde con azione".
+        if not tool_use_blocks and content:
+            from ._schema_utils import parse_inline_tool_invocations
+
+            recovered, cleaned_text = parse_inline_tool_invocations(content, tool_names)
+            if recovered:
+                tool_use_blocks = recovered
+                tool_assistant_blocks = [{"type": "tool_use", **b} for b in recovered]
+                content = cleaned_text
 
         assistant_content: list[dict] = []
         if reasoning:
