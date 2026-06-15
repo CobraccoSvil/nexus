@@ -103,18 +103,37 @@ pub async fn find_or_allocate(
                 mode: "adopted",
             });
         }
-        // Nessun orfano adottabile: rimuovi la riga stale e prosegui ad
-        // allocare ex novo nel bucket.
-        let _ =
-            sqlx::query("DELETE FROM nexus_port_allocations WHERE project_id = $1 AND label = $2")
-                .bind(project_id)
-                .bind(label)
-                .execute(db)
-                .await;
-        tracing::info!(
-            label = %label, stale_port = p,
-            "find_or_allocate: allocazione stale rimossa, procedo con nuova allocazione"
+        // Nessun orfano adottabile. La porta stale risulta libera (il probe TCP
+        // poco sopra e' negativo): ADOTTALA riusando la STESSA porta — per
+        // stabilita' tra restart — invece di eliminarla e riallocarne una nuova.
+        // La riga resta (UNIQUE project_id,label) con mode='adopted'. Questo
+        // chiude il deadlock allocazione stantia: run_service prosegue e riusa la
+        // stessa porta per la label, senza dipendere da `service_restart`.
+        let _ = sqlx::query(
+            "UPDATE nexus_port_allocations \
+             SET allocation_mode = 'adopted', updated_at = NOW() \
+             WHERE project_id = $1 AND label = $2",
+        )
+        .bind(project_id)
+        .bind(label)
+        .execute(db)
+        .await;
+        record_audit(
+            AuditEntry::allowed(project_id, "port_adopt", "port")
+                .with_resource(p.to_string())
+                .with_details(serde_json::json!({
+                    "label": label, "stale_port": p, "mode": "adopted",
+                    "reason": "stale_no_listener"
+                })),
         );
+        tracing::info!(
+            label = %label, adopted_port = p,
+            "find_or_allocate: allocazione stale riusata sulla stessa porta (adopted)"
+        );
+        return Ok(AllocatedPort {
+            port: p,
+            mode: "adopted",
+        });
     }
 
     // 1-bis. Consapevolezza risorse (punto unico, regola L): nessuna riga DB con
@@ -393,6 +412,20 @@ mod tests {
         .expect("upsert allocazione");
     }
 
+    /// Replica dell'adozione di un'allocazione stantia usata da `find_or_allocate`
+    /// (riuso della STESSA porta con mode='adopted', niente DELETE + re-alloc).
+    async fn adopt_stale(pool: &sqlx::PgPool, project_id: Uuid, label: &str) {
+        sqlx::query(
+            "UPDATE nexus_port_allocations SET allocation_mode = 'adopted', updated_at = NOW() \
+             WHERE project_id = $1 AND label = $2",
+        )
+        .bind(project_id)
+        .bind(label)
+        .execute(pool)
+        .await
+        .expect("adopt stale");
+    }
+
     async fn count_rows(pool: &sqlx::PgPool, project_id: Uuid, label: &str) -> i64 {
         sqlx::query(
             "SELECT COUNT(*) AS n FROM nexus_port_allocations \
@@ -463,5 +496,39 @@ mod tests {
             .expect("count total")
             .get::<i64, _>("n");
         assert_eq!(total, 2, "label distinte devono restare righe distinte");
+    }
+
+    #[sqlx::test]
+    async fn adozione_stale_preserva_porta_e_riga(pool: sqlx::PgPool) {
+        create_port_allocations_table(&pool).await;
+        let proj = Uuid::new_v4();
+
+        // Allocazione esistente (poi spenta): l'adozione deve RIUSARE la stessa
+        // porta e mantenere UNA sola riga, marcandola 'adopted'. Niente DELETE +
+        // riallocazione -> la porta resta stabile tra restart (fix deadlock
+        // allocazione stantia).
+        upsert_alloc(&pool, proj, 21951, "backend").await;
+        adopt_stale(&pool, proj, "backend").await;
+
+        assert_eq!(count_rows(&pool, proj, "backend").await, 1);
+        let row = sqlx::query(
+            "SELECT port, allocation_mode FROM nexus_port_allocations \
+             WHERE project_id = $1 AND label = $2",
+        )
+        .bind(proj)
+        .bind("backend")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch row adottata");
+        assert_eq!(
+            row.get::<i32, _>("port"),
+            21951,
+            "la porta stale deve essere riusata, non riallocata"
+        );
+        assert_eq!(
+            row.get::<String, _>("allocation_mode"),
+            "adopted",
+            "l'allocazione stale adottata deve avere mode='adopted'"
+        );
     }
 }

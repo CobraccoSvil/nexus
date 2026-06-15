@@ -98,6 +98,28 @@ fn detect_port_from_output(stdout: &str, stderr: &str) -> Option<i32> {
     None
 }
 
+/// Decisione su cosa fare quando, all'avvio, esiste gia' una risorsa dello
+/// stesso scopo (frontend/backend) nel progetto. Punto unico testabile (regola
+/// L): la scelta dipende SOLO dal fatto che la risorsa sia in ascolto o meno.
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingServiceAction {
+    /// Servizio gia' ATTIVO (porta in LISTEN): rifiuta, l'agente deve riusarlo.
+    RefuseActive,
+    /// Allocazione SPENTA (porta allocata in DB ma nessuno in ascolto): NON e'
+    /// un duplicato da rifiutare ma una allocazione stantia da ADOTTARE. Si
+    /// prosegue l'avvio riusando porta+label (no deadlock quando il servizio non
+    /// e' una systemd unit e `service_restart` non puo' riavviarlo).
+    AdoptStale,
+}
+
+fn existing_service_action(listening: bool) -> ExistingServiceAction {
+    if listening {
+        ExistingServiceAction::RefuseActive
+    } else {
+        ExistingServiceAction::AdoptStale
+    }
+}
+
 /// Avvia un servizio/processo long-running direttamente sul server.
 /// L'output viene catturato nel DB e mostrato nel pannello Output dell'IDE.
 pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind: &str) -> String {
@@ -179,31 +201,37 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         )
         .await
         {
-            if res.listening {
-                // Servizio dello stesso scopo gia' ATTIVO: REFUSE, riusa la sua porta.
-                let port = res
-                    .port
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                return format!(
-                    "[Errore: servizio '{}' di tipo {} gia' ATTIVO sulla porta {}. \
-                     Riusalo invece di crearne uno nuovo (puoi accedere a http://localhost:{}). \
-                     Se vuoi davvero riavviarlo usa `service_restart` con label='{}'.]",
-                    res.label, kind, port, port, res.label
-                );
-            } else {
-                // Servizio dello stesso scopo allocato ma SPENTO: REFUSE, riavvia
-                // quello esistente invece di duplicarlo su una porta nuova.
-                let port = res
-                    .port
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                return format!(
-                    "[Errore: esiste gia' un servizio '{}' di tipo {} (porta {}) ma e' SPENTO. \
-                     RIAVVIALO sulla sua porta esistente con `service_restart` (label='{}') \
-                     invece di crearne uno nuovo. Non allocare un'altra porta.]",
-                    res.label, kind, port, res.label
-                );
+            match existing_service_action(res.listening) {
+                ExistingServiceAction::RefuseActive => {
+                    // Servizio dello stesso scopo gia' ATTIVO: REFUSE, riusa la sua porta.
+                    let port = res
+                        .port
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    return format!(
+                        "[Errore: servizio '{}' di tipo {} gia' ATTIVO sulla porta {}. \
+                         Riusalo invece di crearne uno nuovo (puoi accedere a http://localhost:{}). \
+                         Se vuoi davvero riavviarlo usa `service_restart` con label='{}'.]",
+                        res.label, kind, port, port, res.label
+                    );
+                }
+                ExistingServiceAction::AdoptStale => {
+                    // Allocazione dello stesso scopo SPENTA: NON rifiutare (era la
+                    // causa radice del deadlock allocazione stantia: il refuse
+                    // rimandava a `service_restart`, che pero' non puo' riavviare un
+                    // servizio non-systemd con service_unit NULL). Si ADOTTA e si
+                    // prosegue l'avvio: piu' sotto `cleanup_dead_process_ports`
+                    // preserva questa porta e `find_or_allocate` (punto unico,
+                    // regola L) riusa la stessa allocazione per la label. Per i
+                    // servizi non-web (es. `node src/server.js`) il processo viene
+                    // semplicemente ri-spawnato sulla sua porta.
+                    tracing::info!(
+                        label = %res.label,
+                        kind = %kind,
+                        port = ?res.port,
+                        "run_service: allocazione spenta dello stesso scopo, ADOTTO e riavvio (no refuse)"
+                    );
+                }
             }
         }
     }
@@ -246,8 +274,10 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             }
         }
 
-        // Cleanup porte allocate per processi morti di questo progetto
-        cleanup_dead_process_ports(&ctx.db, ctx.project_id, &existing).await;
+        // Cleanup porte allocate per processi morti di questo progetto. Preserva
+        // la label che stiamo (ri)avviando ora: la sua porta spenta verra'
+        // adottata, non rilasciata (fix deadlock allocazione stantia).
+        cleanup_dead_process_ports(&ctx.db, ctx.project_id, &existing, &label).await;
     }
 
     // ── Quota container (PR hardening) ────────────────────────────────────
@@ -417,6 +447,7 @@ async fn cleanup_dead_process_ports(
     db: &sqlx::PgPool,
     project_id: uuid::Uuid,
     processes: &[crate::agent_processes::ProcessSummary],
+    preserve_label: &str,
 ) {
     // Raccogli le label dei processi ancora attivi
     let active_labels: std::collections::HashSet<String> = processes
@@ -436,6 +467,12 @@ async fn cleanup_dead_process_ports(
 
     if let Ok(allocations) = rows {
         for (port, alloc_label) in allocations {
+            // Non rilasciare l'allocazione del servizio che stiamo (ri)avviando
+            // ora: la sua porta spenta serve all'adozione (deadlock allocazione
+            // stantia), non va liberata.
+            if alloc_label == preserve_label {
+                continue;
+            }
             // Se nessun processo attivo corrisponde a questa allocazione, rilasciala
             if !active_labels.contains(&alloc_label) {
                 // Verifica anche che la porta non sia effettivamente in uso (bind test)
@@ -736,4 +773,25 @@ pub(super) async fn tool_list_active_services(ctx: &AgentToolContext, _input: &V
         "Servizi progetto: {} attivi, {} fermi (ultimi 20)\n\n{}",
         running_count, stopped_count, output
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{existing_service_action, ExistingServiceAction};
+
+    /// Regressione deadlock allocazione stantia: un servizio dello stesso scopo
+    /// gia' ATTIVO va rifiutato (no duplicato), ma una allocazione SPENTA va
+    /// ADOTTATA (run_service prosegue e riavvia) invece di rifiutare rimandando a
+    /// `service_restart` (che non puo' riavviare un servizio non-systemd).
+    #[test]
+    fn esistente_attivo_rifiuta_spento_adotta() {
+        assert_eq!(
+            existing_service_action(true),
+            ExistingServiceAction::RefuseActive
+        );
+        assert_eq!(
+            existing_service_action(false),
+            ExistingServiceAction::AdoptStale
+        );
+    }
 }
