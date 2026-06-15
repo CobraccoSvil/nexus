@@ -112,6 +112,13 @@ _KEYS = (
     # toggle in OrchestratorPanel non aveva alcun effetto.
     "clarifying_questions_enabled",
     "clarifying_questions_max",
+    # Esecuzione SEQUENZIALE dei todo come sub-run ISOLATE (mig 0431).
+    # Gate principale OFF di default: con OFF il grafo si comporta come prima
+    # (edge planner->executor). Vivono sotto prefisso 'agent.' (vedi _KEY_FULL_NAME).
+    "todo_isolation_enabled",
+    "todo_isolation_on_failure",
+    "todo_isolation_max_retries",
+    "todo_isolation_kind",
 )
 
 # Override del nome completo (key DB) per le chiavi che NON usano il prefisso
@@ -128,6 +135,11 @@ _KEY_FULL_NAME: dict[str, str] = {
     "final_gate_runtime_check_enabled": "agent.final_gate.runtime_check_enabled",
     "final_gate_runtime_log_command": "agent.final_gate.runtime_log_command",
     "final_gate_runtime_error_patterns": "agent.final_gate.runtime_error_patterns",
+    # Esecuzione sequenziale isolata dei todo (mig 0431): prefisso 'agent.'.
+    "todo_isolation_enabled": "agent.continuous.todo_isolation_enabled",
+    "todo_isolation_on_failure": "agent.continuous.todo_isolation_on_failure",
+    "todo_isolation_max_retries": "agent.continuous.todo_isolation_max_retries",
+    "todo_isolation_kind": "agent.continuous.todo_isolation_kind",
 }
 
 
@@ -229,6 +241,12 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     # Clarifying questions pre-flight del planner (vedi nota in _KEYS).
     "clarifying_questions_enabled": True,
     "clarifying_questions_max": 3,
+    # Esecuzione SEQUENZIALE dei todo come sub-run ISOLATE (mig 0431).
+    # OFF di default: il sistema resta INVARIATO finche' l'admin non attiva.
+    "todo_isolation_enabled": False,
+    "todo_isolation_on_failure": "stop",   # stop | retry | continue
+    "todo_isolation_max_retries": 1,
+    "todo_isolation_kind": "implement",    # deve essere in subagent_kinds_whitelist
 }
 
 _lock = threading.RLock()
@@ -450,6 +468,40 @@ def is_eligible_adaptive(
     if confidence is not None and float(confidence) < float(cfg["adaptive_low_confidence_max"]):
         return True
     return False
+
+
+# Modalita' di automazione che attivano l'esecuzione autonoma continua.
+# Insieme canonico gia' usato altrove (verifier_node, route_after_executor).
+_AUTONOMOUS_MODES = ("automatic", "automatico", "continuous", "continuo")
+
+
+def todo_isolation_active(state: dict[str, Any]) -> bool:
+    """Punto unico (regola L): il run corrente deve eseguire i todo come sub-run
+    ISOLATE sequenziali invece che nel loop executor?
+
+    Richiede TUTTE e tre le condizioni (decisione POST-plan, ortogonale
+    all'eleggibilita' del planner — per questo e' un helper SEPARATO da
+    is_eligible / is_eligible_adaptive):
+
+      1. modalita' autonoma continua: automation_mode (colonna persistita
+         chat_sessions.automation_mode, mig 0371) in _AUTONOMOUS_MODES, con
+         fallback a behavior_mode. Confronto case-insensitive.
+      2. piano attivo: state["plan_phase_active"] is True (il planner ha prodotto
+         i todo; se si auto-skippa, niente isolamento).
+      3. setting agent.continuous.todo_isolation_enabled == true (DEFAULT FALSE).
+
+    Best-effort/fail-closed: qualunque errore -> False (comportamento storico).
+    """
+    try:
+        if state.get("plan_phase_active") is not True:
+            return False
+        mode = str(state.get("automation_mode") or state.get("behavior_mode") or "").strip().lower()
+        if mode not in _AUTONOMOUS_MODES:
+            return False
+        return bool(get().get("todo_isolation_enabled"))
+    except Exception as exc:  # pragma: no cover - difensivo
+        logger.debug("todo_isolation_active: skip (%s)", exc)
+        return False
 
 
 def force_reload() -> None:

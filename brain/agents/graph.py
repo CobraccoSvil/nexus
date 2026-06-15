@@ -13,11 +13,14 @@ from .nodes import (
     reflection_node,
     route_after_executor,
     route_after_verifier,
+    route_after_planner,
+    route_after_todo_runner,
     router_node,
     tool_dispatch_node,
 )
 from .planner_node import planner_node, configure as _configure_planner
 from .verifier_node import verifier_node, configure as _configure_verifier
+from .todo_runner_node import todo_runner_node, configure as _configure_todo_runner
 from .final_gate import (
     final_gate_node,
     route_after_final_gate,
@@ -129,6 +132,9 @@ def create_agent_graph(
     _configure_final_gate(tool_runner=tool_runner)
     _configure_clarify(providers=providers, routing_client=_routing_client, tool_runner=tool_runner)
     _configure_understanding(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
+    # Esecuzione sequenziale isolata dei todo (mig 0431): riusa il tool_runner
+    # per delegare ogni todo a run_subagent via dispatch_subagents.
+    _configure_todo_runner(tool_runner=tool_runner)
 
     # Crea il grafo con lo schema di stato
     workflow: StateGraph = StateGraph(AgentState)
@@ -138,6 +144,7 @@ def create_agent_graph(
     workflow.add_node("clarify_or_expand", clarify_or_expand_node)  # type: ignore[arg-type]
     workflow.add_node("understanding", understanding_node)  # type: ignore[arg-type]
     workflow.add_node("planner", planner_node)  # type: ignore[arg-type]
+    workflow.add_node("todo_runner", todo_runner_node)  # type: ignore[arg-type]
     workflow.add_node("executor", executor_node)  # type: ignore[arg-type]
     workflow.add_node("tool_dispatch", tool_dispatch_node)  # type: ignore[arg-type]
     workflow.add_node("verifier", verifier_node)  # type: ignore[arg-type]
@@ -172,8 +179,27 @@ def create_agent_graph(
         route_after_router,
         {"planner": "planner", "executor": "executor"},
     )
-    # Il planner emette il piano e poi passa il controllo all'executor.
-    workflow.add_edge("planner", "executor")
+    # Il planner emette il piano. Edge CONDIZIONALE (mig 0431):
+    #   - isolamento todo attivo (Continuo + piano + setting ON) -> todo_runner,
+    #     che esegue ogni todo come sub-run ISOLATA (context fresco, no accumulo).
+    #   - altrimenti -> executor (comportamento storico INVARIANTE con setting OFF).
+    workflow.add_conditional_edges(
+        "planner",
+        route_after_planner,
+        {"todo_runner": "todo_runner", "executor": "executor"},
+    )
+    # Dopo todo_runner: re-entry per il prossimo todo, chiusura via final_gate/
+    # learner, o fallback all'executor classico (guard no-op / dispatch fallito).
+    workflow.add_conditional_edges(
+        "todo_runner",
+        route_after_todo_runner,
+        {
+            "todo_runner": "todo_runner",
+            "final_gate": "final_gate",
+            "executor": "executor",
+            "learner": "reflection",
+        },
+    )
 
     # Dopo executor: loop su tool_dispatch, verificare (PR-2), o passo a reflection.
     # PR-2: se plan_phase_active + verifier_enabled e stop_reason=end_turn,

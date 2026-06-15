@@ -304,3 +304,77 @@ def route_after_verifier(state: AgentState) -> str:
     if stop_reason == "tool_use":
         return "executor"
     return "learner"
+
+
+def route_after_planner(state: AgentState) -> str:
+    """Dopo il planner: instrada all'esecuzione SEQUENZIALE ISOLATA dei todo
+    (todo_runner) se l'isolamento e' attivo, altrimenti all'executor classico.
+
+    Punto unico del gating: orchestrator_config.todo_isolation_active (3
+    condizioni, setting DEFAULT FALSE). Con OFF ritorna sempre "executor" —
+    comportamento INVARIANTE rispetto all'edge storico planner->executor.
+
+    Precedenza esplicita: se il DAG parallelo e' attivo (dag_parallel_enabled),
+    PREVALE il DAG -> executor (il dag_scheduler gira nel ramo executor). Cosi'
+    i due meccanismi non contendono gli stessi todo.
+    """
+    try:
+        cfg = orchestrator_config.get()
+        if cfg.get("dag_parallel_enabled"):
+            logger.info("route_after_planner: dag_parallel attivo, prevale DAG -> executor")
+            return "executor"
+        if orchestrator_config.todo_isolation_active(state):
+            logger.info("route_after_planner: isolamento todo attivo -> todo_runner")
+            return "todo_runner"
+    except Exception as exc:  # pragma: no cover - difensivo
+        logger.debug("route_after_planner: gating skip (%s) -> executor", exc)
+    return "executor"
+
+
+def route_after_todo_runner(state: AgentState) -> str:
+    """Dopo todo_runner: re-entry per il prossimo todo, chiusura via final_gate/
+    learner, o fallback all'executor classico.
+
+    - cap iterazioni globale raggiunto -> learner (stessa safety di route_after_verifier).
+    - stop_reason == "tool_use" -> todo_runner (prossimo todo isolato).
+    - stop_reason == "end_turn" (catena finita/bloccata) -> final_gate se
+      eleggibile (verifica E2E pre-chiusura), altrimenti learner.
+    - stop_reason in (loop_abort, superseded) -> learner.
+    - stop_reason assente (no-op del guard / dispatch fallito) -> executor:
+      fallback al loop storico, il run NON resta mai morto.
+    """
+    iterations = int(state.get("iterations") or 0)
+    iter_cap = int(state.get("iteration_budget") or 0) or MAX_AGENT_ITERATIONS
+    if iterations >= iter_cap:
+        logger.warning(
+            "route_after_todo_runner: cap iterazioni (iter=%d cap=%d), chiudo",
+            iterations, iter_cap,
+        )
+        return "learner"
+    stop_reason = state.get("stop_reason")
+    if stop_reason in ("superseded", "loop_abort"):
+        logger.warning("route_after_todo_runner: stop=%s -> learner", stop_reason)
+        return "learner"
+    if stop_reason == "tool_use":
+        return "todo_runner"
+    if stop_reason == "end_turn":
+        # Catena todo finita o bloccata: il final_gate generale verifica il
+        # flusso E2E (build, runtime) prima di chiudere. plan_phase_active e'
+        # True qui, quindi _final_gate_eligible (che esclude plan_phase) NON
+        # scatta: usiamo la stessa eleggibilita' "software task" del verifier.
+        try:
+            from .. import final_gate as _fg
+            _cfg = orchestrator_config.get()
+            if _cfg.get("final_gate_enabled") and _fg._is_software_task(state, _cfg):
+                _fc = int(state.get("final_gate_cycle", 0) or 0)
+                if _fc < int(_cfg["final_gate_max_cycles"]):
+                    logger.info(
+                        "route_after_todo_runner: catena todo conclusa -> final_gate (verifica E2E)"
+                    )
+                    return "final_gate"
+        except Exception as exc:  # pragma: no cover - difensivo
+            logger.debug("route_after_todo_runner: final_gate eligibility skip (%s)", exc)
+        return "learner"
+    # stop_reason assente: guard no-op o dispatch fallito -> fallback executor.
+    logger.info("route_after_todo_runner: nessuno stop_reason -> fallback executor")
+    return "executor"
