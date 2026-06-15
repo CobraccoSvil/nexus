@@ -38,7 +38,14 @@ redis:
 
 features:
   allow_cloud_tier2: true
-  allow_cloud_tier3: false
+  # Profilo cloud/dev: l'operatore E' il proprietario dei dati e ha richiesto
+  # accesso completo. Coerente con l'intento gia' documentato sul blocco
+  # routing.tier_3 ("Dev locale: cloud abilitato per tier 3, scelta esplicita
+  # operatore"). La redaction reidratabile (redaction.enabled=true) sanitizza
+  # comunque i segreti prima dell'invio al provider. In PROD usare hybrid/onprem
+  # (che mantengono allow_cloud_tier3=false). Override runtime: settings
+  # dlp_allow_cloud_tier3 (regola G).
+  allow_cloud_tier3: true
   dlp_enabled: true
 
 # Provider routing policy
