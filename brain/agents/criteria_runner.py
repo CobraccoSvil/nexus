@@ -167,11 +167,23 @@ async def _check_run_command(
     expected_exit = expected.get("exit_code", 0)
 
     passed = (actual_exit is not None and actual_exit == int(expected_exit))
+    # `max_output_chars` (opzionale nella spec): permette ai call site (es. il
+    # criterio BUILD del final_gate, mig 0426) di esporre piu' contesto quando
+    # un build emette molti errori. Default storico 600 caratteri preservato
+    # per tutti gli altri usi (criteri brevi, check rapidi).
+    try:
+        max_chars = int(spec.get("max_output_chars") or 600)
+    except (TypeError, ValueError):
+        max_chars = 600
+    if max_chars < 200:
+        max_chars = 200
     evidence = {
         "command": cmd,
         "exit_code": actual_exit,
         "expected_exit": expected_exit,
-        "output_excerpt": raw[:600],
+        "output_excerpt": raw[:max_chars],
+        "output_truncated": len(raw) > max_chars,
+        "output_total_chars": len(raw),
     }
     return passed, evidence
 
