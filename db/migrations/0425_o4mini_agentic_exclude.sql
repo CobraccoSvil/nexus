@@ -1,0 +1,30 @@
+-- 0425_o4mini_agentic_exclude.sql
+-- Fix qualita' intervento agentico, PER CAPABILITY (non per model_id fisso).
+--
+-- Problema: o4-mini (reasoner openai o-series) veniva SELEZIONATO per i task
+-- agentici (debug/fix) perche' nel catalog risultava un normale modello
+-- tool-capable: supports_tool_use=t, agentic_thinking_policy='native',
+-- uses_thinking_mode=f. Ma su tool use + chat italiana e' inadatto: risponde in
+-- INGLESE e DESCRIVE i passi invece di emettere tool-call -> l'agente "non
+-- risponde con azione dopo 3 tentativi" -> abort, output in inglese, nessun edit
+-- applicato (incidente reale su Beauty-Book).
+--
+-- Fix: si corregge la CAPABILITY del modello marcandolo
+-- agentic_thinking_policy='exclude'. Il filtro di eligibility della selezione
+-- (crates/mcp-core/src/orchestrator/model_routing.rs: select_models_tierchain
+-- richiede `agentic_thinking_policy <> 'exclude'`) lo scarta DINAMICAMENTE dai
+-- soli task agentici; la scelta del modello resta tier-dinamica sul pool
+-- restante della cascata (claude-sonnet, gemini-flash, deepseek, mistral...).
+-- NESSUN modello fissato in matrix o in codice (regola G): la routing matrix
+-- resta il pool di candidati, e' la SELEZIONE che esclude l'inadatto in base
+-- alla sua capability. capability_source resta 'manual' cosi' il catalog_sync
+-- non sovrascrive la marcatura.
+--
+-- Sostituisce la migrazione 0424 (rimossa), che era una toppa: fissava
+-- gpt-4o-mini al posto di o4-mini direttamente nella routing matrix.
+--
+-- FOLLOW-UP (hardening): far rilevare al catalog_sync i reasoner inadatti ai
+-- task agentici (auto-marcatura), invece della marcatura manuale per-modello;
+-- ed estendere la review agli altri reasoner del catalog (o1, ...).
+-- Idempotente.
+UPDATE ai_price_catalog SET agentic_thinking_policy = 'exclude' WHERE model = 'o4-mini';
