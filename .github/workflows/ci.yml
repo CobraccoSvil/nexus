@@ -77,7 +77,10 @@ jobs:
         run: pnpm build
 
       - name: Run tests
-        run: pnpm test --run
+        # `pnpm test` -> `turbo run test`; i package usano gia' `vitest run`
+        # (esecuzione singola). NON aggiungere `--run`: turbo lo interpreta come
+        # proprio argomento sconosciuto e fallisce ("unexpected argument --run").
+        run: pnpm test
         env:
           POSTGRES_URL: postgres://nexus:nexus@localhost:5432/nexus
           REDIS_URL: redis://localhost:6379
