@@ -23,6 +23,11 @@ qdrant-client = "^1.12"
 openai = "^1.58"
 anthropic = "^0.40"
 google-generativeai = "^0.8"
+# SDK Google nuovo (modulo google.genai), usato da providers/google_provider.py
+# (_convert_messages_to_google, thought signature). Era installato solo a mano sul
+# dev box: senza questa riga un install dal pyproject (CI inclusa) fallisce con
+# "ModuleNotFoundError: No module named 'google.genai'".
+google-genai = "^2.7"
 numpy = "^2.0"
 tiktoken = "^0.8"
 python-docx = "^1.1"
