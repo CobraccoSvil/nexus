@@ -60,11 +60,14 @@ def test_superseded_sempre_learner():
     ) == "learner"
 
 
-def test_g1_escalated_resta_executor():
-    """g1_escalated invariato: re-entry executor per far agire il modello escalato."""
+def test_g1_escalated_passa_per_g1_continue():
+    """g1_escalated re-instrada l'executor PER il nodo passthrough g1_continue:
+    il vecchio self-loop executor->executor non veniva materializzato dal
+    checkpointer custom (fix self-loop 2026-06-15). La re-execution del modello
+    escalato avviene comunque (g1_continue -> executor)."""
     assert routing.route_after_executor(
         _state(stop_reason="g1_escalated", user_intent="fix")
-    ) == "executor"
+    ) == "g1_continue"
 
 
 def test_abort_con_plan_attivo_non_va_al_final_gate():

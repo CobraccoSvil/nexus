@@ -1620,6 +1620,31 @@ def _billing_exhausted_providers() -> list[str]:
         return []
 
 
+async def g1_continue_node(state: AgentState) -> dict[str, Any]:
+    """Nodo passthrough del re-routing G1 (ADR self-loop fix).
+
+    Esiste per ELIMINARE il self-loop ``executor -> executor`` della
+    conditional edge. Il checkpointer PostgreSQL custom non materializza i task
+    schedulati su un self-loop (aput_writes NO-OP, aget_tuple senza
+    pending_writes): il Pregel loop di LangGraph esaurisce con un task pendente
+    e il grafo non raggiunge mai il learner, chiudendosi via finally(done) ->
+    mcp-core mappa Completed su un task NON convergente.
+
+    Inserendo un nodo distinto in mezzo (``executor -> g1_continue ->
+    executor``) si forza un nuovo confine di superstep gestito dal
+    checkpointer, esattamente come ``tool_dispatch`` nei run convergenti.
+
+    Il nodo NON deve azzerare ``g1_reroute_count`` (il cap anti-loop deve
+    progredire) ne' alterare altri segnali: ritorna un patch VUOTO. L'eventuale
+    nudge G1 e' gia' nello stato (iniettato dall'executor) e viene preservato.
+    """
+    logger.info(
+        "g1_continue_node: passthrough re-routing G1 (reroute=%s) -> executor",
+        state.get("g1_reroute_count"),
+    )
+    return {}
+
+
 async def executor_node(state: AgentState) -> dict[str, Any]:
     """Chiama il provider LLM. In modalita' agent (tools_json non vuoto) usa
     `generate_agent_turn` e popola `pending_tool_uses` + `stop_reason`.
@@ -1860,9 +1885,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     _prev_stop_for_g1 = state.get("stop_reason")
     _prev_iterations_for_g1 = int(state.get("iterations") or 0)
     _is_g1_reentry = False
+    # FIX mis-conteggio re-entry G1: il route G1 (route_after_executor) scatta solo
+    # su stop_reason in ("end_turn", "stop", None) con iter>=... ma una re-entry G1
+    # AUTENTICA arriva SEMPRE con uno stop_reason esplicito (end_turn/stop). Contare
+    # anche None a iter>=1 (es. entry iniziale/anomala senza stop) erodeva 1 reroute
+    # su 3, riducendo il budget anti-loop. Escludo None: il contatore avanza solo
+    # sulle chiusure descrittive reali, dove il route G1 ha davvero re-instradato.
     if (
         _prev_iterations_for_g1 >= 1
-        and _prev_stop_for_g1 in ("end_turn", "stop", None)
+        and _prev_stop_for_g1 in ("end_turn", "stop")
         and not (state.get("pending_tool_uses") or [])
     ):
         # Conta la re-entry G1 sia per richiesta action-oriented (input) sia
@@ -1995,6 +2026,12 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             "result": _cap_text,
             "pending_tool_uses": [],
             "stop_reason": "g1_cap_reached",
+            # Esito canonico onesto (mig 0386): il G1 cap NON e' un successo. Senza
+            # questo segnale mcp-core cadeva nel ramo else -> Completed (run vuoto
+            # spacciato per riuscito). forced_close_unverified=True -> FailedDiagnosed
+            # (brain_agent_client.rs:1188). Il route_after_executor manda comunque al
+            # final_gate se eleggibile (verifica E2E), che resta il gate di verita'.
+            "forced_close_unverified": True,
             "iterations": int(state.get("iterations") or 0) + 1,
             "g1_reroute_count": _g1_reroute_count,
             "action_nudge_count": int(state.get("action_nudge_count") or 0),

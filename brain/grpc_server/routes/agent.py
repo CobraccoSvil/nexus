@@ -599,7 +599,19 @@ async def agent_run(body: AgentRunRequest) -> dict[str, object]:
     from langchain_core.messages import HumanMessage as _HumanMessage
 
     graph = runtime._get_agent_graph()
-    config: dict[str, object] = {"configurable": {"thread_id": body.thread_id}}
+    # recursion_limit DB-driven (regola G: niente hardcode). E' il numero massimo
+    # di superstep del Pregel loop prima di sollevare GraphRecursionError. Con il
+    # nodo g1_continue ogni re-routing G1 consuma un superstep in piu' rispetto al
+    # vecchio self-loop: un cap esplicito e generoso (default 50) evita sia
+    # l'aborto prematuro sia il loop incontrollato. Cache TTL 60s (path caldo).
+    from brain.utils.settings_db import get_int_setting_cached as _get_int_setting_cached
+    _recursion_limit = _get_int_setting_cached("agent.graph.recursion_limit", 50)
+    if _recursion_limit < 1:
+        _recursion_limit = 50
+    config: dict[str, object] = {
+        "configurable": {"thread_id": body.thread_id},
+        "recursion_limit": _recursion_limit,
+    }
 
     # Punto unico history builder (regola L, S72).
     history_msgs = _build_history_messages(body.conversation_history)

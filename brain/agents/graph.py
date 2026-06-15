@@ -9,6 +9,7 @@ from langgraph.graph import END, StateGraph  # type: ignore[import-untyped]
 from .nodes import (
     configure_services,
     executor_node,
+    g1_continue_node,
     learner_node,
     reflection_node,
     route_after_executor,
@@ -146,6 +147,10 @@ def create_agent_graph(
     workflow.add_node("planner", planner_node)  # type: ignore[arg-type]
     workflow.add_node("todo_runner", todo_runner_node)  # type: ignore[arg-type]
     workflow.add_node("executor", executor_node)  # type: ignore[arg-type]
+    # Nodo passthrough del re-routing G1: elimina il self-loop executor->executor
+    # (non materializzato dal checkpointer custom) forzando un confine di
+    # superstep distinto, come tool_dispatch nei run convergenti.
+    workflow.add_node("g1_continue", g1_continue_node)  # type: ignore[arg-type]
     workflow.add_node("tool_dispatch", tool_dispatch_node)  # type: ignore[arg-type]
     workflow.add_node("verifier", verifier_node)  # type: ignore[arg-type]
     workflow.add_node("final_gate", final_gate_node)  # type: ignore[arg-type]
@@ -204,6 +209,10 @@ def create_agent_graph(
     # Dopo executor: loop su tool_dispatch, verificare (PR-2), o passo a reflection.
     # PR-2: se plan_phase_active + verifier_enabled e stop_reason=end_turn,
     # route_after_executor ritorna "verifier" che lancia la verifica DoD.
+    # NB: nessun self-loop executor->executor. Il re-routing G1 passa per il nodo
+    # passthrough g1_continue (-> executor), che forza un confine di superstep
+    # gestito dal checkpointer; il vecchio self-loop NON veniva materializzato dal
+    # checkpointer custom (aput_writes NO-OP) e bloccava la convergenza.
     workflow.add_conditional_edges(
         "executor",
         route_after_executor,
@@ -212,9 +221,11 @@ def create_agent_graph(
             "verifier": "verifier",
             "final_gate": "final_gate",
             "learner": "reflection",
-            "executor": "executor",
+            "g1_continue": "g1_continue",
         },
     )
+    # g1_continue rientra nell'executor per la re-execution G1.
+    workflow.add_edge("g1_continue", "executor")
     # Final gate: se fallisce rimanda all'executor per l'integrazione,
     # altrimenti chiude verso reflection (-> learner).
     workflow.add_conditional_edges(

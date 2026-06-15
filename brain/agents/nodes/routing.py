@@ -123,8 +123,10 @@ def route_after_executor(state: AgentState) -> str:
     # (sticky_model aggiornato, reroute azzerato). Ri-entra nell'executor per
     # far agire il modello escalato. Il cap iterazioni globale resta la safety.
     if stop_reason == "g1_escalated":
-        logger.warning("route_after_executor: G1 escalation orchestratore -> re-executor")
-        return "executor"
+        # Ri-entra nell'executor via g1_continue (NO self-loop executor->executor:
+        # il checkpointer custom non lo materializza). Vedi graph.py.
+        logger.warning("route_after_executor: G1 escalation orchestratore -> re-executor (via g1_continue)")
+        return "g1_continue"
     # Abort coordinato (loop_abort, progress_controller) o legacy (loop_detected /
     # g1_cap_reached): NON chiudere "morto". Causa radice corretta qui: gli abort
     # scavalcavano il final_gate andando dritti al learner, chiudendo un task
@@ -265,11 +267,14 @@ def route_after_executor(state: AgentState) -> str:
                         _trigger = "textual(intent-non-compiuta)"
                     logger.warning(
                         "route_after_executor: G1 risposta descrittiva, segnale=%s "
-                        "(iter=%d reroute=%d/%d nudge=%d) -> re-executor",
+                        "(iter=%d reroute=%d/%d nudge=%d) -> re-executor (via g1_continue)",
                         _trigger,
                         iterations, _reroute_count, _max_nudges, _nudge_count_log,
                     )
-                    return "executor"
+                    # Re-routing G1 via nodo passthrough g1_continue: il self-loop
+                    # executor->executor non veniva materializzato dal checkpointer
+                    # custom -> il run si chiudeva 'completed' senza convergere.
+                    return "g1_continue"
         else:
             logger.warning(
                 "route_after_executor: G1 cap reroute raggiunto "
