@@ -516,6 +516,28 @@ export function useChat(
             const next = [...prev, trace];
             return next.length > 100 ? next.slice(next.length - 100) : next;
           });
+          // L'AITraceEvent porta provider/model dell'iterazione = modello REALE
+          // corrente del run (riflette cascade/escalation e il fallback gateway).
+          // Allineiamo agentRun cosi' l'indicatore "run: X/Y" nel composer segue
+          // il modello che sta girando ORA, non quello iniziale del routing
+          // (fix etichetta stantia: mostrava openai/gpt-4o-mini mentre girava
+          // google/gemini-2.5-pro). Aggiorna solo se cambia (evita re-render).
+          if (trace.provider && trace.model) {
+            const tp = trace.provider;
+            const tm = trace.model;
+            setAgentRuns((prevMap) => {
+              const cur = prevMap.get(trace.runId);
+              if (!cur || (cur.provider === tp && cur.model === tm)) return prevMap;
+              return new Map(prevMap).set(trace.runId, { ...cur, provider: tp, model: tm });
+            });
+            if (isPrimary) {
+              setAgentRun((prev) =>
+                prev && prev.runId === trace.runId && (prev.provider !== tp || prev.model !== tm)
+                  ? { ...prev, provider: tp, model: tm }
+                  : prev,
+              );
+            }
+          }
         },
         isPrimary ? setIsReconnecting : undefined,
         isPrimary ? (delta: string) => {
