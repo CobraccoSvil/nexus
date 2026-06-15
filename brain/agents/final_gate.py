@@ -64,6 +64,69 @@ def _is_software_task(state: dict[str, Any], cfg: dict[str, Any]) -> bool:
     return intent in software_intents
 
 
+def _resolve_build_command(state: dict[str, Any]) -> tuple[str, str | None] | None:
+    """Risolve il comando build del progetto per il criterio di COMPILAZIONE del
+    final_gate (fix qualita' 2026-06-15). Priorita':
+      1. run_configurations del progetto con label ~ 'build' o role='build'
+         (fonte per-progetto canonica);
+      2. setting `agent.final_gate.build_command` (auto-detect generico default).
+    Ritorna (command, working_dir|None), oppure None se il build-check e'
+    disabilitato o nessun comando e' risolvibile. Best-effort: su errore DB
+    ritorna None (N/A, non blocca la chiusura)."""
+    try:
+        from brain.utils.db_pool import connect as _db_connect
+    except Exception:
+        return None
+    project_id = state.get("project_id") or os.environ.get("NEXUS_PROJECT_ID", "")
+    try:
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM settings WHERE key = 'agent.final_gate.build_check_enabled'"
+            )
+            row = cur.fetchone()
+            enabled = (row[0] if row and row[0] else "true").strip().lower() in ("true", "1", "yes")
+            if not enabled:
+                return None
+            if project_id:
+                cur.execute(
+                    "SELECT command, args, cwd FROM run_configurations "
+                    "WHERE project_id = %s "
+                    "AND (lower(label) LIKE %s OR lower(coalesce(role, '')) = 'build') "
+                    "ORDER BY (lower(coalesce(role, '')) = 'build') DESC LIMIT 1",
+                    (project_id, "%build%"),
+                )
+                rc = cur.fetchone()
+                if rc and rc[0]:
+                    command, args, cwd = rc[0], rc[1] or [], rc[2]
+                    full = command + ((" " + " ".join(args)) if args else "")
+                    return (full, cwd)
+            cur.execute(
+                "SELECT value FROM settings WHERE key = 'agent.final_gate.build_command'"
+            )
+            row = cur.fetchone()
+            cmd = (row[0] if row and row[0] else "").strip()
+            if cmd:
+                return (cmd, None)
+    except Exception as exc:  # pragma: no cover - difensivo
+        logger.debug("final_gate._resolve_build_command: %s", exc)
+    return None
+
+
+def _build_timeout_s() -> float:
+    """Timeout (s) del criterio build, da settings (default 180: i build sono
+    lenti, i 30s del verifier non basterebbero)."""
+    try:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM settings WHERE key = 'agent.final_gate.build_timeout_s'"
+            )
+            row = cur.fetchone()
+            return float(row[0]) if row and row[0] else 180.0
+    except Exception:
+        return 180.0
+
+
 async def run_general_gates(
     state: dict[str, Any], cfg: dict[str, Any]
 ) -> tuple[bool, list[dict[str, Any]]]:
@@ -115,6 +178,24 @@ async def run_general_gates(
             },
             "expected": {},
         })
+
+    # Criterio BUILD (fix qualita' 2026-06-15): il codice deve COMPILARE prima
+    # di chiudere "completed", non solo esistere (outputs_exist). Comando
+    # risolto per-progetto (run_config 'build' -> setting auto-detect); N/A se
+    # non risolvibile -> non blocca i progetti senza build. Timeout dedicato
+    # (i build sono lenti).
+    build = _resolve_build_command(state)
+    if build is not None:
+        build_cmd, build_cwd = build
+        build_crit: dict[str, Any] = {
+            "type": "run_command",
+            "spec": {"command": build_cmd},
+            "expected": {"exit_code": 0},
+            "timeout_s": _build_timeout_s(),
+        }
+        if build_cwd:
+            build_crit["spec"]["working_dir"] = build_cwd
+        criteria.append(build_crit)
 
     results: list[dict[str, Any]] = []
     for c in criteria:
