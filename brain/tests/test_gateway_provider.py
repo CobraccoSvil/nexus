@@ -484,6 +484,92 @@ async def test_errore_timeout_mappa_su_provider_result(monkeypatch: pytest.Monke
     assert res.metadata["retriable"] is True
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Invariante "provider esposto = provider richiesto" (fix bug Provider 'gateway')
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_errore_preserva_pin_provider_non_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Su errore HTTP/timeout, ProviderResult.provider DEVE essere il provider
+    semantico richiesto (anthropic/openai/...), MAI la stringa di trasporto
+    "gateway".
+
+    Senza questa invariante, l'executor salva "gateway" come provider corrente
+    (vedi brain/agents/nodes/__init__.py:2874) e al turno successivo il
+    registry fallisce con "[Provider 'gateway' not found]".
+    """
+    import httpx
+
+    class _ErrorClient:
+        def __call__(self, *a: Any, **k: Any) -> "_ErrorClient":
+            return self
+
+        async def __aenter__(self) -> "_ErrorClient":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None:
+            return None
+
+        async def post(self, *a: Any, **k: Any):
+            raise httpx.TimeoutException("timed out")
+
+    monkeypatch.setattr(gp.httpx, "AsyncClient", _ErrorClient())
+    # Model prefissato "anthropic/claude-x" -> pin_provider="anthropic".
+    res = await gp.GatewayProvider().generate_agent_turn(
+        "anthropic/claude-x", [{"role": "user", "content": "x"}], [],
+    )
+    # Invariante critica: il provider esposto e' quello richiesto, non "gateway".
+    assert res.provider == "anthropic"
+    assert res.provider != "gateway"
+    # Stessa invariante sulla completion semplice.
+    res2 = await gp.GatewayProvider().generate("openai/gpt-4o-mini", "ping")
+    assert res2.provider == "openai"
+    assert res2.provider != "gateway"
+
+
+@pytest.mark.asyncio
+async def test_rametro_felice_senza_provider_used_usa_pin_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Se il gateway non popola ``provider_used`` nella risposta (campo
+    opzionale), il ProviderResult espone il pin_provider del chiamante, non
+    "gateway". Sintomo storico: provider_used assente -> ripiego su self.name
+    ("gateway") -> contaminazione downstream.
+    """
+    _install_complete_double(
+        monkeypatch,
+        {
+            "content": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "model_used": "claude-x",
+            # provider_used VOLUTAMENTE assente.
+            "finish_reason": "end_turn",
+        },
+    )
+    res = await gp.GatewayProvider().generate_agent_turn(
+        "anthropic/claude-x", [{"role": "user", "content": "ciao"}], [],
+    )
+    assert res.provider == "anthropic"
+    assert res.provider != "gateway"
+
+    # Stesso check sulla completion semplice (rametro felice di generate()).
+    _install_complete_double(
+        monkeypatch,
+        {
+            "content": "ciao",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "model_used": "gpt-4o-mini",
+            "finish_reason": "stop",
+        },
+    )
+    res2 = await gp.GatewayProvider().generate("openai/gpt-4o-mini", "ping")
+    assert res2.provider == "openai"
+    assert res2.provider != "gateway"
+
+
 def test_list_models_vuoto() -> None:
     # Il gateway non espone un catalogo proprio (governato dal DB).
     assert gp.GatewayProvider().list_models() == []

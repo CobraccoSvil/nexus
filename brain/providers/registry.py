@@ -729,6 +729,26 @@ class ProviderRegistry:
             return model
         return f"{provider_name}/{model}"
 
+    @staticmethod
+    def _is_transport_sentinel(provider: str) -> bool:
+        """True se ``provider`` e' il nome del TRASPORTO (gateway) e non di un
+        provider semantico (anthropic/openai/google/...).
+
+        Difesa idempotente (regola L): il gateway e' trasporto, NON provider.
+        Un chiamante che passa qui ``provider="gateway"`` ha contaminato la
+        coordinata di routing da qualche parte a monte (tipicamente leggendo
+        ``ProviderResult.provider`` quando questo era "gateway" per un bug di
+        propagazione, gia' chiuso in ``gateway_provider.py``). Questa guard
+        rileva la regressione invece di nasconderla: fallisce con un messaggio
+        onesto cosi' il bug emerge subito anche se in futuro qualcuno
+        re-introduce un path che propaga la stringa-sentinella.
+
+        Nota: ``_providers`` NON contiene la chiave "gateway" (vedi __init__):
+        questa guard scatta PRIMA del lookup per dare un errore mirato invece
+        del generico "[Provider 'gateway' not found]".
+        """
+        return (provider or "").strip().lower() == "gateway"
+
     def set_enabled(self, name: str, enabled: bool) -> None:
         """Abilita o disabilita un provider. Thread-safe (GIL)."""
         if enabled:
@@ -786,6 +806,17 @@ class ProviderRegistry:
         evitando il content vuoto da reasoning overflow. I provider che non
         conoscono il kwarg lo ignorano (firme ``**kwargs``).
         """
+        # Difesa idempotente (regola L): rifiuta la stringa-sentinella del
+        # trasporto come provider semantico. Il gateway NON e' un provider.
+        if self._is_transport_sentinel(provider):
+            logger.error(
+                "generate_completion: provider='gateway' e' un trasporto, non un provider — bug nel chiamante"
+            )
+            return ProviderResult(
+                provider=provider, model=model,
+                content="[Provider 'gateway' is a transport, not a provider — bug in caller]",
+                metadata={"error": "transport_as_provider"},
+            )
         if not self.is_enabled(provider):
             return ProviderResult(
                 provider=provider, model=model,
@@ -960,6 +991,22 @@ class ProviderRegistry:
         → cerca nella `_provider_fallback_chain()` (DB-driven) il prossimo abilitato.
         Niente modelli hardcoded: i default model vengono da `nexus_provider_default_model`.
         """
+        # Difesa idempotente (regola L): rifiuta la stringa-sentinella del
+        # trasporto come provider semantico. Sintomo storico di questa
+        # contaminazione: ProviderResult con provider="gateway" propagato
+        # all'executor (vedi gateway_provider._build_agent_result), poi salvato
+        # come provider corrente e riusato al turno successivo -> "[Provider
+        # 'gateway' not found]". Qui falliamo onestamente invece di mascherare.
+        if self._is_transport_sentinel(provider):
+            logger.error(
+                "generate_agent_turn_sync: provider='gateway' e' un trasporto, non un provider — bug nel chiamante"
+            )
+            return ProviderResult(
+                provider=provider, model=model,
+                content="[Provider 'gateway' is a transport, not a provider — bug in caller]",
+                metadata={"error": "transport_as_provider", "stop_reason": "error"},
+            )
+
         effective_provider = provider
         effective_model = model
 
@@ -1283,6 +1330,18 @@ class ProviderRegistry:
         return result
 
     async def generate_completion_async(self, provider: str, model: str, prompt: str, **kwargs: Any) -> ProviderResult:
+        # Difesa idempotente (regola L): rifiuta la stringa-sentinella del
+        # trasporto. Vedi guard gemelle in generate_completion /
+        # generate_agent_turn_sync e fix sorgente in gateway_provider.py.
+        if self._is_transport_sentinel(provider):
+            logger.error(
+                "generate_completion_async: provider='gateway' e' un trasporto, non un provider — bug nel chiamante"
+            )
+            return ProviderResult(
+                provider=provider, model=model,
+                content="[Provider 'gateway' is a transport, not a provider — bug in caller]",
+                metadata={"error": "transport_as_provider"},
+            )
         if not self.is_enabled(provider):
             return ProviderResult(
                 provider=provider, model=model,

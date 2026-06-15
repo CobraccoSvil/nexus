@@ -390,11 +390,19 @@ class GatewayProvider(BaseProvider):
         try:
             data = await self._post_complete(payload)
         except Exception as exc:  # noqa: BLE001
-            return _gateway_error_to_result(exc, self.name, model)
+            # Invariante: il provider esposto al chiamante e' quello SEMANTICO
+            # richiesto (anthropic/openai/...), non il nome del trasporto.
+            # Senza questa propagazione, il chiamante salva "gateway" come
+            # provider corrente e i lookup successivi nel registry falliscono
+            # (regola L: il gateway e' trasporto, non provider).
+            return _gateway_error_to_result(exc, pin_provider or self.name, model)
 
         usage = _usage_to_internal(data.get("usage"))
         return ProviderResult(
-            provider=data.get("provider_used") or self.name,
+            # provider_used dal gateway > pin esplicito dal chiamante > trasporto.
+            # Cosi' anche se il gateway non popola provider_used, il chiamante
+            # riceve il provider semantico richiesto.
+            provider=data.get("provider_used") or pin_provider or self.name,
             model=data.get("model_used") or model,
             content=data.get("content") or "",
             metadata={
@@ -470,11 +478,21 @@ class GatewayProvider(BaseProvider):
         try:
             data = await self._post_complete(payload)
         except Exception as exc:  # noqa: BLE001
-            return _gateway_error_to_result(exc, self.name, model)
+            # Stessa invariante della generate(): in errore esponiamo il
+            # provider semantico richiesto dal chiamante (anthropic/openai/...),
+            # non "gateway", cosi' il chiamante non perde la coordinata di
+            # routing su retry/cascade/UPDATE agent_runs.
+            return _gateway_error_to_result(exc, pin_provider or self.name, model)
 
-        return self._build_agent_result(data, model)
+        return self._build_agent_result(data, model, pin_provider=pin_provider)
 
-    def _build_agent_result(self, data: dict[str, Any], model: str) -> ProviderResult:
+    def _build_agent_result(
+        self,
+        data: dict[str, Any],
+        model: str,
+        *,
+        pin_provider: str | None = None,
+    ) -> ProviderResult:
         """Costruisce il ProviderResult del turno agentico dalla LlmResponse.
 
         - tool_calls -> tool_use_blocks + blocchi assistant tool_use;
@@ -502,7 +520,11 @@ class GatewayProvider(BaseProvider):
         stop_reason = "tool_use" if tool_use_blocks else "end_turn"
 
         return ProviderResult(
-            provider=data.get("provider_used") or self.name,
+            # provider_used dal gateway > pin esplicito dal chiamante > trasporto.
+            # Il chiamante (executor_node) usa res.provider come provider corrente
+            # per i turni successivi e per UPDATE agent_runs: deve essere il
+            # provider SEMANTICO (anthropic/...), non il trasporto ("gateway").
+            provider=data.get("provider_used") or pin_provider or self.name,
             model=data.get("model_used") or model,
             content=content,
             metadata={

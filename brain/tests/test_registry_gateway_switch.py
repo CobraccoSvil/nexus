@@ -170,3 +170,54 @@ def test_transport_for_e_sempre_il_gateway(
     assert isolated_registry._transport_for("openai") is fake_gateway
     assert isolated_registry._transport_for("anthropic") is fake_gateway
     assert isolated_registry._transport_for("provider-inesistente") is fake_gateway
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Difesa: provider="gateway" e' un trasporto, non un provider (regola L)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_agent_turn_rifiuta_provider_gateway(
+    isolated_registry: reg.ProviderRegistry,
+) -> None:
+    """Se un chiamante passa erroneamente provider="gateway" (stringa-sentinella
+    del trasporto, NON un provider), il registry deve fallire onestamente con
+    transport_as_provider invece del generico "[Provider 'gateway' not found]".
+
+    Regressione: il sintomo originale era ProviderResult.provider="gateway"
+    propagato dall'executor (vedi gateway_provider.py prima del fix) -> al
+    turno successivo il registry veniva chiamato con provider="gateway".
+    """
+    res = isolated_registry.generate_agent_turn_sync(
+        provider="gateway", model="claude-x",
+        messages=[{"role": "user", "content": "x"}], tools=[],
+    )
+    assert res.metadata.get("error") == "transport_as_provider"
+    assert "transport" in res.content
+    # case-insensitive sulla guard.
+    res2 = isolated_registry.generate_agent_turn_sync(
+        provider="Gateway", model="claude-x",
+        messages=[{"role": "user", "content": "x"}], tools=[],
+    )
+    assert res2.metadata.get("error") == "transport_as_provider"
+
+
+def test_generate_completion_rifiuta_provider_gateway(
+    isolated_registry: reg.ProviderRegistry,
+) -> None:
+    """Stessa guard sul path sincrono di generate_completion."""
+    res = isolated_registry.generate_completion(
+        provider="gateway", model="claude-x", prompt="ciao",
+    )
+    assert res.metadata.get("error") == "transport_as_provider"
+
+
+@pytest.mark.asyncio
+async def test_generate_completion_async_rifiuta_provider_gateway(
+    isolated_registry: reg.ProviderRegistry,
+) -> None:
+    """Stessa guard sul path async."""
+    res = await isolated_registry.generate_completion_async(
+        provider="gateway", model="claude-x", prompt="ciao",
+    )
+    assert res.metadata.get("error") == "transport_as_provider"
