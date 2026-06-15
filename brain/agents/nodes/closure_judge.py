@@ -43,6 +43,10 @@ _cfg_ts: float = 0.0
 _CFG_DEFAULTS: dict[str, Any] = {
     "shadow_enabled": True,
     "min_result_chars": 40,
+    # active=True: il verdetto del judge DECIDE l'esito (de-lessicalizzazione,
+    # promozione mig 0422). False: comportamento storico SHADOW (solo telemetria).
+    # Default codice conservativo (False): la migrazione 0422 setta il valore reale.
+    "active": False,
 }
 
 # Timeout della chiamata LLM: il judge e' leggero e off-path (shadow), non deve
@@ -74,7 +78,8 @@ def _load_config() -> dict[str, Any]:
             cur.execute(
                 "SELECT key, value FROM settings WHERE key IN "
                 "('agent.closure_judge.shadow_enabled',"
-                " 'agent.closure_judge.min_result_chars')"
+                " 'agent.closure_judge.min_result_chars',"
+                " 'agent.closure_judge.active')"
             )
             rows = dict(cur.fetchall())
         cfg = {
@@ -84,6 +89,9 @@ def _load_config() -> dict[str, Any]:
             "min_result_chars": int(
                 rows.get("agent.closure_judge.min_result_chars", "40") or "40"
             ),
+            "active": str(
+                rows.get("agent.closure_judge.active", "false")
+            ).strip().lower() == "true",
         }
     except Exception as exc:  # pragma: no cover - difensivo
         logger.debug("closure_judge: lettura config fallita (%s), uso cache/default", exc)
@@ -192,32 +200,38 @@ async def _resolve_model() -> tuple[str, str] | None:
         return None
 
 
-async def run_shadow(
+async def judge(
     state: dict[str, Any],
     providers: Any,
-    blacklist_unfulfilled_fn: Callable[[str | None], bool],
-) -> None:
-    """Esegue il judge in SHADOW e logga il confronto con la blacklist lessicale.
+    result_override: str | None = None,
+) -> dict[str, Any] | None:
+    """Giudica via LLM se il task e' compiuto. Ritorna {"fulfilled": bool,
+    "reason": str} oppure None (astensione: gating non passato, modello non
+    risolvibile, provider error, verdetto non parsabile).
 
-    NON ritorna nulla e NON modifica lo state: e' puramente osservativo (regola H,
-    niente promozione cieca). Gating economico:
-      - shadow abilitato in DB;
+    Punto unico della decisione di chiusura LLM (regola L): sia `run_shadow`
+    (telemetria) sia l'executor_node (DECISORE, se agent.closure_judge.active)
+    delegano qui. NON guarda shadow_enabled/active: la scelta se USARE il verdetto
+    spetta al chiamante. Best-effort: ogni errore -> None (astensione), mai solleva.
+    Gating economico:
       - esito NON gia' dichiarato via task_complete (altrimenti il judge e' inutile);
       - result presente e sopra la soglia minima caratteri;
       - run d'azione (per chat puro la nozione di "compiuto" non si applica).
     """
     cfg = _load_config()
-    if not cfg["shadow_enabled"]:
-        return
     # Se il modello ha gia' dichiarato l'esito, il segnale primario c'e': skip.
     declared = state.get("declared_outcome")
     if isinstance(declared, dict) and declared.get("outcome") in (
         "done", "blocked", "needs_input",
     ):
         return
-    result = (state.get("result") or "").strip()
+    # result corrente: l'executor_node (decisore) lo passa esplicito perche' nello
+    # state non e' ancora aggiornato a fine turno; run_shadow (learner) usa
+    # state["result"] (gia' aggiornato a quel punto).
+    _res_src = result_override if result_override is not None else state.get("result")
+    result = (_res_src or "").strip()
     if len(result) < int(cfg["min_result_chars"]):
-        return
+        return None
     # Run d'azione: turn_action_oriented (classifier, mig 0387) o intent agentico.
     intent = str(state.get("user_intent") or "").lower()
     action_like = bool(state.get("turn_action_oriented")) or intent.startswith("agentic") or (
@@ -277,24 +291,45 @@ async def run_shadow(
     verdict = _parse_response(raw_text)
     if verdict is None:
         logger.debug("closure_judge: verdetto non parsabile, astensione")
-        return
+        return None
+    logger.debug(
+        "closure_judge: verdetto fulfilled=%s latency=%dms reason=%r",
+        verdict["fulfilled"], latency_ms, verdict["reason"],
+    )
+    return verdict
 
+
+async def run_shadow(
+    state: dict[str, Any],
+    providers: Any,
+    blacklist_unfulfilled_fn: Callable[[str | None], bool],
+) -> None:
+    """Wrapper SHADOW: chiama `judge()` e logga il confronto con la blacklist
+    lessicale, SENZA modificare la decisione del grafo (telemetria per la finestra
+    di confronto pre-promozione, regola H). Gating `shadow_enabled` qui; tutto
+    best-effort. Resta utile anche dopo la promozione: misura quanto la blacklist
+    diverge dal judge sui casi in cui quest'ultimo NON e' decisore."""
+    cfg = _load_config()
+    if not cfg["shadow_enabled"]:
+        return
+    verdict = await judge(state, providers)
+    if verdict is None:
+        return
     judge_unfulfilled = not verdict["fulfilled"]
     try:
         blacklist_unfulfilled = bool(blacklist_unfulfilled_fn(state.get("result")))
     except Exception:
         blacklist_unfulfilled = False
     agree = judge_unfulfilled == blacklist_unfulfilled
-
     thread_id = state.get("thread_id", "?")
-    # Telemetria di confronto (grep-able per il bilancio a ~2 settimane).
+    # Telemetria di confronto (grep-able per il bilancio della promozione).
     logger.info(
         "closure_judge_shadow: thread=%s judge_unfulfilled=%s blacklist_unfulfilled=%s "
-        "agree=%s latency=%dms reason=%r",
-        thread_id, judge_unfulfilled, blacklist_unfulfilled, agree, latency_ms, verdict["reason"],
+        "agree=%s reason=%r",
+        thread_id, judge_unfulfilled, blacklist_unfulfilled, agree, verdict["reason"],
     )
     if not agree:
-        # Riga dedicata per il conteggio dei disaccordi (decisione di promozione).
+        # Riga dedicata per il conteggio dei disaccordi.
         logger.warning(
             "closure_judge_disagreement: thread=%s judge=%s blacklist=%s reason=%r",
             thread_id,

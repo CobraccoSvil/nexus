@@ -612,6 +612,12 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     requires_tools_val: bool | None = None
     # Default True: classifier-down o campo assente NON blocca i fix (fail-safe).
     _authorizes_changes_val: bool = True
+    # True solo se il classifier LLM del TURNO CORRENTE ha effettivamente
+    # prodotto un giudizio (o se l'intent e' gia' risolto via hint). Distingue il
+    # caso "classifier ha risolto" dal caso degradato (LLM down / non
+    # configurato / eccezione): nel ramo degradato il default deve essere
+    # read/report, non action (vedi report_only_val sotto).
+    _classifier_resolved: bool = False
     # Intent gia' RISOLTO a monte (mcp-core, risposta dell'utente a una
     # disambiguazione "A"/"B"/"C"): si usa quello, NIENTE ri-classificazione.
     # Ri-classificare la lettera secca dava 'chat' (prompt_len=1), vanificando
@@ -626,10 +632,13 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         intent = _intent_hint
         intent_confidence = 1.0
         is_ambiguous_val = False
+        # Disambiguazione gia' risolta a monte: e' un giudizio determinato.
+        _classifier_resolved = True
     elif _agentic_classifier is not None:
         try:
             ag = await _agentic_classifier.classify(str(text))
             if ag is not None:
+                _classifier_resolved = True
                 intent = getattr(ag, "intent", None) or "agentic_default"
                 _ag_conf = getattr(ag, "confidence", None)
                 if _ag_conf is not None:
@@ -705,10 +714,24 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     # report_only i tool di MODIFICA file (write/edit/delete/rename) vengono
     # rimossi ANCHE se in _ALWAYS_ON_TOOLS: senza questo l'agente, trovato un
     # problema durante la verifica, lo CORREGGEVA invece di riportarlo
-    # (scope-creep), spesso bloccandosi. Default authorizes_changes=True (LLM
-    # down o campo assente) -> mai report_only -> i fix non vengono bloccati.
+    # (scope-creep), spesso bloccandosi.
     # Una disambiguazione risolta (_intent_hint) e' sempre un'azione.
-    report_only_val = (not _intent_hint) and (not _authorizes_changes_val)
+    #
+    # Default quando il classifier DEGRADA (LLM down / non configurato /
+    # eccezione, _classifier_resolved=False): read/report, NON action. Il vecchio
+    # default action-oriented forzava tool_choice=required anche su una pura
+    # LETTURA (es. "dammi la password dal DB") e i modelli leggeri la
+    # rifiutavano. Una richiesta semanticamente READ/REPORT deve poter essere
+    # eseguita anche senza classificazione: le azioni di MODIFICA restano
+    # esplicite (parole "modifica/crea/correggi/...", punto unico action_oriented
+    # mig 0387) e non passano da qui.
+    # Quando il classifier RISOLVE, comportamento invariato: report_only riflette
+    # il giudizio diretto authorizes_changes (default True nel campo = non blocca
+    # i fix se l'LLM non popola il campo).
+    if _classifier_resolved:
+        report_only_val = (not _intent_hint) and (not _authorizes_changes_val)
+    else:
+        report_only_val = not _intent_hint
     if report_only_val:
         logger.info(
             "router_node: report_only=True (authorizes_changes=False intent=%s)"
@@ -1843,9 +1866,19 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         # imperativo ma il modello narra "Inizio verificando X" senza agire.
         # action-oriented dal punto unico (classifier LLM sul turno corrente,
         # regola L): niente piu' euristica sul primo messaggio della history.
+        # Gerarchia de-lessicalizzata (mig 0422): se il turno precedente ha
+        # lasciato un verdetto closure_judge (executor a fine turno, quando
+        # active), usalo come segnale "non compiuto"; altrimenti fallback alla
+        # blacklist lessicale. Coerente: il verdetto si riferisce alla stessa
+        # risposta (l'ultima assistant) che ha causato questa re-entry G1.
+        _cv_g1 = state.get("closure_verdict")
+        if isinstance(_cv_g1, dict) and isinstance(_cv_g1.get("fulfilled"), bool):
+            _unfulfilled_for_g1 = not _cv_g1["fulfilled"]
+        else:
+            _unfulfilled_for_g1 = _detect_unfulfilled_intent(_last_assistant_text(messages))
         _g1_should_count = (
             turn_action_oriented(state)
-            or _detect_unfulfilled_intent(_last_assistant_text(messages))
+            or _unfulfilled_for_g1
         )
         if _g1_should_count:
             # FIX G1 intelligente: se il modello sta legittimamente reagendo a
@@ -3171,6 +3204,17 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     # leggero (purpose 'choices_extractor') se la risposta sembra proporre scelte.
     # Best-effort: qualunque errore non deve rompere il turno ne' lo streaming.
     _next_actions_payload: dict[str, Any] = {}
+    # Guard anti-menu (belt-and-suspenders del divieto gia' nel prompt mig 0420):
+    # per una richiesta di sola LETTURA/REPORT NON ambigua l'agente deve dare il
+    # dato, non proporre "Scegli come proseguire". report_only=True + non ambiguo
+    # e' esattamente quel caso (es. "dammi un dato dal DB"): sopprimiamo il
+    # menu (meta_step), ma SOLO qui — nessuna modifica al punto unico derive()
+    # ne' ai casi ambigui (dove la disambiguazione e' legittima) o d'azione (dove
+    # le scelte possono essere reali, "vuoi che proceda con A o B?"). La pulizia
+    # del blocco grezzo dal testo visibile resta SEMPRE attiva (niente residui).
+    _suppress_menu = bool(state.get("report_only")) and (
+        state.get("is_ambiguous") is not True
+    )
     if stop_reason == "end_turn" and not pending_tool_uses and result_text:
         try:
             from .. import next_actions as _next_actions
@@ -3184,6 +3228,12 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     content=_cleaned_text,
                     additional_kwargs=getattr(assistant_msg, "additional_kwargs", {}) or {},
                 )
+            if _na_step is not None and _suppress_menu:
+                logger.info(
+                    "executor_node: menu next_actions soppresso (report_only non "
+                    "ambiguo): l'agente deve riportare il dato, non offrire scelte"
+                )
+                _na_step = None
             if _na_step is not None:
                 _next_actions_payload["meta_steps"] = [_na_step]
                 meta_steps.persist_async(state.get("thread_id"), _na_step)
@@ -3216,6 +3266,32 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     "resoconto onesto sostituito alla promessa monca",
                     _auto_mode,
                 )
+
+    # ── Closure judge DECISORE (de-lessicalizzazione esito, mig 0422) ─────────
+    # A turno concluso senza esito DICHIARATO (task_complete), interpella l'LLM
+    # judge per stabilire se il task e' compiuto. Il verdetto viaggia nello state
+    # (closure_verdict) e route_after_executor lo usa come segnale SEMANTICO al
+    # posto della blacklist lessicale _detect_unfulfilled_intent. Gira solo se
+    # agent.closure_judge.active; best-effort (errore/astensione -> nessun campo
+    # -> fallback alla blacklist). result_override=result_text perche' nello state
+    # `result` non e' ancora aggiornato qui. Gating fine (declared assente, run
+    # d'azione, min chars) dentro closure_judge.judge() (punto unico, regola L).
+    _closure_payload: dict[str, Any] = {}
+    if stop_reason == "end_turn" and not pending_tool_uses and result_text:
+        try:
+            from . import closure_judge as _closure_judge
+            if _closure_judge._load_config().get("active"):
+                _verdict = await _closure_judge.judge(
+                    state, _providers, result_override=result_text
+                )
+                if _verdict is not None:
+                    _closure_payload["closure_verdict"] = _verdict
+                    logger.info(
+                        "executor_node: closure_judge DECISORE fulfilled=%s reason=%r",
+                        _verdict["fulfilled"], _verdict.get("reason", ""),
+                    )
+        except Exception as _cj_exc:
+            logger.debug("executor_node: closure_judge decisore skip (%s)", _cj_exc)
 
     return {
         # P3: cutoff di generazione persistito (vuoto se la fase non e' cambiata).
@@ -3272,6 +3348,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         **sticky_out,
         **_thinking_payload,
         **_next_actions_payload,
+        **_closure_payload,
     }
 
 
@@ -3398,7 +3475,18 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # Tool sempre ammessi dalla validazione M16 = meta di discovery + whitelist DB
     # + task_complete (WAVE 3): e' brain-only, iniettato direttamente in tools_json
     # dal router, quindi non passa per la "scoperta" e altrimenti verrebbe rifiutato.
-    _M16_ALLOWED = _M16_META_TOOLS | _df_whitelist | {TASK_COMPLETE_TOOL_NAME, RUN_NOTES_TOOL_NAME}
+    # + always-on del profilo (regola L, FONTE UNICA): qualunque tool che il
+    # profilo marca always-on (DB, worklog, scaffolding, scrittura/esecuzione, ...)
+    # e' core e non puo' essere rifiutato come "non scoperto". Senza questo la
+    # whitelist DB era una CSV manutenuta a mano che dimenticava domini
+    # (whack-a-mole: 0257 file, 0335 delete/rename, 0417 porte, 0420 DB). Ancorare
+    # M16 alla stessa sorgente unica di filter_tools elimina alla radice il rischio.
+    _M16_ALLOWED = (
+        _M16_META_TOOLS
+        | _df_whitelist
+        | profile_loader.AgentProfile._ALWAYS_ON_TOOLS
+        | {TASK_COMPLETE_TOOL_NAME, RUN_NOTES_TOOL_NAME}
+    )
     for _i, b in enumerate(pending):
         name = b.get("name", "")
         # FIX D: predictive cap (ha priorita' sul budget allegati: se passa di qui,

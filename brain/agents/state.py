@@ -56,6 +56,13 @@ class AgentState(TypedDict, total=False):
     # resta governata dai fatti, la dichiarazione e' un segnale in piu' affidabile
     # e indipendente dalla lingua (sostituisce le blacklist _INTENT_NARRATION).
     declared_outcome: dict | None
+    # Verdetto del closure_judge (LLM) quando l'esito NON e' dichiarato via
+    # task_complete: {fulfilled: bool, reason: str}. Scritto dall'executor_node a
+    # fine turno (se agent.closure_judge.active) e letto da route_after_executor
+    # come DECISORE semantico al posto della blacklist lessicale
+    # (_detect_unfulfilled_intent). None = judge non interpellato o astenuto
+    # (-> fallback alla blacklist). De-lessicalizzazione governance (mig 0391/0422).
+    closure_verdict: dict | None
     # WAVE 2.2: True se un tool e' fallito per ToolRunner gRPC down (infrastruttura).
     # Propagato a mcp-core via error_class=infrastructure nell'end_turn -> non si
     # scalano i provider (il problema non e' il modello).

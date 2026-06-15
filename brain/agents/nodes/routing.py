@@ -37,6 +37,21 @@ def _unfulfilled_lexical(result: str | None) -> bool:
     return hit
 
 
+def _unfulfilled_signal(state: AgentState) -> bool:
+    """Segnale SEMANTICO "esito non compiuto" con gerarchia de-lessicalizzata
+    (mig 0422): (1) verdetto del closure_judge (LLM) se presente nello state
+    (l'executor_node lo scrive a fine turno quando agent.closure_judge.active)
+    -> `not fulfilled`; (2) fallback alla blacklist lessicale
+    `_detect_unfulfilled_intent` SOLO quando il judge si e' astenuto/disattivato
+    (cosi' `lexical_fallback_used` misura esattamente i casi di astensione).
+    Il `declared_outcome` (task_complete) e' valutato a monte dal chiamante e ha
+    priorita' su entrambi (segnale PRIMARIO)."""
+    verdict = state.get("closure_verdict")
+    if isinstance(verdict, dict) and isinstance(verdict.get("fulfilled"), bool):
+        return not verdict["fulfilled"]
+    return _unfulfilled_lexical(state.get("result"))
+
+
 def _final_gate_eligible(state: AgentState) -> bool:
     """Punto unico: True se per questo stato e' eleggibile la verifica E2E
     pre-chiusura (task software, gate abilitato, cap non raggiunto).
@@ -175,9 +190,7 @@ def route_after_executor(state: AgentState) -> str:
             # NB: questo ramo (e il G1 sotto) si valuta SOLO se l'esito non e'
             # gia' stato dichiarato via task_complete (elif). _detect_unfulfilled_intent
             # resta come fallback lessicale quando la dichiarazione manca: loggato.
-            elif has_productive_action_in_history(_msgs) and not _unfulfilled_lexical(
-                state.get("result")
-            ):
+            elif has_productive_action_in_history(_msgs) and not _unfulfilled_signal(state):
                 logger.info(
                     "route_after_executor: chiusura con azioni produttive gia' "
                     "eseguite nel run -> resoconto finale legittimo, niente G1"
@@ -192,7 +205,7 @@ def route_after_executor(state: AgentState) -> str:
                 # action-oriented dal punto unico (classifier LLM sul turno corrente,
                 # regola L): niente piu' euristica sul primo messaggio della history.
                 _is_action_req = turn_action_oriented(state)
-                _is_unfulfilled = _unfulfilled_lexical(state.get("result"))
+                _is_unfulfilled = _unfulfilled_signal(state)
                 # Gating modalita': in confirm l'utente vuole controllo step-by-step,
                 # quindi una mera intenzione/attesa narrata e non eseguita NON innesca
                 # auto-azione (re-entry); l'executor produce un resoconto onesto.

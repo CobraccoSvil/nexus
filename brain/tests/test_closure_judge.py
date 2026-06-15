@@ -129,6 +129,83 @@ def test_shadow_abstains_short_result() -> None:
     print("OK test_shadow_abstains_short_result")
 
 
+def test_judge_returns_verdict() -> None:
+    # judge() (decisore, mig 0422): mock provider che ritorna JSON valido ->
+    # ritorna il verdetto parsato. Indipendente da shadow_enabled.
+    orig_cfg, orig_resolve = cj._load_config, cj._resolve_model
+    cj._load_config = lambda: {"shadow_enabled": True, "min_result_chars": 40, "active": True}
+
+    async def _res():
+        return ("google", "gemini-x")
+
+    cj._resolve_model = _res
+    try:
+        class _Prov:
+            async def generate(self, model, prompt, **kw):  # noqa: ARG002
+                class _R:
+                    content = '{"fulfilled": false, "reason": "non risolto"}'
+                return _R()
+
+        class _Registry:
+            _providers = {"google": _Prov()}
+
+        state = {"result": "z" * 100, "turn_action_oriented": True, "messages": []}
+        verdict = asyncio.run(cj.judge(state, _Registry()))
+        assert verdict == {"fulfilled": False, "reason": "non risolto"}
+    finally:
+        cj._load_config, cj._resolve_model = orig_cfg, orig_resolve
+    print("OK test_judge_returns_verdict")
+
+
+def test_judge_result_override() -> None:
+    # result nello state corto, ma result_override lungo -> il gating lunghezza
+    # usa l'override (l'executor lo passa perche' lo state non e' ancora aggiornato).
+    orig_cfg, orig_resolve = cj._load_config, cj._resolve_model
+    cj._load_config = lambda: {"shadow_enabled": True, "min_result_chars": 40, "active": True}
+    called = {"resolve": False}
+
+    async def _spy():
+        called["resolve"] = True
+        return None
+
+    cj._resolve_model = _spy
+    try:
+        asyncio.run(cj.judge(
+            {"result": "breve", "turn_action_oriented": True, "messages": []},
+            object(),
+            result_override="x" * 100,
+        ))
+        assert called["resolve"] is True  # override lungo supera il gating lunghezza
+    finally:
+        cj._load_config, cj._resolve_model = orig_cfg, orig_resolve
+    print("OK test_judge_result_override")
+
+
+def test_unfulfilled_signal_judge_priority() -> None:
+    # _unfulfilled_signal: il verdetto del judge DECIDE, ignorando la blacklist
+    # sul result (gerarchia mig 0422: judge prima della blacklist).
+    from brain.agents.nodes.routing import _unfulfilled_signal
+
+    assert _unfulfilled_signal({"closure_verdict": {"fulfilled": False}, "result": "tutto ok"}) is True
+    assert _unfulfilled_signal({"closure_verdict": {"fulfilled": True}, "result": "non posso procedere"}) is False
+    print("OK test_unfulfilled_signal_judge_priority")
+
+
+def test_unfulfilled_signal_fallback_blacklist() -> None:
+    # Senza verdict (o verdict malformato) -> fallback alla blacklist lessicale
+    # sullo stesso result: stesso esito di _detect_unfulfilled_intent.
+    from brain.agents.nodes.routing import _unfulfilled_signal
+    from brain.agents.nodes.helpers import _detect_unfulfilled_intent
+
+    for txt in ("Ho completato il lavoro e i test passano.", "Non posso procedere oltre."):
+        assert _unfulfilled_signal({"result": txt}) == _detect_unfulfilled_intent(txt)
+    # verdict non-bool -> il judge si astiene -> fallback blacklist.
+    assert _unfulfilled_signal(
+        {"closure_verdict": {"fulfilled": "false"}, "result": "ok"}
+    ) == _detect_unfulfilled_intent("ok")
+    print("OK test_unfulfilled_signal_fallback_blacklist")
+
+
 if __name__ == "__main__":
     test_parse_strict_bool()
     test_coerce_text_reasoner_blocks()
@@ -136,5 +213,9 @@ if __name__ == "__main__":
     test_shadow_abstains_when_disabled()
     test_shadow_abstains_when_declared()
     test_shadow_abstains_short_result()
+    test_judge_returns_verdict()
+    test_judge_result_override()
+    test_unfulfilled_signal_judge_priority()
+    test_unfulfilled_signal_fallback_blacklist()
     print("\nTUTTI I TEST closure_judge PASSATI")
     sys.exit(0)

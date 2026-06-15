@@ -3137,6 +3137,24 @@ def apply_continuity_trim(
 PREDICTIVE_CAP_SENTINEL = "[ERROR: chiamata bloccata da predictive context cap]"
 
 
+# Tool di controllo/output-piccolo ESENTI dal predictive context cap: il loro
+# risultato e' nullo o minuscolo (dichiarazione di fine task, ricerca/chiamata
+# meta, drill-down worklog, metadati tabelle DB), quindi non puo' MAI saturare
+# il contesto. Il cap deve colpire solo i tool a output potenzialmente grande
+# (read_file, estrazioni). Bloccare task_complete o nexus_mcp_tool_call qui
+# significava impedire all'agente di CHIUDERE o di orchestrare i tool a causa di
+# un budget speso da letture pesanti — l'opposto dello scopo del cap.
+# I tool con prefisso "dispatcher_" sono anch'essi di controllo (output piccolo).
+_CAP_EXEMPT_TOOLS = {
+    "task_complete",
+    "nexus_mcp_tool_call",
+    "nexus_mcp_tool_search",
+    "nexus_get_worklog",
+    "nexus_db_tables",
+    "nexus_db_describe",
+}
+
+
 def _predictive_cap_check(
     tool_name: str,
     args: dict[str, Any],
@@ -3149,6 +3167,11 @@ def _predictive_cap_check(
     Ritorna None se OK, altrimenti messaggio user-facing da iniettare come
     tool_result error.
     """
+    # Esenzione tool di controllo/output-piccolo: passano sempre, il cap non li
+    # tocca (vedi _CAP_EXEMPT_TOOLS). Punto unico della guardia di esenzione.
+    _tn = str(tool_name or "")
+    if _tn in _CAP_EXEMPT_TOOLS or _tn.startswith("dispatcher_"):
+        return None
     cfg = _load_ctx_mgmt_config()
     ratio = float(cfg["predictive_cap_ratio"])
     window = _model_context_window(model)
