@@ -36,7 +36,13 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run pnpm verify
+        # Il pytest del brain e' coperto dal job dedicato `brain-tests` (che
+        # installa torch + le deps Python). Questo job NON le installa, quindi la
+        # fase Python di verify.sh va saltata: senza skip, `python3 -m pytest`
+        # fallisce con ModuleNotFoundError nel job verify (gate JS+Rust).
         run: pnpm verify
+        env:
+          VERIFY_SKIP_PY: "1"
 
       - name: Guard punti unici (regola L)
         run: bash scripts/check-single-source.sh
