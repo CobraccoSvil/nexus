@@ -9,6 +9,29 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+
+    # `cargo test --workspace` (dentro pnpm verify) include test #[sqlx::test]
+    # (model_selection, orchestrator, allocate_port, agent_run) che creano DB
+    # temporanei: servono un Postgres e DATABASE_URL, come nel job lint-test-build
+    # di ci.yml. Senza, quei test falliscono e il job verify resta rosso.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: nexus
+          POSTGRES_PASSWORD: nexus
+          POSTGRES_DB: nexus
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      DATABASE_URL: postgres://nexus:nexus@localhost:5432/nexus
+
     steps:
       - uses: actions/checkout@v4
 
