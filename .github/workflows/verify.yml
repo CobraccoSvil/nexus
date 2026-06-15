@@ -18,9 +18,11 @@ jobs:
           node-version: "20"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: 10.7.0
+        # v4 (runtime Node 20): le @v2 usavano Node 16, dismesso da GitHub ->
+        # hard-fail del job all'avvio. La versione pnpm e' letta da package.json
+        # "packageManager" (pnpm@10.7.0): NON aggiungere `version:` o v4 aborta
+        # con "Multiple versions of pnpm specified".
+        uses: pnpm/action-setup@v4
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
