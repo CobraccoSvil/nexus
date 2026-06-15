@@ -156,9 +156,13 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
     fetchPorts();
     fetchPortAllocations();
     fetchChanges();
-    // Polling drop da 5s/6s a 30s: fallback di sicurezza (eventi mancanti, riconnessione SSE).
-    // I refresh "veri" sono triggerati dagli eventi dispatcher sotto.
-    const t1 = setInterval(fetchServices, 30000);
+    // Polling servizi a 5s: gli eventi dispatcher SSE coprono solo
+    // ServiceStarted/Stopped/Restarted, NON le transizioni di sub-state
+    // (activating->running, crash-loop, stop/disable esterno) -> senza un polling
+    // abbastanza fitto lo stato resta stantio fino al refresh manuale (bug
+    // osservato: fullstack mostrato attivo dopo che l'agente l'aveva disabilitato).
+    // Fix radice separato: evento SSE ServiceStatusChanged con payload completo.
+    const t1 = setInterval(fetchServices, 5000);
     const t2 = setInterval(fetchPorts, 30000);
     const t3 = setInterval(fetchChanges, 4000); // file changes mantengono cadenza fitta (no evento dedicato)
     const t4 = setInterval(fetchPortAllocations, 60000);

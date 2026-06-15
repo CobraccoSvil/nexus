@@ -1079,6 +1079,18 @@ export function MessageList({
             <div style={{ color: tc.text, minWidth: 0, wordBreak: "break-word", overflowWrap: "break-word" }}>
               {isUser ? (
                 <MarkdownBlock content={message.content} />
+              ) : (message.content ?? "").includes("[Riassunto della conversazione precedente") ? (
+                // Riassunti di compattazione: collassati di default (blocco <details>
+                // nativo, nessuno stato React) cosi' non sommergono la chat con 4-5
+                // riassunti lunghi. L'esito reale resta visibile; il dettaglio e' a un clic.
+                <details style={{ opacity: 0.7, fontSize: 13 }}>
+                  <summary style={{ cursor: "pointer", fontStyle: "italic", userSelect: "none" }}>
+                    Riassunto della compattazione precedente — clic per espandere
+                  </summary>
+                  <div style={{ marginTop: 8 }}>
+                    <MarkdownBlock content={message.content} projectId={projectId} />
+                  </div>
+                </details>
               ) : (() => {
                 const { thinking, text } = parseThinking(message.content ?? "");
                 const { toolUses, cleanText } = extractToolUseBlocks(text);

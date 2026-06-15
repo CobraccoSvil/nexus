@@ -622,6 +622,14 @@ export function useChat(
           });
           if (isPrimary) {
             setAgentRun((prev) => (prev && prev.runId === runId ? applyUsage(prev) : prev));
+            // Propaga l'usage live anche al contatore globale (TokenUsageBar nel
+            // composer): senza questo, costo/token restano congelati al valore
+            // pre-run fino a fine run / refresh manuale. usage.* sono totali
+            // cumulativi di sessione (no doppi conteggi).
+            setTokenUsage((prev) => ({
+              totalTokens: usage.totalTokens ?? prev.totalTokens,
+              totalCostUsd: usage.totalCostUsd ?? prev.totalCostUsd,
+            }));
           }
         },
       );
