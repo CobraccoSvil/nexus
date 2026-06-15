@@ -100,7 +100,9 @@ impl AutomationMode {
     }
 
     /// Restituisce la chiave DB del template per le istruzioni di modalità.
-    fn prompt_instruction_template_key(self) -> &'static str {
+    /// pub(crate): usata sia da orchestrator::compose_prompt sia dal path chat
+    /// (agent_run::spawn_agent_run) — punto unico delle istruzioni di modalità.
+    pub(crate) fn prompt_instruction_template_key(self) -> &'static str {
         match self {
             Self::Study => "automation.mode_study_instruction",
             Self::Confirm => "automation.mode_confirm_instruction",

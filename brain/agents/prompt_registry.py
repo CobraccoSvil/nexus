@@ -83,9 +83,13 @@ def load_from_db(database_url: Optional[str] = None) -> int:
         from brain.utils.db_pool import connect as _db_connect
         with _db_connect() as conn:
             with conn.cursor() as cur:
+                # Include anche le chiavi system.% (mig 0441+): i prompt/direttive
+                # del brain estratti nel DB (summarizer, judge, classifier, ...)
+                # vivono sotto system.* e devono essere caricati qui.
                 cur.execute(
                     "SELECT key, content FROM nexus_prompt_templates "
-                    "WHERE key LIKE 'agent.%%' OR key LIKE 'subagent.%%'"
+                    "WHERE key LIKE 'agent.%%' OR key LIKE 'subagent.%%' "
+                    "OR key LIKE 'system.%%'"
                 )
                 rows = cur.fetchall()
             _load_shared_directives(conn)

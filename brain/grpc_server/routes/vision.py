@@ -262,6 +262,13 @@ _VISUAL_COMPARE_PROMPT = (
 )
 
 
+def _vision_compare_prompt() -> str:
+    """Prompt vision dal DB (system.vision_design_compare, mig 0444) con fallback
+    alla costante (graceful degradation se il registry e' vuoto / DB down)."""
+    from brain.agents import prompt_registry
+    return prompt_registry.get_prompt("system.vision_design_compare") or _VISUAL_COMPARE_PROMPT
+
+
 def _parse_visual_compare_response(text: str) -> dict[str, object]:
     """Estrae l oggetto JSON {similarity_score, differences} dalla risposta del
     modello. Tollerante: se il modello avvolge il JSON in markdown o testo,
@@ -383,7 +390,7 @@ async def vision_compare(body: VisualCompareRequest) -> dict[str, object]:
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": _VISUAL_COMPARE_PROMPT},
+                {"type": "text", "text": _vision_compare_prompt()},
                 {"type": "image_url", "image_url": {"url": _data_uri(screenshot_mime, screenshot_bytes)}},
                 {"type": "image_url", "image_url": {"url": _data_uri(reference_mime, reference_bytes)}},
             ],

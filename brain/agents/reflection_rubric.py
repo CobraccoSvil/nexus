@@ -111,12 +111,20 @@ def build_reflection_prompt(task_input: str, agent_output: str) -> tuple[str, st
     Returns:
         Tupla (system_prompt, user_prompt) da passare al provider LLM.
     """
-    user = _TEMPLATE_UTENTE.format(
+    from . import prompt_registry
+    _fmt = dict(
         task=task_input[:2000] if task_input else "(nessun input)",
         output=agent_output[:3000] if agent_output else "(nessun output)",
         rubrica_dettaglio=_rubrica_dettaglio(),
     )
-    return _SYSTEM_RUBRIC, user
+    # Template dal DB (mig 0448) con fallback try/except alla costante.
+    _tmpl = prompt_registry.get_prompt("system.reflection_user_template") or _TEMPLATE_UTENTE
+    try:
+        user = _tmpl.format(**_fmt)
+    except (KeyError, IndexError, ValueError):
+        user = _TEMPLATE_UTENTE.format(**_fmt)
+    system = prompt_registry.get_prompt("system.reflection_rubric") or _SYSTEM_RUBRIC
+    return system, user
 
 
 # Regex per estrarre il JSON anche se il modello aggiunge testo circostante

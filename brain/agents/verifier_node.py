@@ -14,6 +14,7 @@ Tutte le scritture su DB sono best-effort (graceful degrade su connection error)
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -193,7 +194,7 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
     # cerca anomalie NON coperte dai criterion pre-definiti, informato dai
     # pattern di fallimento passati (RAG). Il deterministico resta primario:
     # al cap si promuove comunque.
-    if all_passed and bool(cfg.get("exploratory_verify_enabled")):
+    if all_passed and (bool(cfg.get("verify_panel_enabled")) or bool(cfg.get("exploratory_verify_enabled"))):
         expl_cap = int(cfg.get("exploratory_verify_max_cycles", 1) or 1)
         expl_cycle = int(state.get("exploratory_verify_cycle", 0) or 0)
         # Cap GLOBALE per run: `exploratory_verify_cycle` e' per-todo e viene
@@ -206,7 +207,12 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
         expl_total = int(state.get("exploratory_verify_total", 0) or 0)
         expl_global_cap = int(cfg.get("exploratory_verify_max_total", 3) or 3)
         if expl_cycle < expl_cap and expl_total < expl_global_cap:
-            expl_ok, expl_finding = await _run_exploratory_check(state, todo, results, ctx, cfg)
+            # Ultra: il panel avversariale (K lenti + consenso) sostituisce il
+            # singolo check esplorativo quando verify_panel_enabled e' ON.
+            if bool(cfg.get("verify_panel_enabled")):
+                expl_ok, expl_finding = await _run_verify_panel(state, todo, results, ctx, cfg)
+            else:
+                expl_ok, expl_finding = await _run_exploratory_check(state, todo, results, ctx, cfg)
             if not expl_ok and expl_finding:
                 logger.info(
                     "verifier_node: verifica esplorativa ha trovato un'anomalia non coperta "
@@ -301,30 +307,8 @@ async def _run_exploratory_check(
     if not todo_content:
         return True, ""
 
-    # 1. RAG dei fallimenti passati via il tool semantico esistente (kb +
-    #    chat_history catturano correzioni/problemi gia' incontrati). Niente
-    #    client Qdrant nuovo (condizione di integrazione).
-    past_failures = ""
-    try:
-        if _tool_runner is not None:
-            topk = int(cfg.get("exploratory_verify_topk", 5) or 5)
-            res = await _tool_runner.execute_tool(
-                tool_name="nexus_search_semantic",
-                tool_input={
-                    "query": f"problemi o errori ricorrenti su: {todo_content}",
-                    "source_kinds": ["kb", "chat_history"],
-                    "top_k": topk,
-                },
-                session_id=str(ctx.get("session_id") or ""),
-                tool_use_id=str(uuid.uuid4()),
-            )
-            raw = getattr(res, "result_json", None) or "{}"
-            hits = (json.loads(raw).get("hits") or [])[:topk]
-            past_failures = "\n".join(
-                f"- {str(h.get('chunk_text') or '')[:200]}" for h in hits if h.get("chunk_text")
-            )
-    except Exception as exc:
-        logger.debug("verifier_node: RAG fallimenti skip (%s)", exc)
+    # 1. RAG dei fallimenti passati (helper condiviso col panel, regola L).
+    past_failures = await _rag_past_failures(todo_content, ctx, cfg)
 
     # 2. Risolvi il modello economico via purpose model (regola G).
     try:
@@ -339,20 +323,34 @@ async def _run_exploratory_check(
     # 3. Chiamata LLM economica: ispeziona l'esito e segnala SOLO problemi
     #    concreti non gia' coperti dai criteri deterministici (gia' passati).
     crit_summary = "; ".join(str(r.get("type")) for r in results) or "(nessuno)"
-    prompt = (
-        "Sei un revisore di qualita'. Un task e' stato completato e i controlli "
-        "automatici deterministici sono PASSATI.\n\n"
-        f"Task: {todo_content}\n"
-        f"Controlli gia' verificati (NON ripeterli): {crit_summary}\n"
+    _past_block = (
+        f"\nProblemi ricorrenti su task simili (dalla memoria):\n{past_failures}\n"
+        if past_failures
+        else ""
     )
-    if past_failures:
-        prompt += f"\nProblemi ricorrenti su task simili (dalla memoria):\n{past_failures}\n"
-    prompt += (
-        "\nEsiste un problema CONCRETO non coperto dai controlli sopra "
-        "(es. effetto collaterale, caso limite ignorato, incoerenza)? "
-        "Rispondi in una riga: se tutto ok scrivi esattamente 'OK'. "
-        "Altrimenti scrivi 'PROBLEMA: <descrizione sintetica>'."
-    )
+    # Prompt dal DB (system.verifier_quality_check, mig 0448) con replace; fallback
+    # alla costruzione hardcoded (graceful degradation se registry vuoto / DB down).
+    from . import prompt_registry
+
+    _tpl = prompt_registry.get_prompt("system.verifier_quality_check")
+    if _tpl:
+        prompt = (
+            _tpl.replace("{{todo_content}}", todo_content)
+            .replace("{{crit_summary}}", crit_summary)
+            .replace("{{past_failures_block}}", _past_block)
+        )
+    else:
+        prompt = (
+            "Sei un revisore di qualita'. Un task e' stato completato e i controlli "
+            "automatici deterministici sono PASSATI.\n\n"
+            f"Task: {todo_content}\n"
+            f"Controlli gia' verificati (NON ripeterli): {crit_summary}\n"
+            f"{_past_block}"
+            "\nEsiste un problema CONCRETO non coperto dai controlli sopra "
+            "(es. effetto collaterale, caso limite ignorato, incoerenza)? "
+            "Rispondi in una riga: se tutto ok scrivi esattamente 'OK'. "
+            "Altrimenti scrivi 'PROBLEMA: <descrizione sintetica>'."
+        )
     try:
         # Clamp difensivo (punto unico, regola L): il prompt include task +
         # criteri + past_failures (memoria), puo' crescere su run lunghi.
@@ -370,6 +368,140 @@ async def _run_exploratory_check(
     if text.upper().startswith("PROBLEMA"):
         finding = text.split(":", 1)[1].strip() if ":" in text else text
         return False, finding[:500]
+    return True, ""
+
+
+async def _rag_past_failures(todo_content: str, ctx: dict, cfg: dict) -> str:
+    """RAG dei fallimenti passati via il tool semantico esistente (kb +
+    chat_history catturano correzioni/problemi gia' incontrati). Helper condiviso
+    fra verifica esplorativa singola e panel (regola L). Best-effort: su errore
+    ritorna stringa vuota. Niente client Qdrant nuovo."""
+    if _tool_runner is None:
+        return ""
+    try:
+        topk = int(cfg.get("exploratory_verify_topk", 5) or 5)
+        res = await _tool_runner.execute_tool(
+            tool_name="nexus_search_semantic",
+            tool_input={
+                "query": f"problemi o errori ricorrenti su: {todo_content}",
+                "source_kinds": ["kb", "chat_history"],
+                "top_k": topk,
+            },
+            session_id=str(ctx.get("session_id") or ""),
+            tool_use_id=str(uuid.uuid4()),
+        )
+        raw = getattr(res, "result_json", None) or "{}"
+        hits = (json.loads(raw).get("hits") or [])[:topk]
+        return "\n".join(
+            f"- {str(h.get('chunk_text') or '')[:200]}" for h in hits if h.get("chunk_text")
+        )
+    except Exception as exc:
+        logger.debug("verifier_node: RAG fallimenti skip (%s)", exc)
+        return ""
+
+
+# Lenti del panel avversariale: ognuna istruisce un verificatore indipendente a
+# guardare il task completato da un angolo diverso. Le chiavi sono i nomi
+# (lower) usati nel setting verify_panel_lenses; per lenti non note si usa un
+# hint generico col nome della lente.
+_PANEL_LENS_HINTS = {
+    "correttezza": "CORRETTEZZA: il risultato fa davvero quello che il task chiede? Bug logici, output errati, gestione errori assente o sbagliata.",
+    "sicurezza": "SICUREZZA: input non sanitizzato, secret/credenziali esposti, permessi troppo ampi, race condition, injection, path traversal.",
+    "casi limite": "COMPLETEZZA e CASI LIMITE: input vuoto/null/max, condizioni al contorno ignorate, effetti collaterali, regressioni su funzionalita' adiacenti.",
+    "performance": "PERFORMANCE: complessita' inutile, query N+1, allocazioni superflue, blocchi sincroni su path caldi.",
+}
+
+
+def _panel_lens_prompt(lens: str, todo_content: str, crit_summary: str, past_failures: str) -> str:
+    """Prompt per un singolo verificatore del panel, parametrico sulla lente."""
+    hint = _PANEL_LENS_HINTS.get(lens.lower(), f"{lens.upper()}: valuta questo aspetto specifico del task.")
+    prompt = (
+        "Sei un revisore di qualita' avversariale. Un task e' stato completato e i "
+        "controlli automatici deterministici sono PASSATI. Cerca SOLO problemi "
+        "concreti non gia' coperti da quei controlli, dal punto di vista della tua "
+        "lente.\n\n"
+        f"Task: {todo_content}\n"
+        f"Controlli gia' verificati (NON ripeterli): {crit_summary}\n"
+        f"La tua lente di revisione -> {hint}\n"
+    )
+    if past_failures:
+        prompt += f"\nProblemi ricorrenti su task simili (dalla memoria):\n{past_failures}\n"
+    prompt += (
+        "\nDalla tua lente, esiste un problema CONCRETO non coperto dai controlli "
+        "sopra? Rispondi in una riga: se tutto ok scrivi esattamente 'OK'. "
+        "Altrimenti scrivi 'PROBLEMA: <descrizione sintetica>'."
+    )
+    return prompt
+
+
+async def _run_verify_panel(
+    state: AgentState, todo: dict, results: list[dict], ctx: dict, cfg: dict,
+) -> tuple[bool, str]:
+    """Panel di verifica AVVERSARIALE (ultra): K verificatori indipendenti, ognuno
+    con una LENTE diversa (correttezza, sicurezza, casi limite, ...), valutano IN
+    PARALLELO se il todo completato ha un problema concreto non coperto dai criteri
+    deterministici. Consenso: se >= verify_panel_consensus lenti segnalano un
+    problema, il todo NON passa (ritorna False + findings aggregati).
+
+    Riusa il modello economico purpose_model('exploratory_verify') (regola G) e il
+    RAG dei fallimenti passati. Best-effort: una lente che fallisce si astiene (non
+    blocca). Se nessuna raggiunge il consenso -> (True, "")."""
+    if _providers is None or _routing_client is None:
+        return True, ""
+    todo_content = str(todo.get("content") or "").strip()
+    if not todo_content:
+        return True, ""
+
+    # Lenti dal setting (gia' list via _coerce, o csv di fallback). Cap a panel_size.
+    lenses = cfg.get("verify_panel_lenses") or ["correttezza", "sicurezza", "casi limite"]
+    if isinstance(lenses, str):
+        lenses = [s.strip() for s in lenses.split(",") if s.strip()]
+    size = int(cfg.get("verify_panel_size", 3) or 3)
+    if size > 0:
+        lenses = lenses[:size]
+    if not lenses:
+        return True, ""
+    consensus = max(1, int(cfg.get("verify_panel_consensus", 2) or 2))
+
+    # Modello economico (regola G): unico per tutte le lenti.
+    try:
+        decision = _routing_client.purpose_model(purpose="exploratory_verify")
+        provider, model = decision.provider, decision.model
+        if not provider or provider.startswith("__"):
+            return True, ""
+    except Exception as exc:
+        logger.debug("verify_panel: purpose_model(exploratory_verify) fallito (%s)", exc)
+        return True, ""
+
+    past_failures = await _rag_past_failures(todo_content, ctx, cfg)
+    crit_summary = "; ".join(str(r.get("type")) for r in results) or "(nessuno)"
+
+    async def _judge(lens: str) -> tuple[str, bool, str]:
+        prompt = _panel_lens_prompt(lens, todo_content, crit_summary, past_failures)
+        try:
+            from brain.agents.context_brake import clamp_single_prompt
+            prompt = clamp_single_prompt(prompt, model)
+            result = await asyncio.to_thread(
+                _providers.generate_completion, provider, model, prompt
+            )
+            text = (getattr(result, "content", "") or "").strip()
+        except Exception as exc:
+            logger.debug("verify_panel: lente %s fallita, si astiene (%s)", lens, exc)
+            return lens, False, ""
+        if text.upper().startswith("PROBLEMA"):
+            finding = text.split(":", 1)[1].strip() if ":" in text else text
+            return lens, True, finding[:300]
+        return lens, False, ""
+
+    verdicts = await asyncio.gather(*[_judge(l) for l in lenses])
+    flagged = [(lens, f) for (lens, problem, f) in verdicts if problem]
+    logger.info(
+        "verify_panel: %d/%d lenti segnalano un problema (consenso richiesto=%d) su '%s'",
+        len(flagged), len(lenses), consensus, todo_content[:60],
+    )
+    if len(flagged) >= consensus:
+        agg = "; ".join(f"[{lens}] {f}" for lens, f in flagged if f)
+        return False, agg[:500] or "problema rilevato dal panel di verifica"
     return True, ""
 
 

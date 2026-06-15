@@ -10,20 +10,16 @@ export const ACTION_AGENT_HINT = "debugger";
 
 type Severity = "error" | "warn" | "info";
 
-/** Prefisso comune: i testi lunghi "solo analisi" spingevano l'LLM a rispondere senza tool. */
+/** Preambolo dei prompt error-fix: TASK-ONLY (regola D). Il workflow d'azione
+ *  gira in Automatic (handlers.rs forza la modalita' sull'agent_type_hint) e
+ *  l'autonomia/act-first e' governata dal system prompt (system.nexus_base +
+ *  system.nexus_act_first_suffix dal DB): qui niente istruzioni di processo
+ *  ("non chiedere conferma", "usa questi tool"), solo il task e il contratto di
+ *  output. */
 function operativePreamble(): string {
   return [
-    "ISTRUZIONE OPERATIVA (obbligatoria — Nexus):",
-    "",
-    "Fix M44: il workflow di error-fix richiede AZIONE, non solo analisi.",
-    "1. NON chiedere conferma all'utente prima di agire (es. 'Applicheresti questa modifica?', 'Quale file vuoi che modifichi?'). DECIDI tu il file corretto leggendo il filesystem e PROCEDI.",
-    "2. NON elencare possibili soluzioni come domanda aperta: scegli la piu' probabile, applicala con tool concreti (read_file, edit_file, write_file, run_command), poi verifica.",
-    "3. Tutti i passaggi devono usare i tool del progetto attivo. Niente 'snippet teorici' o esempi YAML/sh se NON sono stati prima applicati nei file reali.",
-    "4. Risposta finale: lista file modificati + comando di verifica eseguito + esito.",
-    "",
-    "Solo se e' impossibile agire (segreti mancanti, permessi root non disponibili, servizi offline irraggiungibili) spiega cosa blocca DOPO aver tentato ciò che puoi.",
-    "",
-    "Lingua: rispondi nella lingua dell'utente (default italiano). Tutti i documenti markdown generati (PRD, README, docs/*) seguono la stessa lingua del prompt utente.",
+    "Risolvi il problema descritto sotto sul progetto attivo: applica la correzione ai file reali, non limitarti all'analisi.",
+    "Al termine riporta i file modificati, il comando di verifica eseguito e l'esito. Se qualcosa rende impossibile completare (segreti mancanti, permessi non disponibili, servizi irraggiungibili), spiega cosa blocca dopo aver tentato il possibile.",
     "",
     "---",
     "",

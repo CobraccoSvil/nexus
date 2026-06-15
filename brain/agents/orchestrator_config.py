@@ -93,6 +93,16 @@ _KEYS = (
     "dag_parallel_enabled",
     "dag_max_parallel",
     "dag_verify_layer",
+    # Ultra (flusso default adattivo): parallelizza i todo INDIPENDENTI, non
+    # solo quelli con depends_on espliciti. Il DAG parallelo scatta quando il
+    # ready layer ha almeno dag_parallel_min_ready todo eseguibili.
+    "dag_parallel_min_ready",
+    # Ultra: panel di verifica avversariale (K verificatori indipendenti con
+    # lenti diverse + consenso) al posto del singolo check esplorativo.
+    "verify_panel_enabled",
+    "verify_panel_size",
+    "verify_panel_consensus",
+    "verify_panel_lenses",
     # Final gate generale (fail-closed) anti-placeholder
     "final_gate_enabled",
     "final_gate_software_intents",
@@ -210,6 +220,17 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     "dag_parallel_enabled": False,
     "dag_max_parallel": 2,
     "dag_verify_layer": True,
+    # Ultra: soglia di todo ready per attivare il DAG parallelo anche senza
+    # dipendenze esplicite (todo indipendenti = caso piu' parallelizzabile).
+    # 0 o 1 = comportamento storico (parallelo solo con depends_on presenti).
+    "dag_parallel_min_ready": 2,
+    # Ultra: panel di verifica avversariale. OFF di default (safe_default
+    # conservativo); attivato dalla migrazione ultra. consensus = numero minimo
+    # di verificatori che devono segnalare un problema perche' il todo non passi.
+    "verify_panel_enabled": False,
+    "verify_panel_size": 3,
+    "verify_panel_consensus": 2,
+    "verify_panel_lenses": ["correttezza", "sicurezza", "casi limite"],
     # Final gate generale (fail-closed) anti-placeholder (mig 0265).
     "final_gate_enabled": True,
     "final_gate_software_intents": [

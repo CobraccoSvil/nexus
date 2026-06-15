@@ -400,19 +400,34 @@ pub async fn send_chat_message(
     let (profile_prompt_block, profile_provider, profile_model, profile_automation) =
         fetch_profile_context(&state.db, user_id, &profile_id, &body.content).await;
 
-    // Precedenza modalita' (regola L): body > profilo > sessione persistita
-    // (mig 0371) > default colonna. Se il client non invia il campo NON si ricade
-    // su Confirm ma sulla modalita' scelta per la sessione (fix: dopo un reload UI
-    // la modalita' Automatico non veniva piu' rispettata).
-    let automation_mode = match body
-        .automation_mode
+    // Precedenza modalita' (regola L): workflow d'azione > body > profilo >
+    // sessione persistita (mig 0371) > default colonna.
+    //
+    // Workflow d'azione (agent_type_hint valorizzato: pulsanti error-fix dei
+    // pannelli diagnostici via ACTION_AGENT_HINT, service_observer remediation):
+    // sono autonomi PER CONTRATTO (l'utente ha chiesto di RISOLVERE, non di
+    // proporre). Girano sempre in Automatic, a prescindere dalla modalita' di
+    // sessione. Senza questo, l'istruzione DB della modalita' Confirm ("proponi e
+    // chiedi conferma prima di procedere") contraddice il prompt d'azione e il fix
+    // non viene applicato: l'agente descrive la soluzione invece di eseguirla.
+    let automation_mode = if body
+        .agent_type_hint
         .as_deref()
-        .or(profile_automation.as_deref())
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .is_some_and(|s| !s.is_empty())
     {
-        Some(v) => parse_automation_mode(Some(v)),
-        None => read_session_automation_mode(&state.db, context.session_id).await,
+        AutomationMode::Automatic
+    } else {
+        match body
+            .automation_mode
+            .as_deref()
+            .or(profile_automation.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(v) => parse_automation_mode(Some(v)),
+            None => read_session_automation_mode(&state.db, context.session_id).await,
+        }
     };
     let supervisor_mode =
         SupervisorMode::from_str(body.supervisor_mode.as_deref().unwrap_or("none"));
@@ -436,7 +451,13 @@ pub async fn send_chat_message(
     let system_context = {
         let mut ctx = system_prompt;
         if automation_mode != AutomationMode::Study {
-            ctx.push_str(crate::prompt_templates::AGENT_ACT_FIRST_SUFFIX);
+            let suffix = crate::prompt_templates::get_template_or_default(
+                &state.db,
+                &state.template_cache,
+                "system.nexus_act_first_suffix",
+            )
+            .await;
+            ctx.push_str(&format!("\n\n{suffix}\n"));
         }
         if let Some(ref gh) = github_username {
             ctx.push_str(&format!(" Account GitHub: @{gh}."));
@@ -1159,7 +1180,13 @@ pub async fn resend_chat_message(
                  Profili: quando noti stack tecnico ricorrente, crea/aggiorna profilo con create_profile/update_profile.",
             );
             if automation_mode != AutomationMode::Study {
-                ctx.push_str(crate::prompt_templates::AGENT_ACT_FIRST_SUFFIX);
+                let suffix = crate::prompt_templates::get_template_or_default(
+                    &state.db,
+                    &state.template_cache,
+                    "system.nexus_act_first_suffix",
+                )
+                .await;
+                ctx.push_str(&format!("\n\n{suffix}\n"));
             }
             if let Some(ref gh) = github_username {
                 ctx.push_str(&format!(" Account GitHub: @{gh}."));

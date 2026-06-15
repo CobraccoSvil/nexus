@@ -1838,8 +1838,11 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             from .. import dag_scheduler, todo_store as _ts
             _run_id = state.get("thread_id")
             _todos_now = _ts.list_todos(_run_id) if _run_id else []
-            _has_deps = any(t.get("depends_on") for t in _todos_now)
-            if _has_deps and dag_scheduler.compute_ready_layer(_todos_now):
+            _ready_now = dag_scheduler.compute_ready_layer(_todos_now)
+            # Ultra (decomposizione parallela): la decisione e' nel punto unico
+            # dag_scheduler.should_parallelize, che parallelizza anche i todo
+            # INDIPENDENTI (non solo quelli con depends_on espliciti).
+            if dag_scheduler.should_parallelize(_ready_now, _todos_now, _dag_cfg):
                 total_done = 0
                 waves = 0
                 # Safety cap sul numero di ondate: non puo' superare il numero

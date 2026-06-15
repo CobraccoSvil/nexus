@@ -395,6 +395,20 @@ Examples:
 Return ONLY the JSON object."""
 
 
+def _classifier_prompt(message: str) -> str:
+    """Prompt del classifier dal DB (system.intent_classifier_prompt, mig 0447)
+    con fallback ROBUSTO alla costante: se il template DB e' assente o malformato
+    (.format solleva) si usa _CLASSIFIER_PROMPT. Il router non si rompe mai."""
+    from brain.agents import prompt_registry
+    tpl = prompt_registry.get_prompt("system.intent_classifier_prompt")
+    if tpl:
+        try:
+            return tpl.format(message=message)
+        except (KeyError, IndexError, ValueError):
+            logger.warning("agentic_classifier: template DB malformato, uso fallback costante")
+    return _CLASSIFIER_PROMPT.format(message=message)
+
+
 # ── Classifier principale ───────────────────────────────────────────────────
 
 class AgenticIntentClassifier:
@@ -721,7 +735,7 @@ class AgenticIntentClassifier:
         # Pattern chain (mig 0134): itera nexus_classifier_provider_chain
         # finche' un provider risponde con JSON valido. Se la chain e' vuota
         # cade sul singolo (self._provider, self._model) per retrocompat.
-        prompt = _CLASSIFIER_PROMPT.format(message=message[:2000])
+        prompt = _classifier_prompt(message[:2000])
         # Modello risolto via purpose 'intent_classifier' + tier in _ensure_config
         # (router cooldown-aware, regola G/L). Niente piu' chain hardcoded: la
         # nexus_classifier_provider_chain e' disattivata (mig 0338) e il fallback

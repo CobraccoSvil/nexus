@@ -114,6 +114,11 @@ def _build_prompt(task_input: str, result: str) -> str:
     result_trunc = (result or "").strip()
     if len(result_trunc) > 2500:
         result_trunc = result_trunc[:1200] + "\n[...]\n" + result_trunc[-1200:]
+    from .. import prompt_registry
+    _tpl = prompt_registry.get_prompt("system.closure_judge")
+    if _tpl:
+        return _tpl.replace("{{task}}", task_trunc).replace("{{result}}", result_trunc)
+    # Fallback hardcoded (graceful degradation se il registry e' vuoto / DB down).
     return (
         "Sei un valutatore neutrale. Ti vengono dati: la RICHIESTA di un utente a "
         "un agente software e la RISPOSTA FINALE dell'agente. Giudica SOLO se la "

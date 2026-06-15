@@ -112,6 +112,36 @@ pub async fn tool_scan_code_quality(ctx: &ToolContextCore, input: &Value) -> Str
     }
 }
 
+/// Ruolo di sistema per batch_analyze_code dal DB (mig 0445) con fallback
+/// hardcoded. Query diretta: questo crate e' a monte di mcp-core e non puo'
+/// usare get_template_or_default.
+async fn batch_role_prompt(db: &sqlx::PgPool, task: &str) -> String {
+    let (key, fallback) = match task {
+        "document" => (
+            "system.batch_document_role",
+            "Sei un esperto di documentazione tecnica. Analizza il codice e genera commenti/docstring chiari e concisi in italiano. Concentrati sul WHY, non sul WHAT.",
+        ),
+        "optimize" => (
+            "system.batch_optimize_role",
+            "Sei un esperto di ottimizzazione del codice. Identifica problemi di performance, complessità eccessiva, codice duplicato e suggerisci refactoring concreti.",
+        ),
+        _ => (
+            "system.batch_review_role",
+            "Sei un esperto di revisione del codice. Identifica bug potenziali, problemi di sicurezza, violazioni di pattern architetturali e punti di miglioramento.",
+        ),
+    };
+    sqlx::query_scalar::<_, String>(
+        "SELECT content FROM nexus_prompt_templates WHERE key = $1 AND is_active = true",
+    )
+    .bind(key)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+    .unwrap_or_else(|| fallback.to_string())
+}
+
 pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> String {
     let task = input
         .get("task")
@@ -128,11 +158,7 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
         return "[batch_analyze_code] Massimo 20 file per batch".to_string();
     }
 
-    let system_prompt = match task {
-        "document" => "Sei un esperto di documentazione tecnica. Analizza il codice e genera commenti/docstring chiari e concisi in italiano. Concentrati sul WHY, non sul WHAT.",
-        "optimize" => "Sei un esperto di ottimizzazione del codice. Identifica problemi di performance, complessità eccessiva, codice duplicato e suggerisci refactoring concreti.",
-        _ => "Sei un esperto di revisione del codice. Identifica bug potenziali, problemi di sicurezza, violazioni di pattern architetturali e punti di miglioramento.",
-    };
+    let system_prompt = batch_role_prompt(&ctx.db, task).await;
 
     // Leggi il contenuto dei file non forniti
     let mut requests: Vec<serde_json::Value> = Vec::new();
@@ -164,7 +190,7 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
         };
         requests.push(serde_json::json!({
             "custom_id": format!("file-{}", i),
-            "system": system_prompt,
+            "system": system_prompt.clone(),
             "prompt": format!("File: {}\n\n```\n{}\n```\n\nEsegui il task '{}' su questo file.", path_str, &content[..content.len().min(32000)], task),
         }));
     }

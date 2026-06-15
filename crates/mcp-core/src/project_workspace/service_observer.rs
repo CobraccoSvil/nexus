@@ -886,25 +886,46 @@ async fn run_cycle(
                     // su ma non ascolta sulle porte ALLOCATE (fonte unica), passa il
                     // fatto alla diagnosi. L'LLM, leggendo i log, rileva se ascolta
                     // su una porta hardcoded diversa e suggerisce process.env.PORT.
-                    if reason == "port_not_listening" && !ports.is_empty() {
-                        let plist = ports
-                            .iter()
-                            .map(u16::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        clean = format!(
-                            "[Nexus] Il servizio risulta avviato ma non ascolta sulle porte ALLOCATE \
-                             attese ({plist}). Se dai log ascolta su una porta diversa, la causa \
-                             probabile e' una porta HARDCODED nel codice invece della porta allocata: \
-                             il fix corretto e' leggere la porta da process.env.PORT (porta allocata da \
-                             Nexus), non un valore fisso.\n\nLog del servizio:\n{clean}"
-                        );
+                    // Hint sulle cause per port_not_listening (segnala, non
+                    // prescrive): due cause tipiche da distinguere verificando lo
+                    // stato reale. Va SIA nel log passato alla diagnosi LLM SIA nel
+                    // detail del problema (che l'agente error-fix riceve dal pannello),
+                    // altrimenti finirebbe solo nella diagnosi LLM in background (gated).
+                    let cause_hint: Option<String> =
+                        if reason == "port_not_listening" && !ports.is_empty() {
+                            let plist = ports
+                                .iter()
+                                .map(u16::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            Some(format!(
+                                "[Nexus] Il servizio risulta avviato ma non ascolta sulle porte \
+                                 ALLOCATE attese ({plist}). Per la causa, distingui verificando lo \
+                                 stato reale (quali processi sono in ascolto su quella porta e quali \
+                                 processi di questo servizio sono in esecuzione): (a) il codice \
+                                 ascolta su una porta HARDCODED diversa da quella allocata (dai log \
+                                 vedi una porta diversa); (b) la porta allocata e' gia' occupata da \
+                                 un'altra istanza dello STESSO servizio non terminata (processi \
+                                 orfani -> EADDRINUSE), per cui il nuovo avvio non riesce ad \
+                                 ascoltare. Verifica quale delle due prima di concludere."
+                            ))
+                        } else {
+                            None
+                        };
+                    if let Some(ref hint) = cause_hint {
+                        clean = format!("{hint}\n\nLog del servizio:\n{clean}");
                     }
                     let tail: Vec<&str> = clean.lines().rev().take(15).collect();
                     let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
                     let tail: String = tail.chars().take(600).collect();
-                    let initial_detail =
-                        format!("Servizio non operativo ({reason}). Ultime righe di log:\n{tail}");
+                    let initial_detail = match &cause_hint {
+                        Some(hint) => format!(
+                            "Servizio non operativo ({reason}). {hint}\n\nUltime righe di log:\n{tail}"
+                        ),
+                        None => format!(
+                            "Servizio non operativo ({reason}). Ultime righe di log:\n{tail}"
+                        ),
+                    };
 
                     nexus_events::dispatcher::emit_global(
                         project_id,

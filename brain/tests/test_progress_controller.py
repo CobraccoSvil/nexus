@@ -151,13 +151,14 @@ def test_reallocation_sopra_soglia_prima_volta_guida_grounded():
     # NON forza una nuova tool call (rischierebbe un ennesimo request_port).
     assert d.force_action is False
     assert d.stop_reason is None
-    # Grounding: il nudge ordina il riuso/riavvio dei servizi attivi, non l'allocazione.
+    # Grounding: il nudge ordina il riuso/riavvio dei servizi attivi, non
+    # l'allocazione. La direzione (riusa/riavvia) e' segnalata senza prescrivere
+    # il tool specifico (principio "segnala, non prescrivere").
     assert d.nudge_text is not None
     _txt = d.nudge_text.lower()
-    assert "list_active_services" in _txt
-    assert "service_restart" in _txt
-    assert "non riallocare" in _txt or "non allocarne" in _txt or "non riallocare" in _txt
-    assert "riusa" in _txt or "riusare" in _txt or "riusa" in _txt
+    assert "riusa" in _txt
+    assert "riavvia" in _txt
+    assert "non riallocare" in _txt or "non allocarne" in _txt
     assert "richiesto porte" in _txt or "request_port" in _txt
 
 
@@ -215,15 +216,17 @@ def test_reallocation_nudge_grounded_anche_senza_active_resources():
     assert d.action == "guide"
     assert d.axis == "resource_reallocation"
     assert d.nudge_text is not None
-    assert "service_restart" in d.nudge_text.lower()
+    _txt = d.nudge_text.lower()
+    assert "riusa" in _txt
+    assert "riavvia" in _txt
 
 
 # ── Asse repeated_action: nudge build/test-aware ────────────────────────────
 # Incidente "qualita': final_gate vede 20 errori TS" / loop "npm run build"
 # ripetuto: ri-eseguire un build NON riduce gli errori, li riduce solo
 # correggere i file. Il nudge GUIDE per repeated_action su un label di build
-# deve ordinare la correzione batch (read_file/edit_file) leggendo l'output
-# completo, NON il generico "cambia approccio/comando diverso".
+# deve segnalare la correzione dei file (non ripetere il comando) leggendo
+# l'output completo, NON il generico "cambia approccio/comando diverso".
 
 
 def test_is_build_or_test_label_riconosce_i_build():
@@ -246,9 +249,10 @@ def test_is_build_or_test_label_ignora_non_build():
 def test_repeated_action_build_guida_ordina_correzione_batch():
     """repeated_action su un build, mai guidato -> GUIDE con nudge build-aware.
 
-    Il nudge deve ordinare read_file + edit_file in batch e dire ESPLICITAMENTE
-    di non ripetere il comando; NON deve forzare una nuova tool call (force_action
-    False per repeated_action) ne' suggerire un "comando diverso".
+    Il nudge deve segnalare la causa (ri-eseguire non riduce gli errori, vanno
+    corretti i file) senza prescrivere i tool specifici; NON deve forzare una nuova
+    tool call (force_action False per repeated_action) ne' suggerire un "comando
+    diverso".
     """
     d = decide(ProgressSignals(repeated_action=("run_command: npm run build", 3)))
     assert d.action == "guide"
@@ -256,11 +260,10 @@ def test_repeated_action_build_guida_ordina_correzione_batch():
     assert d.force_action is False  # NON forza una nuova tool call (= un altro build)
     assert d.nudge_text is not None
     _txt = d.nudge_text.lower()
-    # Ordina la correzione batch leggendo l'output completo.
-    assert "read_file" in _txt
-    assert "edit_file" in _txt
-    assert "batch" in _txt
-    assert "non ripetere il comando" in _txt
+    # Segnala la causa: ri-eseguire non riduce gli errori, vanno corretti i file.
+    assert "non riduce gli errori" in _txt
+    assert "corregg" in _txt
+    assert "file" in _txt
     # Non deve cadere nel testo generico "cambia approccio".
     assert "cambia approccio" not in _txt
 
@@ -295,7 +298,7 @@ def test_force_diagnose_build_aware_ordina_fix_non_altro_comando():
     assert d.force_action is False
     assert d.nudge_text is not None
     _txt = d.nudge_text.lower()
-    assert "edit_file" in _txt
+    assert "corregg" in _txt
     assert "causa radice" in _txt
     # Per un build, "ri-eseguire non e' un'azione diversa".
     assert "non e' un'azione diversa" in _txt

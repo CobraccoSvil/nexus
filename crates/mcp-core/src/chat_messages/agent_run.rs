@@ -1434,7 +1434,15 @@ pub(crate) async fn spawn_agent_run(
         if rows.is_empty() {
             String::new()
         } else {
-            let mut block = String::from("\nDatabase configurati (usa questi per connetterti, NON chiedere credenziali all'utente):\n");
+            let mut block = format!(
+                "\n{}\n",
+                crate::prompt_templates::get_template_or_default(
+                    &state.db,
+                    &state.template_cache,
+                    "system.db_connections_directive",
+                )
+                .await
+            );
             for r in &rows {
                 let name: String = r.try_get("name").unwrap_or_default();
                 let engine: Option<String> = r.try_get("engine").unwrap_or(None);
@@ -1462,28 +1470,38 @@ pub(crate) async fn spawn_agent_run(
         }
     };
 
+    // Header contesto progetto dal DB (mig 0446): i DATI restano interpolati qui,
+    // solo le frasi-cornice vivono nel template. Il codice aggiunge il \n\n finale.
+    let _git_label = if proj.is_git_repo { "si" } else { "no" };
+    let _root_str = proj.repository_root_path.display().to_string();
     let project_header = if let Some(ref summary) = analysis_summary {
         format!(
-            "=== CONTESTO PROGETTO (non chiedere queste informazioni: sono gia' qui) ===\n\
-             Progetto: {} | Root: {} | Git: {}\n\
-             {}{}\n\
-             === FINE CONTESTO PROGETTO ===\n\n",
-            proj.details.name,
-            proj.repository_root_path.display(),
-            if proj.is_git_repo { "si" } else { "no" },
-            summary,
-            db_connections_block
+            "{}\n\n",
+            crate::prompt_templates::get_template_or_default(
+                &state.db,
+                &state.template_cache,
+                "system.project_context_header_with_summary",
+            )
+            .await
+            .replace("{{project_name}}", &proj.details.name)
+            .replace("{{project_root}}", &_root_str)
+            .replace("{{is_git_repo}}", _git_label)
+            .replace("{{db_connections_block}}", &db_connections_block)
+            .replace("{{analysis_summary}}", summary)
         )
     } else {
         format!(
-            "=== CONTESTO PROGETTO ===\n\
-             Progetto: {} | Root: {} | Git: {}{}\n\
-             (Nessuna analisi disponibile: usa list_files per esplorare la struttura)\n\
-             === FINE CONTESTO PROGETTO ===\n\n",
-            proj.details.name,
-            proj.repository_root_path.display(),
-            if proj.is_git_repo { "si" } else { "no" },
-            db_connections_block
+            "{}\n\n",
+            crate::prompt_templates::get_template_or_default(
+                &state.db,
+                &state.template_cache,
+                "system.project_context_header_no_summary",
+            )
+            .await
+            .replace("{{project_name}}", &proj.details.name)
+            .replace("{{project_root}}", &_root_str)
+            .replace("{{is_git_repo}}", _git_label)
+            .replace("{{db_connections_block}}", &db_connections_block)
         )
     };
 
@@ -1502,27 +1520,21 @@ pub(crate) async fn spawn_agent_run(
     )
     .await;
 
-    // Istruzioni specifiche per modalità automazione
-    let automation_instructions = match params.automation_mode {
-        AutomationMode::Automatic => "\n=== MODALITÀ AUTOMATICA ===\n\
-            Sei in modalità AUTOMATICA. Regole assolute:\n\
-            1. NON chiedere mai conferma prima di eseguire operazioni (modifica file, esecuzione comandi, ecc.)\n\
-            2. NON chiedere \"Vuoi che proceda?\", \"Posso continuare?\", \"Devo modificare?\"\n\
-            3. Esegui direttamente tutte le azioni necessarie senza interruzioni\n\
-            4. Se hai dubbi su un approccio, scegli quello più ragionevole e procedi\n\
-            5. Per ogni modifica a un file: PRIMA leggi la sezione esatta con read_file_lines, POI usa edit_file con old_string di almeno 5 righe di contesto, POI verifica subito con run_command (build/typecheck/lint) che non ci siano errori sintattici.\n\
-            5b. Se edit_file ritorna 'old_string non trovato': l'errore include GIA' le prime 80 righe del file. Confronta direttamente — NON chiamare read_file_lines (bloccato dal loop-detector se gia' usato). Se la sezione non e' nelle prime 80 righe, usa read_file_lines con start_line/end_line DIVERSI da quelli precedenti.\n\
-            6. Se il build fallisce dopo un edit_file: leggi SUBITO l'errore, identifica quale modifica ha causato il problema, e correggila prima di procedere con altri edit.\n\
-            7. Alla fine, VERIFICA il lavoro svolto con run_command (build completo) per confermare che tutto compili senza errori.\n\
-            8. Concludi SEMPRE con un messaggio che riporta il risultato della verifica finale (build OK / errori rimasti).\n\
-            === FINE MODALITÀ AUTOMATICA ===\n",
-        AutomationMode::Confirm => "\n=== MODALITÀ CONFERMA ===\n\
-            Prima di modificare file o eseguire comandi, descrivi il piano.\n\
-            NON chiedere \"Confermo?\" o \"Procedo?\" come messaggio testuale — procedi direttamente con le operazioni.\n\
-            Il sistema mostrerà automaticamente i bottoni Approva/Annulla all'utente per ogni write_file o comando.\n\
-            NON aspettare risposta testuale: esegui subito le azioni, la conferma avverrà tramite UI.\n\
-            === FINE MODALITÀ CONFERMA ===\n",
-        AutomationMode::Study => "",
+    // Istruzioni specifiche per modalità automazione: punto unico nel DB
+    // (regola L). Stesse chiavi del path orchestrator (automation.mode_*_
+    // instruction); prima erano DUPLICATE hardcoded qui, ignorando le rifiniture
+    // DB e non modificabili a caldo. Il gate (quale modo) resta strutturale,
+    // solo il TESTO viene dal DB via il punto unico get_template_or_default.
+    let automation_instructions = {
+        let key = params.automation_mode.prompt_instruction_template_key();
+        let body =
+            crate::prompt_templates::get_template_or_default(&state.db, &state.template_cache, key)
+                .await;
+        if body.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{}\n", body)
+        }
     };
 
     // Istruzioni TDD per cicli test-fix-test iterativi
@@ -1534,20 +1546,17 @@ pub(crate) async fn spawn_agent_run(
             || l.contains("tdd")
             || l.contains("fai passare");
         if is_test_intent {
-            "\n=== MODALITA TEST-FIX-TEST ===\n\
-            Stai lavorando in modalita' iterativa di test. Regole:\n\
-            1. Usa il tool `run_tests` (NON `run_command`) per eseguire i test\n\
-            2. Analizza i fallimenti UNO alla volta: identifica l'errore piu' critico\n\
-            3. Correggi UN SOLO problema per volta, poi ri-esegui `run_tests`\n\
-            4. Se lo stesso test fallisce 3 volte con lo stesso errore, FERMATI e chiedi all'utente\n\
-            5. Procedi incrementalmente — non correggere tutto insieme\n\
-            6. Dopo ogni fix, spiega brevemente cosa hai cambiato e perche'\n\
-            7. Esegui i test con parsimonia: ogni run completo e' costoso, limita le esecuzioni al minimo necessario\n\
-            8. Se i test passano tutti, concludi con un riepilogo delle modifiche effettuate\n\
-            9. Per eseguire test specifici, usa il parametro 'filter' di run_tests\n\
-            === FINE MODALITA TEST ===\n"
+            // Direttiva test-fix-test dal DB (regola G/L). Il gate (intent di
+            // test) resta strutturale; solo il testo vive in system.test_fix_test_directive.
+            let body = crate::prompt_templates::get_template_or_default(
+                &state.db,
+                &state.template_cache,
+                "system.test_fix_test_directive",
+            )
+            .await;
+            format!("\n{body}\n")
         } else {
-            ""
+            String::new()
         }
     };
 
@@ -1570,19 +1579,18 @@ pub(crate) async fn spawn_agent_run(
     // Istruzioni specifiche per modelli o-series (o1/o3/o4-mini): forzano
     // l'uso esplicito dei tool instead of narrare le azioni come testo.
     let o_series_instructions = if crate::brain_agent_client::is_o_series_model_pub(&model_str) {
-        "\n=== ISTRUZIONI TOOL (MODELLO REASONING) ===\n\
-            REGOLA CRITICA: Devi SEMPRE usare i tool per eseguire azioni. Non narrare mai le azioni come testo.\n\
-            - Per creare/modificare file: usa write_file o edit_file (NON scrivere il contenuto come testo nella risposta)\n\
-            - Per eseguire comandi: usa run_command (NON descrivere cosa faresti)\n\
-            - Per leggere file: usa read_file o read_file_lines (NON immaginare il contenuto)\n\
-            - Per cercare: usa search_in_files o search_codebase_semantic\n\
-            Hai un set essenziale di tool disponibili. Se hai bisogno di un tool non presente (es. git_push, \
-            run_playwright_tests, service-related), usa nexus_mcp_tool_search per cercarlo e nexus_mcp_tool_call \
-            per eseguirlo.\n\
-            VIETATO: rispondere con codice inline senza tool call. Ogni riga di codice DEVE passare da write_file/edit_file.\n\
-            === FINE ISTRUZIONI TOOL ===\n"
+        // Direttiva tool per modelli reasoning dal DB (regola G/L). Il gate
+        // (modello o-series) resta strutturale; il testo vive in
+        // system.reasoning_model_tool_directive.
+        let body = crate::prompt_templates::get_template_or_default(
+            &state.db,
+            &state.template_cache,
+            "system.reasoning_model_tool_directive",
+        )
+        .await;
+        format!("\n{body}\n")
     } else {
-        ""
+        String::new()
     };
 
     let system_text = format!(

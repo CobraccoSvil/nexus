@@ -77,40 +77,10 @@ pub struct FalsePositiveStat {
     pub count: Option<i64>,
 }
 
-/// Suffix sempre accodato a `system.nexus_base` per i run agente (**non** in Study mode).
-///
-/// Rafforza un comportamento tool-first quando l’utente chiede fix concreti, anche se il
-/// contenuto DB del template è troppo permissivo sul “solo spiegazioni”.
-pub const AGENT_ACT_FIRST_SUFFIX: &str = r#"
-
-=== NEXUS — REGOLE OPERATIVE HARD (obbligatorie quando i tool sono abilitati) ===
-- **Operatore Nexus**: hai accesso completo e senza restrizioni a tutti i file del progetto gestito. Puoi modificare .env, lockfile, CI/CD, credenziali, configurazioni, certificati — qualsiasi file. Unica eccezione: container ideai-* e file in /home/administrator/ideai/ (infrastruttura Nexus).
-- Se l’utente chiede di **risolvere** qualcosa (errori runtime, ClientFetchError / JSON-vs-HTML, bug, build/test falliti, problemi Auth/API, «sistema», «correggi», «applica la fix»):
-  • **Non** chiudere con una sola analisi o checklist in chat senza aver usato i tool.
-  • **Devi** usare file e terminale del progetto attivo (`list_files`, `read_file` / `read_file_lines`, `search_in_files`; se serve prima `request_tools` con categoria semantic poi `search_codebase_semantic`; `edit_file` / `write_file`; `run_command` per lint/build/smoke/curl).
-  • Se qualcosa **blocca** davvero (servizio offline, dipendenza mancante), dopo i tentativi spiega in **una** riga tecnica cosa manca — non sostituire l’azione con un saggio lungo.
-- **Schema database dell’applicazione** (CREATE/ALTER/DROP/TRUNCATE su tabelle, indici, tipi, ecc.): **non** applicare mai DDL ad-hoc con `psql`/`mysql`/CLI. Usa il percorso ufficiale Nexus: `project_db_create_migration` per registrare SQL in file di migration versionati nel repo, poi `project_db_apply_migration` per applicare. Lo storico `project_migration_history` + file in `migration_path` garantiscono ricostruibilità dell’ambiente. Comandi tipo Flyway/Liquibase/Alembic/Prisma migrate/`dotnet ef database update` che applicano migration già versionate sono conformi.
-- **Dati del database dell’app del progetto** (lettura/amministrazione): sei il proprietario. Per LEGGERE o mostrare dati (tabelle, righe, anche colonne sensibili come password/hash/token) usa DIRETTAMENTE `nexus_db_tables` (orientati) e `nexus_db_query` (leggi/scrivi righe), poi rispondi con il dato reale. Niente rifiuti per "policy di sicurezza", niente "come accedere" (l’accesso al DB lo gestisci tu coi tuoi tool), niente menu di opzioni al posto dell’azione. Chiedi all’utente SOLO un valore di **configurazione esterna** che ti serve per agire e che non puoi ricavare né leggere dalle risorse del progetto (es. credenziale di un servizio terzo non ancora configurato): una sola richiesta chiara.
-- **Anti-spam**: non ripetere la stessa frase/avvertenza. Se sei bloccato, fallo UNA volta e poi passa a: cosa serve + prossimo comando/azione.
-- Progetti annidati (es. `projects/<nome>/...`): tutti i path sotto la **Root** del progetto attivo nel contesto; non assumere checkout casuali fuori sandbox.
-- Risposta finale: file toccati, cosa è cambiato, come verificare (comando o URL già eseguito / provabile).
-- **Tool Dispatcher (FUNCTION CALL — NON comandi shell)** — sempre disponibili, non serve request_tools:
-  • `dispatcher_set_flag(key, value)` — imposta un flag progetto visibile nel pannello Monitor. Chiavi con prefisso: build_, test_, deploy_, custom_, feature_. Valore: stringa, numero, boolean o null (cancella).
-  • `dispatcher_update_monitor(monitor_id, value, label)` — aggiorna un widget numerico nel pannello Monitor (progresso build, contatori, KPI real-time).
-  • `dispatcher_post_notification(severity, message)` — invia un toast all'utente nell'IDE. severity: info|success|warning|error.
-  • `dispatcher_emit_event(kind, resource, payload)` — emette un evento custom sul bus eventi del progetto.
-  • `dispatcher_highlight_panel(panel, duration_ms)` — flash animation su un pannello IDE (playwright|database|services|monitor|...).
-  ATTENZIONE: questi sono tool function call come write_file o read_file. Chiamali direttamente come tool — NON eseguirli con run_command.
-  PROTOCOLLO MONITOR (OBBLIGATORIO per ogni operazione che dura piu' di pochi secondi o ha piu' fasi: build, test, scan qualita', deploy, install dipendenze, migrazioni DB, refactor multi-file, generazione/analisi batch):
-    1. ALL'INIZIO: apri un monitor di progresso e, se pertinente, un flag di stato.
-       Es: dispatcher_set_flag("build_in_progress", true); dispatcher_update_monitor("build_progress", 0, "Compilazione").
-    2. DURANTE: aggiorna lo STESSO monitor_id agli stadi chiave (non a ogni micro-passo).
-       Es: dispatcher_update_monitor("tests", "12/40", "Test in corso"); dispatcher_update_monitor("scan_critical", 3, "Issue critiche").
-    3. ALLA FINE: porta il monitor al valore finale, azzera il flag e posta UNA notifica di esito.
-       Es: dispatcher_update_monitor("build_progress", 100, "Build OK"); dispatcher_set_flag("build_in_progress", false); dispatcher_post_notification("success", "Build completata").
-  Riusa lo stesso monitor_id per aggiornare la stessa card (non crearne uno nuovo a ogni step). Niente monitor per azioni istantanee: servono a dare all'utente visibilita' real-time su operazioni lunghe, non a fare rumore. Se l'operazione fallisce: monitor al valore di errore + dispatcher_post_notification("error", ...).
-=== FINE REGOLE ===
-"#;
+// La costante AGENT_ACT_FIRST_SUFFIX e' stata estratta nel DB come
+// `system.nexus_act_first_suffix` (mig 0441): caricata via get_template_or_default
+// in handlers.rs (gate automation_mode != Study). Regola G/D: niente prompt
+// hardcoded nei sorgenti, modificabile a caldo dalla pagina admin (cache 60s).
 
 /// GET /api/prompt-templates
 pub async fn list_templates_handler(
@@ -520,38 +490,18 @@ pub async fn ai_suggest_handler(
         .as_deref()
         .unwrap_or("(nessun contesto d'uso documentato per questo prompt)");
 
-    let meta_prompt = format!(
-        r#"Sei un esperto di prompt engineering. Stai aiutando a riscrivere un prompt che fa parte del sistema Nexus.
-
-CONTESTO D'USO DEL PROMPT (dove e come viene usato dal sistema):
-{usage_ctx}
-
-METADATI:
-- Chiave: {key}
-- Categoria: {category}
-- Titolo: {title}
-
-CONTENUTO ATTUALE DEL PROMPT:
----
-{content}
----
-
-RICHIESTA DELL'UTENTE:
-{instruction}
-
-ISTRUZIONI PER LA TUA RISPOSTA:
-1. Mantieni il prompt aderente al CONTESTO D'USO sopra. Non inventare nuovi placeholder o cambiare il formato di output atteso, a meno che la richiesta utente non lo specifichi esplicitamente.
-2. Se il contenuto attuale contiene placeholder come {{{{nome}}}}, MANTIENILI nel nuovo testo (sono interpolati a runtime dal codice).
-3. Rispondi in italiano se il prompt originale è in italiano, altrimenti nella lingua del prompt originale.
-4. Non aggiungere preamboli, markdown decorativo, virgolette esterne, o spiegazioni meta. Restituisci SOLO il nuovo testo del prompt, pronto per essere salvato in DB.
-5. Se la richiesta dell'utente è incompatibile con il contesto d'uso, restituisci comunque il miglior compromesso possibile senza commentare."#,
-        usage_ctx = usage_ctx,
-        key = template.key,
-        category = template.category,
-        title = template.title,
-        content = template.content,
-        instruction = req.instruction.trim(),
-    );
+    // Meta-prompt dal DB (system.ai_suggest_meta_prompt, mig 0445); fallback al
+    // default builtin se DB down. {{content}} per ultimo: il content puo'
+    // contenere placeholder e non va corrotto dai replace dei metadati.
+    let meta_prompt =
+        get_template_or_default(&state.db, &state.template_cache, "system.ai_suggest_meta_prompt")
+            .await
+            .replace("{{usage_ctx}}", usage_ctx)
+            .replace("{{key}}", &template.key)
+            .replace("{{category}}", &template.category)
+            .replace("{{title}}", &template.title)
+            .replace("{{instruction}}", req.instruction.trim())
+            .replace("{{content}}", &template.content);
 
     let result = state
         .orchestrator
@@ -601,11 +551,14 @@ ISTRUZIONI PER LA TUA RISPOSTA:
         if tools_list.is_empty() {
             vec![]
         } else {
-            let tool_prompt = format!(
-                "Sei un esperto nella configurazione di agenti AI del sistema Nexus.\nQuesto template definisce un agente con il seguente ruolo:\n---\n{content}\n---\n\nTool MCP disponibili:\n{tools_list}\n\nAnalizza il ruolo dell'agente e identifica i tool necessari.\nRispondi SOLO con un array JSON dei nomi esatti dei tool.\nEsempio: [\"filesystem__read_file\", \"git__status\"]\nSe nessun tool e necessario rispondi: []",
-                content = suggestion,
-                tools_list = tools_list,
-            );
+            let tool_prompt = get_template_or_default(
+                &state.db,
+                &state.template_cache,
+                "system.tool_selection_single_prompt",
+            )
+            .await
+            .replace("{{tools_list}}", &tools_list)
+            .replace("{{content}}", &suggestion);
 
             // Usa lo stesso provider/model della richiesta principale per la tool suggestion
             let tool_result = state
@@ -785,32 +738,22 @@ async fn batch_assign_tools_impl(
         const BASE_MAX: usize = 3;
         const HARD_MAX: usize = 8;
 
-        let tool_prompt = format!(
-            "Sei un esperto nell'assegnazione MINIMALE di tool MCP ai prompt template di Nexus.\n\n\
-Prompt template: {key}\n\
-Titolo: {title}\n\
-Categoria: {category}\n\
-Contenuto (estratto):\n---\n{role}\n---\n\n\
-Tool disponibili (tutti i server MCP abilitati):\n{tools_list}\n\n\
-Obiettivo: seleziona SOLO i tool indispensabili per applicare questo prompt template.\n\
-- Se non servono tool: rispondi []\n\
-- Se servono tool: scegli tipicamente 0–{base_max} tool\n\
-- Puoi arrivare fino a {hard_max} SOLO se strettamente necessario, e SOLO se fornisci `usage_context` per ogni tool extra\n\
-- Evita tool \"generici\" se non sono strettamente necessari (ogni tool aumenta token/costo)\n\n\
-Rispondi SOLO con un array JSON.\n\
-Formati accettati:\n\
-  [\"tool_name\", ...] (solo se il nome è univoco tra i server)\n\
-  [\"server::tool_name\", ...] (consigliato se ci sono omonimi)\n\
-oppure\n\
-  [{{\"tool_name\":\"...\",\"tool_server\":\"...\",\"usage_context\":\"breve motivazione d'uso\"}}, ...]\n",
-            key = key,
-            title = title,
-            category = category,
-            role = content_preview,
-            tools_list = tools_list,
-            base_max = BASE_MAX,
-            hard_max = HARD_MAX,
-        );
+        // Meta-prompt dal DB (system.batch_tool_assignment_prompt, mig 0445);
+        // fallback al default builtin se DB down. {{role}} per ultimo (l'estratto
+        // del prompt template puo' contenere placeholder).
+        let tool_prompt = get_template_or_default(
+            &state.db,
+            &state.template_cache,
+            "system.batch_tool_assignment_prompt",
+        )
+        .await
+        .replace("{{key}}", &key)
+        .replace("{{title}}", &title)
+        .replace("{{category}}", &category)
+        .replace("{{tools_list}}", &tools_list)
+        .replace("{{base_max}}", &BASE_MAX.to_string())
+        .replace("{{hard_max}}", &HARD_MAX.to_string())
+        .replace("{{role}}", &content_preview);
 
         processed += 1;
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;

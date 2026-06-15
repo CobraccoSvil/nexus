@@ -284,7 +284,8 @@ def _intake_gate(state: AgentState, user_msg: str, cfg: dict) -> dict | None:
         snippet = (r.get("snippet") or "")[:200]
         cand_lines.append(f"[{i}] ({r.get('intent', '?')}) {r.get('title', '')}: {snippet}")
     cand_text = "\n".join(cand_lines)
-    system_text = (
+    from . import prompt_registry
+    _intake_default = (
         "Sei un classificatore di intake per un progetto software. Data una NUOVA "
         "richiesta dell'utente e le note ESISTENTI nella knowledge base del progetto, "
         "determina la RELAZIONE della richiesta con quanto gia' presente:\n"
@@ -296,6 +297,9 @@ def _intake_gate(state: AgentState, user_msg: str, cfg: dict) -> dict | None:
         "Imposta off_topic=true se la richiesta NON riguarda lo scopo del progetto. "
         "Rispondi SOLO chiamando il tool intake_classify."
     )
+    # System prompt dal DB (system.intake_classifier, mig 0444) con fallback alla
+    # costante (graceful degradation se il registry e' vuoto / DB down).
+    system_text = prompt_registry.get_prompt("system.intake_classifier") or _intake_default
     tools_json = [{
         "name": "intake_classify",
         "description": "Classifica la relazione della richiesta con la knowledge base esistente.",

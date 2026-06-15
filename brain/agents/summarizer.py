@@ -184,7 +184,11 @@ async def summarize_old_messages(
             )
             return None
 
-    full_prompt = f"{_SUMMARIZE_SYSTEM}\n\n{user_prompt}"
+    # System prompt dal DB (system.summarizer_system, mig 0442) con fallback alla
+    # costante se il registry e' vuoto (graceful degradation se DB down).
+    from . import prompt_registry
+    system_prompt = prompt_registry.get_prompt("system.summarizer_system") or _SUMMARIZE_SYSTEM
+    full_prompt = f"{system_prompt}\n\n{user_prompt}"
     # Clamp difensivo (punto unico, regola L): il summarizer riceve l'intera
     # history serializzata come user_prompt -> il prompt full puo' superare il
     # window del modello scelto. Cap a max_context_ratio * window con head+tail.

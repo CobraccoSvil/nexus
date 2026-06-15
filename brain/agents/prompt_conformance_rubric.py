@@ -181,14 +181,25 @@ def build_revise_prompt(
         mode: "evaluate" (solo punteggio) o "evaluate_and_revise" (anche revised_template).
         signals: segnali opzionali (es. {"weaknesses": [...]}).
     """
-    tmpl = _TEMPLATE_REVISE if mode == "evaluate_and_revise" else _TEMPLATE_EVALUATE
-    user = tmpl.format(
+    from . import prompt_registry
+    if mode == "evaluate_and_revise":
+        _tmpl_default, _tkey = _TEMPLATE_REVISE, "system.conformance_revise"
+    else:
+        _tmpl_default, _tkey = _TEMPLATE_EVALUATE, "system.conformance_evaluate"
+    _fmt = dict(
         template=(current_template or "(prompt vuoto)")[:12000],
         guidelines=_guidelines_block(guidelines),
         signals=_signals_block(signals),
         rubrica_dettaglio=_rubrica_dettaglio(),
     )
-    return _SYSTEM_RUBRIC, user
+    # Template dal DB (mig 0448) con fallback try/except alla costante.
+    _tmpl = prompt_registry.get_prompt(_tkey) or _tmpl_default
+    try:
+        user = _tmpl.format(**_fmt)
+    except (KeyError, IndexError, ValueError):
+        user = _tmpl_default.format(**_fmt)
+    system = prompt_registry.get_prompt("system.conformance_rubric") or _SYSTEM_RUBRIC
+    return system, user
 
 
 def parse_revise_response(raw: str, mode: str = "evaluate") -> dict[str, Any] | None:

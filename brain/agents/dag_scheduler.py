@@ -52,6 +52,27 @@ def compute_ready_layer(todos: list[dict]) -> list[dict]:
     return ready
 
 
+def should_parallelize(ready: list[dict], todos: list[dict], cfg: dict) -> bool:
+    """Decide se attivare il DAG parallelo (Ultra, decomposizione parallela).
+
+    True se esiste un ready layer e:
+      - ci sono dipendenze esplicite fra i todo (comportamento storico), OPPURE
+      - ci sono almeno `dag_parallel_min_ready` todo ready: i todo INDIPENDENTI
+        (nessun depends_on) sono il caso piu' parallelizzabile, prima bloccato
+        dalla sola guardia _has_deps (col vecchio planner i todo non avevano mai
+        depends_on -> il DAG parallelo non scattava quasi mai).
+
+    Con `dag_parallel_min_ready` <= 1 resta il comportamento storico (parallelo
+    solo quando ci sono dipendenze esplicite). Punto unico della decisione
+    (regola L): l'executor delega qui invece di re-implementare la guardia.
+    """
+    if not ready:
+        return False
+    has_deps = any(t.get("depends_on") for t in todos)
+    min_ready = int(cfg.get("dag_parallel_min_ready", 2) or 2)
+    return has_deps or (min_ready >= 2 and len(ready) >= min_ready)
+
+
 def _descendants(todo_id: str, todos: list[dict]) -> set[str]:
     """Insieme dei todo che dipendono (diretta/transitivamente) da todo_id."""
     children: dict[str, list[str]] = {}

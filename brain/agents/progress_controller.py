@@ -130,9 +130,8 @@ def _port_directive(has_active_resources: bool) -> str:
     if has_active_resources:
         return (
             "per le porte NON allocarne di nuove: i servizi del progetto sono gia' "
-            "attivi (vedi blocco RISORSE PROGETTO), usa list_active_services e "
-            "riusa/riavvia con service_restart, oppure punta i tool alle porte gia' "
-            "allocate"
+            "attivi (vedi blocco RISORSE PROGETTO), riusa o riavvia quelli esistenti "
+            "invece di chiederne di nuove"
         )
     return "request_port SOLO per un servizio NUOVO (non ancora in ascolto)"
 
@@ -148,10 +147,10 @@ def _exploration_nudge(count: int, has_active_resources: bool = False) -> str:
     return (
         f"STOP esplorazione: hai gia' letto/cercato {count} volte di fila senza "
         "produrre nulla. I tool di sola lettura sono ora DISABILITATI per questo "
-        "turno. DEVI agire ORA con una tool call produttiva: se devi modificare il "
-        f"progetto usa write_file/edit_file ({_port_directive(has_active_resources)}) "
-        "oppure run_command per eseguire/verificare; se invece la richiesta era una "
-        "domanda, RISPONDI subito a parole con il risultato. Niente altre letture."
+        "turno: l'unico modo di avanzare e' agire sul progetto (modifica file o "
+        f"comando di esecuzione/verifica; {_port_directive(has_active_resources)}) "
+        "oppure, se la richiesta era una domanda, rispondere subito a parole con il "
+        "risultato."
     )
 
 
@@ -169,11 +168,9 @@ def _resource_reallocation_nudge(count: int) -> str:
         "progetto sono gia' attivi: NON riallocare e NON variare il label per "
         "ottenere una porta nuova (request_port e' idempotente per scopo e ti "
         "ridarebbe comunque la porta esistente). Usa il blocco RISORSE PROGETTO nel "
-        "contesto: se il servizio del tuo scopo e' ATTIVO RIUSA la sua porta "
-        "(punta i tool/le richieste a quella); se e' allocato ma spento, "
-        "RIAVVIALO con service_restart; verifica lo stato reale con "
-        "list_active_services. Chiama request_port SOLO per un servizio NUOVO che "
-        "non e' ancora in ascolto."
+        "contesto: riusa la porta del servizio del tuo scopo se e' attivo, riavvialo "
+        "se e' allocato ma spento. Chiama request_port SOLO per un servizio NUOVO "
+        "che non e' ancora in ascolto."
     )
 
 
@@ -181,19 +178,18 @@ def _signature_nudge(tool: str) -> str:
     """Nudge per il loop su tool identico ripetuto."""
     return (
         f"STOP: hai ripetuto la stessa tool call ('{tool}', stesso input) senza "
-        "progresso. NON ripeterla. Cambia strategia ORA: se ti mancano "
-        "informazioni fai UNA richiesta diversa e piu' specifica, altrimenti "
-        "procedi con l'azione concreta successiva (write_file/edit_file/"
-        "run_command) o riassumi lo stato a parole."
+        "progresso. NON ripeterla. Se ti mancano informazioni fai una richiesta "
+        "diversa e piu' specifica; altrimenti procedi con l'azione concreta "
+        "successiva o riassumi lo stato a parole."
     )
 
 
 def _g1_nudge() -> str:
     """Nudge per la risposta descrittiva su richiesta d'azione (G1)."""
     return (
-        "STOP: hai descritto i passi senza eseguirli. NON descrivere: ESEGUI ORA "
-        "il prossimo step concreto con una tool call (write_file/edit_file/"
-        "run_command). I tool di sola lettura sono disabilitati per questo turno."
+        "STOP: hai descritto i passi senza eseguirli. I tool di sola lettura sono "
+        "disabilitati per questo turno: avanza eseguendo il prossimo step concreto "
+        "con una tool call che modifica il progetto o lancia un comando."
     )
 
 
@@ -238,16 +234,12 @@ def _repeated_action_nudge(label: str, count: int) -> str:
     if _is_build_or_test_label(label):
         return (
             f"STOP: hai gia' eseguito '{label}' {count} volte. Ri-eseguire un "
-            "build/test NON riduce gli errori — li riduce solo correggere i "
-            "file. NON ripetere il comando. Invece, in quest'ordine: (1) leggi "
-            "l'output COMPLETO dell'ultima esecuzione qui sopra: ogni errore ha "
-            "file:riga e in fondo c'e' il totale (es. 'Found N errors'); (2) apri "
-            "con read_file OGNI file segnalato e correggilo con edit_file, TUTTI "
-            "in questo turno (correzione batch, non uno solo); (3) SOLO DOPO aver "
-            "corretto tutti i file ri-esegui il comando UNA volta per confermare. "
-            "Se l'output era troncato e non vedi tutti gli errori, correggi quelli "
-            "visibili e segnala esplicitamente che ne mancano: non ri-eseguire per "
-            "scoprirli."
+            "build/test NON riduce gli errori: li riduce solo correggere i file "
+            "che l'output segnala (ogni errore ha file:riga; in fondo il totale, "
+            "es. 'Found N errors'). Lavora sulla causa, non sulla ripetizione del "
+            "comando. Se l'output era troncato e non vedi tutti gli errori, "
+            "correggi quelli visibili e segnala che ne mancano, invece di "
+            "ri-eseguire per scoprirli."
         )
     return (
         f"STOP: hai gia' eseguito la stessa azione ({label}) {count} volte. "
@@ -275,27 +267,22 @@ def _force_diagnose_nudge(label: str, count: int) -> str:
     if _is_build_or_test_label(label):
         return (
             f"STOP: hai ripetuto '{label}' {count} volte e il sollecito precedente "
-            "non ha cambiato nulla. PRIMA di qualunque altra mossa DEVI, in "
-            "quest'ordine: (1) leggere l'output COMPLETO dell'ultima esecuzione "
-            "(ogni errore ha file:riga, in fondo il totale tipo 'Found N errors'); "
-            "(2) dichiarare in una frase la CAUSA RADICE (es. tipo mancante, import "
-            "errato, simbolo non definito), non il sintomo; (3) correggere con "
-            "edit_file OGNI file segnalato, in questo turno (correzione batch). "
-            "Ri-eseguire il build NON e' un'azione diversa: e' la stessa di prima. "
-            "Se non riesci a correggere (errore in dipendenza esterna/codice "
-            "generato non tuo), dichiara ESPLICITAMENTE che sei bloccato e perche': "
-            "il turno chiudera' con la diagnosi, non con un'altra esecuzione."
+            "non ha cambiato nulla. Ri-eseguire il build NON e' un'azione diversa: "
+            "e' la stessa di prima. Identifica la CAUSA RADICE dagli errori "
+            "dell'ultima esecuzione (file:riga; la causa reale come tipo mancante / "
+            "import errato / simbolo non definito, non il sintomo) e correggi i file "
+            "segnalati. Se non puoi correggere (errore in dipendenza esterna o "
+            "codice generato non tuo), dichiara che sei bloccato e perche': il turno "
+            "chiudera' con la diagnosi, non con un'altra esecuzione."
         )
     return (
         f"STOP: hai ripetuto '{label}' {count} volte e il sollecito precedente non "
-        "ha cambiato nulla. PRIMA di qualunque altra mossa DEVI, in quest'ordine: "
-        "(1) leggere l'output/errore ESATTO dell'ultima esecuzione; (2) dichiarare "
-        "in una frase la CAUSA RADICE del fallimento (non il sintomo); (3) eseguire "
-        "UN'AZIONE DIVERSA che attacchi quella causa (comando o edit diverso), NON "
-        "la stessa di prima. Se non esiste un'azione diversa praticabile, dichiara "
-        "ESPLICITAMENTE che sei bloccato e perche' (es. dipendenza/credenziale/"
-        "permesso/servizio mancante): il turno chiudera' con la diagnosi e il "
-        "prossimo passo, non con una ripetizione."
+        "ha cambiato nulla. Identifica la CAUSA RADICE del fallimento dall'esito "
+        "esatto dell'ultima esecuzione (la causa reale, non il sintomo) e attaccala "
+        "con un'azione diversa, non la stessa di prima. Se non esiste un'azione "
+        "diversa praticabile, dichiara che sei bloccato e perche' (es. dipendenza / "
+        "credenziale / permesso / servizio mancante): il turno chiudera' con la "
+        "diagnosi e il prossimo passo, non con una ripetizione."
     )
 
 

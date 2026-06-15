@@ -105,9 +105,8 @@ def extract_next_steps(text: str) -> list[dict[str, str]]:
             continue
         label = label_full.split(":")[0].split(".")[0].strip()[:_MAX_LABEL_CHARS]
         prompt = (
-            "Esegui ORA questo passo modificando i file del progetto (non "
-            f"limitarti a descriverlo): {label_full}. Al termine verifica che "
-            "funzioni davvero end-to-end."
+            f"Esegui questo passo, modificando i file del progetto: {label_full}. "
+            "Al termine verifica che funzioni davvero end-to-end."
         )
         out.append({"label": label, "prompt": prompt[:_MAX_PROMPT_CHARS]})
         if len(out) >= _MAX_CHOICES:
@@ -334,6 +333,11 @@ def looks_like_choices(text: str) -> bool:
 def _build_extractor_prompt(assistant_text: str) -> str:
     """Costruisce il prompt per il modello leggero del fallback. Istruisce a
     restituire SOLO JSON (lista) cosi' il parsing e' deterministico."""
+    from . import prompt_registry
+    _tpl = prompt_registry.get_prompt("system.choices_extractor")
+    if _tpl:
+        return _tpl.replace("{{assistant_text}}", assistant_text)
+    # Fallback hardcoded (graceful degradation se il registry e' vuoto / DB down).
     return (
         "Sei un estrattore. Ti viene data la risposta di un assistente AI.\n"
         "Se la risposta propone all'utente delle SCELTE su come proseguire "
