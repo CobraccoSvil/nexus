@@ -1487,6 +1487,21 @@ pub(crate) async fn spawn_agent_run(
         )
     };
 
+    // Blocco RISORSE PROGETTO (punto unico resource_resolver, regola L):
+    // stato runtime reale dei servizi del progetto (porte allocate + porte
+    // realmente in ascolto + orfani del bucket), riconciliato dalle fonti
+    // SEMPRE disponibili in WSL (DB + LISTEN, systemd best-effort). Iniettato a
+    // valle di project_header e prima di automation_instructions, NON tocca il
+    // template DB (non re-triggera l'offload del system). Stringa vuota se non
+    // c'e' alcuna risorsa: niente blocco rumoroso. Corregge il loop request_port
+    // (l'agente vedeva 0 risorse e variava la label per riallocare).
+    let risorse_block = crate::project_workspace::resource_resolver::render_prompt_block(
+        &state.db,
+        &state.port_registry,
+        params.project_id,
+    )
+    .await;
+
     // Istruzioni specifiche per modalità automazione
     let automation_instructions = match params.automation_mode {
         AutomationMode::Automatic => "\n=== MODALITÀ AUTOMATICA ===\n\
@@ -1571,8 +1586,9 @@ pub(crate) async fn spawn_agent_run(
     };
 
     let system_text = format!(
-        "{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}",
         project_header,
+        risorse_block,
         project_custom_instructions,
         automation_instructions,
         o_series_instructions,

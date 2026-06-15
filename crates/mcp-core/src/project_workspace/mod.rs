@@ -9,6 +9,7 @@ pub mod monitor_seed;
 pub mod playwright_install;
 pub mod port_recovery;
 pub mod processes;
+pub mod resource_resolver;
 pub mod resource_violation_remediation;
 pub mod run_configs;
 pub mod run_mode;

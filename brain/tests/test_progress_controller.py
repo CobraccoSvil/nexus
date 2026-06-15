@@ -119,3 +119,99 @@ def test_soglia_zero_non_divide_per_zero():
     # 2 >= 2*max(1,0)=2 -> stallo esplorazione, guida.
     assert isinstance(d, ProgressDecision)
     assert d.action == "guide"
+
+
+# ── Asse resource_reallocation (loop request_port) ──────────────────────────
+
+def test_reallocation_sotto_soglia_proceed():
+    """Una sola request_port (count=1, soglia=3) non e' un loop -> proceed.
+
+    Una richiesta porta legittima per un servizio nuovo non deve scattare.
+    """
+    d = decide(ProgressSignals(reallocation_count=1, reallocation_threshold=3))
+    assert d.action == "proceed"
+    assert d.axis is None
+    assert d.nudge_text is None
+    assert d.stop_reason is None
+
+
+def test_reallocation_sopra_soglia_prima_volta_guida_grounded():
+    """N request_port ravvicinate (oltre soglia), mai guidato -> GUIDE con nudge
+    GROUNDED che ordina il riuso, senza forzare una nuova tool call."""
+    d = decide(
+        ProgressSignals(
+            reallocation_count=4,
+            reallocation_threshold=3,
+            has_active_resources=True,
+        )
+    )
+    assert d.action == "guide"
+    assert d.axis == "resource_reallocation"
+    # NON forza una nuova tool call (rischierebbe un ennesimo request_port).
+    assert d.force_action is False
+    assert d.stop_reason is None
+    # Grounding: il nudge ordina il riuso/riavvio dei servizi attivi, non l'allocazione.
+    assert d.nudge_text is not None
+    _txt = d.nudge_text.lower()
+    assert "list_active_services" in _txt
+    assert "service_restart" in _txt
+    assert "non riallocare" in _txt or "non allocarne" in _txt or "non riallocare" in _txt
+    assert "riusa" in _txt or "riusare" in _txt or "riusa" in _txt
+    assert "richiesto porte" in _txt or "request_port" in _txt
+
+
+def test_reallocation_gia_guidata_senza_escalation_aborta_verso_verifica():
+    """Gia' guidato e ancora in loop, nessun candidato escalation -> ABORT con lo
+    stop_reason coordinato (final_gate), non chiusura morta."""
+    d = decide(
+        ProgressSignals(
+            reallocation_count=5,
+            reallocation_threshold=3,
+            already_guided=frozenset({"resource_reallocation"}),
+            has_escalation_candidate=False,
+        )
+    )
+    assert d.action == "abort"
+    assert d.axis == "resource_reallocation"
+    assert d.stop_reason == ABORT_STOP_REASON
+
+
+def test_reallocation_gia_guidata_con_candidato_escala():
+    """Gia' guidato, c'e' un candidato e budget -> ESCALATE prima dell'abort."""
+    d = decide(
+        ProgressSignals(
+            reallocation_count=5,
+            reallocation_threshold=3,
+            already_guided=frozenset({"resource_reallocation"}),
+            has_escalation_candidate=True,
+            escalations=0,
+            max_escalations=3,
+        )
+    )
+    assert d.action == "escalate"
+    assert d.axis == "resource_reallocation"
+    assert d.stop_reason is None
+
+
+def test_reallocation_priorita_su_repeated_action():
+    """Se sono in stallo sia resource_reallocation sia repeated_action, vince il
+    primo: il loop request_port e' specifico e va intercettato prima del generico."""
+    d = decide(
+        ProgressSignals(
+            reallocation_count=4,
+            reallocation_threshold=3,
+            repeated_action=("write_file: x", 3),
+        )
+    )
+    assert d.axis == "resource_reallocation"
+
+
+def test_reallocation_nudge_grounded_anche_senza_active_resources():
+    """Anche senza has_active_resources il nudge resta grounded sul riuso: il
+    blocco RISORSE PROGETTO e' la fonte, il nudge non deve riproporre l'allocazione
+    come default. has_active_resources modula i nudge esplorativi, non questo."""
+    d = decide(ProgressSignals(reallocation_count=3, reallocation_threshold=3))
+    assert d.action == "guide"
+    assert d.axis == "resource_reallocation"
+    assert d.nudge_text is not None
+    assert "service_restart" in d.nudge_text.lower()

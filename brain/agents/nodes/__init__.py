@@ -103,6 +103,9 @@ from .helpers import (
     _detect_repeated_action,
     _load_repeated_action_threshold,
     _load_repeated_action_force_diagnose_enabled,
+    _count_recent_request_port,
+    _load_reallocation_threshold,
+    _has_active_resources_in_history,
     _detect_recent_tool_error,
     MAX_TOOL_RESULT_CHARS,
     MAX_CONTEXT_CHARS,
@@ -2114,14 +2117,26 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             "consecutive_exploration_calls": _exploration_count,
             "exploration_nudge_sent": _exploration_nudge_sent,
         }
+    # Grounding condiviso (regola L): se il run ha gia' allocato porte o sta
+    # operando su servizi attivi, i nudge NON devono proporre request_port come
+    # azione produttiva di default (alimenterebbe il loop di riallocazione): vanno
+    # indirizzati al riuso/riavvio. Calcolato una volta e riusato dai nudge sotto.
+    _has_active_resources = _has_active_resources_in_history(messages)
     if _exploration_count >= _exploration_threshold and not _exploration_nudge_sent:
+        _port_hint = (
+            "per le porte NON allocarne di nuove: i servizi del progetto sono "
+            "gia' attivi (vedi blocco RISORSE PROGETTO), riusa/riavvia con "
+            "service_restart o punta i tool alle porte gia' allocate"
+            if _has_active_resources
+            else "usa request_port SOLO per un servizio NUOVO"
+        )
         _expl_nudge = HumanMessage(
             content=(
                 f"Hai gia' raccolto sufficiente contesto / cercato abbastanza "
                 f"strumenti ({_exploration_count} esplorazioni). NON esplorare "
                 f"oltre e NON cercare altri tool. Procedi ORA in base alla "
                 f"richiesta: se devi MODIFICARE il progetto, scrivi i file con "
-                f"write_file (e usa request_port per le porte); se invece era una "
+                f"write_file ({_port_hint}); se invece era una "
                 f"DOMANDA o una richiesta di proposte/opzioni, RISPONDI subito a "
                 f"parole con il risultato, senza altre tool call."
             )
@@ -2247,6 +2262,80 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     "result": _ra_text,
                     "pending_tool_uses": [],
                     "stop_reason": _ra_dec.stop_reason,
+                    "iterations": int(state.get("iterations") or 0) + 1,
+                    "progress_guided_axes": sorted(_progress_guided),
+                    "progress_diagnosed_axes": sorted(_progress_diagnosed),
+                    "forced_close_unverified": True,
+                }
+
+    # ── Loop-detection RIALLOCAZIONE PORTE (request_port ripetuto) ────────────
+    # Diagnosi confermata (task #22): l'agente chiama request_port piu' volte
+    # variando il label mentre i servizi del progetto sono GIA' attivi. Il loop
+    # sfugge a signature (label diverso) e a repeated_action (request_port non e'
+    # tra i tool tracciati). Segnale STRUTTURALE (conteggio request_port
+    # ravvicinate, a prescindere dal label) -> deleghiamo al PUNTO UNICO
+    # (progress_controller, regola L): GUIDE -> nudge GROUNDED "riusa/riavvia, non
+    # riallocare"; se persiste, ESCALATE/ABORT verso final_gate (mai chiusura
+    # morta). NON aggiungiamo request_port a _EXPLORATION_ONLY_TOOLS (e' un
+    # side-effect reale): questo asse copre proprio il "request_port ripetuto".
+    if _progress_ctrl_on:
+        _rp_threshold = _load_reallocation_threshold()
+        _rp_count = _count_recent_request_port(messages)
+        if _rp_count < _rp_threshold:
+            # Sotto soglia: reset coordinato dell'asse (regola L) cosi' una futura
+            # raffica riparte da GUIDE e non salta dritta all'abort.
+            _progress_guided.discard("resource_reallocation")
+        else:
+            from .. import progress_controller as _pc_rp
+            _rp_dec = _pc_rp.decide(_pc_rp.ProgressSignals(
+                reallocation_count=_rp_count,
+                reallocation_threshold=_rp_threshold,
+                has_active_resources=_has_active_resources,
+                already_guided=frozenset(_progress_guided),
+                has_escalation_candidate=False,
+            ))
+            if _rp_dec.action == "guide":
+                _progress_guided.add("resource_reallocation")
+                if _rp_dec.nudge_text:
+                    messages = list(messages) + [HumanMessage(content=_rp_dec.nudge_text)]
+                logger.warning(
+                    "executor_node: progress_controller GUIDE resource_reallocation "
+                    "(request_port x%d) -> nudge riusa-porte",
+                    _rp_count,
+                )
+            elif _rp_dec.action == "abort":
+                logger.warning(
+                    "executor_node: progress_controller ABORT resource_reallocation "
+                    "(request_port x%d): %s",
+                    _rp_count, _rp_dec.reason,
+                )
+                from ..criteria_runner import modified_files_from_steps
+                _run_id_recap = str(state.get("thread_id") or "")
+                _modified = (
+                    modified_files_from_steps(_run_id_recap) if _run_id_recap else []
+                )
+                _files_line = (
+                    "File toccati: " + ", ".join(_modified)
+                    if _modified
+                    else "File toccati: nessuno."
+                )
+                _rp_text = (
+                    f"ESITO: non completato.\n"
+                    f"Mi sono bloccato richiedendo porte ({_rp_count} chiamate "
+                    f"request_port ravvicinate) invece di riusare i servizi gia' "
+                    f"attivi del progetto; interrompo invece di insistere.\n"
+                    f"{_files_line}\n"
+                    f"Prossimo passo: usare list_active_services per vedere i "
+                    f"servizi attivi e le porte gia' allocate, riusare la porta "
+                    f"esistente del servizio richiesto (o riavviarlo con "
+                    f"service_restart se spento) e puntare i tool/le richieste a "
+                    f"quella porta, senza allocarne di nuove."
+                )
+                return {
+                    "messages": [AIMessage(content=_rp_text)],
+                    "result": _rp_text,
+                    "pending_tool_uses": [],
+                    "stop_reason": _rp_dec.stop_reason,
                     "iterations": int(state.get("iterations") or 0) + 1,
                     "progress_guided_axes": sorted(_progress_guided),
                     "progress_diagnosed_axes": sorted(_progress_diagnosed),

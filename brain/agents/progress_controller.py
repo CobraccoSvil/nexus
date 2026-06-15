@@ -38,7 +38,8 @@ from typing import Literal
 # Assi di stallo riconosciuti. Stringhe stabili: usate come chiavi negli insiemi
 # di stato ("assi gia' guidati") e nei log/meta_step.
 Axis = Literal[
-    "exploration", "signature", "g1_descriptive", "repeated_action"
+    "exploration", "signature", "g1_descriptive", "repeated_action",
+    "resource_reallocation",
 ]
 
 # Azioni possibili, in ordine di severita' crescente.
@@ -73,6 +74,16 @@ class ProgressSignals:
     # Azione produttiva (scrittura/comando) ripetuta identica oltre soglia:
     # (label, conteggio) oppure None. Indipendente dall'esito (anche se riesce).
     repeated_action: tuple[str, int] | None = None
+    # Riallocazione risorse: numero di chiamate request_port ravvicinate, contate
+    # A PRESCINDERE dal label (il variare del label E' il sintomo del loop). Sopra
+    # soglia indica che l'agente continua ad allocare porte invece di riusare i
+    # servizi gia' attivi del progetto. Segnale STRUTTURALE, non lessicale.
+    reallocation_count: int = 0
+    reallocation_threshold: int = 3
+    # Indica se il run ha gia' allocazioni/servizi attivi noti (porte governate o
+    # servizi in ascolto). Quando True il nudge di riallocazione e' GROUNDED: punta
+    # esplicitamente al riuso/riavvio invece di lasciare aperta l'opzione "alloca".
+    has_active_resources: bool = False
     # Budget di escalation gia' consumato e candidato disponibile.
     escalations: int = 0
     max_escalations: int = 3
@@ -106,19 +117,63 @@ class ProgressDecision:
     reason: str = ""
 
 
-def _exploration_nudge(count: int) -> str:
+def _port_directive(has_active_resources: bool) -> str:
+    """Direttiva porte CONDIZIONALE (grounding).
+
+    Quando il run ha gia' risorse attive (porte governate / servizi in ascolto)
+    NON suggerisce request_port come azione produttiva di default: indirizza al
+    riuso/riavvio dei servizi esistenti. Cosi' i nudge che oggi propongono sempre
+    request_port (esplorazione, anti-esplorazione) non spingono verso un nuovo
+    loop di allocazione. Quando non risulta nulla di attivo, request_port resta la
+    via corretta per un servizio NUOVO.
+    """
+    if has_active_resources:
+        return (
+            "per le porte NON allocarne di nuove: i servizi del progetto sono gia' "
+            "attivi (vedi blocco RISORSE PROGETTO), usa list_active_services e "
+            "riusa/riavvia con service_restart, oppure punta i tool alle porte gia' "
+            "allocate"
+        )
+    return "request_port SOLO per un servizio NUOVO (non ancora in ascolto)"
+
+
+def _exploration_nudge(count: int, has_active_resources: bool = False) -> str:
     """Nudge ASSERTIVO per l'esplorazione (piu' forte del nudge soft a 1x soglia).
 
     Non chiede gentilmente: ordina di agire ORA, perche' i tool di sola lettura
-    sono stati rimossi e una tool call produttiva e' obbligata.
+    sono stati rimossi e una tool call produttiva e' obbligata. La direttiva sulle
+    porte e' CONDIZIONALE: se il run ha gia' risorse attive non propone
+    request_port (eviterebbe di alimentare il loop di riallocazione).
     """
     return (
         f"STOP esplorazione: hai gia' letto/cercato {count} volte di fila senza "
         "produrre nulla. I tool di sola lettura sono ora DISABILITATI per questo "
         "turno. DEVI agire ORA con una tool call produttiva: se devi modificare il "
-        "progetto usa write_file/edit_file (e request_port per le porte) oppure "
-        "run_command per eseguire/verificare; se invece la richiesta era una "
+        f"progetto usa write_file/edit_file ({_port_directive(has_active_resources)}) "
+        "oppure run_command per eseguire/verificare; se invece la richiesta era una "
         "domanda, RISPONDI subito a parole con il risultato. Niente altre letture."
+    )
+
+
+def _resource_reallocation_nudge(count: int) -> str:
+    """Nudge GROUNDED per il loop di riallocazione porte (asse resource_reallocation).
+
+    Il sintomo (diagnosi confermata): l'agente chiama request_port ripetutamente
+    variando il label, mentre i servizi del progetto sono GIA' attivi. Il loop
+    sfugge a signature/repeated_action proprio perche' il label cambia. Qui non si
+    forza una nuova tool call (rischierebbe un ennesimo request_port): si ORDINA il
+    riuso, ancorato alle risorse reali gia' presenti nel contesto.
+    """
+    return (
+        f"STOP: hai gia' richiesto porte {count} volte di fila. I servizi del "
+        "progetto sono gia' attivi: NON riallocare e NON variare il label per "
+        "ottenere una porta nuova (request_port e' idempotente per scopo e ti "
+        "ridarebbe comunque la porta esistente). Usa il blocco RISORSE PROGETTO nel "
+        "contesto: se il servizio del tuo scopo e' ATTIVO RIUSA la sua porta "
+        "(punta i tool/le richieste a quella); se e' allocato ma spento, "
+        "RIAVVIALO con service_restart; verifica lo stato reale con "
+        "list_active_services. Chiama request_port SOLO per un servizio NUOVO che "
+        "non e' ancora in ascolto."
     )
 
 
@@ -190,17 +245,28 @@ def decide(signals: ProgressSignals) -> ProgressDecision:
         - altrimenti -> ABORT (verso la verifica E2E)
 
     Priorita' tra assi (dal report di analisi): esplorazione, signature-loop,
-    g1-descrittivo. Il comando-ripetuto resta un nudge soft a se' (gestito dal
-    chiamante) e non innesca abort qui: e' incluso solo per completezza futura.
+    resource_reallocation (loop request_port), repeated_action, g1-descrittivo.
+
+    resource_reallocation: il loop di richieste porte (request_port ripetuto con
+    label che varia) sfugge a signature/repeated_action proprio perche' il label
+    cambia. Il suo segnale e' STRUTTURALE (conteggio request_port ravvicinate). La
+    GUIDE emette un nudge GROUNDED che ordina il riuso/riavvio dei servizi gia'
+    attivi (no force_action: non si forza un'altra tool call). Se persiste sale a
+    ESCALATE/ABORT (verso final_gate) come gli altri assi.
 
     Nessuno stallo -> proceed.
     """
     # Determina l'asse di stallo prioritario (None = nessuno stallo bloccante).
+    # resource_reallocation sta tra signature e repeated_action: e' un loop
+    # strutturale specifico (request_port ripetuto) che va intercettato prima del
+    # generico repeated_action (request_port NON e' tra i tool di repeated_action).
     axis: Axis | None = None
     if signals.exploration_count >= 2 * max(1, signals.exploration_threshold):
         axis = "exploration"
     elif signals.signature_loop_tool:
         axis = "signature"
+    elif signals.reallocation_count >= max(1, signals.reallocation_threshold):
+        axis = "resource_reallocation"
     elif signals.repeated_action is not None:
         axis = "repeated_action"
     elif signals.g1_over_cap:
@@ -219,23 +285,30 @@ def decide(signals: ProgressSignals) -> ProgressDecision:
     # Livello 1 — GUIDE (forza-azione): solo se non gia' tentato per questo asse.
     if not already:
         if axis == "exploration":
-            nudge = _exploration_nudge(signals.exploration_count)
+            nudge = _exploration_nudge(
+                signals.exploration_count, signals.has_active_resources
+            )
         elif axis == "signature":
             nudge = _signature_nudge(signals.signature_loop_tool or "")
+        elif axis == "resource_reallocation":
+            nudge = _resource_reallocation_nudge(signals.reallocation_count)
         elif axis == "repeated_action":
             _ra_label, _ra_count = signals.repeated_action or ("", 0)
             nudge = _repeated_action_nudge(_ra_label, _ra_count)
         else:
             nudge = _g1_nudge()
-        # Per repeated_action NON forziamo una nuova tool call (rischio di
-        # rieseguire la stessa azione): il nudge ordina di procedere/verificare
-        # o concludere. Per gli altri assi la forza-azione rimuove i read-only.
-        _force = axis != "repeated_action"
-        _reason = (
-            f"stallo {axis}: nudge anti-ripetizione (procedi/verifica)"
-            if axis == "repeated_action"
-            else f"stallo {axis}: forza-azione (rimuovo read-only + tool_choice required)"
-        )
+        # Per repeated_action e resource_reallocation NON forziamo una nuova tool
+        # call: nel primo caso rischierebbe di rieseguire la stessa azione, nel
+        # secondo un ennesimo request_port. Il nudge ordina di riusare/procedere.
+        # Per gli altri assi la forza-azione rimuove i read-only.
+        _no_force_axes = {"repeated_action", "resource_reallocation"}
+        _force = axis not in _no_force_axes
+        if axis == "repeated_action":
+            _reason = f"stallo {axis}: nudge anti-ripetizione (procedi/verifica)"
+        elif axis == "resource_reallocation":
+            _reason = f"stallo {axis}: nudge riusa-porte (no nuova allocazione)"
+        else:
+            _reason = f"stallo {axis}: forza-azione (rimuovo read-only + tool_choice required)"
         return ProgressDecision(
             action="guide",
             axis=axis,

@@ -1915,6 +1915,117 @@ def _load_repeated_action_threshold() -> int:
     return value
 
 
+# ── Cache soglia loop riallocazione porte (TTL 60s) ─────────────────────────
+# Diagnosi confermata (loop request_port): l'agente continua a chiamare
+# request_port variando il label (cosi' signature-loop e repeated_action non
+# scattano: il primo richiede signature identica, il secondo non traccia
+# request_port). Il segnale e' STRUTTURALE: il numero di request_port ravvicinate
+# A PRESCINDERE dal label. Soglia DB-driven (regola G): default 3 (le prime
+# allocazioni possono essere legittime su un progetto con piu' servizi nuovi; il
+# loop emerge oltre).
+_REALLOCATION_CACHE: dict[str, Any] = {"loaded_at": 0.0, "threshold": None}
+_REALLOCATION_TTL_SEC = 60.0
+_REALLOCATION_DEFAULT_THRESHOLD = 3
+# Nome del tool di allocazione porte (vedi dispatch.rs: "request_port").
+_PORT_REQUEST_TOOL = "request_port"
+
+
+def _load_reallocation_threshold() -> int:
+    """Legge agent.loop.resource_reallocation_threshold dal DB con cache 60s.
+
+    Gemello di _load_repeated_action_threshold (regola G: niente hardcode, DB
+    unica fonte). Ritorna il default sicuro (3) se il DB e' irraggiungibile o la
+    chiave non esiste: get_int_setting non solleva mai. Soglia minima 1.
+    """
+    now = time.time()
+    cached = _REALLOCATION_CACHE["threshold"]
+    if cached is not None and (
+        now - _REALLOCATION_CACHE["loaded_at"]
+    ) < _REALLOCATION_TTL_SEC:
+        return int(cached)
+    value = _REALLOCATION_DEFAULT_THRESHOLD
+    try:
+        from brain.utils.settings_db import get_int_setting
+        value = int(get_int_setting(
+            "agent.loop.resource_reallocation_threshold",
+            _REALLOCATION_DEFAULT_THRESHOLD,
+        ))
+        if value < 1:
+            value = _REALLOCATION_DEFAULT_THRESHOLD
+    except Exception as exc:
+        logger.warning(
+            "resource_reallocation_threshold: load DB fallito, uso default %d (%s)",
+            _REALLOCATION_DEFAULT_THRESHOLD, exc,
+        )
+        value = _REALLOCATION_DEFAULT_THRESHOLD
+    _REALLOCATION_CACHE["threshold"] = value
+    _REALLOCATION_CACHE["loaded_at"] = now
+    return value
+
+
+def _count_recent_request_port(messages: list, lookback: int = 16) -> int:
+    """Conta le chiamate request_port negli ultimi `lookback` messaggi.
+
+    Segnale STRUTTURALE del loop di riallocazione (regola L: il conteggio vive
+    qui, il progress_controller decide). NESSUN filtro su input/label: e' proprio
+    il variare del label il sintomo del loop, quindi ogni tool_use con
+    name == "request_port" conta, a prescindere dallo scopo/porta richiesti.
+
+    Gestisce il formato del grafo: AIMessage con additional_kwargs
+    ["anthropic_content"] = [{type: "tool_use", name: ...}, ...].
+    """
+    if not messages:
+        return 0
+    recent = messages[-lookback:] if len(messages) > lookback else messages
+    count = 0
+    for m in recent:
+        if not isinstance(m, AIMessage):
+            continue
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content") or []
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            if b.get("name", "") == _PORT_REQUEST_TOOL:
+                count += 1
+    return count
+
+
+def _has_active_resources_in_history(messages: list, lookback: int = 24) -> bool:
+    """True se nella history risulta gia' una risorsa attiva nota al run.
+
+    Determina il GROUNDING del nudge di riallocazione e dei nudge esplorativi:
+    quando il run ha gia' allocato porte o ha visto servizi attivi, i nudge NON
+    devono proporre request_port come azione produttiva di default ma indirizzare
+    al riuso. Segnale strutturale conservativo: e' considerato "risorse attive"
+    se nella finestra recente c'e' almeno un tool_use request_port (l'agente ha
+    gia' ottenuto/richiesto una porta) o list_active_services/service_restart (sta
+    operando su servizi esistenti). Non interroga il DB (la funzione resta pura e
+    testabile): il blocco RISORSE PROGETTO nel system_text fornisce il dettaglio.
+    """
+    if not messages:
+        return False
+    recent = messages[-lookback:] if len(messages) > lookback else messages
+    _resource_tools = {
+        _PORT_REQUEST_TOOL, "list_active_services", "service_restart",
+    }
+    for m in recent:
+        if not isinstance(m, AIMessage):
+            continue
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content") or []
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            if b.get("name", "") in _resource_tools:
+                return True
+    return False
+
+
 def _tool_result_outcome_after(recent: list, idx: int, max_ahead: int = 3) -> bool | None:
     """Esito del primo tool_result nei `max_ahead` messaggi dopo recent[idx].
 

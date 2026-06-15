@@ -166,117 +166,44 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         None
     };
     if let Some(kind) = kind_hint {
-        // ── A. Cerca tra le allocazioni del progetto label compatibili ──
-        let rows = sqlx::query_as::<_, (i32, String)>(
-            "SELECT port, label FROM nexus_port_allocations WHERE project_id = $1",
+        // Anti-duplicato convergente sul PUNTO UNICO resource_resolver (regola L):
+        // niente piu' query SQL + parsing systemctl re-implementati qui. Il
+        // resolver riconcilia DB (nexus_port_allocations) + porte realmente in
+        // LISTEN (verita' di runtime, systemd cieco in WSL) e applica il matching
+        // label/scopo a 2 classi disgiunte (frontend/backend). `kind` e' gia' una
+        // label di classe che il resolver riconosce.
+        if let Some(res) = crate::project_workspace::resource_resolver::resolve_for_label(
+            &ctx.port_registry,
+            ctx.project_id,
+            kind,
         )
-        .bind(ctx.project_id)
-        .fetch_all(&*ctx.db)
         .await
-        .unwrap_or_default();
-        for (port, alloc_label) in &rows {
-            let al = alloc_label.to_lowercase();
-            let matches = match kind {
-                "frontend" => {
-                    al.contains("frontend")
-                        || al.contains("vite")
-                        || al.contains("react")
-                        || al.contains("svelte")
-                        || al.contains("ui")
-                        || al.contains("nuxt")
-                        || al.contains("astro")
-                        || al.contains("web")
-                        || al.contains("client")
-                        || al.contains("dev server")
-                }
-                "backend" => {
-                    al.contains("backend")
-                        || al.contains("api")
-                        || (al.contains("server")
-                            && !al.contains("frontend")
-                            && !al.contains("dev"))
-                }
-                _ => false,
-            };
-            if matches {
+        {
+            if res.listening {
+                // Servizio dello stesso scopo gia' ATTIVO: REFUSE, riusa la sua porta.
+                let port = res
+                    .port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".to_string());
                 return format!(
-                    "[Errore: servizio '{}' di tipo {} gia' attivo sulla porta {}. \
+                    "[Errore: servizio '{}' di tipo {} gia' ATTIVO sulla porta {}. \
                      Riusalo invece di crearne uno nuovo (puoi accedere a http://localhost:{}). \
                      Se vuoi davvero riavviarlo usa `service_restart` con label='{}'.]",
-                    alloc_label, kind, port, port, alloc_label
+                    res.label, kind, port, port, res.label
                 );
-            }
-        }
-
-        // ── B. Cerca tra i servizi systemd persistenti del progetto ──
-        // I servizi systemd hanno label come "backend-dev"/"frontend-dev"
-        // ma l'allocazione di porta puo' avere label generica ("Service").
-        // Query diretta systemctl: list-units --user --state=active per
-        // unit con prefisso slug del progetto.
-        let project_slug_q =
-            sqlx::query_scalar::<_, String>("SELECT slug FROM projects WHERE id = $1")
-                .bind(ctx.project_id)
-                .fetch_optional(&*ctx.db)
-                .await
-                .ok()
-                .flatten();
-        if let Some(slug) = project_slug_q {
-            let slug_norm = slug.to_lowercase().replace([' ', '_'], "-");
-            let systemd_output = tokio::process::Command::new("systemctl")
-                .args([
-                    "--user",
-                    "list-units",
-                    "--type=service",
-                    "--state=active",
-                    "--no-legend",
-                    "--no-pager",
-                ])
-                .output()
-                .await;
-            if let Ok(out) = systemd_output {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let prefix = format!("{}-", slug_norm);
-                for line in stdout.lines() {
-                    let unit = line
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_start_matches('●')
-                        .trim();
-                    if !unit.starts_with(&prefix) || !unit.ends_with(".service") {
-                        continue;
-                    }
-                    let short = unit
-                        .strip_prefix(&prefix)
-                        .unwrap_or(unit)
-                        .strip_suffix(".service")
-                        .unwrap_or(unit)
-                        .to_lowercase();
-                    let matches = match kind {
-                        "frontend" => {
-                            short.contains("frontend")
-                                || short.contains("vite")
-                                || short.contains("ui")
-                                || short.contains("web")
-                                || short.contains("client")
-                        }
-                        "backend" => {
-                            short.contains("backend")
-                                || short.contains("api")
-                                || short.contains("server")
-                        }
-                        _ => false,
-                    };
-                    if matches {
-                        return format!(
-                            "[Errore: servizio systemd '{}' di tipo {} gia' attivo per questo progetto. \
-                             Usalo invece di lanciarne uno nuovo. Per riavviarlo usa il pulsante 'restart' \
-                             nel pannello Run & Debug, oppure systemctl --user restart {}. \
-                             Se hai bisogno di vedere lo stato del servizio, prima usa list_active_services.]",
-                            unit, kind, unit
-                        );
-                    }
-                }
+            } else {
+                // Servizio dello stesso scopo allocato ma SPENTO: REFUSE, riavvia
+                // quello esistente invece di duplicarlo su una porta nuova.
+                let port = res
+                    .port
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                return format!(
+                    "[Errore: esiste gia' un servizio '{}' di tipo {} (porta {}) ma e' SPENTO. \
+                     RIAVVIALO sulla sua porta esistente con `service_restart` (label='{}') \
+                     invece di crearne uno nuovo. Non allocare un'altra porta.]",
+                    res.label, kind, port, res.label
+                );
             }
         }
     }
