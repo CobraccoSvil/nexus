@@ -761,6 +761,158 @@ pub(super) async fn tool_rename_file(ctx: &AgentToolContext, input: &Value) -> S
     }
 }
 
+/// Estrae un prefisso "ancora" dalla prima riga di `old_string` da usare per
+/// trovare la posizione approssimativa nel file. Tronca a 32 caratteri o al
+/// primo separatore "strong" (`{`, `=`, `:`, `,`, `;`) — cosi' un old_string
+/// stantio nel CORPO ma corretto nella TESTA della riga (es. firma di funzione
+/// invariata, body cambiato) trova comunque l'ancora giusta nel file reale.
+///
+/// Esempi:
+///   "pub fn target_function(arg: u32) -> u32 { arg + 2 }"
+///     -> "pub fn target_function(arg" (taglio a 32 char)
+///   "let foo = bar;"
+///     -> "let foo " (taglio al primo `=`)
+fn anchor_prefix(line: &str) -> &str {
+    const MAX: usize = 32;
+    const STOP_CHARS: &[char] = &['{', '=', ':', ',', ';'];
+    let cut = line
+        .char_indices()
+        .find(|(_, c)| STOP_CHARS.contains(c))
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    let cut = cut.min(MAX).min(line.len());
+    // Allinea al boundary char piu' vicino per evitare di tagliare un char
+    // multibyte UTF-8 a meta'.
+    let mut safe = cut;
+    while safe > 0 && !line.is_char_boundary(safe) {
+        safe -= 1;
+    }
+    line[..safe].trim_end()
+}
+
+/// Costruisce il messaggio di errore quando `edit_file` non trova l'old_string.
+///
+/// Strategia anti-loop: oltre a indicare la riga approssimativa (token-match
+/// case-insensitive), include un ESTRATTO NUMERATO del contenuto attuale del
+/// file ATTORNO a quella riga (default +/- 15 righe, max 40 righe totali,
+/// hard-cap ~2 KB) — cosi' l'agente puo' riformulare l'old_string esatto nello
+/// stesso turno senza chiamare read_file (che potrebbe essere bloccato dal
+/// loop-detector e che comunque sprecherebbe un tool-call).
+///
+/// Se il primo token di `old_string` non viene trovato, ripiega sulle prime
+/// 40 righe del file (preview generica, comportamento storico ridotto).
+///
+/// Funzione pura per essere coperta da test unitari senza dipendenze runtime.
+fn build_old_string_not_found_message(content: &str, old_string_lf: &str, path_str: &str) -> String {
+    // Limiti dell'estratto (FIX hardening qualita' agentico):
+    //  - WINDOW_BEFORE/AFTER controllano la finestra simmetrica attorno
+    //    alla riga "simile"; valori conservativi per restare entro ~2 KB.
+    //  - MAX_LINES e' un secondo hard-cap di sicurezza.
+    //  - MAX_BYTES tronca per evitare di gonfiare il contesto su righe molto
+    //    lunghe (minified, JSON serializzato, ecc.).
+    const WINDOW_BEFORE: usize = 15;
+    const WINDOW_AFTER: usize = 15;
+    const MAX_LINES: usize = 40;
+    const MAX_BYTES: usize = 2048;
+
+    // Token-match: prima riga non vuota di old_string vs prima riga del file
+    // che lo contiene (case-insensitive). E' un'ancora di navigazione, non
+    // un match esatto: se manca anche questa, il file e' probabilmente
+    // strutturalmente diverso da quello che l'agente immaginava.
+    //
+    // IMPORTANTE: troncare la prima riga ai primi ~32 char (o al primo
+    // separatore strong: `{`, `=`, `(arg + `, ecc.) — altrimenti differenze
+    // minime sul corpo (es. `arg + 1` vs `arg + 2` nell'old_string stantio)
+    // farebbero fallire il match e ci ridurrebbero al fallback inizio-file,
+    // perdendo proprio il valore di "estratto attorno alla riga giusta".
+    let first_line = old_string_lf
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim())
+        .unwrap_or("");
+    let first_token = anchor_prefix(first_line);
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+
+    let similar_line_idx: Option<usize> = if !first_token.is_empty() {
+        let first_token_lower = first_token.to_lowercase();
+        lines
+            .iter()
+            .position(|l| l.to_lowercase().contains(&first_token_lower))
+    } else {
+        None
+    };
+
+    let approx_hint = if first_token.is_empty() {
+        String::new()
+    } else if let Some(i) = similar_line_idx {
+        format!(" Prima riga simile trovata ~riga {}.", i + 1)
+    } else {
+        " Nessuna riga contiene il primo token di old_string.".to_string()
+    };
+
+    // Calcola finestra: se abbiamo una riga ancora usa +/- WINDOW_BEFORE/AFTER;
+    // altrimenti fallback alle prime righe (caso "file totalmente diverso").
+    let (start, end): (usize, usize) = match similar_line_idx {
+        Some(i) => {
+            let s = i.saturating_sub(WINDOW_BEFORE);
+            let e = (i + WINDOW_AFTER + 1).min(total_lines);
+            // Cap a MAX_LINES anche dopo l'espansione (in caso di window grande).
+            let capped_end = (s + MAX_LINES).min(e);
+            (s, capped_end)
+        }
+        None => (0, MAX_LINES.min(total_lines)),
+    };
+
+    // Render numerato + cap per byte (taglia in fondo se sfora MAX_BYTES, in
+    // modo che la testa dell'estratto — di solito quella piu' utile — resti
+    // sempre visibile).
+    let mut excerpt = String::new();
+    let mut bytes = 0usize;
+    let mut last_rendered_idx = start;
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let line_number = start + offset + 1;
+        let rendered = format!("{:>4} | {}\n", line_number, line);
+        if bytes + rendered.len() > MAX_BYTES {
+            break;
+        }
+        bytes += rendered.len();
+        excerpt.push_str(&rendered);
+        last_rendered_idx = start + offset;
+    }
+    // Rimuovi il newline finale per coerenza visiva con il vecchio formato.
+    if excerpt.ends_with('\n') {
+        excerpt.pop();
+    }
+
+    let lines_shown_end = last_rendered_idx + 1;
+    let header_label = match similar_line_idx {
+        Some(i) => format!("Contenuto attuale attorno alla riga {} (righe {}..{})", i + 1, start + 1, lines_shown_end),
+        None => format!("Contenuto attuale (righe {}..{})", start + 1, lines_shown_end),
+    };
+
+    let more_hint = if lines_shown_end < total_lines {
+        format!(
+            "\n// ... {} righe non mostrate. Usa read_file_lines(\"{}\", {}, {}) se devi vedere altre sezioni.",
+            total_lines - lines_shown_end,
+            path_str,
+            lines_shown_end + 1,
+            (lines_shown_end + WINDOW_AFTER).min(total_lines)
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "[Errore: old_string non trovato nel file '{}'.{approx_hint}\n\
+        \u{26a0} NON chiamare read_file o read_file_lines \u{2014} il contenuto del file e' gia' incluso qui sotto.\n\
+        Confronta il tuo old_string con le righe reali e correggi spazi, newline o testo che differiscono:\n\n\
+        {header_label}:\n{excerpt}{more_hint}]",
+        path_str
+    )
+}
+
 pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> String {
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
@@ -830,57 +982,7 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
 
     let count = content.matches(old_string_lf.as_str()).count();
     match count {
-        0 => {
-            // Cerca la riga approssimativa usando il primo token non vuoto di old_string,
-            // per dare un'ancora di navigazione anche senza chiamare read_file_lines.
-            let first_token = old_string_lf
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .map(|l| l.trim())
-                .unwrap_or("");
-
-            let approx_hint = if !first_token.is_empty() {
-                // Cerca la prima riga del file che contenga il primo token (senza case sensitivity)
-                let first_token_lower = first_token.to_lowercase();
-                content
-                    .lines()
-                    .enumerate()
-                    .find(|(_, l)| l.to_lowercase().contains(&first_token_lower))
-                    .map(|(i, _)| format!(" Prima riga simile trovata ~riga {}.", i + 1))
-                    .unwrap_or_else(|| " Nessuna riga contiene il primo token di old_string.".to_string())
-            } else {
-                String::new()
-            };
-
-            // Includi le prime 80 righe del file con numerazione, così l'agente può
-            // confrontare il suo old_string con il contenuto reale SENZA chiamare
-            // read_file_lines (che potrebbe essere bloccato dal loop-detector).
-            let total_lines = content.lines().count();
-            let preview_end = 80.min(total_lines);
-            let preview: String = content
-                .lines()
-                .enumerate()
-                .take(preview_end)
-                .map(|(i, line)| format!("{:>4} | {}", i + 1, line))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let more_hint = if total_lines > preview_end {
-                format!(
-                    "\n// ... {} righe non mostrate. Usa read_file_lines(\"{}\", {}, {}) se devi vedere altre sezioni.",
-                    total_lines - preview_end, path_str, preview_end + 1, (preview_end + 80).min(total_lines)
-                )
-            } else {
-                String::new()
-            };
-
-            format!(
-                "[Errore: old_string non trovato nel file '{}'.{approx_hint}\n\
-                ⚠ NON chiamare read_file o read_file_lines — il contenuto del file è già incluso qui sotto.\n\
-                Confronta il tuo old_string con le righe reali e correggi spazi, newline o testo che differiscono:\n\n\
-                {preview}{more_hint}]",
-                path_str
-            )
-        }
+        0 => build_old_string_not_found_message(&content, &old_string_lf, path_str),
         n if n > 1 => format!(
             "[Errore: old_string trovato {} volte in '{}'. Deve essere unico: aggiungi piu' contesto (righe circostanti) per renderlo univoco.]",
             n, path_str
@@ -1144,5 +1246,75 @@ pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> Strin
     match tokio::fs::rename(&from, &to).await {
         Ok(()) => format!("Spostato '{}' -> '{}'", from_str, to_str),
         Err(e) => format!("[Errore spostamento: {}]", e),
+    }
+}
+
+// Test unitari sulla funzione pura `build_old_string_not_found_message`.
+// Verifica il branch di errore "old_string non trovato" cosi' che eventuali
+// regressioni sull'estratto numerato attorno alla riga simile siano colte.
+#[cfg(test)]
+mod tests {
+    use super::build_old_string_not_found_message;
+
+    fn make_file(num_lines: usize) -> String {
+        (1..=num_lines)
+            .map(|i| match i {
+                42 => "pub fn target_function(arg: u32) -> u32 { arg + 1 }".to_string(),
+                _ => format!("// riga di riempimento numero {i}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn estratto_numerato_attorno_alla_riga_simile() {
+        let content = make_file(120);
+        // Old string del modello stantio: cerca la firma vecchia che NON
+        // matchera' piu' (per simulare l'edit cieco).
+        let old_string = "pub fn target_function(arg: u32) -> u32 { arg + 2 }";
+
+        let msg = build_old_string_not_found_message(&content, old_string, "src/lib.rs");
+
+        // 1. Messaggio originale conservato.
+        assert!(msg.starts_with("[Errore: old_string non trovato nel file 'src/lib.rs'."),
+            "header originale non preservato: {}", msg);
+        assert!(msg.contains("NON chiamare read_file"),
+            "warning anti-loop perso: {}", msg);
+
+        // 2. Riga simile correttamente individuata (riga 42).
+        assert!(msg.contains("Prima riga simile trovata ~riga 42."),
+            "ancora di navigazione non presente: {}", msg);
+
+        // 3. Header dell'estratto presente con riferimento alla riga 42.
+        assert!(msg.contains("Contenuto attuale attorno alla riga 42"),
+            "header dell'estratto attorno alla riga simile mancante: {}", msg);
+
+        // 4. Estratto NUMERATO contiene la riga 42 ed alcune righe attorno
+        //    (finestra +/- 15: dovrebbe coprire almeno 27 e 57).
+        assert!(msg.contains("  42 | pub fn target_function"),
+            "riga 42 numerata non presente nell'estratto: {}", msg);
+        assert!(msg.contains("  30 | "),
+            "riga 30 (window before) attesa nell'estratto: {}", msg);
+        assert!(msg.contains("  55 | "),
+            "riga 55 (window after) attesa nell'estratto: {}", msg);
+
+        // 5. Limite di sicurezza: il messaggio totale deve restare contenuto
+        //    (tetto ~2 KB sull'estratto + margine).
+        assert!(msg.len() < 4096,
+            "messaggio sopra il tetto ragionevole ({}B): {}", msg.len(), msg);
+    }
+
+    #[test]
+    fn fallback_alle_prime_righe_se_nessun_token_simile() {
+        let content = "alpha\nbeta\ngamma\ndelta\n".to_string();
+        let old_string = "stringa_che_non_compare_da_nessuna_parte_xyz123";
+
+        let msg = build_old_string_not_found_message(&content, old_string, "f.txt");
+
+        assert!(msg.contains("Nessuna riga contiene il primo token di old_string."),
+            "hint di assenza atteso: {}", msg);
+        // L'estratto di fallback parte dalla riga 1.
+        assert!(msg.contains("   1 | alpha"),
+            "fallback alle prime righe non emesso: {}", msg);
     }
 }
