@@ -569,10 +569,27 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
             None
         };
 
+    // tool_choice mappato a `tool_config.function_calling_config.mode` via il
+    // punto unico (regola L). Lo iniettiamo solo quando ci sono `tools` e un
+    // vincolo riconosciuto. NOTA: questo build REST nativo non emette ancora i
+    // `functionDeclarations` (vedi `from_generate_response`: tool_calls=None),
+    // quindi `tool_config` ha effetto pratico solo quando il supporto tool
+    // nativo Google verra' aggiunto; il mapping resta corretto e pronto, e segue
+    // la stessa fonte unica degli altri provider.
+    let tool_config = req
+        .tool_choice
+        .as_ref()
+        .filter(|_| req.tools.is_some())
+        .and_then(super::tool_choice::to_google_function_calling_config)
+        .map(|function_calling_config| GoogleToolConfig {
+            function_calling_config,
+        });
+
     GenerateContentRequest {
         contents,
         system_instruction,
         generation_config,
+        tool_config,
     }
 }
 
@@ -895,6 +912,20 @@ struct GenerateContentRequest {
     system_instruction: Option<GoogleContent>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<GenerationConfig>,
+    /// Vincolo di chiamata tool (`tool_config.function_calling_config`). Presente
+    /// solo quando il chiamante imposta `tool_choice` e ci sono tool.
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    tool_config: Option<GoogleToolConfig>,
+}
+
+/// `tool_config` del body Gemini: incapsula `function_calling_config` che
+/// governa la modalita' di scelta del tool (`mode` + opzionale
+/// `allowedFunctionNames`). Wrapper attorno al `Value` prodotto dal punto unico
+/// di mapping ([`super::tool_choice::to_google_function_calling_config`]).
+#[derive(Debug, Serialize)]
+struct GoogleToolConfig {
+    #[serde(rename = "functionCallingConfig")]
+    function_calling_config: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -1151,6 +1182,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1165,6 +1197,73 @@ mod tests {
         assert_eq!(json["generationConfig"]["maxOutputTokens"], 500);
     }
 
+    fn search_tool() -> crate::types::LlmToolDefinition {
+        crate::types::LlmToolDefinition {
+            kind: "function".to_string(),
+            function: crate::types::ToolFunctionDef {
+                name: "search".to_string(),
+                description: Some("cerca".to_string()),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+
+    fn req_tool_choice(choice: serde_json::Value, with_tools: bool) -> LlmRequest {
+        LlmRequest {
+            model: "gemini-x".to_string(),
+            messages: vec![msg("user", "trova")],
+            temperature: None,
+            max_tokens: Some(500),
+            tools: if with_tools {
+                Some(vec![search_tool()])
+            } else {
+                None
+            },
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: Some(choice),
+            pin_provider: None,
+            metadata: metadata(),
+        }
+    }
+
+    #[test]
+    fn tool_choice_required_diventa_mode_any() {
+        // "required" -> tool_config.functionCallingConfig.mode = ANY.
+        let req = req_tool_choice(serde_json::json!("required"), true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        assert_eq!(
+            json["toolConfig"]["functionCallingConfig"]["mode"],
+            "ANY"
+        );
+
+        // Oggetto funzione -> mode ANY + allowedFunctionNames.
+        let req2 = req_tool_choice(
+            serde_json::json!({"type": "function", "function": {"name": "search"}}),
+            true,
+        );
+        let json2 = serde_json::to_value(build_request_body(&req2, None)).unwrap();
+        assert_eq!(json2["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+        assert_eq!(
+            json2["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
+            "search"
+        );
+
+        // "none" -> mode NONE.
+        let req3 = req_tool_choice(serde_json::json!("none"), true);
+        let json3 = serde_json::to_value(build_request_body(&req3, None)).unwrap();
+        assert_eq!(json3["toolConfig"]["functionCallingConfig"]["mode"], "NONE");
+    }
+
+    #[test]
+    fn tool_choice_senza_tools_non_aggiunge_tool_config() {
+        let req = req_tool_choice(serde_json::json!("required"), false);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        assert!(json.get("toolConfig").is_none());
+    }
+
     #[test]
     fn assistant_mappato_su_model() {
         let req = LlmRequest {
@@ -1176,6 +1275,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1267,6 +1367,7 @@ mod tests {
                 enabled,
                 budget_tokens: budget,
             }),
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         }
@@ -1324,6 +1425,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1350,6 +1452,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1444,6 +1547,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         }

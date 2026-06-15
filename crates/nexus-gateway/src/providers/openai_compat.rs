@@ -412,6 +412,16 @@ fn build_request_body(
         None
     };
 
+    // tool_choice: dialetto OpenAI nativo, inoltrato tale e quale (canonicalizzato)
+    // via il punto unico di mapping (regola L). Inviato solo quando c'e' un
+    // vincolo riconosciuto E ci sono tool da scegliere (senza tools sarebbe
+    // ignorato/rifiutato dall'API).
+    let tool_choice = req
+        .tool_choice
+        .as_ref()
+        .filter(|_| tools.is_some())
+        .and_then(super::tool_choice::to_openai);
+
     ChatCompletionRequest {
         model: req.model.clone(),
         messages,
@@ -421,6 +431,7 @@ fn build_request_body(
         reasoning_effort,
         extra_body,
         tools,
+        tool_choice,
         response_format: req.response_format.clone(),
         stream: if stream { Some(true) } else { None },
         stream_options: if stream {
@@ -710,6 +721,10 @@ struct ChatCompletionRequest {
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<WireTool>>,
+    /// Vincolo di scelta tool in formato OpenAI nativo (stringa o oggetto).
+    /// Inoltrato tale e quale; omesso quando assente.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -922,6 +937,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: RequestMetadata {
                 tenant_id: "t".to_string(),
@@ -985,6 +1001,54 @@ mod tests {
         assert!(json.get("max_completion_tokens").is_none());
         assert!(json.get("reasoning_effort").is_none());
         assert!(json.get("thinking").is_none());
+    }
+
+    fn edit_tool() -> crate::types::LlmToolDefinition {
+        crate::types::LlmToolDefinition {
+            kind: "function".to_string(),
+            function: crate::types::ToolFunctionDef {
+                name: "edit_file".to_string(),
+                description: Some("modifica un file".to_string()),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+
+    #[test]
+    fn tool_choice_required_passthrough_nativo_openai() {
+        // Con tools presenti il vincolo "required" e' inoltrato tale e quale
+        // (dialetto OpenAI nativo): e' questo che FORZA il modello a chiamare il
+        // tool invece di descrivere (fix del bug tool_choice droppato).
+        let mut req = sample_request();
+        req.tools = Some(vec![edit_tool()]);
+        req.tool_choice = Some(serde_json::json!("required"));
+        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+            .unwrap();
+        assert_eq!(json["tool_choice"], "required");
+        // Oggetto funzione: passthrough nella forma OpenAI canonica.
+        req.tool_choice = Some(serde_json::json!({"type": "function", "function": {"name": "edit_file"}}));
+        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+            .unwrap();
+        assert_eq!(json["tool_choice"]["type"], "function");
+        assert_eq!(json["tool_choice"]["function"]["name"], "edit_file");
+    }
+
+    #[test]
+    fn tool_choice_omesso_senza_tools() {
+        // tool_choice senza tools non ha senso: il campo non viene inviato.
+        let mut req = sample_request();
+        req.tools = None;
+        req.tool_choice = Some(serde_json::json!("required"));
+        let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
+            .unwrap();
+        assert!(json.get("tool_choice").is_none());
+        // Senza tool_choice (caso storico): campo assente.
+        let mut req2 = sample_request();
+        req2.tools = Some(vec![edit_tool()]);
+        let json2 = serde_json::to_value(build_request_body(&req2, false, &ResolvedReasoning::none()))
+            .unwrap();
+        assert!(json2.get("tool_choice").is_none());
     }
 
     #[test]

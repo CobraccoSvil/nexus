@@ -513,6 +513,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         }

@@ -418,7 +418,7 @@ class GatewayProvider(BaseProvider):
         tools: list[dict],
         max_tokens: int = 4096,
         system_text: str = "",
-        force_tool_choice: bool | None = None,  # noqa: ARG002 (gateway decide il tool_choice)
+        force_tool_choice: bool | None = None,
         internal_task: bool = False,  # noqa: ARG002 (gateway gestisce il thinking)
         thinking: dict[str, Any] | None = None,
     ) -> ProviderResult:
@@ -428,10 +428,16 @@ class GatewayProvider(BaseProvider):
         LlmResponse al formato Anthropic interno (stop_reason, tool_use_blocks,
         assistant_content con i blocchi thinking/text/tool_use, usage).
 
-        ``force_tool_choice`` / ``internal_task`` sono accettati per compatibilita'
-        con la firma chiamata dal registry (introspezione difensiva), ma il
-        tool_choice e la policy thinking sono decisi dal gateway/provider a valle:
-        non li ri-deriviamo qui per non duplicare logica (regola L).
+        ``force_tool_choice`` (force-action anti-loop del progress_controller +
+        primo turno agentico): quando attivo viene inoltrato al gateway come
+        ``tool_choice="required"``, che il gateway mappa al formato di ogni
+        provider (OpenAI required / Anthropic {type:any} / Google mode ANY)
+        OBBLIGANDO il modello a una tool call. Stessa semantica degli adapter SDK
+        (regola L): True forza sempre, None forza solo al primo turno agentico,
+        False non forza. Senza questo il force-action restava solo testuale (nudge)
+        e i modelli potevano ignorarlo, descrivendo invece di agire -> loop/abort
+        (regressione introdotta dalla migrazione gateway).
+        ``internal_task`` (policy thinking) resta deciso dal gateway/provider a valle.
         """
         pin_provider, concrete_model = _split_pin_provider(model)
         payload: dict[str, Any] = {
@@ -445,6 +451,16 @@ class GatewayProvider(BaseProvider):
         gw_tools = _to_gateway_tools(tools) if tools else []
         if gw_tools:
             payload["tools"] = gw_tools
+            # Force-action anti-loop: stessa condizione degli adapter SDK (regola
+            # L) -> True forza sempre, None forza solo al primo turno agentico,
+            # False non forza. tool_choice="required" obbliga il modello a una
+            # tool call; il gateway lo mappa al formato del provider. Ha senso
+            # solo se ci sono tool da chiamare.
+            from ._schema_utils import is_first_agent_turn
+            if force_tool_choice is True or (
+                force_tool_choice is None and is_first_agent_turn(messages)
+            ):
+                payload["tool_choice"] = "required"
         if thinking and thinking.get("enabled"):
             tcfg: dict[str, Any] = {"enabled": True}
             if thinking.get("budget_tokens"):

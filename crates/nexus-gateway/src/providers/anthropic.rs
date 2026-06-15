@@ -453,7 +453,7 @@ fn build_request_body(
         apply_history_cache_breakpoint(&mut messages, cache_ttl);
     }
 
-    let tools = req.tools.as_ref().map(|tools| {
+    let tools: Option<Vec<AnthropicTool>> = req.tools.as_ref().map(|tools| {
         tools
             .iter()
             .map(|t| AnthropicTool {
@@ -464,6 +464,15 @@ fn build_request_body(
             .collect()
     });
 
+    // tool_choice mappato al dialetto Anthropic (`{type:any|tool|auto}`) via il
+    // punto unico (regola L). Inviato solo con tool presenti e vincolo
+    // riconosciuto; `none` viene omesso (Anthropic non lo supporta).
+    let tool_choice = req
+        .tool_choice
+        .as_ref()
+        .filter(|_| tools.is_some())
+        .and_then(super::tool_choice::to_anthropic);
+
     AnthropicRequest {
         model: req.model.clone(),
         max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -471,6 +480,7 @@ fn build_request_body(
         system,
         messages,
         tools,
+        tool_choice,
         stream: if stream { Some(true) } else { None },
         thinking: thinking_budget.map(|budget_tokens| AnthropicThinking {
             kind: "enabled".to_string(),
@@ -994,6 +1004,10 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessageParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicTool>>,
+    /// Vincolo di scelta tool nel formato Anthropic (`{type:any|tool|auto}`).
+    /// Omesso quando assente o quando il vincolo originale era `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     /// Blocco extended thinking (`{type:"enabled", budget_tokens}`). Presente
@@ -1239,6 +1253,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1269,6 +1284,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1301,6 +1317,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1334,6 +1351,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1343,6 +1361,78 @@ mod tests {
         assert_eq!(t["name"], "search");
         assert_eq!(t["description"], "cerca");
         assert_eq!(t["input_schema"]["type"], "object");
+    }
+
+    fn search_tool() -> LlmToolDefinition {
+        LlmToolDefinition {
+            kind: "function".to_string(),
+            function: ToolFunctionDef {
+                name: "search".to_string(),
+                description: Some("cerca".to_string()),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: None,
+            },
+        }
+    }
+
+    fn req_tool_choice(choice: serde_json::Value, with_tools: bool) -> LlmRequest {
+        LlmRequest {
+            model: "claude-x".to_string(),
+            messages: vec![msg("user", "modifica il file")],
+            temperature: None,
+            max_tokens: Some(100),
+            tools: if with_tools {
+                Some(vec![search_tool()])
+            } else {
+                None
+            },
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: Some(choice),
+            pin_provider: None,
+            metadata: metadata(),
+        }
+    }
+
+    #[test]
+    fn tool_choice_required_diventa_type_any() {
+        // "required" lato contratto -> {"type":"any"} lato Anthropic: e' questo
+        // che OBBLIGA il modello a chiamare un tool (fix del bug tool_choice
+        // droppato dal gateway).
+        let req = req_tool_choice(serde_json::json!("required"), true);
+        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        assert_eq!(json["tool_choice"]["type"], "any");
+
+        // Oggetto funzione -> {"type":"tool","name":X}.
+        let req2 = req_tool_choice(
+            serde_json::json!({"type": "function", "function": {"name": "search"}}),
+            true,
+        );
+        let json2 =
+            serde_json::to_value(build_request_body(&req2, false, None, CacheTtl::Off)).unwrap();
+        assert_eq!(json2["tool_choice"]["type"], "tool");
+        assert_eq!(json2["tool_choice"]["name"], "search");
+
+        // "auto" -> {"type":"auto"}.
+        let req3 = req_tool_choice(serde_json::json!("auto"), true);
+        let json3 =
+            serde_json::to_value(build_request_body(&req3, false, None, CacheTtl::Off)).unwrap();
+        assert_eq!(json3["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn tool_choice_none_e_senza_tools_omettono_il_campo() {
+        // "none" non esiste lato Anthropic: campo omesso.
+        let req = req_tool_choice(serde_json::json!("none"), true);
+        let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
+        assert!(json.get("tool_choice").is_none());
+
+        // tool_choice senza tools: campo omesso.
+        let req2 = req_tool_choice(serde_json::json!("required"), false);
+        let json2 =
+            serde_json::to_value(build_request_body(&req2, false, None, CacheTtl::Off)).unwrap();
+        assert!(json2.get("tool_choice").is_none());
     }
 
     #[test]
@@ -1485,6 +1575,7 @@ mod tests {
                 enabled,
                 budget_tokens: budget,
             }),
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         }
@@ -1601,6 +1692,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1638,6 +1730,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         };
@@ -1686,6 +1779,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking: None,
+            tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
         }

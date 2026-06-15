@@ -120,6 +120,22 @@ pub struct LlmRequest {
     /// thinking. Retrocompatibile: `None` = nessuna richiesta di thinking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    /// Vincolo di scelta del tool, in stile OpenAI Chat Completions (lingua
+    /// franca del gateway). Governa quanto il modello e' OBBLIGATO a chiamare un
+    /// tool: il brain lo imposta a `"required"` quando il force-action anti-loop
+    /// / `progress_controller` devono costringere l'agente ad AGIRE invece di
+    /// descrivere. Formati accettati (identici all'API OpenAI):
+    ///   - stringa `"auto"`   -> il modello sceglie se chiamare un tool;
+    ///   - stringa `"required"` -> il modello DEVE chiamare almeno un tool;
+    ///   - stringa `"none"`   -> il modello NON deve chiamare tool;
+    ///   - oggetto `{"type":"function","function":{"name":"X"}}` -> forza il tool `X`.
+    /// Ogni provider lo rimappa al proprio dialetto nel rispettivo
+    /// `build_request_body` (OpenAI-compat passthrough nativo; Anthropic
+    /// `tool_choice` con `{type:any|tool|auto}`; Google
+    /// `tool_config.function_calling_config.mode`). Retrocompatibile: `None` =
+    /// nessun vincolo inviato (comportamento storico, equivalente ad `auto`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
     /// Pin esplicito del provider da eseguire (bypass routing). Quando `Some`,
     /// il gateway esegue ESATTAMENTE quel provider col `model` indicato
     /// (strippato dell'eventuale prefisso `provider/`), SENZA `policy.decide` e

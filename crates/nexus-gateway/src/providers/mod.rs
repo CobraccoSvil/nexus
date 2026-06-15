@@ -6,6 +6,7 @@
 //! `base_url`, `api_key` e capacita' (`max_context_tokens`, tier ammessi).
 
 pub mod openai_compat;
+pub mod tool_choice;
 
 pub mod anthropic;
 pub mod deepseek;

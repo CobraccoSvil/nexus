@@ -330,6 +330,7 @@ mod tests {
             response_format: None,
             stream: None,
             thinking,
+            tool_choice: None,
             pin_provider: None,
             metadata: RequestMetadata {
                 tenant_id: "t".to_string(),
