@@ -10,7 +10,8 @@ ts="$(date +%Y%m%d-%H%M%S)"
 out="db/backups/nexus-${ts}.sql.gz"
 
 # Local dev compose uses POSTGRES_USER=nexus / POSTGRES_PASSWORD=nexus
-docker exec -t ideai-postgres-nexus-1 bash -lc 'PGPASSWORD=nexus pg_dump -U nexus -d nexus' | gzip > "$out"
+# NB: niente -t (il TTY corrompe il pipe binario verso gzip -> dump vuoto).
+docker exec ideai-postgres-nexus-1 bash -lc 'PGPASSWORD=nexus pg_dump -U nexus -d nexus' | gzip > "$out"
 
 gzip -l "$out" >/dev/null
 echo "$out"
