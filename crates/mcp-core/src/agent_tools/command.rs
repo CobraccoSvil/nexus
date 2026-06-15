@@ -254,11 +254,16 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
                 "{}EXIT CODE: {}\nSTDOUT:\n{}\nSTDERR:\n{}{}",
                 hints_prefix, exit_code, stdout, stderr, hint
             );
-            if combined.chars().count() > 8000 {
-                format!(
-                    "{}\n[OUTPUT TRONCATO A 8000 CARATTERI]",
-                    combined.chars().take(8000).collect::<String>()
-                )
+            // Troncamento testa+coda NON distruttivo (stesso punto unico di run_tests,
+            // regola L): i build tsc/cargo/npm elencano gli errori in ordine col totale
+            // "Found N errors" IN FONDO. Tagliare solo la testa (vecchio .take()) faceva
+            // perdere la coda con gli ultimi errori + il totale, inducendo l'agente a
+            // ri-eseguire il build per "vedere gli altri errori" (loop razionale).
+            // Cap DB-driven (regola G), default 16000 >= cap brain cosi' mcp-core non e'
+            // mai il collo di bottiglia che decapita la coda prima del brain.
+            let max_chars = load_run_command_max_chars(&ctx.db).await;
+            if combined.chars().count() > max_chars {
+                smart_truncate_test_output(&combined, max_chars)
             } else {
                 combined
             }
@@ -808,4 +813,73 @@ async fn load_setting_or(db: &sqlx::PgPool, key: &str, default: &str) -> String 
         .ok()
         .flatten()
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Cap massimo (in caratteri) dell'output combinato di `run_command`, DB-driven
+/// (regola G). Default 16000: deliberatamente alto e >= del cap del brain, cosi'
+/// mcp-core NON e' mai il primo collo di bottiglia che decapita la coda con gli
+/// ultimi errori + "Found N errors" prima che l'output arrivi al brain.
+/// La key e' veicolata da migrazione (settings.agent.command.run_command_max_chars).
+const RUN_COMMAND_MAX_CHARS_DEFAULT: usize = 16000;
+
+async fn load_run_command_max_chars(db: &sqlx::PgPool) -> usize {
+    let raw = load_setting_or(
+        db,
+        "agent.command.run_command_max_chars",
+        &RUN_COMMAND_MAX_CHARS_DEFAULT.to_string(),
+    )
+    .await;
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => n,
+        _ => RUN_COMMAND_MAX_CHARS_DEFAULT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Genera un output di build sintetico con N errori in ordine e il totale
+    /// "Found N errors" in FONDO (come fa tsc/npm build).
+    fn fake_build_output(n: usize) -> String {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!(
+                "src/file{i}.ts({i},5): error TS2304: Cannot find name 'sym{i}'.\n"
+            ));
+        }
+        s.push_str(&format!("Found {n} errors in {n} files.\n"));
+        s
+    }
+
+    #[test]
+    fn troncamento_preserva_coda_con_found_n_errors() {
+        // Output lungo oltre il cap: la testa va persa, ma la coda con
+        // "Found N errors" (cio' che il vecchio .take() buttava) deve restare.
+        let output = fake_build_output(400);
+        assert!(
+            output.chars().count() > 16000,
+            "il fixture deve superare il cap per esercitare il troncamento"
+        );
+        let truncated = smart_truncate_test_output(&output, 16000);
+        assert!(
+            truncated.len() < output.len(),
+            "l'output deve essere effettivamente troncato"
+        );
+        assert!(
+            truncated.contains("Found 400 errors"),
+            "la coda con il totale degli errori deve sopravvivere al troncamento"
+        );
+        assert!(
+            truncated.contains("caratteri omessi"),
+            "il marker testa+coda deve segnalare l'omissione centrale"
+        );
+    }
+
+    #[test]
+    fn troncamento_no_op_sotto_cap() {
+        let output = fake_build_output(3);
+        let out = smart_truncate_test_output(&output, 16000);
+        assert_eq!(out, output, "sotto il cap l'output resta integro");
+    }
 }

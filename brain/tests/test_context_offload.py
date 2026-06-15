@@ -210,6 +210,54 @@ class TestSmartTruncateLossless(unittest.TestCase):
         small = "ciao"
         self.assertEqual(nodes._smart_truncate_lossless(small, max_chars=1000), small)
 
+    def test_truncate_preserva_la_coda_errori_build(self) -> None:
+        """Per i build l'informazione critica (gli ultimi errori + 'Found N
+        errors') sta in CODA: il troncamento testa+coda DEVE preservarla, non
+        decapitarla. Regressione del bug "l'agente ripete npm run build" perche'
+        vede solo i primi errori e perde la coda + il totale.
+        """
+        from brain.agents import nodes
+
+        qdrant = _FakeQdrant()
+        emb = _FakeEmbeddings(qdrant)
+        original = nodes._embeddings
+        nodes._embeddings = emb  # inietta il fake
+        try:
+            # Output simil-tsc: molti errori, con il totale IN FONDO.
+            errori = "\n".join(f"src/f{i}.ts(10,5): error TS2304: msg" for i in range(400))
+            big = errori + "\n\nFound 400 errors in 12 files.\n"
+            out = nodes._smart_truncate_lossless(big, max_chars=2000, source_kind="tool_result")
+            # La CODA (il totale finale) sopravvive al troncamento.
+            self.assertIn("Found 400 errors", out)
+            # Il troncamento e' comunque avvenuto (non e' passato tutto).
+            self.assertLess(len(out), len(big))
+        finally:
+            nodes._embeddings = original
+
+    def test_cap_piu_alto_preserva_piu_coda(self) -> None:
+        """Cap DB-driven: un tool_result_max_chars piu' grande (capability del
+        provider agentico) preserva PIU' coda. Prova che applicare il cap dalla
+        capability (campo prima morto) ha effetto reale sulla coda errori.
+        """
+        from brain.agents import nodes
+
+        qdrant = _FakeQdrant()
+        emb = _FakeEmbeddings(qdrant)
+        original = nodes._embeddings
+        nodes._embeddings = emb
+        try:
+            big = "".join(f"riga-errore-{i:05d}\n" for i in range(3000))
+            out_piccolo = nodes._smart_truncate_lossless(big, max_chars=2000)
+            out_grande = nodes._smart_truncate_lossless(big, max_chars=16000)
+            # Entrambi finiscono con la stessa coda (testa+coda preserva il fondo),
+            # ma il cap maggiore mantiene piu' contenuto complessivo.
+            self.assertTrue(big.endswith("riga-errore-02999\n"))
+            self.assertIn("riga-errore-02999", out_piccolo)
+            self.assertIn("riga-errore-02999", out_grande)
+            self.assertGreater(len(out_grande), len(out_piccolo))
+        finally:
+            nodes._embeddings = original
+
 
 if __name__ == "__main__":
     unittest.main()

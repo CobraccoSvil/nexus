@@ -8,6 +8,7 @@ from brain.agents.progress_controller import (
     ABORT_STOP_REASON,
     ProgressDecision,
     ProgressSignals,
+    _is_build_or_test_label,
     decide,
 )
 
@@ -215,3 +216,102 @@ def test_reallocation_nudge_grounded_anche_senza_active_resources():
     assert d.axis == "resource_reallocation"
     assert d.nudge_text is not None
     assert "service_restart" in d.nudge_text.lower()
+
+
+# ── Asse repeated_action: nudge build/test-aware ────────────────────────────
+# Incidente "qualita': final_gate vede 20 errori TS" / loop "npm run build"
+# ripetuto: ri-eseguire un build NON riduce gli errori, li riduce solo
+# correggere i file. Il nudge GUIDE per repeated_action su un label di build
+# deve ordinare la correzione batch (read_file/edit_file) leggendo l'output
+# completo, NON il generico "cambia approccio/comando diverso".
+
+
+def test_is_build_or_test_label_riconosce_i_build():
+    """Detection sul label (comando), non sull'output."""
+    assert _is_build_or_test_label("run_command: npm run build")
+    assert _is_build_or_test_label("run_command: cargo check --workspace")
+    assert _is_build_or_test_label("run_command: tsc --noEmit")
+    assert _is_build_or_test_label("run_command: pnpm verify")
+    assert _is_build_or_test_label("run_tests: pytest brain/tests")
+    assert _is_build_or_test_label("run_command: npx eslint .")
+
+
+def test_is_build_or_test_label_ignora_non_build():
+    """Un edit_file o un comando non-build non e' build/test."""
+    assert not _is_build_or_test_label("edit_file: src/app.ts")
+    assert not _is_build_or_test_label("run_command: ls -la")
+    assert not _is_build_or_test_label("write_file: config.json")
+
+
+def test_repeated_action_build_guida_ordina_correzione_batch():
+    """repeated_action su un build, mai guidato -> GUIDE con nudge build-aware.
+
+    Il nudge deve ordinare read_file + edit_file in batch e dire ESPLICITAMENTE
+    di non ripetere il comando; NON deve forzare una nuova tool call (force_action
+    False per repeated_action) ne' suggerire un "comando diverso".
+    """
+    d = decide(ProgressSignals(repeated_action=("run_command: npm run build", 3)))
+    assert d.action == "guide"
+    assert d.axis == "repeated_action"
+    assert d.force_action is False  # NON forza una nuova tool call (= un altro build)
+    assert d.nudge_text is not None
+    _txt = d.nudge_text.lower()
+    # Ordina la correzione batch leggendo l'output completo.
+    assert "read_file" in _txt
+    assert "edit_file" in _txt
+    assert "batch" in _txt
+    assert "non ripetere il comando" in _txt
+    # Non deve cadere nel testo generico "cambia approccio".
+    assert "cambia approccio" not in _txt
+
+
+def test_repeated_action_non_build_resta_generico():
+    """repeated_action su un edit (non build) mantiene il nudge generico."""
+    d = decide(ProgressSignals(repeated_action=("edit_file: src/app.ts", 3)))
+    assert d.action == "guide"
+    assert d.axis == "repeated_action"
+    assert d.nudge_text is not None
+    _txt = d.nudge_text.lower()
+    # Il generico parla di "cambia approccio"; non deve ordinare il batch build.
+    assert "cambia approccio" in _txt
+    assert "correzione batch" not in _txt
+
+
+def test_force_diagnose_build_aware_ordina_fix_non_altro_comando():
+    """Stadio FORCE_DIAGNOSE su un build gia' guidato: ordina la correzione dei
+    file (non un comando diverso) e ammette la dichiarazione di blocco.
+
+    force_diagnose scatta solo con flag abilitato, gia' guidato e non ancora
+    diagnosticato (vedi gerarchia decide)."""
+    d = decide(
+        ProgressSignals(
+            repeated_action=("run_command: cargo build", 4),
+            already_guided=frozenset({"repeated_action"}),
+            force_diagnose_enabled=True,
+        )
+    )
+    assert d.action == "force_diagnose"
+    assert d.axis == "repeated_action"
+    assert d.force_action is False
+    assert d.nudge_text is not None
+    _txt = d.nudge_text.lower()
+    assert "edit_file" in _txt
+    assert "causa radice" in _txt
+    # Per un build, "ri-eseguire non e' un'azione diversa".
+    assert "non e' un'azione diversa" in _txt
+
+
+def test_force_diagnose_non_build_resta_generico():
+    """FORCE_DIAGNOSE su un'azione non-build mantiene il testo generico."""
+    d = decide(
+        ProgressSignals(
+            repeated_action=("write_file: data.json", 4),
+            already_guided=frozenset({"repeated_action"}),
+            force_diagnose_enabled=True,
+        )
+    )
+    assert d.action == "force_diagnose"
+    assert d.nudge_text is not None
+    _txt = d.nudge_text.lower()
+    assert "edit_file" not in _txt  # il generico non nomina edit_file in batch
+    assert "causa radice" in _txt

@@ -3576,6 +3576,37 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         or state.get("model_override")
         or ""
     )
+    # CAP DB-driven per il troncamento dei tool_result (attiva il campo morto
+    # tool_result_max_chars di nexus_provider_capabilities / vista 0318): il
+    # cap del singolo tool_result deve essere allineato alla capability del
+    # modello del turno, non a una costante hardcoded. Per i build (output tsc/
+    # npm con gli errori IN CODA + "Found N errors") un admin alza il campo del
+    # provider agentico e la coda sopravvive end-to-end (mcp-core testa+coda ->
+    # qui testa+coda + offload RAG). Regola G: MAX_TOOL_RESULT_CHARS resta SOLO
+    # come fallback di emergenza quando la capability e' assente/DB down; e'
+    # loggato a WARN, non un magic-fallback nascosto. Calcolato UNA volta a
+    # inizio nodo e riusato nel loop sui pending (regola L: un solo punto).
+    _tr_max_chars = MAX_TOOL_RESULT_CHARS
+    try:
+        _tr_provider = (
+            state.get("sticky_provider")
+            or state.get("provider_override")
+            or ""
+        )
+        if _tr_provider and _predictive_model:
+            from brain.providers.capability_loader import load_capability
+            _tr_cap = load_capability(_tr_provider, _predictive_model)
+            _tr_from_cap = int(getattr(_tr_cap, "tool_result_max_chars", 0) or 0)
+            if _tr_from_cap > 0:
+                _tr_max_chars = _tr_from_cap
+    except Exception as _tr_exc:  # noqa: BLE001 — degrado esplicito al fallback
+        logger.warning(
+            "tool_dispatch_node: capability tool_result_max_chars non disponibile "
+            "(provider=%s model=%s): %s — uso fallback MAX_TOOL_RESULT_CHARS=%d",
+            state.get("sticky_provider") or state.get("provider_override") or "",
+            _predictive_model, _tr_exc, MAX_TOOL_RESULT_CHARS,
+        )
+        _tr_max_chars = MAX_TOOL_RESULT_CHARS
     _predictive_messages = list(state.get("messages") or [])
     _predictive_system = state.get("system_text") or ""
     # M16: gate per la validazione tool-in-list nel loop sottostante.
@@ -3791,6 +3822,7 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                 _infra_tool_errors.append(True)
             content = _smart_truncate_lossless(
                 result.result_json,
+                _tr_max_chars,
                 source_kind="tool_result",
                 metadata={
                     "tool_name": _t_name,

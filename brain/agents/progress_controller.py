@@ -197,13 +197,58 @@ def _g1_nudge() -> str:
     )
 
 
+# Vocabolario build/test per il nudge build-aware. Stesso ordine-di-grandezza
+# del ramo build di classify_command_error (mcp-core helpers.rs), ma qui in
+# Python e applicato al LABEL del comando ripetuto ("name: valore"), non
+# all'output. Resta lessicale ma e' solo un NUDGE guidato (testo del sollecito),
+# non una decisione di flusso: le decisioni strutturali restano in `decide`.
+_BUILD_TEST_LABEL_KEYWORDS: tuple[str, ...] = (
+    "build", "tsc", "compile", "cargo check", "cargo build", "cargo test",
+    "npm run", "npm test", "pnpm", "yarn", "lint", "eslint", "make",
+    "pytest", "run_tests", "test", "gradle", "mvn", "go build", "go test",
+)
+
+
+def _is_build_or_test_label(label: str) -> bool:
+    """True se il label del comando ripetuto e' un build/compilazione/test.
+
+    Un build/test ripetuto NON va attaccato con un "comando diverso": va
+    attaccato leggendo gli errori RESIDUI e correggendo i file. Il rilevamento
+    e' sul comando (label "run_command: npm run build"), non sull'output.
+    """
+    _l = label.lower()
+    return any(k in _l for k in _BUILD_TEST_LABEL_KEYWORDS)
+
+
 def _repeated_action_nudge(label: str, count: int) -> str:
     """Nudge per la ripetizione identica di una azione produttiva.
 
     Caso reale (run f1db9550): stessa sequenza edit_file -> npm install ->
     npm run build ripetuta integralmente. Ordina di NON ripeterla e di
     procedere/concludere verificando l'esito.
+
+    Variante BUILD/TEST-AWARE: se il label e' un build/compilazione/test
+    (incidente "qualita': final_gate vede 20 errori TS"), ri-eseguire il
+    comando NON riduce gli errori — li riduce solo correggere i file. Il
+    nudge generico ("cambia approccio") puo' essere letto come "usa un comando
+    diverso" (stesso difetto del classify generico): per i build serve invece
+    l'ordine esplicito di leggere TUTTO l'output e correggere i file in batch
+    PRIMA di ri-eseguire una sola volta.
     """
+    if _is_build_or_test_label(label):
+        return (
+            f"STOP: hai gia' eseguito '{label}' {count} volte. Ri-eseguire un "
+            "build/test NON riduce gli errori — li riduce solo correggere i "
+            "file. NON ripetere il comando. Invece, in quest'ordine: (1) leggi "
+            "l'output COMPLETO dell'ultima esecuzione qui sopra: ogni errore ha "
+            "file:riga e in fondo c'e' il totale (es. 'Found N errors'); (2) apri "
+            "con read_file OGNI file segnalato e correggilo con edit_file, TUTTI "
+            "in questo turno (correzione batch, non uno solo); (3) SOLO DOPO aver "
+            "corretto tutti i file ri-esegui il comando UNA volta per confermare. "
+            "Se l'output era troncato e non vedi tutti gli errori, correggi quelli "
+            "visibili e segnala esplicitamente che ne mancano: non ri-eseguire per "
+            "scoprirli."
+        )
     return (
         f"STOP: hai gia' eseguito la stessa azione ({label}) {count} volte. "
         "Ripeterla identica NON cambia il risultato. NON ripeterla: leggi "
@@ -222,7 +267,25 @@ def _force_diagnose_nudge(label: str, count: int) -> str:
     strategia, oppure a dichiararsi bloccato con una causa precisa. Cosi' l'esito
     successivo e' una diagnosi (FailedDiagnosed/BlockedNeedsInput), mai una
     chiusura grezza "ho ripetuto N volte".
+
+    Variante BUILD/TEST-AWARE: per un build/test ripetuto "azione diversa" NON
+    significa "comando diverso" ma "correggi i file segnalati dagli errori".
+    Lo stadio intermedio lo rende esplicito perche' la GUIDE soft non ha morso.
     """
+    if _is_build_or_test_label(label):
+        return (
+            f"STOP: hai ripetuto '{label}' {count} volte e il sollecito precedente "
+            "non ha cambiato nulla. PRIMA di qualunque altra mossa DEVI, in "
+            "quest'ordine: (1) leggere l'output COMPLETO dell'ultima esecuzione "
+            "(ogni errore ha file:riga, in fondo il totale tipo 'Found N errors'); "
+            "(2) dichiarare in una frase la CAUSA RADICE (es. tipo mancante, import "
+            "errato, simbolo non definito), non il sintomo; (3) correggere con "
+            "edit_file OGNI file segnalato, in questo turno (correzione batch). "
+            "Ri-eseguire il build NON e' un'azione diversa: e' la stessa di prima. "
+            "Se non riesci a correggere (errore in dipendenza esterna/codice "
+            "generato non tuo), dichiara ESPLICITAMENTE che sei bloccato e perche': "
+            "il turno chiudera' con la diagnosi, non con un'altra esecuzione."
+        )
     return (
         f"STOP: hai ripetuto '{label}' {count} volte e il sollecito precedente non "
         "ha cambiato nulla. PRIMA di qualunque altra mossa DEVI, in quest'ordine: "

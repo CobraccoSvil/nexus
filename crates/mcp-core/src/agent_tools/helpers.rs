@@ -259,6 +259,31 @@ pub(crate) fn format_process_output(info: &crate::agent_processes::ProcessOutput
     msg
 }
 
+/// Punto unico (regola L) che riconosce un fallimento di build/compilazione dal
+/// suo output. tsc/cargo/eslint/webpack falliscono con un elenco di errori
+/// file:riga e un totale in fondo ("Found N errors", "could not compile").
+/// Deve avere PRIORITA' sui rami file-oriented: messaggi come `error TS2304:
+/// Cannot find name 'foo'` o `error[E0425]: cannot find value` contengono
+/// "cannot find" ma NON sono "file non trovato" — sono errori di compilazione.
+/// Gate `exit_code != 0`: un grep che stampa "found" esce a 0 e non entra qui.
+fn is_build_failure(exit_code: i32, combined: &str) -> bool {
+    if exit_code == 0 {
+        return false;
+    }
+    combined.contains("error ts")
+        || combined.contains("error[e")
+        || combined.contains("found ") && (combined.contains(" error") || combined.contains(" problem"))
+        || combined.contains("compilation failed")
+        || combined.contains("compilation error")
+        || combined.contains("build failed")
+        || combined.contains("failed to compile")
+        || combined.contains("problems (")
+        || combined.contains("cannot find module")
+        || combined.contains("type error")
+        || combined.contains("ts(")
+        || combined.contains("could not compile")
+}
+
 /// Classifica l'errore di un comando shell e restituisce un suggerimento diagnostico.
 pub(crate) fn classify_command_error(exit_code: i32, stderr: &str, stdout: &str) -> &'static str {
     let err = stderr.to_lowercase();
@@ -270,6 +295,13 @@ pub(crate) fn classify_command_error(exit_code: i32, stderr: &str, stdout: &str)
     }
     if combined.contains("permission denied") || combined.contains("operation not permitted") {
         return "permesso negato — prova ad aggiungere `sudo` oppure verifica i permessi del file con run_command(\"ls -la <percorso>\")";
+    }
+    // Ramo build/compilazione PRIMA di "no such file": un errore tsc/cargo del
+    // tipo "Cannot find name"/"cannot find value" contiene "cannot find" ma NON
+    // e' un file mancante — va correggendo i file segnalati, non cercando un
+    // percorso. Il messaggio generico induceva invece a RI-ESEGUIRE il build.
+    if is_build_failure(exit_code, &combined) {
+        return "build fallito con errori di compilazione — NON ripetere lo stesso comando per vedere se cambia: ri-eseguire il build non riduce gli errori, li riduce solo correggere i file. Leggi TUTTI gli errori nell'output (ognuno ha file:riga, in fondo c'e' il totale tipo 'Found N errors'), apri con read_file OGNI file segnalato e correggilo con edit_file (correzione batch nello stesso turno), poi ri-esegui il build UNA sola volta per confermare. Se l'output era troncato, correggi gli errori visibili e segnala che potrebbero mancarne altri";
     }
     if combined.contains("no such file")
         || combined.contains("cannot find")
@@ -290,4 +322,105 @@ pub(crate) fn classify_command_error(exit_code: i32, stderr: &str, stdout: &str)
         return "exit code 1 senza output — per grep/find significa 'nessuna corrispondenza': prova un pattern diverso";
     }
     "errore generico — leggi stderr per la causa specifica, poi usa un approccio alternativo o un comando diverso"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_tsc_build_failure_emette_guida_build() {
+        let stdout = "src/app.ts(12,5): error TS2304: Cannot find name 'foo'.\n\
+                      src/util.ts(3,1): error TS2552: Cannot find name 'bar'.\n\
+                      Found 2 errors in 2 files.\n";
+        let hint = classify_command_error(1, "", stdout);
+        assert!(
+            hint.contains("build fallito con errori di compilazione"),
+            "atteso ramo build, ottenuto: {hint}"
+        );
+        assert!(
+            hint.contains("NON ripetere lo stesso comando"),
+            "la guida deve scoraggiare la ripetizione del build: {hint}"
+        );
+        assert!(
+            hint.contains("edit_file"),
+            "la guida deve ordinare la correzione dei file: {hint}"
+        );
+    }
+
+    #[test]
+    fn classify_cargo_build_failure_emette_guida_build() {
+        let stderr = "error[E0425]: cannot find value `x` in this scope\n\
+                      error: could not compile `mcp-core` due to previous error\n";
+        let hint = classify_command_error(101, stderr, "");
+        assert!(
+            hint.contains("build fallito con errori di compilazione"),
+            "atteso ramo build per cargo, ottenuto: {hint}"
+        );
+    }
+
+    #[test]
+    fn classify_cannot_find_name_non_e_file_mancante() {
+        // Regressione: "Cannot find name"/"cannot find value" sono errori di
+        // compilazione, NON file mancanti. Il ramo build deve avere priorita'
+        // sul ramo "no such file" che altrimenti li intercetterebbe.
+        let tsc = classify_command_error(
+            1,
+            "",
+            "src/a.ts(1,1): error TS2304: Cannot find name 'foo'.\nFound 1 error.\n",
+        );
+        assert!(
+            tsc.contains("build fallito"),
+            "tsc 'Cannot find name' deve essere build, non file mancante: {tsc}"
+        );
+        let cargo =
+            classify_command_error(101, "error[E0425]: cannot find value `x` in this scope", "");
+        assert!(
+            cargo.contains("build fallito"),
+            "cargo 'cannot find value' deve essere build, non file mancante: {cargo}"
+        );
+    }
+
+    #[test]
+    fn classify_no_such_file_resta_file_mancante() {
+        // Un vero file mancante (senza marker di build) resta classificato
+        // come percorso errato.
+        let hint = classify_command_error(2, "cat: foo.txt: No such file or directory", "");
+        assert!(
+            hint.contains("file o directory non trovata"),
+            "un file realmente mancante deve restare nel ramo file: {hint}"
+        );
+    }
+
+    #[test]
+    fn classify_grep_no_match_non_e_build() {
+        // grep che non trova nulla: exit 1 senza output -> ramo grep, non build.
+        let hint = classify_command_error(1, "", "");
+        assert!(
+            !hint.contains("build fallito"),
+            "un grep vuoto non deve essere classificato come build: {hint}"
+        );
+        assert!(hint.contains("nessuna corrispondenza"));
+    }
+
+    #[test]
+    fn classify_grep_trova_found_a_exit0_non_e_build() {
+        // Un comando andato a buon fine (exit 0) il cui output contiene "found"
+        // non deve entrare nel ramo build (gate exit_code != 0).
+        let hint = classify_command_error(0, "", "Found 3 matching lines\n");
+        assert!(
+            !hint.contains("build fallito"),
+            "exit 0 non deve mai essere build: {hint}"
+        );
+    }
+
+    #[test]
+    fn classify_command_not_found_resta_prioritario() {
+        // I rami specifici precedono il ramo build anche con exit != 0.
+        let hint = classify_command_error(127, "tsc: command not found", "");
+        assert!(
+            hint.contains("comando non trovato"),
+            "command not found deve avere priorita' sul ramo build: {hint}"
+        );
+    }
 }
