@@ -394,4 +394,31 @@ mod tests {
     fn sanitize_query_pulisce() {
         assert_eq!(sanitize_query("foo\"bar\\baz"), "foo bar baz");
     }
+
+    /// Test di INTEGRAZIONE (richiede DATABASE_URL) che stampa il messaggio REALE
+    /// del resolver per i casi tipici, contro il DB vero (connettori/catalog
+    /// inclusi). `#[ignore]` perche' tocca il DB; eseguire con:
+    ///   cargo test --bin mcp-core resolver_casi_reali -- --ignored --nocapture
+    /// Verifica strutturale: ogni output inizia col marker U+274C (gap1).
+    #[tokio::test]
+    #[ignore]
+    async fn resolver_casi_reali() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nexus:nexus@localhost:5433/nexus".to_string());
+        let pool = PgPool::connect(&url).await.expect("connessione DB");
+        // project_id Beauty-Book (scope per il lookup connettori/catalog).
+        let project_id = Uuid::parse_str("73fa9139-50a4-4b17-9a3d-52fad931252d").unwrap();
+        let user_id = Uuid::nil();
+        let casi = [
+            ("INESISTENTE (nome inventato)", "zxcvbnm_fake_tool"),
+            ("NOME SBAGLIATO (typo di read_file)", "read_fil"),
+            ("NOME SIMILE (vicino a list_files)", "list_file"),
+            ("NOME SIMILE (vicino a delete_file)", "delete"),
+        ];
+        for (etichetta, missing) in casi {
+            let out = resolve_tool_not_found(&pool, None, user_id, project_id, "user", missing).await;
+            eprintln!("\n========== {etichetta}: input='{missing}' ==========\n{out}\n");
+            assert!(out.starts_with(ERR_MARK), "manca il marker is_error per '{missing}'");
+        }
+    }
 }
