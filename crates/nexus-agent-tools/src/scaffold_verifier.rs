@@ -40,10 +40,14 @@ pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) ->
         .and_then(Value::as_str)
         .map(|s| s.trim().trim_start_matches('/'))
         .unwrap_or(".");
-    if target_rel.contains("..") {
-        return json!({"error": "target_dir non puo' contenere '..'"}).to_string();
-    }
-    let target = ctx.root_path.join(target_rel);
+    // Punto unico (regola L): de-duplica la root se l'agente l'ha inclusa nel
+    // path e blocca il traversal ".." (normalize_into_root).
+    let target = match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, target_rel) {
+        Ok(clean) => ctx.root_path.join(&clean),
+        Err(e) => {
+            return json!({"error": format!("target_dir non valido: {}", e.message())}).to_string()
+        }
+    };
 
     if !target.exists() {
         return json!({

@@ -15,8 +15,11 @@ pub async fn tool_scan_code_quality(ctx: &ToolContextCore, input: &Value) -> Str
         .unwrap_or("all");
 
     if let Some(rel_path) = file_path {
-        // Single file analysis
-        let full_path = ctx.root_path.join(rel_path);
+        // Single file analysis. Punto unico (regola L): de-duplica la root e blocca "..".
+        let full_path = match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, rel_path) {
+            Ok(clean) => ctx.root_path.join(&clean),
+            Err(e) => return format!("Errore risoluzione path: {}", e.message()),
+        };
         let content = match tokio::fs::read_to_string(&full_path).await {
             Ok(c) => c,
             Err(e) => return format!("Errore lettura file: {}", e),
@@ -174,8 +177,15 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
         {
             c.to_string()
         } else {
-            // Leggi il file dalla root del progetto
-            let abs_path = ctx.root_path.join(&path_str);
+            // Leggi il file dalla root del progetto. Punto unico (regola L):
+            // de-duplica la root e blocca "..".
+            let abs_path = match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, &path_str) {
+                Ok(clean) => ctx.root_path.join(&clean),
+                Err(e) => {
+                    tracing::warn!("batch_analyze_code: path '{}' non valido: {}", path_str, e.message());
+                    continue;
+                }
+            };
             match tokio::fs::read_to_string(&abs_path).await {
                 Ok(c) => c,
                 Err(e) => {

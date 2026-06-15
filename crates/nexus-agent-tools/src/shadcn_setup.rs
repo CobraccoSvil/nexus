@@ -90,12 +90,17 @@ pub async fn tool_nexus_install_shadcn_components(
         .and_then(Value::as_str)
         .map(|s| s.trim().trim_start_matches('/'))
         .unwrap_or("src/components/ui");
-    if target_rel.contains("..") {
-        return json!({"error": "target_dir non puo' contenere '..'"}).to_string();
-    }
-
+    // Punto unico (regola L): de-duplica la root se l'agente l'ha inclusa nel
+    // path e blocca il traversal ".." (normalize_into_root).
     let project_root: &Path = &ctx.root_path;
-    let target_dir: PathBuf = project_root.join(target_rel);
+    let target_dir: PathBuf =
+        match nexus_types::workspace_paths::normalize_into_root(project_root, target_rel) {
+            Ok(clean) => project_root.join(&clean),
+            Err(e) => {
+                return json!({"error": format!("target_dir non valido: {}", e.message())})
+                    .to_string()
+            }
+        };
 
     if let Err(e) = fs::create_dir_all(&target_dir).await {
         return json!({

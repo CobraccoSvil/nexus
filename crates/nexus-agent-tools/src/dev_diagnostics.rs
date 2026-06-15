@@ -190,12 +190,22 @@ pub async fn tool_nexus_dev_server_diagnose(
     let log_content = if let Some(s) = inline_log {
         s
     } else if let Some(lp) = log_path.as_ref() {
-        // Risolvi path: se relativo, rispetto a project root
+        // Path assoluto usato cosi com'e; relativo passa dal punto unico (regola L)
+        // che de-duplica la root se inclusa dall'agente e blocca "..".
         let p = Path::new(lp);
         let resolved = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            ctx.root_path.join(lp)
+            match nexus_types::workspace_paths::normalize_into_root(&ctx.root_path, lp) {
+                Ok(clean) => ctx.root_path.join(&clean),
+                Err(e) => {
+                    return json!({
+                        "error": format!("log_path non valido: {}", e.message()),
+                        "hint": "Passa log_path assoluto o relativo a project root, oppure passa 'log' (stringa inline)."
+                    })
+                    .to_string();
+                }
+            }
         };
         match read_log_tail(&resolved).await {
             Ok(s) => s,

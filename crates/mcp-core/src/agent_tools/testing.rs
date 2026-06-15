@@ -329,7 +329,17 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     // ── 2. Controllo presenza Playwright ─────────────────────────────────────
     let (playwright_root, stale_configs): (std::path::PathBuf, Vec<std::path::PathBuf>) =
         if let Some(ref cp) = config_path_override {
-            let resolved = ctx.root_path.join(cp);
+            // Punto unico (regola L): de-duplica la root se l'agente l'ha inclusa
+            // in config_path e blocca il traversal (resolve_relative_path).
+            let resolved = match resolve_relative_path(&ctx.root_path, cp) {
+                Ok(p) => p,
+                Err(_) => {
+                    return format!(
+                        "[run_playwright_tests] config_path '{}' non trovato. Passa una directory relativa (es. \"app\") o un file config.",
+                        cp
+                    );
+                }
+            };
             let dir = if resolved.is_dir() {
                 resolved
             } else if resolved.is_file() {

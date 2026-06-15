@@ -549,10 +549,20 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
         Some(s) => s,
         None => return "[Errore: parametro 'pattern' mancante]".to_string(),
     };
-    let search_path: &Path = if let Some(p) = input.get("path").and_then(Value::as_str) {
-        &ctx.root_path.join(p.trim_start_matches(['\\', '/']))
+    // Punto unico (regola L): de-duplica la root se l'agente l'ha inclusa nel
+    // path e blocca il traversal ".." (resolve_relative_path -> normalize_into_root).
+    let search_path: PathBuf = if let Some(p) = input.get("path").and_then(Value::as_str) {
+        match resolve_relative_path(&ctx.root_path, p) {
+            Ok(path) => path,
+            Err(e) => {
+                return format!(
+                    "[Errore percorso: {}]",
+                    e.1["error"].as_str().unwrap_or("path error")
+                )
+            }
+        }
     } else {
-        &ctx.root_path
+        ctx.root_path.clone()
     };
 
     let output = Command::new("grep")
@@ -561,7 +571,7 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
         .arg("--max-count=50")
         .arg("-I") // ignora file binari
         .arg(pattern)
-        .arg(search_path)
+        .arg(&search_path)
         .output()
         .await;
 
@@ -695,20 +705,13 @@ pub(super) async fn tool_rename_file(ctx: &AgentToolContext, input: &Value) -> S
         }
     };
 
-    let to_clean = to_str.trim().trim_start_matches(['\\', '/']);
-    let to = ctx.root_path.join(to_clean);
-    let normalized_to =
-        to.components()
-            .collect::<Vec<_>>()
-            .iter()
-            .fold(PathBuf::new(), |mut acc, c| {
-                acc.push(c);
-                acc
-            });
-    if !normalized_to.starts_with(&ctx.root_path) {
-        return "[Errore: destinazione non autorizzata (fuori dalla root del progetto)]"
-            .to_string();
-    }
+    // Destinazione: file nuovo (non ancora esistente), quindi resolve_write_target
+    // (non canonicalizza) e non resolve_relative_path. Punto unico (regola L):
+    // de-duplica la root come per la sorgente e blocca traversal/uscita dalla root.
+    let to = match resolve_write_target(&ctx.root_path, to_str) {
+        Ok(p) => p,
+        Err(e) => return format!("[Errore percorso destinazione: {e}]"),
+    };
 
     if let Some(parent) = to.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
