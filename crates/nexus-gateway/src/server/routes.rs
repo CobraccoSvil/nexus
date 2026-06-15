@@ -272,7 +272,15 @@ async fn run_fallback(
     for rp in resolved {
         let name = rp.provider.name();
         if cooldown.is_in_cooldown(name) {
-            failures.push(format!("{name} (in cooldown, saltato)"));
+            // Includi il motivo nel messaggio: se billing, il brain (che legge il
+            // body del 500) lo riconosce come billing e applica il cooldown lungo
+            // invece di riprovare il provider a ogni iterazione.
+            let secs = cooldown.seconds_remaining(name);
+            if cooldown.is_billing_cooldown(name) {
+                failures.push(format!("{name} (cooldown billing, {secs}s rimanenti)"));
+            } else {
+                failures.push(format!("{name} (in cooldown, {secs}s rimanenti)"));
+            }
             continue;
         }
 

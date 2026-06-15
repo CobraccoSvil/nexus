@@ -315,7 +315,15 @@ def _gateway_error_to_result(exc: Exception, provider: str, model: str) -> Provi
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         logger.error("gateway ha risposto %d per %s/%s", status, provider, model)
-        info = classify_error(exc, provider)
+        # Il body del 500 del gateway contiene il messaggio d'errore del provider
+        # (es. billing/quota): lo passiamo al classificatore (punto unico) perche'
+        # str(exc) di httpx NON include il body. Solo per classificare, MAI loggato
+        # (regola F). Troncato per sicurezza.
+        try:
+            err_body = (exc.response.text or "")[:2000]
+        except Exception:
+            err_body = ""
+        info = classify_error(exc, provider, body=err_body)
         return ProviderResult(
             provider=provider, model=model,
             content=f"[Error: {info['message']}]",

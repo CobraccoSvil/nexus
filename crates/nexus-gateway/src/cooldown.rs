@@ -195,6 +195,17 @@ impl CooldownManager {
         }
     }
 
+    /// `true` se il provider e' in cooldown ATTIVO per motivo Billing (crediti).
+    /// Usato per arricchire il messaggio d'errore del 500: cosi' il brain (che
+    /// legge il body) riconosce il billing e applica il cooldown lungo invece di
+    /// riprovare il provider a ogni iterazione.
+    pub fn is_billing_cooldown(&self, provider: &str) -> bool {
+        match self.states.get(provider) {
+            Some(s) => s.until > Utc::now() && s.reason == CooldownReason::Billing,
+            None => false,
+        }
+    }
+
     /// Secondi rimanenti di cooldown (0 se non in cooldown o scaduto).
     pub fn seconds_remaining(&self, provider: &str) -> i64 {
         self.seconds_remaining_at(provider, Utc::now())

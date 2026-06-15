@@ -191,7 +191,7 @@ def _extract_http_status_structured(exc: Exception) -> int | None:
     return None
 
 
-def classify_error(exc: Exception, provider: str = "") -> dict[str, Any]:
+def classify_error(exc: Exception, provider: str = "", body: str = "") -> dict[str, Any]:
     """
     Classifica un'eccezione del provider e restituisce:
       {
@@ -204,6 +204,11 @@ def classify_error(exc: Exception, provider: str = "") -> dict[str, Any]:
       }
     """
     raw = str(exc)
+    if body:
+        # Body della risposta (es. messaggio billing del provider dentro il 500
+        # del gateway): str(exc) di httpx NON lo include. Usato SOLO per il
+        # pattern matching qui sotto, MAI loggato (regola F: niente body grezzo).
+        raw = f"{raw}\n{body}"
     raw_lower = raw.lower()
 
     # ── 1. Estrai HTTP status code ────────────────────────────────────────────
