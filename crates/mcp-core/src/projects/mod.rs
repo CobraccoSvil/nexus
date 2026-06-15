@@ -478,19 +478,36 @@ pub(crate) async fn load_projects_base_root(db: &PgPool) -> Result<PathBuf, ApiE
 }
 
 pub(crate) fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, ApiError> {
-    let raw = relative.trim();
-    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    use nexus_types::workspace_paths::{normalize_into_root, WorkspaceTargetError};
 
-    let target = if raw.is_empty() {
+    // Normalizzazione/de-duplicazione nel PUNTO UNICO condiviso con la scrittura
+    // (regola L): gestisce il caso in cui l'LLM passa un path che DUPLICA la
+    // project_root (es. `home/administrator/projects/Foo/src/x.ts`) o la root
+    // assoluta. Prima questo resolver di LETTURA non strippava la root, percio'
+    // `read_file` falliva con "Percorso non trovato" sugli stessi file che
+    // `edit_file` (resolve_write_target, che gia' de-duplicava) aveva scritto.
+    let clean = normalize_into_root(root, relative).map_err(|e| {
+        let status = match e {
+            WorkspaceTargetError::OutsideRoot => StatusCode::FORBIDDEN,
+            WorkspaceTargetError::EmptyPath | WorkspaceTargetError::InvalidChars => {
+                StatusCode::BAD_REQUEST
+            }
+        };
+        api_error(status, e.message())
+    })?;
+
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let target = if clean.is_empty() {
         root_canonical.clone()
     } else {
-        let as_path = PathBuf::from(raw);
-        if as_path.is_absolute() {
-            as_path
-        } else {
-            let clean = raw.trim_start_matches(['\\', '/']);
-            root_canonical.join(clean)
+        if relative.trim() != clean {
+            tracing::debug!(
+                original = %relative.trim(),
+                normalized = %clean,
+                "resolve_relative_path: root duplicata/assoluta strippata dal path del tool"
+            );
         }
+        root_canonical.join(&clean)
     };
 
     let canonical = target
@@ -522,6 +539,49 @@ pub(crate) fn resolve_workspace_target(
     })
 }
 
+#[cfg(test)]
+mod tests_resolve_relative_dup_root {
+    use super::resolve_relative_path;
+
+    /// Integrazione con IO reale (canonicalize) del resolver di LETTURA usato dal
+    /// tool read_file dell'agente. Cattura la regressione "read_file fallisce su
+    /// file esistenti quando l'LLM duplica la project_root nel path".
+    #[test]
+    fn read_resolve_strippa_root_duplicata_e_assoluta() {
+        let base = std::env::temp_dir().join(format!("nexus_resolve_{}", std::process::id()));
+        let root = base.join("Beauty-Book");
+        let nested = root.join("backend/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("app.ts");
+        std::fs::write(&file, b"x").unwrap();
+        let expected = file.canonicalize().unwrap();
+
+        let root_str = root.to_string_lossy().to_string();
+        let root_noslash = root_str.trim_start_matches('/');
+
+        // 1. dup-root come "relativo" (il bug): prima -> NOT_FOUND, ora -> OK.
+        let dup = format!("{root_noslash}/backend/src/app.ts");
+        assert_eq!(
+            resolve_relative_path(&root, &dup).expect("dup-root deve risolvere"),
+            expected
+        );
+        // 2. relativo normale (regressione).
+        assert_eq!(
+            resolve_relative_path(&root, "backend/src/app.ts").expect("relativo ok"),
+            expected
+        );
+        // 3. assoluto dentro la root.
+        assert_eq!(
+            resolve_relative_path(&root, &format!("{root_str}/backend/src/app.ts"))
+                .expect("assoluto dentro ok"),
+            expected
+        );
+        // 4. assoluto fuori dalla root -> errore (non risolve fuori progetto).
+        assert!(resolve_relative_path(&root, "/etc/hostname").is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
 
 pub(crate) async fn record_git_operation(
     db: &PgPool,

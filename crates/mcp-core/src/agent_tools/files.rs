@@ -14,59 +14,20 @@ enum BuildGraphPreflight {
 /// Risolve il path di SCRITTURA fornito dall'LLM in un path assoluto confinato
 /// alla `root`, de-duplicando la root se il modello l'ha gia' inclusa nel path.
 ///
-/// Root cause del bug "path duplicato" (`<root>/<root>/file`): l'LLM passava un
-/// path che gia' conteneva la project_root (es. `home/administrator/projects/
-/// Marco/index.html`, relativo ma rappresentante la root). Il vecchio codice
-/// faceva `root.join(path)` senza riconoscerlo, concatenando la root due volte.
-/// A differenza di `resolve_relative_path` (lettura), questa NON richiede che il
-/// file esista (canonicalize fallirebbe sui file nuovi): normalizza testualmente
-/// e confina. Gestisce: (1) assoluto dentro la root -> strip; (2) relativo che
-/// duplica la root -> strip; (3) relativo normale; (4) assoluto fuori root o
-/// `..` -> errore. Punto unico riusabile dai tool di scrittura (regola L).
+/// Delega al PUNTO UNICO `nexus_types::workspace_paths::normalize_into_root`
+/// (regola L), lo STESSO usato dalla lettura (`resolve_relative_path`): cosi'
+/// lettura e scrittura risolvono i path in modo identico. Storicamente la
+/// de-duplicazione viveva solo qui, percio' `read_file` falliva sui file che
+/// `edit_file` scriveva quando l'LLM includeva la project_root nel path.
+/// A differenza della lettura, questa NON richiede che il file esista
+/// (i file nuovi non passerebbero `canonicalize`): normalizza e confina soltanto.
 fn resolve_write_target(root: &std::path::Path, path_str: &str) -> Result<PathBuf, String> {
-    let raw = path_str.trim();
-    if raw.is_empty() {
+    let clean = nexus_types::workspace_paths::normalize_into_root(root, path_str)
+        .map_err(|e| e.message().to_string())?;
+    if clean.is_empty() {
         return Err("percorso vuoto".to_string());
     }
-    let root_str = root.to_string_lossy();
-    let root_str = root_str.trim_end_matches('/');
-
-    // Forma "candidata assoluta": un relativo viene visto come assoluto per
-    // riconoscere se duplica la root (caso 2 del bug).
-    let candidate_abs = if raw.starts_with('/') {
-        raw.to_string()
-    } else {
-        format!("/{}", raw)
-    };
-
-    let relative = if candidate_abs == root_str {
-        String::new()
-    } else if let Some(rest) = candidate_abs.strip_prefix(&format!("{}/", root_str)) {
-        // Dentro la root (assoluto o relativo-che-duplica): usa solo il resto.
-        rest.to_string()
-    } else if raw.starts_with('/') {
-        // Assoluto FUORI dalla root: rifiuta (no scrittura fuori progetto).
-        return Err(format!(
-            "percorso assoluto fuori dalla root del progetto: {raw}"
-        ));
-    } else {
-        // Relativo normale (non duplica la root).
-        raw.to_string()
-    };
-
-    let rel_path = PathBuf::from(&relative);
-    if rel_path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err("percorso non consentito (contiene '..')".to_string());
-    }
-    let target = root.join(&rel_path);
-    // Confinamento finale (difesa in profondita').
-    if !target.starts_with(root) {
-        return Err("percorso fuori dalla root del progetto".to_string());
-    }
-    Ok(target)
+    Ok(root.join(&clean))
 }
 
 /// Esegue il preflight ADR 0020 su `path_str`. Ritorna `Allow` se il file e'
