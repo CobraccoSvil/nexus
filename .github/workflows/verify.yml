@@ -58,6 +58,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # cargo (dentro pnpm verify) verifica le query sqlx a COMPILE-TIME contro
+      # il DB: non esiste cache .sqlx, quindi serve un DB con lo schema. Il
+      # Postgres del service e' vuoto -> senza migrazioni sqlx fallisce con
+      # "relation ... does not exist". Applichiamo le migrazioni versionate
+      # (stesso approccio di nexus-suite.yml) prima di compilare/testare.
+      - name: Apply DB migrations (schema per sqlx)
+        run: |
+          for f in db/migrations/*.sql; do
+            psql "$DATABASE_URL" -f "$f" || true
+          done
+
       # Il crate mcp-proto usa prost-build, che richiede il compilatore protobuf
       # `protoc` a build time. Senza, `cargo check/clippy/test` (dentro pnpm
       # verify) fallisce subito con "Could not find protoc". ci.yml non ne ha
