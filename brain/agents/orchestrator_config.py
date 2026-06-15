@@ -10,7 +10,7 @@ entro un minuto senza riavvio del servizio.
 Chiavi DB (categoria 'orchestrator', vedi mig 0150):
     plan_phase_enabled              bool   default: false
     plan_behavior_modes             csv    default: 'automatico,continuo'
-    plan_intents                    csv    default: 'code,implement,fix,refactor,scaffold_app,architecture'
+    plan_intents                    csv    default include 'debug' + hook 'fix_semplice/fix_complesso' (mig 0426)
     plan_min_token_budget           int    default: 2000
     planner_prompt_key              str    default: 'agent.planner.base'
     todo_reminder_every_n_steps     int    default: 5
@@ -139,7 +139,13 @@ def _full_key(local_key: str) -> str:
 _SAFE_DEFAULTS: dict[str, Any] = {
     "plan_phase_enabled": False,
     "plan_behavior_modes": ["automatico", "continuo"],
-    "plan_intents": ["code", "implement", "fix", "refactor", "scaffold_app", "architecture"],
+    # Estesa con 'debug' (intent canonico del classifier, vedi router/intents.py)
+    # piu' hook 'fix_semplice'/'fix_complesso' per refinement futuri. Override
+    # admin via setting `orchestrator.plan_intents` (mig 0426).
+    "plan_intents": [
+        "code", "implement", "fix", "refactor", "scaffold_app", "architecture",
+        "debug", "fix_semplice", "fix_complesso",
+    ],
     "plan_min_token_budget": 2000,
     "planner_prompt_key": "agent.planner.base",
     "todo_reminder_every_n_steps": 5,

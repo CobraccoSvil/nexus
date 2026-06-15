@@ -93,6 +93,25 @@ class TestOrchestratorConfigEligibility(unittest.TestCase):
         self._set_cfg(plan_phase_enabled=True)
         self.assertTrue(orchestrator_config.is_eligible("automatico", "fix", 5000))
 
+    def test_attiva_su_intent_debug(self):
+        # Regressione mig 0426: 'debug' deve essere in plan_intents default
+        # cosi' il planner_node._guard non si auto-skippa sui task di fix/debug.
+        self._set_cfg(plan_phase_enabled=True)
+        self.assertTrue(orchestrator_config.is_eligible("automatico", "debug", 5000))
+
+    def test_attiva_su_intent_fix_semplice_e_complesso(self):
+        # Hook anticipati: se in futuro il classifier emette varianti raffinate
+        # devono essere accettate dal guard senza altre modifiche al codice.
+        self._set_cfg(plan_phase_enabled=True)
+        self.assertTrue(orchestrator_config.is_eligible("automatico", "fix_semplice", 5000))
+        self.assertTrue(orchestrator_config.is_eligible("automatico", "fix_complesso", 5000))
+
+    def test_gate_hard_budget_resta_attivo_su_debug(self):
+        # Anche con 'debug' negli intent ammessi, un task con budget sotto la
+        # soglia NON deve attivare il planner.
+        self._set_cfg(plan_phase_enabled=True, plan_min_token_budget=1500)
+        self.assertFalse(orchestrator_config.is_eligible("automatico", "debug", 100))
+
     def test_csv_coerce_da_stringa(self):
         # Quando il DB ritorna "a,b, c ,," viene parsato a ["a", "b", "c"]
         result = orchestrator_config._coerce("a,b, c ,,", ["x"])
