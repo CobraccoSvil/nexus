@@ -82,7 +82,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "search_in_files",
-    "description": "Usa questo tool per trovare occorrenze esatte di simboli, funzioni, costanti, pattern regex nel codebase quando conosci il testo esatto (nome funzione, costante, import). Non usare per ricerche concettuali come 'gestione autenticazione': usa search_codebase_semantic per quelle.",
+    "description": "Usa questo tool per trovare occorrenze esatte di simboli, funzioni, costanti, pattern regex nel codebase quando conosci il testo esatto (nome funzione, costante, import). Equivale a grep/ripgrep/find testuale sui file. Non usare per ricerche concettuali come 'gestione autenticazione': usa search_codebase_semantic per quelle.",
     "input_schema": {
       "type": "object",
       "properties": {

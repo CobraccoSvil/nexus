@@ -19,7 +19,9 @@ use uuid::Uuid;
 mod catalog;
 mod docs;
 mod git;
-mod mcp_runtime;
+// pub(crate): il tool-not-found resolver (agent_tools) riusa search_builtin_tools,
+// lookup_installed_tool_by_name e semantic_search da questo modulo (regola L).
+pub(crate) mod mcp_runtime;
 mod mutations;
 mod project;
 mod prompt_admin;
@@ -1349,9 +1351,16 @@ pub async fn execute(
             crate::build_graph::handle_build_graph_info(project_id, &arguments).await
         }
 
+        // Fallback nexus_* inesistente: delega al punto unico tool-not-found
+        // resolver (regola L). FIX gap1: il vecchio messaggio NON aveva il
+        // marker '\u{274C}' -> is_error=FALSE -> finto successo. Il resolver lo
+        // antepone SEMPRE -> is_error=TRUE coerente. neural=None: qui il lookup
+        // e' builtin in-memoria + DB ILIKE/catalog (niente semantica Qdrant).
         _ => {
-            let _ = (user_id, project_id);
-            format!("[Nexus Builtin] Tool '{}' non riconosciuto.", tool_name)
+            crate::agent_tools::tool_not_found::resolve_tool_not_found(
+                db, None, user_id, project_id, user_role, tool_name,
+            )
+            .await
         }
     }
 }

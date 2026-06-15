@@ -3580,10 +3580,18 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     _predictive_system = state.get("system_text") or ""
     # M16: gate per la validazione tool-in-list nel loop sottostante.
     _M16_META_TOOLS = {"nexus_mcp_tool_search", "nexus_mcp_tool_call"}
+    # GAP4 (coerenza codice<->DB): il comportamento runtime e' interamente
+    # DB-driven (settings.agent.tools.discovery_first_enabled, oggi 'true' in
+    # prod). Il SECONDO argomento di get_bool_setting_cached e' solo il valore
+    # di emergenza usato quando la chiave NON esiste in DB: NON e' una fonte di
+    # verita' alternativa (regola G). Lo teniamo a True per allinearlo allo
+    # stato operativo del DB, cosi' chi legge il codice non conclude che il gate
+    # M16 sia inattivo per default, ed e' fail-SAFE (in dubbio, M16 attivo) —
+    # purche' la whitelist DB sia leggibile (vedi nota sull'except).
     try:
         # Letture per-turno: varianti cached 60s (punto unico settings_db, C2).
         from brain.utils.settings_db import get_bool_setting_cached, get_setting_cached
-        _discovery_first_on = get_bool_setting_cached("agent.tools.discovery_first_enabled", False)
+        _discovery_first_on = get_bool_setting_cached("agent.tools.discovery_first_enabled", True)
         # Whitelist dei tool SEMPRE esposti al primo turno discovery (STESSA fonte
         # DB usata da mcp-core build_tools_json: agent.tools.discovery_first_whitelist).
         # Vanno permessi dalla validazione M16 anche se non "scoperti", altrimenti
@@ -3598,6 +3606,16 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
             if t.strip()
         }
     except Exception:
+        # Questo ramo scatta solo se l'IMPORT del modulo settings fallisce (le
+        # varianti *_cached sono best-effort e ingoiano gli errori DB tornando
+        # al default del chiamante, non sollevano). Senza la whitelist DB, M16
+        # NON puo' operare: attivarlo con whitelist vuota rifiuterebbe i tool
+        # core (read_file/list_files/... non sono in _ALWAYS_ON_TOOLS) e
+        # innescherebbe il loop search->reject. Il vero fail-safe qui e' quindi
+        # M16 OFF: l'errore secco "tool non esiste" arriva comunque dal resolver
+        # mcp-core (ramo other di dispatch.rs / fallback nexus_builtin), che e'
+        # il punto unico tool-not-found e suggerisce sempre nexus_mcp_tool_search
+        # indipendentemente da questo flag (regola L: nudge non duplicato qui).
         _discovery_first_on = False
         _df_whitelist = set()
     # Tool sempre ammessi dalla validazione M16 = meta di discovery + whitelist DB

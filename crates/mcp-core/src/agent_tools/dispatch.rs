@@ -13,8 +13,8 @@ use super::semantic_tools::{
 use super::{
     archive_tools, attachment_inspector, attachments, command, dev_diagnostics, dispatcher,
     document_tools, figma_tools, files, git, knowledge, ports, project_db_query, rag_search,
-    sandbox, scaffold_verifier, service, shadcn_setup, subagent, testing, todos, vision_tools,
-    visual_compare, AgentToolContext,
+    sandbox, scaffold_verifier, service, shadcn_setup, subagent, testing, todos, tool_not_found,
+    vision_tools, visual_compare, AgentToolContext,
 };
 
 /// Esegue un tool per conto dell'agente.
@@ -255,25 +255,21 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
             )
             .await
         }
+        // Tool non cablato: delega al punto unico tool-not-found resolver
+        // (regola L). Sostituisce la tabella alias hardcoded con un LOOKUP REALE
+        // (builtin fuzzy + connettori installati + catalog non installato) e
+        // garantisce il marker '\u{274C}' -> is_error=true (gap1). neural=Some:
+        // abilita anche il match semantico Qdrant best-effort.
         other => {
-            // Suggerisci il tool corretto in base al nome errato chiamato
-            let hint = match other {
-                "mcp" | "execute" | "shell" | "bash" | "cmd" | "exec" | "terminal" | "command" =>
-                    " Per eseguire comandi shell usa il tool `run_command` con il parametro `command`. Es: run_command({\"command\": \"which dotnet\"}).",
-                "install" | "apt" | "brew" | "pip" | "npm_install" | "cargo_install" =>
-                    " Per installare pacchetti usa `run_command` con il comando appropriato. Es: run_command({\"command\": \"sudo apt-get install -y <pacchetto>\"}).",
-                "read" | "open" | "cat" | "file_read" =>
-                    " Per leggere file usa `read_file` (parametro: path) oppure `read_file_lines` (parametri: path, start_line, end_line).",
-                "write" | "save" | "file_write" =>
-                    " Per scrivere file usa `write_file` (parametri: path, content) oppure `edit_file` per modifiche parziali.",
-                "search" | "grep" | "find" =>
-                    " Per cercare testo usa `search_in_files` (parametri: query, path). Per cercare file usa `list_files`.",
-                "git" | "git_cmd" | "git_command" =>
-                    " Per operazioni Git usa i tool dedicati: `git_status`, `git_stage`, `git_commit`, `git_push`, `git_pull`.",
-                _ =>
-                    " Controlla la lista dei tool disponibili. Se hai bisogno di eseguire comandi shell usa `run_command`.",
-            };
-            format!("❌ Tool '{other}' non esiste.{hint}")
+            tool_not_found::resolve_tool_not_found(
+                &ctx.db,
+                Some(&ctx.neural),
+                ctx.user_id,
+                ctx.project_id,
+                &ctx.user_role,
+                other,
+            )
+            .await
         }
     }
 }
@@ -338,11 +334,62 @@ mod tests {
     }
 
     /// Contro-prova: un nome sconosciuto cade ancora nel fallback.
+    ///
+    /// GAP1: l'output DEVE iniziare con il marker '\u{274C}' (con eventuale
+    /// trim_start) cosi' `tool_runner_server` deriva is_error=true. Il pool e'
+    /// lazy non connesso: le query DB del resolver degradano (no panic) e resta
+    /// il messaggio base + nudge tool_search.
     #[tokio::test]
     async fn tool_sconosciuto_cade_nel_fallback() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
         let out = execute_agent_tool(&ctx, "tool_che_non_esiste", &serde_json::json!({})).await;
         assert!(out.contains("non esiste"), "fallback atteso, ottenuto: {out}");
+        assert!(
+            out.trim_start().starts_with('\u{274C}'),
+            "GAP1: l'errore tool-not-found deve iniziare col marker U+274C: {out}"
+        );
+        assert!(
+            out.contains("nexus_mcp_tool_search"),
+            "GAP3: nudge a tool_search sempre presente: {out}"
+        );
+    }
+
+    /// GAP1 (bug chiuso): un `nexus_*` INESISTENTE passa per
+    /// nexus_builtin::execute_with_neural -> execute -> fallback `_`. Prima
+    /// ritornava "[Nexus Builtin] Tool ... non riconosciuto." SENZA marker ->
+    /// is_error=FALSE -> finto successo. Ora il resolver antepone U+274C.
+    #[tokio::test]
+    async fn nexus_tool_inesistente_ha_marker_errore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
+        let out =
+            execute_agent_tool(&ctx, "nexus_tool_inventato_dal_modello", &serde_json::json!({}))
+                .await;
+        assert!(
+            out.trim_start().starts_with('\u{274C}'),
+            "GAP1: nexus_* inesistente deve produrre is_error path (marker U+274C): {out}"
+        );
+        assert!(
+            !out.contains("non riconosciuto"),
+            "il vecchio messaggio senza marker non deve piu' comparire: {out}"
+        );
+    }
+
+    /// GAP2: il fuzzy reale (non piu' alias hardcoded) suggerisce il builtin
+    /// corretto per un nome storpiato, end-to-end attraverso il dispatcher.
+    #[tokio::test]
+    async fn fuzzy_storpiato_suggerisce_builtin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
+        let out = execute_agent_tool(&ctx, "read_fil", &serde_json::json!({})).await;
+        assert!(
+            out.trim_start().starts_with('\u{274C}'),
+            "marker atteso: {out}"
+        );
+        assert!(
+            out.contains("read_file"),
+            "GAP2: 'read_fil' deve suggerire read_file: {out}"
+        );
     }
 }

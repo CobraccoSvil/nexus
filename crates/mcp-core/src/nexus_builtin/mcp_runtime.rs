@@ -283,7 +283,10 @@ pub async fn index_tool(
 
 // ── Ricerca semantica Qdrant ──────────────────────────────────────────────────
 
-async fn semantic_search(
+/// `pub(crate)` (regola L): riusata best-effort dal tool-not-found resolver per
+/// arricchire i suggerimenti con i match semantici dei connettori MCP quando il
+/// `NeuralCoreClient` (Qdrant) e' disponibile. Mai duplicata.
+pub(crate) async fn semantic_search(
     db: &PgPool,
     neural: &NeuralCoreClient,
     query: &str,
@@ -664,7 +667,11 @@ async fn handle_mcp_tool_search_inner(
 /// restano scopribili per parola chiave. Se la query non produce token
 /// significativi (sole stopword/simboli) si ricade sulla substring intera per
 /// non regredire su query mono-keyword corte.
-fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
+///
+/// `pub(crate)` (regola L): riusato dal punto unico tool-not-found resolver
+/// (`crate::agent_tools::tool_not_found`) per produrre i suggerimenti "forse
+/// intendevi" senza duplicare la logica di ricerca sul registro builtin.
+pub(crate) fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
     if query.trim().is_empty() {
         return Vec::new();
     }
@@ -736,6 +743,79 @@ fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
     // fondamentali sono dichiarati per primi in AGENT_TOOLS_JSON).
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.into_iter().take(limit).map(|(_, _, v)| v).collect()
+}
+
+/// Tool di un connettore MCP installato/abilitato che corrisponde (esatto o
+/// parziale) a un nome cercato. Riusato dal punto unico tool-not-found resolver
+/// (regola L): la clausola scope/enabled vive accanto alla search, NON viene
+/// duplicata nel resolver.
+#[derive(Debug, Clone)]
+pub(crate) struct InstalledToolMatch {
+    pub server_id: Uuid,
+    pub server_name: String,
+    pub tool_name: String,
+    pub description: Option<String>,
+}
+
+/// Cerca per NOME (non per descrizione) un tool tra i connettori MCP installati
+/// e abilitati accessibili dall'utente/progetto. Match `t.tool_name ILIKE
+/// %name%` (cattura sia esatto sia storpiature contenute). Stessa clausola
+/// scope/enabled della search (`mcp_servers.scope` global/user/project +
+/// `enabled = true`). Best-effort: su errore DB ritorna `Vec` vuoto (mai panic),
+/// cosi' il resolver degrada al messaggio base mantenendo `is_error` coerente.
+pub(crate) async fn lookup_installed_tool_by_name(
+    db: &PgPool,
+    user_id: Uuid,
+    project_id: Uuid,
+    name: &str,
+) -> Vec<InstalledToolMatch> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Vec::new();
+    }
+    // Sanitizza le wildcard ILIKE: i token builtin sono nomi-tool, ma il nome
+    // arriva dal modello (puo' contenere `%`/`_`). Difesa in profondita': resta
+    // comunque bind parametrico.
+    let like = format!("%{}%", name.replace(['%', '_'], ""));
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          s.id          AS server_id,
+          s.name        AS server_name,
+          t.tool_name   AS tool_name,
+          t.description AS description
+        FROM mcp_servers s
+        JOIN mcp_server_tools t ON t.server_id = s.id
+        WHERE s.enabled = true
+          AND (
+            s.scope = 'global'
+            OR (s.scope = 'user' AND s.user_id = $1)
+            OR (s.scope = 'project' AND s.project_id = $2)
+          )
+          AND t.tool_name ILIKE $3
+        ORDER BY
+          -- match esatto (case-insensitive) prima, poi per scope/nome
+          (CASE WHEN lower(t.tool_name) = lower($4) THEN 0 ELSE 1 END),
+          s.scope DESC, s.name, t.tool_name
+        LIMIT 5
+        "#,
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .bind(like)
+    .bind(name)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|r| InstalledToolMatch {
+            server_id: r.try_get("server_id").unwrap_or_else(|_| Uuid::nil()),
+            server_name: r.try_get("server_name").unwrap_or_default(),
+            tool_name: r.try_get("tool_name").unwrap_or_default(),
+            description: r.try_get("description").unwrap_or(None),
+        })
+        .collect()
 }
 
 // ── Handler: nexus_mcp_tool_call ─────────────────────────────────────────────

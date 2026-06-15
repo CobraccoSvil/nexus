@@ -40,6 +40,7 @@ pub(crate) mod sandbox;
 pub(crate) mod semantic_tools;
 pub(crate) mod service;
 pub(crate) mod testing;
+pub(crate) mod tool_not_found;
 pub(crate) mod visual_compare;
 
 // ── API pubblica del package (call site esterni: invariata) ─────────────────
