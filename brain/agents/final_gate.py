@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -62,6 +63,124 @@ def _is_software_task(state: dict[str, Any], cfg: dict[str, Any]) -> bool:
         return False
     software_intents = [str(i).lower() for i in (cfg.get("final_gate_software_intents") or [])]
     return intent in software_intents
+
+
+def _project_slug(name: str) -> str:
+    """Riproduce in Python l'algoritmo di slug usato dalle unit systemd lato Rust
+    (project_workspace/logs.rs: name.to_lowercase().replace([' ', '_'], '-')).
+    Stesso slug del prefisso unit '{slug}-' e dei detached log
+    '/tmp/nexus-proj-{slug}-*.log'. Punto unico (regola L) per la corrispondenza
+    cross-language: senza, il brain costruirebbe slug diversi e i comandi log
+    matcherebbero unit inesistenti."""
+    return name.lower().replace(" ", "-").replace("_", "-")
+
+
+def _resolve_log_command(state: dict[str, Any], cfg: dict[str, Any]) -> str:
+    """Punto unico (regola L) per risolvere il comando log del criterio
+    service_logs_clean nel final_gate. Generalizza il vecchio
+    `cfg.get('final_gate_runtime_log_command')` (docker-only hardcoded nei
+    settings) a una risoluzione PER-PROGETTO consapevole dello stack.
+
+    Ordine di priorita' (esegue la prima regola applicabile):
+
+      1. Override admin per-progetto (setting
+         `agent.final_gate.runtime_log_command_per_project`, JSON object
+         {project_id_uuid: 'comando shell'}). L'admin sa esattamente cosa
+         eseguire: vince su tutto.
+      2. Auto-detect dallo stack guardando i `run_configurations` essential
+         del progetto:
+           - se almeno una usa docker/podman -> stack CONTAINER -> default
+             docker compose (`agent.final_gate.runtime_log_command`).
+           - se TUTTE sono native (npm/cargo/dotnet/python/...) -> stack
+             NATIVE -> systemd template
+             (`agent.final_gate.runtime_log_command_systemd`) con `{slug}`
+             sostituito dal name del progetto (riproduce esattamente il
+             prefisso delle unit installate dal wizard, vedi
+             project_workspace/logs.rs).
+      3. Fallback retro-compatibile: setting globale
+         `agent.final_gate.runtime_log_command` (docker compose default).
+
+    Best-effort: su errore DB ritorna il default docker (non blocca mai il
+    final_gate per problemi di config); senza project_id ritorna il default
+    docker (non c'e' modo di per-progettizzare un run senza progetto)."""
+    docker_default = str(cfg.get("final_gate_runtime_log_command") or "")
+    project_id = state.get("project_id") or os.environ.get("NEXUS_PROJECT_ID", "")
+    project_id_str = str(project_id or "").strip()
+    if not project_id_str:
+        return docker_default
+
+    try:
+        from brain.utils.db_pool import connect as _db_connect
+    except Exception:
+        return docker_default
+
+    try:
+        with _db_connect() as conn, conn.cursor() as cur:
+            # 1. Override admin esplicito per project_id (vince su tutto).
+            cur.execute(
+                "SELECT value FROM settings "
+                "WHERE key = 'agent.final_gate.runtime_log_command_per_project'"
+            )
+            row = cur.fetchone()
+            raw = (row[0] if row and row[0] else "").strip()
+            if raw and raw not in ("{}", "null"):
+                try:
+                    import json as _json
+                    overrides = _json.loads(raw)
+                    if isinstance(overrides, dict):
+                        cmd = overrides.get(project_id_str)
+                        if cmd and isinstance(cmd, str) and cmd.strip():
+                            return cmd.strip()
+                except Exception as exc:  # pragma: no cover - difensivo
+                    logger.debug(
+                        "runtime_log_command_per_project: JSON invalido (%s)", exc,
+                    )
+
+            # 2. Auto-detect dallo stack: i run_configurations 'essential'
+            #    decidono se siamo Container (docker/podman) o Native (systemd).
+            cur.execute(
+                "SELECT kind, command FROM run_configurations "
+                "WHERE project_id = %s AND essential = TRUE",
+                (project_id_str,),
+            )
+            rows = cur.fetchall()
+            if rows:
+                def _is_container(cmd: str) -> bool:
+                    low = (cmd or "").lower()
+                    return (
+                        low.startswith(("docker", "podman"))
+                        or "docker compose" in low
+                        or "docker-compose" in low
+                        or "podman compose" in low
+                    )
+                is_container_stack = any(_is_container(str(c or "")) for _k, c in rows)
+                if is_container_stack:
+                    return docker_default
+
+                # Stack nativo (npm/cargo/dotnet/...): risolvi lo slug dal
+                # name del progetto e applica il template systemd. NB: lo
+                # slug deve coincidere con quello del wizard Rust (logs.rs),
+                # vedi _project_slug.
+                cur.execute(
+                    "SELECT name FROM projects WHERE id = %s",
+                    (project_id_str,),
+                )
+                name_row = cur.fetchone()
+                if name_row and name_row[0]:
+                    slug = _project_slug(str(name_row[0]))
+                    cur.execute(
+                        "SELECT value FROM settings "
+                        "WHERE key = 'agent.final_gate.runtime_log_command_systemd'"
+                    )
+                    tpl_row = cur.fetchone()
+                    tpl = (tpl_row[0] if tpl_row and tpl_row[0] else "").strip()
+                    if tpl and "{slug}" in tpl:
+                        return tpl.replace("{slug}", slug)
+    except Exception as exc:  # pragma: no cover - difensivo
+        logger.debug("final_gate._resolve_log_command: %s", exc)
+
+    # 3. Fallback retro-compatibile (docker default storico).
+    return docker_default
 
 
 def _resolve_build_command(state: dict[str, Any]) -> tuple[str, str | None] | None:
@@ -127,6 +246,54 @@ def _build_timeout_s() -> float:
         return 180.0
 
 
+def _build_output_max_chars() -> int:
+    """Limite caratteri dell'output_excerpt esposto all'agente quando il
+    criterio BUILD fallisce (mig 0426). Default 4000: un build TS/cargo puo'
+    emettere molti errori; troncare a 600 char rende invisibili tutti quelli
+    sotto il primo, e l'agente sistema un errore alla volta restando in loop.
+    Best-effort: su errore DB usa il default 4000."""
+    try:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM settings WHERE key = 'agent.final_gate.build_output_max_chars'"
+            )
+            row = cur.fetchone()
+            v = int(row[0]) if row and row[0] else 4000
+            # Guard: minimi/massimi sani.
+            if v < 1000:
+                v = 1000
+            if v > 32000:
+                v = 32000
+            return v
+    except Exception:
+        return 4000
+
+
+# Pattern di errore di compilazione comuni (TypeScript, Rust, generici). Il
+# conteggio e' indicativo (best-effort): serve a comunicare all'agente la
+# SCALA del problema, non a essere un parser esatto.
+_BUILD_ERROR_PATTERNS = (
+    re.compile(r"error TS\d+:", re.IGNORECASE),       # tsc
+    re.compile(r"\berror\[E\d+\]", re.IGNORECASE),    # rustc
+    re.compile(r"\bSyntaxError\b"),
+    re.compile(r"\bTypeError\b"),
+    re.compile(r"^\s*error:\s", re.MULTILINE),         # generico cargo/cc
+)
+
+
+def _count_build_errors(output: str) -> int:
+    """Conta occorrenze grezze di errori in un output di build (TS/Rust/...).
+    Indicativo: serve a far sapere all'agente quanti errori deve risolvere
+    (non solo il primo). Ritorna 0 se l'output e' vuoto o nessun pattern matcha."""
+    if not output:
+        return 0
+    total = 0
+    for pat in _BUILD_ERROR_PATTERNS:
+        total += len(pat.findall(output))
+    return total
+
+
 async def run_general_gates(
     state: dict[str, Any], cfg: dict[str, Any]
 ) -> tuple[bool, list[dict[str, Any]]]:
@@ -168,16 +335,21 @@ async def run_general_gates(
     # Verifica runtime E2E (mig 0374): i log dei servizi non devono contenere
     # errori runtime. Cattura il pattern "codice scritto ma flusso reale rotto"
     # (es. endpoint 500 perche' una tabella manca) che l'agente ignorerebbe.
+    # Il comando log e' risolto PER-PROGETTO (mig 0427, regola L): docker
+    # compose per stack container, journalctl --user --user-unit '{slug}-*' per
+    # stack systemd; override admin esplicito tramite setting
+    # `agent.final_gate.runtime_log_command_per_project`.
     if cfg.get("final_gate_runtime_check_enabled"):
-        criteria.append({
-            "type": "service_logs_clean",
-            "spec": {
-                "command": cfg.get("final_gate_runtime_log_command")
-                or "docker compose logs --tail 200 --no-color 2>&1 | tail -n 200",
-                "patterns": cfg.get("final_gate_runtime_error_patterns") or [],
-            },
-            "expected": {},
-        })
+        log_cmd = _resolve_log_command(state, cfg)
+        if log_cmd:
+            criteria.append({
+                "type": "service_logs_clean",
+                "spec": {
+                    "command": log_cmd,
+                    "patterns": cfg.get("final_gate_runtime_error_patterns") or [],
+                },
+                "expected": {},
+            })
 
     # Criterio BUILD (fix qualita' 2026-06-15): il codice deve COMPILARE prima
     # di chiudere "completed", non solo esistere (outputs_exist). Comando
@@ -187,9 +359,16 @@ async def run_general_gates(
     build = _resolve_build_command(state)
     if build is not None:
         build_cmd, build_cwd = build
+        # `max_output_chars`: override del troncamento standard (600) del
+        # _check_run_command. Un build TS/cargo emette molti errori sotto il
+        # primo: senza piu' contesto l'agente vede solo l'errore in cima e
+        # ignora gli altri (fix qualita' 2026-06-15, mig 0426).
         build_crit: dict[str, Any] = {
             "type": "run_command",
-            "spec": {"command": build_cmd},
+            "spec": {
+                "command": build_cmd,
+                "max_output_chars": _build_output_max_chars(),
+            },
             "expected": {"exit_code": 0},
             "timeout_s": _build_timeout_s(),
         }
@@ -226,20 +405,76 @@ def _render_failed_block(
     # service_logs_clean, ...) fornisce gia' il suo output_excerpt con diagnosi +
     # "AGISCI". Li aggreghiamo invece di un testo fisso (prima parlava solo del
     # caso Figma; ora copre anche gli errori runtime).
+    #
+    # Cap per-criterio: il run_command del criterio BUILD porta gia' il suo
+    # `max_output_chars` (mig 0426, default 4000): rispettiamo quel budget per
+    # NON ri-troncare a 900 (taglio storico) gli errori di build, altrimenti
+    # l'agente vede solo il primo errore TS/cargo e corregge una cosa alla
+    # volta restando in loop. Per gli altri criteri (excerpt = verdict/error
+    # breve) il taglio rimane a 900 per contenere il prompt.
     failed = [r for r in results if not r.get("passed")]
     body_parts: list[str] = []
+    build_errors_count = 0
+    build_truncated = False
     for r in failed:
         ev = r.get("evidence") or {}
         excerpt = ev.get("output_excerpt") or ev.get("verdict") or ev.get("error") or ""
-        if excerpt:
+        if not excerpt:
+            continue
+        is_build_run_cmd = (
+            r.get("type") == "run_command"
+            and ev.get("exit_code") is not None
+            and ev.get("output_total_chars") is not None
+        )
+        if is_build_run_cmd:
+            # Il criterio build espone l'excerpt gia' tagliato dal runner alla
+            # soglia configurata: lo passiamo intero.
+            text = str(excerpt)
+            build_errors_count = _count_build_errors(text)
+            build_truncated = bool(ev.get("output_truncated"))
+            total_chars = int(ev.get("output_total_chars") or len(text))
+            header_bits = [f"[{r.get('type')}]"]
+            if build_errors_count > 0:
+                header_bits.append(f"errori rilevati: {build_errors_count}")
+            if build_truncated:
+                header_bits.append(
+                    f"output troncato ({len(text)}/{total_chars} char): "
+                    "rilancia il build per leggere il resto"
+                )
+            body_parts.append(" ".join(header_bits) + "\n" + text)
+        else:
             body_parts.append(f"[{r.get('type')}]\n{str(excerpt)[:900]}")
     detail = "\n\n".join(body_parts) if body_parts else "Una verifica del gate e' fallita."
+
+    # Direttiva rafforzata (fix qualita' 2026-06-15): l'agente deve leggere
+    # TUTTO l'output, correggere TUTTI gli errori (non solo il primo) e
+    # lavorare per CONVERGENZA. Niente "completed" finche' il build non passa
+    # al 100%. Se l'output e' troncato, rilanciare il comando di build (o
+    # rileggere i file impattati) per recuperare il contesto mancante.
+    directives_lines = [
+        "DIRETTIVE (fail-closed):",
+        "- Leggi TUTTO l'output qui sopra: ogni errore va corretto, non solo il primo.",
+        "- Correggi TUTTI gli errori in un solo giro quando possibile: edita ogni file",
+        "  impattato (anche errori 'banali' tipo unused/type mismatch contano).",
+        "- Se l'output e' troncato (vedi nota 'output troncato'), rilancia il comando di",
+        "  build con run_command (o rileggi i file impattati) per vedere il resto.",
+        "- Lavora per CONVERGENZA: niente 'task completato' finche' il build non passa",
+        "  al 100% (exit 0, zero errori). Riverifica sempre dopo le correzioni.",
+    ]
+    if build_errors_count > 0:
+        directives_lines.insert(
+            1,
+            f"- Numero di errori rilevati nel build: {build_errors_count}. "
+            "Risolvili TUTTI prima del prossimo final_gate.",
+        )
+    directives = "\n".join(directives_lines)
 
     body = (
         f"<final_gate_failed cycle=\"{cycle}/{max_cycles}\">\n"
         "Verifica pre-chiusura FALLITA. NON dichiarare il task completato finche'\n"
         "non e' risolto e RIVERIFICATO esercitando il flusso reale.\n\n"
-        f"{detail}\n"
+        f"{detail}\n\n"
+        f"{directives}\n"
         "</final_gate_failed>"
     )
 
