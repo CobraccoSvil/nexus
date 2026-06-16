@@ -31,6 +31,10 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             "/api/embedder-status",
             get(nexus_bridge::nexus_embedder_status),
         )
+        // /api/embed — embedding ONNX in-process (punto unico, regola L). Il
+        // brain Python delega qui invece di caricare PyTorch. No-auth come gli
+        // altri endpoint interni del bridge.
+        .route("/api/embed", post(nexus_bridge::nexus_embed))
         .route("/auth/github", get(auth::github_login))
         .route("/auth/github/callback", get(auth::github_callback))
         .route(
@@ -199,6 +203,13 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
         .route(
             "/api/chat/agent-runs/:run_id/next-actions",
             get(chat_agent::get_agent_run_next_actions).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/chat/sessions/:session_id/meta-steps",
+            get(chat_agent::get_session_meta_steps).layer(axum_mw::from_fn_with_state(
                 state.clone(),
                 middleware::require_auth,
             )),

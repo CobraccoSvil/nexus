@@ -460,6 +460,67 @@ pub async fn get_agent_run_next_actions(
     Ok(Json(json!({ "choices": choices })))
 }
 
+/// GET /api/chat/sessions/:session_id/meta-steps -- ripristina l'INTERA timeline
+/// dei meta_step (plan/routing/clarify/fallback/reflection/next_actions) persistiti
+/// per i run della sessione. Gemello di `get_agent_run_next_actions` ma esteso a
+/// tutta la sessione e a tutti i kind: serve a ricostruire `metaStepsMap` nel
+/// frontend dopo un reload, dato che gli eventi SSE vivono solo in memoria e si
+/// perdono al refresh (la timeline delle card sparirebbe pur restando nel DB).
+/// Risposta: { runs: { "<run_id>": [{kind,title,payload,correlationId,createdAt}] } }.
+pub async fn get_session_meta_steps(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
+
+    // Ownership via join su agent_runs.user_id + filtro sessione: nessun leak
+    // cross-utente. LIMIT di sicurezza per non caricare timeline sterminate.
+    let rows = sqlx::query(
+        "SELECT m.run_id, m.kind, m.title, m.payload, m.correlation_id, m.created_at
+         FROM nexus_agent_meta_steps m
+         JOIN agent_runs r ON r.id = m.run_id
+         WHERE r.session_id = $1 AND r.user_id = $2
+         ORDER BY m.created_at ASC
+         LIMIT 500",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Raggruppa per run_id nel formato MetaStepEntry atteso dal frontend.
+    let mut runs: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    for row in rows {
+        let run_id: Uuid = match row.try_get("run_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind: String = row.try_get("kind").unwrap_or_default();
+        let title: String = row.try_get("title").unwrap_or_default();
+        let payload: Value = row
+            .try_get::<Option<Value>, _>("payload")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| json!({}));
+        let correlation_id: Option<String> = row.try_get("correlation_id").ok().flatten();
+        let created_at: chrono::DateTime<chrono::Utc> =
+            row.try_get("created_at").unwrap_or_else(|_| chrono::Utc::now());
+        runs.entry(run_id.to_string()).or_default().push(json!({
+            "kind": kind,
+            "title": title,
+            "payload": payload,
+            "correlationId": correlation_id,
+            "createdAt": created_at.to_rfc3339(),
+        }));
+    }
+
+    Ok(Json(json!({ "runs": runs })))
+}
+
 /// POST /api/chat/agent-runs/:run_id/confirm -- approva o annulla le pending actions.
 pub async fn confirm_agent_run(
     State(state): State<AppState>,

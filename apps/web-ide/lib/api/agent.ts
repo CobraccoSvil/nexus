@@ -1,4 +1,5 @@
 import { API_BASE, NEURAL_BASE, fetchJson, fetchJsonNoAuth } from "./_shared";
+import type { MetaStepEntry } from "../use-chat/types";
 
 interface AgentStepUsage {
   promptTokens?: number;
@@ -123,6 +124,17 @@ export async function getAgentRunNextActions(
   runId: string,
 ): Promise<{ choices: RunNextActionChoice[] }> {
   return fetchJson(`${API_BASE}/api/chat/agent-runs/${runId}/next-actions`);
+}
+
+/** Timeline meta_step persistita (plan/routing/clarify/fallback/reflection/
+ *  next_actions) per i run di una sessione, raggruppata per runId. Usato per
+ *  RIPRISTINARE `metaStepsMap` dopo un reload: gli eventi SSE vivono solo in
+ *  memoria e si perdono al refresh, percio' la timeline delle card sparirebbe
+ *  pur restando nel DB. Risposta: { runs: { "<runId>": MetaStepEntry[] } }. */
+export async function getSessionMetaSteps(
+  sessionId: string,
+): Promise<{ runs: Record<string, MetaStepEntry[]> }> {
+  return fetchJson(`${API_BASE}/api/chat/sessions/${sessionId}/meta-steps`);
 }
 
 export async function getActiveRunForSession(

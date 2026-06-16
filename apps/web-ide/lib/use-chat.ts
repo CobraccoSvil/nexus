@@ -11,6 +11,7 @@ import {
   getActiveRunForSession,
   getAgentRun,
   getChatMessages,
+  getSessionMetaSteps,
   getChatSessions,
   getSessionUsage,
   resendChatMessage,
@@ -257,6 +258,17 @@ export function useChat(
       } catch { /* ignore */ }
       const history = await getChatMessages(activeSessionId);
       setMessages(history.messages ?? []);
+      // Ripristina la timeline meta_step persistita (plan/routing/clarify/
+      // fallback/reflection/next_actions): gli eventi SSE vivono solo in memoria
+      // e si perdono al refresh, qui li rileggiamo dal DB (nexus_agent_meta_steps)
+      // cosi' la presentazione della chat resta identica prima e dopo un reload.
+      try {
+        const meta = await getSessionMetaSteps(activeSessionId);
+        const entries = meta.runs ? Object.entries(meta.runs) : [];
+        if (entries.length > 0) setMetaStepsMap(new Map(entries));
+      } catch {
+        // best-effort: la chat funziona comunque, solo senza timeline storica
+      }
       // Accumulate token usage from history — esclude i messaggi soft-deleted
       // (es. assistant compattati). Senza il filtro, dopo un compact la
       // TokenUsageBar mostrerebbe ancora i token dei messaggi pre-compact.
