@@ -106,6 +106,41 @@ export function useChat(
     Array<{ content: string; options: SendChatMessageOptions }>
   >([]);
 
+  // ── Punto unico contabilita' di sessione (regola L) ────────────────────────
+  // La TokenUsageBar (token totali + costo) DEVE leggere sempre dalla stessa
+  // fonte autoritativa: l'endpoint backend getSessionUsage
+  // (GET /api/billing/session-usage -> billing.rs::get_session_usage), che
+  // aggrega i metadata per-messaggio in DB con la semantica corretta:
+  //   - total_tokens: solo messaggi VIVI (deleted_at IS NULL) -> il context %
+  //     scende dopo un compact.
+  //   - total_cost: TUTTI i messaggi, inclusi i soft-deleted dalla compattazione
+  //     -> il costo e' CUMULATIVO (gia' speso) e non si azzera compattando.
+  // Prima del fix il reload ricalcolava il costo lato client filtrando i
+  // soft-deleted (e l'invio sincrono lo accumulava in modo incrementale),
+  // ri-introducendo il "bug storico" che il backend gia' risolve: live e reload
+  // divergevano (costo che SCENDE mentre i token SALGONO sulla stessa sessione).
+  // Ora reload, fine-run e send sincrono delegano tutti a questo punto unico.
+  // Ritorna i totali per i chiamanti che devono riusarli (es. patch del
+  // messaggio sintetico terminale), oppure null se la lettura fallisce.
+  const refreshSessionUsage = useCallback(
+    async (sid: string): Promise<{ totalTokens: number; totalCostUsd: number } | null> => {
+      try {
+        const usage = await getSessionUsage(sid);
+        setTokenUsage({
+          totalTokens: usage.totalTokens,
+          totalCostUsd: usage.totalCostUsd,
+        });
+        return { totalTokens: usage.totalTokens, totalCostUsd: usage.totalCostUsd };
+      } catch {
+        // best-effort: la barra resta sull'ultimo valore noto; il prossimo turno
+        // (o un reload) la riallinea. Mai bloccare il flusso chat per un
+        // fallimento di lettura della contabilita'.
+        return null;
+      }
+    },
+    [],
+  );
+
   // ── Binding dispatcher: TokenUsageBar e tokenUsage si aggiornano in
   // ── real-time SENZA refresh browser quando il backend emette eventi chat.
   //
@@ -269,20 +304,12 @@ export function useChat(
       } catch {
         // best-effort: la chat funziona comunque, solo senza timeline storica
       }
-      // Accumulate token usage from history — esclude i messaggi soft-deleted
-      // (es. assistant compattati). Senza il filtro, dopo un compact la
-      // TokenUsageBar mostrerebbe ancora i token dei messaggi pre-compact.
-      let histTokens = 0;
-      let histCost = 0;
-      for (const msg of history.messages ?? []) {
-        if (msg.role === "assistant" && !msg.deletedAt) {
-          histTokens += msg.totalTokens ?? 0;
-          histCost += msg.totalCost ?? 0;
-        }
-      }
-      if (histTokens > 0 || histCost > 0) {
-        setTokenUsage({ totalTokens: histTokens, totalCostUsd: histCost });
-      }
+      // Contabilita' di sessione dalla fonte autoritativa (punto unico, regola
+      // L). NON ri-sommare msg.totalCost lato client: lo faceva con un filtro
+      // deletedAt che azzerava il costo dei turni compattati, divergendo dal
+      // valore live. getSessionUsage applica gia' la semantica corretta
+      // (token solo vivi per il ctx%, costo cumulativo incluso il soft-deleted).
+      await refreshSessionUsage(activeSessionId);
       setIsReady(true);
     } catch (e) {
       setError(formatChatError(e, "Impossibile inizializzare la chat."));
@@ -292,7 +319,7 @@ export function useChat(
     } finally {
       setIsLoading(false);
     }
-  }, [hasProject, projectId, opts.sessionId]);
+  }, [hasProject, projectId, opts.sessionId, refreshSessionUsage]);
 
   useEffect(() => {
     void bootstrap();
@@ -425,9 +452,8 @@ export function useChat(
                 const syntheticMsg = createTerminalMessage(finalRun, projectId, streamingTokenRef.current);
                 setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
                 try {
-                  const usage = await getSessionUsage(sid);
-                  setTokenUsage({ totalTokens: usage.totalTokens, totalCostUsd: usage.totalCostUsd });
-                  if (usage.totalTokens > 0 && syntheticMsg) {
+                  const usage = await refreshSessionUsage(sid);
+                  if (usage && usage.totalTokens > 0 && syntheticMsg) {
                     setMessages((current) =>
                       current.map((m) =>
                         m.id === syntheticMsg.id
@@ -504,6 +530,31 @@ export function useChat(
                   // "Continua" manualmente se vuole proseguire.
                   autoContinueCountRef.current = 0;
                 }
+                // REATTACH automatico al run attivo della sessione. Se il backend
+                // ha GIA' un ALTRO run in corso (l'agente si e' rilanciato come
+                // Debugger, oppure questo run e' stato superato da un nuovo run dello
+                // stesso turno), agganciamolo cosi' la chat continua a mostrarne il
+                // lavoro SENZA che l'utente debba fare un refresh manuale (causa
+                // radice del bug "si ferma e riparte solo dopo refresh" quando i run
+                // si succedono). NB: NON e' auto-continue (quello CREA un run e
+                // brucia token, vedi sopra): qui ci agganciamo solo a un run GIA'
+                // attivo nel backend — esattamente cio' che farebbe un refresh.
+                try {
+                  const { activeRun } = await getActiveRunForSession(sid);
+                  if (
+                    activeRun &&
+                    activeRun.runId !== runId &&
+                    !isStatusTerminal(activeRun.status)
+                  ) {
+                    setAgentRun(activeRun);
+                    setAgentRuns((prev) => new Map(prev).set(activeRun.runId, activeRun));
+                    setAgentStepsMap((prev) =>
+                      prev.has(activeRun.runId) ? prev : new Map(prev).set(activeRun.runId, []),
+                    );
+                    setIsLoading(true);
+                    subscribeToRun(sid, activeRun.runId, true);
+                  }
+                } catch { /* nessun run attivo o backend giu': stop normale */ }
               }
             }
             // Rimuove i run completati dalla map dopo 30s
@@ -646,7 +697,7 @@ export function useChat(
         },
       );
     },
-    [projectId],
+    [projectId, refreshSessionUsage],
   );
 
   // Riaggancia un run attivo del backend non ancora noto al client (post-refresh,
@@ -756,14 +807,11 @@ export function useChat(
             ...(response.assistantMessage ? [response.assistantMessage] : []),
           ]);
           if (response.assistantMessage) {
-            const tokens = response.assistantMessage.totalTokens ?? 0;
-            const cost = response.assistantMessage.totalCost ?? 0;
-            if (tokens > 0 || cost > 0) {
-              setTokenUsage((prev) => ({
-                totalTokens: prev.totalTokens + tokens,
-                totalCostUsd: prev.totalCostUsd + cost,
-              }));
-            }
+            // Riallinea sulla fonte autoritativa invece di accumulare lato
+            // client: l'incrementale `prev + cost` partiva dal valore corrente
+            // (eventualmente gia' divergente) e si scollava dal totale di
+            // sessione dopo un reload. getSessionUsage e' il punto unico.
+            await refreshSessionUsage(sessionId);
           }
         }
 
@@ -808,6 +856,7 @@ export function useChat(
       subscribeToRun,
       agentRun,
       reattachActiveRun,
+      refreshSessionUsage,
     ],
   );
 
