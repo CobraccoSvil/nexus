@@ -157,6 +157,26 @@ fn is_docker_compose_command(cmd: &str) -> bool {
     (l.contains("docker compose") || l.contains("docker-compose")) && l.contains(" up")
 }
 
+/// True se `command` e' un servizio long-running (dev server, watcher) secondo i
+/// pattern DB-driven `long_running_patterns` (es. `vite`, `nodemon`, `npm run dev`).
+///
+/// Questi processi NON "completano" volontariamente: un loro stop/fail e' un
+/// crash o un restart (file change, porta occupata), non l'esito di un comando
+/// batch da riferire all'agente. Risvegliare l'agente a ogni loro terminazione
+/// innesca il loop "la chat riparte da sola": dev server in crash-loop ->
+/// process_resume -> nuovo run -> l'agente ritocca i servizi -> altro crash ->
+/// altro resume... (osservato: 14 run sulla stessa sessione in ~18 minuti).
+/// I batch reali (`npm run build`, `tsc`, install, kill one-shot) NON matchano e
+/// continuano a risvegliare l'agente come previsto. Pattern dal DB (regola G/L):
+/// l'admin puo' aggiungerne senza toccare il codice.
+fn is_long_running_service(command: &str, patterns: &[String]) -> bool {
+    let c = command.to_lowercase();
+    patterns.iter().any(|p| {
+        let p = p.trim().to_lowercase();
+        !p.is_empty() && c.contains(&p)
+    })
+}
+
 #[derive(Debug, Clone)]
 struct DockerHealth {
     healthy: bool,
@@ -244,6 +264,11 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
     )
     .await as usize;
 
+    // Pattern dei servizi long-running (dev server/watcher) dal DB: un loro
+    // stop/fail e' un crash o restart, NON un batch concluso da riferire (vedi
+    // is_long_running_service). Caricati una volta per round.
+    let long_running_patterns = crate::long_running::load_enabled_patterns(&state.db).await;
+
     for row in rows {
         let id: Uuid = row.get("id");
         let project_id: Uuid = row.get("project_id");
@@ -254,6 +279,30 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
         let exit_code: Option<i32> = row.try_get("exit_code").unwrap_or(None);
         let output: String = row.try_get("output").unwrap_or_default();
         let error_output: String = row.try_get("error_output").unwrap_or_default();
+
+        // CAUSA RADICE del loop "la chat riparte da sola": i dev server / watcher
+        // long-running (vite, nodemon, dev:*) finiscono in stato stopped/failed a
+        // ogni crash o restart, ed entravano qui come fossero comandi batch
+        // conclusi -> risveglio agente -> nuovo run -> ritocco servizi -> altro
+        // crash -> altro risveglio. Un servizio long-running NON e' un batch da
+        // riferire: lo escludiamo (e lo marchiamo dispatchato per non ri-valutarlo).
+        // Il suo stato e' gia' osservato da run-panel / service_observer.
+        if is_long_running_service(&command, &long_running_patterns) {
+            let _ = sqlx::query(
+                "UPDATE agent_processes SET resume_dispatched_at = NOW() \
+                  WHERE id = $1 AND resume_dispatched_at IS NULL",
+            )
+            .bind(id)
+            .execute(&state.db)
+            .await;
+            tracing::debug!(
+                "process_resume: skip risveglio per servizio long-running {} (label='{}', command='{}') — non e' un batch concluso",
+                id,
+                label,
+                command
+            );
+            continue;
+        }
 
         // Guard anti auto-supersede (fix run uccisi dal proprio comando background):
         // il resume serve a RISVEGLIARE l'agente quando e' a riposo, NON a
@@ -455,6 +504,41 @@ mod tests {
         assert!(t.contains("out"));
         assert!(t.contains("--- stderr ---"));
         assert!(t.contains("err"));
+    }
+
+    #[test]
+    fn long_running_service_distingue_devserver_da_batch() {
+        // Pattern come quelli nel DB (long_running_patterns).
+        let patterns: Vec<String> = [
+            "vite",
+            "nodemon",
+            "npm run dev",
+            "pnpm run dev",
+            "next dev",
+            "docker compose up",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // Dev server / watcher -> long-running (NON devono risvegliare l'agente).
+        assert!(is_long_running_service("pnpm run dev:backend", &patterns));
+        assert!(is_long_running_service("pnpm exec vite --port 21976", &patterns));
+        assert!(is_long_running_service("npm run dev:frontend", &patterns));
+        assert!(is_long_running_service("vite --port 21992", &patterns));
+
+        // Batch reali -> NON long-running (devono continuare a risvegliare).
+        assert!(!is_long_running_service(
+            "if [ -f package.json ]; then npm run build; fi",
+            &patterns
+        ));
+        assert!(!is_long_running_service("pnpm install", &patterns));
+        assert!(!is_long_running_service("tsc --noEmit", &patterns));
+        assert!(!is_long_running_service("lsof -t -i:21950 | xargs kill -9", &patterns));
+
+        // Lista vuota / pattern vuoto -> niente match (nessun falso positivo).
+        assert!(!is_long_running_service("vite", &[]));
+        assert!(!is_long_running_service("vite", &["".to_string()]));
     }
 
     #[test]
