@@ -1,4 +1,11 @@
-"""Embedding service with sentence-transformers and Qdrant vector store."""
+"""Embedding service: thin client verso l'embedder ONNX di mcp-core.
+
+Cutover Fase 2 (studio brain->Rust): il modello vive UNA sola volta, in Rust
+(nexus-orchestrator OnnxMiniLmEmbedder, esposto da mcp-core POST /api/embed). Il
+brain NON carica piu' SentenceTransformer/PyTorch -> -300/400 MB RSS e ~55 thread
+BLAS in meno. Parita' vettoriale verificata (cosine 1.0 vs PyTorch), quindi i
+vettori gia' indicizzati in Qdrant restano validi (nessun re-index).
+"""
 from __future__ import annotations
 
 import logging
@@ -6,12 +13,21 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
+import httpx
 
 logger = logging.getLogger(__name__)
 
-# Lazy-load heavy dependencies
-_model_cache: dict[str, Any] = {}
+
+def _mcp_core_url() -> str:
+    """URL base di mcp-core (punto unico embedder). Env > settings DB > default."""
+    env = os.environ.get("MCP_CORE_URL")
+    if env:
+        return env.rstrip("/")
+    try:
+        from brain.utils.settings_db import get_setting
+        return get_setting("mcp_core_url", "http://127.0.0.1:4000").rstrip("/")
+    except Exception:
+        return "http://127.0.0.1:4000"
 
 
 @dataclass(slots=True)
@@ -28,7 +44,7 @@ class SearchResult:
 
 
 class EmbeddingService:
-    """Real embedding service using sentence-transformers + Qdrant."""
+    """Embedding via mcp-core ONNX (HTTP /api/embed) + Qdrant per store/search."""
 
     def __init__(
         self,
@@ -49,17 +65,7 @@ class EmbeddingService:
         self._collection = qdrant_collection
         self._qdrant_client: Any | None = None
         self._dimension = 384  # all-MiniLM-L6-v2 outputs 384-dim vectors
-
-    def _get_model(self, model_name: str) -> Any:
-        if model_name not in _model_cache:
-            try:
-                from sentence_transformers import SentenceTransformer
-                logger.info("Loading sentence-transformers model: %s", model_name)
-                _model_cache[model_name] = SentenceTransformer(model_name)
-            except ImportError:
-                logger.warning("sentence-transformers not installed, using fallback embeddings")
-                _model_cache[model_name] = None
-        return _model_cache[model_name]
+        self._embed_url = f"{_mcp_core_url()}/api/embed"
 
     def _get_qdrant(self) -> Any | None:
         if self._qdrant_client is None:
@@ -88,35 +94,56 @@ class EmbeddingService:
         except Exception as e:
             logger.warning("Failed to ensure collection: %s", e)
 
-    def _fallback_embed(self, text: str) -> list[float]:
-        """Deterministic fallback when sentence-transformers is unavailable."""
-        base = [float((ord(ch) % 13) / 13) for ch in text[:self._dimension]]
-        padded = base + [0.0] * max(0, self._dimension - len(base))
-        return padded[:self._dimension]
-
     def embed_text(self, model: str, text: str) -> EmbeddingVector:
         model_name = model or self._default_model
-        st_model = self._get_model(model_name)
-
-        if st_model is not None:
-            embedding = st_model.encode(text, normalize_embeddings=True)
-            values = embedding.tolist()
-        else:
-            values = self._fallback_embed(text)
-
-        return EmbeddingVector(model=model_name, values=values)
+        try:
+            resp = httpx.post(
+                self._embed_url,
+                json={"model": model_name, "text": text},
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            values = data.get("vector") or []
+        except Exception as e:  # errore visibile (regola G: niente fallback nascosto)
+            raise RuntimeError(
+                f"embed_text via mcp-core fallita ({self._embed_url}): {e}"
+            ) from e
+        if not values:
+            raise RuntimeError(
+                f"embed_text: vettore vuoto da mcp-core (modello {model_name})"
+            )
+        return EmbeddingVector(
+            model=str(data.get("model") or model_name),
+            values=[float(x) for x in values],
+        )
 
     def embed_batch(self, model: str, texts: list[str]) -> list[EmbeddingVector]:
         model_name = model or self._default_model
-        st_model = self._get_model(model_name)
-
-        if st_model is not None:
-            embeddings = st_model.encode(texts, normalize_embeddings=True, batch_size=32)
-            return [
-                EmbeddingVector(model=model_name, values=emb.tolist())
-                for emb in embeddings
-            ]
-        return [self.embed_text(model_name, t) for t in texts]
+        if not texts:
+            return []
+        try:
+            resp = httpx.post(
+                self._embed_url,
+                json={"model": model_name, "texts": texts},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            vectors = data.get("vectors") or []
+        except Exception as e:  # errore visibile (regola G)
+            raise RuntimeError(
+                f"embed_batch via mcp-core fallita ({self._embed_url}): {e}"
+            ) from e
+        if len(vectors) != len(texts):
+            raise RuntimeError(
+                f"embed_batch: mismatch vettori={len(vectors)} testi={len(texts)}"
+            )
+        used_model = str(data.get("model") or model_name)
+        return [
+            EmbeddingVector(model=used_model, values=[float(x) for x in v])
+            for v in vectors
+        ]
 
     def store_vectors(
         self,

@@ -780,42 +780,12 @@ async def agent_stats() -> dict[str, object]:
         return {"status": "error", "detail": str(exc)}
 
 
-# ── Streaming token (SSE) ──────────────────────────────────────────────────
-class AgentTurnStreamRequest(BaseModel):
-    provider: str
-    model: str
-    messages_json: str
-    tools_json: str
-    max_tokens: int = 8192
-    system_text: str = ""
-
-
-@router.post("/agent-turn/stream")
-async def agent_turn_stream(body: AgentTurnStreamRequest) -> StreamingResponse:
-    import json as _json
-
-    async def generate():
-        try:
-            # Ricaricare le credenziali dal DB per assicurarsi che siano aggiornate
-            runtime._load_keys_from_db()
-
-            prov = runtime.providers.get_provider(body.provider)
-            if prov is None:
-                yield f"data: {_json.dumps({'type': 'error', 'message': f'Provider {body.provider} non trovato'})}\n\n"
-                return
-            if not hasattr(prov, "generate_agent_turn_stream"):
-                yield f"data: {_json.dumps({'type': 'error', 'message': f'Provider {body.provider} non supporta lo streaming'})}\n\n"
-                return
-            messages = _json.loads(body.messages_json)
-            tools = _json.loads(body.tools_json)
-            async for chunk in prov.generate_agent_turn_stream(
-                body.model, messages, tools, body.max_tokens, body.system_text
-            ):
-                yield f"data: {_json.dumps(chunk)}\n\n"
-        except Exception as exc:
-            yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+# NB: l'endpoint POST /agent-turn/stream e' stato RIMOSSO con il consolidamento
+# del trasporto (regola L / ADR 0026): chiamava ``generate_agent_turn_stream``
+# direttamente sull'adapter SDK (bypass del gateway) e non aveva chiamanti reali
+# (ne' mcp-core ne' web-ide). Lo streaming vivo passa dal grafo LangGraph
+# (/agent/run/stream qui sotto), che a sua volta delega al gateway via il
+# registry (GatewayProvider.stream). Gli adapter SDK non eseguono piu' chiamate.
 
 
 # ── Streaming del grafo LangGraph (agent-loop) ─────────────────────────────

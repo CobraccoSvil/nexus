@@ -18,7 +18,8 @@ httpx = "^0.28.1"
 grpcio = "^1.68"
 grpcio-tools = "^1.68"
 protobuf = "^5.29"
-sentence-transformers = "^3.3"
+# sentence-transformers/torch RIMOSSI (cutover Fase 2): l'embedding ora vive in
+# Rust (mcp-core /api/embed, OnnxMiniLmEmbedder). Il brain e' thin-client HTTP.
 qdrant-client = "^1.12"
 openai = "^1.58"
 anthropic = "^0.40"

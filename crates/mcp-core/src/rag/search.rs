@@ -18,43 +18,16 @@ pub struct SearchHit {
     pub metadata: Value,
 }
 
-// URL del brain dal punto unico crate::brain_url (regola L): leggeva
-// BRAIN_REST_URL con fallback refuso 127.0.0.1:8088 (porta inesistente) -> ogni
-// embed della query falliva e nexus_search_semantic era strutturalmente rotto.
-
-async fn embed_query(
-    http: &Client,
-    base_url: &str,
-    endpoint_path: &str,
-    query: &str,
-) -> Result<Vec<f32>, RagError> {
-    let url = format!("{}{}", base_url, endpoint_path);
-    let resp = http
-        .post(&url)
-        .json(&json!({"texts": [query]}))
-        .send()
+/// Embedding della query tramite l'embedder ONNX in-process del bridge
+/// (regola L: punto unico, niente round-trip HTTP/gRPC verso il brain Python).
+/// `embed_one` e' sincrono/CPU-bound, quindi viene avvolto in `spawn_blocking`.
+async fn embed_query(query: &str) -> Result<Vec<f32>, RagError> {
+    let bridge = crate::nexus_bridge::NexusBridge::global()
+        .ok_or_else(|| RagError::Embed("nexus bridge non inizializzato".into()))?;
+    let q = query.to_string();
+    tokio::task::spawn_blocking(move || bridge.embed_one(&q))
         .await
-        .map_err(|e| RagError::Embed(format!("post {url}: {e}")))?;
-    if !resp.status().is_success() {
-        let st = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
-        return Err(RagError::Embed(format!("brain embed {st}: {txt}")));
-    }
-    let parsed: Value = resp
-        .json()
-        .await
-        .map_err(|e| RagError::Embed(format!("parse: {e}")))?;
-    let v0 = parsed
-        .get("vectors")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| RagError::Embed("response embed senza vectors[0]".into()))?;
-    let mut out = Vec::with_capacity(v0.len());
-    for x in v0 {
-        out.push(x.as_f64().unwrap_or(0.0) as f32);
-    }
-    Ok(out)
+        .map_err(|e| RagError::Embed(format!("embed_query spawn_blocking join: {e}")))
 }
 
 /// Cerca i top-K chunk piu' rilevanti per `query` filtrati su:
@@ -94,8 +67,7 @@ pub async fn search_semantic(
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| RagError::Embed(format!("reqwest: {e}")))?;
-    let base_url = crate::brain_url::brain_rest_base_url(db).await;
-    let query_vec = embed_query(&http, &base_url, &cfg.embedding_endpoint, query).await?;
+    let query_vec = embed_query(query).await?;
 
     let mut all_hits: Vec<SearchHit> = Vec::new();
     for kind in kinds {

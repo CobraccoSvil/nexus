@@ -22,15 +22,32 @@ class ProviderResult:
 
 
 class BaseProvider(abc.ABC):
-    """Abstract base for LLM providers."""
+    """Abstract base for LLM providers.
+
+    Consolidamento trasporto (regola L / ADR 0026): le CHIAMATE LLM
+    (``generate`` / ``generate_agent_turn``) sono eseguite ESCLUSIVAMENTE dal
+    ``GatewayProvider`` (delega al gateway Rust, unico trasporto). Gli adapter
+    SDK concreti (anthropic/openai/google/deepseek/mistral/ollama/vllm) non
+    implementano piu' queste chiamate: restano costruiti solo per i metodi
+    NON-chiamata (``list_models`` / ``test_connection`` / client SDK per
+    catalog-sync, vision e batch). Per questo ``generate`` /
+    ``generate_agent_turn`` NON sono piu' ``@abc.abstractmethod`` (gli adapter
+    resterebbero non istanziabili): la base offre un'implementazione di default
+    che solleva ``NotImplementedError``, sovrascritta solo dal
+    ``GatewayProvider``. ``test_connection`` e ``list_models`` restano astratti
+    perche' ogni adapter li implementa davvero (sono il loro ruolo residuo).
+    """
 
     name: str = "base"
 
-    @abc.abstractmethod
     async def generate(self, model: str, prompt: str, **kwargs: Any) -> ProviderResult:
-        ...
+        """Chiamata LLM single-turn: implementata SOLO dal GatewayProvider
+        (trasporto unico). Gli adapter SDK non eseguono piu' chiamate."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.generate non e' una chiamata LLM diretta: "
+            "le chiamate passano dal GatewayProvider (trasporto unico, regola L)."
+        )
 
-    @abc.abstractmethod
     async def generate_agent_turn(
         self,
         model: str,
@@ -39,9 +56,14 @@ class BaseProvider(abc.ABC):
         max_tokens: int = 4096,
         system_text: str = "",
     ) -> "ProviderResult":
-        """Esegue un turno agente con tool calling. Normalizza l'output al formato Anthropic
-        (stop_reason, tool_use_blocks, assistant_content, usage con input_tokens/output_tokens)."""
-        ...
+        """Turno agente con tool calling: implementato SOLO dal GatewayProvider
+        (trasporto unico). Normalizza l'output al formato Anthropic (stop_reason,
+        tool_use_blocks, assistant_content, usage con input_tokens/output_tokens).
+        Gli adapter SDK non eseguono piu' chiamate."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.generate_agent_turn non e' una chiamata LLM "
+            "diretta: le chiamate passano dal GatewayProvider (trasporto unico, regola L)."
+        )
 
     @abc.abstractmethod
     async def test_connection(self) -> dict[str, Any]:

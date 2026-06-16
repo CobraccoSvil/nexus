@@ -72,7 +72,6 @@ mod routing_config;
 mod routing_matrix;
 mod routing_matrix_auto_promoter;
 mod routing_slots;
-mod brain_url;
 mod learned_instructions;
 mod run_reaper;
 pub use nexus_tool_kit::sandbox;
@@ -587,7 +586,7 @@ async fn main() -> anyhow::Result<()> {
     nexus_builtin::seed_tools_and_server(&state.db).await;
     // Reindex semantico Qdrant dei tool MCP (fire-and-forget, +30s delay).
     // Indicizza solo i tool con embedding mancante o hash cambiato.
-    nexus_builtin::spawn_tool_reindex(state.db.clone(), state.orchestrator.neural.clone());
+    nexus_builtin::spawn_tool_reindex(state.db.clone());
 
     // ── ADR 0017 v2 F3 — re-ingest automatico se `wiki_docs` e' vuota ─────
     // Bootstrap one-shot: alla prima esecuzione dopo la migrazione 0295 la

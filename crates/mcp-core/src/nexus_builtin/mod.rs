@@ -115,11 +115,11 @@ pub async fn seed_tools_and_server(db: &PgPool) {
 /// in background. Da chiamare subito dopo `seed_tools_and_server()` al startup.
 /// Il delay di 30s garantisce che il server sia completamente inizializzato prima
 /// di aprire connessioni a Qdrant e all'embedder.
-pub fn spawn_tool_reindex(db: PgPool, neural: crate::orchestrator::NeuralCoreClient) {
+pub fn spawn_tool_reindex(db: PgPool) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let args = serde_json::json!({ "force": false });
-        let result = handle_mcp_tool_reindex(&db, Some(&neural), &args).await;
+        let result = handle_mcp_tool_reindex(&db, &args).await;
         tracing::info!("tool_reindex background completato: {}", result);
     });
 }
@@ -173,7 +173,7 @@ pub async fn execute(
             if user_role != "admin" {
                 return "[Accesso negato] nexus_mcp_tool_reindex richiede ruolo admin.".to_string();
             }
-            handle_mcp_tool_reindex(db, None, &arguments).await
+            handle_mcp_tool_reindex(db, &arguments).await
         }
         // ── admin_settings ────────────────────────────────────────────
         "nexus_admin_setting_get" => {
@@ -1388,7 +1388,7 @@ pub async fn execute_with_neural(
             if user_role != "admin" {
                 return "[Accesso negato] nexus_mcp_tool_reindex richiede ruolo admin.".to_string();
             }
-            handle_mcp_tool_reindex(db, Some(neural), &arguments).await
+            handle_mcp_tool_reindex(db, &arguments).await
         }
         // Tutti gli altri tool non usano neural: delega a execute()
         other => execute(db, user_id, project_id, user_role, other, arguments).await,

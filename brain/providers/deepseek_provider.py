@@ -1,62 +1,24 @@
-"""DeepSeek provider implementation (OpenAI-compatible API)."""
+"""DeepSeek provider adapter (OpenAI-compatible API).
+
+CHIAMATE LLM: NON eseguite da questo adapter. Dopo il consolidamento del
+trasporto (regola L / ADR 0026) tutte le chiamate (generate / agent turn)
+passano dal ``GatewayProvider`` (delega al gateway Rust). Questo adapter resta
+costruito SOLO per i metodi NON-chiamata ereditati da
+``OpenAICompatProviderBase``: ``list_models`` (catalog-sync) e ``test_connection``
+(health-check admin), piu' il client SDK on-demand che essi usano. Le quirk
+DeepSeek delle chiamate (thinking disabled per tool/task interni, sanitizzazione
+leak DSML, reasoning_content round-trip, telemetria context-cache) vivono ora nel
+gateway Rust (crates/nexus-gateway/src/providers/).
+"""
 from __future__ import annotations
 
 import logging
-import os
-from typing import Any
 
-# Modelli DeepSeek "reasoning" che non accettano temperature, top_p
-# e non supportano tool calling.
-_DEEPSEEK_REASONING_MODELS = frozenset({"deepseek-reasoner"})
-
-
-def _is_deepseek_reasoning(model: str) -> bool:
-    """Restituisce True se il modello e' un modello reasoning DeepSeek (R1/R2)."""
-    model_lower = model.lower()
-    return model_lower in _DEEPSEEK_REASONING_MODELS or "deepseek-r" in model_lower
-
-from .base import OpenAICompatProviderBase, ProviderResult
-from .openai_provider import _anthropic_tool_to_openai
-from ._response_parsers import (
-    build_agent_turn_error,
-    build_agent_turn_result,
-    build_generate_result,
-)
-from ._schema_utils import compress_tool_list
+from .base import OpenAICompatProviderBase
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.deepseek.com/v1"
-
-# Marker del formato interno DSML di DeepSeek (token speciali per le tool call)
-# colati nel TESTO: segnale STRUTTURALE di output corrotto/allucinato (incidente
-# Beauty-Book run 963a51fa: final_answer con contenuto allucinato + blocchi
-# "<｜｜DSML｜｜tool_calls>" grezzi). U+FF5C = fullwidth vertical bar; copriamo
-# anche la variante ASCII per robustezza.
-_DSML_LEAK_MARKERS = ("｜DSML｜", "|DSML|")
-
-
-def _strip_dsml_leak(text: str) -> tuple[str, bool]:
-    """Tronca il testo al primo marker DSML grezzo. Ritorna (testo, leaked).
-
-    Il contenuto DOPO il marker e' formato interno del modello (mai testo per
-    l'utente); anche il contenuto PRIMA e' sospetto, ma il troncamento e' il
-    taglio strutturale certo: se il residuo resta sotto soglia, la pipeline
-    soft-failure esistente (is_soft_failure -> cascade fallback) fa il resto.
-    """
-    if not text:
-        return text, False
-    for marker in _DSML_LEAK_MARKERS:
-        idx = text.find(marker)
-        if idx != -1:
-            # Il marker puo' essere preceduto da '<' (es. "<｜｜DSML｜｜tool_calls>"):
-            # tronca dal '<' immediatamente precedente se contiguo.
-            cut = idx
-            if cut > 0 and text[cut - 1] in "<｜":
-                while cut > 0 and text[cut - 1] in "<｜":
-                    cut -= 1
-            return text[:cut].rstrip(), True
-    return text, False
 
 
 class DeepSeekProvider(OpenAICompatProviderBase):
@@ -70,199 +32,3 @@ class DeepSeekProvider(OpenAICompatProviderBase):
     name = "deepseek"
     base_url = BASE_URL
     api_key_label = "DeepSeek"
-
-    async def generate(self, model: str, prompt: str, **kwargs: Any) -> ProviderResult:
-        if not self._api_key:
-            return self._missing_api_key_result(model)
-        try:
-            client = self._get_client()
-            create_kwargs: dict[str, Any] = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": kwargs.get("max_tokens", 4096),
-            }
-            # I modelli reasoning (deepseek-reasoner / R1) non accettano temperature.
-            if not _is_deepseek_reasoning(model):
-                create_kwargs["temperature"] = kwargs.get("temperature", 0.7)
-            # Mig 0390: i task interni TESTUALI (kwarg internal_task=True dai
-            # canali gRPC/REST e dai nodi interni del brain) spengono il thinking
-            # dei dual-mode V4: senza questo il budget di output finisce in
-            # reasoning_content e il content torna vuoto (hollow). Decisione nel
-            # PUNTO UNICO should_disable_thinking (regola L); capability
-            # best-effort: se manca, nessun cambio di comportamento.
-            if kwargs.get("internal_task"):
-                from .adapter_base import should_disable_thinking
-                try:
-                    from .capability_loader import load_capability
-                    cap = load_capability(self.name, model)
-                except Exception:  # noqa: BLE001
-                    cap = None
-                if should_disable_thinking(cap, has_tools=False, internal_task=True):
-                    create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-            response = await client.chat.completions.create(**create_kwargs)
-            choice = response.choices[0]
-            _gen_content, _gen_leaked = _strip_dsml_leak(choice.message.content or "")
-            if _gen_leaked:
-                logger.warning(
-                    "deepseek %s: marker DSML grezzi nel content (generate), troncato",
-                    model,
-                )
-            # Coda comune di generate (punto unico _response_parsers, regola L):
-            # content passato esplicito perche' gia' sanitizzato dal leak DSML.
-            return build_generate_result(self.name, model, response, content=_gen_content)
-        except Exception as e:
-            return build_agent_turn_error(e, self.name, model)
-
-    async def generate_agent_turn(
-        self,
-        model: str,
-        messages: list[dict],
-        tools: list[dict],
-        max_tokens: int = 4096,
-        system_text: str = "",
-        force_tool_choice: bool | None = None,
-        internal_task: bool = False,
-    ) -> ProviderResult:
-        """Esegue un turno agente con function calling (deepseek-chat V3+ supporta tool use).
-
-        ``internal_task`` (mig 0390): True per i task interni (purpose, canali
-        gRPC/REST di mcp-core) — sui dual-mode V4 spegne il thinking anche nelle
-        chiamate SENZA tool, evitando il content vuoto da reasoning overflow.
-        """
-        if not self._api_key:
-            return self._missing_api_key_result(model)
-        try:
-            client = self._get_client()
-            # Punto unico prepare_openai_compat_request (regola L, S78).
-            from .adapter_base import prepare_openai_compat_request
-            cap, oai_messages, max_tokens = prepare_openai_compat_request(
-                self.name, model, max_tokens, messages, system_text,
-            )
-
-            # Capability tool_use dalla fonte UNICA (vista 0318 / ADR 0024) via
-            # cap.tool_use: niente piu' decisione di capability dal nome modello
-            # (regola L). I modelli reasoning (R1) hanno tool_use=false in vista.
-            # L'euristica _is_deepseek_reasoning sul nome resta SOLO come fallback
-            # se la riga capability manca (cap is None) (degrado safe, come google_provider).
-            if cap is not None:
-                supports_tools = cap.tool_use
-            else:
-                supports_tools = not _is_deepseek_reasoning(model)
-            compressed = compress_tool_list(tools) if tools and supports_tools else []
-            oai_tools = [_anthropic_tool_to_openai(t) for t in compressed] if compressed else []
-
-            kwargs_call: dict[str, Any] = {
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": oai_messages,
-            }
-            if oai_tools:
-                kwargs_call["tools"] = oai_tools
-                # Anti-narration: forza tool_choice=required al primo turno.
-                if cap is not None:
-                    from .adapter_base import resolve_tool_choice
-                    _tc = resolve_tool_choice(
-                        cap, oai_messages, force_override=force_tool_choice
-                    )
-                    if _tc is not None:
-                        kwargs_call["tool_choice"] = _tc
-                else:
-                    from ._schema_utils import resolve_tool_choice_openai
-                    kwargs_call["tool_choice"] = resolve_tool_choice_openai(
-                        model, oai_messages, force_override=force_tool_choice,
-                    )
-
-            # ADR 0025 + mig 0390: DeepSeek V4 e' dual-mode e di DEFAULT gira in
-            # thinking mode. Il PUNTO UNICO should_disable_thinking (regola L)
-            # decide quando forzare il NON-THINKING via il parametro ufficiale
-            # extra_body.thinking=disabled (DeepSeek thinking mode guide):
-            # - richieste CON tool (ADR 0025): function calling deterministico,
-            #   nessun reasoning_content da ri-passare (400 altrimenti);
-            # - task interni TESTUALI (internal_task, mig 0390): il reasoning
-            #   brucerebbe il budget di output producendo content vuoto (hollow).
-            from .adapter_base import should_disable_thinking
-            if should_disable_thinking(cap, bool(oai_tools), internal_task):
-                kwargs_call["extra_body"] = {"thinking": {"type": "disabled"}}
-
-            response = await client.chat.completions.create(**kwargs_call)
-            choice = response.choices[0]
-            msg = choice.message
-            text_content = msg.content or ""
-            # Sanitizzazione leak DSML (output corrotto, segnale strutturale).
-            text_content, _dsml_leaked = _strip_dsml_leak(text_content)
-            if _dsml_leaked:
-                logger.warning(
-                    "deepseek %s: marker DSML grezzi nel content (output corrotto), "
-                    "troncato a %d char — la pipeline soft-failure gestisce il residuo",
-                    model, len(text_content),
-                )
-            # DeepSeek thinking mode: il reasoning_content del turno con tool_calls
-            # DEVE essere rispedito nei turni successivi (HTTP 400 altrimenti).
-            # Lo conserviamo in assistant_content come blocco type="reasoning";
-            # convert_messages_to_openai lo ri-traduce in reasoning_content.
-            # Guarded: presente solo con thinking attivo ('native'); con
-            # 'disable_for_tools' (default dual-mode) e' vuoto -> no-op.
-            reasoning_content = getattr(msg, "reasoning_content", "") or ""
-            initial_content: list[dict] = []
-            if reasoning_content:
-                initial_content.append(
-                    {"type": "reasoning", "reasoning": reasoning_content}
-                )
-
-            # Punto unico in _response_parsers (regola L, S61): tool_calls nativi
-            # + fallback XML inline nel content (M64, quirk osservato proprio su
-            # deepseek-chat). Il blocco reasoning entra come contenuto iniziale.
-            from ._response_parsers import parse_openai_compatible_choice
-            stop_reason, text_content, tool_use_blocks, assistant_content = (
-                parse_openai_compatible_choice(
-                    msg, choice.finish_reason, tools, text_content,
-                    initial_assistant_content=initial_content,
-                )
-            )
-
-            # Diagnostica (regola F: solo lunghezze + finish_reason, niente payload):
-            # i modelli deepseek a volte chiudono con content vuoto (la risposta
-            # finisce nel reasoning, o il turno e' troncato per length), causando
-            # il soft-failure M4 + fallback. Logghiamo i segnali per la causa radice.
-            if not text_content.strip() and stop_reason == "end_turn":
-                logger.warning(
-                    "deepseek %s: content VUOTO a end_turn (finish_reason=%s, "
-                    "reasoning_len=%d, completion_tokens=%s) -> soft-failure/fallback probabile",
-                    model,
-                    choice.finish_reason,
-                    len(reasoning_content),
-                    response.usage.completion_tokens if response.usage else "?",
-                )
-            usage_data = {}
-            if response.usage:
-                usage_data = {
-                    "input_tokens": response.usage.prompt_tokens,
-                    "output_tokens": response.usage.completion_tokens,
-                }
-                # Telemetria context caching DeepSeek (P1, roadmap contesto):
-                # il caching e' AUTOMATICO lato server (hit a ~1/10 del prezzo)
-                # ma questi campi non venivano letti -> ledger cieco che
-                # fatturava tutto a prezzo pieno. NB: prompt_tokens INCLUDE i
-                # cached; la decurtazione avviene nel punto unico _record_usage.
-                _hit = getattr(response.usage, "prompt_cache_hit_tokens", None)
-                _miss = getattr(response.usage, "prompt_cache_miss_tokens", None)
-                if isinstance(_hit, int) and _hit > 0:
-                    usage_data["cache_read_input_tokens"] = _hit
-                    logger.info(
-                        "deepseek cache hit: %d/%d token dal context caching (miss=%s)",
-                        _hit, response.usage.prompt_tokens, _miss,
-                    )
-
-            return build_agent_turn_result(
-                provider=self.name,
-                model=model,
-                text_content=text_content,
-                stop_reason=stop_reason,
-                tool_use_blocks=tool_use_blocks,
-                assistant_content=assistant_content,
-                usage_data=usage_data,
-            )
-        except Exception as e:
-            return build_agent_turn_error(e, self.name, model)
-
-

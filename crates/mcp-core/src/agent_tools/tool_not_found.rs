@@ -108,10 +108,10 @@ pub(crate) async fn resolve_tool_not_found(
     // ── (2b) Match semantico best-effort (solo se neural disponibile) ─────────
     // Arricchisce i suggerimenti con i tool dei connettori semanticamente vicini
     // al nome cercato. Best-effort: se Qdrant e' down/errore -> ignorato.
-    if let Some(neural) = neural {
+    if neural.is_some() {
         let semantic = tokio::time::timeout(
             LOOKUP_TIMEOUT,
-            semantic_search(db, neural, missing, user_id, project_id, 3),
+            semantic_search(db, missing, user_id, project_id, 3),
         )
         .await
         .unwrap_or_else(|_| Ok(Vec::new()));

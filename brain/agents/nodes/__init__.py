@@ -3196,43 +3196,46 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                         pass
 
                 if fallback_provider and fallback_model:
-                    p2 = _providers._providers.get(fallback_provider)  # type: ignore[attr-defined]
-                    if p2 is not None and hasattr(p2, "generate_agent_turn"):
-                        # Hint anti-loop nel system_text: chiede esplicitamente di NON ripetere il tool.
-                        anti_loop_hint = (
-                            "\n\n[ANTI-LOOP] Hai appena ripetuto la stessa tool call "
-                            f"('{tool_name}' con stesso input) più volte. "
-                            "Non ripetere la stessa tool call con lo stesso input. "
-                            "Se mancano informazioni, fai UNA richiesta più specifica "
-                            "oppure cambia strategia e riassumi lo stato."
-                        )
-                        system_text2 = (system_text or "") + anti_loop_hint
+                    # Hint anti-loop nel system_text: chiede esplicitamente di NON ripetere il tool.
+                    anti_loop_hint = (
+                        "\n\n[ANTI-LOOP] Hai appena ripetuto la stessa tool call "
+                        f"('{tool_name}' con stesso input) più volte. "
+                        "Non ripetere la stessa tool call con lo stesso input. "
+                        "Se mancano informazioni, fai UNA richiesta più specifica "
+                        "oppure cambia strategia e riassumi lo stato."
+                    )
+                    system_text2 = (system_text or "") + anti_loop_hint
 
-                        # Riprova lo stesso turno agente con provider/model più capace.
-                        prov2 = await p2.generate_agent_turn(
-                            fallback_model,
-                            anth_messages,
-                            tools_json,
-                            max_tokens=effective_max_tokens,
-                            system_text=system_text2,
+                    # Trasporto unico (regola L): il fallback anti-loop passa dal
+                    # registry -> gateway Rust come gli altri agent turn, non piu'
+                    # dall'adapter SDK diretto. generate_agent_turn_async pinna
+                    # (fallback_provider, fallback_model) gia' scelti sopra.
+                    # Riprova lo stesso turno agente con provider/model più capace.
+                    prov2 = await _providers.generate_agent_turn_async(
+                        fallback_provider,
+                        fallback_model,
+                        anth_messages,
+                        tools_json,
+                        max_tokens=effective_max_tokens,
+                        system_text=system_text2,
+                    )
+                    result_text = prov2.content or ""
+                    meta2 = prov2.metadata or {}
+                    stop_reason = meta2.get("stop_reason") or "end_turn"
+                    pending_tool_uses = list(meta2.get("tool_use_blocks") or [])
+                    assistant_content2 = meta2.get("assistant_content")
+                    if assistant_content2:
+                        assistant_msg = AIMessage(
+                            content="",
+                            additional_kwargs={"anthropic_content": assistant_content2},
                         )
-                        result_text = prov2.content or ""
-                        meta2 = prov2.metadata or {}
-                        stop_reason = meta2.get("stop_reason") or "end_turn"
-                        pending_tool_uses = list(meta2.get("tool_use_blocks") or [])
-                        assistant_content2 = meta2.get("assistant_content")
-                        if assistant_content2:
-                            assistant_msg = AIMessage(
-                                content="",
-                                additional_kwargs={"anthropic_content": assistant_content2},
-                            )
-                        else:
-                            assistant_msg = AIMessage(content=result_text)
+                    else:
+                        assistant_msg = AIMessage(content=result_text)
 
-                        provider = fallback_provider
-                        model = fallback_model
-                        tried_escalation = True
-                        new_signatures = []  # reset signature accumulator dopo escalation
+                    provider = fallback_provider
+                    model = fallback_model
+                    tried_escalation = True
+                    new_signatures = []  # reset signature accumulator dopo escalation
             except Exception as exc:
                 logger.warning("executor_node: auto-escalation fallita: %s", exc)
 
@@ -4288,24 +4291,27 @@ async def reflection_node(state: AgentState) -> dict[str, Any]:
 
         t0 = time.monotonic()
         try:
-            prov = _providers._providers.get(reflection_provider)  # type: ignore[attr-defined]
-            if prov is not None and hasattr(prov, "generate_completion_async"):
-                full_prompt = f"{sys_prompt}\n\n{user_prompt}"
-                raw_result = await asyncio.wait_for(
-                    prov.generate_completion_async(
-                        cfg_model,
-                        full_prompt,
-                        max_tokens=400,
-                        temperature=0.0,
-                    ),
-                    timeout=cfg_timeout_s,
+            # Trasporto unico (regola L): reflection passa dal registry -> gateway
+            # Rust. generate_completion_async pinna (provider, model) e funziona
+            # per TUTTI i provider; prima chiamava l'adapter SDK diretto, presente
+            # solo su anthropic/openai -> reflection muta sugli altri provider.
+            full_prompt = f"{sys_prompt}\n\n{user_prompt}"
+            raw_result = await asyncio.wait_for(
+                _providers.generate_completion_async(
+                    reflection_provider,
+                    cfg_model,
+                    full_prompt,
+                    max_tokens=400,
+                    temperature=0.0,
+                ),
+                timeout=cfg_timeout_s,
+            )
+            raw_text = raw_result.content if hasattr(raw_result, "content") else str(raw_result)
+            reflection_data = parse_reflection_response(raw_text)
+            if reflection_data is None:
+                logger.warning(
+                    "reflection_node: parsing fallito per thread=%s", thread_id
                 )
-                raw_text = raw_result.content if hasattr(raw_result, "content") else str(raw_result)
-                reflection_data = parse_reflection_response(raw_text)
-                if reflection_data is None:
-                    logger.warning(
-                        "reflection_node: parsing fallito per thread=%s", thread_id
-                    )
         except asyncio.TimeoutError:
             logger.warning(
                 "reflection_node: timeout (%.1fs) per thread=%s", cfg_timeout_s, thread_id

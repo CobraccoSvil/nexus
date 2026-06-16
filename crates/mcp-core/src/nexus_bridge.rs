@@ -562,6 +562,19 @@ impl NexusBridge {
         &self.embedder
     }
 
+    /// Embedding in-process di un singolo testo (ONNX MiniLM-384d).
+    /// Punto unico per i call site Rust (regola L): evita di importare il trait
+    /// `Embedder` ovunque e il round-trip HTTP/gRPC verso il brain Python. NB:
+    /// e' sincrono/CPU-bound, in contesto async avvolgere in `spawn_blocking`.
+    pub fn embed_one(&self, text: &str) -> Vec<f32> {
+        self.embedder.embed(text)
+    }
+
+    /// Embedding in-process di un batch di testi (vedi `embed_one`).
+    pub fn embed_many(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        self.embedder.embed_batch(texts)
+    }
+
     /// Stato osservabile dell'embedder: tipo attivo, dimensione e flag degraded.
     /// `degraded=true` quando ONNX non era disponibile e si usa HashEmbedder.
     pub fn embedder_status(&self) -> (String, usize, bool) {
@@ -1042,6 +1055,60 @@ pub async fn nexus_embedder_status() -> impl IntoResponse {
             })),
         ),
     }
+}
+
+/// Body di `POST /api/embed`. Accetta `text` (singolo) oppure `texts` (batch).
+#[derive(serde::Deserialize)]
+pub struct EmbedRequest {
+    /// Etichetta modello (compat); ignorata nella selezione (un solo embedder).
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub texts: Vec<String>,
+}
+
+/// POST /api/embed — Embedding semantico (ONNX MiniLM-384d) in-process.
+///
+/// Punto unico embedder (regola L): il brain Python delega QUI invece di
+/// caricare SentenceTransformer/PyTorch. Formato compatibile con l'endpoint
+/// `/embed` storico del brain, cosi' i call site esistenti non cambiano payload:
+///   - `{"texts":[...]}`  -> `{"model":..., "vectors":[[...]], "count":N}`
+///   - `{"text":"..."}`   -> `{"model":..., "vector":[...], "dimensions":384}`
+///
+/// L'etichetta `model` ritornata resta `all-MiniLM-L6-v2` per non invalidare la
+/// `embedder_signature` (used_model:dim) usata negli hash di indicizzazione.
+pub async fn nexus_embed(Json(req): Json<EmbedRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(bridge) = NexusBridge::global() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "bridge_not_initialized"})),
+        );
+    };
+    let embedder = bridge.embedder();
+    let model_label = if req.model.trim().is_empty() {
+        "all-MiniLM-L6-v2".to_string()
+    } else {
+        req.model.clone()
+    };
+
+    if !req.texts.is_empty() {
+        let refs: Vec<&str> = req.texts.iter().map(String::as_str).collect();
+        let vectors = embedder.embed_batch(&refs);
+        let count = vectors.len();
+        return (
+            StatusCode::OK,
+            Json(json!({"model": model_label, "vectors": vectors, "count": count})),
+        );
+    }
+
+    let vector = embedder.embed(&req.text);
+    let dim = vector.len();
+    (
+        StatusCode::OK,
+        Json(json!({"model": model_label, "vector": vector, "dimensions": dim})),
+    )
 }
 
 /// GET /nexus/stats — Snapshot dettagliato delle statistiche.

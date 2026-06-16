@@ -46,7 +46,6 @@ pub async fn test_plugin(
             // Indicizzazione semantica Qdrant (fire-and-forget)
             {
                 let db_idx = state.db.clone();
-                let neural_idx = state.orchestrator.neural.clone();
                 let server_id = resolution.mcp_server_id;
                 let server_name = resolution.mcp_server_name.clone();
                 let tools_meta: Vec<(String, String)> = tools
@@ -65,7 +64,6 @@ pub async fn test_plugin(
                     for (tname, tdesc) in &tools_meta {
                         if let Err(e) = crate::nexus_builtin::index_tool(
                             &db_idx,
-                            &neural_idx,
                             server_id,
                             &server_name,
                             tname,

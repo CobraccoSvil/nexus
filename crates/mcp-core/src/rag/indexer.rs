@@ -1,4 +1,4 @@
-//! Indexer RAG: chunking + embed batch (via brain) + upsert Qdrant.
+//! Indexer RAG: chunking + embed batch (in-process) + upsert Qdrant.
 
 use std::path::PathBuf;
 
@@ -9,51 +9,24 @@ use uuid::Uuid;
 
 use super::{chunker, current_config, qdrant_client, RagError, SourceKind};
 
-// URL del brain dal punto unico crate::brain_url (regola L): leggeva
-// BRAIN_REST_URL con fallback refuso 127.0.0.1:8088 (porta inesistente).
-
-async fn embed_batch(
-    http: &Client,
-    base_url: &str,
-    endpoint_path: &str,
-    texts: &[String],
-) -> Result<Vec<Vec<f32>>, RagError> {
+/// Embedding di un batch di testi tramite l'embedder ONNX in-process del bridge
+/// (regola L: punto unico, niente round-trip HTTP/gRPC verso il brain Python).
+/// `embed_many` e' sincrono/CPU-bound, quindi viene avvolto in `spawn_blocking`.
+async fn embed_batch(texts: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
-    let url = format!("{}{}", base_url, endpoint_path);
-    let body = json!({"texts": texts});
-    let resp = http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| RagError::Embed(format!("post {url}: {e}")))?;
-    if !resp.status().is_success() {
-        let st = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
-        return Err(RagError::Embed(format!("brain embed {st}: {txt}")));
-    }
-    let parsed: Value = resp
-        .json()
-        .await
-        .map_err(|e| RagError::Embed(format!("parse embed: {e}")))?;
-    let vectors = parsed
-        .get("vectors")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| RagError::Embed("response senza 'vectors'".into()))?;
-    let mut out = Vec::with_capacity(vectors.len());
-    for v in vectors {
-        let arr = v
-            .as_array()
-            .ok_or_else(|| RagError::Embed("vector non array".into()))?;
-        let mut floats = Vec::with_capacity(arr.len());
-        for x in arr {
-            floats.push(x.as_f64().unwrap_or(0.0) as f32);
-        }
-        out.push(floats);
-    }
-    Ok(out)
+    let bridge = crate::nexus_bridge::NexusBridge::global()
+        .ok_or_else(|| RagError::Embed("nexus bridge non inizializzato".into()))?;
+    // Clona i testi prima dello spawn (move) per evitare problemi di lifetime;
+    // i `&str` vengono ricostruiti dentro il closure.
+    let owned: Vec<String> = texts.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        bridge.embed_many(&refs)
+    })
+    .await
+    .map_err(|e| RagError::Embed(format!("embed_batch spawn_blocking join: {e}")))
 }
 
 pub async fn index_text(
@@ -90,8 +63,7 @@ pub async fn index_text(
         .build()
         .map_err(|e| RagError::Embed(format!("reqwest build: {e}")))?;
 
-    let base_url = crate::brain_url::brain_rest_base_url(db).await;
-    let vectors = embed_batch(&http, &base_url, &cfg.embedding_endpoint, &chunks).await?;
+    let vectors = embed_batch(&chunks).await?;
     if vectors.len() != chunks.len() {
         return Err(RagError::Embed(format!(
             "mismatch vectors={} chunks={}",

@@ -140,14 +140,14 @@ def test_judge_returns_verdict() -> None:
 
     cj._resolve_model = _res
     try:
-        class _Prov:
-            async def generate(self, model, prompt, **kw):  # noqa: ARG002
+        # Trasporto unico (regola L): il judge chiama generate_completion_async
+        # SUL REGISTRY (che delega al gateway), non piu' .generate() sull'adapter
+        # SDK. Il fake espone quindi il metodo del registry.
+        class _Registry:
+            async def generate_completion_async(self, provider, model, prompt, **kw):  # noqa: ARG002
                 class _R:
                     content = '{"fulfilled": false, "reason": "non risolto"}'
                 return _R()
-
-        class _Registry:
-            _providers = {"google": _Prov()}
 
         state = {"result": "z" * 100, "turn_action_oriented": True, "messages": []}
         verdict = asyncio.run(cj.judge(state, _Registry()))

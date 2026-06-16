@@ -87,92 +87,10 @@ def test_internal_text_policy_none_is_noop(_flag_on):
     assert should_disable_thinking(cap, has_tools=False, internal_task=True) is False
 
 
-# ── Wiring adapter DeepSeek: extra_body presente nella chiamata testuale ─────
-
-class _FakeUsage:
-    prompt_tokens = 10
-    completion_tokens = 5
-    total_tokens = 15
-
-
-class _FakeMessage:
-    content = "ok"
-    reasoning_content = ""
-    tool_calls = None
-
-
-class _FakeChoice:
-    message = _FakeMessage()
-    finish_reason = "stop"
-
-
-class _FakeResponse:
-    choices = [_FakeChoice()]
-    usage = _FakeUsage()
-
-
-class _CapturingClient:
-    """Client OpenAI-compatible finto che cattura i kwargs della create()."""
-
-    def __init__(self) -> None:
-        self.captured: dict = {}
-
-        outer = self
-
-        class _Completions:
-            async def create(self, **kwargs):
-                outer.captured = kwargs
-                return _FakeResponse()
-
-        class _Chat:
-            completions = _Completions()
-
-        self.chat = _Chat()
-
-
-@pytest.mark.asyncio
-async def test_deepseek_generate_internal_task_sends_extra_body(monkeypatch):
-    """generate() testuale con internal_task=True invia extra_body thinking
-    disabled (il probe API 2026-06-10 ha verificato che e' supportato anche
-    senza tool)."""
-    from brain.providers.deepseek_provider import DeepSeekProvider
-    from brain.providers import capability_loader
-
-    prov = DeepSeekProvider.__new__(DeepSeekProvider)
-    # Bypass del mixin ApiKeyClientMixin: niente DB nei test.
-    prov._api_key_provider = lambda: "test-key"
-    prov._cached_key = ""
-    prov._client = None
-    client = _CapturingClient()
-    monkeypatch.setattr(DeepSeekProvider, "_get_client", lambda self: client)
-    monkeypatch.setattr(
-        capability_loader, "load_capability", lambda p, m: _cap()
-    )
-    monkeypatch.setattr(adapter_base, "_internal_text_thinking_disabled", lambda: True)
-
-    result = await prov.generate("deepseek-v4-flash", "titolo?", internal_task=True)
-    assert result.content == "ok"
-    assert client.captured.get("extra_body") == {"thinking": {"type": "disabled"}}
-
-
-@pytest.mark.asyncio
-async def test_deepseek_generate_user_text_no_extra_body(monkeypatch):
-    """generate() senza internal_task: nessun extra_body (chat utente intatta)."""
-    from brain.providers.deepseek_provider import DeepSeekProvider
-    from brain.providers import capability_loader
-
-    prov = DeepSeekProvider.__new__(DeepSeekProvider)
-    # Bypass del mixin ApiKeyClientMixin: niente DB nei test.
-    prov._api_key_provider = lambda: "test-key"
-    prov._cached_key = ""
-    prov._client = None
-    client = _CapturingClient()
-    monkeypatch.setattr(DeepSeekProvider, "_get_client", lambda self: client)
-    monkeypatch.setattr(
-        capability_loader, "load_capability", lambda p, m: _cap()
-    )
-    monkeypatch.setattr(adapter_base, "_internal_text_thinking_disabled", lambda: True)
-
-    result = await prov.generate("deepseek-v4-flash", "ciao", internal_task=False)
-    assert result.content == "ok"
-    assert "extra_body" not in client.captured
+# NB: i due test di WIRING adapter DeepSeek (che chiamavano DeepSeekProvider.generate
+# per verificare l'invio di extra_body thinking=disabled) sono stati RIMOSSI con il
+# consolidamento del trasporto (regola L / ADR 0026): gli adapter SDK non eseguono
+# piu' chiamate LLM. Lo spegnimento del thinking nelle chiamate testuali interne e'
+# ora applicato dal gateway Rust (crates/nexus-gateway/src/providers/deepseek.rs,
+# parita' funzionale con should_disable_thinking). Restano i test PURI del punto
+# unico should_disable_thinking sopra, che ne coprono la logica decisionale.

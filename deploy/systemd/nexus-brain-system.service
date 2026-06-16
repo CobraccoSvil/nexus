@@ -39,6 +39,16 @@ Environment=TRANSFORMERS_OFFLINE=1
 ExecStart=/usr/bin/python3 -m brain.grpc_server.main --rest
 Restart=always
 RestartSec=5
+# Tetto memoria cgroup (rete di sicurezza, NON la causa del consumo normale).
+# A regime il brain usa ~0.8 GB (modello embedding PyTorch + 55 thread BLAS);
+# MemoryHigh=3G mette il kernel in reclaim aggressivo prima del limite, MemoryMax=4G
+# e' il muro: oltre, l'OOM del cgroup uccide SOLO il brain (Restart=always lo
+# riprende in 5s) invece di lasciar saturare la VM e congelarla. Contiene un
+# eventuale leak o doppione SO_REUSEPORT senza piu' freeze dell'intera VM WSL.
+MemoryAccounting=yes
+MemoryHigh=3G
+MemoryMax=4G
+OOMPolicy=kill
 StandardOutput=append:/tmp/nexus-neural.log
 StandardError=append:/tmp/nexus-neural.log
 

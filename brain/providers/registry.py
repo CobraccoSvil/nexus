@@ -1361,6 +1361,40 @@ class ProviderRegistry:
             )
         return await p.generate(wire_model, prompt, **kwargs)
 
+    async def generate_agent_turn_async(
+        self, provider: str, model: str, messages: list[dict], tools: list[dict], **kwargs: Any
+    ) -> ProviderResult:
+        # Gemello di generate_completion_async per l'AGENT TURN (tool calling).
+        # Trasporto unico (regola L): la chiamata passa dal gateway esattamente
+        # come gli altri path. E' una SINGOLA chiamata pinnata su (provider,
+        # model) gia' scelti dal chiamante: niente cascade/cooldown qui (quelli
+        # vivono in generate_agent_turn / generate_agent_turn_sync). I kwargs
+        # (max_tokens, system_text, ...) viaggiano pass-through al transport.
+        if self._is_transport_sentinel(provider):
+            logger.error(
+                "generate_agent_turn_async: provider='gateway' e' un trasporto, non un provider — bug nel chiamante"
+            )
+            return ProviderResult(
+                provider=provider, model=model,
+                content="[Provider 'gateway' is a transport, not a provider — bug in caller]",
+                metadata={"error": "transport_as_provider", "stop_reason": "error"},
+            )
+        if not self.is_enabled(provider):
+            return ProviderResult(
+                provider=provider, model=model,
+                content=f"[Provider '{provider}' è disabilitato]",
+                metadata={"error": "provider_disabled", "stop_reason": "error"},
+            )
+        p = self._transport_for(provider)
+        wire_model = self._transport_model(provider, model)
+        if p is None:
+            return ProviderResult(
+                provider=provider, model=model,
+                content=f"[Provider '{provider}' not found]",
+                metadata={"error": "unknown_provider", "stop_reason": "error"},
+            )
+        return await p.generate_agent_turn(wire_model, messages, tools, **kwargs)
+
     async def test_connection_async(self, provider: str) -> dict[str, Any]:
         """Health-check del provider via gateway Rust (punto unico, regola L).
 

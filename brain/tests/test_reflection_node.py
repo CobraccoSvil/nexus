@@ -232,10 +232,13 @@ class TestReflectionNode(unittest.IsolatedAsyncioTestCase):
             "weaknesses": ["nessun commento nel codice"],
             "suggestions": ["aggiungere docstring"],
         })
-        mock_prov = MagicMock()
-        mock_prov.generate_completion_async = AsyncMock(return_value=mock_result)
+        # Trasporto unico (regola L): reflection_node chiama
+        # generate_completion_async SUL REGISTRY (delega al gateway), non
+        # sull'adapter SDK. La chiave in _providers serve solo all'euristica di
+        # selezione del provider (preferisce "anthropic" se presente).
         mock_providers = MagicMock()
-        mock_providers._providers = {"anthropic": mock_prov}
+        mock_providers._providers = {"anthropic": MagicMock()}
+        mock_providers.generate_completion_async = AsyncMock(return_value=mock_result)
 
         with (
             patch.object(reflection_config, "get", return_value=self._cfg_abilitato()),
@@ -267,10 +270,10 @@ class TestReflectionNode(unittest.IsolatedAsyncioTestCase):
             "weaknesses": [],
             "suggestions": [],
         })
-        mock_prov = MagicMock()
-        mock_prov.generate_completion_async = AsyncMock(return_value=mock_result)
+        # Trasporto unico (regola L): il mock e' sul registry, non sull'adapter.
         mock_providers = MagicMock()
-        mock_providers._providers = {"anthropic": mock_prov}
+        mock_providers._providers = {"anthropic": MagicMock()}
+        mock_providers.generate_completion_async = AsyncMock(return_value=mock_result)
 
         with (
             patch.object(reflection_config, "get", return_value=self._cfg_abilitato()),
@@ -300,10 +303,10 @@ class TestReflectionNode(unittest.IsolatedAsyncioTestCase):
             "weaknesses": [],
             "suggestions": [],
         })
-        mock_prov = MagicMock()
-        mock_prov.generate_completion_async = AsyncMock(return_value=mock_result)
+        # Trasporto unico (regola L): il mock e' sul registry, non sull'adapter.
         mock_providers = MagicMock()
-        mock_providers._providers = {"anthropic": mock_prov}
+        mock_providers._providers = {"anthropic": MagicMock()}
+        mock_providers.generate_completion_async = AsyncMock(return_value=mock_result)
 
         # Peso al 50% invece del 30%
         with (
@@ -324,10 +327,11 @@ class TestReflectionNode(unittest.IsolatedAsyncioTestCase):
         async def _timeout_prov(*args, **kwargs):
             await asyncio.sleep(999)
 
-        mock_prov = MagicMock()
-        mock_prov.generate_completion_async = _timeout_prov
+        # Trasporto unico (regola L): il timeout e' simulato sul metodo del
+        # registry (generate_completion_async), non sull'adapter SDK.
         mock_providers = MagicMock()
-        mock_providers._providers = {"anthropic": mock_prov}
+        mock_providers._providers = {"anthropic": MagicMock()}
+        mock_providers.generate_completion_async = _timeout_prov
 
         with (
             patch.object(reflection_config, "get", return_value=self._cfg_abilitato(reflection_timeout_s=0.01)),
@@ -355,10 +359,10 @@ class TestReflectionNode(unittest.IsolatedAsyncioTestCase):
             "weaknesses": ["manca logging"],
             "suggestions": ["aggiungere tracing"],
         })
-        mock_prov = MagicMock()
-        mock_prov.generate_completion_async = AsyncMock(return_value=mock_result)
+        # Trasporto unico (regola L): il mock e' sul registry, non sull'adapter.
         mock_providers = MagicMock()
-        mock_providers._providers = {"anthropic": mock_prov}
+        mock_providers._providers = {"anthropic": MagicMock()}
+        mock_providers.generate_completion_async = AsyncMock(return_value=mock_result)
 
         with (
             patch.object(reflection_config, "get", return_value=self._cfg_abilitato()),

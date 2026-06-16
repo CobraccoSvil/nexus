@@ -299,8 +299,12 @@ impl Embedder for OnnxMiniLmEmbedder {
 
     fn embed(&self, text: &str) -> Vec<f32> {
         // ── Tokenizzazione ────────────────────────────────────────────────
-        // Tronchiamo a 512 token (limite BERT).
-        let encoding = match self.tokenizer.encode(text, false) {
+        // add_special_tokens=true: aggiunge [CLS]/[SEP] come fa SentenceTransformer.
+        // SENZA di essi il mean-pooling opera su token diversi e i vettori
+        // divergono dal modello PyTorch (parita' cosine crollava a 0.33 sulle
+        // frasi corte) -> i vettori gia' indicizzati in Qdrant sarebbero
+        // incompatibili. Il tokenizer BERT applica il TemplateProcessing.
+        let encoding = match self.tokenizer.encode(text, true) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("MiniLM tokenize error: {e}");
@@ -505,5 +509,64 @@ mod tests {
         let v2 = embedder.embed(text);
         assert_eq!(v1, v2);
         assert_eq!(embedder.cache_size(), 1); // Cache hit, no new entry
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test di parita' numerica ONNX (Rust) vs SentenceTransformer (PyTorch).
+// Prerequisito C6 dello studio brain->Rust: prima di sostituire l'embedder
+// Python serve dimostrare che i vettori sono numericamente compatibili con
+// quelli gia' indicizzati in Qdrant (altrimenti re-index obbligatorio).
+//
+// Riferimenti generati da Python: /tmp/minilm_ref_gen.py -> /tmp/minilm_ref.json
+// Esecuzione (modello caricato dai path assoluti via env):
+//   NEXUS_MINILM_MODEL=/home/administrator/ideai/models/minilm/model.onnx \
+//   NEXUS_MINILM_TOKENIZER=/home/administrator/ideai/models/minilm/tokenizer.json \
+//   cargo test -p nexus-orchestrator --features onnx minilm_parity -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "onnx"))]
+mod parity_tests {
+    use super::*;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb + 1e-9)
+    }
+
+    #[test]
+    #[ignore = "richiede /tmp/minilm_ref.json (generato da /tmp/minilm_ref_gen.py) + feature onnx"]
+    fn minilm_parity_vs_pytorch() {
+        let raw = std::fs::read_to_string("/tmp/minilm_ref.json")
+            .expect("genera prima i riferimenti: python3 /tmp/minilm_ref_gen.py");
+        let refs: Vec<serde_json::Value> = serde_json::from_str(&raw).expect("json valido");
+        let emb = OnnxMiniLmEmbedder::try_from_env()
+            .expect("OnnxMiniLmEmbedder: modello/tokenizer non caricati (controlla NEXUS_MINILM_*)");
+
+        let mut min_cos = 1.0_f32;
+        let mut sum_cos = 0.0_f32;
+        for r in &refs {
+            let text = r["text"].as_str().unwrap();
+            let py: Vec<f32> = r["vec"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            let rs = emb.embed(text);
+            assert_eq!(rs.len(), py.len(), "dim mismatch");
+            let cos = cosine(&py, &rs);
+            min_cos = min_cos.min(cos);
+            sum_cos += cos;
+            let preview: String = text.chars().take(38).collect();
+            eprintln!("cos={cos:.6}  len={:<4} {preview:?}", text.len());
+        }
+        let mean = sum_cos / refs.len() as f32;
+        eprintln!("--- MIN cosine={min_cos:.6}  MEAN cosine={mean:.6}  (n={}) ---", refs.len());
+        assert!(
+            min_cos > 0.999,
+            "parita' insufficiente: min cosine {min_cos:.6} < 0.999 -> re-index Qdrant necessario o bug nel pooling/tokenizer"
+        );
     }
 }

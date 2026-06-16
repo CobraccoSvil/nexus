@@ -201,7 +201,6 @@ fn embed_text_for_tool(tool_name: &str, description: &str) -> String {
 /// Idempotente: skip se hash invariato.
 pub async fn index_tool(
     db: &PgPool,
-    neural: &NeuralCoreClient,
     server_id: Uuid,
     server_name: &str,
     tool_name: &str,
@@ -219,15 +218,21 @@ pub async fn index_tool(
     .unwrap_or(None);
     let old_hash: Option<String> = existing.and_then(|(h,)| h);
 
-    // Genera embedding. Il brain ritorna il modello effettivamente usato:
-    // (modello + dimensione vettore) compongono la signature dell'embedder,
-    // che entra nell'hash per invalidarlo automaticamente al cambio embedder.
+    // Genera embedding con l'embedder ONNX in-process del bridge (regola L:
+    // punto unico, niente round-trip al brain Python). `embed_one` e'
+    // sincrono/CPU-bound, quindi avvolto in `spawn_blocking`.
     let text = embed_text_for_tool(tool_name, description);
-    let (used_model, vector) = neural
-        .embed_text_with_model("", &text)
+    let bridge = crate::nexus_bridge::NexusBridge::global()
+        .ok_or_else(|| anyhow::anyhow!("nexus bridge non inizializzato"))?;
+    let embed_input = text.clone();
+    let vector = tokio::task::spawn_blocking(move || bridge.embed_one(&embed_input))
         .await
-        .map_err(|e| anyhow::anyhow!("embed_text fallita: {e}"))?;
-    let embedder_signature = format!("{}:{}", used_model, vector.len());
+        .map_err(|e| anyhow::anyhow!("embed_text spawn_blocking join: {e}"))?;
+    // Label FISSA "all-MiniLM-L6-v2" nella signature (NON embedder.name(), che
+    // e' "onnx-minilm-l6-v2"): i vettori della tool-search gia' indicizzati sono
+    // numericamente paritetici col nuovo embedder (cosine 1.0), quindi gli hash
+    // esistenti restano validi e si evita un re-index inutile.
+    let embedder_signature = format!("all-MiniLM-L6-v2:{}", vector.len());
     let new_hash = embedding_hash(tool_name, description, &embedder_signature);
 
     // Idempotenza: a parita' di descrizione + embedder l'hash coincide -> skip
@@ -284,17 +289,29 @@ pub async fn index_tool(
 // ── Ricerca semantica Qdrant ──────────────────────────────────────────────────
 
 /// `pub(crate)` (regola L): riusata best-effort dal tool-not-found resolver per
-/// arricchire i suggerimenti con i match semantici dei connettori MCP quando il
-/// `NeuralCoreClient` (Qdrant) e' disponibile. Mai duplicata.
+/// arricchire i suggerimenti con i match semantici dei connettori MCP quando
+/// Qdrant e' disponibile. Mai duplicata.
+///
+/// L'embedding della query e' prodotto dall'embedder ONNX in-process del bridge
+/// (regola L: punto unico, niente round-trip al brain Python). I vettori cosi'
+/// generati sono paritetici a quelli usati in indicizzazione (`index_tool`).
 pub(crate) async fn semantic_search(
     db: &PgPool,
-    neural: &NeuralCoreClient,
     query: &str,
     user_id: Uuid,
     project_id: Uuid,
     limit: i64,
 ) -> anyhow::Result<Vec<Value>> {
-    let vector = neural.embed_text("", query).await?;
+    // Embedding della query con l'embedder in-process. `embed_one` e'
+    // sincrono/CPU-bound, quindi avvolto in `spawn_blocking`. Niente fallback
+    // silenzioso: se il bridge non e' inizializzato si propaga l'errore (regola G).
+    let bridge = crate::nexus_bridge::NexusBridge::global()
+        .ok_or_else(|| anyhow::anyhow!("nexus bridge non inizializzato"))?;
+    let embed_input = query.to_string();
+    let vector = tokio::task::spawn_blocking(move || bridge.embed_one(&embed_input))
+        .await
+        .map_err(|e| anyhow::anyhow!("embed_one spawn_blocking join: {e}"))?;
+
     let base = qdrant_url(db).await;
     let coll = collection_name(db).await;
     let threshold = min_score(db).await;
@@ -479,9 +496,11 @@ async fn handle_mcp_tool_search_inner(
     // riconosciuto dal dispatcher in execute_agent_tool.
     let builtin_matches = search_builtin_tools(&query, limit as usize);
 
-    // ── Tentativo 1: ricerca semantica (se neural disponibile) ────────────────
-    if let Some(neural) = neural {
-        match semantic_search(db, neural, &query, user_id, project_id, limit).await {
+    // ── Tentativo 1: ricerca semantica (se neural-core/Qdrant configurato) ────
+    // Il gate resta `neural` (presenza del NeuralCoreClient = Qdrant disponibile);
+    // l'embedding della query e' invece prodotto in-process da `semantic_search`.
+    if neural.is_some() {
+        match semantic_search(db, &query, user_id, project_id, limit).await {
             Ok(results) if !results.is_empty() || !builtin_matches.is_empty() => {
                 let mut merged = builtin_matches.clone();
                 merged.extend(results);
@@ -854,19 +873,14 @@ pub async fn handle_mcp_tool_call(
 
 /// Rigenera l'indice semantico di tutti i tool MCP (o solo quelli non ancora indicizzati).
 /// Richiede ruolo admin. Esegue in-process, restituisce un report.
-pub async fn handle_mcp_tool_reindex(
-    db: &PgPool,
-    neural: Option<&NeuralCoreClient>,
-    arguments: &Value,
-) -> String {
+pub async fn handle_mcp_tool_reindex(db: &PgPool, arguments: &Value) -> String {
     let force = arguments
         .get("force")
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let Some(neural) = neural else {
-        return format_json(&json!({"error": "embedder non disponibile (neural=None)"}));
-    };
+    // L'embedding e' in-process (bridge ONNX), non dipende piu' dal brain: il
+    // reindex funziona indipendentemente dalla disponibilita' del NeuralCoreClient.
 
     // Crea/verifica collection
     if let Err(e) = ensure_mcp_tools_collection(db).await {
@@ -910,7 +924,6 @@ pub async fn handle_mcp_tool_reindex(
 
         match index_tool(
             db,
-            neural,
             server_id,
             &server_name,
             &tool_name,

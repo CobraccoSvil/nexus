@@ -72,7 +72,6 @@ agent_approve  # handler FastAPI
 agent_state  # handler FastAPI
 agent_feedback  # handler FastAPI
 agent_stats  # handler FastAPI
-agent_turn_stream  # handler FastAPI
 agent_run_stream  # handler FastAPI
 # brain/grpc_server/routes/core.py
 health  # handler FastAPI

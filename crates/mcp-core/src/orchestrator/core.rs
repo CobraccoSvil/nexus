@@ -209,7 +209,14 @@ impl Orchestrator {
     }
 
     pub async fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        self.neural.embed_text("", text).await
+        // Embedder ONNX in-process (regola L: punto unico, niente round-trip al
+        // brain Python). spawn_blocking perche' embed() e' CPU-bound sincrono.
+        let bridge = crate::nexus_bridge::NexusBridge::global()
+            .ok_or_else(|| anyhow::anyhow!("nexus bridge non inizializzato (embed_text)"))?;
+        let text = text.to_string();
+        tokio::task::spawn_blocking(move || bridge.embed_one(&text))
+            .await
+            .map_err(|e| anyhow::anyhow!("embed_text spawn_blocking join: {e}"))
     }
 
     /// Versione "detailed" di [`resolve_agent_provider`] che restituisce

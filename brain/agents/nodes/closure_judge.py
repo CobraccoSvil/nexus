@@ -266,23 +266,21 @@ async def judge(
     if resolved is None:
         return
     prov_name, model = resolved
-    prov = None
-    try:
-        prov = providers._providers.get(prov_name)  # type: ignore[attr-defined]
-    except Exception:
-        prov = None
-    # `generate` e' il metodo CANONICO dell'interfaccia provider (base.py),
-    # presente in TUTTI i provider. NON usare `generate_completion_async`: esiste
-    # solo su anthropic/openai, quindi il judge si asterrebbe ogni volta che il
-    # purpose risolve a mistral/google/deepseek (tier light -> spesso mistral).
-    if prov is None or not hasattr(prov, "generate"):
+    # Trasporto unico (regola L): il judge passa dal registry -> gateway Rust,
+    # non piu' dall'adapter SDK diretto. generate_completion_async pinna
+    # (provider, model) e funziona per TUTTI i provider con una singola chiamata
+    # (nessuna cascade: il judge resta un check isolato, stateless).
+    if providers is None:
         return
 
     prompt = _build_prompt(task_input, result)
     t0 = time.monotonic()
     try:
         raw_res = await asyncio.wait_for(
-            prov.generate(model, prompt, max_tokens=_JUDGE_MAX_TOKENS, temperature=0.0),
+            providers.generate_completion_async(
+                prov_name, model, prompt,
+                max_tokens=_JUDGE_MAX_TOKENS, temperature=0.0,
+            ),
             timeout=_JUDGE_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
