@@ -219,8 +219,15 @@ PY_READER_RE = re.compile(
     r"|get_setting|get_bool_setting|get_int_setting|resolve_port)\s*\(\s*"
     r"(?:key\s*=\s*)?[\"']([^\"']+)[\"']"
 )
+# `FROM settings ... WHERE key = '...'`. Il `[\s"'+\\]*` tra `settings` e `WHERE`
+# tollera le query SQL spezzate su literal adiacenti: in Python la
+# concatenazione implicita ("... FROM settings " "WHERE key = '...'") e in JS/TS
+# quella con `+` inseriscono apici e newline tra le due clausole, che altrimenti
+# spezzano il match (falso MORTA, es. brain/agents/final_gate.py:120-123). La
+# classe di caratteri NON include lettere/cifre, quindi non puo' scavalcare
+# codice reale: copre solo il confine fra literal.
 SQL_KEY_EQ_RE = re.compile(
-    r"FROM\s+settings\s+WHERE\s+key\s*=\s*'([^']+)'", re.IGNORECASE)
+    r"FROM\s+settings\b[\s\"'+\\]*WHERE\s+key\s*=\s*'([^']+)'", re.IGNORECASE)
 # Call site dei lettori che NON hanno chiave literal (per riconciliazione).
 RUST_CALLSITE_RE = re.compile(
     r"\b(get_setting_checked|get_setting_nonempty|get_setting|get_bool_setting"
