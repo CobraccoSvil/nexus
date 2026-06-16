@@ -289,15 +289,33 @@ export function subscribeAgentStream(
       return;
     }
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      // Cap raggiunto: sblocca la UI consultando un'ultima volta il DB.
+      // Cap dei tentativi consecutivi raggiunto. Consulta il DB: se il run e'
+      // gia' terminato chiudi pulito; ma se e' ANCORA running NON arrenderti.
+      // CAUSA RADICE del bug "la chat si ferma e riparte solo al refresh": prima
+      // qui si faceva finish(true) INCONDIZIONATO, percio' dopo ~100s di stream
+      // morto (es. restart di mcp-core o run lento con provider in cooldown) il
+      // frontend mollava la sottoscrizione mentre il backend continuava a
+      // lavorare -> chat ferma -> refresh manuale obbligato. Ora, se il run e'
+      // vivo, azzeriamo il contatore e continuiamo a riconnettere: il frontend si
+      // riaggancia da solo appena lo stream torna disponibile.
       getAgentRun(runId)
         .then((run) => {
+          if (closed) return;
           if (isAgentRunTerminal(run.status)) {
             onStep({ runId, step: null, isFinal: true });
+            finish(true);
+          } else {
+            reconnectAttempts = 0;
+            scheduleReconnect();
           }
         })
-        .catch(() => { /* ignora: chiudiamo comunque */ })
-        .finally(() => finish(true));
+        .catch(() => {
+          // Poll fallito (backend probabilmente in riavvio): non arrenderti.
+          if (!closed) {
+            reconnectAttempts = 0;
+            scheduleReconnect();
+          }
+        });
       return;
     }
 
