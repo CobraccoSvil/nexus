@@ -11,7 +11,9 @@ use nexus_events::event::ProjectEvent;
 use uuid::Uuid;
 
 use crate::agent_types::SupervisorMode;
-use crate::chat_messages::{insert_message, spawn_agent_run, SpawnAgentParams, SpawnOutcome};
+use crate::chat_messages::{
+    insert_message, session_has_active_run, spawn_agent_run, SpawnAgentParams, SpawnOutcome,
+};
 use crate::AppState;
 
 #[allow(clippy::too_many_arguments)]
@@ -101,6 +103,25 @@ pub(crate) async fn maybe_trigger_debugger(
             return;
         }
     };
+
+    // Guard anti-loop (stesso principio di process_resume, regola L): se sulla
+    // sessione c'e' GIA' un run attivo — tipicamente un Debugger lanciato da un
+    // crash precedente che sta ancora lavorando — NON spawnarne un altro. Lo
+    // supererebbe via supersede (last-wins), uccidendo il run in corso e
+    // innescando il loop di run che si superano a vicenda mentre il servizio
+    // resta in crash-loop (es. dev server con porta occupata: ogni crash ha una
+    // firma diversa, quindi il cooldown-per-firma non frena). Si lascia finire il
+    // run attivo; al prossimo crash, se il servizio e' ancora giu', si potra'
+    // ri-triggerare quando la sessione e' di nuovo libera.
+    if session_has_active_run(&state.db, session).await {
+        tracing::debug!(
+            "service_observer: run gia' attivo sulla sessione {}, skip auto-debug per {} ({})",
+            session,
+            unit,
+            kind
+        );
+        return;
+    }
 
     let content = format!(
         "Crash rilevato automaticamente nel servizio `{unit}` (tipo: {kind}).\n\n\
