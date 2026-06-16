@@ -476,15 +476,22 @@ pub async fn get_session_meta_steps(
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
 
-    // Ownership via join su agent_runs.user_id + filtro sessione: nessun leak
-    // cross-utente. LIMIT di sicurezza per non caricare timeline sterminate.
+    // Ownership via filtro sui run della sessione di proprieta' dell'utente:
+    // nessun leak cross-utente. Si limita agli ULTIMI 30 run (per evitare di
+    // caricare timeline sterminate) ma includendo SEMPRE i run piu' recenti --
+    // un LIMIT globale con ORDER BY created_at ASC taglierebbe proprio l'ultimo
+    // run, cioe' il caso d'uso del refresh. I meta_step tornano in ordine
+    // cronologico per la ricostruzione fedele della timeline.
     let rows = sqlx::query(
         "SELECT m.run_id, m.kind, m.title, m.payload, m.correlation_id, m.created_at
          FROM nexus_agent_meta_steps m
-         JOIN agent_runs r ON r.id = m.run_id
-         WHERE r.session_id = $1 AND r.user_id = $2
-         ORDER BY m.created_at ASC
-         LIMIT 500",
+         WHERE m.run_id IN (
+             SELECT id FROM agent_runs
+             WHERE session_id = $1 AND user_id = $2
+             ORDER BY created_at DESC
+             LIMIT 30
+         )
+         ORDER BY m.created_at ASC",
     )
     .bind(session_id)
     .bind(user_id)
