@@ -2209,6 +2209,7 @@ dependencies = [
  "futures",
  "nexus-graph",
  "nexus-graph-derive",
+ "rand 0.8.5",
  "regex",
  "serde",
  "serde_json",

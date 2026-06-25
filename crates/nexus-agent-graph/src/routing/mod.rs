@@ -397,4 +397,46 @@ mod tests {
             NodeTarget::Executor
         );
     }
+
+    /// `stop_reason="error"` (errore provider): replica del default Python.
+    /// In `route_after_executor` (routing.py:101-291) "error" non matcha alcun
+    /// ramo dedicato (superseded/g1_escalated/abort/cap/tool_use/plan/G1) e cade
+    /// al default `return "learner"`. Qui: intent NON software -> il final_gate
+    /// non e' eleggibile -> default `Learner`, identico al Python.
+    #[test]
+    fn error_va_a_learner_default() {
+        let mut s = base();
+        s.stop_reason = Some(StopReason::Error);
+        s.result = Some("[Errore provider: billing_error]".into());
+        s.user_intent = Some("chat".into()); // non software -> no final_gate.
+        assert_eq!(
+            route_after_executor(&s, &RoutingConfig::default()),
+            NodeTarget::Learner
+        );
+    }
+
+    /// `route_after_verifier` (routing.py:294-311): "error" != "tool_use" ->
+    /// default `learner` (parita').
+    #[test]
+    fn error_verifier_va_a_learner() {
+        let mut s = base();
+        s.stop_reason = Some(StopReason::Error);
+        assert_eq!(
+            route_after_verifier(&s, &RoutingConfig::default()),
+            NodeTarget::Learner
+        );
+    }
+
+    /// `route_after_todo_runner` (routing.py:339-385): "error" non in
+    /// (superseded/loop_abort), != tool_use, != end_turn -> fallback finale
+    /// `executor` (parita' col Python `return "executor"`).
+    #[test]
+    fn error_todo_runner_fallback_executor() {
+        let mut s = base();
+        s.stop_reason = Some(StopReason::Error);
+        assert_eq!(
+            route_after_todo_runner(&s, &RoutingConfig::default()),
+            NodeTarget::Executor
+        );
+    }
 }

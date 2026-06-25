@@ -80,6 +80,14 @@ pub enum StopReason {
     LoopAbort,
     /// Cap G1 raggiunto.
     G1CapReached,
+    /// Errore provider durante l'executor (`__init__.py:3104-3107`): l'executor
+    /// scrive `result="[Errore provider ...]"` (NON vuoto) e `stop_reason="error"`.
+    /// Serializza in `"error"` (snake_case): e' il SOLO valore che fa entrare il
+    /// punto unico `heuristic_reward` nel ramo 0.0. Senza questa variante quel
+    /// ramo era irraggiungibile dallo stato Rust (un run fallito sarebbe stato
+    /// premiato 1.0 invece di 0.0). Sul routing cade sul default come in Python
+    /// (route_after_executor -> learner; route_after_todo_runner -> executor).
+    Error,
 }
 
 /// Meta-step semantico pubblicato al frontend chat (`state.py:24`).
