@@ -51,6 +51,35 @@ import { StaticSiteSection } from "./run/static-site-section";
 import { PortAllocationsSection } from "./run/port-allocations-section";
 import { WizardOverlay } from "./run/wizard-overlay";
 
+/**
+ * Conteggio dei servizi rilevati dal wizard ancora DA configurare, per il badge
+ * "+ Configura". Esclude:
+ *  1. i candidati gia' marcati `existing` dal backend;
+ *  2. quelli GIA' gestiti dal progetto (presenti tra `managed` per unit o short),
+ *     anche in modalita' detached: il backend `mark_existing_services` controlla
+ *     solo systemd --user, cieco in WSL/detached, quindi li conterebbe a torto;
+ *  3. i duplicati (stesso unit/short, es. lo script alias `dev` -> `dev:frontend`).
+ * Cosi' il badge non dice "3 da configurare" quando 2 sono gia' in lista e 1 e' un doppione.
+ */
+function pendingServicesCount(
+  suggestions: ServiceWizardSuggestion[],
+  managed: ProjectServiceEntry[],
+): number {
+  const managedUnits = new Set(managed.map((s) => s.unit).filter(Boolean));
+  const managedShorts = new Set(managed.map((s) => s.short).filter(Boolean));
+  const seen = new Set<string>();
+  let n = 0;
+  for (const s of suggestions) {
+    if (s.existing) continue;
+    if ((s.unit && managedUnits.has(s.unit)) || (s.short && managedShorts.has(s.short))) continue;
+    const key = s.unit || s.short || "";
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    n += 1;
+  }
+  return n;
+}
+
 interface RunPanelProps {
   projectId: string;
   projectName?: string;
@@ -356,11 +385,16 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       const r = await detectProjectServices(projectId);
       const items = r.suggestions ?? [];
       setSuggestions(items);
-      setPendingCount(items.filter(s => !s.existing).length);
+      setPendingCount(pendingServicesCount(items, services));
       if (items.length === 0) setWizardMsg("Nessun servizio rilevato automaticamente. Aggiungi una configurazione manualmente.");
     } catch { setWizardMsg("Errore durante il rilevamento. Controlla che il backend sia raggiungibile."); }
     finally { setWizardLoading(false); }
   };
+
+  // Ref a `services` per leggerlo dentro l'interval senza ricrearlo a ogni
+  // aggiornamento (il polling rinfresca `services` di continuo).
+  const servicesRef = useRef(services);
+  useEffect(() => { servicesRef.current = services; }, [services]);
 
   // Auto-fetch al mount + ogni 60s per popolare il badge "pending".
   // Niente UI: solo conteggio. L'utente apre il wizard manualmente quando vede il badge.
@@ -370,7 +404,7 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       try {
         const r = await detectProjectServices(projectId);
         if (!cancelled) {
-          setPendingCount((r.suggestions ?? []).filter(s => !s.existing).length);
+          setPendingCount(pendingServicesCount(r.suggestions ?? [], servicesRef.current));
         }
       } catch { /* ignora errori in background */ }
     };
