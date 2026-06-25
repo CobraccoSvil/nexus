@@ -23,7 +23,10 @@ pub mod shadow;
 pub mod state;
 
 pub use checkpoint_pg::PgCheckpointer;
-pub use nodes::{RouterNode, UnderstandingConfig, UnderstandingNode};
+pub use nodes::{
+    ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
+    RouterNode, UnderstandingConfig, UnderstandingNode,
+};
 pub use runtime::{AgentNodeCtx, EventSink, ExecMode, LlmGateway, ToolExecutor};
 pub use shadow::{compute_diff, persist_node_diff, DiffCollector, NodeDiff};
 pub use state::{AgentState, AutomationMode, Message, MetaStep, StateDelta, StopReason, TaskComplexity};
