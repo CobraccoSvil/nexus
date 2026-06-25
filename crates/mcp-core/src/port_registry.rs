@@ -557,32 +557,55 @@ fn read_ppid(pid: u32) -> Option<u32> {
 }
 
 /// Punto unico (regola L) della logica di dedup dei dev-server di una stessa cwd.
-/// Input: lista `(pid, start_time, ppid)` dei candidati di un gruppo cwd. Output:
-/// i PID delle RADICI da terminare (tutte le radici tranne la piu' recente).
+/// Signature di confronto di un dev-server: la cmdline con le sequenze di 4+
+/// cifre (le porte dev tipiche -- 3000/5173/21954...) rimosse. Cosi' due istanze
+/// dello STESSO server su porte diverse (Vite che auto-incrementa) collassano
+/// sulla stessa signature ed e' giusto deduplicarle, mentre servizi DIVERSI dello
+/// stesso progetto (es. `pnpm run dev:frontend` vs `pnpm run dev:backend`)
+/// restano distinti. Versioni e numeri brevi (1-3 cifre, es. `vite@5.4.21`,
+/// `worker:2`) sono preservati per non collassare servizi distinti.
+fn dev_server_signature(cmdline: &str) -> String {
+    static RE_PORTLIKE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\d{4,}").unwrap());
+    RE_PORTLIKE.replace_all(cmdline, "").to_string()
+}
+
+/// Input: lista `(pid, start_time, ppid, signature)` dei candidati di un gruppo
+/// cwd. Output: i PID delle RADICI da terminare.
 ///
 /// Una "radice" e' un processo il cui padre NON e' un altro membro del gruppo: una
 /// catena `pnpm dev -> node vite -> esbuild` nella stessa cwd e' UN solo albero con
-/// UNA radice, quindi NON un duplicato (ritorna vuoto). Sono veri duplicati solo
-/// 2+ alberi con radici indipendenti: si tiene la radice piu' recente (start time
-/// piu' alto) e si terminano le altre. Estratta da `cleanup_duplicate_dev_servers`
-/// per essere testabile senza /proc reale e per fissare la regressione 2026-06-06
-/// (catena scambiata per duplicati -> kill di gruppo che abbatteva mcp-core).
-fn dev_server_roots_to_kill(procs: &[(u32, u64, u32)]) -> Vec<u32> {
+/// UNA radice, quindi NON un duplicato (ritorna vuoto). Tra le radici indipendenti
+/// sono VERI duplicati solo quelle con la STESSA `signature` di comando (stesso
+/// dev-server rilanciato): si tiene la piu' recente (start time piu' alto) e si
+/// terminano le altre. Radici con signature DIVERSE sono servizi distinti dello
+/// stesso progetto (es. frontend e backend lanciati entrambi da `pnpm run dev:X`
+/// nella root del progetto: stessa cwd, due radici, ma NON duplicati) e non vanno
+/// toccate. Estratta per essere testabile senza /proc reale; fissa la regressione
+/// 2026-06-06 (catena scambiata per duplicati) e 2026-06-25 (frontend+backend
+/// dello stesso progetto scambiati per duplicati -> kill del backend).
+fn dev_server_roots_to_kill(procs: &[(u32, u64, u32, String)]) -> Vec<u32> {
     if procs.len() < 2 {
         return Vec::new();
     }
-    let pids_in_group: HashSet<u32> = procs.iter().map(|(p, _, _)| *p).collect();
-    let mut roots: Vec<(u32, u64)> = procs
-        .iter()
-        .filter(|(_, _, ppid)| !pids_in_group.contains(ppid))
-        .map(|(p, s, _)| (*p, *s))
-        .collect();
-    if roots.len() < 2 {
-        return Vec::new();
+    let pids_in_group: HashSet<u32> = procs.iter().map(|(p, _, _, _)| *p).collect();
+    // Radici indipendenti (padre fuori dal gruppo) raggruppate per signature.
+    let mut by_sig: HashMap<&str, Vec<(u32, u64)>> = HashMap::new();
+    for (pid, start, ppid, sig) in procs {
+        if !pids_in_group.contains(ppid) {
+            by_sig.entry(sig.as_str()).or_default().push((*pid, *start));
+        }
     }
-    // Ordina per start time decrescente: la prima radice e' la piu' recente, da tenere.
-    roots.sort_by_key(|r| std::cmp::Reverse(r.1));
-    roots.iter().skip(1).map(|(p, _)| *p).collect()
+    let mut to_kill: Vec<u32> = Vec::new();
+    for (_, mut roots) in by_sig {
+        if roots.len() < 2 {
+            continue; // un solo dev-server con questa signature: non e' un duplicato.
+        }
+        // Ordina per start time decrescente: la prima e' la piu' recente, da tenere.
+        roots.sort_by_key(|r| std::cmp::Reverse(r.1));
+        to_kill.extend(roots.iter().skip(1).map(|(p, _)| *p));
+    }
+    to_kill
 }
 
 /// Termina i dev-server duplicati per progetto avviati fuori dal registry (es.
@@ -613,7 +636,7 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
     let own_pid = std::process::id();
     // cwd risolto -> lista (pid, start_time, ppid). Il ppid serve a distinguere
     // i veri duplicati (alberi indipendenti) dalle catene padre-figlio.
-    let mut groups: HashMap<String, Vec<(u32, u64, u32)>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<(u32, u64, u32, String)>> = HashMap::new();
 
     let entries = match std::fs::read_dir("/proc") {
         Ok(e) => e,
@@ -654,7 +677,8 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
 
         let start = read_start_time(pid).unwrap_or(0);
         let ppid = read_ppid(pid).unwrap_or(0);
-        groups.entry(cwd_str).or_default().push((pid, start, ppid));
+        let sig = dev_server_signature(&cmdline);
+        groups.entry(cwd_str).or_default().push((pid, start, ppid, sig));
     }
 
     let mut killed = 0u64;
@@ -779,34 +803,56 @@ fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::dev_server_roots_to_kill;
+    use super::{dev_server_roots_to_kill, dev_server_signature};
+
+    // Helper: tuple (pid, start_time, ppid, signature).
+    fn p(pid: u32, start: u64, ppid: u32, sig: &str) -> (u32, u64, u32, String) {
+        (pid, start, ppid, sig.to_string())
+    }
 
     #[test]
     fn catena_padre_figlio_non_e_duplicato() {
         // pnpm(100) -> vite(200) -> esbuild(300): una sola radice (100, padre fuori
         // gruppo). NON e' un duplicato, nessun kill. Fissa la regressione del
         // 2026-06-06 (catena scambiata per duplicati -> suicidio di mcp-core).
-        let procs = vec![(100u32, 10u64, 1u32), (200, 20, 100), (300, 30, 200)];
+        let procs = vec![
+            p(100, 10, 1, "vite"),
+            p(200, 20, 100, "vite"),
+            p(300, 30, 200, "esbuild"),
+        ];
         assert!(dev_server_roots_to_kill(&procs).is_empty());
     }
 
     #[test]
-    fn due_alberi_indipendenti_sono_duplicati() {
-        // Due catene pnpm->vite indipendenti (radici 100 e 400, padri fuori gruppo).
-        // Tiene la radice piu' recente (400, start 40), termina l'altra (100).
+    fn due_alberi_stessa_signature_sono_duplicati() {
+        // Due catene indipendenti con la STESSA signature (stesso dev-server
+        // rilanciato, es. Vite). Tiene la radice piu' recente (400), termina 100.
         let procs = vec![
-            (100u32, 10u64, 1u32),
-            (200, 20, 100),
-            (400, 40, 1),
-            (500, 50, 400),
+            p(100, 10, 1, "vite"),
+            p(200, 20, 100, "vite"),
+            p(400, 40, 1, "vite"),
+            p(500, 50, 400, "vite"),
         ];
         assert_eq!(dev_server_roots_to_kill(&procs), vec![100]);
     }
 
     #[test]
-    fn tre_radici_tiene_solo_la_piu_recente() {
-        // Tre radici indipendenti; tiene 20 (start 9, piu' recente), termina 10 e 30.
-        let procs = vec![(10u32, 5u64, 1u32), (20, 9, 1), (30, 7, 1)];
+    fn frontend_e_backend_non_sono_duplicati() {
+        // Due radici indipendenti nella stessa cwd ma con signature DIVERSE
+        // (frontend vs backend lanciati da `pnpm run dev:X` nella root del progetto).
+        // NON sono duplicati: nessun kill. Fissa la regressione 2026-06-25 (il
+        // backend veniva ucciso come "duplicato" del frontend).
+        let procs = vec![
+            p(100, 10, 1, "node /usr/bin/pnpm run dev:backend"),
+            p(400, 40, 1, "node /usr/bin/pnpm run dev:frontend"),
+        ];
+        assert!(dev_server_roots_to_kill(&procs).is_empty());
+    }
+
+    #[test]
+    fn tre_radici_stessa_signature_tiene_la_piu_recente() {
+        // Tre radici indipendenti stessa signature; tiene 20 (start 9), termina 10 e 30.
+        let procs = vec![p(10, 5, 1, "vite"), p(20, 9, 1, "vite"), p(30, 7, 1, "vite")];
         let mut k = dev_server_roots_to_kill(&procs);
         k.sort_unstable();
         assert_eq!(k, vec![10, 30]);
@@ -814,11 +860,30 @@ mod tests {
 
     #[test]
     fn singolo_processo_nessun_kill() {
-        assert!(dev_server_roots_to_kill(&[(1u32, 1u64, 0u32)]).is_empty());
+        assert!(dev_server_roots_to_kill(&[p(1, 1, 0, "vite")]).is_empty());
     }
 
     #[test]
     fn gruppo_vuoto_nessun_kill() {
         assert!(dev_server_roots_to_kill(&[]).is_empty());
+    }
+
+    #[test]
+    fn signature_normalizza_le_porte_ma_non_le_versioni() {
+        // Stesso server su porte diverse -> stessa signature (deduplicabile).
+        assert_eq!(
+            dev_server_signature("vite --port 21954"),
+            dev_server_signature("vite --port 21955")
+        );
+        // Servizi diversi -> signature diverse (NON deduplicabili).
+        assert_ne!(
+            dev_server_signature("pnpm run dev:backend"),
+            dev_server_signature("pnpm run dev:frontend")
+        );
+        // Numeri brevi (versioni, worker:N) preservati: non collassano servizi distinti.
+        assert_ne!(
+            dev_server_signature("pnpm run worker:1"),
+            dev_server_signature("pnpm run worker:2")
+        );
     }
 }
