@@ -322,6 +322,10 @@ pub struct AgentState {
     pub active_subagent_runs: Option<Vec<String>>,
     /// Costo cumulativo dei sub-agenti in USD.
     pub subagent_cost_cumulative_usd: Option<f64>,
+    /// Numero di retry gia' consumati dal todo_runner per il todo corrente
+    /// (`todo_runner_node.py:308`, `int(state.get("todo_isolation_retries") or 0)`).
+    /// Letto prima del retry, valorizzato a `extra_retries` da `_advance_patch`.
+    pub todo_isolation_retries: Option<i64>,
 
     // ── Allegati / budget ─────────────────────────────────────────────────────
     /// Byte cumulativi letti via read_attachment/read_archive_entry.

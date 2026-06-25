@@ -27,8 +27,9 @@ pub mod test_doubles {
 
     use super::ports::{
         CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmRequest,
-        LlmResponse, LlmUsage, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome,
+        LlmResponse, LlmUsage, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome, TodoStore,
     };
+    use crate::decisions::dag_scheduler::{Todo, TodoStatus};
 
     /// Gateway LLM di test: ritorna una `LlmResponse` fissa e registra le
     /// richieste ricevute (per asserzioni sull'input passato dal nodo).
@@ -148,5 +149,64 @@ pub mod test_doubles {
 
     impl EventSink for NullEventSink {
         fn emit(&self, _ev: SseEvent) {}
+    }
+
+    /// Store todo di test: mantiene una lista di [`Todo`] in memoria e applica i
+    /// `mark_status` ricevuti (cosi' i test del `TodoRunnerNode` osservano gli
+    /// avanzamenti: in_progress/completed/blocked/skipped/pending). Registra anche
+    /// la sequenza delle `mark_status` per asserzioni su cascade-skip e retry.
+    ///
+    /// Gate shadow (come l'impl concreta, regola L): in [`ExecMode::Replay`] la
+    /// `mark_status` e' un NO-OP (nessuna registrazione in `marks`, nessuna
+    /// mutazione dei todo). Cosi' un test puo' asserire ZERO scritture in shadow
+    /// verificando `marks` vuoto.
+    pub struct StubTodoStore {
+        /// Todo correnti (ordinati per `seq`, come `list_todos`).
+        pub todos: Mutex<Vec<Todo>>,
+        /// Storico delle `mark_status` REALI (mode==Real): (todo_id, nuovo_status),
+        /// in ordine. Vuoto in shadow (Replay no-op).
+        pub marks: Mutex<Vec<(String, TodoStatus)>>,
+    }
+
+    impl StubTodoStore {
+        /// Crea uno store coi todo dati (gia' ordinati per `seq` dal chiamante).
+        pub fn with_todos(todos: Vec<Todo>) -> Self {
+            Self {
+                todos: Mutex::new(todos),
+                marks: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TodoStore for StubTodoStore {
+        async fn list_todos(&self, _run_id: &str) -> Result<Vec<Todo>, PortError> {
+            Ok(self.todos.lock().expect("lock todos").clone())
+        }
+
+        async fn mark_status(
+            &self,
+            todo_id: &str,
+            status: TodoStatus,
+            mode: ExecMode,
+        ) -> Result<(), PortError> {
+            // Gate shadow: in Replay NON si scrive (no-op), come l'impl concreta
+            // (zero side-effect sul DAG del run primario).
+            if mode != ExecMode::Real {
+                return Ok(());
+            }
+            self.marks
+                .lock()
+                .expect("lock marks")
+                .push((todo_id.to_string(), status));
+            // Applica lo status in memoria, cosi' una list_todos successiva
+            // riflette l'avanzamento (come il DB reale fra una chiamata e l'altra).
+            for t in self.todos.lock().expect("lock todos").iter_mut() {
+                if t.id == todo_id {
+                    t.status = status;
+                }
+            }
+            Ok(())
+        }
     }
 }

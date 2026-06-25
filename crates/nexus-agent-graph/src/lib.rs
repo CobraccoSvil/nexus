@@ -25,9 +25,9 @@ pub mod state;
 pub use checkpoint_pg::PgCheckpointer;
 pub use nodes::{
     count_build_errors, ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory,
-    FinalGateConfig, FinalGateNode, GateOutcome, LearnerConfig, LearnerNode, LlmDecision,
-    QdrantPayload, ReflectionConfig, ReflectionData, ReflectionNode, RouterNode, UnderstandingConfig,
-    UnderstandingNode,
+    FinalGateConfig, FinalGateNode, GateOutcome, LearnerConfig, LearnerNode, LlmDecision, OnFailure,
+    QdrantPayload, ReflectionConfig, ReflectionData, ReflectionNode, RouterNode, TodoRunnerConfig,
+    TodoRunnerNode, UnderstandingConfig, UnderstandingNode,
 };
 pub use runtime::{
     AgentNodeCtx, CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway,

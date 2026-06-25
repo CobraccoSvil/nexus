@@ -16,6 +16,7 @@ pub mod final_gate;
 pub mod learner;
 pub mod reflection;
 pub mod router;
+pub mod todo_runner;
 pub mod understanding;
 
 pub use clarify_or_expand::{
@@ -25,4 +26,5 @@ pub use final_gate::{count_build_errors, FinalGateConfig, FinalGateNode};
 pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
 pub use reflection::{ReflectionConfig, ReflectionData, ReflectionNode};
 pub use router::RouterNode;
+pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};
 pub use understanding::{UnderstandingConfig, UnderstandingNode};

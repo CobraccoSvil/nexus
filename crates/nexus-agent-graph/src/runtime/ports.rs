@@ -294,5 +294,16 @@ pub trait TodoStore: Send + Sync {
 
     /// Aggiorna lo status di un todo (UPDATE best-effort). 1:1 con i `_mark` /
     /// `_mark_todo_status` di `dag_scheduler.py` e `verifier_node.py`.
-    async fn mark_status(&self, todo_id: &str, status: TodoStatus) -> Result<(), PortError>;
+    ///
+    /// `mode` gata la scrittura come [`ToolExecutor::execute`] (punto unico del
+    /// gate shadow, regola L): l'impl concreta DEVE eseguire l'UPDATE solo in
+    /// [`ExecMode::Real`]. In [`ExecMode::Replay`] (run shadow read-only) la
+    /// chiamata e' un NO-OP: nessuna scrittura su `nexus_agent_todos`, cosi' il
+    /// run shadow non corrompe il DAG del run primario (ZERO side-effect).
+    async fn mark_status(
+        &self,
+        todo_id: &str,
+        status: TodoStatus,
+        mode: ExecMode,
+    ) -> Result<(), PortError>;
 }

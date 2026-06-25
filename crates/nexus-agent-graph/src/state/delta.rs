@@ -359,6 +359,9 @@ pub struct StateDelta {
     /// Vedi `AgentState::subagent_cost_cumulative_usd`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub subagent_cost_cumulative_usd: Option<Option<f64>>,
+    /// Vedi `AgentState::todo_isolation_retries`.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub todo_isolation_retries: Option<Option<i64>>,
 
     // ── Allegati / budget ─────────────────────────────────────────────────────
     /// Vedi `AgentState::attachment_read_bytes`.
