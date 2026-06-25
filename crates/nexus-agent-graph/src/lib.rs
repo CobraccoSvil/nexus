@@ -9,6 +9,7 @@
 
 pub mod checkpoint_pg;
 pub mod decisions;
+pub mod routing;
 pub mod state;
 
 pub use checkpoint_pg::PgCheckpointer;
