@@ -231,6 +231,90 @@ def _resolve_build_command(state: dict[str, Any]) -> tuple[str, str | None] | No
     return None
 
 
+def _resolve_endpoint_check(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Risolve un criterio HTTP FUNZIONALE per il final_gate (B1): una chiamata
+    reale all'endpoint che il task doveva far funzionare (es. il login). Senza,
+    l'agente chiude 'completed' con la build verde ma l'endpoint ancora rotto
+    (incidente login Beauty-Book: 500 dal proxy, ma build TS a posto).
+
+    De-lessicalizzato (linea anti-lessicale del repo): NON guarda il testo del
+    task. Scatta SOLO se il progetto ha una `run_configurations` con role='endpoint'
+    (o label ~ 'endpoint') e uno spec in `http_spec`. Gate via setting
+    `agent.final_gate.endpoint_check_enabled`. Ritorna il criterio {type:'http',
+    spec, expected} pronto per criteria_runner, oppure None (N/A, non blocca i
+    progetti senza endpoint configurato). Best-effort: su errore DB ritorna None.
+    """
+    try:
+        from brain.utils.db_pool import connect as _db_connect
+    except Exception:
+        return None
+    project_id = state.get("project_id") or os.environ.get("NEXUS_PROJECT_ID", "")
+    if not project_id:
+        return None
+    try:
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM settings WHERE key = 'agent.final_gate.endpoint_check_enabled'"
+            )
+            row = cur.fetchone()
+            enabled = (row[0] if row and row[0] else "true").strip().lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+            if not enabled:
+                return None
+            cur.execute(
+                "SELECT command, http_spec FROM run_configurations "
+                "WHERE project_id = %s "
+                "AND (lower(coalesce(role, '')) = 'endpoint' OR lower(label) LIKE %s) "
+                "AND http_spec IS NOT NULL "
+                "ORDER BY (lower(coalesce(role, '')) = 'endpoint') DESC LIMIT 1",
+                (project_id, "%endpoint%"),
+            )
+            rc = cur.fetchone()
+            if not rc:
+                return None
+            command, http_spec = rc[0], rc[1]
+            if not isinstance(http_spec, dict):
+                return None
+            # http_spec: {url, method?, body?, headers?, expected_status?, body_contains?}
+            url = http_spec.get("url") or command
+            if not url:
+                return None
+            spec: dict[str, Any] = {"url": url, "method": http_spec.get("method", "GET")}
+            for k in ("body", "headers"):
+                if k in http_spec:
+                    spec[k] = http_spec[k]
+            expected: dict[str, Any] = {}
+            if "expected_status" in http_spec:
+                expected["status"] = http_spec["expected_status"]
+            if "body_contains" in http_spec:
+                expected["body_contains"] = http_spec["body_contains"]
+            return {
+                "type": "http",
+                "spec": spec,
+                "expected": expected,
+                "timeout_s": _endpoint_timeout_s(),
+            }
+    except Exception as exc:  # pragma: no cover - difensivo
+        logger.debug("final_gate._resolve_endpoint_check: %s", exc)
+    return None
+
+
+def _endpoint_timeout_s() -> float:
+    """Timeout (s) del criterio endpoint HTTP, da settings (default 15)."""
+    try:
+        from brain.utils import settings_db
+
+        return float(
+            settings_db.get_setting("agent.final_gate.endpoint_timeout_seconds", "15")
+            or "15"
+        )
+    except Exception:
+        return 15.0
+
+
 def _build_timeout_s() -> float:
     """Timeout (s) del criterio build, da settings (default 180: i build sono
     lenti, i 30s del verifier non basterebbero)."""
@@ -375,6 +459,15 @@ async def run_general_gates(
         if build_cwd:
             build_crit["spec"]["working_dir"] = build_cwd
         criteria.append(build_crit)
+
+    # Criterio ENDPOINT HTTP (B1): per i progetti con una run_configuration
+    # role='endpoint', verifica con una chiamata REALE che l'endpoint risponda come
+    # atteso PRIMA di chiudere "completed". De-lessicalizzato: scatta solo su config
+    # strutturale, non sul testo del task. N/A (non blocca) se non configurato.
+    # Risolve il caso "build verde ma login ancora 500" (incidente Beauty-Book).
+    endpoint_crit = _resolve_endpoint_check(state)
+    if endpoint_crit is not None:
+        criteria.append(endpoint_crit)
 
     results: list[dict[str, Any]] = []
     for c in criteria:

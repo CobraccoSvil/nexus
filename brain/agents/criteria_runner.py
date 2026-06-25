@@ -421,16 +421,34 @@ async def _check_http(
     except ImportError:
         return False, {"error": "httpx non installato"}
 
-    expected_status = int(expected.get("status", 200))
+    # Status atteso: int singolo oppure lista (es. [200, 201] per un endpoint di
+    # login/registrazione che crea l'utente al primo accesso). Retrocompatibile.
+    raw_status = expected.get("status", 200)
+    expected_statuses = (
+        [int(s) for s in raw_status]
+        if isinstance(raw_status, (list, tuple))
+        else [int(raw_status)]
+    )
+    # body/headers opzionali: necessari per un POST reale (es. login con JSON). Il
+    # vecchio comportamento (GET senza body) resta invariato se non specificati.
+    body = spec.get("body")
+    headers = spec.get("headers") or {}
+    req_kwargs: dict[str, Any] = {}
+    if isinstance(body, (dict, list)):
+        req_kwargs["json"] = body
+    elif isinstance(body, str) and body:
+        req_kwargs["content"] = body
+    if headers:
+        req_kwargs["headers"] = headers
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.request(method, url)
+            resp = await client.request(method, url, **req_kwargs)
             actual = resp.status_code
             body_excerpt = resp.text[:400]
     except Exception as exc:
         return False, {"error": f"http call: {exc}", "url": url}
 
-    passed = actual == expected_status
+    passed = actual in expected_statuses
     if "body_contains" in expected:
         needle = expected["body_contains"]
         passed = passed and (needle in body_excerpt or needle in resp.text)
@@ -439,7 +457,7 @@ async def _check_http(
         "url": url,
         "method": method,
         "status": actual,
-        "expected_status": expected_status,
+        "expected_status": expected_statuses,
         "body_excerpt": body_excerpt,
     }
 
