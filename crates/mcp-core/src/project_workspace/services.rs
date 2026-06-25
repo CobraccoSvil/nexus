@@ -178,6 +178,51 @@ pub(super) async fn project_unit_files_on_disk(
     units
 }
 
+/// PID radice dei servizi DETACHED del progetto (avviati da
+/// `spawn_detached_service`, senza MainPID systemd) mappati al loro `short`.
+/// PUNTO UNICO (regola L): trova il processo wrapper di ogni unit via `pgrep -f`
+/// sull'ExecStart -- lo stesso criterio di `detached_process_running` e del pkill
+/// di stop -- riusando i file unit su disco (`project_unit_files_on_disk`).
+/// `detect_project_ports` usa questi PID come seed della propagazione
+/// pid->service: il processo che apre la porta e' un DISCENDENTE del wrapper
+/// (pnpm -> nodemon/vite -> node), raggiunto dalla BFS gia' presente. Senza
+/// questo seed, in WSL/detached tutte le porte risultano `service=null` e la UI
+/// non mostra il link al servizio.
+pub(super) async fn detached_service_root_pids(slug: &str) -> Vec<(u32, String)> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
+    let dir = format!("{home}/.config/systemd/user");
+    let mut out = Vec::new();
+    for fname in project_unit_files_on_disk(slug).await {
+        let short = fname
+            .strip_prefix(&format!("{slug}-"))
+            .unwrap_or(&fname)
+            .strip_suffix(".service")
+            .unwrap_or(&fname)
+            .to_string();
+        let content = tokio::fs::read_to_string(format!("{dir}/{fname}"))
+            .await
+            .unwrap_or_default();
+        let exec_start = unit_exec_start(&content);
+        if exec_start.trim().is_empty() {
+            continue;
+        }
+        if let Ok(o) = tokio::process::Command::new("pgrep")
+            .args(["-f", &exec_start])
+            .output()
+            .await
+        {
+            if o.status.success() {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        out.push((pid, short.clone()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Elenca i servizi del progetto SENZA systemd --user (manager `user@<uid>`
 /// dead, tipico in WSL). Legge i file unit in `~/.config/systemd/user/{slug}-*.
 /// service` e ne deduce lo stato dal processo detached (pgrep sull'ExecStart).
@@ -1025,12 +1070,24 @@ pub(super) async fn detect_project_ports(
         pids
     };
 
+    // 2a-bis. Servizi DETACHED (WSL/no systemd --user): il MainPID non esiste, ma
+    // il wrapper avviato da spawn_detached_service e' rintracciabile via pgrep
+    // sull'ExecStart del file unit su disco. Senza questo seed, pid_to_service
+    // resta vuoto e TUTTE le porte risultano service=null -> nessun link in UI.
+    for (pid, short) in detached_service_root_pids(slug).await {
+        if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+            pid_to_service.entry(pid).or_insert(short);
+        }
+    }
+
     // 2b. Raccogli tutti i PID rilevanti: agent + systemd + processi con cwd = project_root
     let mut all_pids: std::collections::HashSet<u32> = agent_pids
         .iter()
         .map(|p| *p as u32)
         .chain(systemd_pids)
         .collect();
+    // Seed detached (2a-bis): i PID wrapper entrano nel set per la BFS discendenti.
+    all_pids.extend(pid_to_service.keys().copied());
 
     // Scan /proc per costruire mappa figli e trovare processi con cwd nel project_root.
     // Tutto sincrono → spawn_blocking per non bloccare il runtime tokio.
