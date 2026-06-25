@@ -887,6 +887,61 @@ fn inject_override_flag(exec_start: &str, base_file: &str, override_file: &str) 
     }
 }
 
+/// Deriva le env var di un frontend dai servizi sibling gia' allocati al
+/// progetto (punto unico, regola L): `BACKEND_API_URL` e `VITE_API_URL` dalla
+/// porta del backend sibling, `NEXTAUTH_URL` dalla porta del frontend stesso.
+/// Unica fonte di verita' = le allocazioni in `nexus_port_allocations` (regola
+/// G): la porta del backend non viene mai hardcoded. Inerte se il servizio non
+/// e' un frontend o se non c'e' un backend sibling. Le guard `!contains_key`
+/// non sovrascrivono valori espliciti dell'utente. Funzione pura (nessun I/O)
+/// per essere testabile: l'incidente login Beauty-Book (proxy /api verso porta
+/// vuota -> HTTP 500) nasceva dal fatto che `VITE_API_URL` non era generata.
+pub(crate) fn derive_frontend_sibling_env(
+    env_map: &mut std::collections::HashMap<String, String>,
+    sibling_ports: &[(i32, String)],
+    exec_start: &str,
+    kind: &str,
+) {
+    let exec_lower = exec_start.to_lowercase();
+    let is_frontend = matches!(kind, "npm" | "pnpm")
+        || exec_lower.contains("next")
+        || exec_lower.contains("vite")
+        || exec_lower.contains("react-scripts")
+        || exec_lower.contains("nuxt")
+        || exec_lower.contains("astro");
+    if !is_frontend {
+        return;
+    }
+    // BACKEND_API_URL / VITE_API_URL: porta sibling con label "backend-*" o "api-*"
+    let backend_sibling = sibling_ports.iter().find(|item| {
+        let l = item.1.to_lowercase();
+        l.starts_with("backend") || l.starts_with("api-") || l.starts_with("api_")
+    });
+    if let Some((port, _)) = backend_sibling {
+        let backend_url = format!("http://127.0.0.1:{}", port);
+        if !env_map.contains_key("BACKEND_API_URL")
+            && !env_map.contains_key("BACKEND_API_INTERNAL_URL")
+        {
+            env_map.insert("BACKEND_API_URL".to_string(), backend_url.clone());
+        }
+        // VITE_API_URL: i frontend Vite leggono import.meta.env.VITE_API_URL (e il
+        // proxy di vite.config la usa come target /api) per raggiungere il backend.
+        // Inerte per i frontend non-Vite (non la leggono).
+        if !env_map.contains_key("VITE_API_URL") {
+            env_map.insert("VITE_API_URL".to_string(), backend_url);
+        }
+    }
+    // NEXTAUTH_URL: per Next.js, se non gia' impostata esplicitamente
+    let wants_nextauth = exec_lower.contains("next")
+        || (exec_lower.contains("npm") && exec_lower.contains("start"))
+        || (exec_lower.contains("pnpm") && exec_lower.contains("start"));
+    if wants_nextauth && !env_map.contains_key("NEXTAUTH_URL") {
+        if let Some(p) = env_map.get("PORT").and_then(|s| s.parse::<u16>().ok()) {
+            env_map.insert("NEXTAUTH_URL".to_string(), format!("http://localhost:{}", p));
+        }
+    }
+}
+
 /// Installa un servizio come unit file systemd --user e lo abilita.
 /// Body JSON: { short, command, args, cwd, env, description }
 pub async fn wizard_install_service(
@@ -1321,52 +1376,10 @@ pub async fn wizard_install_service(
             .map(|r| (r.port, r.label))
             .collect();
 
-        let exec_lower = exec_start.to_lowercase();
-        let is_frontend = matches!(kind, "npm" | "pnpm")
-            || exec_lower.contains("next")
-            || exec_lower.contains("vite")
-            || exec_lower.contains("react-scripts")
-            || exec_lower.contains("nuxt")
-            || exec_lower.contains("astro");
-
-        if is_frontend {
-            // BACKEND_API_URL: porta sibling con label "backend-*" o "api-*"
-            let backend_sibling = sibling_ports.iter().find(|item| {
-                let l = item.1.to_lowercase();
-                l.starts_with("backend") || l.starts_with("api-") || l.starts_with("api_")
-            });
-            if let Some((port, _)) = backend_sibling {
-                let backend_url = format!("http://127.0.0.1:{}", port);
-                if !env_map.contains_key("BACKEND_API_URL")
-                    && !env_map.contains_key("BACKEND_API_INTERNAL_URL")
-                {
-                    env_map.insert("BACKEND_API_URL".to_string(), backend_url.clone());
-                }
-                // VITE_API_URL: i frontend Vite leggono import.meta.env.VITE_API_URL
-                // (e il proxy di vite.config la usa come target /api) per raggiungere
-                // il backend. Nexus non la generava -> finiva scritta a mano sulla
-                // porta SBAGLIATA (incidente Beauty-Book: proxy /api verso una porta
-                // vuota -> login HTTP 500). La deriviamo dalla porta del backend
-                // sibling allocato: unica fonte di verita' (regola G). Inerte per i
-                // frontend non-Vite (non la leggono). Guard !contains_key: non
-                // sovrascrive un valore esplicito dell'utente.
-                if !env_map.contains_key("VITE_API_URL") {
-                    env_map.insert("VITE_API_URL".to_string(), backend_url);
-                }
-            }
-            // NEXTAUTH_URL: per Next.js, se non già impostata esplicitamente
-            let wants_nextauth = exec_lower.contains("next")
-                || (exec_lower.contains("npm") && exec_lower.contains("start"))
-                || (exec_lower.contains("pnpm") && exec_lower.contains("start"));
-            if wants_nextauth && !env_map.contains_key("NEXTAUTH_URL") {
-                if let Some(p) = env_map.get("PORT").and_then(|s| s.parse::<u16>().ok()) {
-                    env_map.insert(
-                        "NEXTAUTH_URL".to_string(),
-                        format!("http://localhost:{}", p),
-                    );
-                }
-            }
-        }
+        // Derivazione env frontend dai sibling (punto unico, regola L): vedi
+        // derive_frontend_sibling_env. exec_start qui e' ancora l'originale (il
+        // rebind per l'override docker avviene piu' sotto).
+        derive_frontend_sibling_env(&mut env_map, &sibling_ports, &exec_start, kind);
     }
 
     // Funzione unica (regola L): per i servizi docker-compose, Nexus genera un
@@ -2636,6 +2649,86 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    // ── A2: derivazione env frontend dai sibling (regola L, punto unico) ──
+
+    #[test]
+    fn derive_env_genera_vite_api_url_dal_backend_sibling() {
+        // Caso incidente login Beauty-Book: un frontend Vite con un backend
+        // sibling allocato deve ricevere VITE_API_URL sulla porta del backend
+        // (prima Nexus non la generava -> proxy /api verso porta vuota -> 500).
+        let mut env: HashMap<String, String> = HashMap::new();
+        let siblings = vec![(21976, "backend".to_string())];
+        derive_frontend_sibling_env(&mut env, &siblings, "pnpm run dev:frontend", "pnpm");
+        assert_eq!(
+            env.get("VITE_API_URL").map(String::as_str),
+            Some("http://127.0.0.1:21976")
+        );
+        assert_eq!(
+            env.get("BACKEND_API_URL").map(String::as_str),
+            Some("http://127.0.0.1:21976")
+        );
+    }
+
+    #[test]
+    fn derive_env_label_api_prefix_riconosciuta() {
+        // Il backend sibling puo' avere label "api-*" oltre a "backend-*".
+        let mut env: HashMap<String, String> = HashMap::new();
+        let siblings = vec![(30001, "frontend".to_string()), (30002, "api-main".to_string())];
+        derive_frontend_sibling_env(&mut env, &siblings, "vite", "node");
+        assert_eq!(
+            env.get("VITE_API_URL").map(String::as_str),
+            Some("http://127.0.0.1:30002")
+        );
+    }
+
+    #[test]
+    fn derive_env_non_sovrascrive_valore_esplicito() {
+        // Guard !contains_key: un VITE_API_URL gia' impostato dall'utente resta.
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert("VITE_API_URL".to_string(), "http://custom:9999".to_string());
+        let siblings = vec![(21976, "backend".to_string())];
+        derive_frontend_sibling_env(&mut env, &siblings, "vite", "pnpm");
+        assert_eq!(
+            env.get("VITE_API_URL").map(String::as_str),
+            Some("http://custom:9999")
+        );
+    }
+
+    #[test]
+    fn derive_env_inerte_senza_backend_sibling() {
+        // Nessun sibling backend -> niente VITE_API_URL/BACKEND_API_URL.
+        let mut env: HashMap<String, String> = HashMap::new();
+        let siblings = vec![(30001, "frontend".to_string())];
+        derive_frontend_sibling_env(&mut env, &siblings, "vite", "pnpm");
+        assert!(!env.contains_key("VITE_API_URL"));
+        assert!(!env.contains_key("BACKEND_API_URL"));
+    }
+
+    #[test]
+    fn derive_env_inerte_se_non_frontend() {
+        // Un backend (kind node, exec senza marker frontend) non deve ricevere
+        // VITE_API_URL anche se ha un sibling backend.
+        let mut env: HashMap<String, String> = HashMap::new();
+        let siblings = vec![(21976, "backend".to_string())];
+        derive_frontend_sibling_env(&mut env, &siblings, "node src/server.js", "node");
+        assert!(!env.contains_key("VITE_API_URL"));
+        assert!(!env.contains_key("BACKEND_API_URL"));
+    }
+
+    #[test]
+    fn derive_env_nextauth_per_next_dal_proprio_port() {
+        // Next.js: NEXTAUTH_URL derivata dalla porta del frontend stesso (PORT).
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert("PORT".to_string(), "21950".to_string());
+        let siblings: Vec<(i32, String)> = vec![];
+        derive_frontend_sibling_env(&mut env, &siblings, "next start", "npm");
+        assert_eq!(
+            env.get("NEXTAUTH_URL").map(String::as_str),
+            Some("http://localhost:21950")
+        );
+    }
 
     #[test]
     fn inject_override_aggiunge_base_e_override_prima_di_up() {
