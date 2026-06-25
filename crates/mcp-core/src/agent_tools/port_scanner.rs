@@ -67,6 +67,12 @@ static PORT_REGEXES: Lazy<Vec<Regex>> = Lazy::new(|| {
         // YAML list item plain: - 3000
         Regex::new(r"^\s*-\s+(\d{2,5})\s*$").unwrap(),
         Regex::new(r"(?i)\bEXPOSE\s+(\d{2,5})\b").unwrap(),
+        // CLI flag dei dev-server (vite/next/astro/nuxt) negli script del
+        // package.json: `vite --port 21954` / `--port=21954`. Solo la forma LUNGA
+        // `--port`: la forma breve `-p` e' troppo ambigua (mkdir -p, docker run -p
+        // host:cont). Una porta hardcoded qui (anche dentro il bucket) bypassava
+        // l'allocazione -> disallineamento col .env e porte che si rimescolano.
+        Regex::new(r"(?i)--port[=\s]+(\d{2,5})\b").unwrap(),
     ]
 });
 
@@ -620,6 +626,35 @@ mod tests {
     fn allow_in_bucket() {
         let res = scan_content("src/server.js", "app.listen(25432)\n");
         assert!(matches!(res, PortScanOutcome::Allowed));
+    }
+
+    #[test]
+    fn detect_cli_port_flag_in_script() {
+        // Fix A1: porta hardcoded via `--port` negli script package.json
+        // (Vite/Next/Astro). Prima sfuggiva: nessun regex copriva la sintassi CLI
+        // separata da spazio (incidente Beauty-Book: "vite --port 21954").
+        let res = scan_content(
+            "package.json",
+            "{\n  \"scripts\": {\n    \"dev\": \"vite --port 3000\"\n  }\n}\n",
+        );
+        match res {
+            PortScanOutcome::Reject(f) => assert!(f.iter().any(|p| p.port == 3000), "{f:?}"),
+            _ => panic!("--port 3000 dovrebbe essere Reject"),
+        }
+        // Anche la forma `--port=NNNN`.
+        assert!(matches!(
+            scan_content("package.json", "\"dev\": \"next --port=4000\"\n"),
+            PortScanOutcome::Reject(_)
+        ));
+        // Una porta NEL bucket via --port viene catturata da collect_bucket_ports
+        // (il chiamante poi verifica l'allocazione nel DB).
+        let bucket = collect_bucket_ports("\"dev\": \"vite --port 21954\"\n");
+        assert!(bucket.iter().any(|p| p.port == 21954), "{bucket:?}");
+        // La forma da ENV (nessun numero hardcoded) NON deve essere segnalata.
+        assert!(matches!(
+            scan_content("package.json", "\"dev\": \"vite --port $VITE_PORT\"\n"),
+            PortScanOutcome::Allowed
+        ));
     }
 
     #[test]

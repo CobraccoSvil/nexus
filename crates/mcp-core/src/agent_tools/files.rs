@@ -412,14 +412,59 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
                 path_str,
                 content.len()
             );
+            let mut msg = base;
             if let Some(w) = bg_warning {
-                format!("{}\n\n{}", base, w)
-            } else {
-                base
+                msg = format!("{}\n\n{}", msg, w);
             }
+            // B2: se e' una config critica (.env, vite.config, package.json, ...),
+            // SEGNALA (non prescrive, mig 0438) che i servizi gia' in ascolto non
+            // applicheranno le modifiche finche' non vengono riavviati. Evita il
+            // caso (incidente Beauty-Book) in cui l'agente cambia il .env del proxy
+            // ma non riavvia il frontend, e la verifica gira sulla vecchia config.
+            if is_critical_config(path_str) {
+                msg = format!(
+                    "{}\n\nNota: questo e' un file di CONFIGURAZIONE. Un servizio gia' \
+                     in esecuzione non applichera' le modifiche finche' non viene \
+                     riavviato (es. Vite/Next leggono .env e config solo all'avvio). \
+                     Se un servizio del progetto e' attivo, riavvialo prima di \
+                     verificarne il comportamento.",
+                    msg
+                );
+            }
+            msg
         }
         Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
     }
+}
+
+/// Vero se `path` e' un file di CONFIGURAZIONE critica le cui modifiche
+/// richiedono il riavvio dei servizi gia' in ascolto per avere effetto (Vite,
+/// Next, ecc. leggono questi file solo all'avvio; il .env governa proxy/porte).
+/// Lista conservativa per evitare falsi positivi (B2). Funzione pura/testabile.
+pub(crate) fn is_critical_config(path: &str) -> bool {
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_lowercase();
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    const EXACT: &[&str] = &["package.json", "cargo.toml", "dockerfile"];
+    if EXACT.contains(&name.as_str()) {
+        return true;
+    }
+    const PREFIXES: &[&str] = &[
+        "vite.config.",
+        "next.config.",
+        "nuxt.config.",
+        "astro.config.",
+        "svelte.config.",
+        "vue.config.",
+        "tsconfig",
+        "docker-compose",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// Hook M2: rileva se un file appena scritto e' documentazione del progetto e lo registra in `project_documents`.
@@ -1219,6 +1264,24 @@ pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> Strin
 #[cfg(test)]
 mod tests {
     use super::build_old_string_not_found_message;
+    use super::is_critical_config;
+
+    #[test]
+    fn is_critical_config_riconosce_i_file_di_config() {
+        // B2: config che richiedono il riavvio del servizio per avere effetto.
+        assert!(is_critical_config(".env"));
+        assert!(is_critical_config("proj/.env.production"));
+        assert!(is_critical_config("vite.config.ts"));
+        assert!(is_critical_config("a/b/next.config.js"));
+        assert!(is_critical_config("package.json"));
+        assert!(is_critical_config("tsconfig.app.json"));
+        assert!(is_critical_config("docker-compose.nexus.yml"));
+        // Sorgenti normali: NON critici (niente hint inutile).
+        assert!(!is_critical_config("src/app.ts"));
+        assert!(!is_critical_config("src/components/Login.tsx"));
+        assert!(!is_critical_config("README.md"));
+        assert!(!is_critical_config("environment.ts")); // contiene "env" ma non e' .env
+    }
 
     fn make_file(num_lines: usize) -> String {
         (1..=num_lines)

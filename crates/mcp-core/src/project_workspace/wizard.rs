@@ -1336,13 +1336,22 @@ pub async fn wizard_install_service(
                 l.starts_with("backend") || l.starts_with("api-") || l.starts_with("api_")
             });
             if let Some((port, _)) = backend_sibling {
+                let backend_url = format!("http://127.0.0.1:{}", port);
                 if !env_map.contains_key("BACKEND_API_URL")
                     && !env_map.contains_key("BACKEND_API_INTERNAL_URL")
                 {
-                    env_map.insert(
-                        "BACKEND_API_URL".to_string(),
-                        format!("http://127.0.0.1:{}", port),
-                    );
+                    env_map.insert("BACKEND_API_URL".to_string(), backend_url.clone());
+                }
+                // VITE_API_URL: i frontend Vite leggono import.meta.env.VITE_API_URL
+                // (e il proxy di vite.config la usa come target /api) per raggiungere
+                // il backend. Nexus non la generava -> finiva scritta a mano sulla
+                // porta SBAGLIATA (incidente Beauty-Book: proxy /api verso una porta
+                // vuota -> login HTTP 500). La deriviamo dalla porta del backend
+                // sibling allocato: unica fonte di verita' (regola G). Inerte per i
+                // frontend non-Vite (non la leggono). Guard !contains_key: non
+                // sovrascrive un valore esplicito dell'utente.
+                if !env_map.contains_key("VITE_API_URL") {
+                    env_map.insert("VITE_API_URL".to_string(), backend_url);
                 }
             }
             // NEXTAUTH_URL: per Next.js, se non già impostata esplicitamente
