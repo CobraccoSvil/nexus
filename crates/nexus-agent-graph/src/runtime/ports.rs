@@ -136,6 +136,67 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError>;
 }
 
+/// Specifica di UN criterio di verifica costruita dal `FinalGateNode`
+/// (`no_orphan_imported` / `outputs_exist` / `service_logs_clean` /
+/// `run_command`-build). Replica i dict `{type, spec, expected, timeout_s}`
+/// costruiti in `final_gate.py:316-377`.
+///
+/// E' la forma trasportata al sotto-sistema [`CriteriaRunner`]: il nodo NON
+/// esegue i criteri (richiederebbero il ToolRunner gRPC + la logica di
+/// `criteria_runner._check_*`, sotto-sistema separato come `closure_judge` per
+/// il learner). Il nodo costruisce SOLO queste spec (deterministico,
+/// golden-abile) e delega l'esecuzione.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CriterionSpec {
+    /// Tipo del criterio (`no_orphan_imported`, `outputs_exist`,
+    /// `service_logs_clean`, `run_command`).
+    pub criterion_type: String,
+    /// Parametri del criterio (`spec` Python: staging_dir, command, ...).
+    pub spec: Value,
+    /// Atteso (`expected` Python: `{mounted:true}`, `{exit_code:0}`, ...).
+    pub expected: Value,
+    /// Timeout dedicato in secondi (solo il criterio build lo valorizza).
+    pub timeout_s: Option<f64>,
+}
+
+/// Esito dell'esecuzione di UN criterio (`{type, passed, evidence}` Python,
+/// `final_gate.py:386-390`). `evidence` e' JSON arbitrario: per il criterio
+/// build contiene `output_excerpt`/`exit_code`/`output_total_chars`/
+/// `output_truncated`, per gli altri `verdict`/`error`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CriterionResult {
+    /// Tipo del criterio (eco dello spec).
+    pub criterion_type: String,
+    /// `true` se il criterio e' passato (`bool(ok)` Python).
+    pub passed: bool,
+    /// Evidenza diagnostica (JSON opaco al nodo).
+    pub evidence: Value,
+}
+
+/// Astrazione del motore di verifica dei criteri generali del final gate
+/// (`brain/agents/criteria_runner.py`). mcp-core la implementera' delegando ai
+/// `_check_*` concreti (che a loro volta usano il ToolRunner gRPC).
+///
+/// E' un SOTTO-SISTEMA a se' (come `closure_judge` per il learner): la LOGICA
+/// dei singoli criteri NON e' portata in questo PR (vedi TODO in
+/// `nodes::final_gate`). Il confine e' pulito: il `FinalGateNode` costruisce le
+/// [`CriterionSpec`] e ottiene i [`CriterionResult`]; in modalita' shadow passa
+/// `ExecMode::Replay` (i criteri rileggono i tool_result del primario = zero
+/// side-effect).
+#[async_trait]
+pub trait CriteriaRunner: Send + Sync {
+    /// Esegue (o replaya) i criteri nell'ordine dato; un fallimento di un
+    /// criterio NON deve propagare un errore: il concreto lo mappa su un
+    /// [`CriterionResult`] con `passed=false` + `evidence.error` (parita' col
+    /// try/except del Python, `final_gate.py:381-385`). L'errore di porta resta
+    /// per un guasto infrastrutturale del runner stesso.
+    async fn run(
+        &self,
+        criteria: Vec<CriterionSpec>,
+        mode: ExecMode,
+    ) -> Result<Vec<CriterionResult>, PortError>;
+}
+
 /// Evento pubblicato verso il frontend chat (sottoinsieme del contratto SSE).
 ///
 /// Solo le varianti che servono ai nodi di questo PR + quelle del contratto

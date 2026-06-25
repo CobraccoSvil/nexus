@@ -255,6 +255,17 @@ pub fn route_after_todo_runner(state: &AgentState, cfg: &RoutingConfig) -> NodeT
     NodeTarget::Executor
 }
 
+/// Dopo il final_gate: re-executor se il gate ha rimandato all'executor
+/// (stop_reason tool_use), altrimenti chiusura (learner).
+/// Porting 1:1 di `route_after_final_gate` (final_gate.py:549-551).
+pub fn route_after_final_gate(state: &AgentState) -> NodeTarget {
+    if state.stop_reason == Some(StopReason::ToolUse) {
+        NodeTarget::Executor
+    } else {
+        NodeTarget::Learner
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +449,24 @@ mod tests {
             route_after_todo_runner(&s, &RoutingConfig::default()),
             NodeTarget::Executor
         );
+    }
+
+    /// `route_after_final_gate` (final_gate.py:549-551): tool_use -> executor,
+    /// qualunque altro stop_reason (e None) -> learner.
+    #[test]
+    fn final_gate_tool_use_va_a_executor() {
+        let mut s = base();
+        s.stop_reason = Some(StopReason::ToolUse);
+        assert_eq!(route_after_final_gate(&s), NodeTarget::Executor);
+    }
+
+    #[test]
+    fn final_gate_end_turn_va_a_learner() {
+        let mut s = base();
+        s.stop_reason = Some(StopReason::EndTurn);
+        assert_eq!(route_after_final_gate(&s), NodeTarget::Learner);
+        // stop_reason assente -> learner (parita': != "tool_use").
+        let none = base();
+        assert_eq!(route_after_final_gate(&none), NodeTarget::Learner);
     }
 }

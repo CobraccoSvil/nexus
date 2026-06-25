@@ -24,10 +24,14 @@ pub mod state;
 
 pub use checkpoint_pg::PgCheckpointer;
 pub use nodes::{
-    ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LearnerConfig,
-    LearnerNode, LlmDecision, QdrantPayload, ReflectionConfig, ReflectionData, ReflectionNode,
-    RouterNode, UnderstandingConfig, UnderstandingNode,
+    count_build_errors, ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory,
+    FinalGateConfig, FinalGateNode, GateOutcome, LearnerConfig, LearnerNode, LlmDecision,
+    QdrantPayload, ReflectionConfig, ReflectionData, ReflectionNode, RouterNode, UnderstandingConfig,
+    UnderstandingNode,
 };
-pub use runtime::{AgentNodeCtx, EventSink, ExecMode, LlmGateway, ToolExecutor};
+pub use runtime::{
+    AgentNodeCtx, CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway,
+    ToolExecutor,
+};
 pub use shadow::{compute_diff, persist_node_diff, DiffCollector, NodeDiff};
 pub use state::{AgentState, AutomationMode, Message, MetaStep, StateDelta, StopReason, TaskComplexity};

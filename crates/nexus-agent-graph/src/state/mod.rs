@@ -301,6 +301,11 @@ pub struct AgentState {
     pub exploratory_verify_total: Option<i64>,
     /// Ciclo del final gate generale.
     pub final_gate_cycle: Option<i64>,
+    /// `true` quando il final gate ha PASSATO la verifica E2E (esito canonico
+    /// CompletedVerified lato mcp-core). Settato solo sul ramo PASSED del
+    /// `final_gate_node`; il ramo forced_close/cap NON lo imposta (resta
+    /// FailedDiagnosed). Vedi `final_gate.py:521`.
+    pub final_gate_passed: Option<bool>,
     /// Ultimo risultato del verifier.
     pub verifier_last_result: Option<Value>,
     /// Contatore revisioni strutturali del plan.

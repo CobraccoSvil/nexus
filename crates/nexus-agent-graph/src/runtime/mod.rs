@@ -10,8 +10,8 @@ pub mod ports;
 
 pub use ctx::AgentNodeCtx;
 pub use ports::{
-    EventSink, ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage, PortError,
-    SseEvent, ToolCall, ToolExecutor, ToolOutcome,
+    CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmMessage,
+    LlmRequest, LlmResponse, LlmUsage, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome,
 };
 
 #[cfg(test)]
@@ -25,8 +25,8 @@ pub mod test_doubles {
     use async_trait::async_trait;
 
     use super::ports::{
-        EventSink, ExecMode, LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError, SseEvent,
-        ToolCall, ToolExecutor, ToolOutcome,
+        CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmRequest,
+        LlmResponse, LlmUsage, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome,
     };
 
     /// Gateway LLM di test: ritorna una `LlmResponse` fissa e registra le
@@ -91,6 +91,39 @@ pub mod test_doubles {
             mode: ExecMode,
         ) -> Result<ToolOutcome, PortError> {
             self.seen.lock().expect("lock seen").push((call, mode));
+            Ok(self.canned.clone())
+        }
+    }
+
+    /// Motore criteri di test: ritorna una lista fissa di [`CriterionResult`] e
+    /// registra le chiamate con la modalita' usata (per verificare che lo shadow
+    /// usi `Replay`). I risultati dei criteri sono cosi' INPUT stubati: i test
+    /// del `FinalGateNode` esercitano la decision machine, non l'esecuzione reale.
+    pub struct StubCriteriaRunner {
+        /// Risultati fissi ritornati da ogni `run`.
+        pub canned: Vec<CriterionResult>,
+        /// Chiamate registrate: (criteria, mode).
+        pub seen: Mutex<Vec<(Vec<CriterionSpec>, ExecMode)>>,
+    }
+
+    impl StubCriteriaRunner {
+        /// Crea uno stub che ritorna i risultati dati.
+        pub fn with_results(results: Vec<CriterionResult>) -> Self {
+            Self {
+                canned: results,
+                seen: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CriteriaRunner for StubCriteriaRunner {
+        async fn run(
+            &self,
+            criteria: Vec<CriterionSpec>,
+            mode: ExecMode,
+        ) -> Result<Vec<CriterionResult>, PortError> {
+            self.seen.lock().expect("lock seen").push((criteria, mode));
             Ok(self.canned.clone())
         }
     }
