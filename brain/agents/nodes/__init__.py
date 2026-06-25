@@ -2725,6 +2725,9 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         # locale sotto soglia), la history inline si riduce agli ultimi
         # messaggi + puntatore RAG. Risparmia token su OGNI provider ed evita
         # che i modelli deraglino su contenuti storici non c'entranti.
+        # Anti-contaminazione history: segnale di cambio-argomento, riusato sia
+        # dal trim del continuity gate sia dal rinforzo della turn-focus directive.
+        _new_topic_detected = False
         if _current_iterations == 0:
             try:
                 from .helpers import apply_continuity_trim
@@ -2733,6 +2736,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     messages, _embeddings
                 )
                 if _trimmed:
+                    _new_topic_detected = True
                     logger.info(
                         "executor_node: continuity_gate NEW-TOPIC score=%.2f -> "
                         "history %d -> %d messaggi (storia via RAG on-demand)",
@@ -2849,6 +2853,29 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         messages, system_text = _inject_language_reminder(
             messages, system_text, _lang_enabled, _lang_text
         )
+        # ── Anti-contaminazione history: FOCUS del turno corrente (regola L) ──
+        # Ancora l'ultima richiesta utente come obiettivo prioritario, cosi' la
+        # massa di history su un task precedente non "trascina" l'agente sul
+        # vecchio argomento. Il continuity gate cosine (sopra) non scatta su task
+        # lessicalmente simili dello stesso progetto: questa directive e' la rete
+        # di sicurezza robusta, sempre attiva. new_topic rinforza il linguaggio
+        # quando il gate ha rilevato un cambio netto (iter 0). Iniezione nel
+        # system_text (P3 prefix stabile), gemella del reminder lingua.
+        try:
+            from .helpers import (
+                build_turn_focus_directive,
+                _inject_turn_focus,
+                _load_continuity_config as _load_cont_cfg,
+            )
+            if _load_cont_cfg().get("turn_focus_enabled", True):
+                _focus_directive = build_turn_focus_directive(
+                    messages, new_topic=_new_topic_detected
+                )
+                messages, system_text = _inject_turn_focus(
+                    messages, system_text, _focus_directive
+                )
+        except Exception as _tf_exc:
+            logger.debug("executor_node: turn_focus skip (%s)", _tf_exc)
         # ── FIX C: direttiva auto-verifica se l'utente la chiede esplicitamente ─
         # Quando il primo messaggio utente contiene una richiesta di verifica/test
         # ("verifica tu stesso", "prova ad accedere", "assicurati che funzioni"),

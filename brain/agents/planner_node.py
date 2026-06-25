@@ -349,6 +349,22 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
                 "dipendono da altri, coerentemente con le dipendenze sopra."
             )
 
+    # ── Anti-contaminazione history: FOCUS del turno corrente (regola L) ──────
+    # Ancora il piano all'ultima richiesta utente: con una history grande il
+    # planner tende a pianificare sul task dominante nella cronologia invece che
+    # sull'istruzione corrente. Stesso punto unico usato dall'executor.
+    try:
+        from brain.agents.nodes.helpers import (
+            build_turn_focus_directive,
+            _load_continuity_config,
+        )
+        if _load_continuity_config().get("turn_focus_enabled", True):
+            _focus = build_turn_focus_directive(messages)
+            if _focus:
+                hinted_system = _focus + "\n\n" + hinted_system
+    except Exception as _tf_exc:
+        logger.debug("planner_node: turn_focus skip (%s)", _tf_exc)
+
     # ── LLM call attraverso registry sync (riusa cascade M60) ───────────────
     import asyncio as _asyncio
     try:

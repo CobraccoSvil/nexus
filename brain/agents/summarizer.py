@@ -240,14 +240,20 @@ async def summarize_old_messages(
     try:
         from langchain_core.messages import AIMessage  # type: ignore[import-untyped]
         summary_msg = AIMessage(content=(
-            "[Riassunto automatico della conversazione precedente]\n\n" + summary_text.strip()
+            "[Riassunto del lavoro svolto FINORA in questa sessione. NB: se la "
+                "richiesta corrente dell'utente riguarda un task diverso, questo "
+                "e' solo contesto storico: segui la richiesta corrente, non "
+                "proseguire automaticamente il lavoro qui riassunto.]\n\n" + summary_text.strip()
         ))
     except ImportError:
         # Fallback: dict in formato Anthropic
         summary_msg = {
             "role": "assistant",
             "content": (
-                "[Riassunto automatico della conversazione precedente]\n\n"
+                "[Riassunto del lavoro svolto FINORA in questa sessione. NB: se la "
+                "richiesta corrente dell'utente riguarda un task diverso, questo "
+                "e' solo contesto storico: segui la richiesta corrente, non "
+                "proseguire automaticamente il lavoro qui riassunto.]\n\n"
                 + summary_text.strip()
             ),
         }

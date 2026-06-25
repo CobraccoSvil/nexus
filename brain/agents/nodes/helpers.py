@@ -642,6 +642,12 @@ def _load_repeated_action_force_diagnose_enabled() -> bool:
 # messaggio utente (regola: la lingua di risposta e' quella della richiesta).
 # I default valgono SOLO se il DB e' down (regola G: niente hardcode sparso).
 _LANG_REMINDER_MARKER = "[[NEXUS_LANG_REMINDER]]"
+
+# Marcatore univoco del blocco "focus del turno corrente" (anti-contaminazione
+# della history pregressa, regola L). Iniettato in testa al system_text come
+# _LANG_REMINDER_MARKER; idempotente, prefix-stabile (non muta i messaggi tra
+# iterazioni -> il KV-cache dei provider resta valido).
+_TURN_FOCUS_MARKER = "[[NEXUS_TURN_FOCUS]]"
 _LANG_REMINDER_CACHE: dict[str, Any] = {
     "loaded_at": 0.0,
     "enabled": None,
@@ -854,6 +860,92 @@ def _inject_language_reminder(
     # MEZZO del prefix e invalidando il KV-cache dei provider a ogni giro.
     # Rimosso: il recency e' garantito dal punto 1, che mette il blocco lingua
     # sia in TESTA sia in CODA al system (deterministico tra iterazioni).
+    return messages, new_system
+
+
+def build_turn_focus_directive(
+    messages: list[Any],
+    new_topic: bool = False,
+) -> str:
+    """Costruisce il blocco "focus del turno corrente" (anti-contaminazione
+    della history pregressa). Punto unico (regola L): estrae l'ultima richiesta
+    utente e dichiara esplicitamente che e' l'obiettivo prioritario, declassando
+    la cronologia a contesto di supporto.
+
+    Causa radice che risolve: con una history grande su un certo task, i modelli
+    (specie gli small) seguono il "peso" del contesto storico invece dell'ultima
+    istruzione (osservato: chat con 1M token su bookingService.ts che ignora la
+    richiesta "crea index.html"). Il continuity gate semantico
+    (apply_continuity_trim) NON basta: due task di sviluppo sullo stesso progetto
+    sono lessicalmente simili (cosine sopra soglia) quindi non scatta. Questa
+    direttiva ancora il turno corrente a prescindere dalla similarita'.
+
+    Funzione pura e idempotente: stesso input -> stesso output, nessun side
+    effect. Ritorna "" se non c'e' un messaggio utente valido (no-op a monte).
+
+    new_topic: se True (il continuity gate ha rilevato un cambio d'argomento),
+    aggiunge una riga di rinforzo esplicita.
+    """
+    if not messages:
+        return ""
+    # Ultimo messaggio umano, ripulito dai blocchi di sistema (allegati, ecc.)
+    # col punto unico del parser (regola L) usato anche da apply_continuity_trim.
+    last_user = ""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            try:
+                from ..task_playbook import _user_text_only
+                last_user = _user_text_only(c)
+            except Exception:
+                last_user = c
+            break
+    last_user = (last_user or "").strip()
+    if not last_user:
+        return ""
+    # Estratto compatto: la directive deve restare leggera e cacheabile.
+    excerpt = last_user if len(last_user) <= 600 else last_user[:600].rstrip() + " [...]"
+    lines = [
+        "### FOCUS DEL TURNO CORRENTE ###",
+        "La richiesta da portare a termine ADESSO e' l'ultimo messaggio "
+        "dell'utente:",
+        f"\"{excerpt}\"",
+        "",
+        "La cronologia precedente e' CONTESTO DI SUPPORTO, non l'oggetto di "
+        "questa richiesta. Se il turno corrente riguarda un task diverso da "
+        "quello discusso prima, segui il turno corrente e NON proseguire il "
+        "lavoro precedente. Non dare per scontato che file, componenti o "
+        "obiettivi citati nella cronologia siano l'oggetto di QUESTA richiesta, "
+        "a meno che il turno corrente non li nomini esplicitamente.",
+    ]
+    if new_topic:
+        lines.append(
+            "NOTA: rilevato un cambio di argomento rispetto alla cronologia. "
+            "Concentrati esclusivamente sulla richiesta corrente; ignora il "
+            "lavoro precedente salvo quanto serve a soddisfarla."
+        )
+    return "\n".join(lines)
+
+
+def _inject_turn_focus(
+    messages: list[Any],
+    system_text: str,
+    directive: str,
+) -> tuple[list[Any], str]:
+    """Inietta il blocco focus-del-turno in testa al system_text (idempotente,
+    gemello di _inject_language_reminder, regola L). I messaggi NON vengono mai
+    modificati (P3 prefix stabile): il focus va nel system, non nell'ultimo
+    HumanMessage (che muta a ogni iterazione e invaliderebbe il KV-cache).
+
+    Ritorna (messages, system_text); messages e' sempre l'input invariato.
+    No-op se directive e' vuota o il marcatore e' gia' presente.
+    """
+    if not directive:
+        return messages, system_text
+    base_system = system_text or ""
+    if _TURN_FOCUS_MARKER in base_system:
+        return messages, system_text
+    new_system = f"{_TURN_FOCUS_MARKER}\n{directive}\n\n{base_system}"
     return messages, new_system
 
 
@@ -3319,7 +3411,12 @@ def _load_continuity_config() -> dict:
     now = _t.monotonic()
     if _continuity_cfg_cache is not None and now - _continuity_cfg_ts < 60.0:
         return _continuity_cfg_cache
-    cfg = {"enabled": True, "min_score": 0.30, "keep_recent": 2}
+    cfg = {
+        "enabled": True,
+        "min_score": 0.30,
+        "keep_recent": 2,
+        "turn_focus_enabled": True,
+    }
     try:
         from brain.utils import settings_db
         cfg["enabled"] = settings_db.get_bool_setting(
@@ -3329,6 +3426,12 @@ def _load_continuity_config() -> dict:
             "agent.context.continuity_min_score", "0.30") or "0.30")
         cfg["keep_recent"] = int(settings_db.get_setting(
             "agent.context.continuity_keep_recent", "2") or "2")
+        # Anti-contaminazione history: la directive di focus del turno corrente
+        # e' SEMPRE attiva di default (rete di sicurezza robusta, indipendente
+        # dal continuity gate cosine che non scatta su task lessicalmente simili).
+        cfg["turn_focus_enabled"] = settings_db.get_bool_setting(
+            "agent.context.turn_focus_enabled", True
+        )
     except Exception:
         pass
     _continuity_cfg_cache, _continuity_cfg_ts = cfg, now
