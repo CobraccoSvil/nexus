@@ -1,0 +1,34 @@
+[package]
+name = "nexus-agent-graph"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# Nodi concreti Nexus + checkpointer Postgres. Istanzia il runtime `nexus-graph`
+# coi 12 nodi reali (placeholder in Fase 0). In FASE 0 contiene solo il
+# `PgCheckpointer` (persistenza su `nexus_graph_checkpoints`, migrazione 0451);
+# i nodi reali arrivano nelle fasi successive.
+[lib]
+name = "nexus_agent_graph"
+path = "src/lib.rs"
+
+[dependencies]
+nexus-graph = { path = "../nexus-graph" }
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror = "1.0"
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# `#[sqlx::test]` inietta un PgPool; in CI DATABASE_URL punta al Postgres del job
+# (verify.yml). Senza DB i test sqlx falliscono in locale: e' il pattern gia'
+# usato dagli altri test del repo (es. agent_run.rs tests_session_active).
+serde_json.workspace = true

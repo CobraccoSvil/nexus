@@ -1853,6 +1853,37 @@ pub(crate) async fn spawn_agent_run(
         );
 
         let agent_body = std::panic::AssertUnwindSafe(async move {
+            // ── Confine di selezione del motore (strangler-fig, Fase 0) ──────────
+            // Punto unico select_engine: legge nexus_orchestrator_engine (regola
+            // G). In Fase 0 ritorna SEMPRE Python -> si prosegue col flusso
+            // run_via_brain esistente, comportamento INVARIATO. Il record
+            // agent_runs.engine viene popolato per il recovery (sa su quale
+            // motore girava un run interrotto). Il ramo nativo e' uno stub
+            // (run_via_native) mai raggiunto finche' la tabella non abilita
+            // 'rust'/'shadow'; se per errore venisse selezionato, si logga e si
+            // cade in modo sicuro sul motore Python (nessun crash).
+            let engine = select_engine(&db_clone, &session_id_cp.to_string()).await;
+            let _ = sqlx::query("UPDATE agent_runs SET engine = $2 WHERE id = $1")
+                .bind(run_id)
+                .bind(match engine {
+                    Engine::Python => "python",
+                    Engine::Rust => "rust",
+                    Engine::Shadow => "shadow",
+                })
+                .execute(&db_clone)
+                .await;
+            if engine != Engine::Python {
+                // Mai in Fase 0. run_via_native e' uno stub che ritorna errore:
+                // si logga e si prosegue sul motore Python (fail-safe).
+                if let Err(e) = run_via_native(run_id).await {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "motore nativo selezionato ma non implementato (Fase 0): fallback al motore Python"
+                    );
+                }
+            }
+
             // ── Loop di retry con fallback automatico tra provider ───────────────
             // Se il run fallisce per "credit too low" / "quota exceeded", il provider
             // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
@@ -3007,6 +3038,195 @@ pub(crate) async fn spawn_agent_run(
         provider,
         model: model_str,
     })
+}
+
+// ===========================================================================
+// Confine di selezione del motore di orchestrazione (strangler-fig, Fase 0).
+//
+// Punto UNICO (regola L) di decisione "quale motore esegue questo run":
+// `select_engine`. Il flusso esistente `run_via_brain` (motore Python) NON e'
+// toccato; si affianca solo il confine + lo stub `run_via_native`, mai
+// raggiunto in Fase 0 (la fonte DB ritorna sempre 'python'). Rischio di
+// regressione NULLO.
+// ===========================================================================
+
+/// Motore di orchestrazione con cui un run viene eseguito.
+///
+/// Persistito su `agent_runs.engine` (per il recovery) e deciso da
+/// `select_engine` leggendo `nexus_orchestrator_engine` (regola G: la fonte e'
+/// il DB, niente env var ne' default hardcoded di emergenza).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Engine {
+    /// Motore corrente: orchestrazione nel brain Python/LangGraph (`run_via_brain`).
+    Python,
+    /// Motore nativo Rust (`nexus-agent-graph`). Non ancora raggiungibile in Fase 0.
+    Rust,
+    /// Doppia esecuzione di confronto (parita'): primario Python + ombra Rust
+    /// senza side-effect. Non ancora raggiungibile in Fase 0.
+    Shadow,
+}
+
+impl Engine {
+    /// Parsing dal valore TEXT del DB. Sconosciuto -> `None` (il chiamante
+    /// decide: in Fase 0 cade sul default sicuro 'python' loggando un warn,
+    /// senza mascherare il dato malformato).
+    fn from_db(value: &str) -> Option<Engine> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "python" => Some(Engine::Python),
+            "rust" => Some(Engine::Rust),
+            "shadow" => Some(Engine::Shadow),
+            _ => None,
+        }
+    }
+}
+
+/// Chiave jolly (default globale) in `nexus_orchestrator_engine`.
+const ENGINE_GLOBAL_SCOPE: &str = "*";
+
+static ENGINE_CACHE: std::sync::OnceLock<nexus_cache::TtlCache<String, Engine>> =
+    std::sync::OnceLock::new();
+
+/// Cache TTL 60s del routing motore (stesso pattern di model_selection.rs,
+/// punto unico cache regola L). La chiave e' lo `scope_key` risolto.
+fn engine_cache() -> &'static nexus_cache::TtlCache<String, Engine> {
+    ENGINE_CACHE.get_or_init(|| nexus_cache::TtlCache::new(std::time::Duration::from_secs(60)))
+}
+
+/// Decide il motore di orchestrazione per il run corrente (PUNTO UNICO).
+///
+/// Legge `nexus_orchestrator_engine` (riga jolly '*' come default globale, mig
+/// 0451) con cache 60s. Regola G: nessun fallback hardcoded di emergenza — la
+/// configurazione vive nel DB. In FASE 0 la riga '*' vale 'python', quindi la
+/// funzione ritorna SEMPRE `Engine::Python` e il path Rust non viene mai
+/// imboccato; la firma e' gia' pronta per il routing per-run (Fase 5).
+///
+/// Comportamento difensivo coerente con il resto del sistema: se il DB e'
+/// irraggiungibile o la riga manca, ritorna `Engine::Python` (il motore
+/// stabile) loggando un warn. NON e' un "magic fallback" sul comportamento
+/// configurabile (il motore di default e' una decisione di safety, non un
+/// valore di business mascherato): mantiene il sistema sull'unico motore
+/// validato finche' la tabella non abilita esplicitamente quello nativo.
+pub(crate) async fn select_engine(db: &PgPool, _scope_key: &str) -> Engine {
+    // In Fase 0 il routing e' solo globale: si legge sempre la riga jolly '*'.
+    // La firma accetta gia' lo scope per non rompere i call site quando il
+    // routing per-sessione/progetto verra' attivato (Fase 5).
+    let cache = engine_cache();
+    if let Some(hit) = cache.get(ENGINE_GLOBAL_SCOPE) {
+        return hit;
+    }
+
+    let row = sqlx::query("SELECT engine FROM nexus_orchestrator_engine WHERE scope_key = $1")
+        .bind(ENGINE_GLOBAL_SCOPE)
+        .fetch_optional(db)
+        .await;
+
+    let engine = match row {
+        Ok(Some(r)) => {
+            let raw: String = r.get("engine");
+            match Engine::from_db(&raw) {
+                Some(e) => e,
+                None => {
+                    tracing::warn!(
+                        engine_raw = %raw,
+                        "select_engine: valore engine non riconosciuto in nexus_orchestrator_engine, uso il motore stabile (python)"
+                    );
+                    Engine::Python
+                }
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "select_engine: riga jolly '*' assente in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
+            );
+            Engine::Python
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "select_engine: query nexus_orchestrator_engine fallita, uso il motore stabile (python)"
+            );
+            Engine::Python
+        }
+    };
+
+    cache.insert(ENGINE_GLOBAL_SCOPE.to_string(), engine);
+    engine
+}
+
+/// Avvio di un run sul motore nativo Rust (`nexus-agent-graph`).
+///
+/// STUB di Fase 0: mai raggiunto (`select_engine` ritorna sempre `Python`). La
+/// firma esiste per stabilire il confine; l'implementazione (build del grafo,
+/// `run_until_interrupt`, transport SSE) arriva nelle fasi successive del
+/// porting. Ritorna un errore esplicito invece di `unimplemented!()` per non
+/// far panicare il processo se un futuro refactoring lo invocasse per errore
+/// prima del completamento.
+pub(crate) async fn run_via_native(run_id: Uuid) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "run_via_native non e' ancora implementato (Fase 0 scaffold): il motore nativo Rust \
+         non e' raggiungibile finche' nexus_orchestrator_engine non abilita 'rust'/'shadow'. \
+         run_id={run_id}"
+    )
+}
+
+#[cfg(test)]
+mod tests_select_engine {
+    use super::*;
+
+    /// Crea la tabella minimale di routing motore nel DB di test.
+    async fn create_engine_table(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_orchestrator_engine ( \
+                 scope_key  TEXT PRIMARY KEY, \
+                 scope_kind TEXT NOT NULL DEFAULT 'global', \
+                 engine     TEXT NOT NULL DEFAULT 'python', \
+                 percent    INT NOT NULL DEFAULT 100, \
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create table nexus_orchestrator_engine");
+    }
+
+    #[test]
+    fn engine_from_db_parsing() {
+        assert_eq!(Engine::from_db("python"), Some(Engine::Python));
+        assert_eq!(Engine::from_db("RUST"), Some(Engine::Rust));
+        assert_eq!(Engine::from_db(" shadow "), Some(Engine::Shadow));
+        assert_eq!(Engine::from_db("boh"), None);
+    }
+
+    #[sqlx::test]
+    async fn select_engine_ritorna_python_con_default_globale(pool: sqlx::PgPool) {
+        create_engine_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO nexus_orchestrator_engine (scope_key, scope_kind, engine, percent) \
+             VALUES ('*', 'global', 'python', 100)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert default");
+
+        let engine = select_engine(&pool, "qualsiasi-scope").await;
+        assert_eq!(engine, Engine::Python, "il default globale Fase 0 e' python");
+    }
+
+    #[sqlx::test]
+    async fn select_engine_cade_su_python_se_riga_assente(pool: sqlx::PgPool) {
+        // Tabella vuota: nessuna riga jolly. Comportamento difensivo: python.
+        create_engine_table(&pool).await;
+        let engine = select_engine(&pool, "*").await;
+        assert_eq!(engine, Engine::Python);
+    }
+
+    #[tokio::test]
+    async fn run_via_native_e_uno_stub_che_fallisce() {
+        let err = run_via_native(Uuid::new_v4())
+            .await
+            .expect_err("lo stub di Fase 0 deve fallire, mai eseguire");
+        assert!(err.to_string().contains("non e' ancora implementato"));
+    }
 }
 
 #[cfg(test)]

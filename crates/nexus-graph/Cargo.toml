@@ -1,0 +1,27 @@
+[package]
+name = "nexus-graph"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# Runtime di grafo PURO (macchina a stati superstep stile Pregel). Non conosce
+# nulla dei nodi Nexus (LLM/tool/RAG): quelli vivono in `nexus-agent-graph`.
+# Separazione runtime/nodi -> regola L (punto unico) + composition-over-inheritance.
+[lib]
+name = "nexus_graph"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "1.0"
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,344 @@
+//! `nexus-graph` — runtime di grafo PURO per l'orchestrazione agentica.
+//!
+//! Macchina a stati a superstep (stile Pregel) su un `enum NodeId` chiuso. Non
+//! conosce nulla dei nodi Nexus concreti (LLM/tool/RAG/DB): quelli vivono in
+//! `nexus-agent-graph`. Separazione runtime/nodi -> regola L (punto unico) +
+//! composition-over-inheritance.
+//!
+//! FASE 0 (scaffold): esiste solo `NoOpNode`; i 12 nodi reali sono placeholder
+//! in `NodeId`. Il motore esegue, instrada, fa checkpoint e si interrompe, ma
+//! il path Rust non viene mai imboccato in produzione finche' la tabella di
+//! routing non lo abilita (vedi `select_engine` in mcp-core, che ritorna sempre
+//! `Python` in Fase 0).
+
+pub mod checkpoint;
+pub mod edge;
+pub mod engine;
+pub mod node;
+pub mod outcome;
+pub mod state;
+
+pub use checkpoint::{CheckpointError, Checkpointer};
+pub use edge::Edge;
+pub use engine::{GraphEngine, GraphError, NodeCtxLike};
+pub use node::{GraphNode, NodeError, NodeId, NoOpNode};
+pub use outcome::StepOutcome;
+pub use state::{GraphState, StateDelta};
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use uuid::Uuid;
+
+    use super::*;
+
+    // --- Stato minimale di prova -------------------------------------------
+
+    /// Stato di test: un contatore di passi (per il caso loop) e i due flag di
+    /// interrupt. Implementa `GraphState` con un reducer banale.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct TestState {
+        steps: i64,
+        awaiting_confirmation: bool,
+        pending_clarify: bool,
+    }
+
+    impl GraphState for TestState {
+        fn merge(&mut self, delta: StateDelta) {
+            if let Some(v) = delta.as_map().get("steps").and_then(|v| v.as_i64()) {
+                self.steps = v;
+            }
+            if let Some(v) = delta
+                .as_map()
+                .get("awaiting_confirmation")
+                .and_then(|v| v.as_bool())
+            {
+                self.awaiting_confirmation = v;
+            }
+            if let Some(v) = delta
+                .as_map()
+                .get("pending_clarify")
+                .and_then(|v| v.as_bool())
+            {
+                self.pending_clarify = v;
+            }
+        }
+
+        fn is_awaiting_confirmation(&self) -> bool {
+            self.awaiting_confirmation
+        }
+
+        fn is_pending_clarify(&self) -> bool {
+            self.pending_clarify
+        }
+    }
+
+    // --- Contesto minimale -------------------------------------------------
+
+    struct TestCtx {
+        recursion_limit: u32,
+    }
+
+    impl NodeCtxLike for TestCtx {
+        fn recursion_limit(&self) -> u32 {
+            self.recursion_limit
+        }
+    }
+
+    // --- Checkpointer in memoria (solo test, niente DB) --------------------
+
+    #[derive(Default)]
+    struct MemoryCheckpointer {
+        // (run_id, superstep) -> (state-json, next-label)
+        store: std::sync::Mutex<HashMap<(Uuid, i64), (serde_json::Value, &'static str)>>,
+    }
+
+    #[async_trait]
+    impl Checkpointer<TestState> for MemoryCheckpointer {
+        async fn put(
+            &self,
+            run_id: Uuid,
+            superstep: i64,
+            next: NodeId,
+            state: &TestState,
+        ) -> Result<(), CheckpointError> {
+            let json = serde_json::to_value(state)
+                .map_err(|e| CheckpointError::Store(e.to_string()))?;
+            self.store
+                .lock()
+                .expect("mutex avvelenato nel test")
+                .insert((run_id, superstep), (json, next.as_label()));
+            Ok(())
+        }
+
+        async fn load(
+            &self,
+            run_id: Uuid,
+        ) -> Result<Option<(TestState, NodeId)>, CheckpointError> {
+            let guard = self.store.lock().expect("mutex avvelenato nel test");
+            let latest = guard
+                .iter()
+                .filter(|((rid, _), _)| *rid == run_id)
+                .max_by_key(|((_, step), _)| *step);
+            match latest {
+                None => Ok(None),
+                Some((_, (json, label))) => {
+                    let state: TestState = serde_json::from_value(json.clone())
+                        .map_err(|e| CheckpointError::Store(e.to_string()))?;
+                    let node = NodeId::from_label(label)
+                        .ok_or_else(|| CheckpointError::UnknownNode((*label).to_string()))?;
+                    Ok(Some((state, node)))
+                }
+            }
+        }
+    }
+
+    // --- Nodo che cicla all'infinito (test recursion_limit) ----------------
+
+    /// Instrada sempre a se' stesso (vedi edge `Static(NoOp)` nel grafo del
+    /// test): senza limite il motore girerebbe per sempre.
+    struct LoopNode;
+
+    #[async_trait]
+    impl GraphNode<TestState, TestCtx> for LoopNode {
+        fn id(&self) -> NodeId {
+            NodeId::NoOp
+        }
+
+        async fn run(
+            &self,
+            state: &TestState,
+            _ctx: &TestCtx,
+        ) -> Result<StateDelta, NodeError> {
+            let mut delta = StateDelta::empty();
+            delta.set("steps", serde_json::json!(state.steps + 1));
+            Ok(delta)
+        }
+    }
+
+    // --- Test ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn noop_to_end_ritorna_completed() {
+        // Grafo: NoOp --(End)--> fine.
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));
+        let mut edges = HashMap::new();
+        edges.insert(NodeId::NoOp, Edge::Static(NodeId::End));
+
+        let engine = GraphEngine::new(
+            nodes,
+            edges,
+            NodeId::NoOp,
+            Arc::new(MemoryCheckpointer::default()),
+        );
+
+        let ctx = TestCtx {
+            recursion_limit: 50,
+        };
+        let outcome = engine
+            .run_until_interrupt(Uuid::new_v4(), Some(TestState::default()), &ctx)
+            .await
+            .expect("il grafo NoOp->End deve completare");
+
+        assert!(matches!(outcome, StepOutcome::Completed(_)));
+    }
+
+    #[tokio::test]
+    async fn loop_supera_recursion_limit() {
+        // Grafo: LoopNode --(NoOp)--> LoopNode (self-loop infinito).
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::NoOp, Arc::new(LoopNode));
+        let mut edges = HashMap::new();
+        edges.insert(NodeId::NoOp, Edge::Static(NodeId::NoOp));
+
+        let engine = GraphEngine::new(
+            nodes,
+            edges,
+            NodeId::NoOp,
+            Arc::new(MemoryCheckpointer::default()),
+        );
+
+        let ctx = TestCtx { recursion_limit: 5 };
+        let err = engine
+            .run_until_interrupt(Uuid::new_v4(), Some(TestState::default()), &ctx)
+            .await
+            .expect_err("un grafo che cicla deve superare il recursion_limit");
+
+        match err {
+            GraphError::RecursionLimit(limit) => assert_eq!(limit, 5),
+            other => panic!("atteso RecursionLimit, ottenuto {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_su_pending_clarify() {
+        // Un nodo che setta pending_clarify, edge verso un altro nodo (NON End):
+        // il motore deve interrompersi indicando il resume_at.
+        struct ClarifyNode;
+        #[async_trait]
+        impl GraphNode<TestState, TestCtx> for ClarifyNode {
+            fn id(&self) -> NodeId {
+                NodeId::Router
+            }
+            async fn run(
+                &self,
+                _state: &TestState,
+                _ctx: &TestCtx,
+            ) -> Result<StateDelta, NodeError> {
+                let mut delta = StateDelta::empty();
+                delta.set("pending_clarify", serde_json::json!(true));
+                Ok(delta)
+            }
+        }
+
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::Router, Arc::new(ClarifyNode));
+        // Il NoOp finale serve solo come destinazione (mai eseguito: interrupt prima).
+        nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));
+        let mut edges = HashMap::new();
+        edges.insert(NodeId::Router, Edge::Static(NodeId::NoOp));
+        edges.insert(NodeId::NoOp, Edge::Static(NodeId::End));
+
+        let engine = GraphEngine::new(
+            nodes,
+            edges,
+            NodeId::Router,
+            Arc::new(MemoryCheckpointer::default()),
+        );
+
+        let ctx = TestCtx {
+            recursion_limit: 50,
+        };
+        let outcome = engine
+            .run_until_interrupt(Uuid::new_v4(), Some(TestState::default()), &ctx)
+            .await
+            .expect("deve interrompersi senza errore");
+
+        match outcome {
+            StepOutcome::Interrupted { resume_at, .. } => {
+                assert_eq!(resume_at, NodeId::NoOp);
+            }
+            other => panic!("atteso Interrupted, ottenuto {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_da_checkpoint_senza_init() {
+        // Primo run: NoOp->End completa e lascia un checkpoint.
+        let checkpointer = Arc::new(MemoryCheckpointer::default());
+        let run_id = Uuid::new_v4();
+
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));
+        let mut edges = HashMap::new();
+        edges.insert(NodeId::NoOp, Edge::Static(NodeId::End));
+
+        let engine = GraphEngine::new(nodes, edges, NodeId::NoOp, checkpointer.clone());
+        let ctx = TestCtx {
+            recursion_limit: 50,
+        };
+
+        engine
+            .run_until_interrupt(run_id, Some(TestState::default()), &ctx)
+            .await
+            .expect("primo run deve completare");
+
+        // Resume con init=None: deve trovare il checkpoint (next_node=end) e
+        // chiudere subito con Completed, senza NoCheckpoint.
+        let outcome = engine
+            .run_until_interrupt(run_id, None, &ctx)
+            .await
+            .expect("il resume deve trovare il checkpoint");
+        assert!(matches!(outcome, StepOutcome::Completed(_)));
+    }
+
+    #[tokio::test]
+    async fn resume_senza_checkpoint_e_errore() {
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));
+        let mut edges = HashMap::new();
+        edges.insert(NodeId::NoOp, Edge::Static(NodeId::End));
+
+        let engine = GraphEngine::new(
+            nodes,
+            edges,
+            NodeId::NoOp,
+            Arc::new(MemoryCheckpointer::default()),
+        );
+        let ctx = TestCtx {
+            recursion_limit: 50,
+        };
+
+        let err = engine
+            .run_until_interrupt(Uuid::new_v4(), None, &ctx)
+            .await
+            .expect_err("resume senza checkpoint deve fallire");
+        assert!(matches!(err, GraphError::NoCheckpoint(_)));
+    }
+
+    #[test]
+    fn node_label_round_trip() {
+        for id in [
+            NodeId::NoOp,
+            NodeId::End,
+            NodeId::Router,
+            NodeId::ClarifyOrExpand,
+            NodeId::Understanding,
+            NodeId::Planner,
+            NodeId::TodoRunner,
+            NodeId::Executor,
+            NodeId::ToolDispatch,
+            NodeId::Verifier,
+            NodeId::FinalGate,
+            NodeId::Reflection,
+            NodeId::Learner,
+        ] {
+            assert_eq!(NodeId::from_label(id.as_label()), Some(id));
+        }
+    }
+}
