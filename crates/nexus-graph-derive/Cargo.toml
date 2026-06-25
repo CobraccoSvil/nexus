@@ -1,0 +1,24 @@
+[package]
+name = "nexus-graph-derive"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# Proc-macro `#[derive(GraphState)]`: genera il reducer (`fn merge`) dello stato
+# del grafo a partire dagli attributi `#[reduce(append)]` sui campi. E' il PUNTO
+# UNICO (regola L) che codifica la semantica di canale di LangGraph (append vs
+# overwrite) in un solo posto: aggiungere un canale-append futuro = un attributo
+# su un campo, non un `if` sparso nei nodi.
+[lib]
+name = "nexus_graph_derive"
+path = "src/lib.rs"
+proc-macro = true
+
+[dependencies]
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true

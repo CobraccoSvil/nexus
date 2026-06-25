@@ -1,0 +1,606 @@
+//! `StateDelta` tipizzato — la forma "cio' che un nodo ha modificato".
+//!
+//! Replica campo-per-campo `AgentState`, ma ogni campo e' AVVOLTO in un livello
+//! di `Option` aggiuntivo che codifica la presenza-nel-delta. Il reducer generato
+//! dal `#[derive(GraphState)]` (vedi `nexus-graph-derive`) consuma questa struct:
+//! per ogni campo del delta `Some(...)` => applica, `None` => no-op (non tocca lo
+//! stato). La semantica di merge vive nel derive (PUNTO UNICO, regola L); questo
+//! modulo definisce SOLO la forma dati che il derive sa interpretare.
+//!
+//! ## Regola di wrapping (load-bearing)
+//!
+//! Il derive, per i campi NON-append, genera:
+//! ```ignore
+//! if let Some(__value) = delta.campo { self.campo = __value; }
+//! ```
+//! quindi `__value` deve avere ESATTAMENTE il tipo del campo di `AgentState`. Ne
+//! consegue:
+//!
+//! - Campo `append` (`messages`, `meta_steps`, gli UNICI due con `#[reduce(append)]`):
+//!   il derive fa `self.campo.extend(__items)`, dove `__items: Vec<T>`. Quindi nel
+//!   delta il campo e' `Option<Vec<T>>`: `Some(v)` => append di `v`, `None` => no-op.
+//!
+//! - Campo che in `AgentState` e' `Option<U>` (la stragrande maggioranza): il
+//!   derive assegna `self.campo = __value` con `self.campo: Option<U>`, quindi
+//!   `__value: Option<U>`. Nel delta il campo diventa `Option<Option<U>>`:
+//!     * `None`            => chiave ASSENTE nel delta => NO-OP (non toccare).
+//!     * `Some(None)`      => chiave PRESENTE col valore JSON `null` => imposta a `None`.
+//!     * `Some(Some(x))`   => chiave PRESENTE col valore `x` => imposta a `Some(x)`.
+//!   La distinzione assente(None) vs presente-vuoto e' LOAD-BEARING: per i campi
+//!   lista come `discovered_tools_next_turn`, `Some(Some(vec![]))` AZZERA la lista
+//!   (durata esatta 1 turno), mentre `None` la lascia intatta.
+//!
+//! - `extra`: in `AgentState` e' `serde_json::Map<String, Value>` con
+//!   `#[serde(flatten)]`. Nel delta diventa `Option<serde_json::Map<String, Value>>`
+//!   (campo NORMALE, niente flatten): `Some(map)` => overwrite della mappa extra,
+//!   `None` => no-op. Niente flatten qui perche' nel delta opaco le chiavi extra
+//!   arriverebbero al top-level e non vogliamo che catturino chiavi non note: il
+//!   merge dello stato runtime instrada le chiavi note ai campi tipizzati e le
+//!   ignote restano nello stato concreto via il proprio flatten.
+//!
+//! ## Tolleranza in lettura
+//!
+//! `#[serde(default)]` sullo struct: un delta JSON con chiavi mancanti deserializza
+//! a `None` su quei campi (= no-op). Cosi' il giro
+//! `from_value(delta_opaco) -> StateDelta -> merge_typed` preserva esattamente la
+//! distinzione chiave-assente vs chiave-presente del delta opaco di runtime.
+
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
+
+use super::{AutomationMode, Message, MetaStep, StopReason, TaskComplexity};
+
+/// Deserializzatore per i campi `Option<Option<T>>` che distingue chiave-assente
+/// da chiave-presente-con-`null` (regola load-bearing, vedi doc del modulo).
+///
+/// Senza questo helper, serde mappa il JSON `null` sull'`Option` ESTERNO
+/// (`None`), rendendolo indistinguibile da una chiave assente: si perderebbe la
+/// semantica "chiave presente = overwrite" della regola autoritativa
+/// (`nexus-graph/src/state.rs`). Combinato con `#[serde(default)]` sul campo
+/// (chiave assente => `None`, no-op), qui una chiave PRESENTE col valore `null`
+/// produce `Some(None)` (overwrite a `None`), un valore `x` produce `Some(Some(x))`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    // Il campo e' raggiunto SOLO se la chiave e' presente (altrimenti scatta il
+    // `default` => None). Quindi qui deserializziamo sempre l'Option interno
+    // (`null` => Some(None), valore => Some(Some(v))).
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+/// Delta tipizzato dello stato del grafo agentico.
+///
+/// Ogni campo replica l'omonimo di `AgentState` con un livello di `Option` in
+/// piu' (vedi regola di wrapping nel doc del modulo). `#[serde(default)]` rende
+/// ogni campo omesso un no-op.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StateDelta {
+    // ── Canali con reducer `add` (gli UNICI due) ─────────────────────────────
+    /// Append alla cronologia messaggi. `Some(v)` => `messages.extend(v)`.
+    pub messages: Option<Vec<Message>>,
+    /// Append ai meta-step semantici. `Some(v)` => `meta_steps.extend(v)`.
+    pub meta_steps: Option<Vec<MetaStep>>,
+
+    // ── Classificazione / intent ─────────────────────────────────────────────
+    /// Vedi `AgentState::user_intent`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub user_intent: Option<Option<String>>,
+    /// Vedi `AgentState::intent_confidence`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub intent_confidence: Option<Option<f64>>,
+    /// Vedi `AgentState::task_complexity`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub task_complexity: Option<Option<TaskComplexity>>,
+    /// Vedi `AgentState::agentic_score`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub agentic_score: Option<Option<f64>>,
+    /// Vedi `AgentState::is_ambiguous`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub is_ambiguous: Option<Option<bool>>,
+    /// Vedi `AgentState::expanded_query`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub expanded_query: Option<Option<String>>,
+    /// Vedi `AgentState::pending_clarify`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub pending_clarify: Option<Option<bool>>,
+    /// Vedi `AgentState::clarify_attempts`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub clarify_attempts: Option<Option<i64>>,
+    /// Vedi `AgentState::intent_hint`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub intent_hint: Option<Option<String>>,
+    /// Vedi `AgentState::action_oriented`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub action_oriented: Option<Option<bool>>,
+
+    // ── Esito dichiarato / governance chiusura ───────────────────────────────
+    /// Vedi `AgentState::declared_outcome`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub declared_outcome: Option<Option<Value>>,
+    /// Vedi `AgentState::closure_verdict`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub closure_verdict: Option<Option<Value>>,
+    /// Vedi `AgentState::tool_infra_error`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub tool_infra_error: Option<Option<bool>>,
+    /// Vedi `AgentState::playbook_steps`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub playbook_steps: Option<Option<Vec<String>>>,
+    /// Vedi `AgentState::playbook_key`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub playbook_key: Option<Option<String>>,
+    /// Vedi `AgentState::declared_done_count`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub declared_done_count: Option<Option<i64>>,
+    /// Vedi `AgentState::blocked_cap_rejected`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub blocked_cap_rejected: Option<Option<bool>>,
+
+    // ── Tool discovery / compressione prefix ─────────────────────────────────
+    /// Vedi `AgentState::discovered_tools_run`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub discovered_tools_run: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::compress_cutoff_index`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub compress_cutoff_index: Option<Option<i64>>,
+    /// Vedi `AgentState::compress_cutoff_phase`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub compress_cutoff_phase: Option<Option<i64>>,
+    /// Vedi `AgentState::run_notes`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub run_notes: Option<Option<String>>,
+
+    // ── Routing / esecuzione base ────────────────────────────────────────────
+    /// Vedi `AgentState::task_type`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub task_type: Option<Option<String>>,
+    /// Vedi `AgentState::behavior_mode`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub behavior_mode: Option<Option<String>>,
+    /// Vedi `AgentState::token_budget`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub token_budget: Option<Option<i64>>,
+    /// Vedi `AgentState::result`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub result: Option<Option<String>>,
+    /// Vedi `AgentState::provider_used`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub provider_used: Option<Option<String>>,
+    /// Vedi `AgentState::model_used`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub model_used: Option<Option<String>>,
+    /// Vedi `AgentState::feedback_score`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub feedback_score: Option<Option<f64>>,
+    /// Vedi `AgentState::latency_ms`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub latency_ms: Option<Option<f64>>,
+    /// Vedi `AgentState::token_usage`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub token_usage: Option<Option<i64>>,
+    /// Vedi `AgentState::iterations`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub iterations: Option<Option<i64>>,
+    /// Vedi `AgentState::thread_id`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub thread_id: Option<Option<String>>,
+
+    // ── Agent tool loop ──────────────────────────────────────────────────────
+    /// Vedi `AgentState::pending_tool_uses`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub pending_tool_uses: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::stop_reason`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub stop_reason: Option<Option<StopReason>>,
+    /// Vedi `AgentState::recent_tool_signatures`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub recent_tool_signatures: Option<Option<Vec<String>>>,
+    /// Vedi `AgentState::tools_json`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub tools_json: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::discovered_tools_next_turn`. Distinzione load-bearing:
+    /// `None` no-op, `Some(Some(vec![]))` azzera (durata 1 turno), `Some(Some(v))` set.
+    #[serde(default, deserialize_with = "double_option")]
+    pub discovered_tools_next_turn: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::system_text`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub system_text: Option<Option<String>>,
+    /// Vedi `AgentState::session_id`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub session_id: Option<Option<String>>,
+    /// Vedi `AgentState::approved`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub approved: Option<Option<bool>>,
+    /// Vedi `AgentState::provider_override`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub provider_override: Option<Option<String>>,
+    /// Vedi `AgentState::model_override`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub model_override: Option<Option<String>>,
+    /// Vedi `AgentState::profile_name`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub profile_name: Option<Option<String>>,
+
+    // ── Metriche AI estese ────────────────────────────────────────────────────
+    /// Vedi `AgentState::prompt_tokens`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub prompt_tokens: Option<Option<i64>>,
+    /// Vedi `AgentState::completion_tokens`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub completion_tokens: Option<Option<i64>>,
+    /// Vedi `AgentState::cache_creation_tokens`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub cache_creation_tokens: Option<Option<i64>>,
+    /// Vedi `AgentState::cache_read_tokens`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub cache_read_tokens: Option<Option<i64>>,
+    /// Vedi `AgentState::total_tokens`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub total_tokens: Option<Option<i64>>,
+    /// Vedi `AgentState::total_cost_usd`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub total_cost_usd: Option<Option<f64>>,
+    /// Vedi `AgentState::cache_hit_rate`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub cache_hit_rate: Option<Option<f64>>,
+    /// Vedi `AgentState::temperature`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub temperature: Option<Option<f64>>,
+    /// Vedi `AgentState::top_p`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub top_p: Option<Option<f64>>,
+    /// Vedi `AgentState::created_at`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub created_at: Option<Option<String>>,
+    /// Vedi `AgentState::completed_at`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub completed_at: Option<Option<String>>,
+
+    // ── Self-reflection ────────────────────────────────────────────────────────
+    /// Vedi `AgentState::reflection_score`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub reflection_score: Option<Option<f64>>,
+    /// Vedi `AgentState::reflection_dimensions`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub reflection_dimensions: Option<Option<Value>>,
+    /// Vedi `AgentState::reflection_weaknesses`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub reflection_weaknesses: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::reflection_suggestions`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub reflection_suggestions: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::final_reward`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub final_reward: Option<Option<f64>>,
+
+    // ── Plan / Act / Verify ────────────────────────────────────────────────────
+    /// Vedi `AgentState::plan_phase_active`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plan_phase_active: Option<Option<bool>>,
+    /// Vedi `AgentState::plan_phase_skip_reason`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plan_phase_skip_reason: Option<Option<String>>,
+    /// Vedi `AgentState::current_plan_id`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub current_plan_id: Option<Option<String>>,
+    /// Vedi `AgentState::current_todos`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub current_todos: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::acceptance_criteria`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub acceptance_criteria: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::active_todo_id`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub active_todo_id: Option<Option<String>>,
+    /// Vedi `AgentState::plan_rationale`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plan_rationale: Option<Option<String>>,
+    /// Vedi `AgentState::plan_constraints`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plan_constraints: Option<Option<Vec<String>>>,
+    /// Vedi `AgentState::plan_alternatives`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plan_alternatives: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::plan_rationale_context`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plan_rationale_context: Option<Option<String>>,
+    /// Vedi `AgentState::context_brief`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub context_brief: Option<Option<String>>,
+    /// Vedi `AgentState::understanding_active`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub understanding_active: Option<Option<bool>>,
+    /// Vedi `AgentState::understanding_skip_reason`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub understanding_skip_reason: Option<Option<String>>,
+    /// Vedi `AgentState::since_last_todo_reminder`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub since_last_todo_reminder: Option<Option<i64>>,
+    /// Vedi `AgentState::verify_cycle`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub verify_cycle: Option<Option<i64>>,
+    /// Vedi `AgentState::exploratory_verify_cycle`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub exploratory_verify_cycle: Option<Option<i64>>,
+    /// Vedi `AgentState::exploratory_verify_total`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub exploratory_verify_total: Option<Option<i64>>,
+    /// Vedi `AgentState::final_gate_cycle`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub final_gate_cycle: Option<Option<i64>>,
+    /// Vedi `AgentState::verifier_last_result`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub verifier_last_result: Option<Option<Value>>,
+    /// Vedi `AgentState::plan_revisions`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub plan_revisions: Option<Option<i64>>,
+
+    // ── Sub-agents ──────────────────────────────────────────────────────────────
+    /// Vedi `AgentState::parent_run_id`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub parent_run_id: Option<Option<String>>,
+    /// Vedi `AgentState::subagent_depth`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub subagent_depth: Option<Option<i64>>,
+    /// Vedi `AgentState::subagent_results`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub subagent_results: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::active_subagent_runs`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub active_subagent_runs: Option<Option<Vec<String>>>,
+    /// Vedi `AgentState::subagent_cost_cumulative_usd`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub subagent_cost_cumulative_usd: Option<Option<f64>>,
+
+    // ── Allegati / budget ─────────────────────────────────────────────────────
+    /// Vedi `AgentState::attachment_read_bytes`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub attachment_read_bytes: Option<Option<i64>>,
+
+    // ── G1 / loop-detection ────────────────────────────────────────────────────
+    /// Vedi `AgentState::action_nudge_count`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub action_nudge_count: Option<Option<i64>>,
+    /// Vedi `AgentState::g1_reroute_count`.
+    pub g1_reroute_count: Option<Option<i64>>,
+    /// Vedi `AgentState::consecutive_exploration_calls`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub consecutive_exploration_calls: Option<Option<i64>>,
+    /// Vedi `AgentState::exploration_nudge_sent`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub exploration_nudge_sent: Option<Option<bool>>,
+    /// Vedi `AgentState::repeated_cmd_nudge_sent`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub repeated_cmd_nudge_sent: Option<Option<bool>>,
+
+    // ── progress_controller ────────────────────────────────────────────────────
+    /// Vedi `AgentState::progress_guided_axes`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub progress_guided_axes: Option<Option<Vec<String>>>,
+    /// Vedi `AgentState::progress_diagnosed_axes`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub progress_diagnosed_axes: Option<Option<Vec<String>>>,
+    /// Vedi `AgentState::forced_close_unverified`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub forced_close_unverified: Option<Option<bool>>,
+
+    // ── Sticky cascade ──────────────────────────────────────────────────────────
+    /// Vedi `AgentState::sticky_provider`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub sticky_provider: Option<Option<String>>,
+    /// Vedi `AgentState::sticky_model`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub sticky_model: Option<Option<String>>,
+    /// Vedi `AgentState::planner_sticky_provider`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub planner_sticky_provider: Option<Option<String>>,
+    /// Vedi `AgentState::planner_sticky_model`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub planner_sticky_model: Option<Option<String>>,
+
+    // ── Automazione ─────────────────────────────────────────────────────────────
+    /// Vedi `AgentState::automation_mode`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub automation_mode: Option<Option<AutomationMode>>,
+
+    // ── HITL (predicati di interrupt) ───────────────────────────────────────────
+    /// Vedi `AgentState::awaiting_confirmation`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub awaiting_confirmation: Option<Option<bool>>,
+
+    // ── Schema aperto ───────────────────────────────────────────────────────────
+    /// Overwrite della mappa `extra` (campo NORMALE, niente flatten): `Some(map)`
+    /// sostituisce `AgentState::extra`, `None` e' no-op. Vedi doc del modulo.
+    pub extra: Option<Map<String, Value>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{AgentState, MessageContent};
+    use nexus_graph::{GraphState as _, StateDelta as OpaqueDelta};
+    use serde_json::json;
+
+    /// Costruttore di un messaggio utente testuale (helper di test).
+    fn human(text: &str) -> Message {
+        Message::Human {
+            content: MessageContent::text(text),
+        }
+    }
+
+    /// Reducer `append` su `messages`: `Some(v)` accoda, `None` e' no-op.
+    #[test]
+    fn reducer_append_messages_estende() {
+        let mut state = AgentState {
+            messages: vec![human("primo")],
+            ..Default::default()
+        };
+
+        // Some(v) => extend.
+        state.merge_typed(StateDelta {
+            messages: Some(vec![human("secondo"), human("terzo")]),
+            ..Default::default()
+        });
+        assert_eq!(state.messages.len(), 3);
+        assert_eq!(state.messages[0], human("primo"));
+        assert_eq!(state.messages[2], human("terzo"));
+
+        // None => no-op: la lista resta com'era (non azzerata, non duplicata).
+        state.merge_typed(StateDelta {
+            messages: None,
+            ..Default::default()
+        });
+        assert_eq!(state.messages.len(), 3);
+    }
+
+    /// Distinzione load-bearing su `discovered_tools_next_turn` (campo lista
+    /// overwrite): None=no-op, Some(Some(vec![]))=azzera, Some(Some(v))=set.
+    #[test]
+    fn reducer_overwrite_distinzione_load_bearing() {
+        let mut state = AgentState {
+            discovered_tools_next_turn: Some(vec![json!({"name": "preesistente"})]),
+            ..Default::default()
+        };
+
+        // 1) None => NO-OP: lo stato resta invariato.
+        state.merge_typed(StateDelta {
+            discovered_tools_next_turn: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            state.discovered_tools_next_turn,
+            Some(vec![json!({"name": "preesistente"})]),
+            "None deve essere no-op, non toccare il campo"
+        );
+
+        // 2) Some(Some(vec![])) => AZZERA: diventa Some(vec![]) (lista vuota,
+        //    durata esatta 1 turno). NON diventa None.
+        state.merge_typed(StateDelta {
+            discovered_tools_next_turn: Some(Some(vec![])),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.discovered_tools_next_turn,
+            Some(vec![]),
+            "Some(Some(vec![])) deve azzerare a lista vuota (non None)"
+        );
+
+        // 3) Some(Some(v)) => SET al nuovo valore.
+        state.merge_typed(StateDelta {
+            discovered_tools_next_turn: Some(Some(vec![json!({"name": "nuovo"})])),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.discovered_tools_next_turn,
+            Some(vec![json!({"name": "nuovo"})])
+        );
+
+        // 4) Some(None) => imposta a None (chiave presente col valore JSON null).
+        state.merge_typed(StateDelta {
+            discovered_tools_next_turn: Some(None),
+            ..Default::default()
+        });
+        assert_eq!(state.discovered_tools_next_turn, None);
+    }
+
+    /// Overwrite di un campo scalare `Option<T>`: la stessa distinzione vale
+    /// anche fuori dalle liste (es. `user_intent`).
+    #[test]
+    fn reducer_overwrite_scalare() {
+        let mut state = AgentState {
+            user_intent: Some("code_write".to_string()),
+            ..Default::default()
+        };
+
+        // None => no-op.
+        state.merge_typed(StateDelta {
+            user_intent: None,
+            ..Default::default()
+        });
+        assert_eq!(state.user_intent.as_deref(), Some("code_write"));
+
+        // Some(Some(x)) => set.
+        state.merge_typed(StateDelta {
+            user_intent: Some(Some("code_read".to_string())),
+            ..Default::default()
+        });
+        assert_eq!(state.user_intent.as_deref(), Some("code_read"));
+
+        // Some(None) => azzera a None.
+        state.merge_typed(StateDelta {
+            user_intent: Some(None),
+            ..Default::default()
+        });
+        assert_eq!(state.user_intent, None);
+    }
+
+    /// Giro completo via trait `nexus_graph::GraphState::merge` con delta JSON
+    /// OPACO: una chiave ASSENTE e' no-op, una PRESENTE (anche []) applica.
+    /// Testa la catena `from_value(map) -> StateDelta -> merge_typed`.
+    #[test]
+    fn merge_trait_opaco_chiave_assente_vs_presente() {
+        let mut state = AgentState {
+            user_intent: Some("originale".to_string()),
+            discovered_tools_next_turn: Some(vec![json!({"name": "vecchio"})]),
+            ..Default::default()
+        };
+
+        // Delta opaco con SOLO discovered_tools_next_turn presente (= []).
+        // user_intent e' ASSENTE dalla mappa => deve restare invariato.
+        let mut map = serde_json::Map::new();
+        map.insert("discovered_tools_next_turn".to_string(), json!([]));
+        let delta = OpaqueDelta::from_map(map);
+
+        state.merge(delta);
+
+        // Chiave presente (anche []): azzera la lista a vuota.
+        assert_eq!(
+            state.discovered_tools_next_turn,
+            Some(vec![]),
+            "chiave presente [] deve azzerare la lista"
+        );
+        // Chiave assente: no-op, valore originale preservato.
+        assert_eq!(
+            state.user_intent.as_deref(),
+            Some("originale"),
+            "chiave assente deve essere no-op"
+        );
+    }
+
+    /// Via trait: una chiave presente col valore `null` imposta il campo a None.
+    #[test]
+    fn merge_trait_opaco_null_azzera_a_none() {
+        let mut state = AgentState {
+            result: Some("vecchio risultato".to_string()),
+            ..Default::default()
+        };
+
+        let mut map = serde_json::Map::new();
+        map.insert("result".to_string(), Value::Null);
+        state.merge(OpaqueDelta::from_map(map));
+
+        assert_eq!(state.result, None);
+    }
+
+    /// Via trait: append `messages` attraverso il delta opaco.
+    #[test]
+    fn merge_trait_opaco_append_messages() {
+        let mut state = AgentState {
+            messages: vec![human("uno")],
+            ..Default::default()
+        };
+
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "messages".to_string(),
+            json!([{"role": "user", "content": "due"}]),
+        );
+        state.merge(OpaqueDelta::from_map(map));
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1], human("due"));
+    }
+}

@@ -2207,6 +2207,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "nexus-graph",
+ "nexus-graph-derive",
  "serde",
  "serde_json",
  "sqlx",
@@ -2347,6 +2348,15 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "nexus-graph-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

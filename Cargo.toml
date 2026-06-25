@@ -21,7 +21,7 @@ members = [
   "crates/doc-service",
   "crates/chat-service",
   "crates/plugin-service"
-, "crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events", "crates/nexus-sudo-runner", "crates/nexus-mcp-client", "crates/nexus-gateway", "crates/nexus-graph", "crates/nexus-agent-graph"]
+, "crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events", "crates/nexus-sudo-runner", "crates/nexus-mcp-client", "crates/nexus-gateway", "crates/nexus-graph", "crates/nexus-graph-derive", "crates/nexus-agent-graph"]
 resolver = "2"
 
 [workspace.package]
@@ -78,6 +78,10 @@ nexus-http = { path = "crates/nexus-http" }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 notify = { version = "6", features = ["serde"] }
+# Proc-macro per il derive del reducer di stato del grafo (nexus-graph-derive).
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 
 [workspace.dependencies.tonic-build]
 version = "0.12"
