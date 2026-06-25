@@ -354,11 +354,19 @@ pub(super) const FORBIDDEN_NOOP: &[&str] = &[
     "true", "false", ":", "sleep", "echo", "exit", "noop", "no-op",
 ];
 
-/// Marca come `existing=true` i suggerimenti il cui unit e' gia' installato come
-/// file .service in systemd --user. PUNTO UNICO (regola L): usato sia dal ramo
-/// agentico sia dall'euristica in `wizard_detect_services`. Stato volatile: non
-/// va cachato.
-pub(super) async fn mark_existing_services(suggestions: &mut [serde_json::Value]) {
+/// Marca come `existing=true` i suggerimenti gia' gestiti dal progetto. PUNTO
+/// UNICO (regola L): usato sia dal ramo agentico sia dall'euristica in
+/// `wizard_detect_services`. Considera DUE fonti, cosi' la dialog del wizard
+/// (che decide "Installato vs Installa" su questo flag) resta allineata al badge
+/// e alla lista dei servizi gestiti:
+///   1. unit registrate in systemd --user (`list-unit-files`), quando il bus c'e';
+///   2. file unit presenti su disco (`services::project_unit_files_on_disk`), che
+///      e' l'unica fonte disponibile in WSL/detached dove il bus utente e' giu' e
+///      il punto 1 ritorna vuoto. E' la stessa fonte di `list_services_fallback`.
+/// Stato volatile: non va cachato.
+pub(super) async fn mark_existing_services(slug: &str, suggestions: &mut [serde_json::Value]) {
+    let mut installed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 1. Unit registrate in systemd --user (quando il bus risponde).
     if let Ok(svc_out) = systemctl_user()
         .args([
             "--user",
@@ -370,15 +378,19 @@ pub(super) async fn mark_existing_services(suggestions: &mut [serde_json::Value]
         .output()
         .await
     {
-        let installed: std::collections::HashSet<String> = String::from_utf8_lossy(&svc_out.stdout)
-            .lines()
-            .filter_map(|l| l.split_whitespace().next().map(String::from))
-            .collect();
-        for s in suggestions.iter_mut() {
-            let unit = s["unit"].as_str().unwrap_or("").to_string();
-            if installed.contains(&unit) {
-                s["existing"] = json!(true);
-            }
+        installed.extend(
+            String::from_utf8_lossy(&svc_out.stdout)
+                .lines()
+                .filter_map(|l| l.split_whitespace().next().map(String::from)),
+        );
+    }
+    // 2. Unit presenti come FILE su disco: in WSL/detached il bus e' giu' (punto 1
+    //    vuoto) ma i file unit esistono e il pannello li mostra gia' come gestiti.
+    installed.extend(super::services::project_unit_files_on_disk(slug).await);
+    for s in suggestions.iter_mut() {
+        let unit = s["unit"].as_str().unwrap_or("");
+        if installed.contains(unit) {
+            s["existing"] = json!(true);
         }
     }
 }
@@ -423,7 +435,8 @@ pub async fn wizard_detect_services(
     .await
     {
         if !found.is_empty() {
-            mark_existing_services(&mut found).await;
+            mark_existing_services(&slug, &mut found).await;
+            super::service_discovery::drop_managed_variants(&mut found).await;
             return Ok(Json(json!({ "suggestions": found, "slug": slug })));
         }
     }
@@ -701,7 +714,9 @@ pub async fn wizard_detect_services(
     }
 
     // Marca quelli già installati come .service files (punto unico, regola L).
-    mark_existing_services(&mut suggestions).await;
+    mark_existing_services(&slug, &mut suggestions).await;
+    // Scarta le varianti di avvio di servizi gia' gestiti (punto unico, regola L).
+    super::service_discovery::drop_managed_variants(&mut suggestions).await;
 
     Ok(Json(json!({ "suggestions": suggestions, "slug": slug })))
 }

@@ -142,6 +142,42 @@ pub(super) async fn docker_compose_active_services(
     }
 }
 
+/// Vero se `fname` e' un file unit appartenente al progetto `slug`
+/// (`{slug}-*.service`). Criterio UNICO (regola L) di appartenenza di una unit a
+/// un progetto: usato sia dall'enumerazione dei servizi gestiti
+/// (`list_services_fallback`) sia dal marking dei candidati gia' installati nel
+/// wizard (`mark_existing_services`), cosi' le due viste non divergono mai.
+pub(super) fn is_project_unit_file(fname: &str, slug: &str) -> bool {
+    fname.starts_with(&format!("{slug}-")) && fname.ends_with(".service")
+}
+
+/// Nomi dei file unit del progetto presenti su disco in
+/// `~/.config/systemd/user/{slug}-*.service`. PUNTO UNICO (regola L) per "quali
+/// unit del progetto ESISTONO", indipendente dal bus systemd --user: in
+/// WSL/detached `systemctl --user list-unit-files` fallisce, ma i file unit
+/// restano su disco ed e' QUESTA la fonte che il pannello usa gia' (via
+/// `list_services_fallback`) per elencarli come gestiti. Il wizard la usa per non
+/// ri-offrire l'installazione di servizi gia' configurati. Set vuoto se la dir
+/// non esiste.
+pub(super) async fn project_unit_files_on_disk(
+    slug: &str,
+) -> std::collections::HashSet<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
+    let dir = format!("{home}/.config/systemd/user");
+    let mut units = std::collections::HashSet::new();
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(_) => return units,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if is_project_unit_file(&fname, slug) {
+            units.insert(fname);
+        }
+    }
+    units
+}
+
 /// Elenca i servizi del progetto SENZA systemd --user (manager `user@<uid>`
 /// dead, tipico in WSL). Legge i file unit in `~/.config/systemd/user/{slug}-*.
 /// service` e ne deduce lo stato dal processo detached (pgrep sull'ExecStart).
@@ -167,7 +203,7 @@ pub(super) async fn list_services_fallback(
     let compose_services = docker_compose_active_services(project_root).await;
     while let Ok(Some(entry)) = rd.next_entry().await {
         let fname = entry.file_name().to_string_lossy().to_string();
-        if !fname.starts_with(&prefix) || !fname.ends_with(".service") {
+        if !is_project_unit_file(&fname, slug) {
             continue;
         }
         let short = fname
@@ -2157,6 +2193,21 @@ pub async fn port_allocated_to_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_project_unit_file_riconosce_solo_le_unit_del_progetto() {
+        // Criterio UNICO (regola L) usato sia dall'enumerazione gestiti
+        // (list_services_fallback) sia dal marking wizard (mark_existing_services).
+        assert!(is_project_unit_file("beauty-book-backend.service", "beauty-book"));
+        assert!(is_project_unit_file("beauty-book-frontend.service", "beauty-book"));
+        // Prefisso di un altro progetto: NO.
+        assert!(!is_project_unit_file("other-backend.service", "beauty-book"));
+        // Estensione non .service (timer/socket): NO.
+        assert!(!is_project_unit_file("beauty-book-backend.timer", "beauty-book"));
+        // Manca il separatore '-' dopo lo slug: NO (evita falsi match tra slug uno
+        // prefisso dell'altro, es. "beauty-book" vs "beauty-bookshop").
+        assert!(!is_project_unit_file("beauty-bookshop-api.service", "beauty-book"));
+    }
 
     #[test]
     fn riconosce_servizio_docker_compose() {

@@ -243,6 +243,123 @@ pub(super) async fn discover_services_agentic(
     Some(out)
 }
 
+/// Estrae i BASENAME dei file-entrypoint (sorgenti) citati in una command line.
+/// Parte PURA e testabile della signature di esecuzione: i token che terminano
+/// con una estensione sorgente nota sono il "cosa esegue" il servizio,
+/// indipendentemente dal runner (nodemon, tsx, node, ts-node). Si usa il basename
+/// (non il path relativo) perche' l'agent puo' allucinare cwd diversi per la
+/// stessa variante (es. cwd root vs root/backend con lo stesso `src/app.ts`).
+pub(super) fn entrypoint_files(cmdline: &str) -> std::collections::BTreeSet<String> {
+    const EXTS: [&str; 7] = [".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".py"];
+    let mut sig = std::collections::BTreeSet::new();
+    for tok in cmdline.split_whitespace() {
+        let t = tok.trim_matches(|c| c == '"' || c == '\'');
+        if EXTS.iter().any(|e| t.ends_with(e)) {
+            let base = t.rsplit('/').next().unwrap_or(t);
+            sig.insert(base.to_string());
+        }
+    }
+    sig
+}
+
+/// Signature di esecuzione di un candidato: l'insieme dei file-entrypoint
+/// (basename) che il servizio avvia. Per i candidati che invocano uno script del
+/// package manager (`pnpm/npm/yarn run <script>`) ESPANDE lo script leggendo il
+/// package.json in `cwd`, cosi' il confronto e' sul PROCESSO reale e non sulla
+/// forma di invocazione: "pnpm run dev:backend" e l'equivalente diretto
+/// "nodemon ... src/app.ts" producono la stessa signature. Best-effort: se il
+/// package.json non e' leggibile/parsabile usa la cmdline grezza. Set vuoto (es.
+/// "vite", "docker compose up") = il servizio NON partecipa alla dedup
+/// per-entrypoint.
+pub(super) async fn execution_signature(
+    command: &str,
+    args: &[String],
+    cwd: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut cmdline = format!("{} {}", command, args.join(" "));
+    let base = command.rsplit('/').next().unwrap_or(command);
+    if matches!(base, "pnpm" | "npm" | "yarn" | "npx") {
+        // Nome script: il primo arg che non sia "run" ne' un flag.
+        let script = args
+            .iter()
+            .find(|a| a.as_str() != "run" && !a.starts_with('-'))
+            .cloned();
+        if let Some(name) = script {
+            if let Ok(content) =
+                tokio::fs::read_to_string(format!("{cwd}/package.json")).await
+            {
+                if let Ok(pkg) = serde_json::from_str::<Value>(&content) {
+                    if let Some(v) = pkg
+                        .get("scripts")
+                        .and_then(|s| s.get(&name))
+                        .and_then(Value::as_str)
+                    {
+                        cmdline = v.to_string();
+                    }
+                }
+            }
+        }
+    }
+    entrypoint_files(&cmdline)
+}
+
+/// Signature di esecuzione di un suggerimento (Value con campi command/args/cwd).
+async fn suggestion_signature(s: &Value) -> std::collections::BTreeSet<String> {
+    let command = s.get("command").and_then(Value::as_str).unwrap_or("");
+    let cwd = s.get("cwd").and_then(Value::as_str).unwrap_or("");
+    let args: Vec<String> = s
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    execution_signature(command, &args, cwd).await
+}
+
+/// Scarta i suggerimenti che sono VARIANTI DI AVVIO di un servizio gia' gestito.
+/// PUNTO UNICO (regola L) della de-duplicazione delle varianti, applicato DOPO
+/// `mark_existing_services` (serve il flag `existing`). Criterio robusto: un
+/// candidato NON gestito (`existing=false`) il cui entrypoint coincide con quello
+/// di un candidato GESTITO (`existing=true`) e' lo stesso servizio in un'altra
+/// forma di invocazione (es. "nodemon src/app.ts" vs lo script "pnpm run
+/// dev:backend" che espande allo stesso `app.ts`). I modelli (es. mistral-large)
+/// generano queste varianti nonostante il prompt (mig 0454), talvolta con `cwd`
+/// allucinati: confrontare i basename degli entrypoint e gating sul flag
+/// `existing` evita falsi collassi tra servizi legittimi (che sarebbero entrambi
+/// gestiti o entrambi non gestiti, e comunque con entrypoint diversi).
+pub(super) async fn drop_managed_variants(suggestions: &mut Vec<Value>) {
+    // Entrypoint dei servizi GIA' gestiti.
+    let mut managed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for s in suggestions.iter() {
+        if s.get("existing").and_then(Value::as_bool) == Some(true) {
+            managed.extend(suggestion_signature(s).await);
+        }
+    }
+    if managed.is_empty() {
+        return;
+    }
+    let mut kept: Vec<Value> = Vec::with_capacity(suggestions.len());
+    for s in std::mem::take(suggestions) {
+        if s.get("existing").and_then(Value::as_bool) != Some(true) {
+            let sig = suggestion_signature(&s).await;
+            if !sig.is_empty() && sig.iter().any(|e| managed.contains(e)) {
+                tracing::info!(
+                    "wizard: variante non gestita '{}' scartata (entrypoint {:?} \
+                     gia' coperto da un servizio gestito)",
+                    s.get("short").and_then(|v| v.as_str()).unwrap_or("?"),
+                    sig
+                );
+                continue;
+            }
+        }
+        kept.push(s);
+    }
+    *suggestions = kept;
+}
+
 /// Cache condivisa in-process. TTL letto dal DB alla PRIMA inizializzazione
 /// (cambio del setting a runtime richiede restart). Punto unico cache TTL:
 /// `nexus_cache::TtlCache` (regola L).
@@ -413,6 +530,25 @@ async fn load_u64(db: &sqlx::PgPool, key: &str, default: u64, min: u64) -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn entrypoint_files_usa_il_basename() {
+        // Il runner diretto espone l'entrypoint reale (basename).
+        let sig = entrypoint_files("nodemon --watch src/app.ts --exec tsx src/app.ts");
+        assert!(sig.contains("app.ts"));
+        assert_eq!(sig.len(), 1);
+        // Lo stesso processo via cross-env mantiene la stessa signature -> la dedup
+        // riconosce "pnpm run dev:backend" (espanso) e "nodemon ... src/app.ts".
+        let sig2 =
+            entrypoint_files("cross-env PORT=21976 nodemon --watch src/app.ts --exec tsx src/app.ts");
+        assert_eq!(sig, sig2);
+        // cwd allucinato (backend/src/app.ts): il basename collassa lo stesso, cosi'
+        // la variante con cwd inventato resta riconoscibile come duplicato.
+        assert_eq!(entrypoint_files("nodemon backend/src/app.ts"), sig);
+        // vite/docker non hanno entrypoint sorgente -> signature vuota (no dedup).
+        assert!(entrypoint_files("vite --port 21954").is_empty());
+        assert!(entrypoint_files("docker compose up").is_empty());
+    }
 
     fn valid_svc() -> Value {
         json!({
