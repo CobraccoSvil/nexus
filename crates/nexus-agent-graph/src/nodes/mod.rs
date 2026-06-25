@@ -6,9 +6,12 @@
 //! (porte I/O astratte + DB + config). I nodi NON instradano: l'edge e'
 //! dichiarato fuori dal nodo (vedi `nexus-graph::edge`).
 //!
-//! In QUESTO PR e' portato solo `RouterNode` (caso passthrough/deterministico);
-//! i restanti 11 nodi reali arrivano nei PR successivi del porting.
+//! In QUESTO PR sono portati `RouterNode` (caso passthrough/deterministico) e
+//! `UnderstandingNode` (Cluster 2, comprensione pre-planning); i restanti nodi
+//! reali arrivano nei PR successivi del porting.
 
 pub mod router;
+pub mod understanding;
 
 pub use router::RouterNode;
+pub use understanding::{UnderstandingConfig, UnderstandingNode};

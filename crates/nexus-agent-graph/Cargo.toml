@@ -20,6 +20,7 @@ path = "src/lib.rs"
 nexus-graph = { path = "../nexus-graph" }
 nexus-graph-derive = { path = "../nexus-graph-derive" }
 async-trait = "0.1"
+futures.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
