@@ -8,6 +8,7 @@
 //! `/tmp/langgraph_plan.md`).
 
 pub mod checkpoint_pg;
+pub mod decisions;
 pub mod state;
 
 pub use checkpoint_pg::PgCheckpointer;

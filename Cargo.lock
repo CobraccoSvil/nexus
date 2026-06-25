@@ -2208,6 +2208,7 @@ dependencies = [
  "async-trait",
  "nexus-graph",
  "nexus-graph-derive",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",
