@@ -10,7 +10,7 @@
 //! ## Regola di wrapping (load-bearing)
 //!
 //! Il derive, per i campi NON-append, genera:
-//! ```ignore
+//! ```text
 //! if let Some(__value) = delta.campo { self.campo = __value; }
 //! ```
 //! quindi `__value` deve avere ESATTAMENTE il tipo del campo di `AgentState`. Ne

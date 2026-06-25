@@ -12,6 +12,7 @@
 //! nodi reali arrivano nei PR successivi del porting.
 
 pub mod clarify_or_expand;
+pub mod learner;
 pub mod reflection;
 pub mod router;
 pub mod understanding;
@@ -19,6 +20,7 @@ pub mod understanding;
 pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
 };
+pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
 pub use reflection::{ReflectionConfig, ReflectionData, ReflectionNode};
 pub use router::RouterNode;
 pub use understanding::{UnderstandingConfig, UnderstandingNode};

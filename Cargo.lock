@@ -2206,6 +2206,7 @@ name = "nexus-agent-graph"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "nexus-graph",
  "nexus-graph-derive",

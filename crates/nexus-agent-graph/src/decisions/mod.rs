@@ -23,7 +23,8 @@ pub mod reward;
 
 pub use dag_scheduler::{compute_ready_layer, should_parallelize, DagConfig, Todo, TodoStatus};
 pub use reward::{
-    aggregate_score, final_reward, heuristic_reward, round_half_even, MAX_AGENT_ITERATIONS,
+    aggregate_score, final_reward, heuristic_reward, prelim_reward, round_half_even,
+    MAX_AGENT_ITERATIONS,
 };
 pub use helpers::{
     compute_iteration_budget, estimate_prompt_complexity, should_force_tool_choice,

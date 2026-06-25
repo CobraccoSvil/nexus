@@ -65,6 +65,39 @@ pub fn heuristic_reward(
     0.4
 }
 
+/// Reward PRELIMINARE del learner (`brain/agents/nodes/__init__.py:4502-4508`).
+/// Punto unico (regola L): vive QUI accanto a [`heuristic_reward`] perche' e' un
+/// SECONDO reward del flusso agentico, ma con semantica DIVERSA dall'euristico:
+/// e' calcolato SUBITO (senza reflection) per filtrare il salvataggio Qdrant
+/// (interazioni di bassa qualita' non devono inquinare il RAG). Qui conta
+/// `stop_reason == "end_turn"` + presenza `result`, NON le iterazioni.
+///
+/// Semantica Python (cascata di if nell'ordine, 1:1):
+/// ```text
+/// 1.0 if stop_reason == "end_turn" and result   # end_turn pulito
+/// 0.4 if stop_reason == "end_turn"               # end_turn ma result vuoto
+/// 0.0 if stop_reason == "error"                  # errore provider
+/// 0.3 altrimenti                                 # cap iterazioni o altro
+/// ```
+/// L'ordine e' LOAD-BEARING: i due rami `end_turn` precedono `error`, quindi un
+/// `end_turn` con result vuoto produce 0.4 (non cade su `error`).
+///
+/// Parametri (tutti risolti dal chiamante, regola G):
+/// - `stop_reason`: stringa snake_case (`state.get("stop_reason") or "end_turn"`,
+///   `__init__.py:4502`; il default `end_turn` lo applica il chiamante).
+/// - `result_non_empty`: `bool(result)` Python su stringa (stringa non vuota).
+pub fn prelim_reward(stop_reason: &str, result_non_empty: bool) -> f64 {
+    if stop_reason == "end_turn" && result_non_empty {
+        1.0
+    } else if stop_reason == "end_turn" {
+        0.4
+    } else if stop_reason == "error" {
+        0.0
+    } else {
+        0.3
+    }
+}
+
 /// Fusione del reward finale (`brain/agents/nodes/__init__.py:4367-4374`):
 /// `heuristic_weight = round(1.0 - reward_weight, 4)` e
 /// `final_reward = round(heuristic_weight * heuristic + reward_weight * reflection_score, 4)`.
@@ -142,6 +175,20 @@ mod tests {
     #[test]
     fn heuristic_nessun_result_e_04() {
         assert_eq!(heuristic_reward("end_turn", false, 3, 60), 0.4);
+    }
+
+    #[test]
+    fn prelim_reward_quattro_rami() {
+        // end_turn + result -> 1.0.
+        assert_eq!(prelim_reward("end_turn", true), 1.0);
+        // end_turn senza result -> 0.4 (precede error nell'ordine).
+        assert_eq!(prelim_reward("end_turn", false), 0.4);
+        // error -> 0.0.
+        assert_eq!(prelim_reward("error", false), 0.0);
+        assert_eq!(prelim_reward("error", true), 0.0, "error vince anche con result");
+        // qualsiasi altro stop_reason -> 0.3 (cap iterazioni o altro).
+        assert_eq!(prelim_reward("loop_abort", true), 0.3);
+        assert_eq!(prelim_reward("stop", false), 0.3);
     }
 
     #[test]
