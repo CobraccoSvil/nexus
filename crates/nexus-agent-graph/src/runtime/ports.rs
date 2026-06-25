@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::decisions::dag_scheduler::{Todo, TodoStatus};
 use crate::state::ToolUse;
 
 /// Errore di una porta I/O. Opaco al runtime: messaggio + classe sintetica per
@@ -258,4 +259,40 @@ pub enum SseEvent {
 pub trait EventSink: Send + Sync {
     /// Pubblica un evento (best-effort, non blocca il nodo).
     fn emit(&self, ev: SseEvent);
+}
+
+/// Astrazione dell'I/O sui todo del DAG (`brain/agents/todo_store.py`). Confine
+/// d'inversione: la LOGICA DAG (selezione, ready layer, discendenti) e' pura e
+/// vive in [`crate::decisions::dag_scheduler`] (punto unico, regola L); questo
+/// trait isola SOLO l'accesso DB. I nodi (`verifier`/`todo_runner`, PR futuro)
+/// leggono i todo da qui e delegano la decisione al modulo puro.
+///
+/// mcp-core la implementera' con `sqlx` su `nexus_agent_todos` (TODO: impl
+/// concreta nel PR dei nodi). Il trait e' astratto: definisce il contratto, non
+/// l'implementazione.
+///
+/// INVARIANTE (regola H, bug 2026-06-10): [`list_todos`](TodoStore::list_todos)
+/// DEVE restituire `Todo::depends_on` come `Vec`, MAI una stringa `"{...}"`.
+/// Lato impl significa il cast `depends_on::text[]` (come `todo_store.list_todos`
+/// Python); il tipo Rust `Vec<String>` rende l'invariante non eludibile. Deve
+/// inoltre restituire gli elementi GIA' ordinati per `seq` ascendente (le
+/// funzioni pure si basano sull'ordine dello slice come tie-break).
+#[async_trait]
+pub trait TodoStore: Send + Sync {
+    /// Tutti i todo del run, ordinati per `seq` ascendente, con `depends_on`
+    /// come `Vec` (cast `::text[]`). 1:1 con `todo_store.list_todos`.
+    async fn list_todos(&self, run_id: &str) -> Result<Vec<Todo>, PortError>;
+
+    /// Il todo "attivo": il primo `in_progress`, altrimenti il primo `pending`,
+    /// altrimenti `None`. 1:1 con `todo_store.active_todo`. Default fornito sopra
+    /// [`list_todos`](TodoStore::list_todos) per non duplicare la selezione.
+    async fn active_todo(&self, run_id: &str) -> Result<Option<Todo>, PortError> {
+        let todos = self.list_todos(run_id).await?;
+        let by_status = |s: TodoStatus| todos.iter().find(|t| t.status == s).cloned();
+        Ok(by_status(TodoStatus::InProgress).or_else(|| by_status(TodoStatus::Pending)))
+    }
+
+    /// Aggiorna lo status di un todo (UPDATE best-effort). 1:1 con i `_mark` /
+    /// `_mark_todo_status` di `dag_scheduler.py` e `verifier_node.py`.
+    async fn mark_status(&self, todo_id: &str, status: TodoStatus) -> Result<(), PortError>;
 }

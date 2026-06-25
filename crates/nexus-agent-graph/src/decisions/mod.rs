@@ -8,7 +8,9 @@
 //!
 //! Moduli:
 //!   - [`progress_controller`]: controllo di avanzamento (anti-loop coordinato).
-//!   - [`dag_scheduler`]: ready layer e decisione di parallelizzazione del DAG.
+//!   - [`dag_scheduler`]: PUNTO UNICO della logica DAG dei todo (ready layer,
+//!     decisione di parallelizzazione, selezione sequenziale `pick_next_todo`,
+//!     discendenti per il cascade-skip). Prerequisito di todo_runner e verifier.
 //!   - [`helpers`]: tool_choice forcing, segnale strutturale, action-oriented,
 //!     stima complessita' e budget iterazioni.
 //!   - [`reward`]: reward euristico + fusione del reward finale (punto unico
@@ -21,7 +23,10 @@ pub mod helpers;
 pub mod progress_controller;
 pub mod reward;
 
-pub use dag_scheduler::{compute_ready_layer, should_parallelize, DagConfig, Todo, TodoStatus};
+pub use dag_scheduler::{
+    compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,
+    TodoStatus,
+};
 pub use reward::{
     aggregate_score, final_reward, heuristic_reward, prelim_reward, round_half_even,
     MAX_AGENT_ITERATIONS,

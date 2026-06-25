@@ -11,7 +11,8 @@ pub mod ports;
 pub use ctx::AgentNodeCtx;
 pub use ports::{
     CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmMessage,
-    LlmRequest, LlmResponse, LlmUsage, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome,
+    LlmRequest, LlmResponse, LlmUsage, PortError, SseEvent, TodoStore, ToolCall, ToolExecutor,
+    ToolOutcome,
 };
 
 #[cfg(test)]

@@ -1,16 +1,40 @@
-//! `dag_scheduler`: funzioni pure decisionali per l'esecuzione parallela dei
-//! layer del DAG. Porting 1:1 di `brain/agents/dag_scheduler.py` (solo le parti
-//! pure: [`compute_ready_layer`] e [`should_parallelize`]; `run_dag_layer`
-//! richiede IO/tool e resta lato brain).
+//! `dag_scheduler`: PUNTO UNICO (regola L) di TUTTA la logica DAG dei todo del
+//! grafo agentico. Porting 1:1 della parte PURA (no IO) di due moduli Python che
+//! oggi condividono la stessa logica DAG:
+//!   - `brain/agents/dag_scheduler.py`: [`compute_ready_layer`],
+//!     [`should_parallelize`] e [`descendants`] (`_descendants`).
+//!   - `brain/agents/verifier_node.py`: [`pick_next_todo`] (`_pick_next_todo`).
+//! (`run_dag_layer`/`_advance_or_end` richiedono IO/tool e restano lato brain.)
 //!
-//! Punto unico (regola L) della decisione "quali todo sono eseguibili in
-//! parallelo ora" e "conviene attivare il DAG parallelo": l'executor delega qui
-//! invece di re-implementare la guardia.
+//! Regola L: la selezione/scheduling dei todo (quale eseguire ora, quali sono
+//! pronti in parallelo, quali discendono da un fallimento) ha UN solo punto
+//! autoritativo. I nodi che la useranno (`verifier_node`, `todo_runner_node`,
+//! `dag_scheduler`) NON re-implementano la logica: la chiamano. Un nuovo
+//! requisito (es. un nuovo status, una nuova guardia) si aggiunge UNA volta qui.
+//!
+//! Tutte le funzioni sono PURE: nessun IO, nessuna lettura DB. La config
+//! DB-driven (es. `dag_topological_enabled`, `dag_parallel_min_ready`) arriva
+//! come PARAMETRO esplicito (regola G), mai letta dentro le funzioni. L'I/O DB
+//! e' dietro il trait [`crate::runtime::TodoStore`] (impl concreta = mcp-core).
+//!
+//! INVARIANTE `depends_on` (regola H, bug 2026-06-10): `Todo::depends_on` e' un
+//! `Vec<String>`, MAI una stringa. Lato Python `nexus_agent_todos.depends_on` e'
+//! `uuid[]` e psycopg2 senza array-uuid typecaster lo ritornava come STRINGA
+//! `"{...}"`; iterando "sui caratteri" il fronte parallelo collassava a vuoto e
+//! il verifier andava in falso deadlock. Il fix fu il cast `::text[]` in
+//! `todo_store.list_todos`. In Rust l'invariante e' fissato DAL TIPO: la
+//! `TodoStore` concreta deve garantire `depends_on` come `Vec` (cast `::text[]`),
+//! la deserializzazione di una stringa qui fallisce (non itera sui char).
 
 use serde::{Deserialize, Serialize};
 
-/// Stato di un todo del piano. Stringhe stabili (serde rename) coerenti con
-/// `nexus_agent_todos.status`.
+/// Stato di un todo del piano. Stringhe stabili (serde rename) coerenti con il
+/// `CHECK` di `nexus_agent_todos.status` (migrazione 0148): i SOLI cinque valori
+/// ammessi per una riga todo sono `pending`, `in_progress`, `completed`,
+/// `blocked`, `skipped`. NON esiste `completed_verified` per un todo: quello e'
+/// uno status del RUN agentico (vedi `mcp-core::agent_types`), non della riga
+/// todo. `todo_runner_node.py:208` lo confronta sull'esito del SUB-RUN, non sul
+/// todo. Per le dipendenze DAG conta quindi solo {`completed`, `skipped`}.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TodoStatus {
     #[serde(rename = "pending")]
@@ -25,14 +49,41 @@ pub enum TodoStatus {
     Blocked,
 }
 
+impl TodoStatus {
+    /// `true` se questo status SODDISFA una dipendenza DAG. Punto unico (regola
+    /// L) del set "soddisfatto": sia `compute_ready_layer` che `pick_next_todo`
+    /// lo usano, cosi' il criterio non e' duplicato in due query.
+    ///
+    /// Verificato 1:1 nel Python: `dag_scheduler.compute_ready_layer`
+    /// (`done = {... status in ("completed", "skipped")}`) e
+    /// `verifier_node._pick_next_todo` (stesso set). Solo `Completed` e
+    /// `Skipped` contano: un `Blocked`/`InProgress`/`Pending` NON soddisfa.
+    pub fn satisfies_dependency(self) -> bool {
+        matches!(self, TodoStatus::Completed | TodoStatus::Skipped)
+    }
+}
+
 /// Un todo del DAG. `id` e `depends_on` sono identificatori opachi (stringhe),
-/// coerenti con il cast `::text[]` lato Python (le deps arrivano come stringhe).
+/// coerenti col cast `::text[]` lato Python (id e deps arrivano come stringhe).
+///
+/// INVARIANTE: `depends_on` e' un `Vec<String>`, MAI una stringa `"{...}"` (vedi
+/// la nota di modulo, bug 2026-06-10). La `TodoStore` concreta deve garantirlo
+/// col cast `::text[]`.
+///
+/// `seq` e' l'ordine del piano (`nexus_agent_todos.seq`): la `TodoStore`
+/// restituisce gli elementi GIA' ordinati per `seq` ascendente (come
+/// `todo_store.list_todos`, `ORDER BY seq ASC`); la logica DAG si basa
+/// sull'ORDINE dello slice (tie-break deterministico), `seq` e' trasportato per
+/// diagnostica/round-trip ma non riordina dentro le funzioni pure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Todo {
     pub id: String,
     pub status: TodoStatus,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Ordine del piano (`seq` ascendente). Opzionale per i golden minimali.
+    #[serde(default)]
+    pub seq: Option<i64>,
 }
 
 /// Config del DAG parallelo (PARAMETRO esplicito, no lettura DB: regola G).
@@ -51,23 +102,105 @@ impl Default for DagConfig {
     }
 }
 
+/// Insieme degli id dei todo che soddisfano una dipendenza (`completed` o
+/// `skipped`). Helper interno: criterio "soddisfatto" centralizzato in
+/// [`TodoStatus::satisfies_dependency`] (regola L, niente filtro duplicato fra
+/// `compute_ready_layer` e `pick_next_todo`).
+fn satisfied_ids(todos: &[Todo]) -> std::collections::HashSet<&str> {
+    todos
+        .iter()
+        .filter(|t| t.status.satisfies_dependency())
+        .map(|t| t.id.as_str())
+        .collect()
+}
+
 /// Ritorna i todo pending le cui dipendenze sono tutte completed/skipped.
 ///
 /// E' il fronte eseguibile in parallelo del DAG. Se nessun todo ha dipendenze,
 /// ritorna tutti i pending (il chiamante applichera' il cap). Vedi
-/// `compute_ready_layer` Python.
+/// `compute_ready_layer` Python (`dag_scheduler.py:38-52`).
 pub fn compute_ready_layer(todos: &[Todo]) -> Vec<Todo> {
-    let done: std::collections::HashSet<&str> = todos
-        .iter()
-        .filter(|t| matches!(t.status, TodoStatus::Completed | TodoStatus::Skipped))
-        .map(|t| t.id.as_str())
-        .collect();
+    let done = satisfied_ids(todos);
     todos
         .iter()
         .filter(|t| matches!(t.status, TodoStatus::Pending))
         .filter(|t| t.depends_on.iter().all(|d| done.contains(d.as_str())))
         .cloned()
         .collect()
+}
+
+/// Sceglie il prossimo todo da eseguire (1:1 con `verifier_node._pick_next_todo`,
+/// `verifier_node.py:508-534`). Punto unico (regola L) della selezione
+/// sequenziale: il verifier delega qui invece di re-implementare la cascata.
+///
+/// Cascata (nell'ordine, identica al Python):
+///   1. `pending` = todo con status `Pending`. Se vuoto -> `None` (nessun lavoro
+///      pendente; il chiamante terminera').
+///   2. Se `dag_topological_enabled` e' `false` OPPURE nessun todo ha
+///      `depends_on` -> primo `pending` per ordine (comportamento storico: lo
+///      slice arriva gia' ordinato per `seq`, il tie-break e' l'ordine).
+///   3. Con DAG topologico ON e dipendenze presenti -> primo `pending` (per
+///      ordine, tie-break deterministico) le cui dipendenze sono TUTTE
+///      soddisfatte (`completed`/`skipped`).
+///   4. Fallback deadlock: se nessun pending ha le dipendenze soddisfatte
+///      (dipendenza `blocked` o ciclo residuo) -> primo `pending`, per non
+///      bloccare il loop.
+///
+/// `dag_topological_enabled` e' un PARAMETRO esplicito (regola G): la funzione
+/// non legge il DB. Ritorna un riferimento al todo scelto (preso dallo slice
+/// d'ingresso), o `None`.
+pub fn pick_next_todo(todos: &[Todo], dag_topological_enabled: bool) -> Option<&Todo> {
+    let first_pending = todos.iter().find(|t| matches!(t.status, TodoStatus::Pending));
+    let first_pending = first_pending?; // nessun pending -> None (passo 1)
+
+    let has_deps = todos.iter().any(|t| !t.depends_on.is_empty());
+    if !dag_topological_enabled || !has_deps {
+        return Some(first_pending); // passo 2: primo pending per ordine
+    }
+
+    let done = satisfied_ids(todos);
+    let executable = todos
+        .iter()
+        .filter(|t| matches!(t.status, TodoStatus::Pending))
+        .find(|t| t.depends_on.iter().all(|d| done.contains(d.as_str())));
+    match executable {
+        Some(t) => Some(t),         // passo 3: primo eseguibile
+        None => Some(first_pending), // passo 4: fallback deadlock
+    }
+}
+
+/// Insieme dei todo che dipendono (diretta o transitivamente) da `todo_id`
+/// (1:1 con `dag_scheduler._descendants`, `dag_scheduler.py:76-90`). Usato per
+/// il cascade-skip: se un todo fallisce, tutti i suoi discendenti vengono
+/// marcati `skipped`.
+///
+/// Costruisce la mappa figli `dep -> [todo che la dichiarano]` e fa una DFS
+/// iterativa con set di visitati: gestisce cicli e diamanti SENZA loop infinito
+/// (un nodo gia' in `out` non viene riaccodato). `todo_id` stesso NON e' incluso
+/// nel risultato (solo i discendenti).
+pub fn descendants<'a>(todos: &'a [Todo], todo_id: &str) -> std::collections::HashSet<&'a str> {
+    use std::collections::HashMap;
+    // children[dep] = id dei todo che dichiarano `dep` in depends_on.
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for t in todos {
+        for d in &t.depends_on {
+            children.entry(d.as_str()).or_default().push(t.id.as_str());
+        }
+    }
+    let mut out: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut stack: Vec<&str> = vec![todo_id];
+    while let Some(cur) = stack.pop() {
+        if let Some(kids) = children.get(cur) {
+            for &c in kids {
+                if out.insert(c) {
+                    // insert ritorna true solo se non era presente: niente
+                    // riaccodamento -> niente loop infinito su cicli/diamanti.
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Decide se attivare il DAG parallelo (Ultra, decomposizione parallela).
@@ -96,6 +229,7 @@ mod tests {
             id: id.to_string(),
             status,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            seq: None,
         }
     }
 
@@ -135,5 +269,186 @@ mod tests {
         let todos = vec![todo("a", TodoStatus::Pending, &[])];
         let ready = compute_ready_layer(&todos);
         assert!(!should_parallelize(&ready, &todos, &DagConfig::default()));
+    }
+
+    #[test]
+    fn pick_next_nessun_pending_e_none() {
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Skipped, &[]),
+        ];
+        assert!(pick_next_todo(&todos, true).is_none());
+        assert!(pick_next_todo(&todos, false).is_none());
+    }
+
+    #[test]
+    fn pick_next_off_primo_pending_per_ordine() {
+        // DAG off: primo pending nell'ordine, ignora le deps.
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Pending, &["c"]), // dep non soddisfatta, ma DAG off
+            todo("c", TodoStatus::Pending, &[]),
+        ];
+        let next = pick_next_todo(&todos, false).unwrap();
+        assert_eq!(next.id, "b");
+    }
+
+    #[test]
+    fn pick_next_on_senza_deps_primo_pending() {
+        // DAG on ma nessun depends_on -> comportamento storico (primo pending).
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Pending, &[]),
+            todo("c", TodoStatus::Pending, &[]),
+        ];
+        let next = pick_next_todo(&todos, true).unwrap();
+        assert_eq!(next.id, "b");
+    }
+
+    #[test]
+    fn pick_next_on_deps_soddisfatte() {
+        // DAG on + deps: salta b (dep non pronta), sceglie c (deps soddisfatte).
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Pending, &["x"]), // x non esiste/non soddisfatta
+            todo("c", TodoStatus::Pending, &["a"]), // a completed -> pronto
+        ];
+        let next = pick_next_todo(&todos, true).unwrap();
+        assert_eq!(next.id, "c");
+    }
+
+    #[test]
+    fn pick_next_deadlock_fallback_primo_pending() {
+        // DAG on + deps: nessun pending eseguibile (dep blocked) -> primo pending.
+        let todos = vec![
+            todo("a", TodoStatus::Blocked, &[]),
+            todo("b", TodoStatus::Pending, &["a"]),
+            todo("c", TodoStatus::Pending, &["a"]),
+        ];
+        let next = pick_next_todo(&todos, true).unwrap();
+        assert_eq!(next.id, "b", "fallback al primo pending per ordine");
+    }
+
+    #[test]
+    fn descendants_lineare() {
+        // a -> b -> c (b dipende da a, c da b). Discendenti di a = {b, c}.
+        let todos = vec![
+            todo("a", TodoStatus::Blocked, &[]),
+            todo("b", TodoStatus::Pending, &["a"]),
+            todo("c", TodoStatus::Pending, &["b"]),
+        ];
+        let desc = descendants(&todos, "a");
+        assert_eq!(desc, ["b", "c"].into_iter().collect());
+        // c non ha discendenti.
+        assert!(descendants(&todos, "c").is_empty());
+    }
+
+    #[test]
+    fn descendants_diamante() {
+        // a -> b, a -> c, b -> d, c -> d. Discendenti di a = {b, c, d} (d una volta).
+        let todos = vec![
+            todo("a", TodoStatus::Blocked, &[]),
+            todo("b", TodoStatus::Pending, &["a"]),
+            todo("c", TodoStatus::Pending, &["a"]),
+            todo("d", TodoStatus::Pending, &["b", "c"]),
+        ];
+        let desc = descendants(&todos, "a");
+        assert_eq!(desc, ["b", "c", "d"].into_iter().collect());
+    }
+
+    #[test]
+    fn descendants_ciclo_non_loop_infinito() {
+        // Ciclo degenerato a -> b -> a: la DFS termina (set visitati).
+        let todos = vec![
+            todo("a", TodoStatus::Pending, &["b"]),
+            todo("b", TodoStatus::Pending, &["a"]),
+        ];
+        let desc = descendants(&todos, "a");
+        assert_eq!(desc, ["a", "b"].into_iter().collect());
+    }
+}
+
+/// Golden-test di PARITA' 1:1 vs Python per la logica DAG dei todo.
+///
+/// Lo script `crates/nexus-agent-graph/scripts/gen_golden_todo_dag.py` (versionato)
+/// importa le funzioni REALI del brain (`_pick_next_todo` da `verifier_node`,
+/// `_descendants`/`compute_ready_layer` da `dag_scheduler`) se importabili senza
+/// I/O, altrimenti ne usa una replica byte-fedele, ed emette
+/// `/tmp/golden_todo_dag.json`. Questo test carica quel JSON e verifica che la
+/// funzione Rust produca lo STESSO output del Python.
+///
+/// `#[ignore]` perche' dipende dal file generato. Comando:
+///   python3 crates/nexus-agent-graph/scripts/gen_golden_todo_dag.py
+///   cargo test -p nexus-agent-graph --lib -- --ignored
+#[cfg(test)]
+mod golden {
+    use super::*;
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenCase {
+        case_id: String,
+        function: String,
+        input: Value,
+        output: Value,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TodosInput {
+        todos: Vec<Todo>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        dag_topological_enabled: Option<bool>,
+    }
+
+    #[test]
+    #[ignore = "richiede /tmp/golden_todo_dag.json generato da gen_golden_todo_dag.py"]
+    fn golden_todo_dag_parita() {
+        let path = "/tmp/golden_todo_dag.json";
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!("impossibile leggere {path}: {e}; genera con python3 crates/nexus-agent-graph/scripts/gen_golden_todo_dag.py")
+        });
+        let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
+        assert!(cases.len() >= 25, "attesi >=25 casi, trovati {}", cases.len());
+
+        let mut checked = 0usize;
+        for c in &cases {
+            let input: TodosInput =
+                serde_json::from_value(c.input.clone()).expect("TodosInput");
+            let got: Value = match c.function.as_str() {
+                "compute_ready_layer" => {
+                    let ready = compute_ready_layer(&input.todos);
+                    // L'oracolo Python emette gli id nell'ordine dello slice.
+                    let ids: Vec<String> = ready.into_iter().map(|t| t.id).collect();
+                    serde_json::to_value(ids).expect("serialize ready ids")
+                }
+                "descendants" => {
+                    let id = input.id.expect("descendants richiede 'id'");
+                    let desc = descendants(&input.todos, &id);
+                    // L'oracolo emette un set ordinato (sorted): ordiniamo anche qui.
+                    let mut ids: Vec<&str> = desc.into_iter().collect();
+                    ids.sort_unstable();
+                    serde_json::to_value(ids).expect("serialize descendants")
+                }
+                "pick_next_todo" => {
+                    let dag = input.dag_topological_enabled.unwrap_or(false);
+                    let sel = pick_next_todo(&input.todos, dag);
+                    match sel {
+                        Some(t) => Value::String(t.id.clone()),
+                        None => Value::Null,
+                    }
+                }
+                other => panic!("funzione golden sconosciuta: {other} (caso {})", c.case_id),
+            };
+            assert_eq!(
+                got, c.output,
+                "PARITA' FALLITA caso {} ({}):\n  rust   = {}\n  python = {}",
+                c.case_id, c.function, got, c.output
+            );
+            checked += 1;
+        }
+        println!("golden todo_dag: {checked} casi verificati, tutti verdi");
     }
 }

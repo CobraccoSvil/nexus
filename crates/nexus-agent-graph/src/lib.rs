@@ -31,7 +31,7 @@ pub use nodes::{
 };
 pub use runtime::{
     AgentNodeCtx, CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway,
-    ToolExecutor,
+    TodoStore, ToolExecutor,
 };
 pub use shadow::{compute_diff, persist_node_diff, DiffCollector, NodeDiff};
 pub use state::{AgentState, AutomationMode, Message, MetaStep, StateDelta, StopReason, TaskComplexity};
