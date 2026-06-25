@@ -253,8 +253,7 @@ def _tool_calls_to_blocks(tool_calls: list[dict] | None) -> tuple[list[dict], li
 
     Ogni tool call OpenAI ``{id, function:{name, arguments(JSON string)}}``
     diventa un blocco ``{id, name, input(dict)}``. ``arguments`` viene
-    deserializzato come JSON (fallback dict vuoto su parse fallito, come il
-    punto unico ``_response_parsers.parse_openai_compatible_choice``).
+    deserializzato come JSON (fallback dict vuoto su parse fallito).
     """
     tool_use_blocks: list[dict] = []
     assistant_blocks: list[dict] = []

@@ -1,0 +1,11 @@
+-- 0450_remove_rag_embedding_endpoint_setting.sql
+-- Rimuove la setting `agent.rag.embedding_endpoint`, ora morta (gate audit-settings).
+--
+-- Contesto: il cutover embedding (commit 0cc686b, Fase 2) ha portato l'embedding del
+-- RAG all'OnnxMiniLmEmbedder in-process di mcp-core. rag/indexer.rs e rag/search.rs
+-- non chiamano piu' l'endpoint `/embed` del brain: il reader della chiave e il campo
+-- `embedding_endpoint` in RagConfig sono stati rimossi nello stesso commit. La chiave,
+-- seedata in 0200_rag_unified.sql, non e' piu' letta da alcun call site -> "morta".
+-- Rimuovendola il gate ratchet audit-settings torna a morta=0 (regola H: fix via
+-- migrazione versionata, non DELETE manuale; sopravvive a wipe+re-apply del DB).
+DELETE FROM settings WHERE key = 'agent.rag.embedding_endpoint';
