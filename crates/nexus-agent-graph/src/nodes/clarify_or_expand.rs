@@ -71,7 +71,7 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, ContentBlock, Message, MessageContent, MetaStep, StateDelta, ToolUse};
+use crate::state::{AgentState, Message, MetaStep, StateDelta, ToolUse};
 
 /// Lunghezza minima dell'ultimo messaggio utente sotto la quale il nodo salta
 /// (`clarify_or_expand_node.py:752`: `len(user_msg) < 3`).
@@ -294,22 +294,6 @@ impl ClarifyOrExpandNode {
         Self { cfg }
     }
 
-    /// Estrae il testo "piatto" dal contenuto di un messaggio (concatena i blocchi
-    /// `Text` se strutturato). Per il content stringa restituisce la stringa.
-    fn flatten_text(content: &MessageContent) -> String {
-        match content {
-            MessageContent::Text(s) => s.clone(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        }
-    }
-
     /// Ultimo messaggio di ruolo human/user (in reverse), content come stringa,
     /// NON trimmato. Replica `_last_user_message`
     /// (`clarify_or_expand_node.py:186-191`): itera dal fondo, filtra per ruolo
@@ -320,7 +304,7 @@ impl ClarifyOrExpandNode {
     pub fn last_user_message(messages: &[Message]) -> String {
         for m in messages.iter().rev() {
             if let Message::Human { content } = m {
-                return Self::flatten_text(content);
+                return content.flatten_text();
             }
         }
         String::new()

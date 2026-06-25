@@ -52,7 +52,7 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, ContentBlock, Message, MessageContent, StateDelta, ToolUse};
+use crate::state::{AgentState, Message, StateDelta, ToolUse};
 
 /// Lunghezza minima della query (ultimo messaggio utente) sotto la quale il
 /// nodo salta: replica `len(query) < 10` (`understanding_node.py:92`).
@@ -161,23 +161,6 @@ impl UnderstandingNode {
         false
     }
 
-    /// Estrae il testo "piatto" dal contenuto di un messaggio (concatena i blocchi
-    /// `Text` se strutturato), allineato a `_last_user_message` che guarda
-    /// `m.content` solo quando e' una stringa.
-    fn flatten_text(content: &MessageContent) -> String {
-        match content {
-            MessageContent::Text(s) => s.clone(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        }
-    }
-
     /// Ultimo messaggio (in reverse) con contenuto testuale non vuoto, trimmed.
     /// Replica `_last_user_message` (`understanding_node.py:61-66`): NON filtra
     /// per ruolo (il Python itera su tutti i messaggi e prende il primo, dal
@@ -189,7 +172,7 @@ impl UnderstandingNode {
                 Message::Ai { content, .. } => content,
                 Message::Tool { content, .. } => content,
             };
-            let flat = Self::flatten_text(content);
+            let flat = content.flatten_text();
             let trimmed = flat.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();

@@ -66,7 +66,7 @@ use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::reward::{heuristic_reward, prelim_reward, MAX_AGENT_ITERATIONS};
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, ContentBlock, Message, MessageContent, StateDelta};
+use crate::state::{AgentState, Message, StateDelta};
 
 /// Lunghezza massima delle preview nel payload Qdrant (`__init__.py:4538-4539`:
 /// `user_input[:200]` / `result[:200]`). Troncamento su CHAR, non byte.
@@ -155,31 +155,13 @@ impl LearnerNode {
         Self { cfg }
     }
 
-    /// Estrae il testo "piatto" dal contenuto di un messaggio (concatena i blocchi
-    /// `Text` se strutturato). Per il content stringa restituisce la stringa.
-    /// Stesso comportamento di `ReflectionNode::flatten_text` (la duplicazione e'
-    /// di 8 righe banali; non vale un punto unico condiviso fra due nodi sorella).
-    fn flatten_text(content: &MessageContent) -> String {
-        match content {
-            MessageContent::Text(s) => s.clone(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        }
-    }
-
     /// Testo input utente = content del PRIMO HumanMessage dei messages
     /// (`__init__.py:4491-4495`: itera in avanti, primo `HumanMessage`, `break`).
     /// Stringa vuota se non c'e' alcun messaggio umano.
     pub fn user_input(messages: &[Message]) -> String {
         for m in messages {
             if let Message::Human { content } = m {
-                return Self::flatten_text(content);
+                return content.flatten_text();
             }
         }
         String::new()

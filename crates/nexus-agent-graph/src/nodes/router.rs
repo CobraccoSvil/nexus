@@ -37,7 +37,7 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, Message, MessageContent, StateDelta};
+use crate::state::{AgentState, Message, StateDelta};
 
 /// Intent neutro usato quando la classificazione non e' (ancora) disponibile.
 /// Identico al fallback Python (`agentic_default` attiva il toolkit minimal
@@ -59,32 +59,13 @@ const TOKEN_BUDGET_FLOOR: i64 = 400;
 pub struct RouterNode;
 
 impl RouterNode {
-    /// Estrae il testo "piatto" dal contenuto di un messaggio (per la stima del
-    /// token_budget). Concatena i blocchi `Text` se il contenuto e' strutturato.
-    fn flatten_text(content: &MessageContent) -> String {
-        match content {
-            MessageContent::Text(s) => s.clone(),
-            MessageContent::Blocks(blocks) => {
-                use crate::state::ContentBlock;
-                blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }
-        }
-    }
-
     /// Testo dell'ultimo messaggio (qualunque ruolo), per la stima budget.
     /// Replica `last_message.content` del Python (`__init__.py:599-600`).
     fn last_message_text(messages: &[Message]) -> String {
         match messages.last() {
-            Some(Message::Human { content }) => Self::flatten_text(content),
-            Some(Message::Ai { content, .. }) => Self::flatten_text(content),
-            Some(Message::Tool { content, .. }) => Self::flatten_text(content),
+            Some(Message::Human { content }) => content.flatten_text(),
+            Some(Message::Ai { content, .. }) => content.flatten_text(),
+            Some(Message::Tool { content, .. }) => content.flatten_text(),
             None => String::new(),
         }
     }

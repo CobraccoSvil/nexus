@@ -66,6 +66,27 @@ impl MessageContent {
     pub fn text(s: impl Into<String>) -> Self {
         MessageContent::Text(s.into())
     }
+
+    /// Estrae il testo "piatto" dal contenuto del messaggio. Per `Text`
+    /// restituisce la stringa cosi' com'e'; per `Blocks` concatena i soli blocchi
+    /// `Text` con spazio, ignorando `ToolUse`/`ToolResult`.
+    ///
+    /// Punto unico (regola L): consolidato qui come metodo sul tipo (calcolo puro
+    /// stateless, relazione is-a) al posto delle copie locali nei nodi
+    /// router/understanding/learner/reflection/clarify_or_expand.
+    pub fn flatten_text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
 }
 
 /// Un blocco di contenuto strutturato (Anthropic content block).
@@ -107,4 +128,42 @@ pub struct ToolUse {
     pub name: String,
     /// Argomenti del tool (JSON arbitrario).
     pub input: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flatten_text_punto_unico() {
+        // Text: ritorna la stringa cosi' com'e'.
+        assert_eq!(
+            MessageContent::Text("ciao".to_string()).flatten_text(),
+            "ciao"
+        );
+
+        // Blocks: concatena i soli Text con spazio, ignora ToolUse/ToolResult.
+        let blocks = MessageContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "primo".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "edit_file".to_string(),
+                input: Value::Null,
+            },
+            ContentBlock::Text {
+                text: "secondo".to_string(),
+            },
+        ]);
+        assert_eq!(blocks.flatten_text(), "primo secondo");
+
+        // Blocks senza alcun Text: stringa vuota.
+        let solo_tool = MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            content: Value::Null,
+            is_error: false,
+        }]);
+        assert_eq!(solo_tool.flatten_text(), "");
+    }
 }

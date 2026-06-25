@@ -60,7 +60,7 @@ use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::reward::{final_reward as fuse_final_reward, heuristic_reward, round_half_even};
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, ContentBlock, Message, MessageContent, StateDelta};
+use crate::state::{AgentState, Message, StateDelta};
 
 /// Lunghezza massima del task originale nel prompt (`reflection_rubric.py:116`:
 /// `task_input[:2000]`).
@@ -226,29 +226,13 @@ impl ReflectionNode {
         roll > sample_rate
     }
 
-    /// Estrae il testo "piatto" dal contenuto di un messaggio (concatena i blocchi
-    /// `Text` se strutturato). Per il content stringa restituisce la stringa.
-    fn flatten_text(content: &MessageContent) -> String {
-        match content {
-            MessageContent::Text(s) => s.clone(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        }
-    }
-
     /// Testo del task originale = content del PRIMO HumanMessage dei messages
     /// (`__init__.py:4296-4301`: itera in avanti, primo `HumanMessage`, `break`).
     /// Stringa vuota se non c'e' alcun messaggio umano.
     pub fn task_input(messages: &[Message]) -> String {
         for m in messages {
             if let Message::Human { content } = m {
-                return Self::flatten_text(content);
+                return content.flatten_text();
             }
         }
         String::new()
