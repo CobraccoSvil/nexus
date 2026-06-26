@@ -45,10 +45,25 @@ impl Orchestrator {
         self.neural.is_healthy().await
     }
 
-    /// Classifier intent che usa le soglie da DB (mig 0111) e delega a
-    /// `classify_intent_async_with_threshold` nei call site di routing.
-    /// Se la cache `routing_thresholds` non e' disponibile, fallback ai default.
-    async fn classify_intent_with_db_thresholds(&self, message: &str) -> (&'static str, f32) {
+    /// Classifier intent che usa le soglie da DB (mig 0111) e delega al punto
+    /// unico di scelta motore [`select_classifier_engine`] (regola L, flag mig
+    /// 0458): `python` -> endpoint brain `/classify-intent-agentic` (path vivo
+    /// INVARIATO), `rust` -> `intent_classifier::classify` in-process. Se la
+    /// cache `routing_thresholds` non e' disponibile, fallback ai default.
+    async fn classify_intent_with_db_thresholds(
+        &self,
+        db: &PgPool,
+        message: &str,
+    ) -> (&'static str, f32) {
+        // Path RUST in-process quando il flag DB lo dice E il gateway e'
+        // disponibile (senza gateway non si puo' chiamare l'LLM: si resta sul
+        // path Python, comportamento stabile).
+        if let (ClassifierEngine::Rust, Some(gw)) =
+            (select_classifier_engine(db).await, self.nexus_gateway.as_ref())
+        {
+            let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
+            return (classified.intent, classified.confidence);
+        }
         let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
             Ok(t) => (
                 t.llm_classifier_min_confidence,
@@ -62,7 +77,16 @@ impl Orchestrator {
     /// Variante "full" che ritorna `ClassifiedIntent` con candidati + flag
     /// ambiguita'. Usata da `spawn_agent_run` per decidere se chiedere
     /// disambiguazione all'utente (best practice NLU).
-    pub async fn classify_intent_full(&self, message: &str) -> ClassifiedIntent {
+    pub async fn classify_intent_full(&self, db: &PgPool, message: &str) -> ClassifiedIntent {
+        // Punto unico di scelta motore (regola L, flag mig 0458): `rust` ->
+        // classificatore in-process; `python` (default) -> endpoint brain. Il
+        // path rust richiede il gateway; senza, si resta sul path Python.
+        if let (ClassifierEngine::Rust, Some(gw)) =
+            (select_classifier_engine(db).await, self.nexus_gateway.as_ref())
+        {
+            let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
+            return classified;
+        }
         let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
             Ok(t) => (
                 t.llm_classifier_min_confidence,
@@ -302,7 +326,7 @@ impl Orchestrator {
         let (intent_owned, confidence): (String, f32) = match intent_hint {
             Some(h) if !h.trim().is_empty() => (h.to_string(), 1.0),
             _ => {
-                let (i, c) = self.classify_intent_with_db_thresholds(message).await;
+                let (i, c) = self.classify_intent_with_db_thresholds(db, message).await;
                 (i.to_string(), c)
             }
         };
@@ -684,7 +708,7 @@ impl Orchestrator {
         let intent_owned: String = match intent_hint {
             Some(h) if !h.trim().is_empty() => h.to_string(),
             _ => self
-                .classify_intent_with_db_thresholds(message)
+                .classify_intent_with_db_thresholds(db, message)
                 .await
                 .0
                 .to_string(),
@@ -956,7 +980,7 @@ impl Orchestrator {
         // Usa estimate_complexity per non farsi ingannare da messaggi con liste dati lunghe
         let msg_tokens_estimate = estimate_complexity(&input.message);
         let (intent_str, _confidence) = self
-            .classify_intent_with_db_thresholds(&input.message)
+            .classify_intent_with_db_thresholds(db, &input.message)
             .await;
         let intent = intent_str.to_string();
         let mut routing = Self::load_routing_config(db).await?;

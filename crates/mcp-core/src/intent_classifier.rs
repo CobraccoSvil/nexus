@@ -20,13 +20,11 @@
 //! - chiamata LLM: `nexus_gateway::NexusGatewayClient::complete`
 //! - schema slot: `routing_slots::ActionSlots`
 //!
-//! NOTA `allow(dead_code)`: lo scaffold non e' ancora richiamato da alcun call
-//! site (rischio zero, Tappa 1a). L'intera API pubblica (`classify`,
-//! `derive_*`, le struct) risulta quindi inutilizzata e clippy `-D warnings`
-//! la boccierebbe. L'allow e' temporaneo e VA RIMOSSO in Tappa 1b, quando
-//! intent.rs/grafo cablano `classify`: a quel punto il dead-code sparisce
-//! naturalmente. I test (`#[cfg(test)]`) esercitano comunque tutta la logica.
-#![allow(dead_code)]
+//! CABLATO (Tappa 1b): `classify` e' richiamato da `orchestrator::intent`
+//! (selettore `routing.classifier_engine`, flag mig 0458) e dallo SHADOW
+//! (`agent_run.rs`, derivazione fedele di action_oriented/report_only). I
+//! `derive_*` sono il punto unico (regola L) usato da `native_engine`. I test
+//! (`#[cfg(test)]`) esercitano tutta la logica.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -45,7 +43,9 @@ use nexus_cache::TtlCache;
 
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60; // 24 ore
 // Parita' col Python: dimensione cache. `TtlCache` non ha cap hard (eviction
-// gestita dal TTL), quindi questa costante e' documentazione del contratto.
+// gestita dal TTL), quindi questa costante e' documentazione del contratto: non
+// e' letta dal codice (l'eviction e' solo TTL-based), ma documenta la parita'.
+#[allow(dead_code, reason = "documenta la dimensione cache del Python; TtlCache evince solo per TTL")]
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
 const DEFAULT_LLM_TIMEOUT_SECONDS: f32 = 5.0;
 const DEFAULT_AMBIGUITY_MIN_CONFIDENCE: f32 = 0.70;
@@ -183,6 +183,13 @@ pub struct AgenticIntent {
     pub intent: String,
     pub agentic_score: f32,
     pub requires_tools: bool,
+    /// Complessita' del task (`low`/`medium`/`high`). Parte del porting 1:1 e del
+    /// JSON del classifier; alimentera' l'escalation per difficolta' quando il
+    /// `RouterNode` Rust la consumera' (TODO). Non ancora letto dai call site.
+    #[allow(
+        dead_code,
+        reason = "campo del contratto classifier (escalation per difficolta'): consumato dal RouterNode Rust quando portato, vedi router.rs TODO"
+    )]
     pub complexity: String,
     pub confidence: f32,
     pub model_used: String,

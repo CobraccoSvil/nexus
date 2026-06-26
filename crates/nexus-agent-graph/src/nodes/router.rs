@@ -141,6 +141,20 @@ impl GraphNode<AgentState, AgentNodeCtx> for RouterNode {
         // TODO(PR successivo): profile selection + Q-router (__init__.py:787-838)
         //   e RAG-KB inline; dipendono dal profile_loader e dal canale gRPC.
         //
+        // ── action_oriented: rispetta la pre-derivazione fedele dello shadow ─────
+        // Lo shadow pre-deriva `action_oriented` nello stato INIZIALE dai dati
+        // completi del classifier del turno (Tappa 1b punto B, `build_initial_state`
+        // ramo Shadow -> `intent_classifier::derive_action_oriented`, porting 1:1
+        // del primario Python). Quando lo stato lo porta gia', il RouterNode NON
+        // lo sovrascrive: cosi' lo shadow converge col primario (niente G1 sui
+        // turni conversazionali read-only). Nel primario `action_oriented` arriva
+        // None (build_initial_state Primary) -> si applica il fallback conservativo
+        // sotto, comportamento INVARIATO. `None` nel delta = "non toccare lo stato".
+        let action_oriented_delta: Option<Option<bool>> = match state.action_oriented {
+            Some(_) => None, // gia' derivato a monte (shadow) -> preserva
+            None => Some(Some(true)), // fallback NEUTRO conservativo (Python degradato)
+        };
+
         // Fallback NEUTRO definito (NON un magic fallback nascosto): identico al
         // ramo "classifier non disponibile" del Python (__init__.py:673-707).
         // action_oriented = true e' il default conservativo documentato la'
@@ -154,7 +168,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for RouterNode {
         Ok(StateDelta {
             user_intent: Some(Some(NEUTRAL_INTENT.to_string())),
             intent_confidence: Some(Some(0.5)),
-            action_oriented: Some(Some(true)),
+            action_oriented: action_oriented_delta,
             token_budget: Some(Some(token_budget)),
             ..Default::default()
         }
@@ -248,6 +262,58 @@ mod tests {
         );
         // token_budget calcolato: testo "A" (1 char) -> floor 400.
         assert_eq!(out.token_budget, Some(400));
+    }
+
+    /// Tappa 1b (B): nel ramo generale, se lo stato porta GIA' `action_oriented`
+    /// (pre-derivato dallo shadow dai dati del classifier), il RouterNode NON lo
+    /// sovrascrive -> lo shadow converge col primario (niente G1 forzato a true
+    /// sui turni read-only). Lo stato iniziale con action_oriented=Some(false)
+    /// resta false dopo il router.
+    #[tokio::test]
+    async fn ramo_generale_preserva_action_oriented_prederivato() {
+        let node = RouterNode;
+        let ctx = test_ctx(true); // shadow
+        let state = AgentState {
+            messages: vec![human("riassumi cosa hai fatto")],
+            // Nessun intent_hint -> ramo generale; action_oriented pre-derivato.
+            action_oriented: Some(false),
+            ..Default::default()
+        };
+
+        let delta = node.run(&state, &ctx).await.expect("run ok");
+        // Il delta NON deve includere action_oriented (None = "non toccare").
+        assert!(
+            !delta.as_map().contains_key("action_oriented"),
+            "ramo generale con action_oriented gia' presente -> non sovrascrive"
+        );
+        let out = apply(state, delta);
+        assert_eq!(
+            out.action_oriented,
+            Some(false),
+            "action_oriented pre-derivato preservato (shadow converge)"
+        );
+    }
+
+    /// Tappa 1b (B): nel ramo generale SENZA action_oriented pre-derivato (caso
+    /// primario), il RouterNode applica il fallback conservativo true
+    /// (comportamento INVARIATO del primario).
+    #[tokio::test]
+    async fn ramo_generale_fallback_action_oriented_true() {
+        let node = RouterNode;
+        let ctx = test_ctx(false); // primario
+        let state = AgentState {
+            messages: vec![human("ciao")],
+            action_oriented: None,
+            ..Default::default()
+        };
+
+        let delta = node.run(&state, &ctx).await.expect("run ok");
+        let out = apply(state, delta);
+        assert_eq!(
+            out.action_oriented,
+            Some(true),
+            "primario: fallback conservativo true (decide il RouterNode)"
+        );
     }
 
     /// intent_hint vuoto/whitespace NON e' un passthrough valido: cade nel ramo

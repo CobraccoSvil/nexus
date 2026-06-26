@@ -1011,7 +1011,7 @@ pub(crate) async fn spawn_agent_run(
     .await;
     let mut classified = state
         .orchestrator
-        .classify_intent_full(&classifier_input)
+        .classify_intent_full(&state.db, &classifier_input)
         .await;
     // Continuita' della disambiguazione: se questo messaggio E' la risposta
     // ("A"/"B"/"C") alla domanda appena posta, l'intent e' quello del candidato
@@ -1721,6 +1721,10 @@ pub(crate) async fn spawn_agent_run(
     // Intent risolto dalla risposta di disambiguazione, propagato al brain
     // (None per i run normali: il router_node classifica come sempre).
     let intent_hint_for_brain: Option<String> = resolved_intent_hint.clone();
+    // Messaggio passato al classifier (con contesto recente) catturato per lo
+    // SHADOW: serve a ricostruire i dati COMPLETI del classifier del turno
+    // (Tappa 1b punto B). Usato SOLO nel ramo Engine::Shadow (non instradato).
+    let classifier_input_for_shadow: String = classifier_input.clone();
 
     // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
     // Il filtering per automation_mode avviene dentro build_tools_json_for_agent:
@@ -1891,6 +1895,15 @@ pub(crate) async fn spawn_agent_run(
                     conversation_history: recent_history_for_brain.clone(),
                     tools_json: tools_json_for_brain.clone(),
                     intent_hint: intent_hint_for_brain.clone(),
+                    // Primario nativo (RunRole::Primary): i campi del classifier
+                    // NON sono usati (action_oriented lo decide il RouterNode,
+                    // build_initial_state Primary lascia None). Default neutri.
+                    requires_tools: None,
+                    agentic_score: None,
+                    authorizes_changes: None,
+                    classifier_resolved: false,
+                    action_oriented_min_score:
+                        crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
                     automation_mode: automation_mode_for_brain.clone(),
                     step_tx: tx_for_brain.clone(),
                 };
@@ -3021,6 +3034,51 @@ pub(crate) async fn spawn_agent_run(
                 let shadow_state = state_for_finalize.clone();
                 let (shadow_tx, _shadow_rx) =
                     tokio::sync::broadcast::channel::<AgentStepEvent>(1);
+
+                // ── Tappa 1b (B): dati COMPLETI del classifier per lo shadow ─────
+                // Lo shadow deve derivare action_oriented/report_only ESATTAMENTE
+                // come il primario Python (che riclassifica nel router_node col SUO
+                // classifier). Replichiamo la decisione classificando in-process col
+                // PORTING 1:1 (`intent_classifier::classify`, regola L), cosi'
+                // `build_initial_state` deriva i flag fedeli. Indipendente dal flag
+                // `routing.classifier_engine`: lo shadow usa SEMPRE il classifier
+                // rust per i propri dati (e' la sua natura di replay). Fire-and-forget
+                // post-primario -> ZERO latenza per l'utente. Senza gateway o su
+                // fallback del classifier i campi restano neutri (build_initial_state
+                // cade sul fallback grossolano action_oriented_for_intent).
+                let (
+                    shadow_requires_tools,
+                    shadow_agentic_score,
+                    shadow_authorizes_changes,
+                    shadow_classifier_resolved,
+                ) = match shadow_state.orchestrator.nexus_gateway.as_ref() {
+                    Some(gw) => {
+                        let ai = crate::intent_classifier::classify(
+                            &shadow_state.db,
+                            gw,
+                            &classifier_input_for_shadow,
+                        )
+                        .await;
+                        // classifier_resolved = il classifier ha prodotto un giudizio
+                        // (NON un fallback di sistema). Parita' col brain.
+                        (
+                            Some(ai.requires_tools),
+                            Some(ai.agentic_score),
+                            Some(ai.authorizes_changes),
+                            !ai.fallback_used,
+                        )
+                    }
+                    None => (None, None, None, false),
+                };
+                // Soglia DB action_oriented_min_agentic_score (regola G, mig 0387).
+                let shadow_min_score = nexus_auth::get_setting(
+                    &shadow_state.db,
+                    "routing.action_oriented_min_agentic_score",
+                )
+                .await
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE);
+
                 let shadow_input = crate::native_engine::NativeRunInput {
                     run_id,
                     session_id: session_id_cp,
@@ -3031,6 +3089,11 @@ pub(crate) async fn spawn_agent_run(
                     conversation_history: recent_history_for_brain.clone(),
                     tools_json: tools_json_for_brain.clone(),
                     intent_hint: intent_hint_for_brain.clone(),
+                    requires_tools: shadow_requires_tools,
+                    agentic_score: shadow_agentic_score,
+                    authorizes_changes: shadow_authorizes_changes,
+                    classifier_resolved: shadow_classifier_resolved,
+                    action_oriented_min_score: shadow_min_score,
                     automation_mode: automation_mode_for_brain.clone(),
                     // Canale SSE fittizio: lo shadow usa NullEventSink (non emette
                     // nulla), questo tx esiste solo per soddisfare la firma di

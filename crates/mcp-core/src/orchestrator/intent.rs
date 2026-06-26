@@ -6,9 +6,92 @@
 use sqlx::PgPool;
 use std::sync::atomic::Ordering;
 
-
+use crate::nexus_gateway::NexusGatewayClient;
 
 use super::*;
+
+/// Chiave DB (regola G/L): motore di classificazione intent. Valori ammessi
+/// `'python'` (default, endpoint brain `/classify-intent-agentic`) e `'rust'`
+/// (in-process `crate::intent_classifier::classify`). Punto unico di scelta:
+/// [`select_classifier_engine`]. Migrazione 0458.
+const KEY_CLASSIFIER_ENGINE: &str = "routing.classifier_engine";
+
+/// Motore di classificazione intent selezionato dal DB (flag mig 0458). Verso
+/// la rimozione della dipendenza HTTP `/classify-intent-agentic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClassifierEngine {
+    /// Path STORICO: chiamata HTTP all'endpoint brain `/classify-intent-agentic`.
+    Python,
+    /// Path NATIVO: `crate::intent_classifier::classify` in-process.
+    Rust,
+}
+
+/// Punto unico (regola L): legge `routing.classifier_engine` dal DB e decide il
+/// motore. Default conservativo `Python` (motore stabile) per chiave assente o
+/// valore ignoto — niente magic-fallback nascosto, il degrado e' loggato.
+pub(crate) async fn select_classifier_engine(db: &PgPool) -> ClassifierEngine {
+    match nexus_auth::get_setting(db, KEY_CLASSIFIER_ENGINE).await {
+        Some(v) => match v.trim().to_lowercase().as_str() {
+            "rust" => ClassifierEngine::Rust,
+            "python" => ClassifierEngine::Python,
+            other => {
+                tracing::warn!(
+                    value = %other,
+                    "{KEY_CLASSIFIER_ENGINE}: valore non riconosciuto -> motore stabile (python)"
+                );
+                ClassifierEngine::Python
+            }
+        },
+        None => ClassifierEngine::Python,
+    }
+}
+
+/// Mappa l'output del classifier RUST (`AgenticIntent`) sulla stessa
+/// `ClassifiedIntent` prodotta dal path Python, cosi' i call site di routing non
+/// distinguono il motore (regola L). Gli intent fuori enum della matrix cadono
+/// sul neutro `agentic_default` (stesso contratto di `intent_str_to_static`).
+fn classified_from_rust(ai: crate::intent_classifier::AgenticIntent) -> ClassifiedIntent {
+    let intent_static = intent_str_to_static(&ai.intent).unwrap_or("agentic_default");
+    let candidates: Vec<IntentCandidate> = if ai.candidates.is_empty() {
+        vec![IntentCandidate {
+            intent: intent_static.to_string(),
+            confidence: ai.confidence,
+        }]
+    } else {
+        ai.candidates
+            .into_iter()
+            .map(|c| IntentCandidate {
+                intent: c.intent,
+                confidence: c.confidence,
+            })
+            .collect()
+    };
+    ClassifiedIntent {
+        intent: intent_static,
+        confidence: ai.confidence,
+        candidates,
+        // Il fallback neutro del classifier rust NON e' incertezza (scelta di
+        // sistema): non forziamo disambiguazione su un fallback.
+        is_ambiguous: ai.is_ambiguous && !ai.fallback_used,
+        slots: ai.slots,
+    }
+}
+
+/// Classificazione FULL via motore RUST in-process (`intent_classifier::classify`).
+/// Ritorna sia la `ClassifiedIntent` (per i call site di routing, parita' col
+/// path Python) sia l'`AgenticIntent` grezzo, che porta i dati COMPLETI del
+/// turno (`requires_tools`/`agentic_score`/`authorizes_changes`) necessari alla
+/// derivazione fedele di `action_oriented`/`report_only` nello shadow (Tappa 1b
+/// punto B). `None` per `agentic` quando il path e' Python (dati non disponibili
+/// in-process: il brain riclassifica per conto suo).
+pub(crate) async fn classify_intent_full_rust(
+    db: &PgPool,
+    gateway: &NexusGatewayClient,
+    message: &str,
+) -> (ClassifiedIntent, crate::intent_classifier::AgenticIntent) {
+    let ai = crate::intent_classifier::classify(db, gateway, message).await;
+    (classified_from_rust(ai.clone()), ai)
+}
 
 // Le funzioni di interpretazione keyword-based dell'intent sono state RIMOSSE
 // (classify_intent_local, is_risky_task, is_agentic_request,
@@ -406,5 +489,113 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
         candidates: parsed.candidates,
         is_ambiguous: parsed.is_ambiguous,
         slots: parsed.slots,
+    }
+}
+
+#[cfg(test)]
+mod tests_classifier_engine {
+    use super::*;
+    use crate::intent_classifier::{AgenticIntent, IntentCandidate as RustCandidate};
+
+    fn agentic(intent: &str, is_ambiguous: bool, fallback_used: bool) -> AgenticIntent {
+        AgenticIntent {
+            intent: intent.to_string(),
+            agentic_score: 0.7,
+            requires_tools: true,
+            complexity: "medium".to_string(),
+            confidence: 0.88,
+            model_used: "x".to_string(),
+            cached: false,
+            fallback_used,
+            authorizes_changes: true,
+            candidates: vec![RustCandidate {
+                intent: intent.to_string(),
+                confidence: 0.88,
+            }],
+            is_ambiguous,
+            slots: crate::routing_slots::ActionSlots::default(),
+        }
+    }
+
+    #[test]
+    fn classified_from_rust_mappa_intent_e_candidati() {
+        let c = classified_from_rust(agentic("fix", false, false));
+        assert_eq!(c.intent, "fix");
+        assert!((c.confidence - 0.88).abs() < 1e-6);
+        assert_eq!(c.candidates.len(), 1);
+        assert_eq!(c.candidates[0].intent, "fix");
+        assert!(!c.is_ambiguous);
+    }
+
+    #[test]
+    fn classified_from_rust_intent_fuori_enum_cade_su_neutro() {
+        let c = classified_from_rust(agentic("banana", false, false));
+        assert_eq!(c.intent, "agentic_default");
+    }
+
+    #[test]
+    fn classified_from_rust_fallback_non_e_ambiguo() {
+        // is_ambiguous=true MA fallback_used=true (scelta di sistema): non si
+        // forza disambiguazione su un fallback neutro.
+        let c = classified_from_rust(agentic("agentic_default", true, true));
+        assert!(!c.is_ambiguous, "fallback di sistema -> non ambiguo");
+    }
+
+    /// Tabella settings minimale (gli `#[sqlx::test]` del crate creano lo schema
+    /// a mano: le migrazioni non sono applicate automaticamente).
+    async fn create_settings_table(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS settings ( \
+                 key      TEXT PRIMARY KEY, \
+                 value    TEXT NOT NULL, \
+                 category TEXT \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create table settings");
+    }
+
+    #[sqlx::test]
+    async fn select_engine_default_python_se_setting_assente(pool: sqlx::PgPool) {
+        create_settings_table(&pool).await;
+        // Nessuna riga settings -> default conservativo python.
+        assert_eq!(select_classifier_engine(&pool).await, ClassifierEngine::Python);
+    }
+
+    #[sqlx::test]
+    async fn select_engine_legge_rust_e_python_dal_db(pool: sqlx::PgPool) {
+        create_settings_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO settings (key, value, category) \
+             VALUES ('routing.classifier_engine', 'rust', 'routing')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert setting rust");
+        assert_eq!(select_classifier_engine(&pool).await, ClassifierEngine::Rust);
+
+        sqlx::query(
+            "UPDATE settings SET value = 'python' WHERE key = 'routing.classifier_engine'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update setting python");
+        assert_eq!(
+            select_classifier_engine(&pool).await,
+            ClassifierEngine::Python
+        );
+
+        // Valore ignoto -> degrado conservativo python.
+        sqlx::query(
+            "UPDATE settings SET value = 'boh' WHERE key = 'routing.classifier_engine'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update setting ignoto");
+        assert_eq!(
+            select_classifier_engine(&pool).await,
+            ClassifierEngine::Python
+        );
     }
 }

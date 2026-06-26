@@ -166,6 +166,29 @@ pub struct NativeRunInput {
     /// Intent gia' risolto (es. risposta a disambiguazione). `None` -> il router
     /// classifica normalmente.
     pub intent_hint: Option<String>,
+    /// Dati COMPLETI del classifier del turno (Tappa 1b, punto B). Popolati SOLO
+    /// nel ramo Shadow (`build_initial_state` li usa per derivare
+    /// `action_oriented`/`report_only` FEDELI al primario Python via
+    /// `intent_classifier::derive_*`, sostituendo la mappa grossolana
+    /// `action_oriented_for_intent`). Per il primario restano ai default
+    /// (`None`/`false`): il primario NON forza `action_oriented` (decide il
+    /// RouterNode), comportamento INVARIATO.
+    ///
+    /// `requires_tools`: il turno richiede tool? (giudizio LLM del classifier).
+    pub requires_tools: Option<bool>,
+    /// `agentic_score` (0..1) del classifier sul turno corrente.
+    pub agentic_score: Option<f32>,
+    /// `authorizes_changes`: l'utente AUTORIZZA modifiche in questo turno?
+    /// (giudizio agentico DIRETTO report-vs-act del classifier).
+    pub authorizes_changes: Option<bool>,
+    /// `true` se il classifier del TURNO CORRENTE ha effettivamente prodotto un
+    /// giudizio (distingue "classifier ha risolto" dal degradato). Parita' col
+    /// `_classifier_resolved` del brain.
+    pub classifier_resolved: bool,
+    /// Soglia `routing.action_oriented_min_agentic_score` (DB, default 0.5)
+    /// passata dal call site (regola G: nessun hardcode nel grafo). Usata dalla
+    /// derivazione `action_oriented` quando `requires_tools` e' assente.
+    pub action_oriented_min_score: f32,
     /// Modalita' automazione della sessione (study/confirm/automatic/...).
     pub automation_mode: String,
     /// Canale broadcast SSE del run (lo stesso di `run_via_brain`, `agent_channels`).
@@ -655,40 +678,88 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
     // (incluso null) -> None: lo stato tratta None come "nessun tool dichiarato".
     let tools = input.tools_json.as_array().cloned();
 
-    // ── FIX shadow LLM-Replay: action_oriented/user_intent coerenti col primario ──
+    // ── Tappa 1b (B): action_oriented FEDELE nello shadow (risolve g1) ───────────
     // RADICE della divergenza stop_reason (g1 sui run 0-tool, loop sui run con
-    // tool): in shadow il `RouterNode` NON ha il classifier LLM portato (TODO
-    // `router.rs`), quindi senza `intent_hint` cade nel fallback `agentic_default`
-    // con `action_oriented=true` SEMPRE. Il primario Python invece deriva
-    // `action_oriented` dal classifier del turno: per i turni conversazionali e'
-    // `false` -> niente G1. Per far convergere lo SHADOW (replay della DECISIONE
-    // del primario, non ri-valutazione) deriviamo `action_oriented` dall'`intent`
-    // GIA' DISPONIBILE col PUNTO UNICO deterministico
-    // `decisions::action_oriented_for_intent` (regola L: stessa mappa
-    // intent->azione del classifier Python; non esiste una tabella DB dedicata, e'
-    // semantica di intent). Quando l'`intent_hint` manca (turno normale senza
-    // disambiguazione) lasciamo `user_intent`/`action_oriented` a None: il
-    // `RouterNode` shadow applichera' lo stesso fallback del Python degradato, che
-    // e' il meglio possibile finche' il classifier non e' portato (FIX A, TODO
-    // `router.rs`, da chiudere PRIMA del cutover). SOLO ramo shadow: il primario
-    // reale resta None (decide il RouterNode come oggi).
+    // tool): in shadow il `RouterNode` NON riclassifica, quindi senza dati cade
+    // nel fallback `agentic_default` con `action_oriented=true` SEMPRE. Il
+    // primario Python invece deriva `action_oriented` dal classifier del turno:
+    // per i turni conversazionali read-only e' `false` -> niente G1.
+    //
+    // Per far CONVERGERE lo shadow deriviamo `action_oriented`/`report_only`
+    // dagli STESSI dati del classifier del turno (`requires_tools`/`agentic_score`
+    // /`authorizes_changes`) col PUNTO UNICO `intent_classifier::derive_*` (regola
+    // L: porting 1:1 di `brain/agents/nodes/__init__.py:686-739`). Il call site
+    // shadow popola questi campi in `NativeRunInput`; il fix precedente grossolano
+    // (`action_oriented_for_intent(intent_hint)`) resta SOLO come fallback quando
+    // i dati del classifier non sono disponibili. SOLO ramo shadow: il primario
+    // reale resta None (decide il RouterNode come oggi, comportamento INVARIATO).
     let (shadow_intent, shadow_action_oriented): (Option<String>, Option<bool>) =
         if role.is_shadow() {
-            match input
+            let intent_hint = input
                 .intent_hint
                 .as_deref()
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty());
+            // Dati completi del classifier disponibili (popolati dal call site
+            // shadow): derivazione FEDELE, identica al primario Python.
+            if input.classifier_resolved
+                || input.requires_tools.is_some()
+                || input.agentic_score.is_some()
             {
-                Some(intent) => (
-                    Some(intent.to_string()),
-                    Some(nexus_agent_graph::decisions::action_oriented_for_intent(intent)),
-                ),
-                None => (None, None),
+                let action_oriented = crate::intent_classifier::derive_action_oriented(
+                    intent_hint,
+                    input.requires_tools,
+                    input.agentic_score,
+                    input.action_oriented_min_score,
+                );
+                // user_intent: l'intent del primario se noto (intent_hint),
+                // altrimenti None (l'intent vive nel routing, non e' richiesto
+                // dal grafo per action_oriented).
+                (intent_hint.map(str::to_string), Some(action_oriented))
+            } else {
+                // Fallback grossolano (classifier non disponibile): deriva
+                // dall'intent_hint con la mappa deterministica. Quando manca
+                // anche l'hint, None -> il RouterNode shadow applica il fallback
+                // del Python degradato.
+                match intent_hint {
+                    Some(intent) => (
+                        Some(intent.to_string()),
+                        Some(nexus_agent_graph::decisions::action_oriented_for_intent(intent)),
+                    ),
+                    None => (None, None),
+                }
             }
         } else {
             (None, None)
         };
+
+    // report_only FEDELE (porting `__init__.py:736-739`). Lo stato del grafo Rust
+    // non ha (ancora) un campo `report_only` consumato dai nodi: lo deriviamo per
+    // PARITA' di telemetria/diagnosi e lo logghiamo. Il cablaggio nel grafo
+    // (rimozione tool di modifica in report_only) e' un passo separato. SOLO ramo
+    // shadow: nessun impatto sul primario.
+    if role.is_shadow()
+        && (input.classifier_resolved
+            || input.requires_tools.is_some()
+            || input.agentic_score.is_some())
+    {
+        let intent_hint = input
+            .intent_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let report_only = crate::intent_classifier::derive_report_only(
+            input.classifier_resolved,
+            intent_hint,
+            input.authorizes_changes.unwrap_or(true),
+        );
+        tracing::debug!(
+            run_id = %input.run_id,
+            report_only,
+            action_oriented = ?shadow_action_oriented,
+            "shadow: derivazione fedele action_oriented/report_only dal classifier"
+        );
+    }
 
     AgentState {
         messages,
@@ -1085,6 +1156,13 @@ mod tests {
                 {"name": "read_file", "input_schema": {"type": "object"}}
             ]),
             intent_hint: Some("code_write".to_string()),
+            // Default neutri: il classifier NON ha risolto. I test che esercitano
+            // la derivazione fedele (Tappa 1b B) li sovrascrivono esplicitamente.
+            requires_tools: None,
+            agentic_score: None,
+            authorizes_changes: None,
+            classifier_resolved: false,
+            action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
             automation_mode: "automatic".to_string(),
             step_tx: tx,
         }
@@ -1182,9 +1260,9 @@ mod tests {
         );
     }
 
-    /// FIX shadow LLM-Replay: nel ramo Shadow SENZA `intent_hint`, lo stato resta
-    /// a None (il RouterNode shadow applichera' il fallback del Python degradato;
-    /// il porting completo del classifier resta TODO `router.rs`, FIX A).
+    /// FIX shadow (fallback grossolano): nel ramo Shadow SENZA `intent_hint` E
+    /// senza dati del classifier, lo stato resta a None (il RouterNode shadow
+    /// applichera' il fallback del Python degradato).
     #[test]
     fn initial_state_shadow_senza_intent_resta_none() {
         let mut input = sample_input();
@@ -1193,6 +1271,78 @@ mod tests {
         let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
         assert_eq!(state.user_intent, None);
         assert_eq!(state.action_oriented, None);
+    }
+
+    // ── Tappa 1b (B): derivazione FEDELE dal classifier completo ─────────────
+
+    /// Shadow + classifier RISOLTO su un turno read-only (requires_tools=false,
+    /// agentic_score sotto soglia, niente intent_hint): action_oriented=false
+    /// FEDELE al primario Python -> niente G1Continue -> stop_reason converge.
+    /// Questa e' la RADICE della divergenza g1 che la Tappa 1b chiude.
+    #[test]
+    fn initial_state_shadow_classifier_read_only_action_false() {
+        let mut input = sample_input();
+        input.intent_hint = None;
+        input.classifier_resolved = true;
+        input.requires_tools = Some(false);
+        input.agentic_score = Some(0.10);
+        input.authorizes_changes = Some(false);
+        let primary_run_id = Uuid::new_v4();
+        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
+        assert_eq!(
+            state.action_oriented,
+            Some(false),
+            "turno read-only (classifier risolto) -> NON azione, niente G1"
+        );
+    }
+
+    /// Shadow + classifier RISOLTO su un turno d'azione (requires_tools=true):
+    /// action_oriented=true FEDELE, anche se l'agentic_score e' basso.
+    #[test]
+    fn initial_state_shadow_classifier_azione_action_true() {
+        let mut input = sample_input();
+        input.intent_hint = None;
+        input.classifier_resolved = true;
+        input.requires_tools = Some(true);
+        input.agentic_score = Some(0.20);
+        input.authorizes_changes = Some(true);
+        let primary_run_id = Uuid::new_v4();
+        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
+        assert_eq!(
+            state.action_oriented,
+            Some(true),
+            "requires_tools=true -> azione (fedele al primario)"
+        );
+    }
+
+    /// Shadow + classifier RISOLTO con requires_tools assente ma agentic_score
+    /// SOPRA la soglia: action_oriented=true via soglia (porting __init__.py:699).
+    #[test]
+    fn initial_state_shadow_classifier_score_sopra_soglia_action_true() {
+        let mut input = sample_input();
+        input.intent_hint = None;
+        input.classifier_resolved = true;
+        input.requires_tools = None;
+        input.agentic_score = Some(0.80);
+        input.action_oriented_min_score = 0.5;
+        let primary_run_id = Uuid::new_v4();
+        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
+        assert_eq!(state.action_oriented, Some(true), "score 0.80 >= 0.5 -> azione");
+    }
+
+    /// Il PRIMARIO ignora i dati del classifier anche se presenti: action_oriented
+    /// resta None (lo decide il RouterNode reale). Garanzia di zero impatto sul Real.
+    #[test]
+    fn initial_state_primary_ignora_classifier_resta_none() {
+        let mut input = sample_input();
+        input.classifier_resolved = true;
+        input.requires_tools = Some(false);
+        input.agentic_score = Some(0.0);
+        let state = build_initial_state(&input, RunRole::Primary);
+        assert_eq!(
+            state.action_oriented, None,
+            "primario: classifier ignorato, decide il RouterNode"
+        );
     }
 
     #[test]
