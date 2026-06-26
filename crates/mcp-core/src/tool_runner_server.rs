@@ -107,7 +107,13 @@ impl ToolRunnerService {
         })
     }
 
-    async fn build_ctx(&self, session_id: Uuid) -> Result<AgentToolContext, Status> {
+    /// Costruisce l'`AgentToolContext` per una sessione chat.
+    ///
+    /// `pub(crate)`: riusato dall'adapter `ToolExecutor` del grafo Rust
+    /// (`agent_graph_adapter::tool_executor`) per eseguire i tool IN-PROCESS sullo
+    /// STESSO contesto (root_path/permessi/canali) del path gRPC — un solo punto di
+    /// costruzione del ctx (regola L), nessuna divergenza di permessi o reindex.
+    pub(crate) async fn build_ctx(&self, session_id: Uuid) -> Result<AgentToolContext, Status> {
         let info = self.resolve_session(session_id).await?;
         let long_running_patterns = crate::long_running::load_enabled_patterns(&self.deps.db).await;
         Ok(AgentToolContext {
@@ -153,7 +159,12 @@ struct SessionInfo {
 /// unico Rust della traduzione testo->strutturato: prima ogni consumer Python
 /// ri-parsava la stringa con regex (`EXIT CODE: N`); ora il valore viaggia
 /// strutturato nel proto (contratto dati A, censimento 2026-06-10).
-fn extract_exit_code(result: &str) -> Option<i32> {
+///
+/// `pub(crate)`: riusato dall'adapter `ToolExecutor` del grafo Rust
+/// (`agent_graph_adapter::tool_executor`) per estrarre lo stesso `exit_code`
+/// strutturato sia in Real (dal risultato di `execute_agent_tool`) sia in Replay
+/// (dal `tool_result` riletto da `agent_steps`). Un solo parser (regola L).
+pub(crate) fn extract_exit_code(result: &str) -> Option<i32> {
     let marker = "EXIT CODE: ";
     let start = result.find(marker)? + marker.len();
     let rest = &result[start..];
@@ -161,6 +172,19 @@ fn extract_exit_code(result: &str) -> Option<i32> {
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(rest.len());
     rest[..end].trim().parse::<i32>().ok()
+}
+
+/// `true` se il risultato testuale di un tool e' un ERRORE applicativo.
+///
+/// PUNTO UNICO (regola L) della derivazione `is_error` dal testo del tool: il
+/// contratto e' "il risultato inizia col marker `\u{274C}`" (prodotto dal
+/// resolver `agent_tools::tool_not_found` e dai tool su fallimento). Prima questa
+/// stessa condizione (`trim_start().starts_with('\u{274C}')`) era scritta in
+/// `execute_tool`; ora la usano sia il path gRPC sia l'adapter `ToolExecutor` del
+/// grafo Rust, cosi' Real (output di `execute_agent_tool`) e Replay (testo riletto
+/// da `agent_steps`) classificano l'errore allo stesso modo.
+pub(crate) fn tool_result_is_error(result: &str) -> bool {
+    result.trim_start().starts_with('\u{274C}')
 }
 
 #[tonic::async_trait]
@@ -218,8 +242,9 @@ impl ToolRunner for ToolRunnerService {
         let result = execute_agent_tool(&ctx, &req.tool_name, &input).await;
 
         // execute_agent_tool codifica l'errore come stringa che inizia
-        // con il carattere '❌'. Lo mappiamo su is_error=true.
-        let is_error = result.trim_start().starts_with('\u{274C}');
+        // con il carattere '❌'. Lo mappiamo su is_error=true (punto unico
+        // `tool_result_is_error`, riusato dall'adapter ToolExecutor del grafo).
+        let is_error = tool_result_is_error(&result);
         let duration_ms = started.elapsed().as_millis() as u64;
 
         // Coerenza cache dopo mutazione (incidente Beauty-Book 2026-06-11): un

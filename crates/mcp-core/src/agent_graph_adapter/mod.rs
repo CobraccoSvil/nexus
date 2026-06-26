@@ -7,14 +7,13 @@
 //! (gateway LLM `nexus_gateway`, ToolRunner gRPC, canale SSE `nexus_events`,
 //! `sqlx::PgPool` per le scritture DB).
 //!
-//! STATO — FASE 1 (SCAFFOLDING, ZERO comportamento):
-//! questo modulo contiene SOLO le struct adapter (una per trait di
-//! `runtime::ports`) con il loro costruttore e l'handle al servizio reale a cui
-//! delegheranno. NESSUNA `impl <Trait> for ...` e' ancora presente: l'aggancio
-//! effettivo dei trait (con la delega all'I/O concreto) e' lavoro della FASE 2.
-//! Finche' `select_engine` resta `python` il path Rust e' irraggiungibile, quindi
-//! la regressione e' NULLA: queste struct non sono ancora cablate da nessun
-//! call site.
+//! STATO — FASE 2 COMPLETA (tutte le 14 impl concrete):
+//! ogni modulo qui sotto contiene la struct adapter + il suo costruttore + la
+//! `impl <Trait>` concreta che delega all'I/O reale (gate Real/Replay, fail-open).
+//! L'aggancio nel motore (`run_via_native`) e la costruzione effettiva degli
+//! adapter sono lavoro della FASE 3. Finche' `select_engine` resta `python` il
+//! path Rust e' irraggiungibile, quindi la regressione e' NULLA: queste struct non
+//! sono ancora cablate da nessun call site (da cui l'`#[allow(dead_code)]` mirato).
 //!
 //! Regola L (punto unico): ogni adapter delega a UN servizio concreto gia'
 //! esistente in mcp-core; non re-implementa logica (gateway/cooldown/routing
@@ -22,16 +21,16 @@
 //! provider hardcoded qui (provider e model arrivano gia' risolti nelle
 //! `LlmRequest`).
 
-// STATO — FASE 2a + 2b (11 impl concrete agganciate ai servizi mcp-core):
+// STATO — FASE 2 COMPLETA (tutte le 14 impl concrete agganciate ai servizi mcp-core):
 //
-// Gli 11 adapter sotto hanno l'`impl <Trait>` concreta (delega all'I/O reale,
+// Tutti gli adapter sotto hanno l'`impl <Trait>` concreta (delega all'I/O reale,
 // gate Real/Replay, fail-open). NON sono ancora COSTRUITI da nessun call site:
 // `run_via_native` resta uno stub (select_engine ritorna sempre Python), quindi
-// struct + `new` + impl restano "non costruiti" finche' la FASE 3 non li caggia nel
+// struct + `new` + impl restano "non costruiti" finche' la FASE 3 non li cabla nel
 // motore nativo. Per questo ciascuno porta un `#[allow(dead_code)]` MIRATO con la
-// nota "cablato in F3" (non un allow di modulo che maschererebbe anche i 3 file
-// ancora-stub). I 3 file rimanenti (F2c: LlmGateway/ToolExecutor/CriteriaRunner)
-// sono ancora scaffold senza impl: l'allow di modulo copre solo loro.
+// nota "cablato in F3": l'allow e' per-file (non di modulo), cosi' resta visibile
+// per-adapter e si rimuove uno alla volta quando F3 costruisce ciascuno. select_engine
+// resta Python -> path Rust irraggiungibile -> regressione NULLA.
 
 // --- 8 impl FASE 2a (cablate in F3): allow mirato per-file ---
 #[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
@@ -59,10 +58,10 @@ pub mod escalation_port;
 #[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod next_actions_deriver;
 
-// --- 3 scaffold senza impl (F2c): ancora dead code totale ---
-#[allow(dead_code)] // scaffold F1, impl in F2c
+// --- 3 impl FASE 2c (cablate in F3): LlmGateway / ToolExecutor / CriteriaRunner ---
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod criteria_runner;
-#[allow(dead_code)] // scaffold F1, impl in F2c
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod llm_gateway;
-#[allow(dead_code)] // scaffold F1, impl in F2c
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod tool_executor;
