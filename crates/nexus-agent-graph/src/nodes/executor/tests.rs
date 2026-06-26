@@ -1513,3 +1513,107 @@ mod golden_end_turn {
         println!("golden executor_end_turn: {checked} casi verificati, tutti verdi");
     }
 }
+
+// ── continuita' tool multi-turn: Message -> HistoryMessage -> LlmMessage ──
+// (bug 2026-06-26: il path perdeva tool_use/tool_result -> Anthropic HTTP 400)
+#[cfg(test)]
+mod multi_turn_wire {
+    use super::{ai_tool, human, tool_msg_err};
+    use crate::decisions::context_reduction::HistoryMessage;
+    use crate::nodes::executor::{history_to_llm_messages, message_to_history};
+    use crate::state::{ContentBlock, Message, MessageContent};
+    use serde_json::{json, Value};
+
+    /// Costruisce un `Message::Human` che trasporta un blocco `tool_result` (forma
+    /// reale prodotta dal `tool_dispatch`: HumanMessage + anthropic_content).
+    fn human_tool_result(tool_use_id: &str, result: &str) -> Message {
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                content: Value::String(result.into()),
+                is_error: false,
+                exit_code: Some(0),
+            }]),
+        }
+    }
+
+    #[test]
+    fn multi_turn_assistant_tooluse_e_tool_result_preservati_nel_wire() {
+        // Sequenza reale: [Human, Ai(tool_use id=c1 nei blocchi, tool_calls VUOTO),
+        // Human(tool_result tool_use_id=c1)]. `ai_tool` riproduce il Bug A
+        // (tool_use nei blocchi, tool_calls vec![]); `human_tool_result` la forma
+        // del tool_dispatch.
+        let messages = [
+            human("leggi a.rs"),
+            ai_tool("read_file", json!({"path": "a.rs"})),
+            human_tool_result("c1", "contenuto di a.rs"),
+        ];
+        let hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();
+        let wire = history_to_llm_messages(&hist);
+
+        // 3 messaggi wire: user, assistant(tool_calls), tool(result).
+        assert_eq!(wire.len(), 3, "wire = {wire:?}");
+
+        // [0] user.
+        assert_eq!(wire[0].role, "user");
+        assert!(wire[0].tool_calls.is_none());
+
+        // [1] assistant con tool_calls NON vuoto contenente id=c1 (NON appiattito
+        // nel content): cosi' il server produce un block tool_use, non una stringa.
+        assert_eq!(wire[1].role, "assistant");
+        let calls = wire[1].tool_calls.as_ref().expect("assistant deve avere tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].input["path"], "a.rs");
+
+        // [2] role "tool" con tool_call_id=c1 (round-trip): il server lo trasforma
+        // in block tool_result con tool_use_id=c1.
+        assert_eq!(wire[2].role, "tool");
+        assert_eq!(wire[2].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(wire[2].content, json!("contenuto di a.rs"));
+
+        // COERENZA id: tool_use dell'assistant == tool_call_id del messaggio tool
+        // (la coppia che il server `to_anthropic_messages` riconosce -> no HTTP 400).
+        assert_eq!(calls[0].id, wire[2].tool_call_id.clone().unwrap());
+    }
+
+    #[test]
+    fn multi_turn_message_tool_esplicito_preserva_id() {
+        // Forma alternativa: tool_result come `Message::Tool` esplicito (id su campo).
+        let messages = [
+            human("scrivi"),
+            ai_tool("write_file", json!({"path": "b.rs"})),
+            tool_msg_err("ok scritto"), // Message::Tool { tool_call_id: "c1", ... }
+        ];
+        let hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();
+        let wire = history_to_llm_messages(&hist);
+        assert_eq!(wire.len(), 3);
+        assert_eq!(wire[1].role, "assistant");
+        assert_eq!(wire[1].tool_calls.as_ref().unwrap()[0].id, "c1");
+        assert_eq!(wire[2].role, "tool");
+        assert_eq!(wire[2].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(wire[2].content, json!("ok scritto"));
+    }
+
+    #[test]
+    fn turno_testuale_resta_user_assistant_senza_tool() {
+        // Nessun tool: forma minimale role/content, tool_calls/tool_call_id None.
+        let messages = [
+            human("ciao"),
+            Message::Ai {
+                content: MessageContent::text("risposta"),
+                tool_calls: vec![],
+            },
+        ];
+        let hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();
+        let wire = history_to_llm_messages(&hist);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0].role, "user");
+        assert_eq!(wire[0].content, json!("ciao"));
+        assert!(wire[0].tool_calls.is_none() && wire[0].tool_call_id.is_none());
+        assert_eq!(wire[1].role, "assistant");
+        assert_eq!(wire[1].content, json!("risposta"));
+        assert!(wire[1].tool_calls.is_none() && wire[1].tool_call_id.is_none());
+    }
+}

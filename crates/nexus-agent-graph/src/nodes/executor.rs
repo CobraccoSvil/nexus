@@ -181,7 +181,7 @@ use crate::runtime::ports::{
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
-    AgentState, ContentBlock, Message, MessageContent, StateDelta, StopReason,
+    AgentState, ContentBlock, Message, MessageContent, StateDelta, StopReason, ToolUse,
 };
 
 /// Tool brain-only `task_complete` (vedi `tool_dispatch`): conta nel gate
@@ -1900,7 +1900,18 @@ fn message_to_history(m: &Message) -> HistoryMessage {
             }
             hm
         }
-        Message::Tool { content, .. } => history_from_content(content, false),
+        // Il `ToolMessage` (risultato) preserva ruolo e id: `history_to_llm_messages`
+        // ne ricostruisce il `role="tool"` + `tool_call_id` per il wire (continuita'
+        // tool_use/tool_result, bug 2026-06-26). Senza questi campi il messaggio
+        // verrebbe degradato ad assistant testuale e Anthropic risponderebbe HTTP
+        // 400 (`tool_use ids without tool_result`). La compressione che lo riscrive
+        // azzera questi flag (vedi `HistoryMessage::rebuilt_human`).
+        Message::Tool { content, tool_call_id } => {
+            let mut hm = history_from_content(content, false);
+            hm.is_tool = true;
+            hm.tool_call_id = Some(tool_call_id.clone());
+            hm
+        }
     }
 }
 
@@ -1927,28 +1938,164 @@ fn history_from_content(c: &MessageContent, is_human: bool) -> HistoryMessage {
     }
 }
 
-/// Converte le [`HistoryMessage`] ridotte nei [`LlmMessage`] minimali per la
-/// `LlmRequest` (forma provider-agnostica role/content). Il role deriva da
-/// `is_human` (human -> user, altrimenti assistant; i tool_result viaggiano nei
-/// blocchi). Il content trasporta i blocchi quando presenti (forma a blocchi),
-/// altrimenti il testo: l'impl gateway concreta normalizza per il provider.
+/// Converte le [`HistoryMessage`] ridotte nei [`LlmMessage`] del wire,
+/// PRESERVANDO la continuita' tool_use/tool_result (bug 2026-06-26, regola L: un
+/// solo formato messaggio end-to-end). Un singolo `HistoryMessage` puo' espandersi
+/// in PIU' [`LlmMessage`] (un turno human che porta N blocchi `tool_result`
+/// diventa N messaggi `role="tool"`), quindi usiamo `flat_map`.
+///
+/// Il `tool_dispatch` produce i risultati come `Message::Human` con blocchi
+/// `ContentBlock::ToolResult` (forma autoritativa Rust == HumanMessage +
+/// anthropic_content Python); l'assistant-con-tool porta i `tool_use` nei blocchi.
+/// Il server (`to_anthropic_messages`) riconosce la coppia tool_use/tool_result
+/// SOLO da `role="tool"`+`tool_call_id` e da `assistant`+`tool_calls`: i blocchi
+/// `tool_result`/`tool_use` lasciati DENTRO il content di un user verrebbero
+/// serializzati come stringa JSON (Anthropic non li vede) -> HTTP 400 (`tool_use
+/// ids without tool_result`). Qui li ESTRAIAMO nei campi giusti.
 fn history_to_llm_messages(hist: &[HistoryMessage]) -> Vec<LlmMessage> {
-    hist.iter()
-        .map(|m| {
-            let role = if m.is_human { "user" } else { "assistant" };
-            // Preferisci i blocchi anthropic_content (forma autoritativa) se ci
-            // sono; altrimenti il content (stringa o blocchi).
-            let content = if m.anthropic_content.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                m.anthropic_content.clone()
-            } else {
-                m.content.clone()
-            };
-            LlmMessage {
-                role: role.to_string(),
-                content,
+    hist.iter().flat_map(history_msg_to_wire).collect()
+}
+
+/// Espande UN [`HistoryMessage`] nei [`LlmMessage`] del wire (vedi
+/// [`history_to_llm_messages`]).
+fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
+    // 1) `Message::Tool` esplicito: un solo messaggio `role="tool"` + id.
+    if m.is_tool {
+        let content = if m.content.is_null() {
+            tool_result_content(&m.anthropic_content)
+        } else {
+            m.content.clone()
+        };
+        return vec![LlmMessage {
+            role: "tool".to_string(),
+            content,
+            tool_call_id: m.tool_call_id.clone(),
+            ..Default::default()
+        }];
+    }
+
+    // 2) Messaggio a blocchi: separa tool_result (-> messaggi tool), tool_use
+    //    (-> tool_calls dell'assistant) e testo. Copre sia l'assistant-con-tool
+    //    sia l'human che trasporta i tool_result del tool_dispatch.
+    if let Some(blocks) = m.anthropic_content.as_array() {
+        if !blocks.is_empty() {
+            let tool_results = extract_tool_results(blocks);
+            let tool_uses = extract_tool_uses(blocks);
+            if !tool_results.is_empty() || !tool_uses.is_empty() {
+                let mut out: Vec<LlmMessage> = Vec::new();
+                // I tool_result diventano messaggi `role="tool"` (round-trip id).
+                for (tool_use_id, content) in tool_results {
+                    out.push(LlmMessage {
+                        role: "tool".to_string(),
+                        content,
+                        tool_call_id: Some(tool_use_id),
+                        ..Default::default()
+                    });
+                }
+                // I tool_use diventano `tool_calls` di un assistant (+ testo).
+                if !tool_uses.is_empty() {
+                    out.push(LlmMessage {
+                        role: "assistant".to_string(),
+                        content: flatten_history_blocks_text(&m.anthropic_content),
+                        tool_calls: Some(tool_uses),
+                        ..Default::default()
+                    });
+                }
+                return out;
             }
+            // Blocchi senza tool (es. solo testo / immagini): preserva i blocchi.
+            let role = if m.is_human { "user" } else { "assistant" };
+            return vec![LlmMessage {
+                role: role.to_string(),
+                content: m.anthropic_content.clone(),
+                ..Default::default()
+            }];
+        }
+    }
+
+    // 3) Forma minimale role/content (turno puramente testuale).
+    let role = if m.is_human { "user" } else { "assistant" };
+    vec![LlmMessage {
+        role: role.to_string(),
+        content: m.content.clone(),
+        ..Default::default()
+    }]
+}
+
+/// Estrae i blocchi `{type:"tool_use", id, name, input}` di un `anthropic_content`
+/// in [`ToolUse`] (continuita' tool_use/tool_result). Blocchi non-tool_use ignorati.
+fn extract_tool_uses(blocks: &[Value]) -> Vec<ToolUse> {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|b| {
+            let id = b.get("id").and_then(Value::as_str)?.to_string();
+            let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
+            Some(ToolUse { id, name, input })
         })
         .collect()
+}
+
+/// Estrae i blocchi `{type:"tool_result", tool_use_id, content}` come coppie
+/// `(tool_use_id, content-stringa)`. Il `tool_use_id` referenzia il `tool_use`
+/// dell'assistant che lo ha richiesto (round-trip). Il content e' reso a stringa
+/// (il server fa comunque `content_to_string` per il ruolo tool).
+fn extract_tool_results(blocks: &[Value]) -> Vec<(String, Value)> {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|b| {
+            let id = b.get("tool_use_id").and_then(Value::as_str)?.to_string();
+            let content = match b.get("content") {
+                Some(Value::String(s)) => Value::String(s.clone()),
+                Some(other) => Value::String(serde_json::to_string(other).unwrap_or_default()),
+                None => Value::String(String::new()),
+            };
+            Some((id, content))
+        })
+        .collect()
+}
+
+/// Concatena (separati da `\n`) i testi dei blocchi `{type:"text", text}` di un
+/// `anthropic_content` in una `Value::String` (testo dell'assistant per il wire).
+/// `Value::Null` (nessun blocco testo) per content vuoto.
+fn flatten_history_blocks_text(anthropic_content: &Value) -> Value {
+    let Some(arr) = anthropic_content.as_array() else {
+        return Value::Null;
+    };
+    let text = arr
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Value::String(text)
+}
+
+/// Estrae il payload del/dei blocco/i `{type:"tool_result", content}` di un
+/// `anthropic_content` (forma Anthropic di un `Message::Tool` a blocchi) verso il
+/// content stringa atteso dal server per il ruolo `tool`. Un solo tool_result
+/// (caso comune): il suo content cosi' com'e' (stringa) o serializzato (struttura).
+/// Piu' blocchi o blocchi non-tool_result: serializza l'intero array (il server
+/// fa comunque `content_to_string`). `Value::Null` se non un array.
+fn tool_result_content(anthropic_content: &Value) -> Value {
+    let Some(arr) = anthropic_content.as_array() else {
+        return Value::Null;
+    };
+    let results: Vec<&Value> = arr
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .collect();
+    if let [single] = results.as_slice() {
+        match single.get("content") {
+            Some(Value::String(s)) => return Value::String(s.clone()),
+            Some(other) => return Value::String(serde_json::to_string(other).unwrap_or_default()),
+            None => {}
+        }
+    }
+    // Fallback: l'intero array serializzato (il server lo stringifica comunque).
+    Value::String(serde_json::to_string(arr).unwrap_or_default())
 }
 
 /// Stima chars del contesto a partire dalle [`HistoryMessage`] (riusa

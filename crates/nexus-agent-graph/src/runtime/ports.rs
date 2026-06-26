@@ -44,12 +44,28 @@ pub enum PortError {
 /// Provider-agnostico: il gateway concreto (mcp-core) traduce questa forma nel
 /// payload specifico del provider scelto. `content` e' JSON arbitrario per
 /// ammettere sia testo semplice sia blocchi strutturati (tool_use/tool_result).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// CONTINUITA' TOOL MULTI-TURN (regola L, un solo formato messaggio wire): per
+/// un turno `assistant` che ha chiamato tool i `tool_use` vanno in
+/// [`LlmMessage::tool_calls`] (NON appiattiti in `content`); per un turno `tool`
+/// (risultato) il `role` e' `"tool"` e [`LlmMessage::tool_call_id`] referenzia la
+/// chiamata. Il server (`to_anthropic_messages`) riconosce la coppia tool_use /
+/// tool_result SOLO da questi campi: senza di essi Anthropic risponde HTTP 400
+/// (`tool_use ids without tool_result`). I due campi sono `Option` additivi:
+/// `None` su tutti i messaggi testuali (retrocompatibile coi call site esistenti).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LlmMessage {
     /// Ruolo del messaggio (`system` | `user` | `assistant` | `tool`).
     pub role: String,
     /// Contenuto: stringa o struttura a blocchi (JSON opaco al runtime).
     pub content: Value,
+    /// Tool-call emesse da un turno `assistant` (continuita' tool_use). `None` /
+    /// vuoto per un turno testuale. Gli id qui DEVONO combaciare col
+    /// [`LlmMessage::tool_call_id`] del messaggio `tool` che ne porta il risultato.
+    pub tool_calls: Option<Vec<ToolUse>>,
+    /// Id della tool-call a cui un messaggio `tool` (risultato) risponde
+    /// (round-trip). `None` su tutti gli altri ruoli.
+    pub tool_call_id: Option<String>,
 }
 
 /// Richiesta minimale al gateway LLM.

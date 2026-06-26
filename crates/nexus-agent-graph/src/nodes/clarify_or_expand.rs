@@ -636,11 +636,13 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
                 messages.push(LlmMessage {
                     role: "system".to_string(),
                     content: Value::String(project_context),
+                    ..Default::default()
                 });
             }
             messages.push(LlmMessage {
                 role: "user".to_string(),
                 content: Value::String(user_msg.clone()),
+                ..Default::default()
             });
             let req = LlmRequest {
                 // provider/model RISOLTI A MONTE dal chiamante (regola G): qui

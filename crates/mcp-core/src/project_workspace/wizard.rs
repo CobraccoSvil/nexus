@@ -1918,11 +1918,12 @@ pub(super) async fn refine_with_nexus(
         model: "coder-small".to_string(),
         messages: vec![GwMessage {
             role: "user".to_string(),
-            content: prompt,
+            content: serde_json::Value::String(prompt),
+            tool_calls: None,
+            tool_call_id: None,
         }],
         max_tokens: Some(1024),
         temperature: Some(0.0),
-        tools: None,
         metadata: GwMetadata {
             tenant_id: project_id.to_string(),
             user_id: user_id.to_string(),
@@ -1930,6 +1931,7 @@ pub(super) async fn refine_with_nexus(
             sensitivity_tier: 0,
             feature: "detect_run_configs_ai".to_string(),
         },
+        ..Default::default()
     };
 
     let resp =

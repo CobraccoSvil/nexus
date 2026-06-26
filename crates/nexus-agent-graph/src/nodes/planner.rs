@@ -624,6 +624,7 @@ impl PlannerNode {
                         MessageContent::Text(s) => Value::String(s.clone()),
                         MessageContent::Blocks(_) => Value::String(content.flatten_text()),
                     },
+                    ..Default::default()
                 }
             })
             .collect()
@@ -644,6 +645,7 @@ impl PlannerNode {
         msgs.push(LlmMessage {
             role: "system".to_string(),
             content: Value::String(hinted_system.to_string()),
+            ..Default::default()
         });
         msgs.extend(messages);
         LlmRequest {
@@ -1100,6 +1102,7 @@ impl PlannerNode {
             messages: vec![LlmMessage {
                 role: "user".to_string(),
                 content: Value::String(user_msg),
+                ..Default::default()
             }],
             tools: Some(vec![tool]),
             ..Default::default()

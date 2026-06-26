@@ -22,6 +22,7 @@ fn msg_blocks(blocks: Value) -> HistoryMessage {
         anthropic_content: blocks,
         nexus_summary: false,
         rolling_summary: false,
+        ..Default::default()
     }
 }
 
@@ -32,6 +33,7 @@ fn human_text(text: &str) -> HistoryMessage {
         anthropic_content: Value::Null,
         nexus_summary: false,
         rolling_summary: false,
+        ..Default::default()
     }
 }
 

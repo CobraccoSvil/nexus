@@ -642,10 +642,12 @@ impl ReflectionNode {
                 LlmMessage {
                     role: "system".to_string(),
                     content: Value::String(sys_prompt),
+                    ..Default::default()
                 },
                 LlmMessage {
                     role: "user".to_string(),
                     content: Value::String(user_prompt),
+                    ..Default::default()
                 },
             ],
             // Nessun tool: la reflection ritorna JSON testuale.

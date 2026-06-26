@@ -1145,11 +1145,12 @@ impl Orchestrator {
                 model: gw_model,
                 messages: vec![GwMessage {
                     role: "user".to_string(),
-                    content: composed_prompt.clone(),
+                    content: serde_json::Value::String(composed_prompt.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
                 }],
                 max_tokens: Some(token_budget),
                 temperature: None,
-                tools: None,
                 metadata: GwMetadata {
                     tenant_id: input.project_id.clone(),
                     user_id: input.user_id.clone(),
@@ -1157,6 +1158,7 @@ impl Orchestrator {
                     sensitivity_tier: 0,
                     feature: intent.clone(),
                 },
+                ..Default::default()
             };
             let prompt_tokens = mcp_token::count_tokens(&composed_prompt) as i32;
             let estimated_completion = (token_budget as i32 - prompt_tokens).max(0);

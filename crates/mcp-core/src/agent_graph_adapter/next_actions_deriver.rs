@@ -248,11 +248,12 @@ impl NextActionsDeriverAdapter {
             model,
             messages: vec![GwMessage {
                 role: "user".to_string(),
-                content: prompt,
+                content: serde_json::Value::String(prompt),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             max_tokens: Some(1024),
             temperature: Some(0.0),
-            tools: None,
             metadata: GwMetadata {
                 tenant_id: "internal".to_string(),
                 user_id: "system".to_string(),
@@ -260,6 +261,7 @@ impl NextActionsDeriverAdapter {
                 sensitivity_tier: 0,
                 feature: "choices_extractor".to_string(),
             },
+            ..Default::default()
         };
 
         let resp = match tokio::time::timeout(std::time::Duration::from_secs(20), gw.complete(req))

@@ -41,6 +41,7 @@ fn spec_to_msg(spec: &Value) -> HistoryMessage {
         anthropic_content: spec.get("anthropic_content").cloned().unwrap_or(Value::Null),
         nexus_summary: spec.get("nexus_summary").and_then(Value::as_bool).unwrap_or(false),
         rolling_summary: spec.get("rolling_summary").and_then(Value::as_bool).unwrap_or(false),
+        ..Default::default()
     }
 }
 

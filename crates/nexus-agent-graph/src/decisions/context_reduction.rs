@@ -100,6 +100,20 @@ pub struct HistoryMessage {
     /// `additional_kwargs["rolling_summary"]` truthy.
     #[serde(default)]
     pub rolling_summary: bool,
+    /// `m.type == "tool"` (`ToolMessage` Python). Distingue un risultato di tool
+    /// da un `HumanMessage`/`AIMessage`: serve a ricostruire il `role="tool"` del
+    /// messaggio wire (continuita' tool_use/tool_result, bug 2026-06-26). I
+    /// messaggi COMPRESSI diventano `HumanMessage` (vedi
+    /// [`HistoryMessage::rebuilt_human`]) e perdono questo flag, come nel Python:
+    /// i loro tool_use/tool_result sono gia' degradati a sintesi inline (nessuna
+    /// coppia da referenziare).
+    #[serde(default)]
+    pub is_tool: bool,
+    /// `tool_call_id` del `ToolMessage` (round-trip col `tool_use.id` dell'assistant
+    /// che lo ha richiesto). `None` per tutti i ruoli != tool. Azzerato dalla
+    /// compressione (`rebuilt_human`).
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 impl HistoryMessage {
@@ -114,6 +128,11 @@ impl HistoryMessage {
             anthropic_content: Value::Array(new_blocks),
             nexus_summary: false,
             rolling_summary: false,
+            // Un messaggio compresso diventa `HumanMessage`: perde il ruolo `tool`
+            // e l'id (i suoi tool_use/tool_result sono gia' degradati a sintesi
+            // inline, non c'e' piu' una coppia da referenziare). Coerente col Python.
+            is_tool: false,
+            tool_call_id: None,
         }
     }
 
@@ -1140,6 +1159,7 @@ pub fn inject_forced_rag_reminder(
         anthropic_content: Value::Null,
         nexus_summary: false,
         rolling_summary: false,
+        ..Default::default()
     };
     let mut out = messages.to_vec();
     out.push(reminder);
