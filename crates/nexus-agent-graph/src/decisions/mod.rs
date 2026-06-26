@@ -15,6 +15,8 @@
 //!     stima complessita' e budget iterazioni.
 //!   - [`reward`]: reward euristico + fusione del reward finale (punto unico
 //!     condiviso reflection/learner, regola L).
+//!   - [`turn_focus`]: direttiva "focus del turno corrente" (anti-contaminazione
+//!     history). PUNTO UNICO condiviso da planner ed executor (regola L).
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
@@ -22,6 +24,7 @@ pub mod dag_scheduler;
 pub mod helpers;
 pub mod progress_controller;
 pub mod reward;
+pub mod turn_focus;
 
 pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,
@@ -38,6 +41,7 @@ pub use helpers::{
 pub use progress_controller::{
     decide, Action, Axis, ProgressDecision, ProgressSignals, ABORT_STOP_REASON,
 };
+pub use turn_focus::{build_turn_focus_directive, user_text_only, TURN_FOCUS_MARKER};
 
 #[cfg(test)]
 mod golden_tests;
