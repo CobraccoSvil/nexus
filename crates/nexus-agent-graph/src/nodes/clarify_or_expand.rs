@@ -652,6 +652,11 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
                 model: String::new(),
                 messages,
                 tools: Some(vec![Self::tool_schema()]),
+                // Nodo chiamante = clarify/understanding: in shadow il decorator di
+                // replay neutralizza questo purpose (no-op, il nodo gestisce gia' il
+                // caso "nessun tool_use emesso" come skip). Il gateway concreto lo
+                // IGNORA (regola L).
+                purpose: Some("clarify_expand".into()),
                 ..Default::default()
             };
             match ctx.llm.complete(req).await {

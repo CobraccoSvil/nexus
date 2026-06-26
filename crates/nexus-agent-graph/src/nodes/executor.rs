@@ -1309,6 +1309,10 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             run_id: if run_id.is_empty() { None } else { Some(run_id.clone()) },
             iteration: Some(iters_in),
             intent: state.user_intent.clone(),
+            // Nodo chiamante = executor: il decorator di replay (shadow) rigioca
+            // la sequenza di tool del primario su questo purpose (regola L). Il
+            // gateway concreto (GatewayLlmAdapter) lo IGNORA.
+            purpose: Some("executor".into()),
         };
 
         // `gateway_errored`: il `complete` ha sollevato (Err). Il Python NON fa
@@ -1366,6 +1370,9 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                 run_id: if run_id.is_empty() { None } else { Some(run_id.clone()) },
                 iteration: Some(iters_in),
                 intent: state.user_intent.clone(),
+                // Retry-senza-forcing dello stesso turno executor: stesso purpose
+                // (in shadow consuma lo stesso gruppo-iterazione del replay).
+                purpose: Some("executor".into()),
             };
             if let Ok(r) = ctx.llm.complete(retry).await {
                 resp = r;
@@ -1477,6 +1484,8 @@ riassumi lo stato."
                         run_id: if run_id.is_empty() { None } else { Some(run_id.clone()) },
                         iteration: Some(iters_in),
                         intent: state.user_intent.clone(),
+                        // Auto-escalation dello stesso turno executor: stesso purpose.
+                        purpose: Some("executor".into()),
                     };
                     // Best-effort: se la ri-chiamata fallisce, NON promuoviamo
                     // (parita' con l'except Python py:3266-3267 -> not tried_escalation).

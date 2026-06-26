@@ -653,6 +653,10 @@ impl PlannerNode {
             model: model.to_string(),
             messages: msgs,
             tools: Some(tool_catalog()),
+            // Nodo chiamante = planner (sia primario sia fallback tool-robust): in
+            // shadow il decorator di replay neutralizza questo purpose (pass-through,
+            // planner gia' default OFF). Il gateway concreto lo IGNORA (regola L).
+            purpose: Some("planner".into()),
             ..Default::default()
         }
     }
@@ -1105,6 +1109,9 @@ impl PlannerNode {
                 ..Default::default()
             }],
             tools: Some(vec![tool]),
+            // Clarifying-detect del planner: stesso purpose "planner" (neutralizzato
+            // in shadow). Il gateway concreto lo IGNORA (regola L).
+            purpose: Some("planner".into()),
             ..Default::default()
         };
         let resp = match ctx.llm.complete(req).await {

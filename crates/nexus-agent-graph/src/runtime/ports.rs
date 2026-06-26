@@ -117,6 +117,20 @@ pub struct LlmRequest {
     /// Intent classificato del turno (telemetria usage / routing osservabile).
     /// `None` se non disponibile. Opaco al nodo.
     pub intent: Option<String>,
+    /// Nodo CHIAMANTE della completion (`"executor"` / `"planner"` /
+    /// `"reflection"` / `"clarify_expand"`). `None` (Default) per i call site che
+    /// non lo valorizzano (test, turni minimali).
+    ///
+    /// SCOPO (regola L): e' un discriminante OPACO al gateway concreto. L'impl di
+    /// produzione [`LlmGateway`] (`GatewayLlmAdapter` di mcp-core) lo IGNORA
+    /// completamente — un turno REAL non cambia comportamento. Serve SOLO al
+    /// decorator di REPLAY usato dallo shadow (`ReplayLlmGateway`), che distingue
+    /// la chiamata dell'executor (da RIGIOCARE sulla sequenza tool del primario
+    /// letta da `agent_steps`) da quelle ausiliarie (planner/reflection/
+    /// clarify_expand, da NEUTRALIZZARE con una risposta neutra deterministica).
+    /// Il trait [`LlmGateway`] resta invariato (firma `complete()` non cambia):
+    /// `purpose` viaggia nel payload, l'impl decide se guardarlo.
+    pub purpose: Option<String>,
 }
 
 /// Uso/consumo token riportato dal gateway (forma normalizzata cross-provider).

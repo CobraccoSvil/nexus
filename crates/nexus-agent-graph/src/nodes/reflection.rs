@@ -652,6 +652,10 @@ impl ReflectionNode {
             ],
             // Nessun tool: la reflection ritorna JSON testuale.
             tools: None,
+            // Nodo chiamante = reflection: in shadow il decorator di replay
+            // neutralizza questo purpose (nessuna valutazione LLM, resta il reward
+            // euristico deterministico). Il gateway concreto lo IGNORA (regola L).
+            purpose: Some("reflection".into()),
             ..Default::default()
         };
 

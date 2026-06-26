@@ -15,9 +15,24 @@
 //! `anthropic_content`) per ricostruire il `Message::Ai` con i tool_use originali.
 //! Se uno dei due lati si "perdesse" il force-action anti-loop sarebbe
 //! neutralizzato: i test before/after lo coprono esplicitamente.
+//!
+//! ## Due impl coesistono per ruolo (regola L, punto unico LLM)
+//!
+//! - [`GatewayLlmAdapter`] (primario / cutover): completion REAL. IGNORA
+//!   `LlmRequest::purpose` — un turno REAL non cambia comportamento.
+//! - [`ReplayLlmGateway`] (SHADOW, read-only): NON chiama l'LLM. Per la chiamata
+//!   dell'executor RIGIOCA la sequenza di tool del run PRIMARIO letta da
+//!   `agent_steps` (cosi' `num_tool_calls` converge col primario e le divergenze
+//!   residue sono BUG VERI del grafo, non artefatti LLM); per le chiamate
+//!   ausiliarie (planner/reflection/clarify_expand) ritorna una risposta NEUTRA
+//!   deterministica (costo zero, zero RNG-divergenza). Lo switch per ruolo e' nel
+//!   PUNTO UNICO `native_engine::build_native_engine` (come per `ToolExecutor`).
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use sqlx::PgPool;
+use tokio::sync::{Mutex, OnceCell};
+use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{
     LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError,
@@ -212,26 +227,10 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
         .collect();
 
     // assistant_content (blocchi anthropic_content) per la continuita': blocco
-    // text (se non vuoto) seguito dai blocchi tool_use. Vuoto quando non c'e' ne'
-    // testo ne' tool_call (l'executor ricostruisce dai campi base).
-    let mut assistant_content: Vec<Value> = Vec::new();
-    if !resp.content.is_empty() {
-        assistant_content.push(json!({ "type": "text", "text": resp.content }));
-    }
-    for tc in &tool_calls {
-        assistant_content.push(json!({
-            "type": "tool_use",
-            "id": tc.id,
-            "name": tc.name,
-            "input": tc.input,
-        }));
-    }
-    // Se non c'e' alcun tool_use, NON forziamo un blocco text isolato: lasciamo
-    // l'executor costruire dal solo `content` (forma minimale). assistant_content
-    // serve quando ci sono tool_use da preservare.
-    if tool_calls.is_empty() {
-        assistant_content.clear();
-    }
+    // text (se non vuoto) seguito dai blocchi tool_use; vuoto quando non c'e'
+    // alcun tool_use (l'executor ricostruisce dal solo `content`). PUNTO UNICO
+    // della costruzione (regola L): stesso helper usato dal replay.
+    let assistant_content = assistant_content_for_tool_calls(&resp.content, &tool_calls);
 
     LlmResponse {
         content: resp.content,
@@ -251,6 +250,275 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
         model_used: Some(resp.model_used),
         assistant_content,
         stop_reason: Some(resp.finish_reason),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ReplayLlmGateway — gateway di REPLAY per lo shadow (read-only, costo zero)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Una riga `agent_steps` del run PRIMARIO rilevante per il replay dell'executor.
+///
+/// `step_index` deterministico (mig 0009 / [`crate::agent_graph_adapter::
+/// agent_step_store`]): per un primario PYTHON e' `iteration*1000 + idx_locale`
+/// (lo shadow ha SEMPRE un primario Python — `run_via_brain`). `tool_name` e'
+/// LETTERALE: per i tool wrappati e' `"nexus_mcp_tool_call"` (il vero tool sta in
+/// `tool_input.tool_name`) — il replay NON lo spacchetta, restituisce la colonna
+/// `tool_name` cosi' com'e' (vedi [`ReplayLlmGateway`]).
+#[derive(Debug, Clone)]
+struct ReplayStep {
+    /// Indice globale dello step (`iteration*1000 + idx_locale` per i primari Python).
+    step_index: i64,
+    /// Nome del tool LETTERALE (colonna `tool_name`, non spacchettato).
+    tool_name: String,
+    /// Argomenti del tool (colonna `tool_input` JSONB).
+    tool_input: Value,
+}
+
+/// PUNTO UNICO della lettura degli step di replay da `agent_steps` (funzione
+/// libera, testabile col solo `&PgPool`, regola L). Tutti gli step del run
+/// primario che hanno prodotto un tool_use, ordinati per `step_index` ASC.
+///
+/// I nodi ausiliari (planner/reflection/clarify) NON scrivono `agent_steps`:
+/// quindi qui arrivano SOLO gli step dell'executor (1:1 con la sequenza di tool
+/// che lo shadow deve rigiocare).
+async fn load_replay_steps(
+    db: &PgPool,
+    primary_run_id: Uuid,
+) -> Result<Vec<ReplayStep>, PortError> {
+    let rows: Vec<(i64, String, Value)> = sqlx::query_as(
+        "SELECT step_index::bigint, tool_name, tool_input FROM agent_steps \
+         WHERE run_id = $1 \
+         ORDER BY step_index ASC",
+    )
+    .bind(primary_run_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| PortError::Llm(format!("replay caricamento agent_steps: {e}")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(step_index, tool_name, tool_input)| ReplayStep {
+            step_index,
+            tool_name,
+            tool_input,
+        })
+        .collect())
+}
+
+/// PUNTO UNICO del fetch del messaggio finale del primario (`agent_runs.final_answer`),
+/// usato dallo shadow per chiudere come il primario quando il cursore e' esausto.
+/// `Ok(None)` se la colonna e' NULL (chiusura con content vuoto). Funzione libera,
+/// testabile col solo `&PgPool` (regola L).
+async fn load_primary_final_answer(
+    db: &PgPool,
+    primary_run_id: Uuid,
+) -> Result<Option<String>, PortError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT final_answer FROM agent_runs WHERE id = $1")
+            .bind(primary_run_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| PortError::Llm(format!("replay lettura final_answer: {e}")))?;
+    Ok(row.and_then(|(fa,)| fa))
+}
+
+/// Raggruppa gli step (gia' ordinati per `step_index`) per ITERAZIONE = quoziente
+/// `step_index / 1000`. Ritorna i gruppi nell'ordine dei quozienti DISTINTI
+/// crescenti (i buchi sono ignorati: se il primario ha iterazioni senza tool, quei
+/// quozienti non compaiono). Ogni gruppo mantiene gli step nell'ordine `step_index`.
+///
+/// PURA (regola L): nessun I/O, esercitabile in isolamento. Assume lo schema
+/// `iteration*1000 + idx` (valido per i primari Python che lo shadow rigioca; il
+/// caso legacy sequenziale riguarda i primari Rust, mai shadowati).
+fn group_steps_by_iteration(steps: &[ReplayStep]) -> Vec<Vec<ReplayStep>> {
+    let mut groups: Vec<Vec<ReplayStep>> = Vec::new();
+    let mut current_quot: Option<i64> = None;
+    for s in steps {
+        let quot = s.step_index / 1000;
+        if current_quot != Some(quot) {
+            groups.push(Vec::new());
+            current_quot = Some(quot);
+        }
+        groups
+            .last_mut()
+            .expect("almeno un gruppo creato sopra")
+            .push(s.clone());
+    }
+    groups
+}
+
+/// Costruisce la [`LlmResponse`] dell'executor da rigiocare per UN gruppo-iterazione
+/// del primario. PURA: emette un `tool_use` per ogni step del gruppo (id sintetico
+/// `replay-{step_index}`, name = colonna `tool_name` LETTERALE, input = `tool_input`)
+/// e ricostruisce `assistant_content` riusando la STESSA forma di [`map_gw_response`]
+/// (blocchi `{type:"tool_use", id, name, input}`), per la continuita'
+/// tool_use/tool_result attesa da `build_assistant_message` dell'executor (regola L:
+/// non duplichiamo la logica di costruzione assistant_content, usiamo l'helper
+/// condiviso [`assistant_content_for_tool_calls`]).
+///
+/// RISCHIO NOTO (design): per i tool wrappati `tool_name='nexus_mcp_tool_call'` il
+/// `name` resta la COLONNA (non spacchettiamo `tool_input.tool_name`), cosi'
+/// `num_tool_calls` combacia 1:1 col primario (che conta la stessa colonna). Se il
+/// grafo Rust ramifica diversamente su `nexus_mcp_tool_call` e' una divergenza VERA
+/// da far emergere, non da nascondere.
+fn replay_response_for_group(group: &[ReplayStep], req: &LlmRequest) -> LlmResponse {
+    let tool_calls: Vec<ToolUse> = group
+        .iter()
+        .map(|s| ToolUse {
+            id: format!("replay-{}", s.step_index),
+            name: s.tool_name.clone(),
+            input: s.tool_input.clone(),
+        })
+        .collect();
+    let assistant_content = assistant_content_for_tool_calls("", &tool_calls);
+    LlmResponse {
+        content: String::new(),
+        tool_calls,
+        usage: LlmUsage::default(),
+        // provider/model EFFETTIVI = quelli del req (lo shadow non fa cascade).
+        provider_used: if req.provider.is_empty() {
+            None
+        } else {
+            Some(req.provider.clone())
+        },
+        model_used: if req.model.is_empty() {
+            None
+        } else {
+            Some(req.model.clone())
+        },
+        assistant_content,
+        stop_reason: Some("tool_use".to_string()),
+    }
+}
+
+/// Helper condiviso (regola L): blocchi `assistant_content` in forma
+/// `anthropic_content` da un testo opzionale + i `tool_use`. Stessa forma prodotta
+/// da [`map_gw_response`] (blocco text se non vuoto, poi i blocchi tool_use; vuoto
+/// se non c'e' alcun tool_use). Estratto per essere riusato dal replay senza
+/// duplicare la costruzione.
+fn assistant_content_for_tool_calls(text: &str, tool_calls: &[ToolUse]) -> Vec<Value> {
+    if tool_calls.is_empty() {
+        return Vec::new();
+    }
+    let mut blocks: Vec<Value> = Vec::new();
+    if !text.is_empty() {
+        blocks.push(json!({ "type": "text", "text": text }));
+    }
+    for tc in tool_calls {
+        blocks.push(json!({
+            "type": "tool_use",
+            "id": tc.id,
+            "name": tc.name,
+            "input": tc.input,
+        }));
+    }
+    blocks
+}
+
+/// Risposta NEUTRA deterministica per le chiamate AUSILIARIE in shadow (purpose
+/// planner/reflection/clarify_expand o `None`): content vuoto, nessun tool_call,
+/// `stop_reason=None`, usage zero, assistant_content vuoto. NESSUNA chiamata LLM
+/// reale. Neutralizza il planner (pass-through, gia' default OFF), la reflection
+/// (no valutazione LLM, resta il reward euristico deterministico) e clarify/
+/// understanding (no-op: i nodi gestiscono gia' "nessun tool_use emesso" come skip).
+fn neutral_auxiliary_response() -> LlmResponse {
+    LlmResponse::default()
+}
+
+/// Gateway LLM di REPLAY per lo SHADOW (read-only, costo zero). NON chiama mai
+/// l'LLM reale:
+/// - per la chiamata dell'EXECUTOR (`purpose == "executor"`) consuma il prossimo
+///   gruppo-iterazione del primario (lazy-load di `agent_steps`) ed emette gli
+///   stessi tool_use, nello stesso ordine `step_index`. Esaurito il cursore,
+///   chiude con `agent_runs.final_answer` del primario (`stop_reason=end_turn`),
+///   cosi' lo shadow termina come il primario;
+/// - per le chiamate AUSILIARIE (planner/reflection/clarify_expand o `None`)
+///   ritorna [`neutral_auxiliary_response`] (deterministica, zero I/O).
+///
+/// Coesiste con [`GatewayLlmAdapter`] (Real): lo switch e' per ruolo nel punto
+/// unico `native_engine::build_native_engine`. Il design NON include un fallback
+/// `real`: in shadow puro gli ausiliari sono neutralizzati e l'executor e' replay,
+/// quindi nessuna chiamata REAL e' mai necessaria.
+pub struct ReplayLlmGateway {
+    /// Pool Postgres: lettura `agent_steps` / `agent_runs` del primario.
+    db: PgPool,
+    /// Run primario di cui RIGIOCARE le decisioni dell'executor (= thread_id).
+    primary_run_id: Uuid,
+    /// Step del primario raggruppati per iterazione (lazy-load alla prima chiamata
+    /// executor). `OnceCell`: una sola lettura per run shadow.
+    groups: OnceCell<Vec<Vec<ReplayStep>>>,
+    /// Cursore sui gruppi-iterazione: indice del PROSSIMO gruppo da consumare.
+    /// Ogni `complete()` dell'executor avanza di 1 (interior mutability su `&self`).
+    cursor: Mutex<usize>,
+    /// `agent_runs.final_answer` del primario (lazy-load): chiusura dello shadow a
+    /// cursore esausto. `Some(None)` = caricato ma NULL (content vuoto).
+    final_answer: OnceCell<Option<String>>,
+}
+
+impl ReplayLlmGateway {
+    /// Costruisce il gateway di replay sul run primario dato.
+    pub fn new(db: PgPool, primary_run_id: Uuid) -> Self {
+        Self {
+            db,
+            primary_run_id,
+            groups: OnceCell::new(),
+            cursor: Mutex::new(0),
+            final_answer: OnceCell::new(),
+        }
+    }
+
+    /// Lazy-load (una sola volta) degli step del primario raggruppati per iterazione.
+    async fn groups(&self) -> Result<&Vec<Vec<ReplayStep>>, PortError> {
+        self.groups
+            .get_or_try_init(|| async {
+                let steps = load_replay_steps(&self.db, self.primary_run_id).await?;
+                Ok(group_steps_by_iteration(&steps))
+            })
+            .await
+    }
+
+    /// Lazy-load (una sola volta) del `final_answer` del primario.
+    async fn final_answer(&self) -> Result<&Option<String>, PortError> {
+        self.final_answer
+            .get_or_try_init(|| load_primary_final_answer(&self.db, self.primary_run_id))
+            .await
+    }
+
+    /// Replay della chiamata dell'executor: consuma il prossimo gruppo-iterazione;
+    /// se esausto, chiude con `final_answer` del primario (`stop_reason=end_turn`).
+    async fn complete_executor(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
+        let groups = self.groups().await?;
+        let idx = {
+            let mut cur = self.cursor.lock().await;
+            let i = *cur;
+            *cur += 1;
+            i
+        };
+        match groups.get(idx) {
+            Some(group) => Ok(replay_response_for_group(group, &req)),
+            None => {
+                // Cursore esausto: lo shadow chiude come il primario.
+                let final_answer = self.final_answer().await?.clone().unwrap_or_default();
+                Ok(LlmResponse {
+                    content: final_answer,
+                    stop_reason: Some("end_turn".to_string()),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl LlmGateway for ReplayLlmGateway {
+    async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
+        match req.purpose.as_deref() {
+            Some("executor") => self.complete_executor(req).await,
+            // Ausiliari (planner/reflection/clarify_expand) o purpose assente:
+            // risposta neutra deterministica, nessuna chiamata LLM reale.
+            _ => Ok(neutral_auxiliary_response()),
+        }
     }
 }
 
@@ -553,5 +821,243 @@ mod tests {
         assert_eq!(m2["tool_call_id"], "call_X");
         // Il messaggio tool NON serializza tool_calls (None -> omesso).
         assert!(m2.get("tool_calls").is_none());
+    }
+
+    // ── ReplayLlmGateway: raggruppamento + risposta replay (PURI) ─────────────
+
+    fn step(step_index: i64, tool_name: &str) -> ReplayStep {
+        ReplayStep {
+            step_index,
+            tool_name: tool_name.to_string(),
+            tool_input: json!({"k": step_index}),
+        }
+    }
+
+    #[test]
+    fn group_steps_raggruppa_per_quoziente_1000() {
+        // iter 0 (step 0,1), iter 2 (step 2000) -> due gruppi distinti in ordine.
+        let steps = vec![step(0, "read_file"), step(1, "list_files"), step(2000, "edit_file")];
+        let groups = group_steps_by_iteration(&steps);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].tool_name, "read_file");
+        assert_eq!(groups[0][1].tool_name, "list_files");
+        assert_eq!(groups[1].len(), 1);
+        assert_eq!(groups[1][0].tool_name, "edit_file");
+    }
+
+    #[test]
+    fn group_steps_buchi_non_contigui_in_ordine() {
+        // (e) gruppi non contigui: iter 0, 2, 3 (niente iter 1) -> 3 gruppi, ordine
+        // dei quozienti crescenti, i buchi sono ignorati.
+        let steps = vec![step(0, "a"), step(2000, "b"), step(3000, "c")];
+        let groups = group_steps_by_iteration(&steps);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0][0].tool_name, "a");
+        assert_eq!(groups[1][0].tool_name, "b");
+        assert_eq!(groups[2][0].tool_name, "c");
+    }
+
+    #[test]
+    fn replay_response_emette_tool_use_letterali() {
+        // Tool wrappato: name = colonna tool_name LETTERALE (nexus_mcp_tool_call),
+        // NON spacchettato da tool_input.tool_name. id sintetico replay-{step_index}.
+        let group = vec![ReplayStep {
+            step_index: 1000,
+            tool_name: "nexus_mcp_tool_call".to_string(),
+            tool_input: json!({"tool_name": "build", "args": {}}),
+        }];
+        let req = LlmRequest {
+            provider: "anthropic".to_string(),
+            model: "claude-x".to_string(),
+            ..Default::default()
+        };
+        let resp = replay_response_for_group(&group, &req);
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "nexus_mcp_tool_call");
+        assert_eq!(resp.tool_calls[0].id, "replay-1000");
+        // input = tool_input INTEGRO (col tool vero dentro, non spacchettato).
+        assert_eq!(resp.tool_calls[0].input["tool_name"], "build");
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(resp.content, "");
+        // provider/model effettivi = quelli del req (nessun cascade in shadow).
+        assert_eq!(resp.provider_used.as_deref(), Some("anthropic"));
+        assert_eq!(resp.model_used.as_deref(), Some("claude-x"));
+        // assistant_content deserializzabile in ContentBlock (continuita' tool_use).
+        for b in &resp.assistant_content {
+            serde_json::from_value::<nexus_agent_graph::state::ContentBlock>(b.clone())
+                .expect("assistant_content deserializzabile");
+        }
+    }
+
+    #[test]
+    fn risposta_ausiliaria_neutra_deterministica() {
+        // (c) purpose ausiliario -> LlmResponse neutra, nessun I/O.
+        let neutra = neutral_auxiliary_response();
+        assert_eq!(neutra.content, "");
+        assert!(neutra.tool_calls.is_empty());
+        assert_eq!(neutra.stop_reason, None);
+        assert!(neutra.assistant_content.is_empty());
+        assert_eq!(neutra.usage, LlmUsage::default());
+    }
+
+    // ── ReplayLlmGateway: end-to-end via complete() (sqlx) ─────────────────────
+
+    async fn create_tables(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE agent_runs ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 final_answer TEXT \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create agent_runs");
+        sqlx::query(
+            "CREATE TABLE agent_steps ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 run_id UUID NOT NULL, \
+                 step_index INT NOT NULL, \
+                 tool_name TEXT NOT NULL, \
+                 tool_input JSONB NOT NULL, \
+                 tool_result TEXT, \
+                 status TEXT NOT NULL DEFAULT 'running', \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create agent_steps");
+    }
+
+    async fn insert_run(pool: &PgPool, final_answer: Option<&str>) -> Uuid {
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id, final_answer) VALUES ($1, $2)")
+            .bind(run)
+            .bind(final_answer)
+            .execute(pool)
+            .await
+            .expect("run");
+        run
+    }
+
+    async fn insert_step(
+        pool: &PgPool,
+        run_id: Uuid,
+        step_index: i32,
+        tool_name: &str,
+        tool_input: Value,
+    ) {
+        sqlx::query(
+            "INSERT INTO agent_steps \
+             (id, run_id, step_index, tool_name, tool_input, status) \
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, 'completed')",
+        )
+        .bind(run_id)
+        .bind(step_index)
+        .bind(tool_name)
+        .bind(tool_input)
+        .execute(pool)
+        .await
+        .expect("insert step");
+    }
+
+    fn executor_req() -> LlmRequest {
+        LlmRequest {
+            provider: "anthropic".to_string(),
+            model: "claude-x".to_string(),
+            purpose: Some("executor".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// (a) sequenza multi-iterazione: 2 gruppi (step 0,1 e 2000) -> 2 complete()
+    /// con i tool giusti, poi la 3a complete() = end_turn + final_answer del primario.
+    /// (b) conteggio tool per turno = primario (gruppo 0 ha 2 tool, gruppo 1 ne ha 1).
+    #[sqlx::test]
+    async fn replay_executor_sequenza_multi_iterazione(pool: PgPool) {
+        create_tables(&pool).await;
+        let run = insert_run(&pool, Some("FATTO")).await;
+        // iter 0: read_file (0) + list_files (1); iter 2: edit_file (2000).
+        insert_step(&pool, run, 0, "read_file", json!({"path": "a.rs"})).await;
+        insert_step(&pool, run, 1, "list_files", json!({})).await;
+        insert_step(&pool, run, 2000, "edit_file", json!({"path": "a.rs"})).await;
+
+        let gw = ReplayLlmGateway::new(pool.clone(), run);
+
+        // 1a complete() (executor): gruppo iter 0 -> 2 tool nello stesso ordine.
+        let r1 = gw.complete(executor_req()).await.expect("turno 1");
+        assert_eq!(r1.tool_calls.len(), 2, "conteggio tool turno 1 = primario");
+        assert_eq!(r1.tool_calls[0].name, "read_file");
+        assert_eq!(r1.tool_calls[1].name, "list_files");
+        assert_eq!(r1.stop_reason.as_deref(), Some("tool_use"));
+
+        // 2a complete(): gruppo iter 2 -> 1 tool.
+        let r2 = gw.complete(executor_req()).await.expect("turno 2");
+        assert_eq!(r2.tool_calls.len(), 1, "conteggio tool turno 2 = primario");
+        assert_eq!(r2.tool_calls[0].name, "edit_file");
+
+        // (d) 3a complete(): cursore esausto -> end_turn + final_answer del primario.
+        let r3 = gw.complete(executor_req()).await.expect("turno 3");
+        assert!(r3.tool_calls.is_empty());
+        assert_eq!(r3.content, "FATTO");
+        assert_eq!(r3.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    /// (c) purpose ausiliario via complete() -> risposta neutra SENZA leggere il DB
+    /// (run_id inesistente: se toccasse il DB fallirebbe, ma e' neutralizzato prima).
+    #[sqlx::test]
+    async fn replay_purpose_ausiliario_neutro_senza_io(pool: PgPool) {
+        create_tables(&pool).await;
+        // Nessun run inserito: un purpose ausiliario NON deve leggere agent_steps.
+        let gw = ReplayLlmGateway::new(pool.clone(), Uuid::new_v4());
+        for purpose in ["planner", "reflection", "clarify_expand"] {
+            let req = LlmRequest {
+                purpose: Some(purpose.to_string()),
+                ..Default::default()
+            };
+            let resp = gw.complete(req).await.expect("ausiliario neutro");
+            assert!(resp.tool_calls.is_empty());
+            assert_eq!(resp.content, "");
+            assert_eq!(resp.stop_reason, None);
+        }
+        // purpose None -> anch'esso neutro.
+        let resp = gw.complete(LlmRequest::default()).await.expect("none neutro");
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.stop_reason, None);
+    }
+
+    /// (d) cursore esausto subito (nessuno step) -> la PRIMA complete() executor
+    /// chiude con end_turn (final_answer NULL -> content vuoto).
+    #[sqlx::test]
+    async fn replay_executor_cursore_esausto_subito(pool: PgPool) {
+        create_tables(&pool).await;
+        let run = insert_run(&pool, None).await; // final_answer NULL
+        let gw = ReplayLlmGateway::new(pool.clone(), run);
+
+        let r = gw.complete(executor_req()).await.expect("end_turn immediato");
+        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.content, "", "final_answer NULL -> content vuoto");
+        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    /// (e) gruppi non contigui (iter 0, 2, 3) consumati in ordine da complete()
+    /// successive, ignorando i buchi (iter 1 senza tool non lascia righe).
+    #[sqlx::test]
+    async fn replay_executor_gruppi_non_contigui(pool: PgPool) {
+        create_tables(&pool).await;
+        let run = insert_run(&pool, Some("done")).await;
+        insert_step(&pool, run, 0, "a", json!({})).await;
+        insert_step(&pool, run, 2000, "b", json!({})).await;
+        insert_step(&pool, run, 3000, "c", json!({})).await;
+
+        let gw = ReplayLlmGateway::new(pool.clone(), run);
+        assert_eq!(gw.complete(executor_req()).await.unwrap().tool_calls[0].name, "a");
+        assert_eq!(gw.complete(executor_req()).await.unwrap().tool_calls[0].name, "b");
+        assert_eq!(gw.complete(executor_req()).await.unwrap().tool_calls[0].name, "c");
+        // 4a: esausto -> end_turn.
+        let last = gw.complete(executor_req()).await.unwrap();
+        assert_eq!(last.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(last.content, "done");
     }
 }

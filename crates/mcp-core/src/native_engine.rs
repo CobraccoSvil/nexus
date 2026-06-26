@@ -95,7 +95,8 @@ use nexus_graph::outcome::StepOutcome;
 use crate::agent_graph_adapter::{
     agent_step_store::PgAgentStepStore, billing_cooldown_port::CooldownBillingPort,
     context_offload::RagContextOffloadAdapter, criteria_runner::FinalGateCriteriaRunnerAdapter,
-    escalation_port::PgEscalationPort, event_sink::SseEventSinkAdapter, llm_gateway::GatewayLlmAdapter,
+    escalation_port::PgEscalationPort, event_sink::SseEventSinkAdapter,
+    llm_gateway::{GatewayLlmAdapter, ReplayLlmGateway},
     meta_step_store::PgMetaStepStore, model_upscale_port::CatalogModelUpscalePort,
     next_actions_deriver::NextActionsDeriverAdapter, run_control_store::PgRunControlStore,
     todo_store::PgTodoStore, tool_executor::ToolRunnerExecutorAdapter,
@@ -410,8 +411,19 @@ async fn build_native_engine(
     let (reflection_provider, reflection_model) = resolve_purpose(&db, "reflection").await;
 
     // ── Porte I/O concrete (14 impl FASE 2) ──────────────────────────────────
-    // Gateway LLM (provider/model gia' risolti, il client non re-instrada).
-    let llm: Arc<dyn LlmGateway> = Arc::new(GatewayLlmAdapter::new(deps.gateway.clone()));
+    // Gateway LLM: dipende dal ruolo (regola L, punto unico, stesso switch del
+    // `tools` sotto).
+    //  - Primary: GatewayLlmAdapter REAL (provider/model gia' risolti, il client
+    //    non re-instrada).
+    //  - Shadow: ReplayLlmGateway (executor rigioca le decisioni del primario da
+    //    agent_steps, ausiliari neutralizzati): nessuna chiamata LLM reale ->
+    //    num_tool_calls converge col primario, costo zero, zero RNG-divergenza.
+    let llm: Arc<dyn LlmGateway> = match role {
+        RunRole::Primary => Arc::new(GatewayLlmAdapter::new(deps.gateway.clone())),
+        RunRole::Shadow { primary_run_id } => {
+            Arc::new(ReplayLlmGateway::new(db.clone(), primary_run_id))
+        }
+    };
 
     // ToolExecutor: dipende dal ruolo (regola L, punto unico).
     //  - Primary: ToolRunner in-process REALE (mcp-core E' il ToolRunner, no gRPC
@@ -913,8 +925,12 @@ async fn primary_canonical(db: &PgPool, primary_run_id: Uuid) -> anyhow::Result<
 /// gatati no-op), `ToolExecutor::from_db_for_replay` (rilegge i tool_result del
 /// primario), `NullEventSink` (niente SSE), `MemoryCheckpointer` (niente scritture
 /// su nexus_graph_checkpoints), criterio http del final_gate gatato in Replay
-/// (niente reqwest). L'LLM e' REAL (lo shadow chiama davvero il modello: costo
-/// token accettato, e' il senso dello shadow).
+/// (niente reqwest). L'LLM e' in REPLAY sullo shadow (`ReplayLlmGateway`):
+/// l'executor RIGIOCA la sequenza di tool del primario letta da `agent_steps` (cosi'
+/// `num_tool_calls` converge col primario e le divergenze residue sono BUG VERI del
+/// grafo, non artefatti LLM), gli ausiliari (planner/reflection/clarify) sono
+/// neutralizzati con una risposta neutra deterministica (costo token ZERO). REAL
+/// coesiste sul PRIMARIO via `RunRole` (switch nel punto unico `build_native_engine`).
 ///
 /// Su QUALUNQUE errore lo shadow ritorna `Err` ma il chiamante lo tratta come
 /// WARN: lo shadow non deve MAI impattare il run primario.
