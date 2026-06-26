@@ -33,6 +33,11 @@ mod github;
 mod http_metrics;
 mod internal_learning;
 mod internal_routing;
+// SCAFFOLD ISOLATO (Tappa 1a): porting Rust del classifier intent agentico
+// (brain/router/agentic_classifier.py). Modulo completo + testato ma NON ancora
+// cablato ai call site (intent.rs/grafo/router invariati). L'integrazione e' la
+// Tappa 1b. Vedi crate doc-comment di intent_classifier.rs.
+mod intent_classifier;
 pub(crate) use nexus_types::llm_json;
 mod long_running;
 mod mcp_client;
