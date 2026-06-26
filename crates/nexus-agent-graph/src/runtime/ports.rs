@@ -15,6 +15,7 @@
 //! matrix).
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -147,7 +148,11 @@ pub trait ToolExecutor: Send + Sync {
 /// `criteria_runner._check_*`, sotto-sistema separato come `closure_judge` per
 /// il learner). Il nodo costruisce SOLO queste spec (deterministico,
 /// golden-abile) e delega l'esecuzione.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize`: serve a [`crate::nodes::final_gate::FinalGateConfig`]
+/// (che incapsula un `Option<CriterionSpec>` come criterio endpoint risolto a
+/// monte) per restare serializzabile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CriterionSpec {
     /// Tipo del criterio (`no_orphan_imported`, `outputs_exist`,
     /// `service_logs_clean`, `run_command`).
@@ -196,6 +201,46 @@ pub trait CriteriaRunner: Send + Sync {
         criteria: Vec<CriterionSpec>,
         mode: ExecMode,
     ) -> Result<Vec<CriterionResult>, PortError>;
+}
+
+/// Esito di UN run del verifier da persistere su `nexus_agent_verifier_runs`
+/// (`verifier_node._persist_verifier_run`, `verifier_node.py:584-601`). Forma
+/// minimale: i campi della INSERT (`run_id`/`todo_id`/`cycle`/`criteria_results`/
+/// `passed`/`duration_ms`). `criteria_results` e' JSON arbitrario (la lista dei
+/// [`CriterionResult`] serializzata) opaco allo store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifierRunRecord {
+    /// Id del run (= thread_id).
+    pub run_id: String,
+    /// Id del todo verificato.
+    pub todo_id: String,
+    /// Ciclo di verifica (1-based).
+    pub cycle: i64,
+    /// Risultati dei criteri serializzati (JSON: lista `{type, passed, evidence}`).
+    pub criteria_results: Value,
+    /// `true` se la verifica e' passata.
+    pub passed: bool,
+    /// Durata dell'esecuzione criteri in millisecondi.
+    pub duration_ms: i64,
+}
+
+/// Astrazione della persistenza degli esiti del verifier su
+/// `nexus_agent_verifier_runs` (`verifier_node._persist_verifier_run`). mcp-core
+/// la implementera' con `sqlx` (INSERT best-effort). E' una SCRITTURA DB: come
+/// [`TodoStore::mark_status`] e [`ToolExecutor::execute`], il `mode` gata
+/// l'effetto (punto unico del gate shadow, regola L): l'impl concreta DEVE
+/// eseguire la INSERT solo in [`ExecMode::Real`]; in [`ExecMode::Replay`] (run
+/// shadow read-only) la chiamata e' un NO-OP (zero scritture, il run shadow non
+/// inquina la telemetria del primario).
+///
+/// Parita' col Python: la INSERT e' BEST-EFFORT (su errore DB il verifier
+/// prosegue, `verifier_node.py:600`). L'impl concreta NON deve propagare un
+/// `PortError` per un fallimento dell'INSERT (lo logga e ritorna `Ok(())`); il
+/// `PortError` resta per un contratto rotto (mai usato nel flusso normale).
+#[async_trait]
+pub trait VerifierRunStore: Send + Sync {
+    /// Persiste (best-effort) un esito del verifier. No-op in [`ExecMode::Replay`].
+    async fn record(&self, run: VerifierRunRecord, mode: ExecMode) -> Result<(), PortError>;
 }
 
 /// Evento pubblicato verso il frontend chat (sottoinsieme del contratto SSE).

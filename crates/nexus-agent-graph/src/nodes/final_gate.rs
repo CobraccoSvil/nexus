@@ -24,10 +24,12 @@
 //!   `route_after_*`; NON re-implementato qui). Esso valuta in OR il segnale
 //!   STRUTTURALE `has_filesystem_mutation_in_history` (lista mutator-tools
 //!   DB-driven dalla config) e la whitelist intent.
-//! - **La costruzione delle spec criteri** (`final_gate.py:316-377`,
+//! - **La costruzione delle spec criteri** (`final_gate.py:400-470`,
 //!   [`FinalGateNode::build_criteria`]): `no_orphan_imported` (sempre),
-//!   `outputs_exist` (sempre), `service_logs_clean` (se `runtime_check_enabled`),
-//!   `run_command`-build (se `build_command` presente). Costruzione PURA.
+//!   `outputs_exist` (sempre), `service_logs_clean` (se `runtime_check_enabled` +
+//!   `log_command`), `run_command`-build (se `build_command` presente) e
+//!   `http`-endpoint (se `endpoint_criterion` risolto a monte,
+//!   `_resolve_endpoint_check`). Costruzione PURA.
 //! - **`_count_build_errors` + `_BUILD_ERROR_PATTERNS`** (`final_gate.py:276-294`):
 //!   regex TS/rustc/SyntaxError/TypeError/generico, conteggio indicativo. 1:1.
 //! - **`_render_failed_block`** (`final_gate.py:396-493`,
@@ -144,6 +146,16 @@ pub struct FinalGateConfig {
     /// Timeout (s) generale dei criteri non-build (`verifier_timeout_s`, def 30):
     /// passato nel ctx dei criteri (`final_gate.py:313`).
     pub criteria_timeout_s: f64,
+    /// Criterio ENDPOINT HTTP risolto per-progetto (`_resolve_endpoint_check`,
+    /// `final_gate.py:234-302`). `None` = nessun endpoint configurato O check
+    /// disabilitato (N/A: niente criterio, non blocca i progetti senza endpoint).
+    /// Risolto A MONTE (regola G): la lettura DB di `run_configurations`
+    /// (role='endpoint' + `http_spec`) e del setting
+    /// `agent.final_gate.endpoint_check_enabled` resta fuori dal nodo, esattamente
+    /// come `build_command`/`log_command`. La spec arriva pronta nella forma
+    /// `{type:"http", spec:{url, method, body?, headers?}, expected:{status?,
+    /// body_contains?}, timeout_s}` (vedi `_resolve_endpoint_check`).
+    pub endpoint_criterion: Option<CriterionSpec>,
 }
 
 impl Default for FinalGateConfig {
@@ -164,6 +176,7 @@ impl Default for FinalGateConfig {
             no_orphan_min_ratio: 0.4,
             import_staging_dirs: vec!["figma_export".to_string()],
             criteria_timeout_s: 30.0,
+            endpoint_criterion: None,
         }
     }
 }
@@ -239,11 +252,12 @@ impl FinalGateNode {
         }
     }
 
-    /// Costruisce le spec dei criteri da eseguire (`final_gate.py:316-377`).
+    /// Costruisce le spec dei criteri da eseguire (`final_gate.py:400-470`).
     /// PURA: nessun I/O. L'ordine e' load-bearing (riprodotto 1:1):
     /// `no_orphan_imported`, `outputs_exist`, poi opzionali `service_logs_clean`
-    /// (se runtime_check_enabled + log_command non vuoto) e `run_command`-build
-    /// (se build_command presente).
+    /// (se runtime_check_enabled + log_command non vuoto), `run_command`-build
+    /// (se build_command presente) e infine `http`-endpoint (se
+    /// `endpoint_criterion` risolto a monte, `final_gate.py:468-470`).
     ///
     /// COPERTURA: questo metodo e' verificato dagli unit test Rust
     /// (`build_criteria_ordine_e_opzionali`), NON dal golden cross-language. Il
@@ -315,6 +329,14 @@ impl FinalGateNode {
                 expected: json!({ "exit_code": 0 }),
                 timeout_s: Some(self.cfg.build_timeout_s),
             });
+        }
+
+        // (5) http-endpoint (chiamata REALE all'endpoint che il task doveva far
+        //     funzionare), se risolto a monte (regola G: `_resolve_endpoint_check`
+        //     resta fuori dal nodo). Ultimo nell'ordine (`final_gate.py:468-470`).
+        //     Risolve "build verde ma login ancora 500" (incidente Beauty-Book).
+        if let Some(endpoint_crit) = &self.cfg.endpoint_criterion {
+            criteria.push(endpoint_crit.clone());
         }
 
         criteria
@@ -863,6 +885,48 @@ mod tests {
         assert_eq!(build.spec["working_dir"], json!("app"));
         assert_eq!(build.timeout_s, Some(180.0));
         assert_eq!(build.expected, json!({ "exit_code": 0 }));
+
+        // Con anche l'endpoint_criterion risolto a monte: 5 criteri, http ULTIMO
+        // nell'ordine (`final_gate.py:468-470`). La spec arriva pronta dal
+        // risolutore DB (`_resolve_endpoint_check`): il nodo la accoda 1:1.
+        let endpoint = CriterionSpec {
+            criterion_type: "http".to_string(),
+            spec: json!({ "url": "http://localhost:3000/api/login", "method": "POST" }),
+            expected: json!({ "status": 200 }),
+            timeout_s: Some(15.0),
+        };
+        let cfg3 = FinalGateConfig {
+            log_command: "docker compose logs".to_string(),
+            build_command: Some("pnpm build".to_string()),
+            build_working_dir: Some("app".to_string()),
+            endpoint_criterion: Some(endpoint.clone()),
+            ..Default::default()
+        };
+        let node3 = node_with(cfg3, Arc::new(StubCriteriaRunner::with_results(vec![])));
+        let crits3 = node3.build_criteria(&st);
+        let types3: Vec<&str> = crits3.iter().map(|c| c.criterion_type.as_str()).collect();
+        assert_eq!(
+            types3,
+            vec![
+                "no_orphan_imported",
+                "outputs_exist",
+                "service_logs_clean",
+                "run_command",
+                "http"
+            ]
+        );
+        // Il criterio endpoint e' accodato 1:1 (spec/expected/timeout invariati).
+        assert_eq!(crits3.last().expect("endpoint criterion"), &endpoint);
+
+        // Endpoint risolto SENZA build/log: comunque accodato dopo i 2 sempre-on.
+        let cfg4 = FinalGateConfig {
+            endpoint_criterion: Some(endpoint.clone()),
+            ..Default::default()
+        };
+        let node4 = node_with(cfg4, Arc::new(StubCriteriaRunner::with_results(vec![])));
+        let crits4 = node4.build_criteria(&st);
+        let types4: Vec<&str> = crits4.iter().map(|c| c.criterion_type.as_str()).collect();
+        assert_eq!(types4, vec!["no_orphan_imported", "outputs_exist", "http"]);
     }
 
     // ── count_build_errors ────────────────────────────────────────────────────────

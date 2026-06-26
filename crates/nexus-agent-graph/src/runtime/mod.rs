@@ -12,7 +12,7 @@ pub use ctx::AgentNodeCtx;
 pub use ports::{
     CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmMessage,
     LlmRequest, LlmResponse, LlmUsage, PortError, SseEvent, TodoStore, ToolCall, ToolExecutor,
-    ToolOutcome,
+    ToolOutcome, VerifierRunRecord, VerifierRunStore,
 };
 
 #[cfg(test)]
@@ -28,6 +28,7 @@ pub mod test_doubles {
     use super::ports::{
         CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmRequest,
         LlmResponse, LlmUsage, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome, TodoStore,
+        VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
 
@@ -206,6 +207,32 @@ pub mod test_doubles {
                     t.status = status;
                 }
             }
+            Ok(())
+        }
+    }
+
+    /// Store esiti verifier di test: registra i [`VerifierRunRecord`] persistiti
+    /// (solo in `ExecMode::Real`). In `Replay` la `record` e' un NO-OP (nessuna
+    /// registrazione), come l'impl concreta: un test puo' asserire ZERO scritture
+    /// in shadow verificando `records` vuoto.
+    #[derive(Default)]
+    pub struct StubVerifierRunStore {
+        /// Record persistiti in ordine (vuoto in shadow).
+        pub records: Mutex<Vec<VerifierRunRecord>>,
+    }
+
+    #[async_trait]
+    impl VerifierRunStore for StubVerifierRunStore {
+        async fn record(
+            &self,
+            run: VerifierRunRecord,
+            mode: ExecMode,
+        ) -> Result<(), PortError> {
+            // Gate shadow: in Replay NON si persiste (no-op), come l'impl concreta.
+            if mode != ExecMode::Real {
+                return Ok(());
+            }
+            self.records.lock().expect("lock records").push(run);
             Ok(())
         }
     }
