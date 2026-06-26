@@ -22,23 +22,46 @@
 //! provider hardcoded qui (provider e model arrivano gia' risolti nelle
 //! `LlmRequest`).
 
-// In FASE 1 (scaffolding) nessun call site costruisce ancora questi adapter:
-// struct, costruttori `new` e handle al servizio reale sono "dead code" finche'
-// la FASE 2 non implementa i trait e li caggia nel motore. L'allow vive a livello
-// di modulo (un solo punto) e SARA' RIMOSSO in F2 quando gli adapter diventano vivi.
-#![allow(dead_code)]
+// STATO — FASE 2a (8 impl concrete agganciate ai servizi mcp-core):
+//
+// Gli 8 adapter sotto hanno l'`impl <Trait>` concreta (delega all'I/O reale,
+// gate Real/Replay, fail-open). NON sono ancora COSTRUITI da nessun call site:
+// `run_via_native` resta uno stub (select_engine ritorna sempre Python), quindi
+// struct + `new` + impl restano "non costruiti" finche' la FASE 3 non li caggia nel
+// motore nativo. Per questo ciascuno porta un `#[allow(dead_code)]` MIRATO con la
+// nota "cablato in F3" (non un allow di modulo che maschererebbe anche i 6 file
+// ancora-stub). I 6 file rimanenti (F2b/F2c: NextActions/ContextOffload/Escalation/
+// LlmGateway/ToolExecutor/CriteriaRunner) sono ancora scaffold senza impl: l'allow
+// di modulo copre solo loro.
 
+// --- 8 impl FASE 2a (cablate in F3): allow mirato per-file ---
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod agent_step_store;
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod billing_cooldown_port;
-pub mod context_offload;
-pub mod criteria_runner;
-pub mod escalation_port;
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod event_sink;
-pub mod llm_gateway;
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod meta_step_store;
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod model_upscale_port;
-pub mod next_actions_deriver;
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod run_control_store;
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod todo_store;
-pub mod tool_executor;
+#[allow(dead_code)] // cablato in F3 (run_via_native): impl viva, non ancora costruita
 pub mod verifier_run_store;
+
+// --- 6 scaffold senza impl (F2b/F2c): ancora dead code totale ---
+#[allow(dead_code)] // scaffold F1, impl in F2b/F2c
+pub mod context_offload;
+#[allow(dead_code)] // scaffold F1, impl in F2b/F2c
+pub mod criteria_runner;
+#[allow(dead_code)] // scaffold F1, impl in F2b/F2c
+pub mod escalation_port;
+#[allow(dead_code)] // scaffold F1, impl in F2b/F2c
+pub mod llm_gateway;
+#[allow(dead_code)] // scaffold F1, impl in F2b/F2c
+pub mod next_actions_deriver;
+#[allow(dead_code)] // scaffold F1, impl in F2b/F2c
+pub mod tool_executor;
