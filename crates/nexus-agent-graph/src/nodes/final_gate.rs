@@ -1211,13 +1211,11 @@ mod golden {
     #[test]
     #[ignore = "richiede /tmp/golden_final_gate.json generato da gen_golden_final_gate.py"]
     fn golden_final_gate_parita() {
-        let path = "/tmp/golden_final_gate.json";
-        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
-            panic!(
-                "impossibile leggere {path}: {e}; genera con \
-                 python3 crates/nexus-agent-graph/scripts/gen_golden_final_gate.py"
-            )
-        });
+        let Some(raw) =
+            crate::golden_util::load_golden("golden_final_gate.json", "gen_golden_final_gate.py")
+        else {
+            return;
+        };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
         assert!(!cases.is_empty(), "golden vuoto");
 

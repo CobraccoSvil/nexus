@@ -318,13 +318,11 @@ mod golden {
     #[test]
     #[ignore = "richiede /tmp/golden_turn_focus.json generato da gen_golden_turn_focus.py"]
     fn golden_turn_focus_parita() {
-        let path = "/tmp/golden_turn_focus.json";
-        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
-            panic!(
-                "impossibile leggere {path}: {e}; genera con \
-                 python3 crates/nexus-agent-graph/scripts/gen_golden_turn_focus.py"
-            )
-        });
+        let Some(raw) =
+            crate::golden_util::load_golden("golden_turn_focus.json", "gen_golden_turn_focus.py")
+        else {
+            return;
+        };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
         assert!(cases.len() >= 15, "attesi >=15 casi golden, trovati {}", cases.len());
 

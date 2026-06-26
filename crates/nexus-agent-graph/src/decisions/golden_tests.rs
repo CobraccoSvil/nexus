@@ -151,9 +151,11 @@ fn json_eq(a: &Value, b: &Value) -> bool {
 #[test]
 #[ignore = "richiede /tmp/golden_phase2a.json generato da gen_golden_phase2a.py"]
 fn golden_parita_python() {
-    let path = "/tmp/golden_phase2a.json";
-    let raw = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("impossibile leggere {path}: {e}; genera con python3 /tmp/gen_golden_phase2a.py"));
+    let Some(raw) =
+        crate::golden_util::load_golden("golden_phase2a.json", "gen_golden_phase2a.py")
+    else {
+        return;
+    };
     let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
     assert!(!cases.is_empty(), "golden vuoto");
 

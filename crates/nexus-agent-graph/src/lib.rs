@@ -16,6 +16,8 @@
 
 pub mod checkpoint_pg;
 pub mod decisions;
+#[cfg(test)]
+pub mod golden_util;
 pub mod nodes;
 pub mod py_json;
 pub mod routing;

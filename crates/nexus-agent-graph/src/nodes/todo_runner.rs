@@ -1587,13 +1587,11 @@ mod golden {
     #[test]
     #[ignore = "richiede /tmp/golden_todo_runner.json generato da gen_golden_todo_runner.py"]
     fn golden_todo_runner_parita() {
-        let path = "/tmp/golden_todo_runner.json";
-        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
-            panic!(
-                "impossibile leggere {path}: {e}; genera con \
-                 python3 crates/nexus-agent-graph/scripts/gen_golden_todo_runner.py"
-            )
-        });
+        let Some(raw) =
+            crate::golden_util::load_golden("golden_todo_runner.json", "gen_golden_todo_runner.py")
+        else {
+            return;
+        };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
         assert!(cases.len() >= 25, "attesi >=25 casi, trovati {}", cases.len());
 

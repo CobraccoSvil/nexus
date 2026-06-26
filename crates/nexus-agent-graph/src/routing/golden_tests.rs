@@ -47,10 +47,11 @@ fn node_label(n: NodeTarget) -> &'static str {
 #[test]
 #[ignore = "richiede /tmp/golden_phase2b.json generato da gen_golden_phase2b.py"]
 fn golden_parita_python() {
-    let path = "/tmp/golden_phase2b.json";
-    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        panic!("impossibile leggere {path}: {e}; genera con python3 /tmp/gen_golden_phase2b.py")
-    });
+    let Some(raw) =
+        crate::golden_util::load_golden("golden_phase2b.json", "gen_golden_phase2b.py")
+    else {
+        return;
+    };
     let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
     assert!(!cases.is_empty(), "golden vuoto");
 
