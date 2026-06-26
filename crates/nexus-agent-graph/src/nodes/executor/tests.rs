@@ -16,8 +16,9 @@ use super::*;
 use crate::routing::config::RoutingConfig;
 use crate::runtime::ports::{LlmResponse, LlmUsage};
 use crate::runtime::test_doubles::{
-    NullEventSink, StubAgentStepStore, StubEscalationPort, StubLlmGateway, StubMetaStepStore,
-    StubRunControlStore, StubToolExecutor,
+    NullEventSink, StubAgentStepStore, StubBillingCooldownPort, StubEscalationPort, StubLlmGateway,
+    StubMetaStepStore, StubModelUpscalePort, StubNextActionsDeriver, StubRunControlStore,
+    StubToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{ContentBlock, MessageContent, ToolUse};
@@ -72,6 +73,8 @@ fn node(
 }
 
 /// Come [`node`] ma con una porta escalation configurabile (catena/cross/cooldown).
+/// Le porte next_actions/billing/upscale sono i default no-op (rami POST/billing/
+/// upscale inerti): i test che le esercitano usano [`node_ports`].
 fn node_esc(
     cfg: ExecutorConfig,
     rc: Arc<StubRunControlStore>,
@@ -83,8 +86,41 @@ fn node_esc(
 ) {
     let meta = Arc::new(StubMetaStepStore::default());
     let steps = Arc::new(StubAgentStepStore::default());
-    let n = ExecutorNode::new(cfg, rc, meta.clone(), steps.clone(), esc);
+    let n = ExecutorNode::new(
+        cfg,
+        rc,
+        meta.clone(),
+        steps.clone(),
+        esc,
+        Arc::new(StubNextActionsDeriver::default()),
+        Arc::new(StubBillingCooldownPort::default()),
+        Arc::new(StubModelUpscalePort::default()),
+    );
     (n, meta, steps)
+}
+
+/// Nodo con le porte POST/billing/upscale CONFIGURABILI (per i 4 rami PR-J2).
+/// Escalation = default vuoto. Ritorna anche `meta` per asserire i meta_step.
+fn node_ports(
+    cfg: ExecutorConfig,
+    rc: Arc<StubRunControlStore>,
+    next_actions: Arc<StubNextActionsDeriver>,
+    billing: Arc<StubBillingCooldownPort>,
+    upscale: Arc<StubModelUpscalePort>,
+) -> (ExecutorNode, Arc<StubMetaStepStore>) {
+    let meta = Arc::new(StubMetaStepStore::default());
+    let steps = Arc::new(StubAgentStepStore::default());
+    let n = ExecutorNode::new(
+        cfg,
+        rc,
+        meta.clone(),
+        steps,
+        Arc::new(StubEscalationPort::default()),
+        next_actions,
+        billing,
+        upscale,
+    );
+    (n, meta)
 }
 
 fn human(text: &str) -> Message {
@@ -819,6 +855,355 @@ async fn g1_cap_senza_escalation_chiude_secco() {
     assert!(llm.seen.lock().unwrap().is_empty());
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+//  PR-J2: 4 rami ON/seedati (billing fail-fast, next_actions, unfulfilled, upscale)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn billing_fail_fast_chiude_loop_abort() {
+    // Soglia esplorazione raggiunta + provider in cooldown billing -> chiusura
+    // onesta loop_abort PRIMA della chiamata LLM (py:2072-2092).
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::with_exhausted(&["anthropic", "openai"]));
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("task complesso")],
+        consecutive_exploration_calls: Some(6), // == soglia default 6
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::LoopAbort));
+    assert!(out.result.as_deref().unwrap().contains("cooldown"));
+    assert!(out.result.as_deref().unwrap().contains("anthropic, openai"));
+    // LLM NON chiamato (fail-fast pre-modello).
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn billing_nessun_esausto_prosegue() {
+    // Soglia raggiunta MA nessun provider esausto -> NON fail-fast, prosegue.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default()); // vuoto
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    // Testuale -> end_turn (oltre soglia il nudge anti-esplorazione si inietta ma
+    // non chiude: la chiamata LLM avviene).
+    let llm = Arc::new(StubLlmGateway::with_text("Ecco il dato."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        action_oriented: Some(false),
+        consecutive_exploration_calls: Some(6),
+        exploration_nudge_sent: Some(true), // gia' inviato: evita nudge
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::LoopAbort));
+    // LLM chiamato (nessun fail-fast).
+    assert!(!llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn next_actions_rimuove_blocco_e_deriva() {
+    // A end_turn: il blocco <suggested_actions> e' SEMPRE rimosso dal result
+    // visibile (punto unico deterministico) + meta_step next_actions emesso se la
+    // derivazione trova scelte (py:3379-3402).
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::with_choices(&[
+        ("Aggiungi form", "Aggiungi un form di contatto alla pagina"),
+    ]));
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, meta) = node_ports(cfg_resolved(), rc, next_actions.clone(), billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text(
+        "Ecco la home page.\n<suggested_actions>\n[{\"label\":\"x\",\"prompt\":\"y\"}]\n</suggested_actions>",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea la home")],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Blocco rimosso dal testo visibile.
+    let result = out.result.as_deref().unwrap();
+    assert!(!result.to_lowercase().contains("suggested_actions"));
+    assert!(result.contains("Ecco la home page."));
+    // meta_step next_actions persistito (la derivazione ha trovato scelte).
+    let metas = meta.meta_steps.lock().unwrap();
+    assert!(metas.iter().any(|m| m.get("kind").and_then(Value::as_str) == Some("next_actions")));
+    // La porta ha ricevuto il testo GIA' ripulito.
+    let seen = next_actions.seen.lock().unwrap();
+    assert!(seen.last().map(|s| !s.contains("suggested_actions")).unwrap_or(false));
+}
+
+#[tokio::test]
+async fn next_actions_derive_fallita_blocco_comunque_rimosso() {
+    // Derivazione fallita (best-effort): il blocco <suggested_actions> resta
+    // rimosso dal testo visibile (punto unico deterministico), nessun meta_step.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::failing());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, meta) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text(
+        "Risposta finale.\n<suggested_actions>[{\"label\":\"x\"}]</suggested_actions>",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("fai")],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire su derive fallita");
+    let out = apply(state, delta);
+    let result = out.result.as_deref().unwrap();
+    assert!(!result.to_lowercase().contains("suggested_actions"));
+    assert!(result.contains("Risposta finale."));
+    // Nessun meta_step next_actions (derive fallita -> nessuna scelta).
+    let metas = meta.meta_steps.lock().unwrap();
+    assert!(!metas.iter().any(|m| m.get("kind").and_then(Value::as_str) == Some("next_actions")));
+}
+
+#[tokio::test]
+async fn unfulfilled_report_sostituisce_in_confirm() {
+    // Modalita' confirm (assente == confirm) + intento NON compiuto + turno NON
+    // action-oriented -> il result e' sostituito dal resoconto onesto (py:3404-3429).
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    // Promessa monca (testo che il detector unfulfilled riconosce come futuro 1p).
+    let llm = Arc::new(StubLlmGateway::with_text(
+        "Ora attendo che il servizio parta e poi verifichero' il risultato.",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![
+            human("sistema il login"),
+            ai_tool("write_file", json!({"path": "login.ts"})),
+        ],
+        action_oriented: Some(false),
+        // automation_mode assente -> Python default "confirm" -> sostituisce.
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    let result = out.result.as_deref().unwrap();
+    assert!(result.contains("resoconto onesto"));
+    assert!(result.contains("NON e' completato"));
+    // Il resoconto cita il file toccato dalla history.
+    assert!(result.contains("login.ts"));
+}
+
+#[tokio::test]
+async fn unfulfilled_report_non_sostituisce_in_automatic() {
+    // Modalita' automatic: il re-entry G1 fa agire il modello; qui NON si sostituisce.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    let promessa = "Ora attendo che il servizio parta e poi verifichero' il risultato.";
+    let llm = Arc::new(StubLlmGateway::with_text(promessa));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("sistema il login")],
+        action_oriented: Some(false),
+        automation_mode: Some(crate::state::AutomationMode::Automatic),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Result invariato (nessun resoconto sostituito).
+    assert_eq!(out.result.as_deref(), Some(promessa));
+}
+
+#[tokio::test]
+async fn unfulfilled_report_segue_il_lessicale_ignorando_closure_fulfilled() {
+    // DISTINZIONE LOAD-BEARING (regola L): il ramo report POST end_turn usa SOLO
+    // il detector lessicale (1:1 col Python :3413, che NON consulta closure_verdict
+    // in questo ramo), a differenza del ramo G1 (closure-first, py:1913-1917).
+    // Setup adversariale: closure_verdict = fulfilled (compiuto) MA il testo e' una
+    // promessa monca che il detector lessicale riconosce come NON compiuta. Il ramo
+    // report DEVE seguire il lessicale -> SOSTITUIRE col resoconto onesto, ignorando
+    // il verdetto closure fulfilled. Con la vecchia logica closure-first il ramo
+    // avrebbe visto fulfilled e NON avrebbe sostituito: questo test la cattura.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text(
+        "Ora attendo che il servizio parta e poi verifichero' il risultato.",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![
+            human("sistema il login"),
+            ai_tool("write_file", json!({"path": "login.ts"})),
+        ],
+        action_oriented: Some(false),
+        // closure_verdict fulfilled=true: il ramo report (lessicale-puro) lo IGNORA.
+        closure_verdict: Some(json!({"fulfilled": true})),
+        // automation_mode assente -> "confirm" -> ramo report attivo.
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    let result = out.result.as_deref().unwrap();
+    // SOSTITUITO dal resoconto onesto: il lessicale "unfulfilled" ha prevalso sul
+    // closure "fulfilled". La vecchia logica closure-first avrebbe lasciato il testo.
+    assert!(result.contains("resoconto onesto"));
+    assert!(result.contains("NON e' completato"));
+    assert!(result.contains("login.ts"));
+}
+
+#[tokio::test]
+async fn g1_resta_closure_first_non_conta_se_closure_fulfilled() {
+    // CONTROPROVA della distinzione: il ramo G1-conteggio e' closure-first 1:1 col
+    // Python (py:1913-1917, mig 0422). In una re-entry G1 autentica (prev=end_turn,
+    // iter=1, no pending) con turno NON action-oriented, il conteggio dipende SOLO
+    // dal segnale unfulfilled. Qui closure_verdict = fulfilled -> unfulfilled_for_g1
+    // = false -> il reroute G1 NON viene contato (resta 0). Se G1 usasse il
+    // lessicale (come il ramo report), il testo-promessa lo avrebbe contato a 1.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    // Testo-promessa monca: il detector lessicale direbbe unfulfilled.
+    let llm = Arc::new(StubLlmGateway::with_text(
+        "Ora attendo che il servizio parta e poi verifichero' il risultato.",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        // Re-entry G1: turno precedente chiuso end_turn senza agire, l'ultima
+        // assistant e' una promessa monca (lessicale unfulfilled).
+        messages: vec![
+            human("sistema il login"),
+            Message::Ai {
+                content: MessageContent::text(
+                    "Inizio verificando il login e poi sistemo il resto.",
+                ),
+                tool_calls: vec![],
+            },
+        ],
+        stop_reason: Some(StopReason::EndTurn),
+        iterations: Some(1),
+        action_oriented: Some(false),
+        g1_reroute_count: Some(0),
+        // closure_verdict fulfilled=true: il ramo G1 (closure-first) NON conta.
+        closure_verdict: Some(json!({"fulfilled": true})),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Closure-first: fulfilled -> unfulfilled_for_g1=false -> reroute NON contato.
+    assert_eq!(out.g1_reroute_count, Some(0));
+}
+
+#[tokio::test]
+async fn smart_upscale_promuove_modello() {
+    // Contesto stimato >= 90% del window -> la porta promuove a un modello con
+    // window maggiore PRIMA della chiamata LLM; il provider/model del turno cambia
+    // (py:2812-2830). Il delta riporta il provider/model promosso.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    // Window piccola (200 token) -> con un minimo di history la stima supera 180.
+    let upscale = Arc::new(StubModelUpscalePort::promoting(200, "google", "gemini-2.5-pro"));
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        upscale_enabled: true,
+        ..ExecutorConfig::default()
+    };
+    let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
+    let ctx = ctx_with(llm.clone(), false);
+    // History abbastanza grande da superare 90% di 200 token (~180): un testo lungo.
+    let big = "x".repeat(2000);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human(&big)],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Provider/model promossi nel delta.
+    assert_eq!(out.provider_used.as_deref(), Some("google"));
+    assert_eq!(out.model_used.as_deref(), Some("gemini-2.5-pro"));
+    // La chiamata LLM ha usato il modello promosso.
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(req.model, "gemini-2.5-pro");
+    assert_eq!(req.provider, "google");
+    // La porta e' stata interrogata per la selezione col modello corrente.
+    assert!(!upscale.selected.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn smart_upscale_sotto_soglia_non_promuove() {
+    // Contesto piccolo (< 90% del window): nessun upscale, modello invariato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    // Window enorme -> la stima non la raggiunge mai.
+    let upscale = Arc::new(StubModelUpscalePort::promoting(1_000_000, "google", "gemini-2.5-pro"));
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        upscale_enabled: true,
+        ..ExecutorConfig::default()
+    };
+    let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("ciao")],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Modello invariato (no upscale).
+    assert_eq!(out.provider_used.as_deref(), Some("anthropic"));
+    assert_eq!(out.model_used.as_deref(), Some("claude-x"));
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(req.model, "claude-x");
+    // select_upscale_model NON chiamata (gate should_upscale falso).
+    assert!(upscale.selected.lock().unwrap().is_empty());
+}
+
 /// Golden di parita' 1:1 vs Python per la LOGICA DETERMINISTICA del singolo turno
 /// (gate testa, ordine nudge, risoluzione provider). Carica
 /// `/tmp/golden_executor_node.json` (vedi `gen_golden_executor_node.py`). Riusa i
@@ -1001,5 +1386,130 @@ mod golden {
             checked += 1;
         }
         println!("golden executor_node: {checked} casi verificati, tutti verdi");
+    }
+}
+
+/// Golden di parita' 1:1 vs Python per la PARTE DETERMINISTICA dei 4 rami PR-J2
+/// (unfulfilled-report, rimozione `<suggested_actions>`, messaggio billing,
+/// decisione smart-upscale). Carica `/tmp/golden_executor_end_turn.json` (vedi
+/// `gen_golden_executor_end_turn.py`). Chiama le STESSE funzioni pure del nodo
+/// (`decisions::end_turn`), esercitate in isolamento.
+#[cfg(test)]
+mod golden_end_turn {
+    use crate::decisions::end_turn::{
+        billing_fail_fast_message, build_unfulfilled_report, should_upscale,
+        strip_suggested_actions, upscale_required_tokens,
+    };
+    use crate::state::{ContentBlock, Message, MessageContent};
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenCase {
+        group: String,
+        case_id: String,
+        input: Value,
+        output: Value,
+    }
+
+    /// Costruisce i [`Message`] dai blocchi `{"content": [{type:tool_use,...}]}`
+    /// del golden (forma history Python). I blocchi non-tool_use sono ignorati
+    /// dal report; qui basta ricostruire i `ContentBlock::ToolUse`.
+    fn messages_from_input(arr: &Value) -> Vec<Message> {
+        arr.as_array()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter_map(|m| {
+                        let content = m.get("content")?.as_array()?;
+                        let blocks: Vec<ContentBlock> = content
+                            .iter()
+                            .filter_map(|b| {
+                                if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                                    Some(ContentBlock::ToolUse {
+                                        id: "g".into(),
+                                        name: b
+                                            .get("name")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("tool")
+                                            .to_string(),
+                                        input: b.get("input").cloned().unwrap_or(Value::Null),
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        Some(Message::Ai {
+                            content: MessageContent::Blocks(blocks),
+                            tool_calls: vec![],
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[ignore = "richiede /tmp/golden_executor_end_turn.json generato da gen_golden_executor_end_turn.py"]
+    fn golden_executor_end_turn() {
+        let Some(raw) = crate::golden_util::load_golden(
+            "golden_executor_end_turn.json",
+            "gen_golden_executor_end_turn.py",
+        ) else {
+            return;
+        };
+        let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
+        assert!(cases.len() >= 15, "attesi >= 15 casi, trovati {}", cases.len());
+        let mut checked = 0usize;
+        for c in &cases {
+            let got: Value = match c.group.as_str() {
+                "unfulfilled_report" => {
+                    let rt = c.input.get("result_text").and_then(Value::as_str);
+                    let msgs = messages_from_input(c.input.get("messages").unwrap_or(&Value::Null));
+                    Value::String(build_unfulfilled_report(rt, &msgs))
+                }
+                "strip_suggested_actions" => {
+                    let text = c.input.get("text").and_then(Value::as_str).unwrap_or("");
+                    Value::String(strip_suggested_actions(text))
+                }
+                "billing_fail_fast" => {
+                    let cnt = c.input.get("exploration_count").and_then(Value::as_i64).unwrap_or(0);
+                    let thr = c
+                        .input
+                        .get("exploration_threshold")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let ex: Vec<String> = c
+                        .input
+                        .get("exhausted")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    match billing_fail_fast_message(cnt, thr, &ex) {
+                        Some(s) => Value::String(s),
+                        None => Value::Null,
+                    }
+                }
+                "should_upscale" => {
+                    let en = c.input.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                    let est = c.input.get("est_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    let win = c.input.get("current_window").and_then(Value::as_i64).unwrap_or(0);
+                    Value::Bool(should_upscale(en, est, win))
+                }
+                "upscale_required" => {
+                    let est = c.input.get("est_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    let ov = c.input.get("overhead").and_then(Value::as_f64).unwrap_or(1.0);
+                    Value::from(upscale_required_tokens(est, ov))
+                }
+                other => panic!("gruppo golden sconosciuto: {other} (caso {})", c.case_id),
+            };
+            assert_eq!(
+                got, c.output,
+                "PARITA' FALLITA {} / {}:\n  rust   = {}\n  python = {}",
+                c.group, c.case_id, got, c.output
+            );
+            checked += 1;
+        }
+        println!("golden executor_end_turn: {checked} casi verificati, tutti verdi");
     }
 }

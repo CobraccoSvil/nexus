@@ -642,6 +642,110 @@ pub struct EscalationInputs {
     pub cross_provider: Option<CrossProviderCandidate>,
 }
 
+/// Una scelta di proseguimento derivata dal testo dell'assistente (meta_step
+/// `next_actions`): `{label, prompt}` (`next_actions.py:11`, contratto frontend).
+/// Forma minimale: lo store/sink concreto la serializza nel payload del meta_step
+/// (`{"choices": [...]}`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NextActionChoice {
+    /// Testo breve del pulsante (max 60 char lato Python).
+    pub label: String,
+    /// Prompt completo da inviare come messaggio utente proseguendo con la scelta.
+    pub prompt: String,
+}
+
+/// Astrazione della DERIVAZIONE delle scelte di proseguimento dal testo
+/// dell'assistente (`next_actions.derive`, `next_actions.py:451-484`). Confine
+/// d'inversione (regola L): la RIMOZIONE deterministica del blocco
+/// `<suggested_actions>` dal testo visibile e' PURA e vive in
+/// [`crate::decisions::end_turn::strip_suggested_actions`]; QUESTA porta isola SOLO
+/// l'I/O della derivazione delle scelte (parse blocco machine-readable -> fallback
+/// deterministico "Prossimi passi" -> fallback LLM purpose `choices_extractor`).
+///
+/// BEST-EFFORT (parita' col try/except py:3401-3402): la derivazione NON deve mai
+/// rompere il turno. Su qualunque errore (router giu', provider in cooldown, JSON
+/// malformato) l'impl ritorna `Ok(vec![])` (nessuna scelta -> nessun meta_step),
+/// MAI un `PortError`. Il blocco `<suggested_actions>` viene rimosso dal nodo a
+/// prescindere dall'esito (punto unico deterministico), quindi il testo visibile
+/// e' sempre pulito anche quando la derivazione fallisce.
+///
+/// SOLA LETTURA / nessun side-effect persistente: nessun gate `mode` (il
+/// meta_step si persiste/emette a valle via [`MetaStepStore`]/[`EventSink`]).
+#[async_trait]
+pub trait NextActionsDeriver: Send + Sync {
+    /// Deriva le scelte di proseguimento da `cleaned_text` (testo GIA' privo del
+    /// blocco `<suggested_actions>`, rimosso a monte dal punto unico
+    /// deterministico). Ritorna le scelte (vuoto = nessuna). Best-effort: errore
+    /// -> `Ok(vec![])`, mai `PortError` nel flusso normale.
+    async fn derive(&self, cleaned_text: &str)
+        -> Result<Vec<NextActionChoice>, PortError>;
+}
+
+/// Astrazione della LISTA dei provider AI in cooldown billing/quota (fonte unica:
+/// `brain.providers.registry.get_billing_cooldown_snapshot`, `__init__.py:1611-1620`).
+/// Confine d'inversione: la DECISIONE fail-fast (gate soglia + messaggio) e' PURA
+/// e vive in [`crate::decisions::end_turn::billing_fail_fast_message`]; questa
+/// porta isola SOLO la lettura dello snapshot cooldown.
+///
+/// FAIL-OPEN (sicurezza, parita' col best-effort py:1619): un guasto di lettura
+/// NON deve bloccare il run — l'impl ritorna `Ok(vec![])` (nessun provider
+/// esausto -> nessun fail-fast, il run prosegue), MAI un `PortError`. La lista
+/// DEVE arrivare GIA' ORDINATA (`sorted(snap.keys())`, py:1618) per parita' del
+/// messaggio. SOLA LETTURA: nessun gate `mode`.
+#[async_trait]
+pub trait BillingCooldownPort: Send + Sync {
+    /// Provider in cooldown billing/quota, ordinati alfabeticamente. Vuoto se
+    /// nessuno. Fail-open: errore -> `Ok(vec![])`, mai `PortError`.
+    async fn billing_exhausted_providers(&self) -> Result<Vec<String>, PortError>;
+}
+
+/// Esito dello smart-upscale risolto dall'I/O: il modello target promosso (con il
+/// suo provider risolto via catalog) + reason diagnostica, oppure `None` se non
+/// c'e' un candidato adeguato. Forma minimale: il nodo riassegna `provider`/`model`
+/// del turno e logga `reason` (`_smart_upscale_model` + `_provider_from_model`,
+/// `helpers.py:2742-2800` / `2719-2739`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpscalePick {
+    /// Provider del modello promosso (risolto da `ai_price_catalog`).
+    pub provider: String,
+    /// Modello promosso (window piu' grande nel tier configurato).
+    pub model: String,
+    /// Reason diagnostica (`context_overflow:est=...:from_window=...:tier=...`).
+    pub reason: String,
+}
+
+/// Astrazione dell'I/O dello smart-upscale del modello (`_smart_upscale_model`,
+/// `helpers.py:2742-2800`). Confine d'inversione (regola L): la DECISIONE di SE
+/// tentare l'upscale (`est_tokens >= window*0.9`) + il numero `required` di token
+/// sono PURI ([`crate::decisions::end_turn::should_upscale`] /
+/// [`crate::decisions::end_turn::upscale_required_tokens`]); questa porta isola
+/// l'I/O: il lookup del context window del modello corrente E la SELEZIONE
+/// dinamica dal catalog (tier + capability + window >= required) del modello
+/// target con provider risolto.
+///
+/// Tier-based, DB-driven (regola G): nessun nome modello hardcoded; il tier
+/// (`agent.upscale.target_tier`) e i flag (`agent.upscale.*`) sono settings letti
+/// dall'impl. BEST-EFFORT (parita' col try/except py:2829-2830): un guasto NON
+/// deve rompere il turno — l'impl ritorna `Ok(None)` (nessun upscale, prosegue
+/// col modello corrente), MAI un `PortError`. SOLA LETTURA: nessun gate `mode`.
+#[async_trait]
+pub trait ModelUpscalePort: Send + Sync {
+    /// Context window (token) del modello corrente (`_model_context_window`,
+    /// `helpers.py:3309-3336`). `0` se ignoto: il chiamante salta l'upscale
+    /// (`should_upscale` gata `current_window > 0`). Fail-open: errore -> `Ok(0)`.
+    async fn context_window(&self, model: &str) -> Result<i64, PortError>;
+
+    /// Seleziona dal catalog un modello con `context_window >= required_tokens`
+    /// nel tier configurato (capable per tool use, escluso `agentic_thinking_policy
+    /// = 'exclude'`), col provider risolto. `None` se nessun candidato o se il
+    /// migliore coincide col modello corrente. Fail-open: errore -> `Ok(None)`.
+    async fn select_upscale_model(
+        &self,
+        current_model: &str,
+        required_tokens: i64,
+    ) -> Result<Option<UpscalePick>, PortError>;
+}
+
 /// Astrazione dell'I/O dell'auto-escalation (catena DB + cooldown + router
 /// cross-provider). mcp-core la implementera' leggendo
 /// `nexus_model_escalation_chain` (mig 0128), consultando il gate cooldown

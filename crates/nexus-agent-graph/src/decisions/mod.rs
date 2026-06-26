@@ -37,11 +37,20 @@
 //!     condiviso reflection/learner, regola L).
 //!   - [`turn_focus`]: direttiva "focus del turno corrente" (anti-contaminazione
 //!     history). PUNTO UNICO condiviso da planner ed executor (regola L).
+//!   - [`end_turn`]: decisioni DETERMINISTICHE post-end_turn dell'executor
+//!     (unfulfilled-report, rimozione blocco `<suggested_actions>`, messaggio
+//!     billing fail-fast, gate smart-upscale). PUNTO UNICO dei rami che
+//!     riscrivono/gatano il `result` a turno concluso; l'I/O (derivazione LLM
+//!     delle scelte, lista provider esauriti, lookup window catalog) e' dietro le
+//!     porte [`crate::runtime::ports::NextActionsDeriver`] /
+//!     [`crate::runtime::ports::BillingCooldownPort`] /
+//!     [`crate::runtime::ports::ModelUpscalePort`].
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
 pub mod context_reduction;
 pub mod dag_scheduler;
+pub mod end_turn;
 pub mod escalation;
 pub mod g1_accounting;
 pub mod helpers;
@@ -64,6 +73,10 @@ pub use context_reduction::{
 pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,
     TodoStatus,
+};
+pub use end_turn::{
+    billing_fail_fast_message, build_unfulfilled_report, should_substitute_unfulfilled_report,
+    should_upscale, strip_suggested_actions, upscale_required_tokens,
 };
 pub use escalation::{pick_escalation_model, ChainEntry, CrossProviderCandidate, EscalationPick};
 pub use g1_accounting::{g1_accounting, G1Accounting, G1Signals};

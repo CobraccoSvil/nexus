@@ -310,14 +310,15 @@ mod tests {
         UnderstandingConfig, UnderstandingNode, VerifierConfig, VerifierNode,
     };
     use crate::runtime::ports::{
-        AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, EscalationPort, ExecMode,
-        LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, PortError, RunControlStore,
-        TodoStore, ToolCall, ToolExecutor, ToolOutcome, VerifierRunStore,
+        AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
+        EscalationPort, ExecMode, LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore,
+        ModelUpscalePort, NextActionsDeriver, PortError, RunControlStore, TodoStore, ToolCall,
+        ToolExecutor, ToolOutcome, VerifierRunStore,
     };
     use crate::runtime::test_doubles::{
-        NullEventSink, StubAgentStepStore, StubContextOffload, StubCriteriaRunner,
-        StubEscalationPort, StubMetaStepStore, StubRunControlStore, StubTodoStore,
-        StubVerifierRunStore,
+        NullEventSink, StubAgentStepStore, StubBillingCooldownPort, StubContextOffload,
+        StubCriteriaRunner, StubEscalationPort, StubMetaStepStore, StubModelUpscalePort,
+        StubNextActionsDeriver, StubRunControlStore, StubTodoStore, StubVerifierRunStore,
     };
     use crate::state::{Message, MessageContent, StopReason, ToolUse};
 
@@ -504,6 +505,10 @@ mod tests {
         let todos: Arc<dyn TodoStore> = Arc::new(StubTodoStore::with_todos(vec![]));
         let verifier_runs: Arc<dyn VerifierRunStore> = Arc::new(StubVerifierRunStore::default());
         let escalation: Arc<dyn EscalationPort> = Arc::new(StubEscalationPort::default());
+        let next_actions: Arc<dyn NextActionsDeriver> =
+            Arc::new(StubNextActionsDeriver::default());
+        let billing: Arc<dyn BillingCooldownPort> = Arc::new(StubBillingCooldownPort::default());
+        let upscale: Arc<dyn ModelUpscalePort> = Arc::new(StubModelUpscalePort::default());
 
         let exec_cfg = ExecutorConfig {
             routing_provider: "stub-provider".to_string(),
@@ -534,6 +539,9 @@ mod tests {
                 meta_steps.clone(),
                 steps.clone(),
                 escalation.clone(),
+                next_actions.clone(),
+                billing.clone(),
+                upscale.clone(),
             )),
             tool_dispatch: Arc::new(ToolDispatchNode::new(
                 ToolDispatchConfig::default(),

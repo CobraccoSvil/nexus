@@ -41,8 +41,11 @@
 //!   force_tool_choice/system_text/max_tokens), [`RunControlStore`]
 //!   (is_superseded/heartbeat/set_effective_model), [`AgentStepStore`],
 //!   [`MetaStepStore`], [`EventSink`], [`EscalationPort`] (input I/O dell'auto-
-//!   escalation: catena DB + cooldown + cross-provider). Sono CAMPI del nodo
-//!   (coerente con `ToolDispatchNode`/`FinalGateNode`).
+//!   escalation: catena DB + cooldown + cross-provider), [`NextActionsDeriver`]
+//!   (derivazione scelte di proseguimento), [`BillingCooldownPort`] (lista
+//!   provider in cooldown billing per il fail-fast), [`ModelUpscalePort`] (window
+//!   modello + selezione upscale catalog). Sono CAMPI del nodo (coerente con
+//!   `ToolDispatchNode`/`FinalGateNode`).
 //!
 //! ## Ordine 1:1 (TESTA -> NUDGE -> LLM -> POST), load-bearing
 //!
@@ -114,16 +117,29 @@
 //! - `plan_rationale` injection (`:1766`): default OFF (`plan_rationale_enabled`) —
 //!   portato come iniezione pura solo quando il flag e' ON.
 //!
-//! ### (B) Rami ON/SEEDATI in produzione (NON portati, DIVERGONO al wiring, da completare in PR-J prima del cutover)
+//! ### (B) Rami ON/SEEDATI in produzione
 //!
-//! - `next_actions.derive` (`:3379-3402`) — LLM: SEMPRE attivo a end_turn (non
-//!   gated), rimuove il blocco `<suggested_actions>` dal `result` visibile.
-//! - unfulfilled-report (`:3404-3429`): in confirm mode (l'`automation_mode`
-//!   DEFAULT) sostituisce il `result` con `build_unfulfilled_report`. Non OFF.
-//! - `_billing_exhausted_providers` fail-fast (`:2072-2092`) — I/O (cooldown gate):
-//!   SEMPRE attivo, chiude con `loop_abort` se il provider e' in cooldown.
-//! - smart-upscale / model_context_window (cambio modello se contesto > window) +
-//!   summarizer/offload/continuity-trim/rolling-summary — I/O: attivi in prod.
+//! PORTATI in PR-J2 (parte DETERMINISTICA pura + I/O dietro trait):
+//!  - `next_actions.derive` (`:3379-3402`): la RIMOZIONE del blocco
+//!    `<suggested_actions>` e' pura ([`strip_suggested_actions`], SEMPRE applicata
+//!    a end_turn); la DERIVAZIONE scelte e' I/O dietro [`NextActionsDeriver`]
+//!    (best-effort) + emissione/persistenza meta_step `next_actions`.
+//!  - unfulfilled-report (`:3404-3429`): gate puro
+//!    ([`should_substitute_unfulfilled_report`]: NON autonoma + unfulfilled + NON
+//!    action-oriented) + resoconto deterministico ([`build_unfulfilled_report`]).
+//!  - `_billing_exhausted_providers` fail-fast (`:2072-2092`): DECISIONE pura
+//!    ([`billing_fail_fast_message`]: soglia esplorazione + provider esausti ->
+//!    `loop_abort`); la lista provider e' I/O dietro [`BillingCooldownPort`]
+//!    (fail-open). Posizione 1:1: PRE-LLM, prima del 2x soglia.
+//!  - smart-upscale / model_context_window (`:2812-2830`): DECISIONE pura
+//!    ([`should_upscale`] >=90% window + [`upscale_required_tokens`]); il lookup
+//!    window + la SELEZIONE catalog tier-based sono I/O dietro [`ModelUpscalePort`]
+//!    (best-effort). Posizione 1:1: PRE-token-brake, dopo la risoluzione provider.
+//!
+//! ANCORA NON portati (I/O context, DIVERGONO al wiring, da completare prima del cutover):
+//!  - summarizer / offload / continuity-trim / rolling-summary (riduzione contesto
+//!    I/O): le parti PURE sono in `context_reduction`; le parti LLM/embeddings
+//!    restano TODO -> trait dedicati.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -136,6 +152,10 @@ use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::context_reduction::{
     self as ctxr, CompressParams, CtxMgmtConfig, HistoryMessage, TokenBrakeConfig,
+};
+use crate::decisions::end_turn::{
+    billing_fail_fast_message, build_unfulfilled_report, should_substitute_unfulfilled_report,
+    should_upscale, strip_suggested_actions, upscale_required_tokens,
 };
 use crate::decisions::escalation::pick_escalation_model;
 use crate::decisions::g1_accounting::{g1_accounting, G1Signals};
@@ -156,7 +176,8 @@ use crate::routing::signals::{
     has_tool_calls_in_history, EXPLORATION_ONLY_TOOLS,
 };
 use crate::runtime::ports::{
-    AgentStepStore, EscalationPort, LlmMessage, LlmRequest, MetaStepStore, RunControlStore, SseEvent,
+    AgentStepStore, BillingCooldownPort, EscalationPort, LlmMessage, LlmRequest, MetaStepStore,
+    ModelUpscalePort, NextActionsDeriver, RunControlStore, SseEvent,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
@@ -246,6 +267,14 @@ pub struct ExecutorConfig {
     /// Cap globale di iterazioni del run (`iteration_budget`/`MAX_AGENT_ITERATIONS`):
     /// soglia forced-text = `cap - 5`.
     pub iteration_cap: i64,
+    /// `true` se lo smart-upscale e' attivo (`agent.upscale.enabled`, default ON
+    /// in produzione): promuove a un modello con window piu' grande se il contesto
+    /// stimato supera il window del modello corrente (PRIMA della chiamata LLM).
+    pub upscale_enabled: bool,
+    /// Ratio di overhead per il window richiesto all'upscale
+    /// (`agent.upscale.target_overhead_ratio`, default 1.2): `required =
+    /// est_tokens * ratio`. Il tier e la query catalog vivono nell'impl della porta.
+    pub upscale_overhead_ratio: f64,
 }
 
 impl Default for ExecutorConfig {
@@ -287,6 +316,12 @@ impl Default for ExecutorConfig {
             routing_provider: String::new(),
             routing_model: String::new(),
             iteration_cap: 60,
+            // Default safe-DB-down: upscale OFF (il wiring mcp-core passa il valore
+            // reale `agent.upscale.enabled`, ON in produzione). Coerente con la nota
+            // "rami OFF coi safe-default" sopra: con questo default lo smart-upscale
+            // non scatta (parita' col Python quando enabled=false).
+            upscale_enabled: false,
+            upscale_overhead_ratio: 1.2,
         }
     }
 }
@@ -311,16 +346,33 @@ pub struct ExecutorNode {
     /// La SELEZIONE e' del modulo puro [`pick_escalation_model`] (regola L); qui
     /// la porta fornisce solo gli input gia' risolti.
     escalation: Arc<dyn EscalationPort>,
+    /// Porta I/O della derivazione scelte di proseguimento (`next_actions`). La
+    /// RIMOZIONE deterministica del blocco `<suggested_actions>` e' del modulo puro
+    /// [`strip_suggested_actions`] (regola L); qui la porta deriva le scelte
+    /// (parse/fallback/LLM). Best-effort: errore -> nessuna scelta.
+    next_actions: Arc<dyn NextActionsDeriver>,
+    /// Porta I/O della lista provider in cooldown billing (fail-fast esplorazione).
+    /// La DECISIONE (gate soglia + messaggio) e' del modulo puro
+    /// [`billing_fail_fast_message`] (regola L). Fail-open: errore -> nessun esausto.
+    billing: Arc<dyn BillingCooldownPort>,
+    /// Porta I/O dello smart-upscale (window corrente + selezione modello target).
+    /// La DECISIONE (`should_upscale` + `required`) e' del modulo puro (regola L).
+    /// Best-effort: errore -> nessun upscale.
+    upscale: Arc<dyn ModelUpscalePort>,
 }
 
 impl ExecutorNode {
     /// Costruisce il nodo con la config DB-driven gia' risolta e le porte I/O.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: ExecutorConfig,
         run_control: Arc<dyn RunControlStore>,
         meta_steps: Arc<dyn MetaStepStore>,
         steps: Arc<dyn AgentStepStore>,
         escalation: Arc<dyn EscalationPort>,
+        next_actions: Arc<dyn NextActionsDeriver>,
+        billing: Arc<dyn BillingCooldownPort>,
+        upscale: Arc<dyn ModelUpscalePort>,
     ) -> Self {
         Self {
             cfg,
@@ -328,6 +380,9 @@ impl ExecutorNode {
             meta_steps,
             steps,
             escalation,
+            next_actions,
+            billing,
+            upscale,
         }
     }
 }
@@ -690,10 +745,45 @@ la richiesta in modo piu' specifico.",
             state.progress_diagnosed_axes.clone().unwrap_or_default().into_iter().collect();
         let progress_on = self.cfg.progress_controller_enabled;
 
-        // fail-fast billing-exhausted (py:2072-2092): I/O (cooldown gate):
-        // ON/SEEDATO in produzione (SEMPRE attivo, chiude con loop_abort se il
-        // provider e' in cooldown billing/quota) - NON portato - DIVERGE al wiring
-        // - da completare in PR-J PRIMA del cutover.
+        // ── fail-fast billing-exhausted (py:2072-2092) ────────────────────────
+        // Se l'esplorazione ha raggiunto la SOGLIA (non 2x) E i provider AI buoni
+        // sono in cooldown billing/quota, NON insistere con nudge/escalation su un
+        // modello di riserva che esplora senza concludere: la causa e' la ricarica
+        // crediti, non il modello. Chiude SUBITO col messaggio onesto (loop_abort),
+        // risparmiando i turni successivi. DECISIONE = punto unico puro
+        // [`billing_fail_fast_message`] (regola L); la LISTA dei provider esausti
+        // e' I/O dietro la porta [`BillingCooldownPort`] (fail-open). Posizione
+        // 1:1 col Python: PRIMA del controllo esplorazione a 2x soglia.
+        if exploration_count >= exploration_threshold {
+            let exhausted = self
+                .billing
+                .billing_exhausted_providers()
+                .await
+                .unwrap_or_default();
+            if let Some(ff_msg) =
+                billing_fail_fast_message(exploration_count, exploration_threshold, &exhausted)
+            {
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    count = exploration_count,
+                    esauriti = exhausted.len(),
+                    "fail-fast esplorazione: provider billing esauriti, chiusura onesta"
+                );
+                return Ok(StateDelta {
+                    messages: Some(vec![Message::Ai {
+                        content: MessageContent::text(ff_msg.clone()),
+                        tool_calls: vec![],
+                    }]),
+                    result: Some(Some(ff_msg)),
+                    pending_tool_uses: Some(Some(vec![])),
+                    stop_reason: Some(Some(StopReason::LoopAbort)),
+                    iterations: Some(Some(iters_in + 1)),
+                    consecutive_exploration_calls: Some(Some(exploration_count)),
+                    ..Default::default()
+                }
+                .into_opaque());
+            }
+        }
 
         // (6a) ESPLORAZIONE a 2x soglia -> guide/abort (py:2093-2159).
         if exploration_count >= 2 * exploration_threshold && progress_on {
@@ -1114,6 +1204,34 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             hist = ctxr::compress_old_tool_results(&hist, 6, 0, None, &ctxr::degraded_marker);
         }
 
+        // ── smart upscale modello (py:2812-2830, ADR 0016 Fase C) ─────────────
+        // Se il contesto stimato supera (>=90%) il window del modello attivo,
+        // promuove a un modello con window maggiore PRIMA del brake (cosi' il brake
+        // usa il window del modello effettivo). DECISIONE = punti unici puri
+        // [`should_upscale`] / [`upscale_required_tokens`] (regola L); il lookup
+        // window + la SELEZIONE catalog (tier-based) sono I/O dietro la porta
+        // [`ModelUpscalePort`] (best-effort, fail-open). Riassegna provider/model
+        // del turno (la risoluzione provider e' gia' avvenuta sopra). Niente switch
+        // se la porta non promuove (parita' col Python: `_upscale_result is None`).
+        let upscale_est_tokens = history_token_estimator(&hist);
+        let upscale_window = self.upscale.context_window(&model).await.unwrap_or(0);
+        if should_upscale(self.cfg.upscale_enabled, upscale_est_tokens, upscale_window) {
+            let required = upscale_required_tokens(upscale_est_tokens, self.cfg.upscale_overhead_ratio);
+            if let Ok(Some(pick)) = self.upscale.select_upscale_model(&model, required).await {
+                tracing::info!(
+                    target: "nexus_agent_graph::executor",
+                    from_model = %model,
+                    to_provider = %pick.provider,
+                    to_model = %pick.model,
+                    est = upscale_est_tokens,
+                    reason = %pick.reason,
+                    "smart upscale: promosso a modello con window maggiore"
+                );
+                provider = pick.provider;
+                model = pick.model;
+            }
+        }
+
         // Token brake (py:2836): cap hard sotto window (token_estimator puro qui).
         if self.cfg.context_window > 0 {
             hist = ctxr::apply_token_brake(
@@ -1441,8 +1559,82 @@ modo piu' specifico."
         }
 
         // ── Costruzione del delta finale (py:3457-3513) ───────────────────────
-        let final_result = loop_close_result.unwrap_or(result_text);
+        let mut final_result = loop_close_result.unwrap_or(result_text);
         let stop_reason_enum = stop_reason_from_str(stop_reason_final);
+
+        // ── POST end_turn: next_actions + unfulfilled-report (py:3379-3429) ───
+        // Entrambi i rami si applicano SOLO a turno realmente concluso (end_turn
+        // senza tool pendenti e `result` non vuoto): la risposta assistant e'
+        // completa e visibile. Mutano `final_result` (testo visibile) + il
+        // `assistant_msg` (entrambi finiscono nel delta sotto), 1:1 col Python.
+        let turn_concluded = stop_reason_enum == StopReason::EndTurn
+            && pending_tool_uses.is_empty()
+            && !final_result.trim().is_empty();
+        if turn_concluded {
+            // (1) next_actions (py:3379-3402): RIMOZIONE deterministica del blocco
+            // <suggested_actions> dal testo visibile (punto unico puro, SEMPRE
+            // applicata) + DERIVAZIONE delle scelte via porta (best-effort: errore
+            // -> nessuna scelta, ma il testo resta comunque ripulito).
+            let cleaned = strip_suggested_actions(&final_result);
+            if cleaned != final_result {
+                final_result = cleaned.clone();
+                assistant_msg = Message::Ai {
+                    content: MessageContent::text(cleaned.clone()),
+                    tool_calls: vec![],
+                };
+            }
+            // Derivazione scelte sul testo ripulito (best-effort). Il meta_step si
+            // EMETTE (live) e si PERSISTE (storico): entrambi via le porte esistenti.
+            let choices = self.next_actions.derive(&cleaned).await.unwrap_or_default();
+            if !choices.is_empty() {
+                let payload = json!({
+                    "choices": choices
+                        .iter()
+                        .map(|c| json!({"label": c.label, "prompt": c.prompt}))
+                        .collect::<Vec<_>>(),
+                });
+                let meta = json!({
+                    "kind": "next_actions",
+                    "title": "Prossimi passi",
+                    "payload": payload,
+                });
+                ctx.emit.emit(SseEvent::MetaStep {
+                    kind: "next_actions".to_string(),
+                    title: "Prossimi passi".to_string(),
+                    payload,
+                });
+                let _ = self.meta_steps.persist_meta_step(meta, mode).await;
+            }
+
+            // (2) unfulfilled-report (py:3404-3429): in modalita' NON autonoma con
+            // intento NON compiuto e turno NON action-oriented, SOSTITUISCE il
+            // result con il resoconto onesto deterministico. Gate puro
+            // [`should_substitute_unfulfilled_report`] + segnale unfulfilled dal
+            // detector LESSICALE puro sul testo GIA' ripulito (1:1 col Python
+            // :3413, che in QUESTO ramo report usa SOLO _detect_unfulfilled_intent
+            // e NON consulta closure_verdict). La distinzione col ramo G1
+            // (closure-first, py:1913-1917 mig 0422) e' LOAD-BEARING: il verdetto
+            // closure NON va consultato qui, altrimenti al cutover closure_judge
+            // il ramo report leggerebbe un verdetto (potenzialmente stale del turno
+            // precedente) che il Python ignora deliberatamente in questo punto.
+            let unfulfilled_post = detect_unfulfilled_intent(Some(final_result.as_str()));
+            if should_substitute_unfulfilled_report(
+                state.automation_mode,
+                unfulfilled_post,
+                turn_action_oriented(state.action_oriented),
+            ) {
+                let report = build_unfulfilled_report(Some(final_result.as_str()), &messages);
+                tracing::info!(
+                    target: "nexus_agent_graph::executor",
+                    "intenzione non eseguita in modalita' non-autonoma -> resoconto onesto"
+                );
+                final_result = report.clone();
+                assistant_msg = Message::Ai {
+                    content: MessageContent::text(report),
+                    tool_calls: vec![],
+                };
+            }
+        }
 
         // sticky: aggiornato solo se cascade ha fatto fallback (o gia' presente).
         let sticky_provider = if cascade_did_fallback {
@@ -1503,14 +1695,10 @@ modo piu' specifico."
         extra_out.insert("auto_escalations".to_string(), json!(escalations));
         delta.extra = Some(extra_out);
 
-        // next_actions.derive (py:3379-3402): ON/seedato in produzione (sempre
-        // attivo a end_turn, rimuove <suggested_actions> dal result visibile) -
-        // NON portato - DIVERGE al wiring - da completare in PR-J PRIMA del cutover.
-        // closure_judge.judge (py:3441-3455): genuinamente OFF di default
-        // (agent.closure_judge.active=false) -> non diverge coi default.
-        // unfulfilled-report (py:3404-3429): ON/seedato in produzione (confirm e'
-        // l'automation_mode DEFAULT: sostituisce result con build_unfulfilled_report)
-        // - NON portato - DIVERGE al wiring - da completare in PR-J PRIMA del cutover.
+        // next_actions.derive (py:3379-3402) + unfulfilled-report (py:3404-3429):
+        // PORTATI sopra (rimozione <suggested_actions> + derivazione scelte +
+        // resoconto onesto). closure_judge.judge (py:3441-3455): genuinamente OFF
+        // di default (agent.closure_judge.active=false) -> non diverge coi default.
 
         let _ = TASK_COMPLETE_TOOL_NAME; // dichiarazione done gestita nel dispatch
 

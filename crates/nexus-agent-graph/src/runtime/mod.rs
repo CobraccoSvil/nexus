@@ -10,10 +10,11 @@ pub mod ports;
 
 pub use ctx::AgentNodeCtx;
 pub use ports::{
-    AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, CriterionSpec,
-    EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway, LlmMessage, LlmRequest,
-    LlmResponse, LlmUsage, MetaStepStore, PlanRow, PortError, RunControlStore, SseEvent, TodoStore,
-    ToolCall, ToolExecutor, ToolOutcome, VerifierRunRecord, VerifierRunStore,
+    AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
+    CriterionSpec, EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway, LlmMessage,
+    LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort, NextActionChoice,
+    NextActionsDeriver, PlanRow, PortError, RunControlStore, SseEvent, TodoStore, ToolCall,
+    ToolExecutor, ToolOutcome, UpscalePick, VerifierRunRecord, VerifierRunStore,
 };
 
 #[cfg(test)]
@@ -27,10 +28,11 @@ pub mod test_doubles {
     use async_trait::async_trait;
 
     use super::ports::{
-        AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, CriterionSpec,
-        EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway, LlmRequest, LlmResponse,
-        LlmUsage, MetaStepStore, PlanRow, PortError, RunControlStore, SseEvent, ToolCall,
-        ToolExecutor, ToolOutcome, TodoStore, VerifierRunRecord, VerifierRunStore,
+        AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
+        CriterionSpec, EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway,
+        LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort, NextActionChoice,
+        NextActionsDeriver, PlanRow, PortError, RunControlStore, SseEvent, ToolCall, ToolExecutor,
+        ToolOutcome, TodoStore, UpscalePick, VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
     use crate::decisions::escalation::{ChainEntry, CrossProviderCandidate};
@@ -527,6 +529,146 @@ pub mod test_doubles {
                         model: m.clone(),
                     }),
             })
+        }
+    }
+
+    /// Deriver di test per le scelte di proseguimento (`next_actions`): ritorna
+    /// una lista fissa di [`NextActionChoice`] (default vuota = nessun meta_step) e
+    /// registra il testo ricevuto. `fail=true` esercita il ramo best-effort
+    /// (errore -> il nodo NON deve propagare: tratta come nessuna scelta, ma il
+    /// blocco e' gia' stato rimosso dal punto unico deterministico).
+    #[derive(Default)]
+    pub struct StubNextActionsDeriver {
+        /// Scelte fisse ritornate da `derive` (vuoto = nessuna).
+        pub choices: Vec<NextActionChoice>,
+        /// Se `true`, `derive` ritorna un `PortError` (test del ramo error).
+        pub fail: bool,
+        /// Testi (gia' puliti) ricevuti, in ordine.
+        pub seen: Mutex<Vec<String>>,
+    }
+
+    impl StubNextActionsDeriver {
+        /// Stub che ritorna le scelte date (label, prompt).
+        pub fn with_choices(choices: &[(&str, &str)]) -> Self {
+            Self {
+                choices: choices
+                    .iter()
+                    .map(|(l, p)| NextActionChoice {
+                        label: l.to_string(),
+                        prompt: p.to_string(),
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        /// Stub che FALLISCE sempre (per il ramo best-effort).
+        pub fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NextActionsDeriver for StubNextActionsDeriver {
+        async fn derive(
+            &self,
+            cleaned_text: &str,
+        ) -> Result<Vec<NextActionChoice>, PortError> {
+            self.seen.lock().expect("lock seen").push(cleaned_text.to_string());
+            if self.fail {
+                return Err(PortError::Llm("stub: derive fail".to_string()));
+            }
+            Ok(self.choices.clone())
+        }
+    }
+
+    /// Porta cooldown billing di test: ritorna una lista fissa di provider
+    /// esauriti (default vuota = nessun fail-fast). `fail=true` esercita il
+    /// fail-open dei chiamanti (errore -> trattato come nessun esausto).
+    #[derive(Default)]
+    pub struct StubBillingCooldownPort {
+        /// Provider in cooldown billing (gia' ordinati dal chiamante).
+        pub exhausted: Vec<String>,
+        /// Se `true`, ritorna un `PortError` (test del fail-open del chiamante).
+        pub fail: bool,
+    }
+
+    impl StubBillingCooldownPort {
+        /// Stub con i provider esauriti dati.
+        pub fn with_exhausted(providers: &[&str]) -> Self {
+            Self {
+                exhausted: providers.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BillingCooldownPort for StubBillingCooldownPort {
+        async fn billing_exhausted_providers(&self) -> Result<Vec<String>, PortError> {
+            if self.fail {
+                return Err(PortError::Llm("stub: billing snapshot fail".to_string()));
+            }
+            Ok(self.exhausted.clone())
+        }
+    }
+
+    /// Porta smart-upscale di test: window fissa per il modello corrente +
+    /// candidato di upscale fisso (default `None` = nessun upscale). Registra le
+    /// chiamate di selezione (modello corrente + required) per le asserzioni.
+    #[derive(Default)]
+    pub struct StubModelUpscalePort {
+        /// Window ritornata da `context_window` (0 = ignota -> niente upscale).
+        pub window: i64,
+        /// Candidato ritornato da `select_upscale_model` (`None` = nessuno).
+        pub pick: Option<UpscalePick>,
+        /// Chiamate di selezione registrate: (current_model, required_tokens).
+        pub selected: Mutex<Vec<(String, i64)>>,
+    }
+
+    impl StubModelUpscalePort {
+        /// Stub con una window data e un candidato di upscale `(provider, model)`.
+        pub fn promoting(window: i64, provider: &str, model: &str) -> Self {
+            Self {
+                window,
+                pick: Some(UpscalePick {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    reason: "context_overflow".to_string(),
+                }),
+                selected: Mutex::new(vec![]),
+            }
+        }
+
+        /// Stub con una window data ma NESSUN candidato (l'upscale non promuove).
+        pub fn no_pick(window: i64) -> Self {
+            Self {
+                window,
+                pick: None,
+                selected: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelUpscalePort for StubModelUpscalePort {
+        async fn context_window(&self, _model: &str) -> Result<i64, PortError> {
+            Ok(self.window)
+        }
+
+        async fn select_upscale_model(
+            &self,
+            current_model: &str,
+            required_tokens: i64,
+        ) -> Result<Option<UpscalePick>, PortError> {
+            self.selected
+                .lock()
+                .expect("lock selected")
+                .push((current_model.to_string(), required_tokens));
+            Ok(self.pick.clone())
         }
     }
 }
