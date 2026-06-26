@@ -8,6 +8,15 @@
 //!
 //! Moduli:
 //!   - [`progress_controller`]: controllo di avanzamento (anti-loop coordinato).
+//!   - [`g1_accounting`]: CONTEGGIO puro del gate G1 (re-entry/cap) dell'executor.
+//!     Solo il conteggio del contatore `g1_reroute_count`: la DECISIONE conseguente
+//!     (escalation/abort/nudge) DELEGA a [`progress_controller::decide`].
+//!   - [`tool_dispatch`]: 6 helper puri del tool_dispatch_node (run_notes, outcome,
+//!     stima dimensione tool_result, byte ritornati, stima contesto, reminder block).
+//!   - [`predictive_cap`]: guardia pura del predictive context cap + SENTINEL condivisa
+//!     (PUNTO UNICO testuale del guard "blocked-da-cap").
+//!   - [`m16`]: gate validazione tool-in-list discovery-first + parser dei tool scoperti
+//!     (raw INTEGRO, robusto al JSON troncato) + accumulo dedup per il run.
 //!   - [`dag_scheduler`]: PUNTO UNICO della logica DAG dei todo (ready layer,
 //!     decisione di parallelizzazione, selezione sequenziale `pick_next_todo`,
 //!     discendenti per il cascade-skip). Prerequisito di todo_runner e verifier.
@@ -24,15 +33,31 @@
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
 pub mod dag_scheduler;
+pub mod g1_accounting;
 pub mod helpers;
 pub mod loop_signatures;
+pub mod m16;
+pub mod predictive_cap;
 pub mod progress_controller;
 pub mod reward;
+pub mod tool_dispatch;
 pub mod turn_focus;
 
 pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,
     TodoStatus,
+};
+pub use g1_accounting::{g1_accounting, G1Accounting, G1Signals};
+pub use m16::{
+    build_m16_allowed, is_tool_allowed, merge_discovered_run, parse_discovered_tools,
+    DiscoveredTool, M16_META_TOOLS,
+};
+pub use predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
+pub use tool_dispatch::{
+    append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
+    estimate_tool_result_size_bytes, extract_returned_bytes, normalize_declared_outcome,
+    ContextMessage, MAX_CONTEXT_CHARS, MAX_TOOL_RESULT_CHARS, RUN_NOTES_MAX_CHARS,
+    TOKEN_CHARS_DIVISOR, VALID_OUTCOMES,
 };
 pub use reward::{
     aggregate_score, final_reward, heuristic_reward, prelim_reward, round_half_even,
