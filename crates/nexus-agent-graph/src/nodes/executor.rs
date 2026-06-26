@@ -21,6 +21,9 @@
 //!   [`detect_unfulfilled_intent`], [`unfulfilled_signal`],
 //!   [`has_tool_calls_in_history`], lista [`EXPLORATION_ONLY_TOOLS`].
 //! - `decisions::g1_accounting`: [`g1_accounting`] (CONTEGGIO re-entry/cap G1).
+//! - `decisions::escalation`: [`pick_escalation_model`] (SELEZIONE pura del modello
+//!   di auto-escalation, Tier 1 catena intra-provider + Tier 2 cross-provider,
+//!   cooldown-aware) — usata dal signature-loop e dal cap G1.
 //! - `decisions::progress_controller`: [`pc_decide`] (DECISIONE escalation/abort/
 //!   guide/force_diagnose) — punto unico dei nudge anti-stallo.
 //! - `decisions::helpers`: [`should_force_tool_choice`],
@@ -37,8 +40,9 @@
 //! - Trait (`runtime::ports`): [`LlmGateway`] (chiamata LLM con
 //!   force_tool_choice/system_text/max_tokens), [`RunControlStore`]
 //!   (is_superseded/heartbeat/set_effective_model), [`AgentStepStore`],
-//!   [`MetaStepStore`], [`EventSink`]. Sono CAMPI del nodo (coerente con
-//!   `ToolDispatchNode`/`FinalGateNode`).
+//!   [`MetaStepStore`], [`EventSink`], [`EscalationPort`] (input I/O dell'auto-
+//!   escalation: catena DB + cooldown + cross-provider). Sono CAMPI del nodo
+//!   (coerente con `ToolDispatchNode`/`FinalGateNode`).
 //!
 //! ## Ordine 1:1 (TESTA -> NUDGE -> LLM -> POST), load-bearing
 //!
@@ -51,6 +55,11 @@
 //!     default (`worker_mode_enabled`/`dag_parallel_enabled` false),
 //!     SubagentDispatcher = PR-J. TODO esplicito (coi flag OFF NON divergono).
 //!  5. G1 cap/reentry (`:1882-2042`): [`g1_accounting`] (conteggio) + decisione cap.
+//!     Al cap: auto-escalation orchestratore (`:1962-1993`) via [`pick_escalation_model`]
+//!     (input dalla porta [`EscalationPort`]) -> se promuove, sticky al modello
+//!     escalato + nudge "ESEGUI subito" + `g1_escalated` + reroute azzerato (NON
+//!     ri-chiama l'LLM: il self-loop rientra in executor); a escalation esaurita,
+//!     cap secco `g1_cap_reached`.
 //!  6. NUDGE pre-LLM IN ORDINE (CRITICO): esplorazione -> comando-fallito ->
 //!     repeated_action -> resource_reallocation -> G1. Replica ESATTA dell'ordine
 //!     e delle mutazioni (messaggi/tools/system_text/force_action_hard).
@@ -72,12 +81,14 @@
 //! `Message::Ai` con `assistant_content` (blocchi tool_use) coerente coi pending.
 //!
 //! POST: [`build_signature`] sui pending + [`detect_signature_loop`] (coda cap 12);
-//! auto-escalation nel signature loop (`:3159-3284`) = I/O (DB+LLM): ON/seedato in
-//! produzione (`nexus_model_escalation_chain` SEEDATA mig 0128 + `loop_fallback_
-//! default` popolato) - NON portato - DIVERGE al wiring - da completare in PR-J
-//! PRIMA del cutover. Il ramo DOMINANTE in prod e' `tried_escalation` (il modello
-//! viene PROMOSSO e il turno RI-ESEGUITO): qui invece chiudiamo SEMPRE secco con
-//! `loop_detected` (e' il ramo MINORITARIO `not tried_escalation`).
+//! auto-escalation nel signature loop (`:3159-3284`) PORTATA: alla rilevazione del
+//! loop l'orchestratore PROMUOVE il modello via [`pick_escalation_model`] (punto
+//! unico puro, input dalla porta [`EscalationPort`]) e RI-ESEGUE il turno col
+//! modello promosso (ramo DOMINANTE `tried_escalation`: `auto_escalations`+1,
+//! `provider`/`model` riassegnati, pending dalla 2a risposta, stop_reason di quella
+//! risposta — NON `loop_detected`). Solo a escalation NON disponibile (catena
+//! esaurita / provider in cooldown senza cross / `auto_escalations >= 3`) si chiude
+//! secco con `loop_detected` (ramo MINORITARIO `not tried_escalation`).
 //! [`exploration_counter_update`]; meta_step `executor_call` (EventSink +
 //! MetaStepStore gata Real); delta con iterations+1, pending, stop_reason, messages,
 //! provider_used/model_used, recent_tool_signatures, auto_escalations, ecc.
@@ -86,9 +97,12 @@
 //!
 //! Scritture gated shadow no-op in Replay: heartbeat/set_effective_model
 //! (RunControlStore), persist meta_step (MetaStepStore). La chiamata LLM in shadow
-//! segue il pattern del crate: oggi [`LlmGateway`] NON ha `ExecMode` (come per
-//! reflection/planner/clarify) — la pendenza e' documentata, il gateway concreto
-//! la gestira' (un run shadow non emette eventi: `EventSink` no-op nel ctx shadow).
+//! (sia il turno principale sia la RI-chiamata dell'auto-escalation del
+//! signature-loop) segue il pattern del crate: oggi [`LlmGateway`] NON ha
+//! `ExecMode` (come per reflection/planner/clarify) — la pendenza e' documentata,
+//! il gateway concreto la gestira' (un run shadow non emette eventi: `EventSink`
+//! no-op nel ctx shadow). La porta [`EscalationPort`] e' SOLA LETTURA (catena +
+//! cooldown + cross-provider): nessun gate `mode`.
 //!
 //! ## Cosa NON porta — DUE classi (etichettatura onesta, regola H)
 //!
@@ -102,12 +116,6 @@
 //!
 //! ### (B) Rami ON/SEEDATI in produzione (NON portati, DIVERGONO al wiring, da completare in PR-J prima del cutover)
 //!
-//! - auto-escalation intra-provider nel signature loop (`:3159-3284`) + auto-
-//!   escalation G1-cap (`:1962-1993`) — I/O (DB + LLM): la `nexus_model_escalation_
-//!   chain` e' SEEDATA (mig 0128) + `loop_fallback_default` popolato, quindi il
-//!   ramo `tried_escalation`/`g1_escalated` e' DOMINANTE in prod (modello PROMOSSO
-//!   + turno RI-ESEGUITO), NON un fallback raro. Qui chiudiamo SEMPRE secco
-//!   (`loop_detected`/cap), che e' il ramo MINORITARIO `not tried_escalation`.
 //! - `next_actions.derive` (`:3379-3402`) — LLM: SEMPRE attivo a end_turn (non
 //!   gated), rimuove il blocco `<suggested_actions>` dal `result` visibile.
 //! - unfulfilled-report (`:3404-3429`): in confirm mode (l'`automation_mode`
@@ -129,6 +137,7 @@ use nexus_graph::StateDelta as OpaqueDelta;
 use crate::decisions::context_reduction::{
     self as ctxr, CompressParams, CtxMgmtConfig, HistoryMessage, TokenBrakeConfig,
 };
+use crate::decisions::escalation::pick_escalation_model;
 use crate::decisions::g1_accounting::{g1_accounting, G1Signals};
 use crate::decisions::helpers::{
     provider_style_supports_forcing, should_force_tool_choice, turn_action_oriented,
@@ -147,7 +156,7 @@ use crate::routing::signals::{
     has_tool_calls_in_history, EXPLORATION_ONLY_TOOLS,
 };
 use crate::runtime::ports::{
-    AgentStepStore, LlmMessage, LlmRequest, MetaStepStore, RunControlStore, SseEvent,
+    AgentStepStore, EscalationPort, LlmMessage, LlmRequest, MetaStepStore, RunControlStore, SseEvent,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
@@ -298,6 +307,10 @@ pub struct ExecutorNode {
     /// persistono nel dispatch; tenuto per simmetria/uso futuro). Gata Real.
     #[allow(dead_code)]
     steps: Arc<dyn AgentStepStore>,
+    /// Porta I/O dell'auto-escalation (catena DB + cooldown + cross-provider).
+    /// La SELEZIONE e' del modulo puro [`pick_escalation_model`] (regola L); qui
+    /// la porta fornisce solo gli input gia' risolti.
+    escalation: Arc<dyn EscalationPort>,
 }
 
 impl ExecutorNode {
@@ -307,12 +320,14 @@ impl ExecutorNode {
         run_control: Arc<dyn RunControlStore>,
         meta_steps: Arc<dyn MetaStepStore>,
         steps: Arc<dyn AgentStepStore>,
+        escalation: Arc<dyn EscalationPort>,
     ) -> Self {
         Self {
             cfg,
             run_control,
             meta_steps,
             steps,
+            escalation,
         }
     }
 }
@@ -557,13 +572,82 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // G1 cap tramite il punto unico [`head_gate`] (regola L): qui superseded/
         // declared-done sono gia' esclusi (gestiti in testa), conta solo il cap.
         if matches!(head_gate(false, false, 0, g1.cap_reached), HeadGate::G1Cap) {
-            // ESCALATION orchestratore (py:1962-1993): I/O (DB catena + LLM):
-            // ON/SEEDATO in produzione (nexus_model_escalation_chain mig 0128 +
-            // loop_fallback_default) - NON portato - DIVERGE al wiring - da
-            // completare in PR-J PRIMA del cutover. Il ramo `g1_escalated` (modello
-            // PROMOSSO + turno RI-ESEGUITO) e' DOMINANTE in prod; qui cadiamo SEMPRE
-            // al cap secco G1, che e' il ramo MINORITARIO `not _g1_picked`.
-            // PR-J escalation: _pick_escalation_model (intra-provider chain).
+            // ESCALATION orchestratore (py:1962-1993): prima di arrenderci, l'
+            // orchestratore PROMUOVE il turno a un modello piu' capace (catena DB
+            // intra-provider + cross-provider loop_fallback_default), azzerando il
+            // contatore reroute cosi' il nuovo modello ha il suo budget. La
+            // SELEZIONE e' il punto unico puro [`pick_escalation_model`] (regola L);
+            // gli input (catena/cooldown/cross) arrivano dalla porta. Solo a catena
+            // ESAURITA (o auto_escalations >= 3) chiudiamo davvero al cap secco
+            // (ramo `not _g1_picked`).
+            let g1_cur_provider = state
+                .provider_used
+                .clone()
+                .or_else(|| state.sticky_provider.clone())
+                .or_else(|| state.provider_override.clone());
+            let g1_cur_model = state
+                .model_used
+                .clone()
+                .or_else(|| state.sticky_model.clone())
+                .or_else(|| state.model_override.clone());
+            let g1_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+            // `_g1_picked = _pick(...) if _g1_escal < 3 else None` (py:1962-1966).
+            let g1_picked = if g1_escal < 3 {
+                let inputs = self
+                    .escalation
+                    .escalation_inputs(
+                        state.user_intent.as_deref(),
+                        g1_cur_provider.as_deref(),
+                        g1_cur_model.as_deref(),
+                    )
+                    .await
+                    .unwrap_or_default();
+                pick_escalation_model(
+                    &inputs.chain,
+                    g1_cur_provider.as_deref(),
+                    g1_cur_model.as_deref(),
+                    g1_escal,
+                    inputs.provider_in_cooldown,
+                    inputs.cross_provider.as_ref(),
+                )
+            } else {
+                None
+            };
+            if let Some(pick) = g1_picked {
+                // Escalation orchestratore: sticky al modello promosso, reroute
+                // azzerato, nudge "ESEGUI subito" (py:1967-1993). Il SELF-LOOP del
+                // grafo rientra in executor che usera' lo sticky (NON ri-chiamiamo
+                // l'LLM qui, parita' col return immediato del Python).
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    reroute = g1_reroute_count,
+                    from_provider = g1_cur_provider.as_deref().unwrap_or(""),
+                    to_provider = %pick.provider,
+                    to_model = %pick.model,
+                    "G1 cap, ESCALATION orchestratore -> azzero reroute e ri-do il turno"
+                );
+                let esc_nudge = human_msg(
+                    "Il modello precedente ha solo descritto le azioni senza eseguirle \
+dopo i tentativi previsti. Ora rispondi tu, che sei un modello piu' capace: NON \
+descrivere, ESEGUI subito il prossimo step concreto con un tool call.",
+                );
+                let mut extra_out = state.extra.clone();
+                extra_out.insert("auto_escalations".to_string(), json!(g1_escal + 1));
+                return Ok(StateDelta {
+                    messages: Some(vec![esc_nudge]),
+                    sticky_provider: Some(Some(pick.provider)),
+                    sticky_model: Some(Some(pick.model)),
+                    g1_reroute_count: Some(Some(0)),
+                    action_nudge_count: Some(Some(0)),
+                    pending_tool_uses: Some(Some(vec![])),
+                    stop_reason: Some(Some(StopReason::G1Escalated)),
+                    iterations: Some(Some(iters_in + 1)),
+                    extra: Some(extra_out),
+                    ..Default::default()
+                }
+                .into_opaque());
+            }
+            // Catena esaurita / auto_escalations >= 3: cap secco G1 (py:1994-2003).
             let cap_text = format!(
                 "Modello non risponde con azione dopo {} tentativi e anche i modelli \
 piu' capaci provati in escalation non hanno agito. Fermo l'esecuzione: riformula \
@@ -573,7 +657,8 @@ la richiesta in modo piu' specifico.",
             tracing::warn!(
                 target: "nexus_agent_graph::executor",
                 reroute = g1_reroute_count,
-                "G1 cap raggiunto, interrompo (escalation = TODO PR-J)"
+                auto_escalations = g1_escal,
+                "G1 cap raggiunto e catena escalation esaurita, interrompo"
             );
             return Ok(StateDelta {
                 messages: Some(vec![Message::Ai {
@@ -898,8 +983,10 @@ tool/le richieste a quella porta, senza allocarne di nuove."
         }
 
         // ── Risoluzione provider/model: sticky > override > routing (py:2460-2521) ─
-        let provider;
-        let model;
+        // Mutabili: l'auto-escalation nel signature-loop (py:3262-3263) li riassegna
+        // al modello promosso prima del calcolo eff/sticky del delta finale.
+        let mut provider;
+        let mut model;
         match self.resolve_provider(state) {
             ProviderResolution::Resolved(p, m) => {
                 provider = p;
@@ -1151,7 +1238,9 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             let retry = LlmRequest {
                 provider: provider.clone(),
                 model: model.clone(),
-                messages: llm_messages,
+                // clone: `llm_messages` serve anche all'eventuale ri-chiamata di
+                // auto-escalation del signature-loop (sotto).
+                messages: llm_messages.clone(),
                 tools: if tools_json.is_empty() { None } else { Some(tools_json.clone()) },
                 force_tool_choice: Some(false),
                 system_text: Some(system_text.clone()),
@@ -1165,21 +1254,13 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             }
         }
 
-        // Provider/model EFFETTIVI (il gateway puo' aver fatto cascade interno):
-        // se riportati, sono la fonte di verita' per telemetria/sticky.
-        let eff_provider = resp.provider_used.clone().unwrap_or_else(|| provider.clone());
-        let eff_model = resp.model_used.clone().unwrap_or_else(|| model.clone());
-        let cascade_did_fallback = eff_provider != provider || eff_model != model;
-        if cascade_did_fallback {
-            // set_effective_model best-effort (gata Real) — modello reale in UI.
-            let _ = self
-                .run_control
-                .set_effective_model(&run_id, &eff_provider, &eff_model, mode)
-                .await;
-        }
+        // NB: il calcolo dei provider/model EFFETTIVI (cascade) + set_effective_model
+        // e' RIMANDATO a DOPO l'auto-escalation del signature-loop (py:3457+): se il
+        // loop scala il modello, `provider`/`model` vengono riassegnati e il calcolo
+        // eff/cascade deve vedere il NUOVO modello.
 
-        let result_text = resp.content.clone();
-        let stop_reason_str_resp = resp.stop_reason.clone();
+        let mut result_text = resp.content.clone();
+        let mut stop_reason_str_resp = resp.stop_reason.clone();
         // pending_tool_uses = i blocchi tool_use della risposta (forma Value).
         let mut pending_tool_uses: Vec<Value> = resp
             .tool_calls
@@ -1205,7 +1286,9 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             .collect();
         let recent: Vec<String> = state.recent_tool_signatures.clone().unwrap_or_default();
         let det = detect_signature_loop(&recent, &new_signatures);
-        let mut stop_reason_final = stop_reason_str_resp.as_deref();
+        // `escalations` (auto_escalations) cresce di 1 quando il loop scala il
+        // modello (py:3284); resta invariato altrimenti. Tracciato per il delta.
+        let mut escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
         let mut loop_close_result: Option<String> = None;
         if let Some(loop_sig) = &det.loop_signature {
             let tool_name = loop_sig.split_once('|').map(|(t, _)| t).unwrap_or(loop_sig);
@@ -1214,27 +1297,122 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                 tool = tool_name,
                 "LOOP detected per signature ripetuta"
             );
-            // Auto-escalation intra-provider (py:3159-3284) = I/O (DB chain + LLM):
-            // ON/SEEDATO in produzione (nexus_model_escalation_chain mig 0128 +
-            // loop_fallback_default popolato) - NON portato - DIVERGE al wiring -
-            // da completare in PR-J PRIMA del cutover. Il ramo DOMINANTE in prod e'
-            // `tried_escalation` (modello PROMOSSO + turno RI-ESEGUITO); qui
-            // chiudiamo SEMPRE secco con loop_detected, che e' il ramo MINORITARIO
-            // `not tried_escalation`. (NON e' "parita' col ramo not tried_escalation".)
-            let loop_msg = format!(
-                "[LOOP RILEVATO] Il modello {provider}/{model} ha ripetuto il tool '{tool_name}' \
+            // Auto-escalation intra-provider (py:3159-3284): al primo loop l'
+            // orchestratore PROMUOVE automaticamente un modello piu' capace (catena
+            // DB + cross-provider loop_fallback_default, cooldown-aware) e RI-ESEGUE
+            // lo stesso turno. SELEZIONE = punto unico puro [`pick_escalation_model`]
+            // (regola L); gli input arrivano dalla porta. Cap `escalations < 3`
+            // (py:3166). Solo a escalation NON disponibile chiudiamo secco
+            // loop_detected (ramo `not tried_escalation`).
+            let mut tried_escalation = false;
+            if escalations < 3 && !tools_json.is_empty() {
+                let inputs = self
+                    .escalation
+                    .escalation_inputs(state.user_intent.as_deref(), Some(&provider), Some(&model))
+                    .await
+                    .unwrap_or_default();
+                if let Some(pick) = pick_escalation_model(
+                    &inputs.chain,
+                    Some(&provider),
+                    Some(&model),
+                    escalations,
+                    inputs.provider_in_cooldown,
+                    inputs.cross_provider.as_ref(),
+                ) {
+                    // Hint anti-loop nel system_text (py:3227-3234): chiede di NON
+                    // ripetere la stessa tool call.
+                    let anti_loop_hint = format!(
+                        "\n\n[ANTI-LOOP] Hai appena ripetuto la stessa tool call ('{tool_name}' \
+con stesso input) piu' volte. Non ripetere la stessa tool call con lo stesso input. \
+Se mancano informazioni, fai UNA richiesta piu' specifica oppure cambia strategia e \
+riassumi lo stato."
+                    );
+                    let system_text2 = format!("{system_text}{anti_loop_hint}");
+                    tracing::info!(
+                        target: "nexus_agent_graph::executor",
+                        from_provider = %provider,
+                        to_provider = %pick.provider,
+                        to_model = %pick.model,
+                        from_chain = pick.from_chain,
+                        "LOOP -> auto-escalation, ri-eseguo il turno col modello promosso"
+                    );
+                    // Ri-esegue lo STESSO turno col provider/model promosso
+                    // (py:3241-3248). Trasporto unico (regola L): passa dal gateway
+                    // come gli altri agent turn.
+                    let esc_req = LlmRequest {
+                        provider: pick.provider.clone(),
+                        model: pick.model.clone(),
+                        messages: llm_messages.clone(),
+                        tools: if tools_json.is_empty() {
+                            None
+                        } else {
+                            Some(tools_json.clone())
+                        },
+                        // Parita' col Python (py:3241-3248): la ri-chiamata escalata
+                        // NON passa `force_tool_choice` -> default `None` -> `auto`.
+                        // La primaria mantiene `force_tc`; qui forzare il tool
+                        // contraddirebbe l'`anti_loop_hint` ("cambia strategia,
+                        // riassumi lo stato"), che ammette anche risposta testuale.
+                        force_tool_choice: None,
+                        system_text: Some(system_text2),
+                        max_tokens: Some(max_tokens),
+                        run_id: if run_id.is_empty() { None } else { Some(run_id.clone()) },
+                        iteration: Some(iters_in),
+                        intent: state.user_intent.clone(),
+                    };
+                    // Best-effort: se la ri-chiamata fallisce, NON promuoviamo
+                    // (parita' con l'except Python py:3266-3267 -> not tried_escalation).
+                    if let Ok(resp2) = ctx.llm.complete(esc_req).await {
+                        resp = resp2;
+                        result_text = resp.content.clone();
+                        stop_reason_str_resp = resp.stop_reason.clone();
+                        pending_tool_uses = resp
+                            .tool_calls
+                            .iter()
+                            .map(|t| json!({"type": "tool_use", "id": t.id, "name": t.name, "input": t.input}))
+                            .collect();
+                        assistant_msg = build_assistant_message(&resp, &result_text);
+                        provider = pick.provider;
+                        model = pick.model;
+                        new_signatures = vec![]; // reset accumulator dopo escalation (py:3265)
+                        tried_escalation = true;
+                    }
+                }
+            }
+            if tried_escalation {
+                escalations += 1; // py:3284
+            } else {
+                // Catena esaurita / tutti in cooldown / ri-chiamata fallita: chiude
+                // secco con loop_detected (py:3269-3281).
+                let loop_msg = format!(
+                    "[LOOP RILEVATO] Il modello {provider}/{model} ha ripetuto il tool '{tool_name}' \
 con stesso input 3+ volte senza progresso. Esecuzione interrotta per evitare stallo. \
 Suggerimento: usa un modello piu' capace (es. anthropic/claude) o riformula il prompt in \
 modo piu' specifico."
-            );
-            assistant_msg = Message::Ai {
-                content: MessageContent::text(loop_msg.clone()),
-                tool_calls: vec![],
-            };
-            pending_tool_uses = vec![];
-            stop_reason_final = Some("loop_detected");
-            loop_close_result = Some(loop_msg);
-            new_signatures = vec![]; // reset accumulator (py:3281)
+                );
+                assistant_msg = Message::Ai {
+                    content: MessageContent::text(loop_msg.clone()),
+                    tool_calls: vec![],
+                };
+                pending_tool_uses = vec![];
+                stop_reason_str_resp = Some("loop_detected".to_string());
+                loop_close_result = Some(loop_msg);
+                new_signatures = vec![]; // reset accumulator (py:3281)
+            }
+        }
+        let stop_reason_final = stop_reason_str_resp.as_deref();
+
+        // Provider/model EFFETTIVI (cascade interno del gateway), calcolati DOPO l'
+        // eventuale escalation cosi' il confronto e' col NUOVO modello promosso
+        // (py:3457+). set_effective_model best-effort (gata Real) -> modello reale UI.
+        let eff_provider = resp.provider_used.clone().unwrap_or_else(|| provider.clone());
+        let eff_model = resp.model_used.clone().unwrap_or_else(|| model.clone());
+        let cascade_did_fallback = eff_provider != provider || eff_model != model;
+        if cascade_did_fallback {
+            let _ = self
+                .run_control
+                .set_effective_model(&run_id, &eff_provider, &eff_model, mode)
+                .await;
         }
         // Coda aggiornata cap 12: con loop chiuso new_signatures e' [] -> recent only.
         let updated_signatures = detect_signature_loop(&recent, &new_signatures).updated_signatures;
@@ -1314,21 +1492,15 @@ modo piu' specifico."
 
         // auto_escalations nel delta (py:3475) — campo non tipizzato, vive in
         // `extra`. Valore Python: `escalations if loop_sig is not None else
-        // int(state.get("auto_escalations") or 0)`. L'auto-escalation
-        // intra-provider (py:3159-3284) e' I/O (DB chain + LLM) ancora ON/SEEDATA
-        // in produzione (nexus_model_escalation_chain mig 0128) ma NON portata:
-        // qui il ramo loop chiude sempre senza promuovere (escalations invariato),
-        // quindi il valore e' SEMPRE quello dello stato (invariato). Il campo va
-        // EMESSO comunque per coerenza col consumer. `extra` e' overwrite secco
-        // (regola di wrapping delta.rs): preserviamo l'INTERA mappa extra dello
-        // stato e impostiamo solo questa chiave per non azzerare gli altri campi
-        // runtime (project_id, iteration_budget, ...). DIVERGE al wiring PR-J:
-        // col vero ramo escalation `auto_escalations` cresce e il turno e'
-        // ri-eseguito (vedi FIX 2).
-        let auto_escalations =
-            state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+        // int(state.get("auto_escalations") or 0)`. La variabile `escalations`
+        // qui e' GIA' incrementata se il signature-loop ha promosso il modello
+        // (ramo `tried_escalation`), e invariata altrimenti: coincide con il valore
+        // Python in entrambi i rami. `extra` e' overwrite secco (regola di wrapping
+        // delta.rs): preserviamo l'INTERA mappa extra dello stato e impostiamo solo
+        // questa chiave per non azzerare gli altri campi runtime (project_id,
+        // iteration_budget, ...).
         let mut extra_out = state.extra.clone();
-        extra_out.insert("auto_escalations".to_string(), json!(auto_escalations));
+        extra_out.insert("auto_escalations".to_string(), json!(escalations));
         delta.extra = Some(extra_out);
 
         // next_actions.derive (py:3379-3402): ON/seedato in produzione (sempre

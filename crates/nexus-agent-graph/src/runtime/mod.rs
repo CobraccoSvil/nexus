@@ -10,10 +10,10 @@ pub mod ports;
 
 pub use ctx::AgentNodeCtx;
 pub use ports::{
-    AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, CriterionSpec, EventSink,
-    ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, PlanRow,
-    PortError, RunControlStore, SseEvent, TodoStore, ToolCall, ToolExecutor, ToolOutcome,
-    VerifierRunRecord, VerifierRunStore,
+    AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, CriterionSpec,
+    EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway, LlmMessage, LlmRequest,
+    LlmResponse, LlmUsage, MetaStepStore, PlanRow, PortError, RunControlStore, SseEvent, TodoStore,
+    ToolCall, ToolExecutor, ToolOutcome, VerifierRunRecord, VerifierRunStore,
 };
 
 #[cfg(test)]
@@ -27,12 +27,13 @@ pub mod test_doubles {
     use async_trait::async_trait;
 
     use super::ports::{
-        AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, CriterionSpec, EventSink,
-        ExecMode, LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, PlanRow, PortError,
-        RunControlStore, SseEvent, ToolCall, ToolExecutor, ToolOutcome, TodoStore,
-        VerifierRunRecord, VerifierRunStore,
+        AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, CriterionSpec,
+        EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway, LlmRequest, LlmResponse,
+        LlmUsage, MetaStepStore, PlanRow, PortError, RunControlStore, SseEvent, ToolCall,
+        ToolExecutor, ToolOutcome, TodoStore, VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
+    use crate::decisions::escalation::{ChainEntry, CrossProviderCandidate};
 
     /// Gateway LLM di test: ritorna una `LlmResponse` fissa e registra le
     /// richieste ricevute (per asserzioni sull'input passato dal nodo).
@@ -453,6 +454,79 @@ pub mod test_doubles {
             g.push(payload);
             // Pointer fittizio deterministico (indice progressivo).
             Ok(format!("stub-rag-pointer-{}", g.len() - 1))
+        }
+    }
+
+    /// Porta escalation di test: ritorna `EscalationInputs` fissi (catena +
+    /// cooldown + cross-provider configurabili) e registra le chiamate. Il
+    /// default (campi vuoti) fa risolvere la selezione a `None` -> chiusura secca,
+    /// cosi' i test che NON vogliono escalation usano `default()`.
+    #[derive(Default)]
+    pub struct StubEscalationPort {
+        /// Modelli della catena intra-provider (in ordine di posizione).
+        pub chain: Vec<String>,
+        /// `true` se il provider corrente e' in cooldown (salta Tier 1).
+        pub provider_in_cooldown: bool,
+        /// Candidato cross-provider `(provider, model)`, o `None`.
+        pub cross_provider: Option<(String, String)>,
+        /// Se `true`, `escalation_inputs` ritorna un `PortError` (per i test del
+        /// mapping fail-open dei chiamanti).
+        pub fail: bool,
+        /// Chiamate registrate: (intent, provider, model).
+        pub seen: Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>,
+    }
+
+    impl StubEscalationPort {
+        /// Stub con una catena intra-provider data (nessun cooldown, nessun cross).
+        pub fn with_chain(models: &[&str]) -> Self {
+            Self {
+                chain: models.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            }
+        }
+
+        /// Stub con SOLO un candidato cross-provider (catena vuota).
+        pub fn with_cross(provider: &str, model: &str) -> Self {
+            Self {
+                cross_provider: Some((provider.to_string(), model.to_string())),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EscalationPort for StubEscalationPort {
+        async fn escalation_inputs(
+            &self,
+            intent: Option<&str>,
+            provider: Option<&str>,
+            model: Option<&str>,
+        ) -> Result<EscalationInputs, PortError> {
+            self.seen.lock().expect("lock seen").push((
+                intent.map(str::to_string),
+                provider.map(str::to_string),
+                model.map(str::to_string),
+            ));
+            if self.fail {
+                return Err(PortError::Llm("stub: escalation_inputs fail".to_string()));
+            }
+            Ok(EscalationInputs {
+                chain: self
+                    .chain
+                    .iter()
+                    .map(|m| ChainEntry {
+                        escalation_model: m.clone(),
+                    })
+                    .collect(),
+                provider_in_cooldown: self.provider_in_cooldown,
+                cross_provider: self
+                    .cross_provider
+                    .as_ref()
+                    .map(|(p, m)| CrossProviderCandidate {
+                        provider: p.clone(),
+                        model: m.clone(),
+                    }),
+            })
         }
     }
 }

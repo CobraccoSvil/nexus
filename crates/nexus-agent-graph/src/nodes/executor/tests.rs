@@ -16,8 +16,8 @@ use super::*;
 use crate::routing::config::RoutingConfig;
 use crate::runtime::ports::{LlmResponse, LlmUsage};
 use crate::runtime::test_doubles::{
-    NullEventSink, StubAgentStepStore, StubLlmGateway, StubMetaStepStore, StubRunControlStore,
-    StubToolExecutor,
+    NullEventSink, StubAgentStepStore, StubEscalationPort, StubLlmGateway, StubMetaStepStore,
+    StubRunControlStore, StubToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{ContentBlock, MessageContent, ToolUse};
@@ -58,6 +58,8 @@ fn ctx_with(llm: Arc<dyn crate::runtime::ports::LlmGateway>, shadow: bool) -> Ag
 }
 
 /// Nodo con porte stub configurabili; ritorna anche gli store per le asserzioni.
+/// Escalation disabilitata di default (porta vuota -> selezione `None` -> chiusura
+/// secca come prima): i test che vogliono l'escalation usano [`node_esc`].
 fn node(
     cfg: ExecutorConfig,
     rc: Arc<StubRunControlStore>,
@@ -66,9 +68,22 @@ fn node(
     Arc<StubMetaStepStore>,
     Arc<StubAgentStepStore>,
 ) {
+    node_esc(cfg, rc, Arc::new(StubEscalationPort::default()))
+}
+
+/// Come [`node`] ma con una porta escalation configurabile (catena/cross/cooldown).
+fn node_esc(
+    cfg: ExecutorConfig,
+    rc: Arc<StubRunControlStore>,
+    esc: Arc<StubEscalationPort>,
+) -> (
+    ExecutorNode,
+    Arc<StubMetaStepStore>,
+    Arc<StubAgentStepStore>,
+) {
     let meta = Arc::new(StubMetaStepStore::default());
     let steps = Arc::new(StubAgentStepStore::default());
-    let n = ExecutorNode::new(cfg, rc, meta.clone(), steps.clone());
+    let n = ExecutorNode::new(cfg, rc, meta.clone(), steps.clone(), esc);
     (n, meta, steps)
 }
 
@@ -523,6 +538,285 @@ async fn errore_gateway_persiste_contatori() {
     assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(0));
     // UNA sola chiamata LLM: nessun retry-senza-forcing sul ramo error gateway.
     assert_eq!(llm.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn signature_loop_escalation_riesegue() {
+    // Signature-loop CON escalation disponibile: la catena intra-provider promuove
+    // il modello e RI-ESEGUE il turno. La 2a risposta (testuale end_turn) sostituisce
+    // i pending -> NON loop_detected, auto_escalations 0->1, provider_used = promosso.
+    struct TwoPhaseLlm {
+        same_input: Value,
+        calls: std::sync::Mutex<Vec<crate::runtime::ports::LlmRequest>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::runtime::ports::LlmGateway for TwoPhaseLlm {
+        async fn complete(
+            &self,
+            req: crate::runtime::ports::LlmRequest,
+        ) -> Result<LlmResponse, crate::runtime::ports::PortError> {
+            let n = {
+                let mut g = self.calls.lock().unwrap();
+                g.push(req.clone());
+                g.len()
+            };
+            if n == 1 {
+                // Turno primario: ripete lo stesso tool -> loop.
+                Ok(LlmResponse {
+                    tool_calls: vec![ToolUse {
+                        id: "tc1".into(),
+                        name: "read_file".into(),
+                        input: self.same_input.clone(),
+                    }],
+                    stop_reason: Some("tool_use".into()),
+                    ..Default::default()
+                })
+            } else {
+                // Turno escalato (modello promosso): chiude con testo.
+                Ok(LlmResponse {
+                    content: "Risolto col modello promosso.".into(),
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+    let rc = Arc::new(StubRunControlStore::default());
+    // Catena intra-provider: anthropic/claude-x -> claude-piu-capace.
+    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let same_input = json!({"path": "x"});
+    let sig = build_signature("read_file", &same_input);
+    let llm = Arc::new(TwoPhaseLlm {
+        same_input: same_input.clone(),
+        calls: std::sync::Mutex::new(vec![]),
+    });
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("leggi")],
+        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Due chiamate LLM: primaria (loop) + escalata.
+    assert_eq!(llm.calls.lock().unwrap().len(), 2);
+    // NON loop_detected: la 2a risposta chiude end_turn.
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.result.as_deref(), Some("Risolto col modello promosso."));
+    assert!(out.pending_tool_uses.unwrap().is_empty());
+    // auto_escalations incrementato.
+    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    // provider/model promossi nel delta (provider_used = richiesto escalato).
+    assert_eq!(out.provider_used.as_deref(), Some("anthropic"));
+    assert_eq!(out.model_used.as_deref(), Some("claude-piu-capace"));
+    // La porta escalation e' stata interrogata col modello corrente.
+    let seen = esc.seen.lock().unwrap();
+    assert_eq!(seen.last().unwrap().2.as_deref(), Some("claude-x"));
+}
+
+#[tokio::test]
+async fn signature_loop_escalation_non_forza_tool_choice() {
+    // Parita' col Python (py:3241-3248): nel ramo signature-loop la ri-chiamata
+    // LLM escalata NON deve ereditare il `force_tool_choice` della PRIMARIA. Se la
+    // primaria forza il tool (`Some(true)`, frequente proprio nei loop perche'
+    // should_force_tool_choice scatta su action_oriented + tools + iter bassa),
+    // l'escalata deve passare `None` (-> `auto`): forzare il tool contraddirebbe
+    // l'anti_loop_hint ("cambia strategia, riassumi lo stato"), che ammette anche
+    // una risposta testuale.
+    struct TwoPhaseLlm {
+        same_input: Value,
+        calls: std::sync::Mutex<Vec<crate::runtime::ports::LlmRequest>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::runtime::ports::LlmGateway for TwoPhaseLlm {
+        async fn complete(
+            &self,
+            req: crate::runtime::ports::LlmRequest,
+        ) -> Result<LlmResponse, crate::runtime::ports::PortError> {
+            let n = {
+                let mut g = self.calls.lock().unwrap();
+                g.push(req.clone());
+                g.len()
+            };
+            if n == 1 {
+                // Turno primario: ripete lo stesso tool -> loop.
+                Ok(LlmResponse {
+                    tool_calls: vec![ToolUse {
+                        id: "tc1".into(),
+                        name: "read_file".into(),
+                        input: self.same_input.clone(),
+                    }],
+                    stop_reason: Some("tool_use".into()),
+                    ..Default::default()
+                })
+            } else {
+                // Turno escalato: chiude con testo (l'hint permette la risposta).
+                Ok(LlmResponse {
+                    content: "Stato riassunto, cambio strategia.".into(),
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+    let rc = Arc::new(StubRunControlStore::default());
+    // Forcing attivo sulla PRIMARIA: enabled + stile che supporta il forcing.
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        progress_controller_enabled: true,
+        tool_choice_forcing_enabled: true,
+        tool_choice_style: Some("anthropic_any".to_string()),
+        ..ExecutorConfig::default()
+    };
+    // Catena intra-provider disponibile -> l'escalation parte.
+    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
+    let (n, _m, _s) = node_esc(cfg, rc, esc);
+    let same_input = json!({"path": "x"});
+    let sig = build_signature("read_file", &same_input);
+    let llm = Arc::new(TwoPhaseLlm {
+        same_input: same_input.clone(),
+        calls: std::sync::Mutex::new(vec![]),
+    });
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("leggi")],
+        // action_oriented + iter bassa -> should_force_tool_choice scatta sulla 1a.
+        action_oriented: Some(true),
+        iterations: Some(0),
+        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let _ = n.run(&state, &ctx).await.expect("run");
+    let calls = llm.calls.lock().unwrap();
+    // Due chiamate: primaria (loop) + escalata.
+    assert_eq!(calls.len(), 2);
+    // La PRIMARIA forza il tool (action_oriented + tools + iter<=max + stile ok).
+    assert_eq!(calls[0].force_tool_choice, Some(true));
+    // L'ESCALATA NON eredita il forcing: passa None (parita' col Python).
+    assert_eq!(calls[1].force_tool_choice, None);
+}
+
+#[tokio::test]
+async fn signature_loop_senza_escalation_chiude_secco() {
+    // Signature-loop SENZA escalation (porta vuota -> selezione None): chiude secco
+    // loop_detected, NON ri-esegue, auto_escalations invariato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota (default)
+    let same_input = json!({"path": "x"});
+    let sig = build_signature("read_file", &same_input);
+    let llm = llm_tool_call("read_file", same_input.clone());
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("leggi")],
+        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // UNA sola chiamata LLM (nessuna ri-esecuzione).
+    assert_eq!(llm.seen.lock().unwrap().len(), 1);
+    assert_eq!(out.stop_reason, Some(StopReason::LoopDetected));
+    assert!(out.result.as_deref().unwrap().contains("[LOOP RILEVATO]"));
+    assert!(out.pending_tool_uses.unwrap().is_empty());
+    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(0));
+}
+
+#[tokio::test]
+async fn signature_loop_cap_escalations_chiude_secco() {
+    // Anche con catena disponibile, se auto_escalations >= 3 il cap impedisce
+    // l'escalation -> chiude secco loop_detected.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc);
+    let same_input = json!({"path": "x"});
+    let sig = build_signature("read_file", &same_input);
+    let llm = llm_tool_call("read_file", same_input.clone());
+    let ctx = ctx_with(llm.clone(), false);
+    let mut extra = serde_json::Map::new();
+    extra.insert("auto_escalations".into(), json!(3));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("leggi")],
+        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(llm.seen.lock().unwrap().len(), 1);
+    assert_eq!(out.stop_reason, Some(StopReason::LoopDetected));
+    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(3));
+}
+
+#[tokio::test]
+async fn g1_cap_escalation_promuove_sticky() {
+    // G1 cap CON escalation disponibile (cross-provider): NON chiude secco; scrive
+    // sticky al modello promosso, g1_escalated, auto_escalations+1, reroute=0, e un
+    // nudge "ESEGUI subito". L'LLM NON viene chiamato (self-loop rientra).
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_cross("google", "gemini-2.5-pro"));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    // Re-entry G1: current_count 2 + 1 = 3 = cap. provider_used corrente noto.
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("avvia il servizio")],
+        action_oriented: Some(true),
+        stop_reason: Some(StopReason::EndTurn),
+        iterations: Some(4),
+        g1_reroute_count: Some(2),
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-x".into()),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_provider.as_deref(), Some("google"));
+    assert_eq!(out.sticky_model.as_deref(), Some("gemini-2.5-pro"));
+    assert_eq!(out.g1_reroute_count, Some(0));
+    assert_eq!(out.action_nudge_count, Some(0));
+    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    // LLM NON chiamato (escalation G1 = sticky + nudge, niente turno).
+    assert!(llm.seen.lock().unwrap().is_empty());
+    // La porta e' stata interrogata col modello corrente (provider_used).
+    assert_eq!(esc.seen.lock().unwrap().last().unwrap().1.as_deref(), Some("anthropic"));
+}
+
+#[tokio::test]
+async fn g1_cap_senza_escalation_chiude_secco() {
+    // G1 cap SENZA escalation (porta vuota): cap secco g1_cap_reached come prima.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // porta vuota
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("avvia il servizio")],
+        action_oriented: Some(true),
+        stop_reason: Some(StopReason::EndTurn),
+        iterations: Some(4),
+        g1_reroute_count: Some(2),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1CapReached));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    assert_eq!(out.g1_reroute_count, Some(3));
+    assert!(llm.seen.lock().unwrap().is_empty());
 }
 
 /// Golden di parita' 1:1 vs Python per la LOGICA DETERMINISTICA del singolo turno

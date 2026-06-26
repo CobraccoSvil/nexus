@@ -310,13 +310,14 @@ mod tests {
         UnderstandingConfig, UnderstandingNode, VerifierConfig, VerifierNode,
     };
     use crate::runtime::ports::{
-        AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, ExecMode, LlmGateway,
-        LlmRequest, LlmResponse, LlmUsage, MetaStepStore, PortError, RunControlStore, TodoStore,
-        ToolCall, ToolExecutor, ToolOutcome, VerifierRunStore,
+        AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, EscalationPort, ExecMode,
+        LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, PortError, RunControlStore,
+        TodoStore, ToolCall, ToolExecutor, ToolOutcome, VerifierRunStore,
     };
     use crate::runtime::test_doubles::{
         NullEventSink, StubAgentStepStore, StubContextOffload, StubCriteriaRunner,
-        StubMetaStepStore, StubRunControlStore, StubTodoStore, StubVerifierRunStore,
+        StubEscalationPort, StubMetaStepStore, StubRunControlStore, StubTodoStore,
+        StubVerifierRunStore,
     };
     use crate::state::{Message, MessageContent, StopReason, ToolUse};
 
@@ -502,6 +503,7 @@ mod tests {
         let offload: Arc<dyn ContextOffload> = Arc::new(StubContextOffload::default());
         let todos: Arc<dyn TodoStore> = Arc::new(StubTodoStore::with_todos(vec![]));
         let verifier_runs: Arc<dyn VerifierRunStore> = Arc::new(StubVerifierRunStore::default());
+        let escalation: Arc<dyn EscalationPort> = Arc::new(StubEscalationPort::default());
 
         let exec_cfg = ExecutorConfig {
             routing_provider: "stub-provider".to_string(),
@@ -531,6 +533,7 @@ mod tests {
                 run_control.clone(),
                 meta_steps.clone(),
                 steps.clone(),
+                escalation.clone(),
             )),
             tool_dispatch: Arc::new(ToolDispatchNode::new(
                 ToolDispatchConfig::default(),

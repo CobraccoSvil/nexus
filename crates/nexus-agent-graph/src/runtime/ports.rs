@@ -20,6 +20,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::decisions::dag_scheduler::{Todo, TodoStatus};
+use crate::decisions::escalation::{ChainEntry, CrossProviderCandidate};
 use crate::state::ToolUse;
 
 /// Errore di una porta I/O. Opaco al runtime: messaggio + classe sintetica per
@@ -618,4 +619,53 @@ pub trait ContextOffload: Send + Sync {
     /// `PortError` (il run shadow non scrive Qdrant). Su guasto infrastrutturale
     /// (anche in Real) ritorna `PortError` (il chiamante degrada a troncamento).
     async fn offload_to_rag(&self, payload: Value, mode: ExecMode) -> Result<String, PortError>;
+}
+
+/// Dati di INPUT dell'auto-escalation gia' risolti dall'impl (catena DB + gate
+/// cooldown + router cross-provider): tutto cio' che serve a
+/// [`crate::decisions::escalation::pick_escalation_model`] per DECIDERE in modo
+/// PURO. Il confine d'inversione (regola L): l'I/O (lettura
+/// `nexus_model_escalation_chain`, gate ADR 0020, purpose `loop_fallback_default`)
+/// vive nell'impl della porta; la SELEZIONE resta nel modulo puro `escalation`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EscalationInputs {
+    /// Catena intra-provider per `(provider, model)` correnti, gia' filtrata
+    /// (`is_active = TRUE`) e ordinata per `escalation_position` ASC. Vuota se non
+    /// c'e' catena per la coppia corrente.
+    pub chain: Vec<ChainEntry>,
+    /// `true` se il provider corrente e' in cooldown billing/quota (gate ADR 0020):
+    /// in tal caso la SELEZIONE salta il Tier 1 intra-provider.
+    pub provider_in_cooldown: bool,
+    /// Candidato cross-provider (`loop_fallback_default`) risolto dal router, gia'
+    /// con sentinelle escluse (`__router_unavailable__` / `__no_capable_provider__`
+    /// NON arrivano: l'impl ritorna `None` in quel caso). `None` = nessun Tier 2.
+    pub cross_provider: Option<CrossProviderCandidate>,
+}
+
+/// Astrazione dell'I/O dell'auto-escalation (catena DB + cooldown + router
+/// cross-provider). mcp-core la implementera' leggendo
+/// `nexus_model_escalation_chain` (mig 0128), consultando il gate cooldown
+/// (ADR 0020, fonte unica) e risolvendo il purpose `loop_fallback_default` dalla
+/// routing matrix (regola G). I nodi dipendono solo da questo trait, mai dal DB.
+///
+/// CONFINE (regola L): qui c'e' SOLO l'I/O che fornisce i dati; la DECISIONE
+/// (quale modello promuovere o `None`) e' del modulo puro
+/// [`crate::decisions::escalation`], golden-abile in isolamento.
+#[async_trait]
+pub trait EscalationPort: Send + Sync {
+    /// Risolve gli input dell'escalation per il turno corrente: catena
+    /// intra-provider di `(provider, model)`, stato cooldown del provider e
+    /// candidato cross-provider per `intent`. SOLA LETTURA: nessun gate `mode`.
+    ///
+    /// FAIL-OPEN (sicurezza): un guasto di lettura (DB/router down) NON deve
+    /// bloccare il run — l'impl ritorna `EscalationInputs` "vuoto" (catena vuota,
+    /// `provider_in_cooldown=false`, `cross_provider=None`), che fa risolvere la
+    /// selezione a `None` (chiusura secca come oggi), MAI un `PortError`. Il
+    /// `PortError` resta per un contratto rotto (mai nel flusso normale).
+    async fn escalation_inputs(
+        &self,
+        intent: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<EscalationInputs, PortError>;
 }

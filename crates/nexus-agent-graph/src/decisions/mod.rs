@@ -24,6 +24,10 @@
 //!   - [`dag_scheduler`]: PUNTO UNICO della logica DAG dei todo (ready layer,
 //!     decisione di parallelizzazione, selezione sequenziale `pick_next_todo`,
 //!     discendenti per il cascade-skip). Prerequisito di todo_runner e verifier.
+//!   - [`escalation`]: SELEZIONE pura del modello di auto-escalation (Tier 1 catena
+//!     intra-provider `nexus_model_escalation_chain` + Tier 2 cross-provider
+//!     `loop_fallback_default`, cooldown-aware). PUNTO UNICO di `_pick_escalation_model`;
+//!     l'I/O (catena DB + cooldown) e' la porta [`crate::runtime::ports::EscalationPort`].
 //!   - [`helpers`]: tool_choice forcing, segnale strutturale, action-oriented,
 //!     stima complessita' e budget iterazioni.
 //!   - [`loop_signatures`]: RILEVAZIONE pura del loop di tool call per signature
@@ -38,6 +42,7 @@
 
 pub mod context_reduction;
 pub mod dag_scheduler;
+pub mod escalation;
 pub mod g1_accounting;
 pub mod helpers;
 pub mod loop_signatures;
@@ -60,6 +65,7 @@ pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,
     TodoStatus,
 };
+pub use escalation::{pick_escalation_model, ChainEntry, CrossProviderCandidate, EscalationPick};
 pub use g1_accounting::{g1_accounting, G1Accounting, G1Signals};
 pub use m16::{
     build_m16_allowed, is_tool_allowed, merge_discovered_run, parse_discovered_tools,
