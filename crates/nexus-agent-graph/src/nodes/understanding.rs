@@ -522,6 +522,7 @@ mod tests {
                 // Il contenuto e' la stringa `result_json` (forma reale del tool).
                 content: Value::String(rj),
                 is_error: false,
+                ..Default::default()
             })
         }
     }
@@ -747,6 +748,7 @@ mod tests {
                     tool_call_id: call.id,
                     content: Value::String(r#"{"summary": "trovato qualcosa"}"#.to_string()),
                     is_error: false,
+                    ..Default::default()
                 })
             }
         }

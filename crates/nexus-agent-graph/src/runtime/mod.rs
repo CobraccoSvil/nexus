@@ -10,9 +10,10 @@ pub mod ports;
 
 pub use ctx::AgentNodeCtx;
 pub use ports::{
-    CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmMessage,
-    LlmRequest, LlmResponse, LlmUsage, PlanRow, PortError, SseEvent, TodoStore, ToolCall,
-    ToolExecutor, ToolOutcome, VerifierRunRecord, VerifierRunStore,
+    AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, CriterionSpec, EventSink,
+    ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, PlanRow,
+    PortError, RunControlStore, SseEvent, TodoStore, ToolCall, ToolExecutor, ToolOutcome,
+    VerifierRunRecord, VerifierRunStore,
 };
 
 #[cfg(test)]
@@ -26,9 +27,10 @@ pub mod test_doubles {
     use async_trait::async_trait;
 
     use super::ports::{
-        CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmRequest,
-        LlmResponse, LlmUsage, PlanRow, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome,
-        TodoStore, VerifierRunRecord, VerifierRunStore,
+        AgentStepStore, ContextOffload, CriteriaRunner, CriterionResult, CriterionSpec, EventSink,
+        ExecMode, LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, PlanRow, PortError,
+        RunControlStore, SseEvent, ToolCall, ToolExecutor, ToolOutcome, TodoStore,
+        VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
 
@@ -49,6 +51,7 @@ pub mod test_doubles {
                     content: text.to_string(),
                     tool_calls: vec![],
                     usage: LlmUsage::default(),
+                    ..Default::default()
                 },
                 seen: Mutex::new(vec![]),
             }
@@ -67,6 +70,7 @@ pub mod test_doubles {
                         input,
                     }],
                     usage: LlmUsage::default(),
+                    ..Default::default()
                 },
                 seen: Mutex::new(vec![]),
             }
@@ -98,6 +102,7 @@ pub mod test_doubles {
                     tool_call_id: "stub".to_string(),
                     content,
                     is_error: false,
+                    ..Default::default()
                 },
                 seen: Mutex::new(vec![]),
             }
@@ -271,6 +276,155 @@ pub mod test_doubles {
             }
             self.records.lock().expect("lock records").push(run);
             Ok(())
+        }
+    }
+
+    /// Controllo run di test (punto unico executor+tool_dispatch). `superseded`
+    /// configurabile (default `false`); registra heartbeat e modello effettivo
+    /// SOLO in `Real` (gate shadow), cosi' un test asserisce ZERO scritture in
+    /// shadow verificando i vettori vuoti.
+    #[derive(Default)]
+    pub struct StubRunControlStore {
+        /// Valore ritornato da `is_superseded`.
+        pub superseded: bool,
+        /// Se `true`, `is_superseded` ritorna un errore: lo stub VERIFICA il
+        /// fail-open dei chiamanti (errore -> trattato come `false`, il run
+        /// prosegue). Lo stub NON applica il fail-open al posto loro: ritorna
+        /// l'errore cosi' i test del nodo esercitano il loro mapping.
+        pub fail_is_superseded: bool,
+        /// `run_id` per cui e' stato chiamato `heartbeat` (solo `Real`).
+        pub heartbeats: Mutex<Vec<String>>,
+        /// Modelli effettivi registrati (`Real`): (run_id, provider, model).
+        pub effective_models: Mutex<Vec<(String, String, String)>>,
+    }
+
+    #[async_trait]
+    impl RunControlStore for StubRunControlStore {
+        async fn is_superseded(&self, _run_id: &str) -> Result<bool, PortError> {
+            if self.fail_is_superseded {
+                return Err(PortError::Llm("stub: is_superseded fail".to_string()));
+            }
+            Ok(self.superseded)
+        }
+
+        async fn heartbeat(&self, run_id: &str, mode: ExecMode) -> Result<(), PortError> {
+            if mode != ExecMode::Real {
+                return Ok(());
+            }
+            self.heartbeats
+                .lock()
+                .expect("lock heartbeats")
+                .push(run_id.to_string());
+            Ok(())
+        }
+
+        async fn set_effective_model(
+            &self,
+            run_id: &str,
+            provider: &str,
+            model: &str,
+            mode: ExecMode,
+        ) -> Result<(), PortError> {
+            if mode != ExecMode::Real {
+                return Ok(());
+            }
+            self.effective_models.lock().expect("lock models").push((
+                run_id.to_string(),
+                provider.to_string(),
+                model.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    /// Store step di test: registra i blocchi persistiti (solo `Real`). In
+    /// `Replay` la `persist_step` e' un NO-OP (nessuna registrazione): un test
+    /// asserisce ZERO scritture in shadow verificando `steps` vuoto.
+    #[derive(Default)]
+    pub struct StubAgentStepStore {
+        /// Step persistiti in ordine: (run_id, step_index = iteration*1000+idx,
+        /// block, result). Vuoto in shadow.
+        pub steps: Mutex<Vec<(String, i64, serde_json::Value, Option<serde_json::Value>)>>,
+    }
+
+    #[async_trait]
+    impl AgentStepStore for StubAgentStepStore {
+        async fn persist_step(
+            &self,
+            run_id: &str,
+            iteration: i64,
+            idx: i64,
+            block: serde_json::Value,
+            result: Option<serde_json::Value>,
+            mode: ExecMode,
+        ) -> Result<(), PortError> {
+            // Gate shadow: in Replay NON si scrive (no-op), come l'impl concreta.
+            if mode != ExecMode::Real {
+                return Ok(());
+            }
+            // step_index deterministico = iteration*1000 + idx (come l'impl concreta).
+            self.steps.lock().expect("lock steps").push((
+                run_id.to_string(),
+                iteration * 1000 + idx,
+                block,
+                result,
+            ));
+            Ok(())
+        }
+    }
+
+    /// Store meta-step di test: registra i meta-step persistiti (solo `Real`).
+    /// `Replay` no-op (zero scritture shadow).
+    #[derive(Default)]
+    pub struct StubMetaStepStore {
+        /// Meta-step persistiti in ordine (JSON). Vuoto in shadow.
+        pub meta_steps: Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait]
+    impl MetaStepStore for StubMetaStepStore {
+        async fn persist_meta_step(
+            &self,
+            meta_step: serde_json::Value,
+            mode: ExecMode,
+        ) -> Result<(), PortError> {
+            if mode != ExecMode::Real {
+                return Ok(());
+            }
+            self.meta_steps
+                .lock()
+                .expect("lock meta_steps")
+                .push(meta_step);
+            Ok(())
+        }
+    }
+
+    /// Offload di test: NON tocca Qdrant; ritorna un pointer fittizio
+    /// deterministico e registra i payload "offloadati" (per asserire che il nodo
+    /// abbia delegato l'offload). Per esercitare il DEGRADO A TRONCAMENTO dei
+    /// chiamanti si puo' impostare `fail=true` (ritorna `PortError`).
+    #[derive(Default)]
+    pub struct StubContextOffload {
+        /// Se `true`, `offload_to_rag` fallisce (test del degrado a troncamento).
+        pub fail: bool,
+        /// Payload "offloadati" in ordine (sempre, anche se sarebbe no-op altrove:
+        /// l'offload non e' una scrittura di telemetria run, non ha gate `mode`).
+        pub offloaded: Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait]
+    impl ContextOffload for StubContextOffload {
+        async fn offload_to_rag(
+            &self,
+            payload: serde_json::Value,
+        ) -> Result<String, PortError> {
+            if self.fail {
+                return Err(PortError::Tool("stub: offload fail".to_string()));
+            }
+            let mut g = self.offloaded.lock().expect("lock offloaded");
+            g.push(payload);
+            // Pointer fittizio deterministico (indice progressivo).
+            Ok(format!("stub-rag-pointer-{}", g.len() - 1))
         }
     }
 }

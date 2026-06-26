@@ -56,7 +56,12 @@ pub struct LlmMessage {
 /// `provider`/`model` sono RISOLTI A MONTE dalla routing matrix (regola G: il
 /// nodo non li sceglie e non li hardcoda, li riceve gia' decisi). `tools` e'
 /// opzionale: assente per un turno puramente testuale.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// I campi estesi sono tutti `Option`/`Default` per non rompere i call site
+/// esistenti (i nodi gia' portati costruiscono `LlmRequest` con i soli campi
+/// base + `..Default::default()`): un turno minimale resta valido senza
+/// valorizzarli.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LlmRequest {
     /// Provider risolto dalla routing matrix (es. valore opaco "anthropic").
     pub provider: String,
@@ -66,10 +71,45 @@ pub struct LlmRequest {
     pub messages: Vec<LlmMessage>,
     /// Tool dichiarati al modello (schema JSON). `None` = turno senza tool.
     pub tools: Option<Vec<Value>>,
+    /// Forza il modello a chiamare un tool (`tool_choice` non-`auto`).
+    ///
+    /// RISCHIO NOTO (memoria progetto, "Gateway droppava tool_choice"): in una
+    /// migrazione passata il gateway PERDEVA il `tool_choice`, neutralizzando il
+    /// force-action anti-loop (l'agente descriveva il fix ma non chiamava
+    /// `edit_file` -> abort). Per questo `force_tool_choice` e' un campo
+    /// ESPLICITO del contratto: l'impl gateway concreta (Fase 6) DEVE onorarlo
+    /// end-to-end (`tool_choice` propagato al provider), mai droppato. `None` =
+    /// lascia la scelta al modello (`auto`); `Some(true)` = forza un tool;
+    /// `Some(false)` = vieta i tool (turno puramente testuale).
+    pub force_tool_choice: Option<bool>,
+    /// System prompt del turno (forma testuale provider-agnostica). `None` se il
+    /// system viaggia gia' come primo `LlmMessage` con `role="system"` (forma
+    /// usata da planner/clarify): le due forme sono alternative, l'impl concreta
+    /// le normalizza nel payload del provider.
+    pub system_text: Option<String>,
+    /// Tetto di token di output per il turno (`max_tokens`). `None` = default del
+    /// provider risolto a monte.
+    pub max_tokens: Option<i64>,
+    /// Metadati per la registrazione usage lato gateway concreto (telemetria
+    /// token/costo per run): `run_id` del run corrente. `None` per le chiamate
+    /// fuori-run (es. test). Opaco al nodo.
+    pub run_id: Option<String>,
+    /// Iterazione del run a cui la chiamata appartiene (telemetria usage). `None`
+    /// fuori-run.
+    pub iteration: Option<i64>,
+    /// Intent classificato del turno (telemetria usage / routing osservabile).
+    /// `None` se non disponibile. Opaco al nodo.
+    pub intent: Option<String>,
 }
 
 /// Uso/consumo token riportato dal gateway (forma normalizzata cross-provider).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// I campi cache/costo sono `Option`: `None` = il provider/gateway non li ha
+/// riportati (compute_turn_cost resta lato gateway concreto, il nodo legge
+/// l'usage gia' normalizzato; vedi memoria progetto "Token usage stream + live"
+/// per la normalizzazione cross-provider `extract_usage_tokens`). `Eq` rimosso
+/// perche' `total_cost_usd` e' un `f64` (non `Eq`); `PartialEq` basta per i test.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LlmUsage {
     /// Token di prompt (input).
     pub prompt_tokens: i64,
@@ -77,10 +117,23 @@ pub struct LlmUsage {
     pub completion_tokens: i64,
     /// Token totali.
     pub total_tokens: i64,
+    /// Token usati per CREARE la cache di prompt (Anthropic
+    /// `cache_creation_input_tokens`). `None` se il provider non la espone.
+    pub cache_creation_tokens: Option<i64>,
+    /// Token LETTI dalla cache di prompt (Anthropic `cache_read_input_tokens`):
+    /// risparmio della KV-cache. `None` se il provider non la espone.
+    pub cache_read_tokens: Option<i64>,
+    /// Costo del turno in USD calcolato dal gateway (`compute_turn_cost`). `None`
+    /// se non calcolato. Il nodo lo legge gia' pronto, non lo calcola.
+    pub total_cost_usd: Option<f64>,
 }
 
 /// Risposta minimale del gateway LLM.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// I campi estesi sono `Option`/`Vec` con `Default` per non rompere i call site
+/// esistenti (i nodi gia' portati costruiscono `LlmResponse` con i soli campi
+/// base + `..Default::default()`).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LlmResponse {
     /// Contenuto testuale prodotto dal modello (vuoto se solo tool_calls).
     pub content: String,
@@ -88,6 +141,25 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolUse>,
     /// Consumo token normalizzato.
     pub usage: LlmUsage,
+    /// Provider EFFETTIVAMENTE usato dal gateway (puo' differire dal `provider`
+    /// richiesto: il gateway fa cascade/sticky internamente). Il nodo legge
+    /// l'effettivo per la telemetria e per `RunControlStore::set_effective_model`.
+    /// `None` = il gateway non l'ha riportato (es. stub di test).
+    pub provider_used: Option<String>,
+    /// Modello EFFETTIVAMENTE usato dal gateway (vedi `provider_used`). `None` se
+    /// non riportato.
+    pub model_used: Option<String>,
+    /// Blocchi grezzi del contenuto dell'assistente nel formato "anthropic_content"
+    /// (testo + `tool_use`), per ricostruire fedelmente il `Message::Ai` con i
+    /// blocchi `tool_use` originali. Serve la continuita' `tool_use`/`tool_result`
+    /// gia' gestita nel planner (un `tool_result` deve referenziare il `tool_use`
+    /// originale). `Vec` vuoto = il gateway ha riportato solo `content`/`tool_calls`
+    /// (i nodi ricostruiscono dai campi base).
+    pub assistant_content: Vec<Value>,
+    /// Motivo di fine turno riportato dal provider (`stop_reason`/`finish_reason`
+    /// normalizzato: `end_turn`/`tool_use`/`max_tokens`/...). `None` se non
+    /// riportato. Segnale per la chiusura turno (vedi `routing::signals`).
+    pub stop_reason: Option<String>,
 }
 
 /// Astrazione del gateway LLM. mcp-core la implementera' delegando a
@@ -119,14 +191,42 @@ pub enum ExecMode {
 }
 
 /// Esito dell'esecuzione di un tool nel formato minimale richiesto dai nodi.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// COERENZA `exit_code` (regola L, un solo segnale d'esito): un `ToolOutcome`
+/// diventa un [`crate::state::ContentBlock::ToolResult`] quando il nodo lo
+/// appende ai messaggi (vedi `tool_call_id` -> `tool_use_id`, `content`,
+/// `is_error`, `exit_code`). Il campo `exit_code` qui DEVE fluire INVARIATO in
+/// quel `ContentBlock::ToolResult` (stesso tipo `Option<i64>`, stessa semantica:
+/// `Some(0)` successo, `Some(!=0)` errore di comando, `None` tool non-comando):
+/// e' il segnale PRIMARIO letto da
+/// [`crate::routing::signals::tool_result_outcome_after`]. Non re-derivare
+/// l'esito altrove.
+///
+/// I campi estesi sono `Option`/`bool` con `Default` per non rompere i call site
+/// esistenti.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolOutcome {
-    /// Id della `ToolCall` a cui questo esito risponde (round-trip).
+    /// Id della `ToolCall` a cui questo esito risponde (round-trip). Diventa
+    /// `tool_use_id` nel `ContentBlock::ToolResult`.
     pub tool_call_id: String,
     /// Contenuto del risultato (JSON: stringa o struttura).
     pub content: Value,
     /// `true` se il tool ha fallito (errore applicativo, non infrastrutturale).
     pub is_error: bool,
+    /// Exit code STRUTTURATO del tool-comando: `Some(0)` successo, `Some(!=0)`
+    /// errore, `None` tool non-comando. DEVE confluire INVARIATO nel campo
+    /// `exit_code` di [`crate::state::ContentBlock::ToolResult`] (alimenta
+    /// [`crate::routing::signals::tool_result_outcome_after`]).
+    pub exit_code: Option<i64>,
+    /// `true` se il fallimento e' INFRASTRUTTURALE (ToolRunner/gRPC down, non un
+    /// errore applicativo del tool). Mappa il caso "gRPC-down -> degrada a
+    /// executor" senza scalare provider (WAVE 2.2: mcp-core NON scala il provider
+    /// su un guasto infra). Default `false` (errore applicativo / successo).
+    pub is_infrastructure: bool,
+    /// Classe sintetica dell'errore (`timeout`/`grpc_unavailable`/`tool_error`/...)
+    /// per il mapping diagnostico fine. `None` su successo o quando non
+    /// classificato. Opaco al nodo (eco diagnostica).
+    pub error_class: Option<String>,
 }
 
 /// Astrazione dell'esecutore di tool. mcp-core la implementera' delegando al
@@ -377,4 +477,137 @@ pub trait TodoStore: Send + Sync {
         status: TodoStatus,
         mode: ExecMode,
     ) -> Result<(), PortError>;
+
+    /// Reminder testuale dei todo da iniettare nel prompt dell'executor quando la
+    /// fase di piano e' attiva (`plan_phase_active`). L'impl concreta legge i
+    /// todos del run e rende il testo (lista compatta stato/seq), `None` se non
+    /// c'e' un piano attivo o nessun todo. Default `Ok(None)` per non obbligare
+    /// gli store che non servono l'executor (es. il `TodoRunnerNode` esistente).
+    /// SOLA LETTURA: nessun gate `mode` (non scrive).
+    async fn build_reminder_text(&self, _run_id: &str) -> Result<Option<String>, PortError> {
+        Ok(None)
+    }
+
+    /// Incrementa il contatore di iterazioni "viste" per il run (telemetria di
+    /// avanzamento del piano). UPDATE best-effort gata `Real` (no-op in
+    /// [`ExecMode::Replay`], stesso gate shadow di [`mark_status`](TodoStore::mark_status),
+    /// regola L). Default no-op: gli store che non lo servono non lo
+    /// sovrascrivono.
+    async fn increment_iteration_seen(
+        &self,
+        _run_id: &str,
+        _mode: ExecMode,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+/// Controllo di run condiviso da `executor` e `tool_dispatch` (PUNTO UNICO,
+/// regola L): la stessa domanda "il run e' stato superato?" e gli stessi
+/// side-effect best-effort (heartbeat, modello effettivo) vivono in UN solo
+/// trait, i due nodi delegano qui invece di re-implementare query/UPDATE.
+///
+/// Relazione con `ctx.cancel` (memoria progetto, "Single run per session" /
+/// supersede last-wins): in Rust il segnale di run superato e' GIA' parzialmente
+/// coperto dal `CancellationToken` del ctx (l'orchestratore lo cancella quando
+/// un nuovo run supera il corrente). `is_superseded` e' il segnale ESPLICITO e
+/// POLLABILE complementare: il nodo lo interroga ai checkpoint (inizio
+/// iterazione) anche quando il token non e' ancora propagato (es. supersede
+/// scritto su DB da un altro processo). Le due fonti convergono; l'impl concreta
+/// puo' leggere il flag `superseded`/`supersede_active_runs` su `agent_runs`.
+#[async_trait]
+pub trait RunControlStore: Send + Sync {
+    /// `true` se il run e' stato superato (last-wins) e deve fermarsi. FAIL-OPEN
+    /// (regola di sicurezza): un errore di lettura DB ritorna `Ok(false)` (il run
+    /// PROSEGUE), mai un `PortError` che lo bloccherebbe per un guasto
+    /// infrastrutturale. SOLA LETTURA: nessun gate `mode`.
+    async fn is_superseded(&self, run_id: &str) -> Result<bool, PortError>;
+
+    /// Heartbeat del run (UPDATE `updated_at` best-effort): segnala che il run e'
+    /// vivo (anti-recovery prematuro). Gata `Real` (no-op in [`ExecMode::Replay`]:
+    /// il run shadow non tocca la telemetria del primario, regola L).
+    /// Best-effort: l'impl logga e ritorna `Ok(())` su errore DB.
+    async fn heartbeat(&self, _run_id: &str, _mode: ExecMode) -> Result<(), PortError>;
+
+    /// Registra il modello EFFETTIVAMENTE usato dal gateway (da
+    /// [`LlmResponse::provider_used`]/[`LlmResponse::model_used`]) sul run, per la
+    /// telemetria/osservabilita' (la chat mostra il modello reale, non quello
+    /// richiesto). Gata `Real` (no-op in [`ExecMode::Replay`]). Best-effort.
+    async fn set_effective_model(
+        &self,
+        _run_id: &str,
+        _provider: &str,
+        _model: &str,
+        _mode: ExecMode,
+    ) -> Result<(), PortError>;
+}
+
+/// Persistenza dei singoli step dell'agente su `agent_steps`
+/// (modello: [`VerifierRunStore`]). Ogni blocco prodotto in un'iterazione
+/// (tool_use, tool_result, testo) e' uno step indicizzato. Confine d'inversione:
+/// SOLO l'INSERT, nessuna logica.
+///
+/// `step_index` deterministico = `iteration * 1000 + idx` (idx = posizione del
+/// blocco nell'iterazione): garantisce ordinamento globale stabile senza
+/// contatore condiviso. L'impl concreta DEVE usare `ON CONFLICT DO NOTHING`
+/// (idempotente sui retry) + guard `untracked_run` (non inserire step per run non
+/// tracciati, evita FK orfane).
+#[async_trait]
+pub trait AgentStepStore: Send + Sync {
+    /// Persiste UN blocco di una iterazione. `block` = il blocco emesso
+    /// (tool_use/testo, JSON opaco), `result` = l'eventuale tool_result associato
+    /// (`None` per i blocchi di testo o quando non ancora disponibile).
+    ///
+    /// Gata `Real` (punto unico gate shadow, regola L): INSERT solo in
+    /// [`ExecMode::Real`]; no-op in [`ExecMode::Replay`] (il run shadow non scrive
+    /// step). Best-effort come [`VerifierRunStore::record`]: errore DB loggato,
+    /// `Ok(())` ritornato (il `PortError` resta per un contratto rotto).
+    async fn persist_step(
+        &self,
+        run_id: &str,
+        iteration: i64,
+        idx: i64,
+        block: Value,
+        result: Option<Value>,
+        mode: ExecMode,
+    ) -> Result<(), PortError>;
+}
+
+/// Persistenza dei meta-step dell'agente su `agent_meta_steps` (plan/routing/
+/// clarify/fallback/reflection persistiti per la cronologia, distinti dal canale
+/// live SSE).
+///
+/// SCELTA `MetaStepStore` vs estendere [`EventSink`] (documentata, regola L):
+/// resta un TRAIT SEPARATO. `EventSink::emit` e' il canale LIVE verso il
+/// frontend — SINCRONO, infallibile, best-effort, NON gata `mode` (lo shadow usa
+/// un sink no-op). La PERSISTENZA DB e' invece una scrittura ASYNC, FALLIBILE e
+/// GATA `Real/Replay` (no-op shadow): semantica diversa. Fonderle in `EventSink`
+/// costringerebbe a un `emit` async fallibile e a un gate `mode` sul canale live,
+/// rompendo i call site `emit` esistenti e mescolando due concern (live vs
+/// storico). I due trait sono complementari: un meta-step tipicamente si EMETTE
+/// (live) e si PERSISTE (storico) nello stesso punto.
+#[async_trait]
+pub trait MetaStepStore: Send + Sync {
+    /// Persiste un meta-step (`meta_step` = JSON `{kind,title,payload}` opaco allo
+    /// store). Gata `Real` (INSERT solo in [`ExecMode::Real`], no-op in
+    /// [`ExecMode::Replay`], regola L). Best-effort: errore DB loggato, `Ok(())`.
+    async fn persist_meta_step(&self, meta_step: Value, mode: ExecMode) -> Result<(), PortError>;
+}
+
+/// Offload del contesto verso RAG (Qdrant + embeddings) quando un payload e'
+/// troppo grande per restare inline nel contesto del modello.
+///
+/// CONFINE (regola L): la logica head/tail/pointer-size (DECIDERE cosa offloadare
+/// e come troncare) e' PURA e NON vive qui — andra' nel modulo
+/// `context_reduction` quando servira'. Questo trait espone SOLO l'I/O di
+/// offload (scrittura su Qdrant + ritorno del pointer), che e' infrastrutturale.
+/// Best-effort con DEGRADO A TRONCAMENTO: se l'offload fallisce (embed/Qdrant
+/// down), l'impl ritorna un `PortError` e il chiamante degrada troncando inline
+/// (non blocca il run).
+#[async_trait]
+pub trait ContextOffload: Send + Sync {
+    /// Scrive `payload` su RAG e ritorna un POINTER opaco (chiave per il recupero
+    /// successivo). Su guasto infrastrutturale ritorna `PortError` (il chiamante
+    /// degrada a troncamento).
+    async fn offload_to_rag(&self, payload: Value) -> Result<String, PortError>;
 }

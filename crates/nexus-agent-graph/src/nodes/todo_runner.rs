@@ -890,6 +890,7 @@ mod tests {
                         tool_call_id: "dispatch".to_string(),
                         content: p,
                         is_error: false,
+                        ..Default::default()
                     })
                 })
                 .collect();
@@ -907,6 +908,7 @@ mod tests {
                     tool_call_id: "dispatch".to_string(),
                     content: json!({}),
                     is_error: true,
+                    ..Default::default()
                 })]),
                 seen: Mutex::new(vec![]),
             }
@@ -956,6 +958,7 @@ mod tests {
                         tool_call_id: "empty".to_string(),
                         content: json!({}),
                         is_error: false,
+                        ..Default::default()
                     }),
                 }
             }

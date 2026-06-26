@@ -650,6 +650,7 @@ impl ReflectionNode {
             ],
             // Nessun tool: la reflection ritorna JSON testuale.
             tools: None,
+            ..Default::default()
         };
 
         match ctx.llm.complete(req).await {
@@ -795,6 +796,7 @@ mod tests {
                 content: self.content.clone(),
                 tool_calls: vec![],
                 usage: LlmUsage::default(),
+                ..Default::default()
             })
         }
     }

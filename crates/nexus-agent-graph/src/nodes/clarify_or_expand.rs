@@ -650,6 +650,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
                 model: String::new(),
                 messages,
                 tools: Some(vec![Self::tool_schema()]),
+                ..Default::default()
             };
             match ctx.llm.complete(req).await {
                 Ok(resp) => resp,
@@ -797,6 +798,7 @@ mod tests {
                 content: String::new(),
                 tool_calls,
                 usage: LlmUsage::default(),
+                ..Default::default()
             })
         }
     }
@@ -833,6 +835,7 @@ mod tests {
                 tool_call_id: call.id,
                 content: Value::String(self.listing.clone()),
                 is_error: false,
+                ..Default::default()
             })
         }
     }

@@ -651,6 +651,7 @@ impl PlannerNode {
             model: model.to_string(),
             messages: msgs,
             tools: Some(tool_catalog()),
+            ..Default::default()
         }
     }
 
@@ -1101,6 +1102,7 @@ impl PlannerNode {
                 content: Value::String(user_msg),
             }],
             tools: Some(vec![tool]),
+            ..Default::default()
         };
         let resp = match ctx.llm.complete(req).await {
             Ok(r) => r,
@@ -1276,6 +1278,7 @@ mod tests {
                 input,
             }],
             usage: LlmUsage::default(),
+            ..Default::default()
         }
     }
     fn text_resp() -> LlmResponse {
@@ -1283,6 +1286,7 @@ mod tests {
             content: "nessun tool".to_string(),
             tool_calls: vec![],
             usage: LlmUsage::default(),
+            ..Default::default()
         }
     }
 
@@ -1331,6 +1335,7 @@ mod tests {
                 tool_call_id: id,
                 content: Value::String(self.result_json.clone()),
                 is_error: self.is_error,
+                ..Default::default()
             })
         }
     }
