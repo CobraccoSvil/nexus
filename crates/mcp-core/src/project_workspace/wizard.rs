@@ -1248,28 +1248,48 @@ pub async fn wizard_install_service(
         || looks_like_web_server_command(&exec_start);
     let existing_port = env_map.get("PORT").and_then(|v| parse_port_token(v));
     let final_port = if wants_port {
-        // Se il client non passa PORT, assegnalo in modo deterministico nel bucket progetto.
-        // Questo evita che servizi web finiscano su 3000/3002 per fallback e garantisce stabilità.
-        let port = match existing_port {
-            Some(p) => p,
+        let actual = match existing_port {
+            // Il client/utente ha forzato PORT: rispettalo, ma validalo e ripiega su
+            // una porta libera del bucket se occupata/riservata.
+            Some(p) => {
+                let ok = !reserved.contains(&p)
+                    && state.port_registry.is_port_available(p).await
+                    && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", p))
+                        .await
+                        .is_ok();
+                if ok {
+                    p
+                } else {
+                    services::find_free_project_port(&project_id, &state.port_registry).await
+                }
+            }
+            // Auto-allocazione: PUNTO UNICO (regola L). find_or_allocate riusa la
+            // porta gia' persistita in nexus_port_allocations per (project_id, short)
+            // se esiste, altrimenti ne alloca una deterministica nel bucket e la
+            // PERSISTE. Cosi' un re-install/riavvio riprende SEMPRE la stessa porta
+            // (A3: niente swap frontend<->backend) e l'allocazione non resta 0-righe
+            // (causa radice login Beauty-Book: A2 non aveva una riga backend da cui
+            // derivare VITE_API_URL). Niente piu' calcolo hash order-dependent qui.
             None => {
-                super::services::deterministic_project_port_for_key(
-                    &project_id,
-                    short,
+                match super::allocate_port::find_or_allocate(
+                    &state.db,
                     &state.port_registry,
+                    project_id,
+                    short,
                 )
                 .await
+                {
+                    Ok(a) => a.port,
+                    Err(e) => {
+                        tracing::warn!(
+                            "wizard: find_or_allocate fallita per {} ({}), fallback find_free",
+                            short,
+                            e
+                        );
+                        services::find_free_project_port(&project_id, &state.port_registry).await
+                    }
+                }
             }
-        };
-        let ok = !reserved.contains(&port)
-            && state.port_registry.is_port_available(port).await
-            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-                .await
-                .is_ok();
-        let actual = if ok {
-            port
-        } else {
-            services::find_free_project_port(&project_id, &state.port_registry).await
         };
         env_map.insert("PORT".to_string(), actual.to_string());
         // .NET: usa ASPNETCORE_URLS per forzare la porta (PORT da solo non basta).
@@ -1527,8 +1547,36 @@ pub async fn wizard_install_service(
     // Registra le porte del servizio nel port_registry (mig 0114).
     // Estrae le porte dal contenuto unit appena scritto e le registra come "auto".
     // Indipendente dalla strategia di avvio (systemd o detached).
+    //
+    // A3: la porta PRINCIPALE (final_port) e' gia' stata scelta e PERSISTITA da
+    // find_or_allocate sopra, sulla riga (project_id, short). Qui basta valorizzarne
+    // il service_unit (find_or_allocate lo lascia NULL) con un UPDATE idempotente, e
+    // registrare le eventuali porte SECONDARIE estratte dalla unit (raro). Saltiamo
+    // final_port nel loop per non collidere su uq_port_alloc_project_label.
+    if let Some(fp) = final_port {
+        if let Err(e) = sqlx::query(
+            "UPDATE nexus_port_allocations SET service_unit = $1, updated_at = NOW() \
+             WHERE project_id = $2 AND label = $3",
+        )
+        .bind(&unit_name)
+        .bind(project_id)
+        .bind(short)
+        .execute(&state.db)
+        .await
+        {
+            tracing::warn!(
+                "wizard: update service_unit per {} (porta {}) fallito: {}",
+                unit_name,
+                fp,
+                e
+            );
+        }
+    }
     let detected_ports = services::extract_ports_from_unit(&unit_content);
     for p in &detected_ports {
+        if Some(*p) == final_port {
+            continue; // gia' persistita da find_or_allocate + service_unit sopra
+        }
         // Ignora errori di registrazione (es. porta gia' allocata) — non blocca l'install
         if let Err(e) = state
             .port_registry

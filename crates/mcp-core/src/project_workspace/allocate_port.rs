@@ -14,7 +14,7 @@
 //! 4. Scrive `nexus_resource_audit` (allowed/blocked).
 //! 5. Ritorna `{port, label, allocation_mode}` per uso dell'agente.
 
-use super::services::find_free_project_port;
+use super::services::deterministic_project_port_for_key;
 use super::*;
 use crate::port_registry::PortRegistryCache;
 use crate::security::{record_audit, AuditEntry};
@@ -209,8 +209,13 @@ pub async fn find_or_allocate(
         return Err(reason);
     }
 
-    // 3. Trova porta libera nel bucket
-    let port = find_free_project_port(&project_id, registry).await;
+    // 3. Prima allocazione: porta DETERMINISTICA per (project_id, label) nel bucket
+    //    (offset hash della label), non la prima libera dal basso. Cosi' la porta
+    //    coincide con quella PROPOSTA da service_discovery/run_configs per la stessa
+    //    label (entrambi usano deterministic_project_port_for_key) e la prima scelta
+    //    non dipende dall'ordine di richiesta (A3: niente swap). La funzione fa gia'
+    //    fallback a find_free_project_port se la porta ideale e' occupata.
+    let port = deterministic_project_port_for_key(&project_id, label, registry).await;
 
     // 4. INSERT in DB. Idempotenza reale per (project_id, label) via indice
     //    UNIQUE (mig 0434): variare il contorno della label NON crea piu' righe
@@ -530,5 +535,55 @@ mod tests {
             "adopted",
             "l'allocazione stale adottata deve avere mode='adopted'"
         );
+    }
+
+    /// Replica del lookup idempotente (ramo 1 di `find_or_allocate`): la porta
+    /// gia' persistita per (project_id, label) viene riusata.
+    async fn lookup_port(pool: &sqlx::PgPool, project_id: Uuid, label: &str) -> Option<i32> {
+        sqlx::query(
+            "SELECT port FROM nexus_port_allocations \
+             WHERE project_id = $1 AND label = $2 LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(label)
+        .fetch_optional(pool)
+        .await
+        .expect("lookup")
+        .map(|r| r.get::<i32, _>("port"))
+    }
+
+    #[sqlx::test]
+    async fn binding_canonico_niente_swap_tra_restart(pool: sqlx::PgPool) {
+        // A3: il binding porta<->servizio e' ancorato a (project_id, label) nel DB,
+        // non all'ordine di avvio. Una volta che il wizard converge su
+        // find_or_allocate, ogni servizio RIPRENDE la sua porta persistita a ogni
+        // riavvio, indipendentemente da quale parte prima. Senza questo (vecchio
+        // percorso deterministic_project_port_for_key hash + linear-probing
+        // order-dependent) frontend e backend potevano scambiarsi la porta, e il
+        // proxy /api del frontend finiva su una porta sbagliata (incidente login
+        // Beauty-Book: VITE_API_URL verso la porta del frontend stesso).
+        create_port_allocations_table(&pool).await;
+        let proj = Uuid::new_v4();
+
+        // Primo avvio: porte distinte e persistite.
+        upsert_alloc(&pool, proj, 21950, "frontend").await;
+        upsert_alloc(&pool, proj, 21976, "backend").await;
+
+        // "Riavvio in ordine inverso": il lookup ancorato alla label ritorna SEMPRE
+        // la stessa porta per ogni servizio. Niente swap.
+        assert_eq!(
+            lookup_port(&pool, proj, "backend").await,
+            Some(21976),
+            "backend deve riprendere la SUA porta persistita anche risolto per primo"
+        );
+        assert_eq!(
+            lookup_port(&pool, proj, "frontend").await,
+            Some(21950),
+            "frontend deve riprendere la SUA porta persistita"
+        );
+
+        // Ri-risolvere non duplica righe ne' cambia le porte (idempotenza per label).
+        assert_eq!(count_rows(&pool, proj, "frontend").await, 1);
+        assert_eq!(count_rows(&pool, proj, "backend").await, 1);
     }
 }
