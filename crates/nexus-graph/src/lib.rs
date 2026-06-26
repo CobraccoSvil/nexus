@@ -18,7 +18,7 @@ pub mod node;
 pub mod outcome;
 pub mod state;
 
-pub use checkpoint::{CheckpointError, Checkpointer};
+pub use checkpoint::{CheckpointError, Checkpointer, MemoryCheckpointer};
 pub use edge::Edge;
 pub use engine::{GraphEngine, GraphError, NodeCtxLike};
 pub use node::{GraphNode, NodeError, NodeId, NoOpNode};
@@ -85,53 +85,9 @@ mod tests {
         }
     }
 
-    // --- Checkpointer in memoria (solo test, niente DB) --------------------
-
-    #[derive(Default)]
-    struct MemoryCheckpointer {
-        // (run_id, superstep) -> (state-json, next-label)
-        store: std::sync::Mutex<HashMap<(Uuid, i64), (serde_json::Value, &'static str)>>,
-    }
-
-    #[async_trait]
-    impl Checkpointer<TestState> for MemoryCheckpointer {
-        async fn put(
-            &self,
-            run_id: Uuid,
-            superstep: i64,
-            next: NodeId,
-            state: &TestState,
-        ) -> Result<(), CheckpointError> {
-            let json = serde_json::to_value(state)
-                .map_err(|e| CheckpointError::Store(e.to_string()))?;
-            self.store
-                .lock()
-                .expect("mutex avvelenato nel test")
-                .insert((run_id, superstep), (json, next.as_label()));
-            Ok(())
-        }
-
-        async fn load(
-            &self,
-            run_id: Uuid,
-        ) -> Result<Option<(TestState, NodeId)>, CheckpointError> {
-            let guard = self.store.lock().expect("mutex avvelenato nel test");
-            let latest = guard
-                .iter()
-                .filter(|((rid, _), _)| *rid == run_id)
-                .max_by_key(|((_, step), _)| *step);
-            match latest {
-                None => Ok(None),
-                Some((_, (json, label))) => {
-                    let state: TestState = serde_json::from_value(json.clone())
-                        .map_err(|e| CheckpointError::Store(e.to_string()))?;
-                    let node = NodeId::from_label(label)
-                        .ok_or_else(|| CheckpointError::UnknownNode((*label).to_string()))?;
-                    Ok(Some((state, node)))
-                }
-            }
-        }
-    }
+    // --- Checkpointer in memoria: PUNTO UNICO `MemoryCheckpointer` (niente DB),
+    //     riusato dai test e dal run shadow in produzione (regola L). Qui lo si
+    //     istanzia col tipo di stato di prova `TestState`. ----------------------
 
     // --- Nodo che cicla all'infinito (test recursion_limit) ----------------
 

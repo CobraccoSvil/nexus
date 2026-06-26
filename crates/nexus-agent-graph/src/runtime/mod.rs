@@ -17,6 +17,19 @@ pub use ports::{
     ToolExecutor, ToolOutcome, UpscalePick, VerifierRunRecord, VerifierRunStore,
 };
 
+/// Sink eventi NO-OP: scarta ogni evento, nessun output verso l'utente.
+///
+/// E' un'implementazione legittima in PRODUZIONE per il run SHADOW (read-only):
+/// lo shadow non deve emettere nulla sul canale SSE del frontend (l'output
+/// all'utente resta quello del primario). Vive fuori da `#[cfg(test)]` perche'
+/// e' un no-op reale, non un doppio di test. I test lo riusano (regola L: un
+/// solo no-op sink, non duplicato in `test_doubles`).
+pub struct NullEventSink;
+
+impl EventSink for NullEventSink {
+    fn emit(&self, _ev: SseEvent) {}
+}
+
 #[cfg(test)]
 pub mod test_doubles {
     //! Implementazioni di test delle porte (mock/stub) riusabili dai test dei
@@ -189,13 +202,10 @@ pub mod test_doubles {
         }
     }
 
-    /// Sink eventi no-op: scarta tutto. Usato nel ctx SHADOW (nessun output
-    /// verso l'utente dal run shadow).
-    pub struct NullEventSink;
-
-    impl EventSink for NullEventSink {
-        fn emit(&self, _ev: SseEvent) {}
-    }
+    /// Sink eventi no-op: ri-esportato dal PUNTO UNICO `super::NullEventSink`
+    /// (regola L). Vive fuori da `#[cfg(test)]` perche' lo usa anche il run
+    /// shadow in produzione; i test continuano a importarlo da qui.
+    pub use super::NullEventSink;
 
     /// Store todo di test: mantiene una lista di [`Todo`] in memoria e applica i
     /// `mark_status` ricevuti (cosi' i test del `TodoRunnerNode` osservano gli

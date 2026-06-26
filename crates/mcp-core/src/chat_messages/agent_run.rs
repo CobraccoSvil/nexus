@@ -1872,13 +1872,15 @@ pub(crate) async fn spawn_agent_run(
                 })
                 .execute(&db_clone)
                 .await;
-            if engine != Engine::Python {
-                // NON instradato in produzione: select_engine ritorna SEMPRE Python
-                // (regola G). Se per dati DB venisse selezionato il motore nativo, lo
-                // si esegue; su QUALUNQUE errore si logga e si prosegue sul motore
-                // Python (fail-safe), come da confine strangler-fig. Il path nativo
-                // riusa gli stessi input gia' risolti a monte (regola L) + le
-                // dipendenze infra da AppState.
+            if engine == Engine::Rust {
+                // ── Engine::Rust (cutover) — NON instradato in produzione ─────────
+                // select_engine ritorna SEMPRE Python (regola G). Se per dati DB
+                // venisse selezionato il motore nativo come PRIMARIO, lo si esegue;
+                // su QUALUNQUE errore si logga e si prosegue sul motore Python
+                // (fail-safe), come da confine strangler-fig. Il path nativo riusa
+                // gli stessi input gia' risolti a monte (regola L) + le dipendenze
+                // infra da AppState. NB: lo SHADOW non passa di qui — il suo primario
+                // resta Python (run_via_brain) e lo shadow Rust gira DOPO, aggiuntivo.
                 let native_input = crate::native_engine::NativeRunInput {
                     run_id,
                     session_id: session_id_cp,
@@ -3004,6 +3006,58 @@ pub(crate) async fn spawn_agent_run(
                     tracing::warn!(error = %e, "session_worklog: ingest a fine run fallito");
                 }
             }
+
+            // ── SHADOW (F4): ombra Rust AGGIUNTIVA dopo il primario Python ────────
+            // Solo per Engine::Shadow (NON instradato in produzione: select_engine
+            // ritorna SEMPRE Python, regola G). Il primario Python sopra e' gia'
+            // concluso e i suoi agent_steps sono APPENA stati persistiti -> il
+            // Replay puo' rileggerli. Lo shadow gira in un task tokio fire-and-forget
+            // (NON aggiunge latenza all'utente: il primario ha gia' risposto) e su
+            // QUALUNQUE errore logga WARN senza impattare il run reale (lo shadow non
+            // deve mai rompere un run reale). primary_run_id = run_id del primario.
+            if engine == Engine::Shadow {
+                // AppState (con db, neural, channels...) per costruire i deps nativi
+                // dentro il task: clone a basso costo (campi Arc/pool condivisi).
+                let shadow_state = state_for_finalize.clone();
+                let (shadow_tx, _shadow_rx) =
+                    tokio::sync::broadcast::channel::<AgentStepEvent>(1);
+                let shadow_input = crate::native_engine::NativeRunInput {
+                    run_id,
+                    session_id: session_id_cp,
+                    provider: provider_clone.clone(),
+                    model: model_clone.clone(),
+                    system_text: system_text_clone.clone(),
+                    initial_msg: initial_msg_clone.clone(),
+                    conversation_history: recent_history_for_brain.clone(),
+                    tools_json: tools_json_for_brain.clone(),
+                    intent_hint: intent_hint_for_brain.clone(),
+                    automation_mode: automation_mode_for_brain.clone(),
+                    // Canale SSE fittizio: lo shadow usa NullEventSink (non emette
+                    // nulla), questo tx esiste solo per soddisfare la firma di
+                    // NativeRunInput e viene scartato.
+                    step_tx: shadow_tx,
+                };
+                let primary_run_id = run_id;
+                tokio::spawn(async move {
+                    match run_shadow_for_state(&shadow_state, &shadow_input, primary_run_id).await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                primary_run_id = %primary_run_id,
+                                "shadow: run ombra completato (telemetria persistita)"
+                            );
+                        }
+                        Err(e) => {
+                            // Lo shadow non impatta MAI il primario: solo WARN.
+                            tracing::warn!(
+                                primary_run_id = %primary_run_id,
+                                error = %e,
+                                "shadow: run ombra fallito (nessun impatto sul primario)"
+                            );
+                        }
+                    }
+                });
+            }
         }); // chiude AssertUnwindSafe(async move { ... })
 
         // Cattura panic dell'intero body: senza questo, un panic dentro lo
@@ -3202,6 +3256,15 @@ pub(crate) async fn run_via_native(
     state: &AppState,
     input: &crate::native_engine::NativeRunInput,
 ) -> anyhow::Result<crate::native_engine::NativeRunOutcome> {
+    let deps = build_native_deps(state).await;
+    crate::native_engine::run_native(&deps, input).await
+}
+
+/// Assembla le `NativeDeps` (ToolRunner in-process + client gateway) da
+/// `AppState`. PUNTO UNICO (regola L): sia il run nativo primario
+/// (`run_via_native`) sia lo shadow (`run_shadow_for_state`) lo riusano, niente
+/// duplicazione del cablaggio infra.
+async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps {
     // Dipendenze del ToolRunner concreto: stesso assemblaggio del server gRPC
     // (main.rs), ma per l'esecuzione IN-PROCESS (mcp-core E' il ToolRunner).
     let tool_runner_deps = crate::tool_runner_server::ToolRunnerDeps {
@@ -3222,13 +3285,26 @@ pub(crate) async fn run_via_native(
         .unwrap_or_else(|_| "dev-internal-token".to_string());
     let gateway = crate::nexus_gateway::NexusGatewayClient::new(gw_url, gw_token);
 
-    let deps = crate::native_engine::NativeDeps {
+    crate::native_engine::NativeDeps {
         db: state.db.clone(),
         tool_runner_deps,
         gateway,
-    };
+    }
+}
 
-    crate::native_engine::run_native(&deps, input).await
+/// Avvio del run SHADOW (Engine::Shadow): ri-esegue il grafo Rust in modalita'
+/// shadow (read-only) confrontando lo stato finale col primario Python gia'
+/// concluso (`primary_run_id`). Riusa il PUNTO UNICO `build_native_deps` +
+/// `native_engine::run_shadow` (regola L). NON instradato in produzione
+/// (select_engine ritorna SEMPRE Python). Lo shadow non impatta MAI il primario:
+/// su errore il chiamante logga WARN.
+pub(crate) async fn run_shadow_for_state(
+    state: &AppState,
+    input: &crate::native_engine::NativeRunInput,
+    primary_run_id: Uuid,
+) -> anyhow::Result<()> {
+    let deps = build_native_deps(state).await;
+    crate::native_engine::run_shadow(&deps, input, primary_run_id).await
 }
 
 #[cfg(test)]

@@ -121,7 +121,7 @@ impl FinalGateCriteriaRunnerAdapter {
             "service_logs_clean" => {
                 self.check_service_logs_clean(&c.spec, mode, timeout_s).await
             }
-            "http" => self.check_http(&c.spec, &c.expected, timeout_s).await,
+            "http" => self.check_http(&c.spec, &c.expected, mode, timeout_s).await,
             "file_exists" => self.check_file_exists(&c.spec, &c.expected, mode, timeout_s).await,
             "outputs_exist" => self.check_outputs_exist(&c.spec, mode, timeout_s).await?,
             // Anti-placeholder grafo import: non ancora portato (F3) -> inconclusive.
@@ -264,7 +264,30 @@ impl FinalGateCriteriaRunnerAdapter {
 
     // ── http: chiamata REALE via reqwest (parita' httpx Python) ───────────────
 
-    async fn check_http(&self, spec: &Value, expected: &Value, timeout_s: f64) -> (bool, Value) {
+    async fn check_http(
+        &self,
+        spec: &Value,
+        expected: &Value,
+        mode: ExecMode,
+        timeout_s: f64,
+    ) -> (bool, Value) {
+        // SHADOW-SAFETY (FIX FINDING F2c-2): il criterio `http` esegue reqwest
+        // verso un endpoint REALE — un side-effect che NON passa per il
+        // ToolExecutor (che in Replay rilegge senza eseguire). In modalita'
+        // Replay (run shadow read-only) NON deve partire alcuna chiamata: si
+        // ritorna inconclusive (passed=true, non conteggiato dal gate, parita'
+        // col trattamento di un criterio non valutabile), con evidence che
+        // dichiara lo skip. Cosi' lo shadow resta a ZERO side-effect anche sui
+        // criteri side-effect-ful estranei al ToolExecutor.
+        if matches!(mode, ExecMode::Replay) {
+            return (
+                true,
+                json!({
+                    "inconclusive": true,
+                    "skipped_reason": "criterio http saltato in modalita' Replay (shadow): nessuna chiamata di rete reale",
+                }),
+            );
+        }
         let url = spec.get("url").and_then(Value::as_str).unwrap_or("");
         if url.is_empty() {
             return (false, json!({ "error": "spec.url obbligatorio" }));
@@ -725,6 +748,32 @@ mod tests {
         // inconclusive -> passed=true (il gate non lo conteggia come fallimento).
         assert!(res[0].passed);
         assert_eq!(res[0].evidence["inconclusive"], json!(true));
+    }
+
+    #[sqlx::test]
+    async fn http_in_replay_e_inconclusive_senza_chiamata(pool: PgPool) {
+        // FIX FINDING F2c-2: il criterio http in modalita' Replay (shadow) NON
+        // deve eseguire reqwest. Si esercita con un URL irraggiungibile: se la
+        // chiamata partisse il criterio fallirebbe (passed=false, evidence.error);
+        // invece deve ritornare inconclusive (passed=true) senza alcuna rete.
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "http",
+                    json!({ "url": "http://127.0.0.1:1/never-reached" }),
+                    json!({ "status": 200 }),
+                )],
+                ExecMode::Replay,
+            )
+            .await
+            .expect("ok");
+        assert!(res[0].passed, "Replay -> inconclusive (passed=true, non conteggiato)");
+        assert_eq!(res[0].evidence["inconclusive"], json!(true));
+        // Nessuna evidence di una chiamata avvenuta (no status, no error di rete).
+        assert!(res[0].evidence.get("status").is_none());
+        assert!(res[0].evidence.get("error").is_none());
     }
 
     #[sqlx::test]

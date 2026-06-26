@@ -62,6 +62,7 @@
 
 use std::sync::Arc;
 
+use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -74,6 +75,7 @@ use nexus_agent_graph::runtime::ports::{
     LlmGateway, MetaStepStore, ModelUpscalePort, NextActionsDeriver, RunControlStore, TodoStore,
     ToolExecutor, VerifierRunStore,
 };
+use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
     build_agent_graph, AgentGraphEngine, AgentGraphNodes, AgentNodeCtx, AgentState, ClarifyConfig,
     ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, LearnerConfig, LearnerNode, Message,
@@ -201,15 +203,45 @@ async fn resolve_purpose(db: &PgPool, purpose: &str) -> (String, String) {
     }
 }
 
+/// Ruolo del run nel motore nativo: distingue il run PRIMARIO (side-effect
+/// reali, output SSE, checkpoint persistente) dal run SHADOW (read-only).
+///
+/// PUNTO UNICO (regola L) della differenza primario/shadow: `build_native_engine`
+/// e `run_engine` leggono SOLO questo enum per decidere tools/emit/checkpointer
+/// e il flag `shadow` del ctx; non c'e' alcun altro `if shadow` sparso. Lo shadow
+/// porta con se' il `primary_run_id` da cui rileggere i tool_result in Replay.
+#[derive(Clone, Copy)]
+enum RunRole {
+    /// Run primario: tool REALI, SSE verso il frontend, checkpoint Postgres.
+    Primary,
+    /// Run shadow read-only: tool in Replay dal primario (`primary_run_id`),
+    /// EventSink no-op, checkpointer in-memory (niente scritture).
+    Shadow { primary_run_id: Uuid },
+}
+
+impl RunRole {
+    /// `true` se questo e' un run shadow (read-only).
+    fn is_shadow(&self) -> bool {
+        matches!(self, RunRole::Shadow { .. })
+    }
+}
+
 /// Costruisce le 14 impl concrete + gli 11 nodi (porte iniettate) + la
 /// `RoutingConfig` e la `PlannerConfig` DB-driven, e assembla il
-/// [`AgentGraphEngine`] col checkpointer Postgres.
+/// [`AgentGraphEngine`].
+///
+/// Il `role` decide le sole tre porte che cambiano fra primario e shadow (regola
+/// L: un solo punto): `tools` (Real vs Replay), `emit` (SSE vs no-op),
+/// `checkpointer` (Postgres vs in-memory). Tutto il resto (nodi, config DB-driven,
+/// purpose model) e' IDENTICO -> lo shadow attraversa la STESSA topologia del
+/// primario, presupposto del confronto di parita'.
 ///
 /// Ritorna anche la `RoutingConfig` risolta (serve a popolare il ctx, il cui
 /// `recursion_limit` viene letto dal motore) + le porte gateway/tools per il ctx.
 async fn build_native_engine(
     deps: &NativeDeps,
     input: &NativeRunInput,
+    role: RunRole,
 ) -> anyhow::Result<(
     AgentGraphEngine,
     RoutingConfig,
@@ -240,17 +272,31 @@ async fn build_native_engine(
     // Gateway LLM (provider/model gia' risolti, il client non re-instrada).
     let llm: Arc<dyn LlmGateway> = Arc::new(GatewayLlmAdapter::new(deps.gateway.clone()));
 
-    // ToolRunner in-process (Real): mcp-core E' il ToolRunner (no gRPC su se'
-    // stesso). `primary_run_id=None`: questo e' il run primario (non shadow).
-    let tools: Arc<dyn ToolExecutor> = Arc::new(ToolRunnerExecutorAdapter::new(
-        deps.tool_runner_deps.clone(),
-        input.session_id,
-        None,
-    ));
+    // ToolExecutor: dipende dal ruolo (regola L, punto unico).
+    //  - Primary: ToolRunner in-process REALE (mcp-core E' il ToolRunner, no gRPC
+    //    su se' stesso). `primary_run_id=None`.
+    //  - Shadow: Replay-only by-construction (nessun `ToolRunnerDeps`): rilegge i
+    //    tool_result del primario da `agent_steps`, ZERO side-effect.
+    let tools: Arc<dyn ToolExecutor> = match role {
+        RunRole::Primary => Arc::new(ToolRunnerExecutorAdapter::new(
+            deps.tool_runner_deps.clone(),
+            input.session_id,
+            None,
+        )),
+        RunRole::Shadow { primary_run_id } => Arc::new(
+            ToolRunnerExecutorAdapter::from_db_for_replay(db.clone(), Some(primary_run_id)),
+        ),
+    };
 
-    // Canale SSE: lo STESSO broadcast del run (parita' 1:1 con run_via_brain).
-    let emit: Arc<dyn EventSink> =
-        Arc::new(SseEventSinkAdapter::new(input.step_tx.clone(), input.run_id));
+    // Canale eventi: dipende dal ruolo.
+    //  - Primary: STESSO broadcast SSE del run (parita' 1:1 con run_via_brain).
+    //  - Shadow: NullEventSink (no-op): il run shadow non emette NULLA verso il
+    //    frontend (l'output all'utente resta quello del primario).
+    let emit: Arc<dyn EventSink> = if role.is_shadow() {
+        Arc::new(NullEventSink)
+    } else {
+        Arc::new(SseEventSinkAdapter::new(input.step_tx.clone(), input.run_id))
+    };
 
     // Store DB + porte ausiliarie.
     let run_control: Arc<dyn RunControlStore> = Arc::new(PgRunControlStore::new(db.clone()));
@@ -350,8 +396,18 @@ async fn build_native_engine(
         learner: Arc::new(LearnerNode::new(LearnerConfig::default())),
     };
 
-    // Checkpointer Postgres (persistenza per-superstep su nexus_graph_checkpoints).
-    let checkpointer = Arc::new(nexus_agent_graph::PgCheckpointer::new(db.clone()));
+    // Checkpointer: dipende dal ruolo.
+    //  - Primary: Postgres (persistenza per-superstep su nexus_graph_checkpoints,
+    //    serve al recovery di un run interrotto).
+    //  - Shadow: IN-MEMORY. Lo shadow gira UNA volta fino a End e NON deve scrivere
+    //    su nexus_graph_checkpoints (i checkpoint Python e Rust hanno topologie
+    //    diverse: persisterli inquinerebbe la tabella di recovery del primario).
+    let checkpointer: Arc<dyn nexus_graph::checkpoint::Checkpointer<AgentState>> =
+        if role.is_shadow() {
+            Arc::new(nexus_graph::MemoryCheckpointer::<AgentState>::new())
+        } else {
+            Arc::new(nexus_agent_graph::PgCheckpointer::new(db.clone()))
+        };
 
     let engine = build_agent_graph(nodes, routing_cfg.clone(), planner_cfg, checkpointer);
     Ok((engine, routing_cfg, llm, tools, emit))
@@ -443,17 +499,25 @@ fn parse_automation_mode(s: &str) -> Option<nexus_agent_graph::AutomationMode> {
 /// Per il path primario `shadow=false` (`ExecMode::Real`): i tool hanno
 /// side-effect reali sul progetto.
 pub async fn run_native(deps: &NativeDeps, input: &NativeRunInput) -> anyhow::Result<NativeRunOutcome> {
-    run_native_inner(deps, input, true).await
+    let outcome = run_engine(deps, input, true, RunRole::Primary).await?;
+    Ok(map_outcome(outcome))
 }
 
-/// Variante interna con controllo esplicito su nuovo-run vs resume. Estratta per
-/// il test E2E (che esercita sia il run completo sia il resume da checkpoint).
-async fn run_native_inner(
+/// Esegue il grafo nativo end-to-end e ritorna lo [`StepOutcome`] COMPLETO (lo
+/// stato finale, non solo il sommario): il run shadow ne ha bisogno per la
+/// proiezione canonica (conteggio tool, produced_work). Punto unico (regola L)
+/// dell'esecuzione del motore: sia il primario che lo shadow passano di qui,
+/// distinti solo dal `role` (e dal `new_run`).
+///
+/// `new_run` distingue nuovo run (Some initial_state) da resume (None, riparte dal
+/// checkpoint). `role` decide tools/emit/checkpointer + il flag `shadow` del ctx.
+async fn run_engine(
     deps: &NativeDeps,
     input: &NativeRunInput,
     new_run: bool,
-) -> anyhow::Result<NativeRunOutcome> {
-    let (engine, routing_cfg, llm, tools, emit) = build_native_engine(deps, input).await?;
+    role: RunRole,
+) -> anyhow::Result<StepOutcome<AgentState>> {
+    let (engine, routing_cfg, llm, tools, emit) = build_native_engine(deps, input, role).await?;
 
     let ctx = AgentNodeCtx {
         db: deps.db.clone(),
@@ -465,9 +529,10 @@ async fn run_native_inner(
         run_id: input.run_id,
         session_id: input.session_id,
         thread_id: input.run_id,
-        // Run PRIMARIO: Real (side-effect reali). Lo shadow ha il suo path (crate
-        // `shadow`), non passa di qui.
-        shadow: false,
+        // `shadow` deriva dal ruolo: in Shadow i nodi usano ExecMode::Replay (punto
+        // unico AgentNodeCtx::exec_mode) -> tutti gli store gatati no-op, zero
+        // side-effect. Il primario e' Real.
+        shadow: role.is_shadow(),
     };
 
     let init = if new_run {
@@ -476,12 +541,10 @@ async fn run_native_inner(
         None
     };
 
-    let outcome = engine
+    engine
         .run_until_interrupt(input.run_id, init, &ctx)
         .await
-        .map_err(|e| anyhow::anyhow!("motore nativo: run_until_interrupt fallita: {e}"))?;
-
-    Ok(map_outcome(outcome))
+        .map_err(|e| anyhow::anyhow!("motore nativo: run_until_interrupt fallita: {e}"))
 }
 
 /// Mappa lo [`StepOutcome`] del motore nel [`NativeRunOutcome`] del chiamante.
@@ -504,6 +567,246 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             resume_at: Some(resume_at.as_label().to_string()),
         },
     }
+}
+
+// ===========================================================================
+// SHADOW (F4): driver di confronto STATO FINALE primario Python <-> shadow Rust.
+//
+// Modello STRADA B (confronto stato finale, NON per-nodo): il grafo Python e
+// quello Rust hanno topologie DIVERSE (i nodi non corrispondono 1:1), quindi un
+// confronto per-nodo e' inutile. Si esegue l'INTERO grafo Rust in shadow (Replay
+// dei tool_result del primario, LlmGateway REAL) e si confronta la PROIEZIONE
+// CANONICA dell'esito (segnali STRUTTURALI), NON il testo della risposta (con
+// LLM Real il testo diverge sempre -> rumore inutile). Si persiste UN solo record
+// in nexus_shadow_telemetry con node_name "__final_state__".
+// ===========================================================================
+
+/// Pseudo-nodo della telemetria shadow: il confronto e' sullo STATO FINALE, non
+/// per-nodo (le topologie Python/Rust differiscono). Un solo record per run.
+const SHADOW_FINAL_STATE_NODE: &str = "__final_state__";
+
+/// Tool che producono LAVORO concreto sul progetto (scrittura/modifica/esecuzione).
+/// Se il run ne ha invocato almeno uno, `has_produced_work=true` nella proiezione
+/// canonica. Lista MINIMA estendibile (e' una proiezione, non un enforcement).
+const MUTATING_TOOLS: &[&str] = &[
+    "write_file",
+    "edit_file",
+    "create_file",
+    "apply_patch",
+    "rename_file",
+    "fs_move",
+    "run_command",
+];
+
+/// Canonicalizza un `stop_reason` (Rust o Python) al VOCABOLARIO COMUNE della
+/// proiezione: `end_turn` / `tool_use` / `failed` / `interrupted` / `loop` /
+/// `superseded` / `other`. Punto unico (regola L): sia il primario (stringa dal
+/// DB) sia lo shadow (enum Rust mappato a stringa via serde) passano di qui, cosi'
+/// i due lati sono confrontabili anche se nascono da rappresentazioni diverse.
+///
+/// `None` (nessun stop_reason) -> `"none"`. Stringhe Python note (es. lo status
+/// `agent_runs.status` quando lo stop_reason non e' separato) sono mappate ai
+/// valori del vocabolario; le ignote ricadono su `"other"` (esplicito, niente
+/// magic fallback su un valore di business — regola G).
+fn canonical_stop_reason(raw: Option<&str>) -> &'static str {
+    match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        None => "none",
+        Some(s) => match s.as_str() {
+            // Vocabolario comune diretto.
+            "end_turn" | "endturn" | "stop" | "completed" | "completed_verified" => "end_turn",
+            "tool_use" | "tooluse" => "tool_use",
+            "error" | "failed" | "failed_diagnosed" => "failed",
+            "interrupted" | "awaiting_confirmation" | "blocked_needs_input" => "interrupted",
+            "loop_detected" | "loop_abort" | "loopdetected" | "loopabort" => "loop",
+            "superseded" => "superseded",
+            "g1_escalated" | "g1_cap_reached" | "g1escalated" | "g1capreached" => "g1",
+            "" => "none",
+            _ => "other",
+        },
+    }
+}
+
+/// Serializza lo `StopReason` Rust nella sua forma snake_case (la stessa del
+/// `#[serde(rename_all = "snake_case")]` dell'enum) per poi canonicalizzarla con
+/// lo STESSO `canonical_stop_reason` del primario (un solo vocabolario, regola L).
+fn stop_reason_label(sr: Option<StopReason>) -> Option<String> {
+    sr.and_then(|r| match serde_json::to_value(r) {
+        Ok(Value::String(s)) => Some(s),
+        _ => None,
+    })
+}
+
+/// Proiezione canonica MINIMA dell'esito di un run (chiavi STRUTTURALI, NON il
+/// testo della risposta). E' il punto unico del confronto shadow (regola L):
+/// sia il primario sia lo shadow producono questa stessa forma, cosi'
+/// `compute_diff` opera su chiavi omogenee. Estendibile con altre chiavi
+/// strutturali (es. files_touched) senza toccare il confronto.
+///
+/// Chiavi:
+/// - `completed` (bool): il grafo e' arrivato a completare?
+/// - `stop_reason` (string): vocabolario comune (vedi `canonical_stop_reason`).
+/// - `num_tool_calls` (int): quanti tool sono stati invocati.
+/// - `has_produced_work` (bool): almeno un tool mutativo (write/edit/run/...)?
+fn make_canonical(
+    completed: bool,
+    stop_reason: &str,
+    num_tool_calls: i64,
+    has_produced_work: bool,
+) -> Value {
+    serde_json::json!({
+        "completed": completed,
+        "stop_reason": stop_reason,
+        "num_tool_calls": num_tool_calls,
+        "has_produced_work": has_produced_work,
+    })
+}
+
+/// Proiezione canonica dell'esito del run SHADOW dal suo `AgentState` finale.
+///
+/// - `completed`: lo `StepOutcome` e' `Completed` (passato dal driver).
+/// - `stop_reason`: canonicalizzato dall'enum Rust.
+/// - tool calls: contati dai `Message` dello stato (forma OpenAI-compat
+///   `Ai.tool_calls` + forma Anthropic `ContentBlock::ToolUse` inline). Per
+///   `has_produced_work` si guarda il NOME del tool contro `MUTATING_TOOLS`.
+fn shadow_canonical(state: &AgentState, completed: bool) -> Value {
+    use nexus_agent_graph::state::{ContentBlock, MessageContent};
+
+    let mut num_tool_calls: i64 = 0;
+    let mut produced = false;
+    let mut note_tool = |name: &str| {
+        num_tool_calls += 1;
+        if MUTATING_TOOLS.contains(&name) {
+            produced = true;
+        }
+    };
+
+    for m in &state.messages {
+        if let Message::Ai { content, tool_calls } = m {
+            // Forma OpenAI-compat: tool_calls fuori dal contenuto.
+            for tc in tool_calls {
+                note_tool(&tc.name);
+            }
+            // Forma Anthropic: ToolUse come blocco di contenuto inline.
+            if let MessageContent::Blocks(blocks) = content {
+                for b in blocks {
+                    if let ContentBlock::ToolUse { name, .. } = b {
+                        note_tool(name);
+                    }
+                }
+            }
+        }
+    }
+
+    let sr_label = stop_reason_label(state.stop_reason);
+    make_canonical(
+        completed,
+        canonical_stop_reason(sr_label.as_deref()),
+        num_tool_calls,
+        produced,
+    )
+}
+
+/// Proiezione canonica dell'esito del run PRIMARIO (Python) letta dal DB.
+///
+/// - `completed`: lo `status` di `agent_runs` e' uno stato di successo
+///   (completed / completed_verified).
+/// - `stop_reason`: canonicalizzato dallo `status` (il primario Python non
+///   persiste uno `stop_reason` separato in agent_runs: lo status e' il segnale
+///   strutturale di chiusura).
+/// - tool calls: contati da `agent_steps` (gli step del run = i tool invocati);
+///   `has_produced_work` se almeno un `tool_name` e' mutativo.
+async fn primary_canonical(db: &PgPool, primary_run_id: Uuid) -> anyhow::Result<Value> {
+    // status e' TEXT NOT NULL (mig 0009): fetch_optional -> Option<String> (None
+    // solo se il run non esiste, caso anomalo nel flusso shadow).
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(primary_run_id)
+            .fetch_optional(db)
+            .await?;
+
+    let tool_names: Vec<String> =
+        sqlx::query_scalar("SELECT tool_name FROM agent_steps WHERE run_id = $1")
+            .bind(primary_run_id)
+            .fetch_all(db)
+            .await?;
+
+    let num_tool_calls = tool_names.len() as i64;
+    let has_produced_work = tool_names
+        .iter()
+        .any(|n| MUTATING_TOOLS.contains(&n.as_str()));
+    let status_lc = status.as_deref().map(|s| s.to_ascii_lowercase());
+    let completed = matches!(
+        status_lc.as_deref(),
+        Some("completed") | Some("completed_verified")
+    );
+
+    Ok(make_canonical(
+        completed,
+        canonical_stop_reason(status.as_deref()),
+        num_tool_calls,
+        has_produced_work,
+    ))
+}
+
+/// Driver SHADOW: dato un run PRIMARIO Python gia' concluso, ri-esegue l'intero
+/// grafo Rust in modalita' shadow (read-only) e persiste UN record di telemetria
+/// con il confronto della proiezione canonica.
+///
+/// Shadow-safety (zero side-effect, regola E/F): `ExecMode::Replay` (tool e store
+/// gatati no-op), `ToolExecutor::from_db_for_replay` (rilegge i tool_result del
+/// primario), `NullEventSink` (niente SSE), `MemoryCheckpointer` (niente scritture
+/// su nexus_graph_checkpoints), criterio http del final_gate gatato in Replay
+/// (niente reqwest). L'LLM e' REAL (lo shadow chiama davvero il modello: costo
+/// token accettato, e' il senso dello shadow).
+///
+/// Su QUALUNQUE errore lo shadow ritorna `Err` ma il chiamante lo tratta come
+/// WARN: lo shadow non deve MAI impattare il run primario.
+pub async fn run_shadow(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+    primary_run_id: Uuid,
+) -> anyhow::Result<()> {
+    // Esegue il grafo Rust in shadow: nuovo run (initial_state dal prompt del
+    // primario), tools in Replay sul primario, checkpointer in-memory.
+    let outcome = run_engine(
+        deps,
+        input,
+        true,
+        RunRole::Shadow { primary_run_id },
+    )
+    .await?;
+
+    let (shadow_state, completed) = match &outcome {
+        StepOutcome::Completed(s) => (s, true),
+        StepOutcome::Interrupted { state, .. } => (state, false),
+    };
+
+    // Proiezioni canoniche: primario dal DB, shadow dallo stato finale.
+    let primary = primary_canonical(&deps.db, primary_run_id).await?;
+    let shadow = shadow_canonical(shadow_state, completed);
+
+    // Persiste UN record "__final_state__" col diff (punto unico shadow, regola L:
+    // NESSUN uso di DiffCollector::record per-nodo). persist_node_diff ricalcola
+    // internamente i divergent_keys via compute_diff.
+    let divergent = nexus_agent_graph::compute_diff(&primary, &shadow);
+    nexus_agent_graph::persist_node_diff(
+        &deps.db,
+        primary_run_id,
+        SHADOW_FINAL_STATE_NODE,
+        &primary,
+        &shadow,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("persistenza telemetria shadow: {e}"))?;
+
+    // Niente leak (regola F): si logga la convergenza strutturale, non il testo.
+    tracing::info!(
+        primary_run_id = %primary_run_id,
+        converged = divergent.is_empty(),
+        divergent_keys = ?divergent,
+        "shadow: confronto stato finale persistito (__final_state__)"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -654,5 +957,241 @@ mod tests {
         // Sanity: il client gateway e' costruibile (l'adapter lo avvolge senza I/O).
         let gw = NexusGatewayClient::new("http://127.0.0.1:1".to_string(), "tok".to_string());
         let _adapter = GatewayLlmAdapter::new(gw);
+    }
+
+    // ── SHADOW (F4): proiezione canonica + persistenza telemetria ─────────────
+    //
+    // Il driver completo `run_shadow` esegue il grafo via `build_native_engine`,
+    // che costruisce un `GatewayLlmAdapter` su `NexusGatewayClient` HTTP: non
+    // scriptabile in unit test (l'E2E del grafo con gateway stub vive in
+    // `nexus_agent_graph::graph`). Qui copriamo la parte SPECIFICA del driver che
+    // quel test non tocca: la PROIEZIONE CANONICA (vocabolario comune Python/Rust)
+    // e la PERSISTENZA del singolo record "__final_state__". Le garanzie di
+    // zero-scrittura (Replay, MemoryCheckpointer, NullEventSink, gate http in
+    // Replay) sono testate ognuna nel proprio modulo.
+
+    use serde_json::json;
+
+    #[test]
+    fn canonical_stop_reason_mappa_vocabolario_comune() {
+        // Python (status agent_runs) -> vocabolario comune.
+        assert_eq!(canonical_stop_reason(Some("completed")), "end_turn");
+        assert_eq!(canonical_stop_reason(Some("completed_verified")), "end_turn");
+        assert_eq!(canonical_stop_reason(Some("failed")), "failed");
+        assert_eq!(canonical_stop_reason(Some("failed_diagnosed")), "failed");
+        assert_eq!(
+            canonical_stop_reason(Some("awaiting_confirmation")),
+            "interrupted"
+        );
+        // Rust (StopReason snake_case) -> stesso vocabolario.
+        assert_eq!(canonical_stop_reason(Some("end_turn")), "end_turn");
+        assert_eq!(canonical_stop_reason(Some("tool_use")), "tool_use");
+        assert_eq!(canonical_stop_reason(Some("error")), "failed");
+        assert_eq!(canonical_stop_reason(Some("loop_abort")), "loop");
+        assert_eq!(canonical_stop_reason(Some("superseded")), "superseded");
+        assert_eq!(canonical_stop_reason(Some("g1_escalated")), "g1");
+        // None / ignoto.
+        assert_eq!(canonical_stop_reason(None), "none");
+        assert_eq!(canonical_stop_reason(Some("qualcosa-di-strano")), "other");
+    }
+
+    #[test]
+    fn stop_reason_label_serializza_snake_case() {
+        // L'enum Rust serializza nella forma snake_case poi canonicalizzata uguale
+        // al primario (un solo vocabolario, regola L).
+        let lbl = stop_reason_label(Some(StopReason::EndTurn));
+        assert_eq!(lbl.as_deref(), Some("end_turn"));
+        assert_eq!(canonical_stop_reason(lbl.as_deref()), "end_turn");
+        assert!(stop_reason_label(None).is_none());
+    }
+
+    #[test]
+    fn shadow_canonical_conta_tool_e_produced_work() {
+        use nexus_agent_graph::state::{ContentBlock, MessageContent, ToolUse};
+
+        let state = AgentState {
+            stop_reason: Some(StopReason::EndTurn),
+            messages: vec![
+                Message::Human {
+                    content: MessageContent::text("scrivi e leggi"),
+                },
+                // Forma OpenAI-compat: un read_file (non mutativo).
+                Message::Ai {
+                    content: MessageContent::text(""),
+                    tool_calls: vec![ToolUse {
+                        id: "t1".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({}),
+                    }],
+                },
+                // Forma Anthropic: un edit_file inline (mutativo) -> produced_work.
+                Message::Ai {
+                    content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                        id: "t2".to_string(),
+                        name: "edit_file".to_string(),
+                        input: json!({}),
+                    }]),
+                    tool_calls: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let c = shadow_canonical(&state, true);
+        assert_eq!(c["completed"], json!(true));
+        assert_eq!(c["stop_reason"], json!("end_turn"));
+        assert_eq!(c["num_tool_calls"], json!(2), "read_file + edit_file");
+        assert_eq!(c["has_produced_work"], json!(true), "edit_file e' mutativo");
+    }
+
+    #[test]
+    fn shadow_canonical_solo_testo_nessun_lavoro() {
+        let state = AgentState {
+            stop_reason: Some(StopReason::EndTurn),
+            messages: vec![Message::Ai {
+                content: nexus_agent_graph::state::MessageContent::text("risposta testuale"),
+                tool_calls: vec![],
+            }],
+            ..Default::default()
+        };
+        let c = shadow_canonical(&state, true);
+        assert_eq!(c["num_tool_calls"], json!(0));
+        assert_eq!(c["has_produced_work"], json!(false));
+    }
+
+    /// Tabelle minimali per `primary_canonical`: agent_runs (status) + agent_steps.
+    async fn create_primary_tables(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE agent_runs ( \
+                 id UUID PRIMARY KEY, \
+                 status TEXT NOT NULL DEFAULT 'running' \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create agent_runs");
+        sqlx::query(
+            "CREATE TABLE agent_steps ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 run_id UUID NOT NULL, \
+                 step_index INT NOT NULL, \
+                 tool_name TEXT NOT NULL, \
+                 tool_input JSONB NOT NULL DEFAULT '{}'::jsonb, \
+                 tool_result TEXT, \
+                 status TEXT NOT NULL DEFAULT 'completed' \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create agent_steps");
+    }
+
+    async fn create_shadow_telemetry_table(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_shadow_telemetry ( \
+                 id UUID PRIMARY KEY, \
+                 run_id UUID NOT NULL, \
+                 node_name TEXT NOT NULL, \
+                 primary_output JSONB NOT NULL, \
+                 shadow_output JSONB NOT NULL, \
+                 divergent_keys TEXT[] NOT NULL DEFAULT '{}', \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_shadow_telemetry");
+    }
+
+    #[sqlx::test]
+    async fn primary_canonical_legge_status_e_step(pool: sqlx::PgPool) {
+        create_primary_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'completed')")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        // Due step: un read_file (non mutativo) + un write_file (mutativo).
+        for (i, name) in [(1000, "read_file"), (2000, "write_file")] {
+            sqlx::query(
+                "INSERT INTO agent_steps (id, run_id, step_index, tool_name) \
+                 VALUES (gen_random_uuid(), $1, $2, $3)",
+            )
+            .bind(run)
+            .bind(i)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("insert step");
+        }
+
+        let c = primary_canonical(&pool, run).await.expect("canonical");
+        assert_eq!(c["completed"], json!(true));
+        assert_eq!(c["stop_reason"], json!("end_turn"), "completed -> end_turn");
+        assert_eq!(c["num_tool_calls"], json!(2));
+        assert_eq!(c["has_produced_work"], json!(true), "write_file mutativo");
+    }
+
+    #[sqlx::test]
+    async fn shadow_persiste_un_solo_record_final_state(pool: sqlx::PgPool) {
+        // Replica la parte finale di run_shadow (dopo l'esecuzione del grafo): il
+        // confronto canonico primario(DB)<->shadow(stato) e la persistenza del
+        // SINGOLO record "__final_state__". Verifica che ci sia ESATTAMENTE una
+        // riga, sul nodo "__final_state__", con i divergent_keys attesi.
+        create_primary_tables(&pool).await;
+        create_shadow_telemetry_table(&pool).await;
+        let run = Uuid::new_v4();
+        // Primario: completed, 0 step (nessun tool, nessun lavoro).
+        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'completed')")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+
+        let primary = primary_canonical(&pool, run).await.expect("primary");
+        // Shadow: completato ma con un write_file (diverge su num_tool_calls +
+        // has_produced_work rispetto al primario a 0 tool).
+        let shadow_state = AgentState {
+            stop_reason: Some(StopReason::EndTurn),
+            messages: vec![Message::Ai {
+                content: nexus_agent_graph::state::MessageContent::text(""),
+                tool_calls: vec![nexus_agent_graph::state::ToolUse {
+                    id: "t".to_string(),
+                    name: "write_file".to_string(),
+                    input: json!({}),
+                }],
+            }],
+            ..Default::default()
+        };
+        let shadow = shadow_canonical(&shadow_state, true);
+
+        nexus_agent_graph::persist_node_diff(
+            &pool,
+            run,
+            SHADOW_FINAL_STATE_NODE,
+            &primary,
+            &shadow,
+        )
+        .await
+        .expect("persist telemetria shadow");
+
+        // ESATTAMENTE un record, sul nodo __final_state__.
+        let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+            "SELECT node_name, divergent_keys FROM nexus_shadow_telemetry WHERE run_id = $1",
+        )
+        .bind(run)
+        .fetch_all(&pool)
+        .await
+        .expect("select telemetria");
+        assert_eq!(rows.len(), 1, "un solo record per run shadow");
+        assert_eq!(rows[0].0, "__final_state__");
+        // Divergenze attese: num_tool_calls (0 vs 1) + has_produced_work (false vs true).
+        let mut keys = rows[0].1.clone();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["has_produced_work".to_string(), "num_tool_calls".to_string()]
+        );
     }
 }
