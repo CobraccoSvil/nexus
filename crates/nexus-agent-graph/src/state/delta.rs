@@ -342,6 +342,12 @@ pub struct StateDelta {
     /// Vedi `AgentState::plan_revisions`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub plan_revisions: Option<Option<i64>>,
+    /// Vedi `AgentState::pending_clarifications`.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub pending_clarifications: Option<Option<Vec<Value>>>,
+    /// Vedi `AgentState::applied_default_assumptions`.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub applied_default_assumptions: Option<Option<Vec<Value>>>,
 
     // ── Sub-agents ──────────────────────────────────────────────────────────────
     /// Vedi `AgentState::parent_run_id`.

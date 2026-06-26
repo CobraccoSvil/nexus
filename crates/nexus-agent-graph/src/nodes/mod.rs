@@ -14,6 +14,7 @@
 pub mod clarify_or_expand;
 pub mod final_gate;
 pub mod learner;
+pub mod planner;
 pub mod reflection;
 pub mod router;
 pub mod todo_runner;
@@ -25,6 +26,10 @@ pub use clarify_or_expand::{
 };
 pub use final_gate::{count_build_errors, FinalGateConfig, FinalGateNode};
 pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
+pub use planner::{
+    clarifying_branch, plan_reuse_decision, ClarifyingBranch, PlanReuse, PlannerConfig, PlannerNode,
+    ToolResultOutcome,
+};
 pub use reflection::{ReflectionConfig, ReflectionData, ReflectionNode};
 pub use router::RouterNode;
 pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};

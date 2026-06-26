@@ -306,10 +306,25 @@ pub trait EventSink: Send + Sync {
     fn emit(&self, ev: SseEvent);
 }
 
+/// Riga di piano (`nexus_agent_plans`) nella forma MINIMALE che serve al riuso
+/// piano intent/mode-aware del planner (`planner_node.py:84-113`,
+/// `todo_store.fetch_plan`). Trasporta SOLO i due campi su cui il planner decide
+/// l'invalidazione (`user_intent` / `behavior_mode`): un piano esistente si
+/// RIUSA se questi non sono cambiati (campo non-None e divergente -> rigenera).
+/// I piani legacy (pre-mig 0328) hanno questi campi a `None` (intent non
+/// tracciato): in quel caso il riuso storico e' mantenuto (vedi nota Python).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlanRow {
+    /// Intent con cui il piano e' stato creato (`None` per i piani legacy).
+    pub user_intent: Option<String>,
+    /// Behavior_mode con cui il piano e' stato creato (`None` per i legacy).
+    pub behavior_mode: Option<String>,
+}
+
 /// Astrazione dell'I/O sui todo del DAG (`brain/agents/todo_store.py`). Confine
 /// d'inversione: la LOGICA DAG (selezione, ready layer, discendenti) e' pura e
 /// vive in [`crate::decisions::dag_scheduler`] (punto unico, regola L); questo
-/// trait isola SOLO l'accesso DB. I nodi (`verifier`/`todo_runner`, PR futuro)
+/// trait isola SOLO l'accesso DB. I nodi (`verifier`/`todo_runner`/`planner`)
 /// leggono i todo da qui e delegano la decisione al modulo puro.
 ///
 /// mcp-core la implementera' con `sqlx` su `nexus_agent_todos` (TODO: impl
@@ -327,6 +342,17 @@ pub trait TodoStore: Send + Sync {
     /// Tutti i todo del run, ordinati per `seq` ascendente, con `depends_on`
     /// come `Vec` (cast `::text[]`). 1:1 con `todo_store.list_todos`.
     async fn list_todos(&self, run_id: &str) -> Result<Vec<Todo>, PortError>;
+
+    /// Il piano esistente per il run, se presente (1:1 con
+    /// `todo_store.fetch_plan`). Usato dal `PlannerNode` per il riuso piano
+    /// intent/mode-aware (`planner_node.py:84-113`): `None` = nessun piano
+    /// (prima pianificazione del run). Default `Ok(None)` cosi' le impl che non
+    /// servono il planner (es. il `TodoRunnerNode`, gia' esistente) non devono
+    /// fornirlo; l'impl concreta in mcp-core e lo stub del planner lo
+    /// sovrascrivono.
+    async fn fetch_plan(&self, _run_id: &str) -> Result<Option<PlanRow>, PortError> {
+        Ok(None)
+    }
 
     /// Il todo "attivo": il primo `in_progress`, altrimenti il primo `pending`,
     /// altrimenti `None`. 1:1 con `todo_store.active_todo`. Default fornito sopra

@@ -310,6 +310,15 @@ pub struct AgentState {
     pub verifier_last_result: Option<Value>,
     /// Contatore revisioni strutturali del plan.
     pub plan_revisions: Option<i64>,
+    /// Domande di chiarimento pendenti emesse dal planner (HITL Confirm): se
+    /// valorizzato il turno si ferma in attesa della risposta utente. `None`
+    /// (assente) abilita la pre-flight clarifying del planner; una lista (anche
+    /// vuota) la salta. Forma opaca (lista di `{id, question, suggested_default}`).
+    pub pending_clarifications: Option<Vec<Value>>,
+    /// Assunzioni di default applicate dal planner in modalita' autonoma
+    /// (Automatico/Continuo) al posto di fermarsi per chiarimenti: trasparenza
+    /// (le stesse domande con il loro `suggested_default`). Forma opaca.
+    pub applied_default_assumptions: Option<Vec<Value>>,
 
     // ── Sub-agents ──────────────────────────────────────────────────────────────
     /// Id del run genitore (se sub-run).

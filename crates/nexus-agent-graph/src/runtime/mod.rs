@@ -11,8 +11,8 @@ pub mod ports;
 pub use ctx::AgentNodeCtx;
 pub use ports::{
     CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmMessage,
-    LlmRequest, LlmResponse, LlmUsage, PortError, SseEvent, TodoStore, ToolCall, ToolExecutor,
-    ToolOutcome, VerifierRunRecord, VerifierRunStore,
+    LlmRequest, LlmResponse, LlmUsage, PlanRow, PortError, SseEvent, TodoStore, ToolCall,
+    ToolExecutor, ToolOutcome, VerifierRunRecord, VerifierRunStore,
 };
 
 #[cfg(test)]
@@ -27,8 +27,8 @@ pub mod test_doubles {
 
     use super::ports::{
         CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway, LlmRequest,
-        LlmResponse, LlmUsage, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome, TodoStore,
-        VerifierRunRecord, VerifierRunStore,
+        LlmResponse, LlmUsage, PlanRow, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome,
+        TodoStore, VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
 
@@ -48,6 +48,24 @@ pub mod test_doubles {
                 canned: LlmResponse {
                     content: text.to_string(),
                     tool_calls: vec![],
+                    usage: LlmUsage::default(),
+                },
+                seen: Mutex::new(vec![]),
+            }
+        }
+
+        /// Crea uno stub che emette UN tool_call (nome + input dati), nessun testo.
+        /// Usato dai test dei nodi che forzano una tool call (es. il planner con
+        /// `nexus_todo_write`).
+        pub fn with_tool_call(name: &str, input: serde_json::Value) -> Self {
+            Self {
+                canned: LlmResponse {
+                    content: String::new(),
+                    tool_calls: vec![crate::state::ToolUse {
+                        id: "stub-tc".to_string(),
+                        name: name.to_string(),
+                        input,
+                    }],
                     usage: LlmUsage::default(),
                 },
                 seen: Mutex::new(vec![]),
@@ -167,14 +185,29 @@ pub mod test_doubles {
         /// Storico delle `mark_status` REALI (mode==Real): (todo_id, nuovo_status),
         /// in ordine. Vuoto in shadow (Replay no-op).
         pub marks: Mutex<Vec<(String, TodoStatus)>>,
+        /// Piano restituito da `fetch_plan` (`None` = nessun piano). Usato dai
+        /// test del `PlannerNode` per esercitare il riuso piano intent/mode-aware.
+        pub plan: Mutex<Option<PlanRow>>,
     }
 
     impl StubTodoStore {
         /// Crea uno store coi todo dati (gia' ordinati per `seq` dal chiamante).
+        /// `fetch_plan` ritorna `None` (nessun piano).
         pub fn with_todos(todos: Vec<Todo>) -> Self {
             Self {
                 todos: Mutex::new(todos),
                 marks: Mutex::new(vec![]),
+                plan: Mutex::new(None),
+            }
+        }
+
+        /// Crea uno store coi todo dati + un piano esistente per `fetch_plan`
+        /// (test del riuso piano del `PlannerNode`).
+        pub fn with_plan(todos: Vec<Todo>, plan: Option<PlanRow>) -> Self {
+            Self {
+                todos: Mutex::new(todos),
+                marks: Mutex::new(vec![]),
+                plan: Mutex::new(plan),
             }
         }
     }
@@ -183,6 +216,10 @@ pub mod test_doubles {
     impl TodoStore for StubTodoStore {
         async fn list_todos(&self, _run_id: &str) -> Result<Vec<Todo>, PortError> {
             Ok(self.todos.lock().expect("lock todos").clone())
+        }
+
+        async fn fetch_plan(&self, _run_id: &str) -> Result<Option<PlanRow>, PortError> {
+            Ok(self.plan.lock().expect("lock plan").clone())
         }
 
         async fn mark_status(

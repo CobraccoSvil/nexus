@@ -1,0 +1,1997 @@
+//! `PlannerNode` — porta la SPINA DORSALE deterministica + i rami ON-di-default
+//! di `planner_node` (`brain/agents/planner_node.py:62-621`).
+//!
+//! Il planner produce la TODO list strutturata PRIMA dell'executor quando il run
+//! e' eleggibile (plan_phase). E' un nodo HIGH, OFF di default
+//! (`plan_phase_enabled=false`): con i safe-default DB il nodo fa SEMPRE
+//! pass-through (`is_eligible` false), path identico a oggi. Quando attivo:
+//! risolve provider/model del purpose `planner` (RISOLTI A MONTE, regola G),
+//! esegue UNA chiamata LLM con tool_choice forzato su `nexus_todo_write`, esegue
+//! il tool via ToolRunner (persiste su `nexus_agent_todos`) e popola lo stato per
+//! l'executor. In caso di problema NON blocca mai il run: segna
+//! `plan_phase_active=false` + `plan_phase_skip_reason` e il loop legacy prende
+//! il sopravvento (fallback).
+//!
+//! ## Cosa porta QUESTO PR (deterministico + rami ON di default, golden 1:1)
+//!
+//! - **`is_eligible`** (`orchestrator_config.py:410-428`,
+//!   [`PlannerConfig::is_eligible`]): i 4 gate (plan_phase_enabled AND
+//!   behavior_mode in plan_behavior_modes AND intent in plan_intents AND
+//!   token_budget >= plan_min_token_budget), confronto case-insensitive. false ->
+//!   pass-through (`{plan_phase_active:false}`).
+//! - **Riuso piano intent/mode-aware** (`:84-113`, [`PlannerNode::plan_reuse`]):
+//!   se `fetch_plan(run_id)` esiste, INVALIDA solo se `plan_intent != intent`
+//!   (non-None) o `plan_mode != behavior_mode` (non-None) -> rigenera; altrimenti
+//!   delta di riuso. Decisione PURA (i fetch sono I/O del nodo).
+//! - **Clarifying pre-flight branching** (`:132-170`, RAMO ON,
+//!   [`PlannerNode::clarifying_branch`]): dato l'esito di `_detect_clarifications`
+//!   (LLM, delegato), il BRANCHING e' deterministico: Confirm/study/None ->
+//!   si FERMA (`awaiting_clarifications` + `pending_clarifications`);
+//!   Automatico/Continuo -> applica `suggested_default`
+//!   (`applied_default_assumptions`) e PROSEGUE. Golden sul branching.
+//! - **Tool catalog `nexus_todo_write`** (`:221-290`, [`tool_catalog`]): schema
+//!   JSON statico. Costante 1:1.
+//! - **`hinted_system`** (`:296-366`, rami ON, [`PlannerNode::build_hinted_system`]):
+//!   `system_text` + RUN_ID hint + `<comprensione_preliminare>` (context_brief) +
+//!   turn_focus PREPEND (riusa [`crate::decisions::turn_focus::build_turn_focus_directive`],
+//!   punto unico, regola L). Ordine di concatenazione 1:1. RAG/backlog/dag = OFF
+//!   (TODO, vedi sotto).
+//! - **Fallback chain decision** (`:399-492`,
+//!   [`PlannerNode::resolve_todo_block`]): `next()` su tool_use per
+//!   `nexus_todo_write`; se None -> fallback tool-robust (provider/model diverso,
+//!   escluse sentinelle); se ancora None -> fallback DETERMINISTICO da
+//!   `playbook_steps` ([`playbook_fallback_block`]); altrimenti skip
+//!   `no_tool_use_emitted`.
+//! - **Build tool_input + parse** (`:495-527`, [`build_tool_input`] /
+//!   [`parse_tool_result`]): forza `run_id`, `setdefault planner_model`, persiste
+//!   `user_intent`/`behavior_mode`, parse JSON, gate `result.ok`.
+//! - **Sticky cascade M69** (`:176-184`): se `planner_sticky_provider/model`
+//!   presenti, salta il purpose_model.
+//! - **Sentinella gate ADR 0020** (`:198-209`): provider sentinella
+//!   (`__router_unavailable__` / `__no_capable_provider__`) -> skip
+//!   `no_capable_provider`.
+//!
+//! ## Cosa NON porta (rami OFF di default + I/O delegato, TODO espliciti)
+//!
+//! - **RAG decisionale** (`_retrieve_decision_context`, `:624`),
+//!   **backlog brief** (`_retrieve_backlog_brief`, `:694`), **dag_kb**
+//!   (`dag_kb.build_dependency_context`, `:339`), **persist rationale come nota**
+//!   (`_persist_rationale_as_note`, `:735`): rami OFF di default
+//!   (`plan_rationale_enabled` / `dag_topological_enabled` False). NON portati
+//!   (nessuna divergenza coi default OFF); richiedono la porta KB-search non
+//!   ancora presente in `runtime::ports`. TODO esplicito.
+//! - **`apply_context_reduction`** (freno contesto, `:375`): non esiste ancora un
+//!   punto unico lato Rust -> TODO documentato. Sui golden e' irrilevante (i
+//!   messaggi LLM sono input stubati); nel runtime il chiamante dovra' applicarlo
+//!   prima di passare i messaggi (vedi nota in `build_llm_messages`).
+//! - **Chiamata LLM planner + fallback + `_detect_clarifications`**: I/O dietro
+//!   [`crate::runtime::LlmGateway`] (`ctx.llm`); provider/model/prompt RISOLTI A
+//!   MONTE (regola G), passati nella [`PlannerConfig`] / via la `LlmRequest`.
+//!   In shadow l'LLM segue il pattern del crate (oggi latente come negli altri
+//!   nodi: vedi `clarify_or_expand`/`understanding`).
+//! - **`nexus_todo_write` + `knowledge_create_note`**: I/O dietro
+//!   [`crate::runtime::ToolExecutor`] (`ctx.tools`); `knowledge_create_note` e' il
+//!   ramo rationale OFF (non portato). In shadow `ctx.exec_mode() -> Replay`.
+//! - **`fetch_plan` / `list_todos`**: dietro [`crate::runtime::TodoStore`]
+//!   (`fetch_plan` aggiunto come punto unico todo store, regola L).
+//! - **`_persist_clarifications`** (INSERT `nexus_agent_clarifications`, `:862`):
+//!   SCRITTURA DB best-effort. Non esiste una porta dedicata; e' gated shadow
+//!   (no-op in Replay) e best-effort lato Python. TODO impl concreta in mcp-core
+//!   (oggi il delta clarifying viaggia comunque nello stato, la INSERT e' solo
+//!   telemetria). Il nodo NON la richiede per funzionare.
+//! - **`meta_steps.persist_async`** (`:562`): la persistenza best-effort del
+//!   meta_step `plan` su `nexus_agent_meta_steps` e' un side-effect del brain; nel
+//!   runtime Rust il meta_step viaggia gia' nel delta (`meta_steps`, reducer
+//!   append) e la persistenza sara' del runtime/emit, non del nodo (parita' col
+//!   commento analogo in `clarify_or_expand`).
+//!
+//! Il nodo NON instrada: l'edge post-planner vive in `routing::route_after_planner`
+//! (gia' portato 1:1, NON duplicato).
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use nexus_graph::node::{GraphNode, NodeError, NodeId};
+use nexus_graph::StateDelta as OpaqueDelta;
+
+use crate::decisions::turn_focus::build_turn_focus_directive;
+use crate::runtime::ports::{LlmMessage, LlmRequest, PlanRow, TodoStore};
+use crate::runtime::AgentNodeCtx;
+use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, ToolUse};
+
+/// Config DB-driven del nodo planner, PASSATA (regola G: nessuna lettura DB nel
+/// nodo, nessun fallback hardcoded dentro la logica decisionale).
+///
+/// Mappa i settings risolti dal brain via `orchestrator_config.get()`
+/// (`orchestrator_config.py`) + il prompt risolto dal registry + i provider/
+/// model del purpose `planner` / `planner_fallback` (RISOLTI A MONTE, regola G:
+/// il nodo li riceve gia' decisi, non chiama la routing matrix).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannerConfig {
+    /// Plan-phase abilitata (`plan_phase_enabled`, default false). OFF ->
+    /// `is_eligible` sempre false -> pass-through.
+    pub plan_phase_enabled: bool,
+    /// Behavior_mode che attivano il planner (`plan_behavior_modes`, default
+    /// `["automatico", "continuo"]`). Confronto case-insensitive.
+    pub plan_behavior_modes: Vec<String>,
+    /// Intent che attivano il planner (`plan_intents`, default code/implement/
+    /// fix/...). Confronto case-insensitive.
+    pub plan_intents: Vec<String>,
+    /// Token budget minimo del turno sotto cui il planner non si attiva
+    /// (`plan_min_token_budget`, default 2000).
+    pub plan_min_token_budget: i64,
+    /// Chiave del prompt agente del planner nel registry (`planner_prompt_key`,
+    /// default `agent.planner.base`). Il TESTO e' risolto a monte; questa chiave
+    /// e' trasportata per diagnostica/log.
+    pub planner_prompt_key: String,
+    /// System prompt del planner RISOLTO a monte dal registry (regola G): vuoto
+    /// = prompt non trovato -> skip `prompt_missing` (`planner_node.py:214-216`).
+    pub planner_system_text: String,
+    /// Clarifying pre-flight abilitata (`clarifying_questions_enabled`, default
+    /// TRUE = RAMO ON).
+    pub clarifying_questions_enabled: bool,
+    /// Numero massimo di domande di chiarimento (`clarifying_questions_max`,
+    /// default 3).
+    pub clarifying_questions_max: i64,
+    /// Anti-contaminazione history attiva (`turn_focus_enabled`, default true).
+    /// RAMO ON: il planner antepone il turn_focus al system (punto unico riusato).
+    ///
+    /// WIRING (TODO impl mcp-core): va popolato dalla CONTINUITY config
+    /// (`agent.context.turn_focus_enabled`), NON da `orchestrator_config`. E' la
+    /// stessa fonte che alimenta il turn_focus negli altri nodi (punto unico,
+    /// regola L); l'impl concreta di mcp-core deve leggerlo da li' quando
+    /// costruisce la `PlannerConfig`, non duplicare la lettura sul ramo planner.
+    pub turn_focus_enabled: bool,
+    /// Razionale del piano abilitato (`plan_rationale_enabled`, default false):
+    /// RAMO OFF (RAG decisionale + persist nota + estrazione rationale). Quando
+    /// OFF nessuna divergenza.
+    pub plan_rationale_enabled: bool,
+    /// DAG topologico abilitato (`dag_topological_enabled`, default false): RAMO
+    /// OFF (dag_kb). Quando OFF nessuna divergenza.
+    pub dag_topological_enabled: bool,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        // Default IDENTICI ai safe-default del brain (orchestrator_config.py).
+        // Valgono SOLO se il DB e' irraggiungibile, mai come magic fallback nella
+        // logica. plan_phase_enabled FALSE -> il planner e' OFF di default.
+        Self {
+            plan_phase_enabled: false,
+            plan_behavior_modes: vec!["automatico".to_string(), "continuo".to_string()],
+            plan_intents: vec![
+                "code".to_string(),
+                "implement".to_string(),
+                "fix".to_string(),
+                "debug".to_string(),
+                "scaffold".to_string(),
+                "build".to_string(),
+                "refactor".to_string(),
+                "frontend".to_string(),
+            ],
+            plan_min_token_budget: 2000,
+            planner_prompt_key: "agent.planner.base".to_string(),
+            planner_system_text: String::new(),
+            clarifying_questions_enabled: true,
+            clarifying_questions_max: 3,
+            turn_focus_enabled: true,
+            plan_rationale_enabled: false,
+            dag_topological_enabled: false,
+        }
+    }
+}
+
+impl PlannerConfig {
+    /// `is_eligible` (`orchestrator_config.py:410-428`): il run corrente puo'
+    /// attivare il planner? I 4 gate (in AND), confronto CASE-INSENSITIVE su
+    /// behavior_mode e intent. PURA: nessuna lettura DB (la config e' gia' qui).
+    ///
+    /// Parita' falsy col Python: `if behavior_mode and ...` -> un behavior_mode
+    /// `None`/vuoto NON applica il gate del mode (passa); idem per `intent`. Il
+    /// gate budget usa `int(token_budget or 0)` (gia' i64 qui).
+    pub fn is_eligible(&self, behavior_mode: Option<&str>, intent: Option<&str>, token_budget: i64) -> bool {
+        if !self.plan_phase_enabled {
+            return false;
+        }
+        // `if behavior_mode and behavior_mode.lower() not in [...]`: stringa vuota
+        // = falsy (salta il gate), come `None`.
+        if let Some(bm) = behavior_mode {
+            if !bm.is_empty() {
+                let bm_l = bm.to_lowercase();
+                if !self.plan_behavior_modes.iter().any(|m| m.to_lowercase() == bm_l) {
+                    return false;
+                }
+            }
+        }
+        if let Some(it) = intent {
+            if !it.is_empty() {
+                let it_l = it.to_lowercase();
+                if !self.plan_intents.iter().any(|i| i.to_lowercase() == it_l) {
+                    return false;
+                }
+            }
+        }
+        if token_budget < self.plan_min_token_budget {
+            return false;
+        }
+        true
+    }
+}
+
+/// Esito della decisione di RIUSO PIANO (pura, `planner_node.py:84-113`). I fetch
+/// (`fetch_plan`/`list_todos`/`active_todo`) sono I/O del nodo; QUESTA e' la sola
+/// DECISIONE: dato il piano esistente (o la sua assenza) + l'intent/mode correnti.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanReuse {
+    /// Nessun piano esistente -> prosegue alla creazione di un nuovo piano.
+    NoPlan,
+    /// Piano esistente ma obsoleto (intent o mode divergente, non-None) ->
+    /// rigenera (nessun return, prosegue alla creazione).
+    Stale,
+    /// Piano esistente e valido -> RIUSA (delta di riuso, niente nuova
+    /// pianificazione).
+    Reuse,
+}
+
+/// Decisione PURA di riuso piano (`planner_node.py:84-100`). `existing` e' il
+/// piano letto via `fetch_plan` (`None` = nessun piano). Invalida SOLO con
+/// informazione tracciata e divergente: i piani legacy (campo `None`) mantengono
+/// il riuso storico (mig 0328). PUNTO UNICO della decisione (regola L): la `run`
+/// e il golden la chiamano entrambi.
+pub fn plan_reuse_decision(
+    existing: Option<&PlanRow>,
+    intent: Option<&str>,
+    behavior_mode: Option<&str>,
+) -> PlanReuse {
+    let Some(plan) = existing else {
+        return PlanReuse::NoPlan;
+    };
+    // intent_diverged = plan_intent is not None and plan_intent != intent
+    let intent_diverged = plan
+        .user_intent
+        .as_deref()
+        .map(|pi| Some(pi) != intent)
+        .unwrap_or(false);
+    // mode_diverged = plan_mode is not None and plan_mode != behavior_mode
+    let mode_diverged = plan
+        .behavior_mode
+        .as_deref()
+        .map(|pm| Some(pm) != behavior_mode)
+        .unwrap_or(false);
+    if intent_diverged || mode_diverged {
+        PlanReuse::Stale
+    } else {
+        PlanReuse::Reuse
+    }
+}
+
+/// Branching deterministico della clarifying pre-flight (`planner_node.py:144-170`).
+/// Dato l'esito di `_detect_clarifications` (delegato all'LLM) e il behavior_mode,
+/// decide se FERMARSI (HITL Confirm) o PROSEGUIRE applicando i default.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClarifyingBranch {
+    /// Nessuna domanda emessa (o detection fallita): il planner prosegue
+    /// normalmente, nessun campo clarifying nel delta.
+    Proceed,
+    /// Confirm/study/None: si FERMA per HITL. Trasporta le domande da esporre.
+    Halt {
+        /// Domande pendenti (`{id, question, suggested_default}`).
+        questions: Vec<Value>,
+    },
+    /// Automatico/Continuo: applica i default e PROSEGUE. Trasporta le domande
+    /// (con i loro `suggested_default`) come assunzioni applicate.
+    ApplyDefaults {
+        /// Domande con i default applicati (trasparenza).
+        assumptions: Vec<Value>,
+    },
+}
+
+/// `true` se il `behavior_mode` impone la HITL (Confirm) sul ramo clarifying:
+/// `behavior_mode in (None, "confirm", "study")` (`planner_node.py:147`).
+/// Confronto case-sensitive come il Python (i valori sono normalizzati a monte).
+fn clarifying_is_confirm(behavior_mode: Option<&str>) -> bool {
+    matches!(behavior_mode, None | Some("confirm") | Some("study"))
+}
+
+/// Branching clarifying PURO (`planner_node.py:144-170`). `questions` sono le
+/// domande emesse da `_detect_clarifications` (gia' filtrate/clampate dal lato
+/// LLM): vuote -> `Proceed`. PUNTO UNICO del branching (regola L).
+pub fn clarifying_branch(questions: &[Value], behavior_mode: Option<&str>) -> ClarifyingBranch {
+    if questions.is_empty() {
+        return ClarifyingBranch::Proceed;
+    }
+    if clarifying_is_confirm(behavior_mode) {
+        ClarifyingBranch::Halt {
+            questions: questions.to_vec(),
+        }
+    } else {
+        ClarifyingBranch::ApplyDefaults {
+            assumptions: questions.to_vec(),
+        }
+    }
+}
+
+/// Set di provider/model sentinella del gate ADR 0020 (`planner_node.py:200,420`).
+const SENTINELS: [&str; 2] = ["__router_unavailable__", "__no_capable_provider__"];
+
+/// `true` se il provider e' una sentinella del gate (no provider disponibile).
+/// Replica `not provider or provider in (...)` (`planner_node.py:198-201`): anche
+/// la stringa vuota e' "sentinella" (no provider).
+pub fn is_sentinel_provider(provider: &str) -> bool {
+    provider.is_empty() || SENTINELS.contains(&provider)
+}
+
+/// Tool catalog `nexus_todo_write` dichiarato al planner (`planner_node.py:221-290`).
+/// Schema JSON STATICO (costante 1:1): action/run_id/todos[content,status,
+/// priority,acceptance_criteria,node_key,dep_keys]/planner_model/rationale/
+/// constraints/alternatives.
+pub fn tool_catalog() -> Vec<Value> {
+    vec![json!({
+        "name": "nexus_todo_write",
+        "description": "Crea la TODO list strutturata del piano. Chiamare UNA sola volta con action='create' e l'intera lista di todos atomici e verificabili.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["create"]},
+                "run_id": {"type": "string", "description": "UUID del run corrente (ti viene passato gia' valorizzato)"},
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pending"]},
+                            "priority": {"type": "string", "enum": ["high", "normal", "low"]},
+                            "acceptance_criteria": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string"},
+                                        "command": {"type": "string"},
+                                        "expected": {"type": "string"},
+                                        "url": {"type": "string"},
+                                        "path": {"type": "string"}
+                                    }
+                                }
+                            },
+                            "node_key": {
+                                "type": "string",
+                                "description": "Comp.3a (DAG): chiave logica univoca del todo (es. 'schema_db', 'api', 'frontend'), per referenziarlo come dipendenza."
+                            },
+                            "dep_keys": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Comp.3a (DAG): node_key dei todo che devono COMPLETARSI prima di questo (dipendenze di esecuzione). Vuoto se indipendente."
+                            }
+                        },
+                        "required": ["content"]
+                    }
+                },
+                "planner_model": {"type": "string"},
+                "rationale": {
+                    "type": "string",
+                    "description": "Razionale/strategia del piano: perche' questi todos in quest'ordine, assunzioni chiave."
+                },
+                "constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Vincoli/non-goal che hanno guidato il design del piano."
+                },
+                "alternatives": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "option": {"type": "string"},
+                            "rejected_because": {"type": "string"}
+                        }
+                    },
+                    "description": "Approcci alternativi considerati e perche' scartati."
+                }
+            },
+            "required": ["action", "run_id", "todos"]
+        }
+    })]
+}
+
+/// Costruisce il `nexus_todo_write` block DETERMINISTICO dai passi del playbook
+/// (`planner_node.py:474-483`, fallback ultimo-resort, incidente Beauty-Book mig
+/// 0395). Ogni passo diventa un todo `{content, status:"pending", priority:
+/// "normal"}`. Ritorna `None` se non ci sono passi (-> skip `no_tool_use_emitted`).
+pub fn playbook_fallback_block(playbook_steps: &[String]) -> Option<Value> {
+    if playbook_steps.is_empty() {
+        return None;
+    }
+    let todos: Vec<Value> = playbook_steps
+        .iter()
+        .map(|s| json!({"content": s, "status": "pending", "priority": "normal"}))
+        .collect();
+    Some(json!({
+        "name": "nexus_todo_write",
+        "input": { "action": "create", "todos": todos }
+    }))
+}
+
+/// Costruisce il `tool_input` finale di `nexus_todo_write` (`planner_node.py:495-503`):
+/// parte dall'input del todo_block, FORZA `run_id`, `setdefault planner_model` =
+/// `provider/model`, persiste `user_intent`/`behavior_mode` (mig 0328,
+/// invalidazione intent-aware del riuso). PURA.
+pub fn build_tool_input(
+    todo_block: &Value,
+    run_id: &str,
+    used_provider: &str,
+    used_model: &str,
+    intent: Option<&str>,
+    behavior_mode: Option<&str>,
+) -> Value {
+    // `tool_input = dict(todo_block.get("input") or {})`.
+    let mut map = todo_block
+        .get("input")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    // `tool_input["run_id"] = run_id` (forza valorizzazione corretta).
+    map.insert("run_id".to_string(), json!(run_id));
+    // `tool_input.setdefault("planner_model", f"{used_provider}/{used_model}")`.
+    map.entry("planner_model".to_string())
+        .or_insert_with(|| json!(format!("{used_provider}/{used_model}")));
+    if let Some(it) = intent {
+        map.insert("user_intent".to_string(), json!(it));
+    }
+    if let Some(bm) = behavior_mode {
+        map.insert("behavior_mode".to_string(), json!(bm));
+    }
+    Value::Object(map)
+}
+
+/// Esito del parse del `result_json` del tool `nexus_todo_write`
+/// (`planner_node.py:517-527`). Il gate e' `result_obj.get("ok")`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolResultOutcome {
+    /// `ok: true` -> il piano e' stato persistito, prosegue.
+    Ok,
+    /// `ok` assente/false/non-truthy -> skip `tool_returned_error`.
+    Error,
+}
+
+/// Parse + gate del `result_json` del tool (`planner_node.py:517-527`).
+/// JSON malformato -> `{ok:false}` (Python: `{"ok": False, "raw": ...}`); poi il
+/// gate `result_obj.get("ok")` (truthy). PURA.
+pub fn parse_tool_result(result_json: &str) -> ToolResultOutcome {
+    let parsed: Value = serde_json::from_str(result_json).unwrap_or_else(|_| json!({"ok": false}));
+    // `if not result_obj.get("ok")`: truthiness del campo (bool true, o valore
+    // truthy). Un `ok` assente/null/false/0/""/[]/{} e' falsy -> Error.
+    let ok = match parsed.get("ok") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+    };
+    if ok {
+        ToolResultOutcome::Ok
+    } else {
+        ToolResultOutcome::Error
+    }
+}
+
+/// Nodo planner. Le dipendenze I/O specifiche (`TodoStore` per fetch_plan/
+/// list_todos) sono CAMPI del nodo (come `TodoRunnerNode`/`FinalGateNode`); LLM e
+/// ToolExecutor arrivano dal `AgentNodeCtx`. La config DB-driven (incluso
+/// provider/model/prompt RISOLTI A MONTE, regola G) e' nella [`PlannerConfig`].
+pub struct PlannerNode {
+    /// Config DB-driven del planner (regola G: passata, mai letta dal nodo).
+    cfg: PlannerConfig,
+    /// Provider del purpose `planner` RISOLTO A MONTE (regola G). Vuoto =
+    /// sentinella -> skip `no_capable_provider`.
+    planner_provider: String,
+    /// Modello del purpose `planner` RISOLTO A MONTE (regola G).
+    planner_model: String,
+    /// Provider del purpose `planner_fallback` RISOLTO A MONTE (tool-robust).
+    fallback_provider: String,
+    /// Modello del purpose `planner_fallback` RISOLTO A MONTE.
+    fallback_model: String,
+    /// Store dei todo/piani (`nexus_agent_todos`/`nexus_agent_plans`): fetch_plan
+    /// + list_todos. Impl concreta in mcp-core; stub nei test.
+    store: Arc<dyn TodoStore>,
+}
+
+impl PlannerNode {
+    /// Costruisce il nodo con la config DB-driven gia' risolta dal chiamante
+    /// (provider/model/prompt risolti a monte, regola G) e lo store dei todo.
+    pub fn new(
+        cfg: PlannerConfig,
+        planner_provider: String,
+        planner_model: String,
+        fallback_provider: String,
+        fallback_model: String,
+        store: Arc<dyn TodoStore>,
+    ) -> Self {
+        Self {
+            cfg,
+            planner_provider,
+            planner_model,
+            fallback_provider,
+            fallback_model,
+            store,
+        }
+    }
+
+    /// Delta di pass-through `{plan_phase_active: false}` (`planner_node.py:74`):
+    /// il run NON e' eleggibile o un piano valido non c'e'; il loop legacy
+    /// prosegue. PUNTO UNICO dei pass-through con motivo opzionale (regola L).
+    fn skip(reason: Option<&str>) -> OpaqueDelta {
+        let mut delta = StateDelta {
+            plan_phase_active: Some(Some(false)),
+            ..Default::default()
+        };
+        if let Some(r) = reason {
+            delta.plan_phase_skip_reason = Some(Some(r.to_string()));
+        }
+        delta.into_opaque()
+    }
+
+    /// Delta di RIUSO PIANO (`planner_node.py:108-113`): plan_phase_active true +
+    /// current_plan_id + current_todos + active_todo_id. `active_id` e' l'id del
+    /// todo attivo (o None). PURO.
+    fn reuse_delta(run_id: &str, todos: Vec<Value>, active_id: Option<String>) -> OpaqueDelta {
+        StateDelta {
+            plan_phase_active: Some(Some(true)),
+            current_plan_id: Some(Some(run_id.to_string())),
+            current_todos: Some(Some(todos)),
+            active_todo_id: Some(active_id),
+            ..Default::default()
+        }
+        .into_opaque()
+    }
+
+    /// Costruisce `hinted_system` con i SOLI rami ON di default
+    /// (`planner_node.py:296-366`). Ordine di concatenazione 1:1:
+    ///   1. `system_text`
+    ///   2. RUN_ID hint
+    ///   3. `<comprensione_preliminare>` (context_brief, se presente)
+    ///   4. turn_focus PREPEND (se `turn_focus_enabled`, riusa il punto unico)
+    ///
+    /// Rami OFF (RAG decisionale, backlog, dag_kb) NON aggiunti (vedi doc modulo).
+    /// PURO: nessun I/O (il turn_focus e' una funzione pura sui messaggi).
+    pub fn build_hinted_system(&self, state: &AgentState, run_id: &str) -> String {
+        // (1) + (2) system_text + RUN_ID hint (`:296-299`).
+        let mut hinted = format!(
+            "{}\n\nRUN_ID corrente: {run_id} (usalo come parametro run_id nel tool nexus_todo_write)",
+            self.cfg.planner_system_text
+        );
+
+        // (3) <comprensione_preliminare> dal context_brief del nodo understanding
+        // (`:301-309`). `str(state.get("context_brief") or "").strip()`.
+        let brief = state.context_brief.as_deref().unwrap_or("").trim();
+        if !brief.is_empty() {
+            hinted.push_str(
+                "\n\n<comprensione_preliminare>\n\
+                 Contesto raccolto prima di pianificare (grounding sul codebase + \
+                 esplorazioni). Usalo per un piano fondato, non assunzioni alla cieca.\n",
+            );
+            hinted.push_str(brief);
+            hinted.push_str("\n</comprensione_preliminare>");
+        }
+
+        // Rami OFF (RAG / backlog / dag_kb): NON portati. Con i default DB
+        // (plan_rationale_enabled / dag_topological_enabled FALSE) il Python NON
+        // li attraversa, quindi questa parte e' assente in entrambi (parita').
+
+        // (4) turn_focus PREPEND (`:352-366`, RAMO ON). RIUSA il punto unico
+        // `build_turn_focus_directive` (regola L: NON re-implementato). Best-effort
+        // 1:1 col Python (try/except -> prosegue senza directive): la funzione
+        // Rust e' infallibile (ritorna Option), quindi "errore -> prosegue" diventa
+        // "None -> nessun prepend". `new_topic=false`: il planner Python chiama
+        // `build_turn_focus_directive(messages)` SENZA il flag new_topic (default
+        // del continuity gate non passato qui).
+        if self.cfg.turn_focus_enabled {
+            if let Some(focus) = build_turn_focus_directive(&state.messages, false) {
+                hinted = format!("{focus}\n\n{hinted}");
+            }
+        }
+
+        hinted
+    }
+
+    /// Costruisce i messaggi minimali per la `LlmRequest` del planner dai
+    /// `messages` dello stato (`planner_node.py:293,378`). Forma provider-agnostica
+    /// (`role`/`content` testo o blocchi). NOTA (TODO): `apply_context_reduction`
+    /// (freno contesto, punto unico Python `:375`) NON e' ancora portato lato Rust
+    /// -> il chiamante (mcp-core) dovra' applicarlo PRIMA, oppure si porta qui
+    /// quando esistera' il punto unico Rust. Sui golden e' irrilevante (i messaggi
+    /// LLM sono input stubati).
+    fn build_llm_messages(messages: &[Message]) -> Vec<LlmMessage> {
+        messages
+            .iter()
+            .map(|m| {
+                let (role, content) = match m {
+                    Message::Human { content } => ("user", content),
+                    Message::Ai { content, .. } => ("assistant", content),
+                    Message::Tool { content, .. } => ("user", content),
+                };
+                // Forma minimale: il testo piatto (i blocchi tool_use/result del
+                // canale interno sono ricostruiti dal gateway concreto a monte
+                // della LlmRequest se servono; qui trasportiamo il testo).
+                LlmMessage {
+                    role: role.to_string(),
+                    content: match content {
+                        MessageContent::Text(s) => Value::String(s.clone()),
+                        MessageContent::Blocks(_) => Value::String(content.flatten_text()),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Costruisce la `LlmRequest` del planner per un dato provider/model
+    /// (tool_choice forzato su `nexus_todo_write` e' del gateway concreto: qui
+    /// dichiariamo il solo tool, come il Python passa `tools_json`).
+    fn build_request(
+        provider: &str,
+        model: &str,
+        messages: Vec<LlmMessage>,
+        hinted_system: &str,
+    ) -> LlmRequest {
+        // Il system prompt (`hinted_system`) viaggia come primo messaggio di
+        // sistema (forma minimale provider-agnostica, come in clarify_or_expand).
+        let mut msgs = Vec::with_capacity(messages.len() + 1);
+        msgs.push(LlmMessage {
+            role: "system".to_string(),
+            content: Value::String(hinted_system.to_string()),
+        });
+        msgs.extend(messages);
+        LlmRequest {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            messages: msgs,
+            tools: Some(tool_catalog()),
+        }
+    }
+
+    /// Estrae il primo tool_call `nexus_todo_write` da una lista di tool_calls
+    /// (`next((b for b in ... if b.name == "nexus_todo_write"), None)`,
+    /// `planner_node.py:399`). Il `ToolUse` del canale interno porta `input`.
+    fn extract_todo_block(tool_calls: &[crate::state::ToolUse]) -> Option<Value> {
+        tool_calls
+            .iter()
+            .find(|t| t.name == "nexus_todo_write")
+            .map(|t| json!({"name": t.name, "input": t.input, "id": t.id}))
+    }
+
+    /// Meta-step `plan` per la pubblicazione in chat (`planner_node.py:540-559`).
+    /// PURO sui todos riletti + provider/model + active_todo_id.
+    fn make_plan_meta(
+        run_id: &str,
+        todos: &[Value],
+        used_provider: &str,
+        used_model: &str,
+        active_id: Option<&str>,
+    ) -> MetaStep {
+        let todos_payload: Vec<Value> = todos
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.get("id"),
+                    "seq": t.get("seq"),
+                    "content": t.get("content"),
+                    "status": t.get("status"),
+                    "priority": t.get("priority"),
+                })
+            })
+            .collect();
+        MetaStep {
+            kind: "plan".to_string(),
+            title: format!("Piano creato — {} step", todos.len()),
+            payload: json!({
+                "plan_id": run_id,
+                "todos": todos_payload,
+                "provider": used_provider,
+                "model": used_model,
+                "active_todo_id": active_id,
+            }),
+            correlation_id: None,
+            created_at: None,
+        }
+    }
+}
+
+/// Estrae l'id del todo attivo da una lista di todos (forma JSON): `active.id` se
+/// presente (`planner_node.py:531`, via `todo_store.active_todo`). Il selettore
+/// e' il punto unico [`TodoStore::active_todo`]; qui derivo l'id dalla forma
+/// JSON dei todos riletti per il delta/meta-step.
+fn active_todo_id_from(active: Option<&crate::decisions::dag_scheduler::Todo>) -> Option<String> {
+    active.map(|t| t.id.clone())
+}
+
+#[async_trait]
+impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
+    fn id(&self) -> NodeId {
+        NodeId::Planner
+    }
+
+    async fn run(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
+        let behavior_mode = state.behavior_mode.as_deref();
+        let intent = state.user_intent.as_deref();
+        let token_budget = state.token_budget.unwrap_or(0);
+
+        // ── Guard: feature flag + eligibilita' (planner_node.py:64-74) ─────────
+        if !self.cfg.is_eligible(behavior_mode, intent, token_budget) {
+            tracing::debug!(
+                target: "nexus_agent_graph::planner",
+                plan_enabled = self.cfg.plan_phase_enabled,
+                "planner: skip (non eligible)"
+            );
+            // pass-through {plan_phase_active:false} SENZA skip_reason (Python:74).
+            return Ok(Self::skip(None));
+        }
+
+        // ── Riuso piano intent/mode-aware (planner_node.py:84-113) ─────────────
+        // run_id = thread_id. Senza run_id NON si puo' fetchare il piano; il
+        // controllo "run_id assente -> skip no_thread_id" e' a valle (Python:123).
+        let run_id = state.thread_id.clone().unwrap_or_default();
+        if !run_id.is_empty() {
+            let existing = self.store.fetch_plan(&run_id).await.map_err(port_err)?;
+            match plan_reuse_decision(existing.as_ref(), intent, behavior_mode) {
+                PlanReuse::Reuse => {
+                    let todos = self.store.list_todos(&run_id).await.map_err(port_err)?;
+                    let active = self.store.active_todo(&run_id).await.map_err(port_err)?;
+                    let active_id = active_todo_id_from(active.as_ref());
+                    tracing::info!(
+                        target: "nexus_agent_graph::planner",
+                        run_id = %run_id,
+                        todos = todos.len(),
+                        "planner: piano valido, riuso"
+                    );
+                    return Ok(Self::reuse_delta(&run_id, todos_to_values(&todos), active_id));
+                }
+                // Stale/NoPlan: prosegue alla creazione di un nuovo piano.
+                PlanReuse::Stale | PlanReuse::NoPlan => {}
+            }
+        }
+
+        // ── Pre-requisiti: run_id + session_id (planner_node.py:123-130) ───────
+        // (providers/tool_runner/routing_client del Python sono il ctx + le porte
+        // del runtime Rust: sempre presenti, mai None.)
+        if run_id.is_empty() {
+            tracing::warn!(target: "nexus_agent_graph::planner", "thread_id assente -> skip");
+            return Ok(Self::skip(Some("no_thread_id")));
+        }
+        let session_id = state.session_id.clone().unwrap_or_default();
+        if session_id.is_empty() {
+            tracing::warn!(target: "nexus_agent_graph::planner", "session_id assente -> skip");
+            return Ok(Self::skip(Some("no_session_id")));
+        }
+
+        // ── Clarifying pre-flight (planner_node.py:132-170, RAMO ON) ───────────
+        // `pending_clarifications is None` -> abilita la detection. La detection
+        // (_detect_clarifications) e' una chiamata LLM (delegata): il provider/
+        // model/prompt sono risolti a monte (regola G). Best-effort: errore ->
+        // proceed (Python:141-143). Il BRANCHING e' deterministico (golden).
+        let mut applied_assumptions: Option<Vec<Value>> = None;
+        if self.cfg.clarifying_questions_enabled && state.pending_clarifications.is_none() {
+            let questions = self.detect_clarifications(state, ctx).await;
+            match clarifying_branch(&questions, behavior_mode) {
+                ClarifyingBranch::Halt { questions } => {
+                    tracing::info!(
+                        target: "nexus_agent_graph::planner",
+                        run_id = %run_id,
+                        n = questions.len(),
+                        "planner: pending_clarifications (HITL Confirm)"
+                    );
+                    // SCRITTURA DB best-effort (_persist_clarifications): TODO porta
+                    // dedicata; il delta clarifying viaggia comunque nello stato.
+                    return Ok(StateDelta {
+                        plan_phase_active: Some(Some(false)),
+                        plan_phase_skip_reason: Some(Some("awaiting_clarifications".to_string())),
+                        pending_clarifications: Some(Some(questions)),
+                        ..Default::default()
+                    }
+                    .into_opaque());
+                }
+                ClarifyingBranch::ApplyDefaults { assumptions } => {
+                    tracing::info!(
+                        target: "nexus_agent_graph::planner",
+                        run_id = %run_id,
+                        n = assumptions.len(),
+                        "planner: applied clarifying defaults"
+                    );
+                    applied_assumptions = Some(assumptions);
+                }
+                ClarifyingBranch::Proceed => {}
+            }
+        }
+
+        // ── Sticky cascade M69 / sentinella gate ADR 0020 (planner_node.py:176-209) ─
+        // Sticky: se planner_sticky_* presenti, salta il purpose_model (risolto a
+        // monte). Altrimenti usa planner_provider/model risolti a monte.
+        let (mut used_provider, mut used_model) = match (
+            state.planner_sticky_provider.as_deref(),
+            state.planner_sticky_model.as_deref(),
+        ) {
+            (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => {
+                tracing::info!(
+                    target: "nexus_agent_graph::planner",
+                    provider = %p, model = %m,
+                    "planner: M69 sticky cascade attivo"
+                );
+                (p.to_string(), m.to_string())
+            }
+            _ => {
+                // Sentinella gate: provider non disponibile -> skip (Python:198-209).
+                if is_sentinel_provider(&self.planner_provider) {
+                    tracing::warn!(
+                        target: "nexus_agent_graph::planner",
+                        provider = %self.planner_provider,
+                        "planner: nessun provider disponibile -> skip"
+                    );
+                    return Ok(Self::skip(Some(&format!(
+                        "no_capable_provider:{}",
+                        self.planner_provider
+                    ))));
+                }
+                (self.planner_provider.clone(), self.planner_model.clone())
+            }
+        };
+
+        // ── Prompt (planner_node.py:211-216) ───────────────────────────────────
+        // Il TESTO e' risolto a monte (regola G): vuoto -> skip prompt_missing.
+        if self.cfg.planner_system_text.is_empty() {
+            tracing::warn!(
+                target: "nexus_agent_graph::planner",
+                key = %self.cfg.planner_prompt_key,
+                "planner: prompt non trovato -> skip"
+            );
+            return Ok(Self::skip(Some(&format!(
+                "prompt_missing:{}",
+                self.cfg.planner_prompt_key
+            ))));
+        }
+
+        // ── hinted_system (rami ON) + chiamata LLM (planner_node.py:292-391) ───
+        let hinted_system = self.build_hinted_system(state, &run_id);
+        let llm_messages = Self::build_llm_messages(&state.messages);
+
+        let req = Self::build_request(&used_provider, &used_model, llm_messages.clone(), &hinted_system);
+        let mut todo_block = match ctx.llm.complete(req).await {
+            // NOTA parita': la `LlmResponse` minimale NON espone provider/model
+            // (il gateway concreto puo' aver fatto un cascade interno usando un
+            // provider diverso, ma quel dettaglio non arriva ai nodi — forma
+            // minimale del crate). Manteniamo used_provider/used_model che ABBIAMO
+            // passato, come il fallback Python `prov_result.provider or planner_provider`
+            // quando il provider effettivo non e' disponibile.
+            Ok(resp) => Self::extract_todo_block(&resp.tool_calls),
+            Err(err) => {
+                tracing::error!(
+                    target: "nexus_agent_graph::planner",
+                    error = %err,
+                    "planner: LLM call fallita -> skip"
+                );
+                return Ok(Self::skip(Some("llm_error")));
+            }
+        };
+
+        // ── FALLBACK tool-robust (planner_node.py:401-459, mig 0267) ───────────
+        // Se il primario NON ha emesso la tool call, UN tentativo con un modello
+        // fallback risolto a monte (planner_fallback), escluse sentinelle e diverso
+        // dal (provider,model) gia' usato.
+        if todo_block.is_none() {
+            let fb_provider = self.fallback_provider.clone();
+            let fb_model = self.fallback_model.clone();
+            if !is_sentinel_provider(&fb_provider)
+                && !is_sentinel_provider(&fb_model)
+                && (fb_provider.as_str(), fb_model.as_str()) != (used_provider.as_str(), used_model.as_str())
+            {
+                tracing::warn!(
+                    target: "nexus_agent_graph::planner",
+                    primario = %format!("{used_provider}/{used_model}"),
+                    fallback = %format!("{fb_provider}/{fb_model}"),
+                    "planner: nessuna tool call dal primario -> fallback tool-robust"
+                );
+                let fb_req =
+                    Self::build_request(&fb_provider, &fb_model, llm_messages, &hinted_system);
+                match ctx.llm.complete(fb_req).await {
+                    Ok(resp) => {
+                        used_provider = fb_provider;
+                        used_model = fb_model;
+                        todo_block = Self::extract_todo_block(&resp.tool_calls);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            target: "nexus_agent_graph::planner",
+                            error = %err,
+                            "planner: LLM call fallback fallita -> skip"
+                        );
+                        return Ok(Self::skip(Some("llm_error")));
+                    }
+                }
+            }
+        }
+
+        // ── Fallback DETERMINISTICO da playbook_steps (planner_node.py:461-492) ─
+        if todo_block.is_none() {
+            let steps = state.playbook_steps.clone().unwrap_or_default();
+            match playbook_fallback_block(&steps) {
+                Some(block) => {
+                    tracing::info!(
+                        target: "nexus_agent_graph::planner",
+                        steps = steps.len(),
+                        "planner: todos deterministici dai passi del playbook"
+                    );
+                    todo_block = Some(block);
+                }
+                None => {
+                    tracing::warn!(
+                        target: "nexus_agent_graph::planner",
+                        "planner: nessuna nexus_todo_write emessa -> skip"
+                    );
+                    return Ok(Self::skip(Some("no_tool_use_emitted")));
+                }
+            }
+        }
+        let todo_block = todo_block.expect("todo_block presente dopo i fallback");
+
+        // ── Esegui nexus_todo_write via ToolExecutor (planner_node.py:494-514) ──
+        let tool_input =
+            build_tool_input(&todo_block, &run_id, &used_provider, &used_model, intent, behavior_mode);
+        let tool_use_id = todo_block
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let call = crate::runtime::ports::ToolCall {
+            id: tool_use_id.clone(),
+            name: "nexus_todo_write".to_string(),
+            input: tool_input,
+        };
+        // CONTINUITA' tool_use/tool_result (planner_node.py:586-602): conserva la
+        // tool_use di nexus_todo_write da appendere al `Message::Ai` finale. L'id
+        // e' lo STESSO del tool_result che segue (`tool_use_id`), cosi' la coppia
+        // tool_use -> tool_result e' valida per le API Anthropic-compat al turno
+        // successivo. Vale per entrambi i rami: id reale dal modello oppure uuid
+        // sintetico del fallback playbook (l'id e' gia' risolto sopra, parita' con
+        // `tool_use_id = todo_block.get("id") or str(uuid.uuid4())`).
+        let planner_tool_use = ToolUse {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input: call.input.clone(),
+        };
+        let outcome = match ctx.tools.execute(call, ctx.exec_mode()).await {
+            Ok(o) => o,
+            Err(err) => {
+                tracing::error!(
+                    target: "nexus_agent_graph::planner",
+                    error = %err,
+                    "planner: execute_tool nexus_todo_write fallita -> skip"
+                );
+                return Ok(Self::skip(Some("tool_error")));
+            }
+        };
+
+        // ── Parse risultato tool + gate ok (planner_node.py:516-527) ───────────
+        let result_json = match &outcome.content {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if outcome.is_error || matches!(parse_tool_result(&result_json), ToolResultOutcome::Error) {
+            tracing::warn!(
+                target: "nexus_agent_graph::planner",
+                "planner: tool ritorna errore -> skip"
+            );
+            return Ok(Self::skip(Some("tool_returned_error")));
+        }
+
+        // ── Ricarica todos persistiti + popola lo stato (planner_node.py:529-621) ─
+        let todos = self.store.list_todos(&run_id).await.map_err(port_err)?;
+        let active = self.store.active_todo(&run_id).await.map_err(port_err)?;
+        let active_id = active_todo_id_from(active.as_ref());
+        let todos_values = todos_to_values(&todos);
+
+        tracing::info!(
+            target: "nexus_agent_graph::planner",
+            run_id = %run_id,
+            todos = todos.len(),
+            provider = %used_provider,
+            model = %used_model,
+            "planner: plan creato"
+        );
+
+        let plan_meta = Self::make_plan_meta(
+            &run_id,
+            &todos_values,
+            &used_provider,
+            &used_model,
+            active_id.as_deref(),
+        );
+
+        // Messaggi di continuita' (assistant + tool_result) cosi' il prossimo
+        // turno dell'executor vede il plan (`planner_node.py:583-602`). L'AIMessage
+        // DEVE trasportare la tool_use di nexus_todo_write (stesso `tool_use_id`
+        // del tool_result che segue): senza, il tool_result sarebbe ORFANO e le API
+        // Anthropic-compat rifiuterebbero (400) la sequenza al turno successivo.
+        // Il testo content resta vuoto (forma minimale del crate: il `LlmResponse`
+        // del gateway porta `content`, ma la parita' funzionale richiesta dalla
+        // continuity e' la coppia tool_use/tool_result simmetrica, non il testo;
+        // il Python mette `prov_result.content or ""`, di norma vuoto col solo tool).
+        let assistant_msg = Message::Ai {
+            content: MessageContent::text(""),
+            tool_calls: vec![planner_tool_use],
+        };
+        let tool_result_msg = Message::Tool {
+            tool_call_id: tool_use_id,
+            content: MessageContent::text(result_json),
+        };
+
+        // Estrazione rationale/constraints/alternatives: RAMO OFF (plan_rationale
+        // _enabled false di default) -> non popolato (parita' col Python che li
+        // lascia vuoti/None). TODO quando la porta KB-search permettera' il ramo ON.
+        Ok(StateDelta {
+            plan_phase_active: Some(Some(true)),
+            current_plan_id: Some(Some(run_id.clone())),
+            current_todos: Some(Some(todos_values)),
+            active_todo_id: Some(active_id),
+            messages: Some(vec![assistant_msg, tool_result_msg]),
+            provider_used: Some(Some(used_provider.clone())),
+            model_used: Some(Some(used_model.clone())),
+            // M69: persisti il provider/model vincente per i replan futuri.
+            planner_sticky_provider: Some(Some(used_provider)),
+            planner_sticky_model: Some(Some(used_model)),
+            meta_steps: Some(vec![plan_meta]),
+            // Trasparenza: assunzioni di default applicate (ramo Automatico/Continuo).
+            applied_default_assumptions: applied_assumptions.map(Some),
+            ..Default::default()
+        }
+        .into_opaque())
+    }
+}
+
+impl PlannerNode {
+    /// Chiamata LLM `_detect_clarifications` (`planner_node.py:775-859`): chiede al
+    /// modello se il task e' ambiguo. RITORNA le domande (gia' filtrate/clampate)
+    /// o vuoto. Best-effort: errore/assenza -> vuoto (proceed). L'I/O e' dietro
+    /// `ctx.llm`; il BRANCHING a valle e' deterministico (golden). Il provider/
+    /// model/prompt del purpose `planner` sono risolti a monte (regola G), qui
+    /// riusiamo planner_provider/model.
+    async fn detect_clarifications(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Vec<Value> {
+        // Sentinella gate: nessun provider disponibile -> niente detection (proceed).
+        if is_sentinel_provider(&self.planner_provider) {
+            return Vec::new();
+        }
+        // Ultimo messaggio utente (il task): vuoto -> niente detection.
+        let user_msg = last_user_text(&state.messages);
+        if user_msg.trim().is_empty() {
+            return Vec::new();
+        }
+        let tool = json!({
+            "name": "request_clarification",
+            "description": "Emetti questa lista di domande se e SOLO se il task utente e' ambiguo.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "question": {"type": "string"},
+                                "suggested_default": {"type": "string"}
+                            },
+                            "required": ["id", "question"]
+                        }
+                    }
+                },
+                "required": ["questions"]
+            }
+        });
+        // Il system prompt (`agent.clarifying.detect`, renderizzato con max_q) e'
+        // risolto a monte; qui passiamo il solo user_msg (clamp_single_prompt =
+        // TODO punto unico Rust). Forma minimale.
+        let req = LlmRequest {
+            provider: self.planner_provider.clone(),
+            model: self.planner_model.clone(),
+            messages: vec![LlmMessage {
+                role: "user".to_string(),
+                content: Value::String(user_msg),
+            }],
+            tools: Some(vec![tool]),
+        };
+        let resp = match ctx.llm.complete(req).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::debug!(
+                    target: "nexus_agent_graph::planner",
+                    error = %err,
+                    "planner: clarifying detect saltata (best-effort)"
+                );
+                return Vec::new();
+            }
+        };
+        // Estrai il tool_use request_clarification -> questions (filtrate+clampate).
+        let max_q = self.cfg.clarifying_questions_max.max(0) as usize;
+        for tc in &resp.tool_calls {
+            if tc.name == "request_clarification" {
+                let qs = tc
+                    .input
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                // `[q for q in qs if isinstance(q, dict) and q.get("id") and q.get("question")][:max_q]`
+                let filtered: Vec<Value> = qs
+                    .into_iter()
+                    .filter(|q| {
+                        q.as_object()
+                            .map(|m| {
+                                truthy_str_field(m.get("id")) && truthy_str_field(m.get("question"))
+                            })
+                            .unwrap_or(false)
+                    })
+                    .take(max_q)
+                    .collect();
+                return filtered;
+            }
+        }
+        Vec::new()
+    }
+}
+
+/// `true` se il campo JSON e' una stringa NON vuota (truthy `q.get("id")` Python).
+fn truthy_str_field(v: Option<&Value>) -> bool {
+    matches!(v, Some(Value::String(s)) if !s.is_empty())
+}
+
+/// Ultimo messaggio utente (in reverse) con testo non vuoto
+/// (`_detect_clarifications`, `planner_node.py:783-788`): filtra ruolo human/user.
+fn last_user_text(messages: &[Message]) -> String {
+    for m in messages.iter().rev() {
+        if let Message::Human { content } = m {
+            let flat = content.flatten_text();
+            if !flat.trim().is_empty() {
+                return flat;
+            }
+        }
+    }
+    String::new()
+}
+
+/// Serializza i `Todo` (forma DAG) come `Vec<Value>` per il trasporto nello
+/// stato (`current_todos`). I campi non-DAG (content/acceptance_criteria) NON
+/// sono nel punto unico `Todo` (vedi nota `todo_runner`): la `TodoStore` concreta
+/// dovra' esporre il todo completo per popolarli (TODO impl mcp-core). Qui i todos
+/// trasportano i campi DAG noti, sufficienti per active_todo_id/meta-step.
+fn todos_to_values(todos: &[crate::decisions::dag_scheduler::Todo]) -> Vec<Value> {
+    todos
+        .iter()
+        .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+        .collect()
+}
+
+/// Converte un [`crate::runtime::ports::PortError`] in [`NodeError::Failed`]: un
+/// guasto infrastrutturale dello store (DB down) propaga (il run NON resta morto;
+/// il runtime lo gestisce). I fallimenti APPLICATIVI (LLM/tool) sono gia' gestiti
+/// inline come skip (parita' col try/except Python che fa fallback al loop legacy).
+fn port_err(e: crate::runtime::ports::PortError) -> NodeError {
+    NodeError::Failed {
+        node: "planner",
+        message: format!("store todo/plan fallito: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use nexus_graph::node::GraphNode;
+    use nexus_graph::GraphState as _;
+    use sqlx::postgres::PgPoolOptions;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::decisions::dag_scheduler::{Todo, TodoStatus};
+    use crate::runtime::ports::{
+        ExecMode, LlmResponse, LlmUsage, PortError, ToolCall, ToolOutcome,
+    };
+    use crate::runtime::test_doubles::{NullEventSink, StubTodoStore};
+    use crate::runtime::AgentNodeCtx;
+    use crate::state::{MessageContent, ToolUse};
+
+    fn apply(base: AgentState, delta: nexus_graph::StateDelta) -> AgentState {
+        let mut s = base;
+        s.merge(delta);
+        s
+    }
+
+    fn human(text: &str) -> Message {
+        Message::Human {
+            content: MessageContent::text(text),
+        }
+    }
+
+    /// Config attiva (plan_phase ON, prompt risolto) per i test del flusso pieno.
+    fn cfg_active() -> PlannerConfig {
+        PlannerConfig {
+            plan_phase_enabled: true,
+            planner_system_text: "Sei il planner. Crea la TODO list.".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Stato eleggibile: behavior_mode automatico, intent code, budget alto,
+    /// thread_id + session_id presenti, un messaggio utente.
+    fn eligible_state() -> AgentState {
+        AgentState {
+            messages: vec![human("Implementa il login del progetto in modo robusto")],
+            behavior_mode: Some("automatico".to_string()),
+            user_intent: Some("code".to_string()),
+            token_budget: Some(8000),
+            thread_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            session_id: Some("sess-1".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// LLM scriptato per il planner: la 1a chiamata `complete` ritorna
+    /// `primary`, le successive `secondary` (per esercitare il fallback
+    /// tool-robust). Registra il numero di chiamate.
+    struct ScriptedLlm {
+        primary: LlmResponse,
+        secondary: LlmResponse,
+        calls: Mutex<usize>,
+    }
+
+    impl ScriptedLlm {
+        fn new(primary: LlmResponse, secondary: LlmResponse) -> Self {
+            Self {
+                primary,
+                secondary,
+                calls: Mutex::new(0),
+            }
+        }
+        /// Emette sempre (primario e fallback) il tool dato.
+        fn always_tool(name: &str, input: Value) -> Self {
+            let r = tool_resp(name, input);
+            Self::new(r.clone(), r)
+        }
+        /// Non emette mai tool (testo vuoto): forza i fallback.
+        fn never_tool() -> Self {
+            Self::new(text_resp(), text_resp())
+        }
+    }
+
+    fn tool_resp(name: &str, input: Value) -> LlmResponse {
+        LlmResponse {
+            content: String::new(),
+            tool_calls: vec![ToolUse {
+                id: "tc-1".to_string(),
+                name: name.to_string(),
+                input,
+            }],
+            usage: LlmUsage::default(),
+        }
+    }
+    fn text_resp() -> LlmResponse {
+        LlmResponse {
+            content: "nessun tool".to_string(),
+            tool_calls: vec![],
+            usage: LlmUsage::default(),
+        }
+    }
+
+    #[async_trait]
+    impl crate::runtime::ports::LlmGateway for ScriptedLlm {
+        async fn complete(
+            &self,
+            _req: LlmRequest,
+        ) -> Result<LlmResponse, PortError> {
+            let mut c = self.calls.lock().unwrap();
+            *c += 1;
+            if *c == 1 {
+                Ok(self.primary.clone())
+            } else {
+                Ok(self.secondary.clone())
+            }
+        }
+    }
+
+    /// ToolExecutor scriptato: ritorna un `result_json` fisso e registra le
+    /// chiamate + modalita' (per verificare shadow -> Replay).
+    struct ScriptedTools {
+        result_json: String,
+        is_error: bool,
+        seen: Mutex<Vec<(ToolCall, ExecMode)>>,
+    }
+    impl ScriptedTools {
+        fn ok(result_json: &str) -> Self {
+            Self {
+                result_json: result_json.to_string(),
+                is_error: false,
+                seen: Mutex::new(vec![]),
+            }
+        }
+    }
+    #[async_trait]
+    impl crate::runtime::ports::ToolExecutor for ScriptedTools {
+        async fn execute(
+            &self,
+            call: ToolCall,
+            mode: ExecMode,
+        ) -> Result<ToolOutcome, PortError> {
+            let id = call.id.clone();
+            self.seen.lock().unwrap().push((call, mode));
+            Ok(ToolOutcome {
+                tool_call_id: id,
+                content: Value::String(self.result_json.clone()),
+                is_error: self.is_error,
+            })
+        }
+    }
+
+    /// Costruisce il nodo con store dato + provider/model di test.
+    fn node_with(cfg: PlannerConfig, store: Arc<dyn TodoStore>) -> PlannerNode {
+        PlannerNode::new(
+            cfg,
+            "anthropic".to_string(),
+            "modello-planner".to_string(),
+            "openai".to_string(),
+            "modello-fallback".to_string(),
+            store,
+        )
+    }
+
+    /// Ctx con LLM/tool dati. PgPool lazy (il planner non interroga il DB
+    /// direttamente: passa per la TodoStore).
+    fn ctx_with(
+        llm: Arc<dyn crate::runtime::ports::LlmGateway>,
+        tools: Arc<dyn crate::runtime::ports::ToolExecutor>,
+        shadow: bool,
+    ) -> AgentNodeCtx {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@127.0.0.1:1/test")
+            .expect("connect_lazy");
+        AgentNodeCtx {
+            db: pool,
+            llm,
+            tools,
+            emit: Arc::new(NullEventSink),
+            cfg: crate::routing::config::RoutingConfig::default(),
+            cancel: CancellationToken::new(),
+            run_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            thread_id: Uuid::new_v4(),
+            shadow,
+        }
+    }
+
+    fn todo(id: &str, status: TodoStatus, seq: i64) -> Todo {
+        Todo {
+            id: id.to_string(),
+            status,
+            depends_on: vec![],
+            seq: Some(seq),
+        }
+    }
+
+    // ── is_eligible ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_eligible_gates() {
+        let cfg = cfg_active();
+        // Eleggibile: tutto a posto.
+        assert!(cfg.is_eligible(Some("Automatico"), Some("CODE"), 8000), "case-insensitive");
+        // plan_phase OFF -> mai eleggibile.
+        let off = PlannerConfig::default();
+        assert!(!off.is_eligible(Some("automatico"), Some("code"), 8000));
+        // behavior_mode fuori lista.
+        assert!(!cfg.is_eligible(Some("confirm"), Some("code"), 8000));
+        // intent fuori lista.
+        assert!(!cfg.is_eligible(Some("automatico"), Some("chat"), 8000));
+        // budget sotto soglia.
+        assert!(!cfg.is_eligible(Some("automatico"), Some("code"), 100));
+        // behavior_mode None/"" salta il gate del mode (parita' falsy Python).
+        assert!(cfg.is_eligible(None, Some("code"), 8000));
+        assert!(cfg.is_eligible(Some(""), Some("code"), 8000));
+    }
+
+    // ── Pass-through non eligible ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn non_eligible_pass_through() {
+        // plan_phase OFF (default) -> {plan_phase_active:false}, niente reason.
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let node = node_with(PlannerConfig::default(), store);
+        let ctx = ctx_with(
+            Arc::new(ScriptedLlm::never_tool()),
+            Arc::new(ScriptedTools::ok("{}")),
+            false,
+        );
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(false));
+        assert_eq!(out.plan_phase_skip_reason, None);
+    }
+
+    // ── Riuso piano ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn riuso_piano_valido() {
+        // Piano con stesso intent/mode -> riuso (delta plan_phase_active true +
+        // todos). L'LLM NON deve essere chiamato.
+        let store = Arc::new(StubTodoStore::with_plan(
+            vec![
+                todo("t1", TodoStatus::Completed, 1),
+                todo("t2", TodoStatus::Pending, 2),
+            ],
+            Some(PlanRow {
+                user_intent: Some("code".to_string()),
+                behavior_mode: Some("automatico".to_string()),
+            }),
+        ));
+        let llm = Arc::new(ScriptedLlm::never_tool());
+        let node = node_with(cfg_active(), store);
+        let ctx = ctx_with(llm.clone(), Arc::new(ScriptedTools::ok("{}")), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(true));
+        assert_eq!(out.current_plan_id.as_deref(), Some("11111111-1111-1111-1111-111111111111"));
+        // active_todo = primo pending (t1 e' completed) -> t2.
+        assert_eq!(out.active_todo_id.as_deref(), Some("t2"));
+        // Riuso: nessuna chiamata LLM.
+        assert_eq!(*llm.calls.lock().unwrap(), 0, "il riuso non chiama l'LLM");
+    }
+
+    #[tokio::test]
+    async fn riuso_piano_obsoleto_rigenera() {
+        // Piano con intent diverso -> stale -> rigenera (chiama LLM + tool, crea).
+        // clarifying OFF per isolare la sola chiamata del planner.
+        let mut cfg = cfg_active();
+        cfg.clarifying_questions_enabled = false;
+        let store = Arc::new(StubTodoStore::with_plan(
+            vec![todo("t1", TodoStatus::Pending, 1)],
+            Some(PlanRow {
+                user_intent: Some("docs".to_string()), // diverso da "code"
+                behavior_mode: Some("automatico".to_string()),
+            }),
+        ));
+        let llm = Arc::new(ScriptedLlm::always_tool(
+            "nexus_todo_write",
+            json!({"action": "create", "todos": [{"content": "fai X"}]}),
+        ));
+        let node = node_with(cfg, store);
+        let ctx = ctx_with(llm.clone(), Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(true));
+        // Ha rigenerato: il planner ha chiamato l'LLM una volta e creato il plan
+        // (sticky settato). clarifying OFF -> nessuna detection.
+        assert_eq!(*llm.calls.lock().unwrap(), 1);
+        assert_eq!(out.planner_sticky_provider.as_deref(), Some("anthropic"));
+    }
+
+    // ── Clarifying ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn clarifying_ferma_confirm() {
+        // behavior_mode confirm + LLM emette request_clarification -> HALT.
+        // confirm non e' in plan_behavior_modes di default -> per esercitare il
+        // branching clarifying serve eleggibilita': aggiungo confirm alla lista.
+        let mut cfg = cfg_active();
+        cfg.plan_behavior_modes.push("confirm".to_string());
+        let node = node_with(cfg, Arc::new(StubTodoStore::with_todos(vec![])));
+        // L'LLM e' chiamato PRIMA per la detection (request_clarification).
+        let llm = Arc::new(ScriptedLlm::always_tool(
+            "request_clarification",
+            json!({"questions": [
+                {"id": "q1", "question": "Quale DB?", "suggested_default": "postgres"}
+            ]}),
+        ));
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
+        let mut st = eligible_state();
+        st.behavior_mode = Some("confirm".to_string());
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(false));
+        assert_eq!(out.plan_phase_skip_reason.as_deref(), Some("awaiting_clarifications"));
+        let pending = out.pending_clarifications.expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["id"], json!("q1"));
+    }
+
+    #[tokio::test]
+    async fn clarifying_prosegue_automatico() {
+        // behavior_mode automatico + domande emesse -> applica default e PROSEGUE
+        // (crea il piano). applied_default_assumptions popolato.
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        // 1a chiamata: detection -> request_clarification; 2a chiamata: planner ->
+        // nexus_todo_write.
+        let llm = Arc::new(ScriptedLlm::new(
+            tool_resp(
+                "request_clarification",
+                json!({"questions": [
+                    {"id": "q1", "question": "Quale DB?", "suggested_default": "postgres"}
+                ]}),
+            ),
+            tool_resp("nexus_todo_write", json!({"action": "create", "todos": [{"content": "X"}]})),
+        ));
+        let node = node_with(cfg_active(), store);
+        let ctx = ctx_with(llm.clone(), Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(true));
+        let applied = out.applied_default_assumptions.expect("applied");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["suggested_default"], json!("postgres"));
+        // 2 chiamate LLM: detection + planner.
+        assert_eq!(*llm.calls.lock().unwrap(), 2);
+    }
+
+    // ── Fallback playbook ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fallback_playbook_deterministico() {
+        // L'LLM non emette mai nexus_todo_write (primario e fallback) -> usa i
+        // playbook_steps deterministici per costruire il todo_block.
+        // clarifying OFF per non consumare chiamate LLM nel branching.
+        let mut cfg = cfg_active();
+        cfg.clarifying_questions_enabled = false;
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let node = node_with(cfg, store);
+        let llm = Arc::new(ScriptedLlm::never_tool());
+        let tools = Arc::new(ScriptedTools::ok(r#"{"ok": true}"#));
+        let ctx = ctx_with(llm.clone(), tools.clone(), false);
+        let mut st = eligible_state();
+        st.playbook_steps = Some(vec!["passo 1".to_string(), "passo 2".to_string()]);
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(true));
+        // Primario + fallback tool-robust = 2 chiamate, poi playbook (no terza LLM).
+        assert_eq!(*llm.calls.lock().unwrap(), 2);
+        // Il tool nexus_todo_write e' stato eseguito coi todos del playbook.
+        let seen = tools.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let todos = seen[0].0.input["todos"].as_array().expect("todos");
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0]["content"], json!("passo 1"));
+    }
+
+    #[tokio::test]
+    async fn skip_no_tool_use_emitted() {
+        // Nessun tool + nessun playbook -> skip no_tool_use_emitted.
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let mut cfg = cfg_active();
+        cfg.clarifying_questions_enabled = false;
+        let node = node_with(cfg, store);
+        let llm = Arc::new(ScriptedLlm::never_tool());
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(false));
+        assert_eq!(out.plan_phase_skip_reason.as_deref(), Some("no_tool_use_emitted"));
+    }
+
+    #[tokio::test]
+    async fn skip_no_capable_provider() {
+        // Provider planner sentinella -> skip no_capable_provider.
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let mut cfg = cfg_active();
+        cfg.clarifying_questions_enabled = false;
+        let node = PlannerNode::new(
+            cfg,
+            "__no_capable_provider__".to_string(),
+            "x".to_string(),
+            "openai".to_string(),
+            "y".to_string(),
+            store,
+        );
+        let llm = Arc::new(ScriptedLlm::never_tool());
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(false));
+        assert!(out
+            .plan_phase_skip_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("no_capable_provider:"));
+    }
+
+    #[tokio::test]
+    async fn skip_tool_returned_error() {
+        // Il tool nexus_todo_write ritorna {ok:false} -> skip tool_returned_error.
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let mut cfg = cfg_active();
+        cfg.clarifying_questions_enabled = false;
+        let node = node_with(cfg, store);
+        let llm = Arc::new(ScriptedLlm::always_tool(
+            "nexus_todo_write",
+            json!({"action": "create", "todos": [{"content": "X"}]}),
+        ));
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": false}"#)), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_skip_reason.as_deref(), Some("tool_returned_error"));
+    }
+
+    // ── Shadow: tool in Replay ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shadow_usa_replay() {
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let mut cfg = cfg_active();
+        cfg.clarifying_questions_enabled = false;
+        let node = node_with(cfg, store);
+        let llm = Arc::new(ScriptedLlm::always_tool(
+            "nexus_todo_write",
+            json!({"action": "create", "todos": [{"content": "X"}]}),
+        ));
+        let tools = Arc::new(ScriptedTools::ok(r#"{"ok": true}"#));
+        let ctx = ctx_with(llm, tools.clone(), true); // shadow
+        let st = eligible_state();
+        let _ = node.run(&st, &ctx).await.expect("run");
+        let seen = tools.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, ExecMode::Replay, "shadow -> Replay");
+    }
+
+    // ── Continuita' tool_use/tool_result (planner_node.py:586-602) ───────────
+
+    /// Estrae gli ULTIMI due messaggi del delta-mergiato (assistant + tool) e
+    /// verifica la coppia tool_use/tool_result SIMMETRICA: il `Message::Ai` porta
+    /// una `ToolUse` di `nexus_todo_write` il cui id COINCIDE col `tool_call_id`
+    /// del `Message::Tool` che segue. Senza, il tool_result e' orfano e le API
+    /// Anthropic-compat rifiutano (400) la sequenza al turno successivo.
+    fn assert_simmetria_tool_use_result(out: &AgentState) -> String {
+        let n = out.messages.len();
+        assert!(n >= 2, "attesi almeno assistant + tool in coda, trovati {n}");
+        let (tool_use_id, name) = match &out.messages[n - 2] {
+            Message::Ai { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1, "il Message::Ai deve portare 1 tool_use");
+                (tool_calls[0].id.clone(), tool_calls[0].name.clone())
+            }
+            other => panic!("penultimo messaggio non e' Message::Ai: {other:?}"),
+        };
+        assert_eq!(name, "nexus_todo_write", "la tool_use e' nexus_todo_write");
+        let result_id = match &out.messages[n - 1] {
+            Message::Tool { tool_call_id, .. } => tool_call_id.clone(),
+            other => panic!("ultimo messaggio non e' Message::Tool: {other:?}"),
+        };
+        assert_eq!(
+            tool_use_id, result_id,
+            "tool_use.id deve coincidere col tool_result.tool_call_id (coppia valida)"
+        );
+        assert!(!tool_use_id.is_empty(), "id non vuoto");
+        tool_use_id
+    }
+
+    #[tokio::test]
+    async fn continuity_tool_use_result_ramo_modello() {
+        // Ramo modello: il tool_use porta l'id REALE emesso dal modello (tc-1) e il
+        // tool_result lo referenzia -> coppia valida.
+        let mut cfg = cfg_active();
+        cfg.clarifying_questions_enabled = false;
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let node = node_with(cfg, store);
+        let llm = Arc::new(ScriptedLlm::always_tool(
+            "nexus_todo_write",
+            json!({"action": "create", "todos": [{"content": "X"}]}),
+        ));
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(true));
+        // Id reale dal modello (vedi `tool_resp`: id = "tc-1").
+        let id = assert_simmetria_tool_use_result(&out);
+        assert_eq!(id, "tc-1", "ramo modello: id reale del tool_use_block");
+    }
+
+    #[tokio::test]
+    async fn continuity_tool_use_result_ramo_playbook() {
+        // Ramo fallback playbook: il todo_block sintetico NON ha id -> il planner
+        // genera un uuid (parita' `tool_use_id = todo_block.get("id") or uuid4`).
+        // La coppia tool_use/tool_result deve restare simmetrica (stesso uuid).
+        let mut cfg = cfg_active();
+        cfg.clarifying_questions_enabled = false;
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let node = node_with(cfg, store);
+        let llm = Arc::new(ScriptedLlm::never_tool());
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
+        let mut st = eligible_state();
+        st.playbook_steps = Some(vec!["passo 1".to_string(), "passo 2".to_string()]);
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(out.plan_phase_active, Some(true));
+        // Id sintetico (uuid generato): non "tc-1", ma coincidente tra Ai e Tool.
+        let id = assert_simmetria_tool_use_result(&out);
+        assert_ne!(id, "tc-1", "ramo playbook: id NON dal modello");
+        assert!(
+            Uuid::parse_str(&id).is_ok(),
+            "ramo playbook: id e' un uuid sintetico valido, era {id}"
+        );
+    }
+
+    // ── plan_reuse_decision puro ─────────────────────────────────────────────
+
+    #[test]
+    fn plan_reuse_pura() {
+        assert_eq!(plan_reuse_decision(None, Some("code"), Some("auto")), PlanReuse::NoPlan);
+        // Legacy (campi None) -> riuso storico.
+        assert_eq!(
+            plan_reuse_decision(Some(&PlanRow::default()), Some("code"), Some("auto")),
+            PlanReuse::Reuse
+        );
+        // Intent divergente tracciato -> stale.
+        assert_eq!(
+            plan_reuse_decision(
+                Some(&PlanRow { user_intent: Some("docs".into()), behavior_mode: None }),
+                Some("code"),
+                Some("auto"),
+            ),
+            PlanReuse::Stale
+        );
+        // Stesso intent/mode -> reuse.
+        assert_eq!(
+            plan_reuse_decision(
+                Some(&PlanRow {
+                    user_intent: Some("code".into()),
+                    behavior_mode: Some("auto".into()),
+                }),
+                Some("code"),
+                Some("auto"),
+            ),
+            PlanReuse::Reuse
+        );
+    }
+
+    // ── clarifying_branch puro ───────────────────────────────────────────────
+
+    #[test]
+    fn clarifying_branch_pura() {
+        // Nessuna domanda -> proceed (a prescindere dal mode).
+        assert_eq!(clarifying_branch(&[], Some("confirm")), ClarifyingBranch::Proceed);
+        let q = vec![json!({"id": "q1", "question": "x"})];
+        // None/confirm/study -> halt.
+        assert!(matches!(clarifying_branch(&q, None), ClarifyingBranch::Halt { .. }));
+        assert!(matches!(clarifying_branch(&q, Some("confirm")), ClarifyingBranch::Halt { .. }));
+        assert!(matches!(clarifying_branch(&q, Some("study")), ClarifyingBranch::Halt { .. }));
+        // automatico/continuo -> apply defaults.
+        assert!(matches!(
+            clarifying_branch(&q, Some("automatico")),
+            ClarifyingBranch::ApplyDefaults { .. }
+        ));
+    }
+
+    // ── parse_tool_result + build_tool_input ─────────────────────────────────
+
+    #[test]
+    fn parse_tool_result_gate() {
+        assert_eq!(parse_tool_result(r#"{"ok": true}"#), ToolResultOutcome::Ok);
+        assert_eq!(parse_tool_result(r#"{"ok": false}"#), ToolResultOutcome::Error);
+        assert_eq!(parse_tool_result(r#"{}"#), ToolResultOutcome::Error);
+        assert_eq!(parse_tool_result("non-json"), ToolResultOutcome::Error);
+    }
+
+    #[test]
+    fn build_tool_input_forza_campi() {
+        let block = json!({"input": {"action": "create", "todos": []}});
+        let out = build_tool_input(&block, "RID", "anthropic", "m1", Some("code"), Some("automatico"));
+        assert_eq!(out["run_id"], json!("RID"));
+        assert_eq!(out["planner_model"], json!("anthropic/m1"));
+        assert_eq!(out["user_intent"], json!("code"));
+        assert_eq!(out["behavior_mode"], json!("automatico"));
+        // setdefault: se planner_model gia' presente, NON sovrascrive.
+        let block2 = json!({"input": {"planner_model": "gia-presente", "todos": []}});
+        let out2 = build_tool_input(&block2, "RID", "p", "m", None, None);
+        assert_eq!(out2["planner_model"], json!("gia-presente"));
+    }
+}
+
+#[cfg(test)]
+mod golden {
+    //! Golden-test di PARITA' 1:1 vs Python sulla logica DETERMINISTICA + rami ON
+    //! del planner. Lo script `scripts/gen_golden_planner.py` importa/replica le
+    //! funzioni reali (`is_eligible`, decision di riuso piano, branching
+    //! clarifying, tool catalog, fallback chain decision, `build_hinted_system`
+    //! sui soli rami ON, `build_tool_input`, parse) e salva `{case_id, function,
+    //! input, output}` in `/tmp/golden_planner.json`. Qui ricostruiamo l'input,
+    //! chiamiamo la funzione Rust corrispondente e verifichiamo
+    //! `output == golden Python`.
+    //!
+    //! `#[ignore]` perche' dipende dal file generato. Comando:
+    //!   python3 crates/nexus-agent-graph/scripts/gen_golden_planner.py
+    //!   cargo test -p nexus-agent-graph --lib golden_planner_parita -- --ignored
+
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+
+    use super::{
+        build_tool_input, clarifying_branch, parse_tool_result, plan_reuse_decision, tool_catalog,
+        ClarifyingBranch, PlanReuse, PlannerConfig, PlannerNode, ToolResultOutcome,
+    };
+    use crate::runtime::ports::PlanRow;
+    use crate::state::{AgentState, Message, MessageContent};
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenCase {
+        case_id: String,
+        function: String,
+        input: Value,
+        output: Value,
+    }
+
+    /// Config dai campi dell'input golden (i 4 gate di is_eligible + i rami ON).
+    fn cfg_from(input: &Value) -> PlannerConfig {
+        let mut cfg = PlannerConfig::default();
+        if let Some(b) = input.get("plan_phase_enabled").and_then(Value::as_bool) {
+            cfg.plan_phase_enabled = b;
+        }
+        if let Some(a) = input.get("plan_behavior_modes").and_then(Value::as_array) {
+            cfg.plan_behavior_modes =
+                a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        }
+        if let Some(a) = input.get("plan_intents").and_then(Value::as_array) {
+            cfg.plan_intents = a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        }
+        if let Some(n) = input.get("plan_min_token_budget").and_then(Value::as_i64) {
+            cfg.plan_min_token_budget = n;
+        }
+        if let Some(s) = input.get("planner_system_text").and_then(Value::as_str) {
+            cfg.planner_system_text = s.to_string();
+        }
+        if let Some(b) = input.get("turn_focus_enabled").and_then(Value::as_bool) {
+            cfg.turn_focus_enabled = b;
+        }
+        cfg
+    }
+
+    /// Ricostruisce uno stato minimale per build_hinted_system: messages (solo
+    /// testo) + context_brief.
+    fn state_from(input: &Value) -> AgentState {
+        let mut msgs: Vec<Message> = Vec::new();
+        if let Some(arr) = input.get("messages").and_then(Value::as_array) {
+            for m in arr {
+                let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+                let text = m.get("content").and_then(Value::as_str).unwrap_or("");
+                let content = MessageContent::text(text);
+                msgs.push(match role {
+                    "assistant" | "ai" => Message::Ai {
+                        content,
+                        tool_calls: vec![],
+                    },
+                    _ => Message::Human { content },
+                });
+            }
+        }
+        let mut st = AgentState {
+            messages: msgs,
+            ..Default::default()
+        };
+        if let Some(b) = input.get("context_brief").and_then(Value::as_str) {
+            st.context_brief = Some(b.to_string());
+        }
+        st
+    }
+
+    fn opt_str(input: &Value, key: &str) -> Option<String> {
+        input.get(key).and_then(Value::as_str).map(str::to_string)
+    }
+
+    fn plan_reuse_label(r: PlanReuse) -> &'static str {
+        match r {
+            PlanReuse::NoPlan => "no_plan",
+            PlanReuse::Stale => "stale",
+            PlanReuse::Reuse => "reuse",
+        }
+    }
+
+    fn clarifying_label(b: &ClarifyingBranch) -> Value {
+        match b {
+            ClarifyingBranch::Proceed => json!({"branch": "proceed"}),
+            ClarifyingBranch::Halt { questions } => json!({"branch": "halt", "questions": questions}),
+            ClarifyingBranch::ApplyDefaults { assumptions } => {
+                json!({"branch": "apply_defaults", "assumptions": assumptions})
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "richiede /tmp/golden_planner.json generato da gen_golden_planner.py"]
+    fn golden_planner_parita() {
+        let path = "/tmp/golden_planner.json";
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "impossibile leggere {path}: {e}; genera con \
+                 python3 crates/nexus-agent-graph/scripts/gen_golden_planner.py"
+            )
+        });
+        let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
+        assert!(cases.len() >= 25, "attesi >=25 casi golden, trovati {}", cases.len());
+
+        let mut checked = 0usize;
+        for c in &cases {
+            let got: Value = match c.function.as_str() {
+                "is_eligible" => {
+                    let cfg = cfg_from(&c.input);
+                    let bm = opt_str(&c.input, "behavior_mode");
+                    let it = opt_str(&c.input, "intent");
+                    let tb = c.input.get("token_budget").and_then(Value::as_i64).unwrap_or(0);
+                    json!(cfg.is_eligible(bm.as_deref(), it.as_deref(), tb))
+                }
+                "plan_reuse" => {
+                    // existing: null | {user_intent?, behavior_mode?}
+                    let existing = c.input.get("existing").and_then(|v| {
+                        if v.is_null() {
+                            None
+                        } else {
+                            Some(PlanRow {
+                                user_intent: v.get("user_intent").and_then(Value::as_str).map(str::to_string),
+                                behavior_mode: v.get("behavior_mode").and_then(Value::as_str).map(str::to_string),
+                            })
+                        }
+                    });
+                    let it = opt_str(&c.input, "intent");
+                    let bm = opt_str(&c.input, "behavior_mode");
+                    json!(plan_reuse_label(plan_reuse_decision(existing.as_ref(), it.as_deref(), bm.as_deref())))
+                }
+                "clarifying_branch" => {
+                    let questions = c
+                        .input
+                        .get("questions")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let bm = opt_str(&c.input, "behavior_mode");
+                    clarifying_label(&clarifying_branch(&questions, bm.as_deref()))
+                }
+                "tool_catalog" => {
+                    // La lista di un solo tool; confronto strutturale JSON.
+                    json!(tool_catalog())
+                }
+                "build_hinted_system" => {
+                    let cfg = cfg_from(&c.input);
+                    let st = state_from(&c.input);
+                    let run_id = c.input.get("run_id").and_then(Value::as_str).unwrap_or("");
+                    // build_hinted_system e' un metodo del nodo: serve un'istanza.
+                    let node = PlannerNode::new(
+                        cfg,
+                        "p".to_string(),
+                        "m".to_string(),
+                        "fp".to_string(),
+                        "fm".to_string(),
+                        std::sync::Arc::new(crate::runtime::test_doubles::StubTodoStore::with_todos(vec![])),
+                    );
+                    json!(node.build_hinted_system(&st, run_id))
+                }
+                "build_tool_input" => {
+                    let block = c.input.get("todo_block").cloned().unwrap_or(json!({}));
+                    let run_id = c.input.get("run_id").and_then(Value::as_str).unwrap_or("");
+                    let up = c.input.get("used_provider").and_then(Value::as_str).unwrap_or("");
+                    let um = c.input.get("used_model").and_then(Value::as_str).unwrap_or("");
+                    let it = opt_str(&c.input, "intent");
+                    let bm = opt_str(&c.input, "behavior_mode");
+                    build_tool_input(&block, run_id, up, um, it.as_deref(), bm.as_deref())
+                }
+                "parse_tool_result" => {
+                    let rj = c.input.get("result_json").and_then(Value::as_str).unwrap_or("");
+                    json!(matches!(parse_tool_result(rj), ToolResultOutcome::Ok))
+                }
+                other => panic!("funzione golden sconosciuta: {other} (caso {})", c.case_id),
+            };
+
+            assert!(
+                got == c.output,
+                "PARITA' FALLITA caso {} ({}):\n  rust   = {}\n  python = {}",
+                c.case_id,
+                c.function,
+                got,
+                c.output
+            );
+            checked += 1;
+        }
+        println!("golden planner: {checked} casi verificati, tutti verdi");
+    }
+}

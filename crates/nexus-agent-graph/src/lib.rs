@@ -24,14 +24,15 @@ pub mod state;
 
 pub use checkpoint_pg::PgCheckpointer;
 pub use nodes::{
-    count_build_errors, ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory,
-    FinalGateConfig, FinalGateNode, GateOutcome, LearnerConfig, LearnerNode, LlmDecision, OnFailure,
-    QdrantPayload, ReflectionConfig, ReflectionData, ReflectionNode, RouterNode, TodoRunnerConfig,
-    TodoRunnerNode, UnderstandingConfig, UnderstandingNode,
+    clarifying_branch, count_build_errors, plan_reuse_decision, ClarifyConfig, ClarifyMode,
+    ClarifyOrExpandNode, ClarifyingBranch, DecisionCategory, FinalGateConfig, FinalGateNode,
+    GateOutcome, LearnerConfig, LearnerNode, LlmDecision, OnFailure, PlanReuse, PlannerConfig,
+    PlannerNode, QdrantPayload, ReflectionConfig, ReflectionData, ReflectionNode, RouterNode,
+    TodoRunnerConfig, TodoRunnerNode, ToolResultOutcome, UnderstandingConfig, UnderstandingNode,
 };
 pub use runtime::{
     AgentNodeCtx, CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway,
-    TodoStore, ToolExecutor,
+    PlanRow, TodoStore, ToolExecutor,
 };
 pub use shadow::{compute_diff, persist_node_diff, DiffCollector, NodeDiff};
 pub use state::{AgentState, AutomationMode, Message, MetaStep, StateDelta, StopReason, TaskComplexity};
