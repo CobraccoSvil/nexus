@@ -159,9 +159,20 @@ where
                 return Ok(StepOutcome::Completed(state));
             }
 
-            // Interrupt: lo stato attende input umano. Si ferma e indica da dove
-            // riprendere (il nodo gia' instradato).
-            if state.is_awaiting_confirmation() || state.is_pending_clarify() {
+            // Interrupt-resume vero (HITL): SOLO `awaiting_confirmation`. Lo stato
+            // attende una conferma umana per RIPRENDERE lo STESSO run; il motore si
+            // ferma e indica da dove riprendere (il nodo gia' instradato). Replica
+            // l'`interrupt_before=["executor"]` di graph.py (modalita' legacy,
+            // ripreso via `/agent/approve`).
+            //
+            // `pending_clarify` NON e' un interrupt-resume: in graph.py e' un edge
+            // CONDIZIONALE che instrada a END (run terminale, Completed). Il prossimo
+            // messaggio utente avvia un NUOVO run dall'entry `router`. Quel ramo e'
+            // gestito dalla TOPOLOGIA (edge condizionale a `End` in `build_edges`),
+            // non da un interrupt nativo: qui non lo intercettiamo, altrimenti il run
+            // verrebbe sospeso (divergenza da graph.py) e un resume riprenderebbe dal
+            // nodo instradato saltando router+clarify.
+            if state.is_awaiting_confirmation() {
                 return Ok(StepOutcome::Interrupted {
                     state,
                     resume_at: next,

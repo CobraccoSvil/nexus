@@ -50,6 +50,14 @@ pub struct RoutingConfig {
     /// Tool che MUTANO il filesystem/progetto (per `has_filesystem_mutation_in_history`).
     /// Punto unico dei DATI: setting `agent.tools.result_cache_mutators` (mig 0394).
     pub fs_mutator_tools: Vec<String>,
+    /// Cap di superstep del motore di grafo (`GraphEngine`): anti-loop infinito
+    /// del grafo (NON delle iterazioni agentiche, che hanno il loro `iter_cap`).
+    /// DB-driven (`agent.graph.recursion_limit`): un grafo che non converge si
+    /// ferma qui invece di girare per sempre. Il default replica il
+    /// `recursion_limit` di LangGraph (`MAX_AGENT_ITERATIONS` Python con margine
+    /// per i nodi non-executor: router/clarify/understanding/planner/verifier/
+    /// final_gate/reflection/learner attraversati in un run convergente).
+    pub recursion_limit: u32,
 }
 
 impl Default for RoutingConfig {
@@ -79,6 +87,11 @@ impl Default for RoutingConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            // Cap conservativo: 150 superstep coprono ampiamente un run con
+            // MAX_AGENT_ITERATIONS (60) iterazioni executor<->tool_dispatch (2
+            // superstep ciascuna) + i nodi di contorno. Identico in spirito al
+            // `recursion_limit` di LangGraph (mai raggiunto in un run sano).
+            recursion_limit: 150,
         }
     }
 }

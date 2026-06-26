@@ -143,7 +143,10 @@ pub struct AgentState {
     pub is_ambiguous: Option<bool>,
     /// Query arricchita prodotta dal clarify_or_expand (mode=expand).
     pub expanded_query: Option<String>,
-    /// `true` se e' stata emessa una richiesta di chiarimento (turno fermo).
+    /// `true` se e' stata emessa una richiesta di chiarimento: il run e' TERMINALE
+    /// (l'edge condizionale di `clarify_or_expand` instrada a `End` -> `Completed`).
+    /// Il prossimo messaggio utente avvia un NUOVO run dall'entry `router`. NON e'
+    /// un interrupt-resume (a differenza di `awaiting_confirmation`).
     pub pending_clarify: Option<bool>,
     /// Numero di chiarimenti gia' emessi nel run.
     pub clarify_attempts: Option<i64>,
@@ -374,10 +377,12 @@ pub struct AgentState {
     /// Modalita' automazione del turno chat propagata da mcp-core.
     pub automation_mode: Option<AutomationMode>,
 
-    // ── HITL (predicati di interrupt) ───────────────────────────────────────────
+    // ── HITL (predicato di interrupt-resume) ─────────────────────────────────────
     /// `true` quando lo stato attende una conferma umana (HITL). Non presente
     /// nel TypedDict come campo top-level: lo aggiungiamo qui esplicitamente
-    /// perche' e' uno dei due predicati di interrupt del runtime.
+    /// perche' e' l'UNICO predicato di interrupt-resume del runtime (il motore
+    /// SOSPENDE lo stesso run con `Interrupted`). Distinto da `pending_clarify`,
+    /// che e' uno stato TERMINALE gestito dalla topologia (edge a `End`).
     pub awaiting_confirmation: Option<bool>,
 
     // ── Schema aperto ───────────────────────────────────────────────────────────
@@ -396,6 +401,8 @@ impl AgentState {
     }
 
     /// `true` se lo stato attende un chiarimento dall'utente (disambiguazione).
+    /// Usato dalla TOPOLOGIA (edge condizionale di `clarify_or_expand` -> `End`),
+    /// NON come predicato di interrupt del motore: il run si CHIUDE (terminale).
     pub fn is_pending_clarify(&self) -> bool {
         self.pending_clarify.unwrap_or(false)
     }
@@ -430,10 +437,6 @@ impl nexus_graph::GraphState for AgentState {
 
     fn is_awaiting_confirmation(&self) -> bool {
         AgentState::is_awaiting_confirmation(self)
-    }
-
-    fn is_pending_clarify(&self) -> bool {
-        AgentState::is_pending_clarify(self)
     }
 }
 

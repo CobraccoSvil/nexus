@@ -62,3 +62,13 @@ impl AgentNodeCtx {
         }
     }
 }
+
+/// Adattatore al motore di grafo (`nexus_graph::GraphEngine`): il motore richiede
+/// solo `recursion_limit()` dal contesto. Lo legge dalla `RoutingConfig`
+/// DB-driven (regola G: PASSATA nel ctx, mai letta dal DB qui), cosi' il cap
+/// anti-loop del grafo e' configurabile senza toccare il motore puro.
+impl nexus_graph::engine::NodeCtxLike for AgentNodeCtx {
+    fn recursion_limit(&self) -> u32 {
+        self.cfg.recursion_limit
+    }
+}

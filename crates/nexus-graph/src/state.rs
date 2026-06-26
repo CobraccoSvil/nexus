@@ -50,20 +50,22 @@ impl StateDelta {
 
 /// Contratto dello stato condiviso del grafo.
 ///
-/// Il runtime usa solo questi tre metodi: NON conosce i campi concreti dello
-/// stato. `merge` e' il reducer (punto unico, regola L). I due predicati di
-/// interrupt mappano 1:1 sugli stati NON terminali dell'orchestratore Nexus
-/// (`AwaitingConfirmation` / `BlockedNeedsInput`).
+/// Il runtime usa solo questi due metodi: NON conosce i campi concreti dello
+/// stato. `merge` e' il reducer (punto unico, regola L).
+///
+/// L'UNICO predicato di interrupt-resume del runtime e' `is_awaiting_confirmation`
+/// (HITL vero: il run si SOSPENDE e riprende dallo stesso punto). NON esiste un
+/// predicato `is_pending_clarify` nel contratto del runtime: `pending_clarify` e'
+/// uno stato TERMINALE (il run CHIUDE con `Completed`, il prossimo input avvia un
+/// nuovo run dall'entry), gestito dalla TOPOLOGIA con un edge condizionale a
+/// `End`, non dal motore. Replica 1:1 `brain/agents/graph.py`
+/// (`_route_after_clarify_or_expand` -> END vs `interrupt_before=["executor"]`).
 pub trait GraphState: Send + Sync {
     /// Applica un delta allo stato secondo la semantica di canale (append vs
     /// overwrite). Implementazione concreta nel crate dei nodi.
     fn merge(&mut self, delta: StateDelta);
 
     /// `true` se lo stato richiede una conferma umana prima di proseguire
-    /// (HITL): il motore sospende con `Interrupted`.
+    /// (HITL): il motore sospende con `Interrupted` e riprende lo stesso run.
     fn is_awaiting_confirmation(&self) -> bool;
-
-    /// `true` se lo stato attende un chiarimento dall'utente (disambiguazione):
-    /// il motore sospende con `Interrupted`.
-    fn is_pending_clarify(&self) -> bool;
 }

@@ -16,6 +16,7 @@
 
 pub mod checkpoint_pg;
 pub mod decisions;
+pub mod graph;
 #[cfg(test)]
 pub mod golden_util;
 pub mod nodes;
@@ -26,6 +27,9 @@ pub mod shadow;
 pub mod state;
 
 pub use checkpoint_pg::PgCheckpointer;
+pub use graph::{
+    build_agent_graph, node_target_to_node_id, AgentGraphEngine, AgentGraphNode, AgentGraphNodes,
+};
 pub use nodes::{
     clarifying_branch, count_build_errors, plan_reuse_decision, ClarifyConfig, ClarifyMode,
     ClarifyOrExpandNode, ClarifyingBranch, DecisionCategory, FinalGateConfig, FinalGateNode,

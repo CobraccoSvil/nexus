@@ -71,10 +71,6 @@ mod tests {
         fn is_awaiting_confirmation(&self) -> bool {
             self.awaiting_confirmation
         }
-
-        fn is_pending_clarify(&self) -> bool {
-            self.pending_clarify
-        }
     }
 
     // --- Contesto minimale -------------------------------------------------
@@ -216,12 +212,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupt_su_pending_clarify() {
-        // Un nodo che setta pending_clarify, edge verso un altro nodo (NON End):
-        // il motore deve interrompersi indicando il resume_at.
-        struct ClarifyNode;
+    async fn interrupt_su_awaiting_confirmation() {
+        // HITL vero: un nodo setta awaiting_confirmation, edge verso un altro nodo
+        // (NON End). Il motore deve SOSPENDERE indicando il resume_at (lo stesso
+        // run riprende da li' dopo la conferma). E' l'UNICO predicato di interrupt.
+        struct ConfirmNode;
         #[async_trait]
-        impl GraphNode<TestState, TestCtx> for ClarifyNode {
+        impl GraphNode<TestState, TestCtx> for ConfirmNode {
             fn id(&self) -> NodeId {
                 NodeId::Router
             }
@@ -231,13 +228,13 @@ mod tests {
                 _ctx: &TestCtx,
             ) -> Result<StateDelta, NodeError> {
                 let mut delta = StateDelta::empty();
-                delta.set("pending_clarify", serde_json::json!(true));
+                delta.set("awaiting_confirmation", serde_json::json!(true));
                 Ok(delta)
             }
         }
 
         let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
-        nodes.insert(NodeId::Router, Arc::new(ClarifyNode));
+        nodes.insert(NodeId::Router, Arc::new(ConfirmNode));
         // Il NoOp finale serve solo come destinazione (mai eseguito: interrupt prima).
         nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));
         let mut edges = HashMap::new();
@@ -264,6 +261,142 @@ mod tests {
                 assert_eq!(resume_at, NodeId::NoOp);
             }
             other => panic!("atteso Interrupted, ottenuto {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_clarify_non_interrompe_il_motore() {
+        // pending_clarify NON e' piu' un interrupt del motore: e' uno stato
+        // TERMINALE gestito dalla TOPOLOGIA (edge a End). Senza un edge a End, il
+        // motore PROSEGUE (non sospende). Qui un nodo setta pending_clarify ma
+        // l'edge va verso un nodo che chiude: il run COMPLETA, non si interrompe.
+        struct ClarifyNode;
+        #[async_trait]
+        impl GraphNode<TestState, TestCtx> for ClarifyNode {
+            fn id(&self) -> NodeId {
+                NodeId::Router
+            }
+            async fn run(
+                &self,
+                _state: &TestState,
+                _ctx: &TestCtx,
+            ) -> Result<StateDelta, NodeError> {
+                let mut delta = StateDelta::empty();
+                delta.set("pending_clarify", serde_json::json!(true));
+                Ok(delta)
+            }
+        }
+
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::Router, Arc::new(ClarifyNode));
+        nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));
+        let mut edges = HashMap::new();
+        // Router -> NoOp -> End: pending_clarify NON deve fermare il motore prima.
+        edges.insert(NodeId::Router, Edge::Static(NodeId::NoOp));
+        edges.insert(NodeId::NoOp, Edge::Static(NodeId::End));
+
+        let engine = GraphEngine::new(
+            nodes,
+            edges,
+            NodeId::Router,
+            Arc::new(MemoryCheckpointer::default()),
+        );
+
+        let ctx = TestCtx {
+            recursion_limit: 50,
+        };
+        let outcome = engine
+            .run_until_interrupt(Uuid::new_v4(), Some(TestState::default()), &ctx)
+            .await
+            .expect("il motore non deve interrompersi su pending_clarify");
+
+        // NoOp viene eseguito (il motore non si e' fermato su pending_clarify) e il
+        // run chiude con Completed.
+        match outcome {
+            StepOutcome::Completed(s) => assert!(s.pending_clarify),
+            other => panic!("atteso Completed, ottenuto {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_clarify_con_edge_a_end_e_terminale() {
+        // Replica la topologia reale (graph.rs): un nodo setta pending_clarify e il
+        // suo edge CONDIZIONALE instrada a End. Il run e' TERMINALE -> Completed,
+        // SENZA attraversare il nodo successivo. Verifica il fix della divergenza.
+        struct ClarifyNode;
+        #[async_trait]
+        impl GraphNode<TestState, TestCtx> for ClarifyNode {
+            fn id(&self) -> NodeId {
+                NodeId::Router
+            }
+            async fn run(
+                &self,
+                _state: &TestState,
+                _ctx: &TestCtx,
+            ) -> Result<StateDelta, NodeError> {
+                let mut delta = StateDelta::empty();
+                delta.set("pending_clarify", serde_json::json!(true));
+                Ok(delta)
+            }
+        }
+        // Nodo "successivo" che NON deve mai essere eseguito (settarebbe steps).
+        struct ShouldNotRun;
+        #[async_trait]
+        impl GraphNode<TestState, TestCtx> for ShouldNotRun {
+            fn id(&self) -> NodeId {
+                NodeId::Understanding
+            }
+            async fn run(
+                &self,
+                state: &TestState,
+                _ctx: &TestCtx,
+            ) -> Result<StateDelta, NodeError> {
+                let mut delta = StateDelta::empty();
+                delta.set("steps", serde_json::json!(state.steps + 100));
+                Ok(delta)
+            }
+        }
+
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::Router, Arc::new(ClarifyNode));
+        nodes.insert(NodeId::Understanding, Arc::new(ShouldNotRun));
+        let mut edges = HashMap::new();
+        // Edge condizionale come in graph.rs: pending_clarify -> End, altrimenti
+        // -> Understanding.
+        edges.insert(
+            NodeId::Router,
+            Edge::conditional(|s: &TestState| {
+                if s.pending_clarify {
+                    NodeId::End
+                } else {
+                    NodeId::Understanding
+                }
+            }),
+        );
+        edges.insert(NodeId::Understanding, Edge::Static(NodeId::End));
+
+        let engine = GraphEngine::new(
+            nodes,
+            edges,
+            NodeId::Router,
+            Arc::new(MemoryCheckpointer::default()),
+        );
+
+        let ctx = TestCtx {
+            recursion_limit: 50,
+        };
+        let outcome = engine
+            .run_until_interrupt(Uuid::new_v4(), Some(TestState::default()), &ctx)
+            .await
+            .expect("pending_clarify con edge a End deve completare");
+
+        match outcome {
+            StepOutcome::Completed(s) => {
+                assert!(s.pending_clarify, "pending_clarify resta valorizzato");
+                // Understanding NON e' stato eseguito: steps invariato (terminale).
+                assert_eq!(s.steps, 0, "il nodo successivo NON deve essere eseguito");
+            }
+            other => panic!("atteso Completed, ottenuto {other:?}"),
         }
     }
 
