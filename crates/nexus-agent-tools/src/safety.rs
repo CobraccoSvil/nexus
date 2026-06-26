@@ -110,6 +110,21 @@ static FORBIDDEN_PATTERNS: &[(&str, &str, &str, &str)] = &[
         "docker compose su Nexus stack vietato",
         "Non eseguire docker compose sul compose Nexus.",
     ),
+    // Lo stack Nexus e' un progetto docker compose con project name `ideai` e file
+    // /home/administrator/ideai/docker-compose.local.yml. I container hanno il
+    // prefisso `ideai-` (coperto dai pattern docker_*_ideai sopra), MA un
+    // `docker compose down` referenziato per PATH (/home/administrator/ideai/...,
+    // dove dopo `ideai` c'e' `/` non `-`) o per PROJECT NAME (`-p ideai`,
+    // `--project-name ideai`) fermerebbe postgres/redis/qdrant AGGIRANDO il
+    // pattern `ideai-`. Questo pattern chiude il vettore (difesa in profondita',
+    // regola E). Non tocca i compose dei progetti utente (sotto
+    // /home/administrator/projects/<slug>, mai sotto /home/administrator/ideai).
+    (
+        "docker_compose_nexus",
+        r"(?i)\bdocker[\s-]+compose\b[^|;&]*(?:/home/administrator/ideai|\$IDEAI_ROOT|(?:-p|--project-name)[=\s]+ideai)\b",
+        "docker compose sullo stack Nexus (path /home/administrator/ideai o project name ideai) vietato",
+        "Per il cleanup usa solo `docker compose -f <COMPOSE_DEL_TUO_PROGETTO> down`. Mai toccare lo stack Nexus (postgres-nexus, redis, qdrant).",
+    ),
     (
         "docker_system_prune",
         r"(?i)\bdocker\s+system\s+prune\b",
@@ -425,6 +440,45 @@ mod tests {
         let r = check_command("docker system prune -af");
         assert!(r.is_some());
         assert_eq!(r.unwrap().category, "docker_system_prune");
+    }
+
+    #[test]
+    fn blocca_docker_compose_stack_nexus_via_path_o_project() {
+        // Vettori che fermerebbero lo stack Nexus aggirando il pattern ideai-*:
+        // il path /home/administrator/ideai (dopo 'ideai' c'e' '/', non '-') e il
+        // project name 'ideai' (senza trattino). I container ideai-* sono protetti
+        // solo contro docker stop/kill/rm/restart, non contro 'compose down'.
+        let r = check_command(
+            "docker compose -f /home/administrator/ideai/docker-compose.local.yml down",
+        );
+        assert!(r.is_some(), "compose verso il path Nexus deve essere bloccato");
+        assert_eq!(r.unwrap().category, "docker_compose_nexus");
+
+        assert!(
+            check_command("docker compose -p ideai down").is_some(),
+            "compose con project name ideai deve essere bloccato"
+        );
+        assert!(
+            check_command("docker-compose --project-name ideai stop").is_some(),
+            "anche docker-compose (v1) con project name ideai"
+        );
+    }
+
+    #[test]
+    fn permette_docker_compose_progetto_utente() {
+        // Il compose di un progetto utente (sotto /home/administrator/projects)
+        // NON deve essere bloccato: e' il cleanup legittimo del proprio stack.
+        assert!(
+            check_command(
+                "docker compose -f /home/administrator/projects/Beauty-Book/docker-compose.yml down"
+            )
+            .is_none(),
+            "il compose del progetto utente deve passare"
+        );
+        assert!(
+            check_command("docker compose -p beauty-book down").is_none(),
+            "project name del progetto utente deve passare"
+        );
     }
 
     #[test]
