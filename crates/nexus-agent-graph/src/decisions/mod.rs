@@ -96,9 +96,9 @@ pub use reward::{
     MAX_AGENT_ITERATIONS,
 };
 pub use helpers::{
-    compute_iteration_budget, estimate_prompt_complexity, provider_style_supports_forcing,
-    should_force_tool_choice, structural_unfulfilled_signal, turn_action_oriented,
-    AdaptiveBudgetConfig,
+    action_oriented_for_intent, compute_iteration_budget, estimate_prompt_complexity,
+    provider_style_supports_forcing, should_force_tool_choice, structural_unfulfilled_signal,
+    turn_action_oriented, AdaptiveBudgetConfig,
 };
 pub use loop_signatures::{
     build_signature, detect_signature_loop, exploration_counter_update, ExplorationCounterUpdate,

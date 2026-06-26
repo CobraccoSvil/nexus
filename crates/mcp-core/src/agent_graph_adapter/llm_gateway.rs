@@ -277,11 +277,21 @@ struct ReplayStep {
 
 /// PUNTO UNICO della lettura degli step di replay da `agent_steps` (funzione
 /// libera, testabile col solo `&PgPool`, regola L). Tutti gli step del run
-/// primario che hanno prodotto un tool_use, ordinati per `step_index` ASC.
+/// primario che hanno prodotto un tool_use, ordinati in modo DETERMINISTICO.
 ///
 /// I nodi ausiliari (planner/reflection/clarify) NON scrivono `agent_steps`:
 /// quindi qui arrivano SOLO gli step dell'executor (1:1 con la sequenza di tool
 /// che lo shadow deve rigiocare).
+///
+/// ORDINAMENTO (FIX shadow LLM-Replay, difesa in profondita'): `created_at ASC,
+/// step_index ASC, id ASC`. Lo `step_index` del primario Python NON e' univoco
+/// per run (retry/fallback della cascade riusano lo stesso indice), quindi un
+/// ordinamento per solo `step_index` poteva MESCOLARE le ondate (gruppi-iterazione
+/// di `group_steps_by_iteration`) e produrre divergenza ("loop"). `created_at` da'
+/// l'ordine temporale reale; `step_index` poi `id` (PK UUID) sono tiebreak
+/// deterministici quando `created_at` collide. Il raggruppamento per quoziente
+/// `step_index / 1000` resta invariato (vedi `group_steps_by_iteration`); questo e'
+/// solo l'ordine di lettura.
 async fn load_replay_steps(
     db: &PgPool,
     primary_run_id: Uuid,
@@ -289,7 +299,7 @@ async fn load_replay_steps(
     let rows: Vec<(i64, String, Value)> = sqlx::query_as(
         "SELECT step_index::bigint, tool_name, tool_input FROM agent_steps \
          WHERE run_id = $1 \
-         ORDER BY step_index ASC",
+         ORDER BY created_at ASC, step_index ASC, id ASC",
     )
     .bind(primary_run_id)
     .fetch_all(db)
@@ -1059,5 +1069,55 @@ mod tests {
         let last = gw.complete(executor_req()).await.unwrap();
         assert_eq!(last.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(last.content, "done");
+    }
+
+    /// Inserisce uno step con `created_at` ESPLICITO (per testare l'ordinamento
+    /// temporale a parita'/duplicazione di `step_index`).
+    async fn insert_step_at(
+        pool: &PgPool,
+        run_id: Uuid,
+        step_index: i32,
+        tool_name: &str,
+        created_at_iso: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO agent_steps \
+             (id, run_id, step_index, tool_name, tool_input, status, created_at) \
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, 'completed', $5::timestamptz)",
+        )
+        .bind(run_id)
+        .bind(step_index)
+        .bind(tool_name)
+        .bind(json!({}))
+        .bind(created_at_iso)
+        .execute(pool)
+        .await
+        .expect("insert step at");
+    }
+
+    /// FIX shadow LLM-Replay (difesa in profondita'): con `step_index` DUPLICATI
+    /// (ondate retry/fallback del primario) l'ordine di `load_replay_steps` deve
+    /// seguire `created_at` (tiebreak `step_index`, poi `id`), NON il solo
+    /// `step_index`. Un ordinamento per solo `step_index` mescolerebbe le ondate.
+    #[sqlx::test]
+    async fn load_replay_steps_ordina_per_created_at_con_step_index_duplicati(pool: PgPool) {
+        create_tables(&pool).await;
+        let run = insert_run(&pool, Some("done")).await;
+        // Ondate con step_index COLLIDENTI ma created_at crescente nell'ordine reale:
+        // ondata 1 (idx 0,1) PRIMA, poi ondata 2 (idx 0,1 di nuovo, retry) DOPO.
+        // Inserimento volutamente FUORI ordine per dimostrare che e' la query a
+        // ordinare (non l'ordine di insert).
+        insert_step_at(&pool, run, 1, "w2_b", "2026-06-27T10:00:04Z").await; // ondata 2, secondo
+        insert_step_at(&pool, run, 0, "w1_a", "2026-06-27T10:00:01Z").await; // ondata 1, primo
+        insert_step_at(&pool, run, 1, "w1_b", "2026-06-27T10:00:02Z").await; // ondata 1, secondo
+        insert_step_at(&pool, run, 0, "w2_a", "2026-06-27T10:00:03Z").await; // ondata 2, primo
+
+        let steps = load_replay_steps(&pool, run).await.expect("load steps");
+        let order: Vec<&str> = steps.iter().map(|s| s.tool_name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["w1_a", "w1_b", "w2_a", "w2_b"],
+            "ordine = created_at, NON mescolato per solo step_index"
+        );
     }
 }

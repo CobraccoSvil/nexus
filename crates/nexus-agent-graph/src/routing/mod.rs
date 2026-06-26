@@ -362,6 +362,27 @@ mod tests {
         );
     }
 
+    /// FIX shadow LLM-Replay (RADICE divergenza "g1"): un turno CONVERSAZIONALE
+    /// (0 tool, `action_oriented=false`, intent `chat`) che chiude con `EndTurn`
+    /// NON deve scattare il gate G1 — va alla chiusura (learner). Era questo il
+    /// caso in cui lo shadow, con `action_oriented` forzato a true dal fallback del
+    /// RouterNode, divergeva dal primario (canonical "g1" vs "end_turn"). Con la
+    /// derivazione corretta `action_oriented_for_intent("chat") = false` qui non si
+    /// entra mai in G1Continue.
+    #[test]
+    fn turno_conversazionale_zero_tool_non_va_in_g1() {
+        let mut s = base();
+        s.stop_reason = Some(StopReason::EndTurn);
+        s.action_oriented = Some(false); // derivato da intent "chat".
+        s.user_intent = Some("chat".into()); // non software -> learner.
+        s.result = Some("Ecco la risposta.".into());
+        // Nessuna azione produttiva, nessun declared, ma action_oriented=false e
+        // non unfulfilled -> NON G1, chiude.
+        let target = route_after_executor(&s, &RoutingConfig::default());
+        assert_ne!(target, NodeTarget::G1Continue, "niente G1 sul turno chat");
+        assert_eq!(target, NodeTarget::Learner);
+    }
+
     #[test]
     fn default_final_gate_software() {
         let mut s = base();

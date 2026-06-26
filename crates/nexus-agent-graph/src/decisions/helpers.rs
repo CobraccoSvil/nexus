@@ -79,6 +79,38 @@ pub fn turn_action_oriented(action_oriented: Option<bool>) -> bool {
     action_oriented.unwrap_or(true)
 }
 
+/// Intent semanticamente CONVERSAZIONALI (risposta testuale, nessuna azione con
+/// tool). Fonte autoritativa, allineata 1:1 con la semantica del classifier
+/// Python (`brain/router/agentic_classifier.py`: per `intent=chat` ->
+/// `requires_tools=false, agentic_score<=0.2`) e con `_INTENT_TOOL_SUBSET`
+/// (`brain/agents/profile_loader.py`: `chat`/`general_chat` -> solo
+/// apri-file, nessun tool di esecuzione/scrittura). Tutti gli ALTRI intent
+/// (debug/fix/refactor/test/docs/architecture/file_ops/system_admin/code_read/
+/// agentic_default) sono operativi (`requires_tools=true`).
+const CONVERSATIONAL_INTENTS: &[&str] = &["chat", "general_chat"];
+
+/// Punto unico (regola L): deriva `action_oriented` da un intent gia' RISOLTO.
+///
+/// E' la replica DETERMINISTICA della mappa intent->azione che il brain Python
+/// ottiene dal classifier LLM (`__init__.py:686-707`): un intent conversazionale
+/// (`chat`/`general_chat`) NON e' d'azione; ogni altro intent operativo lo e'.
+/// Usata quando un intent e' gia' noto a monte (es. `intent_hint` di una
+/// disambiguazione risolta, o l'intent del primario nello shadow LLM-Replay) e
+/// NON e' disponibile il giudizio LLM per-turno (`requires_tools`/`agentic_score`).
+///
+/// Niente nome modello qui (regola G): mappa di intent semantici, non di modelli.
+/// Il porting completo del classifier LLM nel `RouterNode` (TODO `router.rs`)
+/// resta separato; questa funzione copre il caso "intent gia' deciso".
+pub fn action_oriented_for_intent(intent: &str) -> bool {
+    let intent = intent.trim();
+    if intent.is_empty() {
+        // Nessun intent noto: conservativo true (parita' col ramo "classifier non
+        // disponibile" del Python, `__init__.py:703-707`).
+        return true;
+    }
+    !CONVERSATIONAL_INTENTS.contains(&intent)
+}
+
 /// Stili di `tool_choice` (cap.tool_choice_style) che permettono di OBBLIGARE
 /// una tool call. `_TC_FORCING_SUPPORTED_STYLES` Python (1:1). Gli stili "none"
 /// e "openai_auto" NON permettono il forcing -> non sono in lista.
@@ -260,6 +292,43 @@ mod tests {
     fn action_oriented_default_none() {
         assert!(turn_action_oriented(None));
         assert!(!turn_action_oriented(Some(false)));
+    }
+
+    #[test]
+    fn action_oriented_da_intent_conversazionale() {
+        // chat/general_chat -> NON azione (parita' classifier Python).
+        assert!(!action_oriented_for_intent("chat"));
+        assert!(!action_oriented_for_intent("general_chat"));
+        assert!(!action_oriented_for_intent("  chat  "), "trim applicato");
+    }
+
+    #[test]
+    fn action_oriented_da_intent_operativo() {
+        // Intent operativi -> azione.
+        for intent in [
+            "debug",
+            "fix",
+            "refactor",
+            "test",
+            "docs",
+            "architecture",
+            "file_ops",
+            "system_admin",
+            "code_read",
+            "agentic_default",
+        ] {
+            assert!(
+                action_oriented_for_intent(intent),
+                "{intent} deve essere d'azione"
+            );
+        }
+    }
+
+    #[test]
+    fn action_oriented_da_intent_vuoto_conservativo() {
+        // Nessun intent noto -> conservativo true (ramo classifier non disponibile).
+        assert!(action_oriented_for_intent(""));
+        assert!(action_oriented_for_intent("   "));
     }
 
     #[test]

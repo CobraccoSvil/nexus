@@ -58,6 +58,15 @@
 //! 4. Il ramo `engine != python` del call site deve fare `return` su `Ok` (oggi
 //!    prosegue nel loop `run_via_brain` -> doppio run); innocuo solo perche' mai
 //!    raggiunto.
+//! 5. CLASSIFIER LLM nel `RouterNode` (TODO `router.rs`, FIX A): la
+//!    classificazione intent via LLM (`AgenticIntentClassifier`) NON e' ancora
+//!    portata. Senza `intent_hint` il RouterNode cade nel fallback
+//!    `agentic_default`/`action_oriented=true`. Per lo SHADOW questo divergeva dal
+//!    primario (g1 sui run 0-tool, loop sui run con tool): mitigato derivando
+//!    `action_oriented`/`user_intent` dall'`intent_hint` in `build_initial_state`
+//!    (ramo Shadow, punto unico `decisions::action_oriented_for_intent`). Resta da
+//!    portare il classifier completo PRIMA del cutover: senza, i turni shadow
+//!    SENZA `intent_hint` non hanno l'intent reale del primario.
 //!
 //! ## Stato (NON instradato in produzione)
 //!
@@ -93,7 +102,8 @@ use nexus_agent_graph::{
 use nexus_graph::outcome::StepOutcome;
 
 use crate::agent_graph_adapter::{
-    agent_step_store::PgAgentStepStore, billing_cooldown_port::CooldownBillingPort,
+    agent_step_store::PgAgentStepStore,
+    billing_cooldown_port::{CooldownBillingPort, NullBillingCooldownPort},
     context_offload::RagContextOffloadAdapter, criteria_runner::FinalGateCriteriaRunnerAdapter,
     escalation_port::PgEscalationPort, event_sink::SseEventSinkAdapter,
     llm_gateway::{GatewayLlmAdapter, ReplayLlmGateway},
@@ -462,7 +472,19 @@ async fn build_native_engine(
     let escalation: Arc<dyn EscalationPort> = Arc::new(PgEscalationPort::new(db.clone()));
     let next_actions: Arc<dyn NextActionsDeriver> =
         Arc::new(NextActionsDeriverAdapter::new(db.clone()));
-    let billing: Arc<dyn BillingCooldownPort> = Arc::new(CooldownBillingPort::new());
+    // Porta billing: dipende dal ruolo (FIX shadow LLM-Replay).
+    //  - Primary: cooldown LIVE (fonte unica `provider_cooldown`), il fail-fast
+    //    esplorazione riflette lo stato reale dei provider.
+    //  - Shadow: NO-OP (lista vuota). Lo shadow rigioca la DECISIONE del primario,
+    //    non rivaluta il billing corrente: leggere lo snapshot LIVE introdurrebbe
+    //    non-determinismo e un fail-fast SPURIO (-> canonical "loop") da stato
+    //    esterno evoluto dopo il primario. Allineata agli altri ausiliari shadow
+    //    gia' neutralizzati (NullEventSink, MemoryCheckpointer).
+    let billing: Arc<dyn BillingCooldownPort> = if role.is_shadow() {
+        Arc::new(NullBillingCooldownPort::new())
+    } else {
+        Arc::new(CooldownBillingPort::new())
+    };
     let upscale: Arc<dyn ModelUpscalePort> = Arc::new(CatalogModelUpscalePort::new(db.clone()));
 
     // Motore criteri del final_gate / verifier: delega al tool_executor (punto
@@ -606,7 +628,12 @@ fn history_entry_to_message(v: &serde_json::Value) -> Option<Message> {
 /// l'`initial_state` dell'endpoint brain `/agent/run/stream`: history convertita
 /// in `Message` + il messaggio utente del turno in coda,
 /// system/session/intent/automation/provider override valorizzati.
-fn build_initial_state(input: &NativeRunInput) -> AgentState {
+///
+/// `role` distingue primario da shadow. SOLO nel ramo Shadow valorizziamo
+/// `user_intent`/`action_oriented` derivandoli dall'`intent_hint` (FIX shadow
+/// LLM-Replay, vedi nota sotto): il primario reale resta INTATTO (None ->
+/// il `RouterNode` decide come oggi).
+fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
     use nexus_agent_graph::state::MessageContent;
 
     // History pregressa nel formato compatto `{"role","content"}` prodotto da
@@ -628,12 +655,49 @@ fn build_initial_state(input: &NativeRunInput) -> AgentState {
     // (incluso null) -> None: lo stato tratta None come "nessun tool dichiarato".
     let tools = input.tools_json.as_array().cloned();
 
+    // ── FIX shadow LLM-Replay: action_oriented/user_intent coerenti col primario ──
+    // RADICE della divergenza stop_reason (g1 sui run 0-tool, loop sui run con
+    // tool): in shadow il `RouterNode` NON ha il classifier LLM portato (TODO
+    // `router.rs`), quindi senza `intent_hint` cade nel fallback `agentic_default`
+    // con `action_oriented=true` SEMPRE. Il primario Python invece deriva
+    // `action_oriented` dal classifier del turno: per i turni conversazionali e'
+    // `false` -> niente G1. Per far convergere lo SHADOW (replay della DECISIONE
+    // del primario, non ri-valutazione) deriviamo `action_oriented` dall'`intent`
+    // GIA' DISPONIBILE col PUNTO UNICO deterministico
+    // `decisions::action_oriented_for_intent` (regola L: stessa mappa
+    // intent->azione del classifier Python; non esiste una tabella DB dedicata, e'
+    // semantica di intent). Quando l'`intent_hint` manca (turno normale senza
+    // disambiguazione) lasciamo `user_intent`/`action_oriented` a None: il
+    // `RouterNode` shadow applichera' lo stesso fallback del Python degradato, che
+    // e' il meglio possibile finche' il classifier non e' portato (FIX A, TODO
+    // `router.rs`, da chiudere PRIMA del cutover). SOLO ramo shadow: il primario
+    // reale resta None (decide il RouterNode come oggi).
+    let (shadow_intent, shadow_action_oriented): (Option<String>, Option<bool>) =
+        if role.is_shadow() {
+            match input
+                .intent_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(intent) => (
+                    Some(intent.to_string()),
+                    Some(nexus_agent_graph::decisions::action_oriented_for_intent(intent)),
+                ),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
     AgentState {
         messages,
         thread_id: Some(input.run_id.to_string()),
         session_id: Some(input.session_id.to_string()),
         system_text: Some(input.system_text.clone()),
         intent_hint: input.intent_hint.clone(),
+        user_intent: shadow_intent,
+        action_oriented: shadow_action_oriented,
         provider_override: Some(input.provider.clone()),
         model_override: Some(input.model.clone()),
         tools_json: tools,
@@ -705,7 +769,7 @@ async fn run_engine(
     };
 
     let init = if new_run {
-        Some(build_initial_state(input))
+        Some(build_initial_state(input, role))
     } else {
         None
     };
@@ -1029,7 +1093,7 @@ mod tests {
     #[test]
     fn initial_state_da_prompt_history_e_override() {
         let input = sample_input();
-        let state = build_initial_state(&input);
+        let state = build_initial_state(&input, RunRole::Primary);
 
         // History pregressa convertita (lc_serde) + messaggio del turno in coda.
         assert_eq!(state.messages.len(), 2, "history (1) + turno corrente (1)");
@@ -1063,14 +1127,72 @@ mod tests {
         let tools = state.tools_json.expect("tools propagati");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "read_file");
+
+        // FIX shadow: il PRIMARIO non forza action_oriented/user_intent: restano
+        // None e il RouterNode reale decide come oggi (zero impatto sul Real).
+        assert_eq!(
+            state.action_oriented, None,
+            "primario: action_oriented non forzato (decide il RouterNode)"
+        );
+        assert_eq!(
+            state.user_intent, None,
+            "primario: user_intent non forzato (decide il RouterNode)"
+        );
     }
 
     #[test]
     fn initial_state_tools_null_diventa_none() {
         let mut input = sample_input();
         input.tools_json = serde_json::Value::Null;
-        let state = build_initial_state(&input);
+        let state = build_initial_state(&input, RunRole::Primary);
         assert!(state.tools_json.is_none(), "tools null -> None");
+    }
+
+    /// FIX shadow LLM-Replay: nel ramo Shadow, con `intent_hint` OPERATIVO
+    /// (`code_write`), lo stato iniziale deriva `user_intent` + `action_oriented`
+    /// (true) col punto unico, cosi' il grafo shadow non parte da `action_oriented`
+    /// forzato dal fallback del RouterNode.
+    #[test]
+    fn initial_state_shadow_intent_operativo_deriva_action() {
+        let input = sample_input(); // intent_hint = "code_write"
+        let primary_run_id = Uuid::new_v4();
+        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
+        assert_eq!(state.user_intent.as_deref(), Some("code_write"));
+        assert_eq!(
+            state.action_oriented,
+            Some(true),
+            "intent operativo -> azione"
+        );
+    }
+
+    /// FIX shadow LLM-Replay: nel ramo Shadow, con `intent_hint` CONVERSAZIONALE
+    /// (`chat`), `action_oriented` deriva a `false` -> niente G1 sui turni 0-tool
+    /// (questa era la RADICE della divergenza `g1`).
+    #[test]
+    fn initial_state_shadow_intent_chat_action_false() {
+        let mut input = sample_input();
+        input.intent_hint = Some("chat".to_string());
+        let primary_run_id = Uuid::new_v4();
+        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
+        assert_eq!(state.user_intent.as_deref(), Some("chat"));
+        assert_eq!(
+            state.action_oriented,
+            Some(false),
+            "intent conversazionale -> NON azione (niente G1)"
+        );
+    }
+
+    /// FIX shadow LLM-Replay: nel ramo Shadow SENZA `intent_hint`, lo stato resta
+    /// a None (il RouterNode shadow applichera' il fallback del Python degradato;
+    /// il porting completo del classifier resta TODO `router.rs`, FIX A).
+    #[test]
+    fn initial_state_shadow_senza_intent_resta_none() {
+        let mut input = sample_input();
+        input.intent_hint = None;
+        let primary_run_id = Uuid::new_v4();
+        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
+        assert_eq!(state.user_intent, None);
+        assert_eq!(state.action_oriented, None);
     }
 
     #[test]
@@ -1083,7 +1205,7 @@ mod tests {
             serde_json::json!({"role": "system", "content": "system da scartare"}),
             serde_json::json!({"role": "assistant", "content": "ok"}),
         ];
-        let state = build_initial_state(&input);
+        let state = build_initial_state(&input, RunRole::Primary);
         // Malformata + system saltate (best-effort): resta la valida + il turno.
         assert_eq!(state.messages.len(), 2);
         // La entry valida e' l'assistant pregresso (penultimo), poi il turno Human.
