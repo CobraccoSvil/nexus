@@ -101,6 +101,12 @@ impl ToolRunnerExecutorAdapter {
     /// quindi nessun path Real possibile (zero side-effect by construction). Lo
     /// shadow non esegue mai tool reali — rilegge solo i tool_result del primario.
     /// Usato anche dai test del Replay (niente `ToolRunnerDeps` da fabbricare).
+    ///
+    /// Cablato in F4 (run shadow): in F3 il motore nativo costruisce SOLO il path
+    /// Real (run primario, `new`); il path shadow read-only non e' ancora
+    /// instradato, quindi questo costruttore ha per ora il solo call site nei
+    /// test. `allow(dead_code)` mirato fuori dai test finche' F4 non lo cabla.
+    #[cfg_attr(not(test), allow(dead_code))] // cablato in F4 (shadow): impl viva
     pub fn from_db_for_replay(db: PgPool, primary_run_id: Option<Uuid>) -> Self {
         Self {
             db,

@@ -1873,14 +1873,47 @@ pub(crate) async fn spawn_agent_run(
                 .execute(&db_clone)
                 .await;
             if engine != Engine::Python {
-                // Mai in Fase 0. run_via_native e' uno stub che ritorna errore:
-                // si logga e si prosegue sul motore Python (fail-safe).
-                if let Err(e) = run_via_native(run_id).await {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        error = %e,
-                        "motore nativo selezionato ma non implementato (Fase 0): fallback al motore Python"
-                    );
+                // NON instradato in produzione: select_engine ritorna SEMPRE Python
+                // (regola G). Se per dati DB venisse selezionato il motore nativo, lo
+                // si esegue; su QUALUNQUE errore si logga e si prosegue sul motore
+                // Python (fail-safe), come da confine strangler-fig. Il path nativo
+                // riusa gli stessi input gia' risolti a monte (regola L) + le
+                // dipendenze infra da AppState.
+                let native_input = crate::native_engine::NativeRunInput {
+                    run_id,
+                    session_id: session_id_cp,
+                    provider: provider_clone.clone(),
+                    model: model_clone.clone(),
+                    system_text: system_text_clone.clone(),
+                    initial_msg: initial_msg_clone.clone(),
+                    conversation_history: recent_history_for_brain.clone(),
+                    tools_json: tools_json_for_brain.clone(),
+                    intent_hint: intent_hint_for_brain.clone(),
+                    automation_mode: automation_mode_for_brain.clone(),
+                    step_tx: tx_for_brain.clone(),
+                };
+                match run_via_native(&state_for_finalize, &native_input).await {
+                    Ok(outcome) => {
+                        // Niente leak: si logga la LUNGHEZZA della risposta, non il
+                        // contenuto (regola F). provider/model EFFETTIVI post cascade.
+                        tracing::info!(
+                            run_id = %run_id,
+                            completed = outcome.completed,
+                            stop_reason = ?outcome.stop_reason,
+                            final_answer_len = outcome.final_answer.as_deref().map(str::len).unwrap_or(0),
+                            provider_used = outcome.provider_used.as_deref().unwrap_or("-"),
+                            model_used = outcome.model_used.as_deref().unwrap_or("-"),
+                            resume_at = outcome.resume_at.as_deref().unwrap_or("-"),
+                            "motore nativo: run eseguito (path non instradato in produzione)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            error = %e,
+                            "motore nativo selezionato ma esecuzione fallita: fallback al motore Python"
+                        );
+                    }
                 }
             }
 
@@ -3155,18 +3188,47 @@ pub(crate) async fn select_engine(db: &PgPool, _scope_key: &str) -> Engine {
 
 /// Avvio di un run sul motore nativo Rust (`nexus-agent-graph`).
 ///
-/// STUB di Fase 0: mai raggiunto (`select_engine` ritorna sempre `Python`). La
-/// firma esiste per stabilire il confine; l'implementazione (build del grafo,
-/// `run_until_interrupt`, transport SSE) arriva nelle fasi successive del
-/// porting. Ritorna un errore esplicito invece di `unimplemented!()` per non
-/// far panicare il processo se un futuro refactoring lo invocasse per errore
-/// prima del completamento.
-pub(crate) async fn run_via_native(run_id: Uuid) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "run_via_native non e' ancora implementato (Fase 0 scaffold): il motore nativo Rust \
-         non e' raggiungibile finche' nexus_orchestrator_engine non abilita 'rust'/'shadow'. \
-         run_id={run_id}"
-    )
+/// FASE 3 (aggancio reale): costruisce ed esegue il grafo Rust con le 14 impl
+/// concrete di [`crate::agent_graph_adapter`] tramite il PUNTO UNICO
+/// [`crate::native_engine::run_native`] (regola L: la costruzione/esecuzione
+/// vive in un solo modulo). Raccoglie da `AppState` le dipendenze infra
+/// (`ToolRunnerDeps` + client gateway) e le passa con gli input del run gia'
+/// risolti a monte (regola L: prompt/tools/history NON ricostruiti qui).
+///
+/// NON instradato in produzione: `select_engine` ritorna SEMPRE `Python` (regola
+/// G), quindi questo path e' eseguibile/testato ma mai chiamato sul flusso reale
+/// — regressione NULLA. Su errore il chiamante fa fallback al motore Python.
+pub(crate) async fn run_via_native(
+    state: &AppState,
+    input: &crate::native_engine::NativeRunInput,
+) -> anyhow::Result<crate::native_engine::NativeRunOutcome> {
+    // Dipendenze del ToolRunner concreto: stesso assemblaggio del server gRPC
+    // (main.rs), ma per l'esecuzione IN-PROCESS (mcp-core E' il ToolRunner).
+    let tool_runner_deps = crate::tool_runner_server::ToolRunnerDeps {
+        db: state.db.clone(),
+        neural: state.orchestrator.neural.clone(),
+        playwright_channels: state.playwright_channels.clone(),
+        dependency_status: state.dependency_status.clone(),
+        project_channels: state.project_channels.clone(),
+        monitor_registry: state.monitor_registry.clone(),
+        port_registry: state.port_registry.clone(),
+    };
+
+    // Client gateway dalla porta nel DB (regola G: niente env/porta hardcoded; il
+    // solo segreto del token resta in env, come in main.rs).
+    let gw_port = nexus_auth::resolve_port(&state.db, "nexus_gateway_port").await;
+    let gw_url = format!("http://127.0.0.1:{gw_port}");
+    let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
+        .unwrap_or_else(|_| "dev-internal-token".to_string());
+    let gateway = crate::nexus_gateway::NexusGatewayClient::new(gw_url, gw_token);
+
+    let deps = crate::native_engine::NativeDeps {
+        db: state.db.clone(),
+        tool_runner_deps,
+        gateway,
+    };
+
+    crate::native_engine::run_native(&deps, input).await
 }
 
 #[cfg(test)]
@@ -3220,13 +3282,15 @@ mod tests_select_engine {
         assert_eq!(engine, Engine::Python);
     }
 
-    #[tokio::test]
-    async fn run_via_native_e_uno_stub_che_fallisce() {
-        let err = run_via_native(Uuid::new_v4())
-            .await
-            .expect_err("lo stub di Fase 0 deve fallire, mai eseguire");
-        assert!(err.to_string().contains("non e' ancora implementato"));
-    }
+    // `run_via_native` (FASE 3) richiede un `AppState` reale (ToolRunnerDeps +
+    // gateway), non costruibile in unit test: il suo corpo e' un assemblaggio di
+    // clone da AppState + delega al PUNTO UNICO `native_engine::run_native`. La
+    // logica testabile (costruzione initial_state dal prompt, mapping esito) e'
+    // coperta dai test di `crate::native_engine`; il grafo end-to-end con gateway
+    // scriptato e' coperto da `nexus_agent_graph::graph` (stessi tipi e builder).
+    // Qui resta la garanzia che il confine select_engine ritorna SEMPRE Python in
+    // Fase 0 (i due `select_engine_*` sopra), cosi' il path nativo non e'
+    // raggiungibile in produzione: regressione NULLA.
 }
 
 #[cfg(test)]

@@ -42,6 +42,7 @@ mod model_catalog_sync;
 mod model_health_probe;
 mod models;
 mod mutations_api;
+mod native_engine;
 mod nexus_bridge;
 mod nexus_builtin;
 mod nexus_database_stats;
