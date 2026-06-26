@@ -76,7 +76,13 @@ uuid = { version = "1.16", features = ["serde", "v4"] }
 jsonwebtoken = "9"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 sha2 = "0.10"
+sha1 = "0.10"
 rand = "0.8"
+# Formattazione f64 shortest con tie-break round-half-to-EVEN, bit-identica al
+# float.__repr__/json.dumps di CPython (la stdlib Rust usa round-half-away e
+# diverge sui tie). Usato dal punto unico py_json (regola L) per la parita 1:1
+# col brain delle signature anti-loop e dell'evidence del verifier.
+ryu = "1.0"
 urlencoding = "2"
 base64 = "0.22"
 dashmap = "5"

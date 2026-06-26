@@ -66,7 +66,11 @@ fn ai_tool_use_names(messages: &[Message]) -> Vec<&str> {
 /// Tool di SOLA esplorazione (`_EXPLORATION_ONLY_TOOLS` Python): leggono/ispezionano
 /// senza produrre side-effect. Un tool_use con nome NON in questo set conta come
 /// azione produttiva. Lista tenuta allineata 1:1 a helpers.py.
-const EXPLORATION_ONLY_TOOLS: &[&str] = &[
+///
+/// PUNTO UNICO (regola L) della lista: oltre a `has_productive_action_in_history`
+/// la usa `decisions::loop_signatures::exploration_counter_update` (passata come
+/// parametro per restare pura).
+pub const EXPLORATION_ONLY_TOOLS: &[&str] = &[
     "nexus_list_archive_entries",
     "nexus_read_archive_entry",
     "nexus_inspect_attachment",
@@ -103,6 +107,442 @@ pub fn has_filesystem_mutation_in_history(messages: &[Message], cfg: &RoutingCon
     ai_tool_use_names(messages)
         .into_iter()
         .any(|name| cfg.fs_mutator_tools.iter().any(|m| m == name))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  Detector strutturali su lista messaggi (anti-loop dell'executor)
+//
+//  Porting 1:1 di `helpers.py`. Tutti PURI su `&[Message]`: scansionano i
+//  blocchi tool_use/tool_result. Usano segnali STRUTTURALI (exit_code/is_error)
+//  con fallback lessicale [`TOOL_ERROR_HINTS`], come il Python. Punto unico
+//  (regola L) della domanda "questo tool_use e' riuscito?" -> [`tool_result_outcome_after`].
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Pattern testuali che indicano errore in un tool_result (`_TOOL_ERROR_HINTS`
+/// Python, 1:1). Match case-insensitive. SOLO fallback lessicale: i segnali
+/// strutturali (exit_code/is_error) hanno priorita'.
+pub const TOOL_ERROR_HINTS: &[&str] = &[
+    "error:",
+    "errore:",
+    "[error",
+    "exit code: 1",
+    "exit code 1",
+    "command failed",
+    "comando fallito",
+    "traceback",
+    "exception:",
+    "fatal:",
+    "syntax error",
+    "not found",
+    "non trovato",
+    "cannot find module",
+    "module not found",
+    "permission denied",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "404 not found",
+    "500 internal",
+    "econnrefused",
+    "enoent",
+    "enotfound",
+    "eperm",
+    "no such file",
+    "is_error",
+    "[errno",
+];
+
+/// Nome del tool di allocazione porte (`_PORT_REQUEST_TOOL` Python: "request_port").
+const PORT_REQUEST_TOOL: &str = "request_port";
+
+/// Tool che, se presenti nella history recente, indicano risorse gia' attive
+/// note al run (`_resource_tools` Python).
+const RESOURCE_TOOLS: &[&str] = &[PORT_REQUEST_TOOL, "list_active_services", "service_restart"];
+
+/// True se uno degli hint lessicali compare nel testo (case-insensitive).
+fn text_has_error_hint(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    TOOL_ERROR_HINTS.iter().any(|h| lower.contains(h))
+}
+
+/// Estrae i tool_use `(name, input)` di un singolo [`Message::Ai`], guardando
+/// ENTRAMBE le forme: `tool_calls` (OpenAI-compat) e `ContentBlock::ToolUse`
+/// (Anthropic, == anthropic_content Python). Ritorna vuoto per gli altri ruoli.
+fn message_tool_uses(m: &Message) -> Vec<(&str, &Value)> {
+    let mut out: Vec<(&str, &Value)> = Vec::new();
+    if let Message::Ai {
+        content,
+        tool_calls,
+    } = m
+    {
+        for tc in tool_calls {
+            out.push((tc.name.as_str(), &tc.input));
+        }
+        if let MessageContent::Blocks(blocks) = content {
+            for b in blocks {
+                if let ContentBlock::ToolUse { name, input, .. } = b {
+                    out.push((name.as_str(), input));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Esito strutturato di un campo `content` di tool_result (stringa o struttura).
+/// Replica il fallback lessicale Python sul testo del risultato.
+fn content_value_has_error(content: &Value) -> bool {
+    match content {
+        Value::String(s) => text_has_error_hint(s),
+        Value::Array(arr) => arr.iter().any(|cc| {
+            if let Value::Object(map) = cc {
+                let txt = map
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| map.get("content").and_then(Value::as_str))
+                    .unwrap_or("");
+                text_has_error_hint(txt)
+            } else {
+                false
+            }
+        }),
+        other => text_has_error_hint(&other.to_string()),
+    }
+}
+
+/// Valuta l'esito di UN messaggio se e' un tool_result: `Some(true)`=errore,
+/// `Some(false)`=successo, `None`=non e' un tool_result valutabile.
+///
+/// Gestisce ENTRAMBE le forme: [`Message::Tool`] (== `ToolMessage` langchain) e
+/// i blocchi [`ContentBlock::ToolResult`] in un qualsiasi messaggio (==
+/// `HumanMessage`+anthropic_content Python). Gerarchia dei segnali (contratto A):
+///   1. `exit_code` STRUTTURATO (tool-comando): 0=successo, !=0=errore;
+///   2. `is_error` STRUTTURATO del blocco/messaggio tool;
+///   3. fallback lessicale [`TOOL_ERROR_HINTS`] sul testo.
+/// Il `status` del `ToolMessage` Python (`status == "error"`) non esiste nel
+/// modello Rust: e' coperto dal blocco `is_error`/lessicale equivalente.
+fn message_tool_result_outcome(m: &Message) -> Option<bool> {
+    match m {
+        // ToolMessage langchain: il content puo' essere testo o blocchi.
+        Message::Tool { content, .. } => match content {
+            MessageContent::Text(s) => Some(text_has_error_hint(s)),
+            MessageContent::Blocks(blocks) => {
+                // Cerca un blocco con segnale strutturale; poi lessicale.
+                for b in blocks {
+                    if let ContentBlock::ToolResult {
+                        is_error,
+                        exit_code,
+                        content,
+                        ..
+                    } = b
+                    {
+                        if let Some(ec) = exit_code {
+                            return Some(*ec != 0);
+                        }
+                        if *is_error {
+                            return Some(true);
+                        }
+                        if content_value_has_error(content) {
+                            return Some(true);
+                        }
+                    }
+                }
+                // Nessun blocco tool_result strutturato: fallback su testo piatto.
+                Some(blocks.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text } if text_has_error_hint(text))
+                }))
+            }
+        },
+        // anthropic_content tool_result in un HumanMessage (tool_dispatch_node
+        // emette il tool_result come HumanMessage; gli AIMessage portano i
+        // tool_use, mai i tool_result -> non valutati, come in Python).
+        Message::Human { content } => {
+            let MessageContent::Blocks(blocks) = content else {
+                return None;
+            };
+            let mut found_result = false;
+            for b in blocks {
+                if let ContentBlock::ToolResult {
+                    is_error,
+                    exit_code,
+                    content,
+                    ..
+                } = b
+                {
+                    found_result = true;
+                    // 1) exit_code strutturato.
+                    if let Some(ec) = exit_code {
+                        return Some(*ec != 0);
+                    }
+                    // 2) is_error strutturato.
+                    if *is_error {
+                        return Some(true);
+                    }
+                    // 3) fallback lessicale sul testo.
+                    if content_value_has_error(content) {
+                        return Some(true);
+                    }
+                }
+            }
+            if found_result {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        // AIMessage: porta tool_use, mai tool_result -> non e' un risultato.
+        Message::Ai { .. } => None,
+    }
+}
+
+/// Coda degli ultimi `lookback` messaggi (come `messages[-lookback:]` Python).
+fn tail_messages(messages: &[Message], lookback: usize) -> &[Message] {
+    let start = messages.len().saturating_sub(lookback);
+    &messages[start..]
+}
+
+/// True se nella history ci sono gia' stati tool call effettivi (un `Message::Ai`
+/// con almeno un tool_use). Vedi `_has_tool_calls_in_history`.
+pub fn has_tool_calls_in_history(messages: &[Message]) -> bool {
+    messages.iter().any(|m| !message_tool_uses(m).is_empty())
+}
+
+/// Esito del primo tool_result nei `max_ahead` messaggi dopo `recent[idx]`.
+/// `Some(true)`=errore, `Some(false)`=successo, `None`=nessun risultato trovato.
+/// Vedi `_tool_result_outcome_after` (max_ahead=3 default). Punto unico (regola L)
+/// della domanda "il tool_use a recent[idx] e' riuscito?".
+pub fn tool_result_outcome_after(recent: &[Message], idx: usize, max_ahead: usize) -> Option<bool> {
+    let end = (idx + 1 + max_ahead).min(recent.len());
+    for nm in recent.iter().take(end).skip(idx + 1) {
+        if let Some(outcome) = message_tool_result_outcome(nm) {
+            return Some(outcome);
+        }
+    }
+    None
+}
+
+/// Conta le chiamate `request_port` negli ultimi `lookback` messaggi (default 16).
+/// Segnale STRUTTURALE del loop di riallocazione. NESSUN filtro su input/label.
+/// Vedi `_count_recent_request_port`.
+pub fn count_recent_request_port(messages: &[Message], lookback: usize) -> i64 {
+    let recent = tail_messages(messages, lookback);
+    let mut count = 0i64;
+    for m in recent {
+        for (name, _) in message_tool_uses(m) {
+            if name == PORT_REQUEST_TOOL {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// True se nella history recente (default lookback 24) risulta gia' una risorsa
+/// attiva nota al run (un tool_use request_port / list_active_services /
+/// service_restart). Vedi `_has_active_resources_in_history`.
+pub fn has_active_resources_in_history(messages: &[Message], lookback: usize) -> bool {
+    let recent = tail_messages(messages, lookback);
+    recent
+        .iter()
+        .flat_map(message_tool_uses)
+        .any(|(name, _)| RESOURCE_TOOLS.contains(&name))
+}
+
+/// True se uno degli ultimi `lookback` tool message (default 4) indica errore.
+/// Vedi `_detect_recent_tool_error`: scansiona in ordine INVERSO i soli
+/// [`Message::Tool`] (== `ToolMessage`), si ferma dopo `lookback` di essi, e
+/// segnala errore su `is_error` strutturato o hint lessicale.
+pub fn detect_recent_tool_error(messages: &[Message], lookback: usize) -> bool {
+    let mut checked = 0usize;
+    for m in messages.iter().rev() {
+        if checked >= lookback {
+            break;
+        }
+        let Message::Tool { .. } = m else {
+            continue;
+        };
+        checked += 1;
+        if message_tool_result_outcome(m) == Some(true) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Comandi shell tracciati da `_detect_repeated_failed_command` (1:1).
+const FAILED_COMMAND_TOOLS: &[&str] = &["run_command", "run_service", "run_in_terminal"];
+
+/// Rileva la ripetizione dello STESSO comando shell con ERRORE. Ritorna
+/// `(Some(command), count)` della signature `command|working_dir` piu' frequente
+/// che ha prodotto errore, `(None, 0)` se nessuna. Vedi
+/// `_detect_repeated_failed_command` (lookback=12). Solo i comandi il cui
+/// tool_result successivo (entro 3 step) e' errore vengono contati.
+pub fn detect_repeated_failed_command(
+    messages: &[Message],
+    lookback: usize,
+) -> (Option<String>, i64) {
+    if messages.is_empty() {
+        return (None, 0);
+    }
+    let recent = tail_messages(messages, lookback);
+    // signature `command|working_dir` -> count; preferisce l'ultima in parita'.
+    let mut failed: Vec<(String, i64)> = Vec::new();
+    let mut last_signature: Option<String> = None;
+    for (idx, m) in recent.iter().enumerate() {
+        for (name, input) in message_tool_uses(m) {
+            if !FAILED_COMMAND_TOOLS.contains(&name) {
+                continue;
+            }
+            let cmd = input
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if cmd.is_empty() {
+                continue;
+            }
+            let wd = input
+                .get("working_dir")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let signature = format!("{cmd}|{wd}");
+            // _detect_repeated_failed_command guarda i 3 messaggi successivi e
+            // valuta il PRIMO ToolMessage trovato (max_ahead=3, ma si ferma al
+            // primo result a prescindere dall'esito: break).
+            let next_is_error = first_tool_result_is_error(recent, idx, 3);
+            if next_is_error == Some(true) {
+                bump(&mut failed, &signature);
+                last_signature = Some(signature);
+            }
+        }
+    }
+    pick_top(&failed, last_signature.as_deref()).map_or((None, 0), |(sig, count)| {
+        let cmd = sig.split_once('|').map(|(c, _)| c).unwrap_or(&sig).to_string();
+        (Some(cmd), count)
+    })
+}
+
+/// Tool PRODUTTIVI tracciati da `_detect_repeated_action` -> chiavi argomento
+/// che ne definiscono l'identita' (`_REPEATED_ACTION_TOOLS` Python, 1:1).
+fn repeated_action_keys(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "write_file" | "edit_file" => Some(&["path", "file_path"]),
+        "run_command" | "run_service" | "run_in_terminal" => Some(&["command"]),
+        _ => None,
+    }
+}
+
+/// Rileva la ripetizione IDENTICA di un'azione produttiva (scrittura/comando),
+/// a prescindere dall'esito. Ritorna `(Some(label), count)` della signature piu'
+/// frequente (`name: valore` troncato a 120 char), `(None, 0)` se nessuna. Vedi
+/// `_detect_repeated_action` (lookback=24). FALSO-DOPPIONE: le signature la cui
+/// PRIMA occorrenza e' RIUSCITA (`tool_result_outcome_after == Some(false)`)
+/// sono ESCLUSE dal conteggio (ridondanza innocua, non stallo).
+pub fn detect_repeated_action(messages: &[Message], lookback: usize) -> (Option<String>, i64) {
+    if messages.is_empty() {
+        return (None, 0);
+    }
+    let recent = tail_messages(messages, lookback);
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    let mut labels: Vec<(String, String)> = Vec::new();
+    let mut succeeded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_sig: Option<String> = None;
+    for (idx, m) in recent.iter().enumerate() {
+        for (name, input) in message_tool_uses(m) {
+            let Some(keys) = repeated_action_keys(name) else {
+                continue;
+            };
+            // value = primo argomento non vuoto fra le chiavi candidate.
+            let mut value = String::new();
+            for k in keys {
+                if let Some(v) = input.get(*k).and_then(Value::as_str) {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        value = v.to_string();
+                        break;
+                    }
+                }
+            }
+            if value.is_empty() {
+                continue;
+            }
+            let sig = format!("{name}|{value}");
+            bump(&mut counts, &sig);
+            let label_value: String = value.chars().take(120).collect();
+            set_label(&mut labels, &sig, format!("{name}: {label_value}"));
+            last_sig = Some(sig.clone());
+            // Esito strutturale: un successo marca la signature come riuscita.
+            if tool_result_outcome_after(recent, idx, 3) == Some(false) {
+                succeeded.insert(sig);
+            }
+        }
+    }
+    // Rimuove le signature riuscite (mai stallo da abort).
+    counts.retain(|(sig, _)| !succeeded.contains(sig));
+    pick_top(&counts, last_sig.as_deref()).map(|(sig, count)| {
+        let label = labels
+            .iter()
+            .find(|(s, _)| *s == sig)
+            .map(|(_, l)| l.clone())
+            .unwrap_or(sig);
+        (Some(label), count)
+    }).unwrap_or((None, 0))
+}
+
+// ── Helper di conteggio condivisi dai due detector di ripetizione ───────────
+
+/// Valuta il PRIMO tool_result trovato entro `max_ahead` messaggi dopo `idx`
+/// e ritorna il suo esito (`break` al primo, come `_detect_repeated_failed_command`).
+fn first_tool_result_is_error(recent: &[Message], idx: usize, max_ahead: usize) -> Option<bool> {
+    let end = (idx + 1 + max_ahead).min(recent.len());
+    for nm in recent.iter().take(end).skip(idx + 1) {
+        if let Message::Tool { .. } = nm {
+            return message_tool_result_outcome(nm);
+        }
+    }
+    None
+}
+
+/// Incrementa il contatore della signature in una lista-associativa ordinata
+/// per inserimento (replica `dict[sig] = dict.get(sig,0)+1`).
+fn bump(list: &mut Vec<(String, i64)>, sig: &str) {
+    if let Some(entry) = list.iter_mut().find(|(s, _)| s == sig) {
+        entry.1 += 1;
+    } else {
+        list.push((sig.to_string(), 1));
+    }
+}
+
+/// Imposta/aggiorna la label leggibile di una signature.
+fn set_label(list: &mut Vec<(String, String)>, sig: &str, label: String) {
+    if let Some(entry) = list.iter_mut().find(|(s, _)| s == sig) {
+        entry.1 = label;
+    } else {
+        list.push((sig.to_string(), label));
+    }
+}
+
+/// Ritorna la signature con chiave massima `(count, sig == last)`, replicando
+/// `max(items, key=lambda kv: (kv[1], kv[0] == last))` di Python. `max` tiene il
+/// PRIMO massimo a parita' PIENA di chiave (sostituisce solo se STRETTAMENTE
+/// maggiore), quindi usiamo `>` e scorriamo in ordine d'inserimento. Il flag
+/// `sig == last` (l'ultima signature processata) prevale a parita' di count.
+fn pick_top(list: &[(String, i64)], last: Option<&str>) -> Option<(String, i64)> {
+    let mut best: Option<&(String, i64)> = None;
+    for item in list {
+        let item_key = (item.1, Some(item.0.as_str()) == last);
+        match best {
+            None => best = Some(item),
+            Some(b) => {
+                let best_key = (b.1, Some(b.0.as_str()) == last);
+                if item_key > best_key {
+                    best = Some(item);
+                }
+            }
+        }
+    }
+    best.map(|(s, c)| (s.clone(), *c))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -661,6 +1101,151 @@ mod tests {
         )]));
     }
 
+    // Helper: AIMessage con tool_use (forma anthropic_content) + input.
+    fn ai_tool_input(name: &str, input: Value) -> Message {
+        Message::Ai {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: name.into(),
+                input,
+            }]),
+            tool_calls: vec![],
+        }
+    }
+
+    // Helper: HumanMessage con anthropic_content tool_result strutturato.
+    fn human_tool_result(exit_code: Option<i64>, is_error: bool, text: &str) -> Message {
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String(text.into()),
+                is_error,
+                exit_code,
+            }]),
+        }
+    }
+
+    // Helper: ToolMessage langchain con content testuale.
+    fn tool_msg(text: &str) -> Message {
+        Message::Tool {
+            tool_call_id: "c1".into(),
+            content: MessageContent::text(text),
+        }
+    }
+
+    #[test]
+    fn has_tool_calls_history() {
+        assert!(has_tool_calls_in_history(&[ai_with_tool("read_file")]));
+        assert!(!has_tool_calls_in_history(&[Message::Ai {
+            content: MessageContent::text("solo testo"),
+            tool_calls: vec![],
+        }]));
+    }
+
+    #[test]
+    fn outcome_after_exit_code_primario() {
+        // tool_use seguito da tool_result con exit_code=0 -> successo.
+        let msgs = vec![
+            ai_tool_input("run_command", json!({"command": "ls"})),
+            human_tool_result(Some(0), false, "ok"),
+        ];
+        assert_eq!(tool_result_outcome_after(&msgs, 0, 3), Some(false));
+        // exit_code != 0 -> errore, anche senza is_error.
+        let msgs2 = vec![
+            ai_tool_input("run_command", json!({"command": "ls"})),
+            human_tool_result(Some(2), false, "tutto bene a parole"),
+        ];
+        assert_eq!(tool_result_outcome_after(&msgs2, 0, 3), Some(true));
+        // Nessun risultato dopo -> None.
+        let msgs3 = vec![ai_tool_input("run_command", json!({"command": "ls"}))];
+        assert_eq!(tool_result_outcome_after(&msgs3, 0, 3), None);
+    }
+
+    #[test]
+    fn outcome_after_lessicale_fallback() {
+        // Niente exit_code/is_error: fallback su _TOOL_ERROR_HINTS.
+        let msgs = vec![
+            ai_tool_input("run_command", json!({"command": "x"})),
+            human_tool_result(None, false, "bash: command not found"),
+        ];
+        assert_eq!(tool_result_outcome_after(&msgs, 0, 3), Some(true));
+        let msgs_ok = vec![
+            ai_tool_input("run_command", json!({"command": "x"})),
+            human_tool_result(None, false, "Compilato con successo"),
+        ];
+        assert_eq!(tool_result_outcome_after(&msgs_ok, 0, 3), Some(false));
+    }
+
+    #[test]
+    fn conta_request_port_senza_filtro_label() {
+        let msgs = vec![
+            ai_tool_input("request_port", json!({"label": "web"})),
+            ai_tool_input("request_port", json!({"label": "api"})),
+            ai_tool_input("read_file", json!({"path": "a"})),
+        ];
+        assert_eq!(count_recent_request_port(&msgs, 16), 2);
+        assert!(has_active_resources_in_history(&msgs, 24));
+        // Senza request_port/servizi -> nessuna risorsa attiva.
+        let solo_read = vec![ai_tool_input("read_file", json!({"path": "a"}))];
+        assert!(!has_active_resources_in_history(&solo_read, 24));
+    }
+
+    #[test]
+    fn recent_tool_error_solo_tool_message() {
+        // Ultimo ToolMessage con hint -> errore.
+        assert!(detect_recent_tool_error(
+            &[tool_msg("Error: build failed")],
+            4
+        ));
+        // ToolMessage pulito -> nessun errore.
+        assert!(!detect_recent_tool_error(&[tool_msg("done ok")], 4));
+    }
+
+    #[test]
+    fn repeated_failed_command_stessa_signature() {
+        // Stesso comando fallito 2 volte -> rilevato. _detect_repeated_failed_command
+        // valuta SOLO i ToolMessage successivi (1:1 col Python, che guarda
+        // isinstance(nm, ToolMessage)), quindi qui usiamo tool_msg.
+        let msgs = vec![
+            ai_tool_input("run_command", json!({"command": "npm i", "working_dir": "/p"})),
+            tool_msg("error: build failed"),
+            ai_tool_input("run_command", json!({"command": "npm i", "working_dir": "/p"})),
+            tool_msg("error: build failed"),
+        ];
+        let (cmd, count) = detect_repeated_failed_command(&msgs, 12);
+        assert_eq!(cmd.as_deref(), Some("npm i"));
+        assert_eq!(count, 2);
+        // Comando RIUSCITO (ToolMessage pulito) -> non contato.
+        let ok = vec![
+            ai_tool_input("run_command", json!({"command": "npm i"})),
+            tool_msg("done ok"),
+        ];
+        assert_eq!(detect_repeated_failed_command(&ok, 12), (None, 0));
+    }
+
+    #[test]
+    fn repeated_action_esclude_signature_riuscita() {
+        // edit_file applicato con successo poi ri-emesso e fallito: la prima
+        // occorrenza riuscita ESCLUDE la signature dal conteggio (falso-doppione).
+        let msgs = vec![
+            ai_tool_input("edit_file", json!({"path": "a.rs"})),
+            human_tool_result(Some(0), false, "applied"),
+            ai_tool_input("edit_file", json!({"path": "a.rs"})),
+            human_tool_result(None, true, "old_string non trovato"),
+        ];
+        assert_eq!(detect_repeated_action(&msgs, 24), (None, 0));
+        // Stessa scrittura ripetuta SENZA mai riuscire -> stallo rilevato.
+        let stallo = vec![
+            ai_tool_input("write_file", json!({"path": "b.rs"})),
+            human_tool_result(None, true, "permission denied"),
+            ai_tool_input("write_file", json!({"path": "b.rs"})),
+            human_tool_result(None, true, "permission denied"),
+        ];
+        let (label, count) = detect_repeated_action(&stallo, 24);
+        assert_eq!(label.as_deref(), Some("write_file: b.rs"));
+        assert_eq!(count, 2);
+    }
+
     #[test]
     fn fs_mutation_da_config() {
         let cfg = RoutingConfig::default();
@@ -755,5 +1340,148 @@ mod tests {
         // Modalita' non autonoma -> false.
         state.automation_mode = Some(AutomationMode::Confirm);
         assert!(!todo_isolation_active(&state, &cfg_on));
+    }
+}
+
+/// Golden di parita' 1:1 vs Python per i detector strutturali. Carica
+/// `/tmp/golden_executor_detectors.json` (vedi `gen_golden_executor_detectors.py`).
+#[cfg(test)]
+mod golden {
+    use super::*;
+    use serde::Deserialize;
+    use serde_json::json;
+
+    /// Forma INTERMEDIA di un messaggio (replica i raw spec dello script Python).
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "kind")]
+    enum RawMsg {
+        #[serde(rename = "ai_tool")]
+        AiTool {
+            name: String,
+            #[serde(default)]
+            input: Value,
+        },
+        #[serde(rename = "ai_text")]
+        AiText {
+            #[serde(default)]
+            text: String,
+        },
+        #[serde(rename = "tool")]
+        Tool {
+            #[serde(default)]
+            text: String,
+        },
+        #[serde(rename = "human_result")]
+        HumanResult {
+            #[serde(default)]
+            exit_code: Option<i64>,
+            #[serde(default)]
+            is_error: bool,
+            #[serde(default)]
+            text: String,
+        },
+    }
+
+    impl RawMsg {
+        fn to_message(&self) -> Message {
+            match self {
+                RawMsg::AiTool { name, input } => Message::Ai {
+                    content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                        id: "golden".into(),
+                        name: name.clone(),
+                        input: if input.is_null() { json!({}) } else { input.clone() },
+                    }]),
+                    tool_calls: vec![],
+                },
+                RawMsg::AiText { text } => Message::Ai {
+                    content: MessageContent::text(text.clone()),
+                    tool_calls: vec![],
+                },
+                RawMsg::Tool { text } => Message::Tool {
+                    tool_call_id: "golden".into(),
+                    content: MessageContent::text(text.clone()),
+                },
+                RawMsg::HumanResult {
+                    exit_code,
+                    is_error,
+                    text,
+                } => Message::Human {
+                    content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: "golden".into(),
+                        content: Value::String(text.clone()),
+                        is_error: *is_error,
+                        exit_code: *exit_code,
+                    }]),
+                },
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenCase {
+        group: String,
+        case_id: String,
+        messages: Vec<RawMsg>,
+        output: Value,
+    }
+
+    /// Mappa `Option<bool>` Python (True/False/None) al `Value` JSON corrispondente.
+    fn opt_bool(v: Option<bool>) -> Value {
+        match v {
+            Some(b) => Value::Bool(b),
+            None => Value::Null,
+        }
+    }
+
+    #[test]
+    #[ignore = "richiede /tmp/golden_executor_detectors.json generato da gen_golden_executor_detectors.py"]
+    fn golden_executor_detectors() {
+        let path = "/tmp/golden_executor_detectors.json";
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "impossibile leggere {path}: {e}; genera con \
+                 python3 crates/nexus-agent-graph/scripts/gen_golden_executor_detectors.py"
+            )
+        });
+        let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
+        assert!(cases.len() >= 20, "attesi >= 20 casi, trovati {}", cases.len());
+
+        let cfg = RoutingConfig::default();
+        let mut checked = 0usize;
+        for c in &cases {
+            let msgs: Vec<Message> = c.messages.iter().map(RawMsg::to_message).collect();
+            let got: Value = match c.group.as_str() {
+                "has_filesystem_mutation" => {
+                    Value::Bool(has_filesystem_mutation_in_history(&msgs, &cfg))
+                }
+                "has_tool_calls_in_history" => Value::Bool(has_tool_calls_in_history(&msgs)),
+                "tool_result_outcome_after" => {
+                    opt_bool(tool_result_outcome_after(&msgs, 0, 3))
+                }
+                "detect_repeated_failed_command" => {
+                    let (cmd, count) = detect_repeated_failed_command(&msgs, 12);
+                    json!({ "command": cmd, "count": count })
+                }
+                "detect_repeated_action" => {
+                    let (label, count) = detect_repeated_action(&msgs, 24);
+                    json!({ "label": label, "count": count })
+                }
+                "count_recent_request_port" => {
+                    Value::from(count_recent_request_port(&msgs, 16))
+                }
+                "has_active_resources_in_history" => {
+                    Value::Bool(has_active_resources_in_history(&msgs, 24))
+                }
+                "detect_recent_tool_error" => Value::Bool(detect_recent_tool_error(&msgs, 4)),
+                other => panic!("gruppo golden sconosciuto: {other} (caso {})", c.case_id),
+            };
+            assert_eq!(
+                got, c.output,
+                "PARITA' FALLITA {} / {}:\n  rust   = {}\n  python = {}",
+                c.group, c.case_id, got, c.output
+            );
+            checked += 1;
+        }
+        println!("golden executor_detectors: {checked} casi verificati, tutti verdi");
     }
 }

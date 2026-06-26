@@ -101,6 +101,7 @@ use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::dag_scheduler::{self, TodoStatus};
 use crate::nodes::final_gate::FinalGateNode;
+use crate::py_json::{py_json_dumps, SortKeys};
 use crate::routing::config::RoutingConfig;
 use crate::routing::signals;
 use crate::runtime::ports::{
@@ -257,57 +258,6 @@ fn status_as_i64(v: Option<&Value>) -> Option<i64> {
     }
 }
 
-/// Serializza un [`Value`] nel formato di `json.dumps(value, ensure_ascii=False)`
-/// di Python (default): separatori `", "` fra elementi e `": "` fra chiave e
-/// valore (con SPAZIO), niente escape ASCII (UTF-8 nudo). `serde_json::to_string`
-/// usa invece separatori COMPATTI (`,`/`:`): la stringa risultante differirebbe,
-/// e qui il troncamento a 300 char e' confrontato 1:1 col Python (golden).
-///
-/// ORDINE CHIAVI (FIX B): la feature `preserve_order` di `serde_json` e' ATTIVA
-/// nel workspace (Cargo.toml root), quindi [`serde_json::Map`] e' un IndexMap che
-/// conserva l'ordine d'inserimento/deserializzazione delle chiavi. `map.iter()`
-/// qui sotto le emette in QUEL ordine, identico a json.dumps di Python (ordine
-/// d'inserimento). La parita' 1:1 vale quindi anche per le evidence multi-chiave
-/// NON alfabetiche prodotte da criteria_runner (es. http {status,
-/// expected_status, method, url, body_excerpt}): vedi il caso golden
-/// `rfb_http_non_alfabetico`. Senza `preserve_order` l'ordine sarebbe alfabetico
-/// e divergerebbe dal Python (bug chiuso da FIX B).
-fn py_json_dumps(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => {
-            if *b {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        Value::Number(n) => n.to_string(),
-        // json.dumps di una stringa: virgolette + escape JSON, ensure_ascii=False
-        // (UTF-8 nudo). serde_json::to_string su una String produce esattamente
-        // questo (escape JSON standard, niente \uXXXX per i non-ASCII di default).
-        Value::String(_) => serde_json::to_string(v).unwrap_or_else(|_| "\"\"".into()),
-        Value::Array(arr) => {
-            let inner = arr.iter().map(py_json_dumps).collect::<Vec<_>>().join(", ");
-            format!("[{inner}]")
-        }
-        Value::Object(map) => {
-            // serde_json::Map con `preserve_order` (FIX B) itera nell'ordine
-            // d'inserimento/deserializzazione, identico a json.dumps Python.
-            let inner = map
-                .iter()
-                .map(|(k, val)| {
-                    let key = serde_json::to_string(&Value::String(k.clone()))
-                        .unwrap_or_else(|_| "\"\"".into());
-                    format!("{key}: {}", py_json_dumps(val))
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{{{inner}}}")
-        }
-    }
-}
-
 /// `repr` Python di un campo opzionale interpolato in f-string: `None` se assente,
 /// altrimenti il valore. Replica `f"...{ev.get('exit_code')}..."`.
 fn python_repr_opt(v: Option<&Value>) -> String {
@@ -435,8 +385,10 @@ impl VerifierNode {
             .iter()
             .map(|r| {
                 // json.dumps(..., ensure_ascii=False)[:300] -> formato Python
-                // (separatori ", " / ": ", ensure_ascii=False) + taglio su CHAR.
-                let ev_json = py_json_dumps(&r.evidence);
+                // (separatori ", " / ": ", ensure_ascii=False, ORDINE
+                // d'inserimento: il verifier non usa sort_keys) + taglio su CHAR.
+                // Delega al PUNTO UNICO py_json (regola L).
+                let ev_json = py_json_dumps(&r.evidence, SortKeys::No);
                 let ev_trunc: String = ev_json.chars().take(300).collect();
                 format!("- [{}] {ev_trunc}", criterion_type_repr(&r.criterion_type))
             })

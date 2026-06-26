@@ -236,6 +236,7 @@ mod tests {
                     tool_use_id: "t1".to_string(),
                     content: Value::Null,
                     is_error: false,
+                    exit_code: None,
                 },
                 ContentBlock::Text {
                     text: "seconda parte".to_string(),

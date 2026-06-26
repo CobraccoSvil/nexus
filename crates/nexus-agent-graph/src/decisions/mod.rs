@@ -13,6 +13,9 @@
 //!     discendenti per il cascade-skip). Prerequisito di todo_runner e verifier.
 //!   - [`helpers`]: tool_choice forcing, segnale strutturale, action-oriented,
 //!     stima complessita' e budget iterazioni.
+//!   - [`loop_signatures`]: RILEVAZIONE pura del loop di tool call per signature
+//!     ripetuta + aggiornamento del contatore di esplorazione (PUNTO UNICO della
+//!     signature anti-loop dell'executor; l'auto-escalation I/O resta nel nodo).
 //!   - [`reward`]: reward euristico + fusione del reward finale (punto unico
 //!     condiviso reflection/learner, regola L).
 //!   - [`turn_focus`]: direttiva "focus del turno corrente" (anti-contaminazione
@@ -22,6 +25,7 @@
 
 pub mod dag_scheduler;
 pub mod helpers;
+pub mod loop_signatures;
 pub mod progress_controller;
 pub mod reward;
 pub mod turn_focus;
@@ -35,8 +39,13 @@ pub use reward::{
     MAX_AGENT_ITERATIONS,
 };
 pub use helpers::{
-    compute_iteration_budget, estimate_prompt_complexity, should_force_tool_choice,
-    structural_unfulfilled_signal, turn_action_oriented, AdaptiveBudgetConfig,
+    compute_iteration_budget, estimate_prompt_complexity, provider_style_supports_forcing,
+    should_force_tool_choice, structural_unfulfilled_signal, turn_action_oriented,
+    AdaptiveBudgetConfig,
+};
+pub use loop_signatures::{
+    build_signature, detect_signature_loop, exploration_counter_update, ExplorationCounterUpdate,
+    LoopDetection, LOOP_THRESHOLD, RECENT_SIGNATURES_CAP,
 };
 pub use progress_controller::{
     decide, Action, Axis, ProgressDecision, ProgressSignals, ABORT_STOP_REASON,

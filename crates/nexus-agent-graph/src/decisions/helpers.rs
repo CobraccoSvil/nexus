@@ -79,6 +79,25 @@ pub fn turn_action_oriented(action_oriented: Option<bool>) -> bool {
     action_oriented.unwrap_or(true)
 }
 
+/// Stili di `tool_choice` (cap.tool_choice_style) che permettono di OBBLIGARE
+/// una tool call. `_TC_FORCING_SUPPORTED_STYLES` Python (1:1). Gli stili "none"
+/// e "openai_auto" NON permettono il forcing -> non sono in lista.
+const TC_FORCING_SUPPORTED_STYLES: &[&str] =
+    &["anthropic_any", "openai_required", "google_function_calling_any"];
+
+/// True se lo style di tool_choice del provider permette di obbligare una tool
+/// call (`anthropic_any` / `openai_required` / `google_function_calling_any`).
+///
+/// Pura, niente DB: lo style arriva dalla `ProviderCapability` gia' caricata.
+/// Calcola il bool `provider_supports_forcing` consumato da
+/// [`should_force_tool_choice`]. Vedi `provider_style_supports_forcing` Python.
+pub fn provider_style_supports_forcing(tool_choice_style: Option<&str>) -> bool {
+    match tool_choice_style {
+        Some(style) if !style.is_empty() => TC_FORCING_SUPPORTED_STYLES.contains(&style),
+        _ => false,
+    }
+}
+
 /// Config dell'adaptive budget (PARAMETRO esplicito, no lettura DB: regola G).
 /// Mappa i settings `agent.iteration_budget.*` / `agent.complexity.*`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -241,6 +260,20 @@ mod tests {
     fn action_oriented_default_none() {
         assert!(turn_action_oriented(None));
         assert!(!turn_action_oriented(Some(false)));
+    }
+
+    #[test]
+    fn provider_style_forcing_supportati() {
+        assert!(provider_style_supports_forcing(Some("anthropic_any")));
+        assert!(provider_style_supports_forcing(Some("openai_required")));
+        assert!(provider_style_supports_forcing(Some(
+            "google_function_calling_any"
+        )));
+        // Non supportati / assenti.
+        assert!(!provider_style_supports_forcing(Some("openai_auto")));
+        assert!(!provider_style_supports_forcing(Some("none")));
+        assert!(!provider_style_supports_forcing(Some("")));
+        assert!(!provider_style_supports_forcing(None));
     }
 
     #[test]

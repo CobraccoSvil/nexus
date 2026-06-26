@@ -17,6 +17,7 @@
 pub mod checkpoint_pg;
 pub mod decisions;
 pub mod nodes;
+pub mod py_json;
 pub mod routing;
 pub mod runtime;
 pub mod shadow;

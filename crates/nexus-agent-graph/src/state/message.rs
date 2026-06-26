@@ -116,6 +116,13 @@ pub enum ContentBlock {
         /// `true` se il tool ha fallito (errore applicativo).
         #[serde(default)]
         is_error: bool,
+        /// Exit code STRUTTURATO dei tool-comando (contratto dati A): `Some(0)`
+        /// successo, `Some(!=0)` errore. Segnale PRIMARIO per l'esito di un
+        /// tool_result (vedi `routing::signals::tool_result_outcome_after`),
+        /// equivalente alla chiave `exit_code` del blocco `tool_result` Python.
+        /// `None` quando il tool non e' un comando (resta `is_error`/lessicale).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i64>,
     },
 }
 
@@ -163,6 +170,7 @@ mod tests {
             tool_use_id: "t1".to_string(),
             content: Value::Null,
             is_error: false,
+            exit_code: None,
         }]);
         assert_eq!(solo_tool.flatten_text(), "");
     }
