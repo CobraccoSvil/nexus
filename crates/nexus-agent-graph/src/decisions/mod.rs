@@ -7,6 +7,10 @@
 //! parametro esplicito (regola G), cosi' resta deterministica e testabile.
 //!
 //! Moduli:
+//!   - [`context_reduction`]: parte PURA della riduzione del contesto dell'executor
+//!     (decisione di fase, dedup tool_result, drop base64, compress, freno token, 5
+//!     iniezioni system). Le parti I/O (summary LLM, offload/continuity embeddings)
+//!     restano TODO -> trait futuri; due confini I/O parametrizzati con callback pure.
 //!   - [`progress_controller`]: controllo di avanzamento (anti-loop coordinato).
 //!   - [`g1_accounting`]: CONTEGGIO puro del gate G1 (re-entry/cap) dell'executor.
 //!     Solo il conteggio del contatore `g1_reroute_count`: la DECISIONE conseguente
@@ -32,6 +36,7 @@
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
+pub mod context_reduction;
 pub mod dag_scheduler;
 pub mod g1_accounting;
 pub mod helpers;
@@ -43,6 +48,14 @@ pub mod reward;
 pub mod tool_dispatch;
 pub mod turn_focus;
 
+pub use context_reduction::{
+    apply_token_brake, compress_old_tool_results, dedup_tool_results,
+    dedup_tool_results_history, degraded_marker, drop_unused_base64_payloads, first_human_index,
+    inject_forced_rag_reminder, inject_language_reminder, inject_turn_focus,
+    inject_verification_directive, looks_like_base64, should_compress_now, CompressParams,
+    CtxMgmtConfig, HistoryMessage, TokenBrakeConfig, AGGRESSIVE_TRUNC_MARKER, LANG_REMINDER_MARKER,
+    RAG_REMINDER_MARKER, VERIFY_DIRECTIVE_MARKER,
+};
 pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,
     TodoStatus,
