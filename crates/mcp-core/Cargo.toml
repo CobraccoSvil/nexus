@@ -42,6 +42,8 @@ nexus-tool-kit = { path = "../nexus-tool-kit" }
 nexus-agent-tools = { path = "../nexus-agent-tools" }
 nexus-orchestrator = { path = "../nexus-orchestrator" }
 nexus-events = { path = "../nexus-events" }
+nexus-graph = { path = "../nexus-graph" }
+nexus-agent-graph = { path = "../nexus-agent-graph" }
 parking_lot = "0.12"
 ruvector = { path = "../ruvector" }
 dashmap.workspace = true

@@ -1,4 +1,5 @@
 mod admin;
+mod agent_graph_adapter;
 mod agent_processes;
 mod agent_router_server;
 mod agent_todos_routes;

@@ -6,7 +6,7 @@
 //! stato tipizzato (`AgentState` + reducer derivato + `StateDelta`). In FASE 3
 //! l'INFRASTRUTTURA dei nodi I/O (modulo `runtime`: porte astratte +
 //! `AgentNodeCtx`), il primo nodo (`nodes::RouterNode`) e lo scaffold della
-//! modalita' shadow (`shadow`, telemetria mig 0452). Il transport SSE e i nodi
+//! modalita' shadow (`shadow`, telemetria mig 0453). Il transport SSE e i nodi
 //! restanti arrivano nelle fasi successive del porting (vedi
 //! `/tmp/langgraph_plan.md`).
 //!

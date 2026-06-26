@@ -13,7 +13,7 @@
 //! - **Niente decisioni**: il diff e' solo osservabilita'. Non influenza il run
 //!   primario (l'output verso l'utente resta quello del primario).
 //!
-//! Lo schema della tabella telemetria e' VERSIONATO (mig 0452, regola H): NON
+//! Lo schema della tabella telemetria e' VERSIONATO (mig 0453, regola H): NON
 //! viene creato con `CREATE TABLE IF NOT EXISTS` a runtime.
 
 use serde_json::Value;
@@ -120,7 +120,7 @@ pub fn compute_diff(primary: &Value, shadow: &Value) -> Vec<String> {
 }
 
 /// Persiste un diff per-nodo nella telemetria shadow (`nexus_shadow_telemetry`,
-/// mig 0452). INSERT puro (read-only rispetto al run: scrive solo telemetria).
+/// mig 0453). INSERT puro (read-only rispetto al run: scrive solo telemetria).
 /// L'id e' generato lato Rust (`Uuid::new_v4`) per non dipendere da un default
 /// DB (esplicito = testabile).
 pub async fn persist_node_diff(
@@ -215,7 +215,7 @@ mod db_tests {
     use sqlx::PgPool;
 
     /// Crea la tabella telemetria nel DB di test iniettato da `#[sqlx::test]`
-    /// (stesso pattern di checkpoint_pg.rs: lo schema reale e' nella mig 0452).
+    /// (stesso pattern di checkpoint_pg.rs: lo schema reale e' nella mig 0453).
     async fn create_telemetry_table(pool: &PgPool) {
         sqlx::query(
             "CREATE TABLE nexus_shadow_telemetry ( \
