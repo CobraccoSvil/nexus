@@ -604,10 +604,18 @@ pub trait MetaStepStore: Send + Sync {
 /// Best-effort con DEGRADO A TRONCAMENTO: se l'offload fallisce (embed/Qdrant
 /// down), l'impl ritorna un `PortError` e il chiamante degrada troncando inline
 /// (non blocca il run).
+///
+/// Gata `Real` (PUNTO UNICO gate shadow, regola L; uniforme con
+/// [`AgentStepStore`]/[`RunControlStore`]/[`TodoStore`]/[`VerifierRunStore`]/
+/// [`MetaStepStore`]): la SCRITTURA su Qdrant e' un side-effect, quindi
+/// `offload_to_rag` riceve `mode` e in [`ExecMode::Replay`] e' un NO-OP che
+/// ritorna `PortError` (il chiamante degrada a troncamento testa+coda non-RAG).
+/// Cosi' il gate vive nell'impl/porta (un solo punto), NON sparso nel nodo.
 #[async_trait]
 pub trait ContextOffload: Send + Sync {
     /// Scrive `payload` su RAG e ritorna un POINTER opaco (chiave per il recupero
-    /// successivo). Su guasto infrastrutturale ritorna `PortError` (il chiamante
-    /// degrada a troncamento).
-    async fn offload_to_rag(&self, payload: Value) -> Result<String, PortError>;
+    /// successivo). Gata `Real`: in [`ExecMode::Replay`] e' un no-op che ritorna
+    /// `PortError` (il run shadow non scrive Qdrant). Su guasto infrastrutturale
+    /// (anche in Real) ritorna `PortError` (il chiamante degrada a troncamento).
+    async fn offload_to_rag(&self, payload: Value, mode: ExecMode) -> Result<String, PortError>;
 }

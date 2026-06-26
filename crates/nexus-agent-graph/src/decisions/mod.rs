@@ -63,7 +63,7 @@ pub use dag_scheduler::{
 pub use g1_accounting::{g1_accounting, G1Accounting, G1Signals};
 pub use m16::{
     build_m16_allowed, is_tool_allowed, merge_discovered_run, parse_discovered_tools,
-    DiscoveredTool, M16_META_TOOLS,
+    py_json_len_ascii, DiscoveredTool, M16_META_TOOLS,
 };
 pub use predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
 pub use tool_dispatch::{

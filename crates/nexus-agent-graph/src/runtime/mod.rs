@@ -403,12 +403,15 @@ pub mod test_doubles {
     /// deterministico e registra i payload "offloadati" (per asserire che il nodo
     /// abbia delegato l'offload). Per esercitare il DEGRADO A TRONCAMENTO dei
     /// chiamanti si puo' impostare `fail=true` (ritorna `PortError`).
+    ///
+    /// Gata `Real` come l'impl concreta: in `Replay` la scrittura e' NO-OP (nulla
+    /// in `offloaded`) e ritorna `PortError` (il chiamante degrada a troncamento).
+    /// Un test asserisce ZERO scritture in shadow verificando `offloaded` vuoto.
     #[derive(Default)]
     pub struct StubContextOffload {
-        /// Se `true`, `offload_to_rag` fallisce (test del degrado a troncamento).
+        /// Se `true`, `offload_to_rag` fallisce in Real (test del degrado a troncamento).
         pub fail: bool,
-        /// Payload "offloadati" in ordine (sempre, anche se sarebbe no-op altrove:
-        /// l'offload non e' una scrittura di telemetria run, non ha gate `mode`).
+        /// Payload "offloadati" in ordine. Vuoto in shadow (gate `Real`).
         pub offloaded: Mutex<Vec<serde_json::Value>>,
     }
 
@@ -417,7 +420,13 @@ pub mod test_doubles {
         async fn offload_to_rag(
             &self,
             payload: serde_json::Value,
+            mode: ExecMode,
         ) -> Result<String, PortError> {
+            // Gate shadow: in Replay NON si scrive (no-op), come l'impl concreta.
+            // Ritorna PortError cosi' il chiamante degrada a troncamento non-RAG.
+            if mode != ExecMode::Real {
+                return Err(PortError::Tool("shadow: offload no-op".to_string()));
+            }
             if self.fail {
                 return Err(PortError::Tool("stub: offload fail".to_string()));
             }

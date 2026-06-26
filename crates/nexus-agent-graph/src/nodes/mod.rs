@@ -18,6 +18,7 @@ pub mod planner;
 pub mod reflection;
 pub mod router;
 pub mod todo_runner;
+pub mod tool_dispatch;
 pub mod understanding;
 pub mod verifier;
 
@@ -33,5 +34,6 @@ pub use planner::{
 pub use reflection::{ReflectionConfig, ReflectionData, ReflectionNode};
 pub use router::RouterNode;
 pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};
+pub use tool_dispatch::{ToolDispatchConfig, ToolDispatchNode};
 pub use understanding::{UnderstandingConfig, UnderstandingNode};
 pub use verifier::{suggest_remediation, VerifierConfig, VerifierNode};

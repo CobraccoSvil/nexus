@@ -150,6 +150,22 @@ def main() -> None:
         ("desc_truncata", json.dumps({"results": [
             {"tool_name": "long", "description": "x" * 600},
         ]}), 8192),
+        # FIX ensure_ascii (PR-G): schema con caratteri non-ASCII vicino alla
+        # soglia. len(json.dumps({"d": "à"*5})) misura gli accenti come \uXXXX
+        # (ensure_ascii=True, default) -> 9 + 5*6 = 39 > 30 -> scartato. Con
+        # ensure_ascii=False sarebbe 14 (NON scartato): il caso fa divergere le
+        # due misure e blocca la regressione lato Rust.
+        ("schema_non_ascii_oversize",
+         json.dumps({"results": [
+             {"tool_name": "loc", "input_schema": {"d": "à" * 5}},
+         ]}, ensure_ascii=False), 30),
+        # Controprova: stesso schema non-ASCII ma con soglia ALTA (>= 39) ->
+        # NON scartato (lo schema originale sopravvive). Verifica che la misura
+        # ensure_ascii non scarti per eccesso quando sta sotto la soglia.
+        ("schema_non_ascii_kept",
+         json.dumps({"results": [
+             {"tool_name": "loc2", "input_schema": {"d": "à" * 5}},
+         ]}, ensure_ascii=False), 50),
     ]
     for cid, raw, mx in parse_inputs:
         out = parse_discovered_tools(raw, mx)

@@ -31,7 +31,8 @@ pub use nodes::{
     ClarifyOrExpandNode, ClarifyingBranch, DecisionCategory, FinalGateConfig, FinalGateNode,
     GateOutcome, LearnerConfig, LearnerNode, LlmDecision, OnFailure, PlanReuse, PlannerConfig,
     PlannerNode, QdrantPayload, ReflectionConfig, ReflectionData, ReflectionNode, RouterNode,
-    TodoRunnerConfig, TodoRunnerNode, ToolResultOutcome, UnderstandingConfig, UnderstandingNode,
+    TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, ToolResultOutcome,
+    UnderstandingConfig, UnderstandingNode,
 };
 pub use runtime::{
     AgentNodeCtx, CriteriaRunner, CriterionResult, CriterionSpec, EventSink, ExecMode, LlmGateway,
