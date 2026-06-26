@@ -26,25 +26,32 @@
 //!   [`crate::internal_routing::resolve_purpose_model`] (tier-aware);
 //! - provider/model del turno (executor) RISOLTI a monte e PASSATI in input.
 //!
-//! Le restanti config dei nodi usano i loro `Default`, che replicano 1:1 i
-//! `_SAFE_DEFAULTS` del brain (`orchestrator_config.py`): valgono SOLO se il
-//! valore DB-specifico non e' ancora necessario in questa cablatura iniziale, e
-//! NON sono "magic fallback" su un comportamento di business (sono i medesimi
-//! safe-default gia' validati per il path Python). I gate che richiederebbero un
-//! I/O di risoluzione a monte non ancora portato (es. `_resolve_build_command`
-//! per il criterio build del final_gate) restano OFF (nessun comando -> nessun
-//! criterio, non blocca): un TODO esplicito li traccia, niente toppa.
+//! Le config dei nodi che il brain legge da `orchestrator_config.get()`
+//! (`orchestrator_config.py`) — `PlannerConfig`, `FinalGateConfig`,
+//! `VerifierConfig` — sono LETTE dal DB (regola G piena) da `load_*_config` col
+//! punto unico `nexus_auth::get_setting` (regola L), 1:1 con le chiavi del brain;
+//! il `Default` resta SOLO come safe-default se la chiave manca (identico ai
+//! `_SAFE_DEFAULTS`). Le restanti config (`ExecutorConfig`/`ReflectionConfig`/...)
+//! usano i loro `Default` per i campi RISOLTI A MONTE (capability, prompt text)
+//! non ancora portati in questa cablatura: NON sono "magic fallback" su un
+//! comportamento di business (sono i medesimi safe-default gia' validati per il
+//! path Python). I gate che richiederebbero un I/O di risoluzione a monte non
+//! ancora portato (es. `_resolve_build_command` per il criterio build del
+//! final_gate) restano OFF (nessun comando -> nessun criterio, non blocca): un
+//! TODO esplicito li traccia, niente toppa.
 //!
 //! ## TODO Fase 5 (debiti di parita' da chiudere PRIMA dell'instradamento)
 //!
 //! Verifica adversariale 2026-06: latenti finche' `select_engine` resta python
 //! (regressione viva NULLA), ma da chiudere all'instradamento per parita' col brain:
-//! 1. `build_initial_state` NON valorizza `behavior_mode` (resta `None`): oggi
-//!    innocuo (il brain hardcoda "bilanciata" e il planner e' comunque OFF via
-//!    `plan_phase_enabled=false`), ma al cutover va popolato dal turno.
-//! 2. `PlannerConfig`/`FinalGateConfig`/altre config dei nodi usano `default()`:
-//!    il DB ha gia' `orchestrator.plan_phase_enabled=true` (mig 0426/0439) -> al
-//!    routing vanno LETTE dal DB (regola G piena), non lasciate al safe-default.
+//! 1. CHIUSO (F5a). `build_initial_state` valorizza `behavior_mode` con la STESSA
+//!    fonte del primario Python (`PRIMARY_BEHAVIOR_MODE`, costante riusata dal
+//!    client brain): lo shadow attraversa il grafo col mode IDENTICO. Conta dal
+//!    momento in cui il planner e' eleggibile (`plan_phase_enabled=true`).
+//! 2. CHIUSO (F5a). `PlannerConfig`/`FinalGateConfig`/`VerifierConfig` sono LETTE
+//!    dal DB (`load_*_config`, punto unico `get_setting`, regola G piena), 1:1 con
+//!    le chiavi `orchestrator.*`/`agent.*` del brain; il `Default` resta solo come
+//!    safe-default se la chiave manca.
 //! 3. SSE: i nodi emettono via `ctx.emit` solo `MetaStep`; mancano
 //!    `AssistantDelta`/`ToolUse`/`ToolResult` e il terminatore `Done`, + la
 //!    finalizzazione di `agent_runs` e la gestione hollow nel call site.
@@ -203,6 +210,140 @@ async fn resolve_purpose(db: &PgPool, purpose: &str) -> (String, String) {
     }
 }
 
+// ── Coercizione setting tipizzati (parita' 1:1 con `_coerce` del brain) ───────
+//
+// Il brain (`orchestrator_config.py::_coerce`) converte il `value` testuale del DB
+// nel tipo del default: bool da `{true,1,yes,on}` (case-insensitive); CSV ->
+// `list[str]` con strip + scarto dei vuoti; int/float con parse e fallback al
+// default. Replichiamo qui la STESSA semantica perche' le config nodi Rust devono
+// coincidere coi valori che il brain calcola dalle medesime chiavi (presupposto
+// del confronto shadow). `get_setting` (punto unico, regola L) gia' fa trim +
+// scarto dei vuoti -> una chiave assente/vuota torna `None` e si usa il default.
+
+/// `value` -> bool con la semantica `_coerce` del brain (`{true,1,yes,on}` truthy).
+fn coerce_bool(raw: &str) -> bool {
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+}
+
+/// `value` CSV -> `Vec<String>` (strip per elemento + scarto dei vuoti), come
+/// `_coerce` sui default di tipo `list`.
+fn coerce_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Legge un setting bool dal DB (chiave `key`) col fallback al `default` se
+/// assente/vuoto (safe-default identico al brain). Punto unico `get_setting`.
+async fn setting_bool(db: &PgPool, key: &str, default: bool) -> bool {
+    match nexus_auth::get_setting(db, key).await {
+        Some(raw) => coerce_bool(&raw),
+        None => default,
+    }
+}
+
+/// Legge un setting i64 dal DB col fallback al `default` (parse tollerante: un
+/// valore non parsabile cade sul default, come `_coerce`).
+async fn setting_i64(db: &PgPool, key: &str, default: i64) -> i64 {
+    nexus_auth::get_setting(db, key)
+        .await
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+/// Legge un setting f64 dal DB col fallback al `default`.
+async fn setting_f64(db: &PgPool, key: &str, default: f64) -> f64 {
+    nexus_auth::get_setting(db, key)
+        .await
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+/// Legge un setting CSV dal DB col fallback al `default` (lista) se assente/vuoto.
+async fn setting_csv(db: &PgPool, key: &str, default: Vec<String>) -> Vec<String> {
+    match nexus_auth::get_setting(db, key).await {
+        Some(raw) => coerce_csv(&raw),
+        None => default,
+    }
+}
+
+/// Costruisce la [`PlannerConfig`] DB-driven (regola G), 1:1 con le chiavi
+/// `orchestrator.*` lette dal brain (`orchestrator_config.py`). I campi che il
+/// brain NON popola da `orchestrator_config` restano al loro `Default`:
+/// - `planner_system_text`: prompt RISOLTO A MONTE dal registry (regola G) — non
+///   ancora portato nella cablatura nativa, resta vuoto (`prompt_missing` -> skip,
+///   parita' col safe-default);
+/// - `turn_focus_enabled`: viene dalla CONTINUITY config (`agent.context.turn_focus_enabled`),
+///   non da `orchestrator_config` — TODO wiring continuity (default true).
+async fn load_planner_config(db: &PgPool) -> PlannerConfig {
+    let d = PlannerConfig::default();
+    PlannerConfig {
+        plan_phase_enabled: setting_bool(db, "orchestrator.plan_phase_enabled", d.plan_phase_enabled).await,
+        plan_behavior_modes: setting_csv(db, "orchestrator.plan_behavior_modes", d.plan_behavior_modes).await,
+        plan_intents: setting_csv(db, "orchestrator.plan_intents", d.plan_intents).await,
+        plan_min_token_budget: setting_i64(db, "orchestrator.plan_min_token_budget", d.plan_min_token_budget).await,
+        planner_prompt_key: nexus_auth::get_setting(db, "orchestrator.planner_prompt_key")
+            .await
+            .unwrap_or(d.planner_prompt_key),
+        clarifying_questions_enabled: setting_bool(db, "orchestrator.clarifying_questions_enabled", d.clarifying_questions_enabled).await,
+        clarifying_questions_max: setting_i64(db, "orchestrator.clarifying_questions_max", d.clarifying_questions_max).await,
+        plan_rationale_enabled: setting_bool(db, "orchestrator.plan_rationale_enabled", d.plan_rationale_enabled).await,
+        dag_topological_enabled: setting_bool(db, "orchestrator.dag_topological_enabled", d.dag_topological_enabled).await,
+        // Risolti a monte / da altra fonte (vedi doc della funzione): default.
+        planner_system_text: d.planner_system_text,
+        turn_focus_enabled: d.turn_focus_enabled,
+    }
+}
+
+/// Costruisce la [`FinalGateConfig`] DB-driven (regola G), 1:1 con le chiavi che
+/// il brain legge da `orchestrator_config` (prefisso `agent.final_gate.*` +
+/// `agent.no_orphan.min_ratio` + `agent.import_staging_dirs`; `criteria_timeout_s`
+/// = `orchestrator.verifier_timeout_s`).
+///
+/// Restano al `Default` i campi RISOLTI PER-PROGETTO a monte (regola G), non
+/// ancora portati nella cablatura nativa (gli stessi gia' OFF nel TODO esistente):
+/// `build_command`/`build_working_dir` (`_resolve_build_command`), `log_command`
+/// (`_resolve_log_command`), `endpoint_criterion` (`_resolve_endpoint_check`). Con
+/// `None`/vuoto il criterio corrispondente NON si aggiunge (non blocca, niente
+/// toppa). `build_timeout_s`/`build_output_max_chars` vivono in DB ma servono SOLO
+/// quando `build_command` e' risolto: si leggono comunque per fedelta'.
+async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
+    let d = FinalGateConfig::default();
+    FinalGateConfig {
+        enabled: setting_bool(db, "agent.final_gate.enabled", d.enabled).await,
+        max_cycles: setting_i64(db, "agent.final_gate.max_cycles", d.max_cycles).await,
+        runtime_check_enabled: setting_bool(db, "agent.final_gate.runtime_check_enabled", d.runtime_check_enabled).await,
+        build_timeout_s: setting_f64(db, "agent.final_gate.build_timeout_s", d.build_timeout_s).await,
+        build_output_max_chars: setting_i64(db, "agent.final_gate.build_output_max_chars", d.build_output_max_chars).await,
+        runtime_error_patterns: setting_csv(db, "agent.final_gate.runtime_error_patterns", d.runtime_error_patterns).await,
+        no_orphan_min_ratio: setting_f64(db, "agent.no_orphan.min_ratio", d.no_orphan_min_ratio).await,
+        import_staging_dirs: setting_csv(db, "agent.import_staging_dirs", d.import_staging_dirs).await,
+        criteria_timeout_s: setting_f64(db, "orchestrator.verifier_timeout_s", d.criteria_timeout_s).await,
+        // Risolti per-progetto a monte (non ancora portati): default (None/vuoto).
+        build_command: d.build_command,
+        build_working_dir: d.build_working_dir,
+        log_command: d.log_command,
+        endpoint_criterion: d.endpoint_criterion,
+    }
+}
+
+/// Costruisce la [`VerifierConfig`] DB-driven (regola G), 1:1 con le chiavi che il
+/// brain legge da `orchestrator_config`: `verifier_enabled`, `max_verify_cycles`,
+/// `verifier_fail_closed` (`agent.verifier.fail_closed`), `dag_topological_enabled`.
+/// `exploratory_verify_max_total` e' un default-locale del verifier_node (rami
+/// esplorativi OFF + non portati): resta al `Default`.
+async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
+    let d = VerifierConfig::default();
+    VerifierConfig {
+        enabled: setting_bool(db, "orchestrator.verifier_enabled", d.enabled).await,
+        max_verify_cycles: setting_i64(db, "orchestrator.max_verify_cycles", d.max_verify_cycles).await,
+        fail_closed: setting_bool(db, "agent.verifier.fail_closed", d.fail_closed).await,
+        dag_topological_enabled: setting_bool(db, "orchestrator.dag_topological_enabled", d.dag_topological_enabled).await,
+        exploratory_verify_max_total: d.exploratory_verify_max_total,
+    }
+}
+
 /// Ruolo del run nel motore nativo: distingue il run PRIMARIO (side-effect
 /// reali, output SSE, checkpoint persistente) dal run SHADOW (read-only).
 ///
@@ -317,8 +458,17 @@ async fn build_native_engine(
     let criteria: Arc<dyn CriteriaRunner> =
         Arc::new(FinalGateCriteriaRunnerAdapter::new(tools.clone(), db.clone()));
 
-    // ── Config dei nodi (DB-driven dove richiesto, Default safe altrove) ──────
-    let planner_cfg = PlannerConfig::default();
+    // ── Config dei nodi (DB-driven, regola G piena) ──────────────────────────
+    // DEBITO 2 chiuso (TODO Fase 5): le config dei nodi che il brain Python legge
+    // da `orchestrator_config.get()` (`orchestrator_config.py`) vengono ora LETTE
+    // dal DB col PUNTO UNICO `nexus_auth::get_setting` (regola L), 1:1 con le chiavi
+    // settings del brain. Il `Default` di ciascuna config resta SOLO come
+    // safe-default se la chiave manca (identico ai `_SAFE_DEFAULTS` del brain): mai
+    // come magic fallback (regola G). Copre SIA il primario nativo (run_native) SIA
+    // lo shadow (run_shadow): entrambi passano di qui (punto unico).
+    let planner_cfg = load_planner_config(&db).await;
+    let final_gate_cfg = load_final_gate_config(&db).await;
+    let verifier_cfg = load_verifier_config(&db).await;
 
     let exec_cfg = ExecutorConfig {
         routing_provider: input.provider.clone(),
@@ -336,12 +486,6 @@ async fn build_native_engine(
         model: reflection_model,
         ..ReflectionConfig::default()
     };
-
-    // FinalGateConfig: `build_command` resta None in questa cablatura iniziale.
-    // TODO(F3+): risolvere _resolve_build_command per-progetto (criterio build E2E)
-    // quando il resolver sara' portato; finche' None il criterio non e' aggiunto
-    // (nessun blocco, niente toppa).
-    let final_gate_cfg = FinalGateConfig::default();
 
     // ── 11 nodi (porte iniettate nei costruttori reali) ──────────────────────
     let nodes = AgentGraphNodes {
@@ -380,7 +524,7 @@ async fn build_native_engine(
             offload.clone(),
         )),
         verifier: Arc::new(VerifierNode::new(
-            VerifierConfig::default(),
+            verifier_cfg,
             final_gate_cfg.clone(),
             routing_cfg.clone(),
             todos.clone(),
@@ -482,6 +626,19 @@ fn build_initial_state(input: &NativeRunInput) -> AgentState {
         model_override: Some(input.model.clone()),
         tools_json: tools,
         automation_mode: parse_automation_mode(&input.automation_mode),
+        // DEBITO 1 chiuso (TODO Fase 5): `behavior_mode` valorizzato con la STESSA
+        // fonte del primario Python, il quale lo riceve dal payload
+        // `/agent/run/stream` (campo `behavior_mode`) e lo copia in
+        // `initial_state["behavior_mode"]` (`agent.py:621`). mcp-core invia la
+        // costante `PRIMARY_BEHAVIOR_MODE` (`brain_agent_client.rs`): la riusiamo
+        // qui (punto unico, regola L) cosi' lo shadow confronta un grafo col mode
+        // IDENTICO. Conta sul serio dal momento in cui il planner e' eleggibile
+        // (`plan_phase_enabled=true`, mig 0426/0439): `PlannerConfig::is_eligible`
+        // gata su questo mode; senza valorizzarlo, lo shadow divergerebbe (None vs
+        // "bilanciata"). Il valore-vero-dal-turno (derivarlo dall'automation_mode/
+        // routing) e' un miglioramento separato, valido per ENTRAMBI i motori
+        // (fuori scope: andrebbe cambiato PRIMA lato Python, vedi nota costante).
+        behavior_mode: Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE.to_string()),
         ..Default::default()
     }
 }
@@ -878,6 +1035,14 @@ mod tests {
         assert_eq!(state.provider_override.as_deref(), Some("anthropic"));
         assert_eq!(state.model_override.as_deref(), Some("claude-x"));
 
+        // DEBITO 1: behavior_mode valorizzato con la STESSA fonte del primario
+        // Python (la costante del client brain), non None.
+        assert_eq!(
+            state.behavior_mode.as_deref(),
+            Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE),
+            "behavior_mode = fonte primario (bilanciata), per parita' con lo shadow"
+        );
+
         // Tools propagati (array non vuoto).
         let tools = state.tools_json.expect("tools propagati");
         assert_eq!(tools.len(), 1);
@@ -1193,5 +1358,123 @@ mod tests {
             keys,
             vec!["has_produced_work".to_string(), "num_tool_calls".to_string()]
         );
+    }
+
+    /// Tabella `settings` minimale (key, value) per i test DB-driven delle config.
+    async fn create_settings_table(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE settings ( \
+                 key   TEXT PRIMARY KEY, \
+                 value TEXT \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create settings");
+    }
+
+    async fn set_setting(pool: &sqlx::PgPool, key: &str, value: &str) {
+        sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2)")
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await
+            .expect("insert setting");
+    }
+
+    #[sqlx::test]
+    async fn planner_config_db_driven_legge_orchestrator_settings(pool: sqlx::PgPool) {
+        // DEBITO 2: con i setting orchestrator.* nel DB, load_planner_config deve
+        // leggerli (regola G), non lasciare i safe-default. Replica i valori reali
+        // di produzione (plan_phase_enabled=true abilita il planner).
+        create_settings_table(&pool).await;
+        set_setting(&pool, "orchestrator.plan_phase_enabled", "true").await;
+        set_setting(&pool, "orchestrator.plan_behavior_modes", "bilanciata,approfondita").await;
+        set_setting(&pool, "orchestrator.plan_intents", "code,fix,debug").await;
+        set_setting(&pool, "orchestrator.plan_min_token_budget", "800").await;
+        set_setting(&pool, "orchestrator.clarifying_questions_enabled", "false").await;
+        set_setting(&pool, "orchestrator.dag_topological_enabled", "true").await;
+
+        let cfg = load_planner_config(&pool).await;
+        assert!(cfg.plan_phase_enabled, "letto true dal DB");
+        assert_eq!(cfg.plan_behavior_modes, vec!["bilanciata", "approfondita"]);
+        assert_eq!(cfg.plan_intents, vec!["code", "fix", "debug"]);
+        assert_eq!(cfg.plan_min_token_budget, 800);
+        assert!(!cfg.clarifying_questions_enabled, "false dal DB sovrascrive il default true");
+        assert!(cfg.dag_topological_enabled);
+
+        // Con plan_phase_enabled=true e behavior_mode "bilanciata" (fonte primario,
+        // DEBITO 1) in plan_behavior_modes + un intent in plan_intents + budget
+        // sufficiente, il planner Rust e' eleggibile (accoppiamento debito 1+2).
+        assert!(
+            cfg.is_eligible(Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE), Some("code"), 1000),
+            "planner eleggibile col behavior_mode del primario + intent + budget"
+        );
+    }
+
+    #[sqlx::test]
+    async fn config_db_driven_safe_default_se_chiave_assente(pool: sqlx::PgPool) {
+        // DEBITO 2 (rovescio): tabella settings VUOTA -> ogni config cade sul proprio
+        // safe-default (identico ai _SAFE_DEFAULTS del brain), non panica, non
+        // inventa valori. In particolare plan_phase_enabled=false (planner OFF).
+        create_settings_table(&pool).await;
+
+        let planner = load_planner_config(&pool).await;
+        assert!(!planner.plan_phase_enabled, "safe-default: planner OFF se chiave assente");
+        assert_eq!(planner.plan_min_token_budget, PlannerConfig::default().plan_min_token_budget);
+
+        let verifier = load_verifier_config(&pool).await;
+        assert!(!verifier.enabled, "safe-default: verifier OFF se chiave assente");
+        assert_eq!(verifier.max_verify_cycles, VerifierConfig::default().max_verify_cycles);
+
+        let final_gate = load_final_gate_config(&pool).await;
+        assert_eq!(final_gate.enabled, FinalGateConfig::default().enabled);
+        assert_eq!(final_gate.max_cycles, FinalGateConfig::default().max_cycles);
+    }
+
+    #[sqlx::test]
+    async fn verifier_config_db_driven_legge_settings(pool: sqlx::PgPool) {
+        // DEBITO 2: verifier_enabled + max_verify_cycles + fail_closed dal DB.
+        create_settings_table(&pool).await;
+        set_setting(&pool, "orchestrator.verifier_enabled", "true").await;
+        set_setting(&pool, "orchestrator.max_verify_cycles", "5").await;
+        set_setting(&pool, "agent.verifier.fail_closed", "false").await;
+
+        let cfg = load_verifier_config(&pool).await;
+        assert!(cfg.enabled, "verifier_enabled=true dal DB");
+        assert_eq!(cfg.max_verify_cycles, 5);
+        assert!(!cfg.fail_closed, "fail_closed=false dal DB sovrascrive il default true");
+    }
+
+    #[sqlx::test]
+    async fn final_gate_config_db_driven_legge_settings(pool: sqlx::PgPool) {
+        // DEBITO 2: campi del final_gate dal DB (prefisso agent.final_gate.* +
+        // no_orphan + import_staging + criteria_timeout da verifier_timeout_s).
+        create_settings_table(&pool).await;
+        set_setting(&pool, "agent.final_gate.enabled", "false").await;
+        set_setting(&pool, "agent.final_gate.max_cycles", "4").await;
+        set_setting(&pool, "agent.final_gate.runtime_check_enabled", "false").await;
+        set_setting(&pool, "agent.no_orphan.min_ratio", "0.7").await;
+        set_setting(&pool, "agent.import_staging_dirs", "figma_export,staging").await;
+        set_setting(&pool, "orchestrator.verifier_timeout_s", "45.0").await;
+        set_setting(
+            &pool,
+            "agent.final_gate.runtime_error_patterns",
+            "ECONNREFUSED,Traceback",
+        )
+        .await;
+
+        let cfg = load_final_gate_config(&pool).await;
+        assert!(!cfg.enabled, "enabled=false dal DB");
+        assert_eq!(cfg.max_cycles, 4);
+        assert!(!cfg.runtime_check_enabled);
+        assert!((cfg.no_orphan_min_ratio - 0.7).abs() < f64::EPSILON);
+        assert_eq!(cfg.import_staging_dirs, vec!["figma_export", "staging"]);
+        assert!((cfg.criteria_timeout_s - 45.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.runtime_error_patterns, vec!["ECONNREFUSED", "Traceback"]);
+        // Risolti per-progetto a monte: restano None/vuoto (non ancora portati).
+        assert!(cfg.build_command.is_none());
+        assert!(cfg.log_command.is_empty());
+        assert!(cfg.endpoint_criterion.is_none());
     }
 }

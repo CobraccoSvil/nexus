@@ -3181,62 +3181,99 @@ fn engine_cache() -> &'static nexus_cache::TtlCache<String, Engine> {
 
 /// Decide il motore di orchestrazione per il run corrente (PUNTO UNICO).
 ///
-/// Legge `nexus_orchestrator_engine` (riga jolly '*' come default globale, mig
-/// 0451) con cache 60s. Regola G: nessun fallback hardcoded di emergenza — la
-/// configurazione vive nel DB. In FASE 0 la riga '*' vale 'python', quindi la
-/// funzione ritorna SEMPRE `Engine::Python` e il path Rust non viene mai
-/// imboccato; la firma e' gia' pronta per il routing per-run (Fase 5).
+/// Legge `nexus_orchestrator_engine` (mig 0451) con cache 60s PER-SCOPE. Lo
+/// `scope_key` e' il `session_id` testuale del run. Risoluzione (regola G):
+///   1. riga con `scope_key = <scope>` (override per-sessione/progetto), se c'e';
+///   2. fallback alla riga jolly '*' (default globale, INVARIANTE 'python' in
+///      Fase 5: NON si instrada globalmente, si abilita solo il per-sessione).
 ///
-/// Comportamento difensivo coerente con il resto del sistema: se il DB e'
-/// irraggiungibile o la riga manca, ritorna `Engine::Python` (il motore
-/// stabile) loggando un warn. NON e' un "magic fallback" sul comportamento
-/// configurabile (il motore di default e' una decisione di safety, non un
-/// valore di business mascherato): mantiene il sistema sull'unico motore
-/// validato finche' la tabella non abilita esplicitamente quello nativo.
-pub(crate) async fn select_engine(db: &PgPool, _scope_key: &str) -> Engine {
-    // In Fase 0 il routing e' solo globale: si legge sempre la riga jolly '*'.
-    // La firma accetta gia' lo scope per non rompere i call site quando il
-    // routing per-sessione/progetto verra' attivato (Fase 5).
+/// Cosi' `engine = 'shadow'`/'rust' si attiva PER-SESSIONE (riga dedicata) senza
+/// toccare il traffico globale: i run delle altre sessioni continuano a leggere
+/// la riga '*' = 'python'. Niente fallback hardcoded di emergenza: la
+/// configurazione vive nel DB.
+///
+/// Cache: chiave = `scope_key` risolto. La riga specifica e la riga '*' hanno
+/// chiavi cache DISTINTE (lo scope concreto vs `ENGINE_GLOBAL_SCOPE`), quindi
+/// attivare/disattivare lo shadow su UNA sessione si propaga entro il TTL (60s)
+/// senza invalidare la cache globale esistente.
+///
+/// Comportamento difensivo coerente col resto del sistema: se il DB e'
+/// irraggiungibile o nessuna riga matcha (ne' specifica ne' '*'), ritorna
+/// `Engine::Python` (il motore stabile) loggando un warn. NON e' un "magic
+/// fallback" sul comportamento configurabile (il motore di default e' una
+/// decisione di safety): mantiene il sistema sull'unico motore validato finche'
+/// la tabella non abilita esplicitamente quello nativo.
+pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
     let cache = engine_cache();
-    if let Some(hit) = cache.get(ENGINE_GLOBAL_SCOPE) {
+    if let Some(hit) = cache.get(scope_key) {
         return hit;
     }
 
-    let row = sqlx::query("SELECT engine FROM nexus_orchestrator_engine WHERE scope_key = $1")
-        .bind(ENGINE_GLOBAL_SCOPE)
-        .fetch_optional(db)
-        .await;
+    // Un'unica query: prende la riga specifica E la riga '*' (al massimo 2 righe),
+    // poi si preferisce la specifica. Evita due round-trip e tiene la logica di
+    // precedenza in un solo punto (regola L). NB: lo scope '*' coincide con la
+    // riga globale -> la `WHERE scope_key IN ('*', '*')` resta corretta.
+    let rows = sqlx::query(
+        "SELECT scope_key, engine FROM nexus_orchestrator_engine WHERE scope_key = $1 OR scope_key = $2",
+    )
+    .bind(scope_key)
+    .bind(ENGINE_GLOBAL_SCOPE)
+    .fetch_all(db)
+    .await;
 
-    let engine = match row {
-        Ok(Some(r)) => {
-            let raw: String = r.get("engine");
-            match Engine::from_db(&raw) {
-                Some(e) => e,
+    let engine = match rows {
+        Ok(rows) if !rows.is_empty() => {
+            // Preferisci la riga con scope_key == quello richiesto; altrimenti la
+            // riga jolly '*'. (Se scope_key == '*', la prima clausola coincide.)
+            let pick = rows
+                .iter()
+                .find(|r| r.get::<String, _>("scope_key") == scope_key)
+                .or_else(|| {
+                    rows.iter()
+                        .find(|r| r.get::<String, _>("scope_key") == ENGINE_GLOBAL_SCOPE)
+                });
+            match pick {
+                Some(r) => {
+                    let raw: String = r.get("engine");
+                    match Engine::from_db(&raw) {
+                        Some(e) => e,
+                        None => {
+                            tracing::warn!(
+                                engine_raw = %raw,
+                                scope_key = %scope_key,
+                                "select_engine: valore engine non riconosciuto in nexus_orchestrator_engine, uso il motore stabile (python)"
+                            );
+                            Engine::Python
+                        }
+                    }
+                }
                 None => {
                     tracing::warn!(
-                        engine_raw = %raw,
-                        "select_engine: valore engine non riconosciuto in nexus_orchestrator_engine, uso il motore stabile (python)"
+                        scope_key = %scope_key,
+                        "select_engine: nessuna riga specifica ne' jolly '*' in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
                     );
                     Engine::Python
                 }
             }
         }
-        Ok(None) => {
+        Ok(_) => {
             tracing::warn!(
-                "select_engine: riga jolly '*' assente in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
+                scope_key = %scope_key,
+                "select_engine: nessuna riga (ne' '{scope_key}' ne' jolly '*') in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
             );
             Engine::Python
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
+                scope_key = %scope_key,
                 "select_engine: query nexus_orchestrator_engine fallita, uso il motore stabile (python)"
             );
             Engine::Python
         }
     };
 
-    cache.insert(ENGINE_GLOBAL_SCOPE.to_string(), engine);
+    cache.insert(scope_key.to_string(), engine);
     engine
 }
 
@@ -3356,6 +3393,37 @@ mod tests_select_engine {
         create_engine_table(&pool).await;
         let engine = select_engine(&pool, "*").await;
         assert_eq!(engine, Engine::Python);
+    }
+
+    #[sqlx::test]
+    async fn select_engine_scoping_per_sessione(pool: sqlx::PgPool) {
+        // Riga jolly '*' = python (default globale INVARIATO) + riga specifica per
+        // una sessione = shadow. La sessione con riga dedicata deve ottenere Shadow;
+        // qualunque altra sessione (senza riga) deve cadere sul jolly '*' = Python.
+        // scope_key UNIVOCI (uuid) -> nessuna collisione con la cache statica
+        // condivisa tra i test (idempotenza, regola F).
+        create_engine_table(&pool).await;
+        let sess = Uuid::new_v4().to_string();
+        let other = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO nexus_orchestrator_engine (scope_key, scope_kind, engine, percent) \
+             VALUES ('*', 'global', 'python', 100), ($1, 'session', 'shadow', 100)",
+        )
+        .bind(&sess)
+        .execute(&pool)
+        .await
+        .expect("insert default + sessione shadow");
+
+        assert_eq!(
+            select_engine(&pool, &sess).await,
+            Engine::Shadow,
+            "la sessione con riga dedicata 'shadow' deve attivare lo shadow"
+        );
+        assert_eq!(
+            select_engine(&pool, &other).await,
+            Engine::Python,
+            "una sessione SENZA riga dedicata cade sul jolly '*' = python (globale invariato)"
+        );
     }
 
     // `run_via_native` (FASE 3) richiede un `AppState` reale (ToolRunnerDeps +

@@ -22,6 +22,23 @@ use crate::agent_types::{
     AgentMetaStep, AgentRunResult, AgentRunStatus, AgentStep, AgentStepEvent, AgentStepStatus,
 };
 
+/// Behavior_mode con cui il PRIMARIO (brain Python) avvia ogni run agentico.
+///
+/// PUNTO UNICO (regola L): mcp-core lo invia nel payload `/agent/run/stream`
+/// (campo `behavior_mode`) e il brain lo copia TALE E QUALE in
+/// `initial_state["behavior_mode"]` (`brain/grpc_server/routes/agent.py:621`).
+/// Non e' derivato dall'`automation_mode` ne' dal routing del turno: e' la
+/// costante storica del client. Il motore nativo (`native_engine`) DEVE
+/// valorizzare lo stesso `behavior_mode` nello stato iniziale per attraversare la
+/// STESSA topologia del primario (eleggibilita' del planner gata su questo valore):
+/// non si re-definisce il valore in due punti, si riusa questa costante.
+///
+/// NB: il valore-vero-dal-turno (derivare il behavior_mode dall'automation_mode o
+/// dal routing) sarebbe un miglioramento SEPARATO, valido sia per il primario
+/// Python sia per il nativo Rust; e' fuori scope qui (richiederebbe di cambiare
+/// PRIMA la fonte Python, altrimenti i due motori divergerebbero).
+pub const PRIMARY_BEHAVIOR_MODE: &str = "bilanciata";
+
 /// URL REST del brain (FastAPI). Default allineato al port di `--rest` del brain.
 /// Gerarchia: env var BRAIN_REST_URL (override emergenza) > hardcoded.
 /// Nota: il valore canonico e' in DB (settings.brain_rest_url), ma questa
@@ -599,7 +616,7 @@ pub async fn run_via_brain(
     let mut body = json!({
         "thread_id": run_id_str,
         "prompt": initial_msg,
-        "behavior_mode": "bilanciata",
+        "behavior_mode": PRIMARY_BEHAVIOR_MODE,
         "tools_json": tools_json,
         "system_text": system_text,
         "session_id": session_id.to_string(),
