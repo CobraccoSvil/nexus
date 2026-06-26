@@ -39,6 +39,9 @@ pub mod test_doubles {
     pub struct StubLlmGateway {
         /// Risposta fissa ritornata da ogni `complete`.
         pub canned: LlmResponse,
+        /// Se `Some`, `complete` ritorna `Err(PortError::Llm(_))` (provider down/
+        /// billing): esercita il ramo error del nodo (parita' con l'except Python).
+        pub error: Option<String>,
         /// Richieste registrate (in ordine d'arrivo).
         pub seen: Mutex<Vec<LlmRequest>>,
     }
@@ -53,6 +56,7 @@ pub mod test_doubles {
                     usage: LlmUsage::default(),
                     ..Default::default()
                 },
+                error: None,
                 seen: Mutex::new(vec![]),
             }
         }
@@ -72,6 +76,18 @@ pub mod test_doubles {
                     usage: LlmUsage::default(),
                     ..Default::default()
                 },
+                error: None,
+                seen: Mutex::new(vec![]),
+            }
+        }
+
+        /// Crea uno stub il cui `complete` fallisce sempre con `PortError::Llm`
+        /// (provider down/billing): per il ramo error del nodo (il run NON deve
+        /// abortire con `NodeError` ma proseguire al delta con `stop_reason=error`).
+        pub fn with_error(message: &str) -> Self {
+            Self {
+                canned: LlmResponse::default(),
+                error: Some(message.to_string()),
                 seen: Mutex::new(vec![]),
             }
         }
@@ -81,6 +97,9 @@ pub mod test_doubles {
     impl LlmGateway for StubLlmGateway {
         async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
             self.seen.lock().expect("lock seen").push(req);
+            if let Some(msg) = &self.error {
+                return Err(PortError::Llm(msg.clone()));
+            }
             Ok(self.canned.clone())
         }
     }

@@ -12,6 +12,7 @@
 //! nodi reali arrivano nei PR successivi del porting.
 
 pub mod clarify_or_expand;
+pub mod executor;
 pub mod final_gate;
 pub mod learner;
 pub mod planner;
@@ -25,6 +26,7 @@ pub mod verifier;
 pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
 };
+pub use executor::{ExecutorConfig, ExecutorNode};
 pub use final_gate::{count_build_errors, FinalGateConfig, FinalGateNode};
 pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
 pub use planner::{
