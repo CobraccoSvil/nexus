@@ -15,6 +15,10 @@
 //! `agent_channels` (il flusso `run_via_brain` emette li'); l'adapter delega allo
 //! stesso canale per parita' 1:1 con il motore Python.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -29,18 +33,43 @@ pub struct SseEventSinkAdapter {
     tx: broadcast::Sender<AgentStepEvent>,
     /// Run a cui gli eventi emessi appartengono (campo `run_id` degli eventi SSE).
     run_id: Uuid,
+    /// Contatore monotono per-run dello `step_index` (parita' col path Python
+    /// `brain_agent_client::run_via_brain`, dove ogni `tool_use` incrementa
+    /// l'indice). Senza questo ogni step usava `step_index: 0` e il frontend
+    /// (upsert per `stepIndex`) sovrascriveva lo step precedente mostrandone uno
+    /// solo: il progresso live spariva. `fetch_add(1)` ritorna il valore PRIMA
+    /// dell'incremento, quindi il primo step ha indice 0 e i successivi crescono.
+    next_step_index: AtomicI64,
+    /// Mappa `tool_call_id` -> (step_index, tool_name) registrata al `ToolUse`:
+    /// permette al `ToolResult` correlato di aggiornare LO STESSO step (stesso
+    /// indice, stesso nome del tool) invece di crearne uno nuovo con nome vuoto
+    /// e indice 0 (parita' col Python che aggiorna l'oggetto step in `Running`).
+    tool_index: Mutex<HashMap<String, (i64, String)>>,
 }
 
 impl SseEventSinkAdapter {
     /// Costruisce l'adapter sul sender broadcast concreto del run.
     pub fn new(tx: broadcast::Sender<AgentStepEvent>, run_id: Uuid) -> Self {
-        Self { tx, run_id }
+        Self {
+            tx,
+            run_id,
+            next_step_index: AtomicI64::new(0),
+            tool_index: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Helper interno: invia un `AgentStepEvent` best-effort (l'errore "nessun
     /// subscriber" e' atteso e ignorato, come in `run_via_brain`).
     fn send(&self, ev: AgentStepEvent) {
         let _ = self.tx.send(ev);
+    }
+
+    /// Converte l'indice monotono interno (`i64`, mai negativo) nel `u32` del
+    /// campo `AgentStep::step_index`. Saturazione esplicita (niente cast silente):
+    /// gli indici partono da 0 e crescono, un overflow di `u32` e' irrealistico
+    /// per un singolo run ma la clamp evita comunque un troncamento ambiguo.
+    fn step_index_u32(idx: i64) -> u32 {
+        idx.clamp(0, u32::MAX as i64) as u32
     }
 
     /// Scheletro evento con `run_id` valorizzato e tutti i campi opzionali a `None`
@@ -123,13 +152,19 @@ impl EventSink for SseEventSinkAdapter {
                 self.send(e);
             }
             SseEvent::ToolUse { id, name, input } => {
+                // Indice monotono per-run (parita' Python): ogni tool_use apre un
+                // nuovo step. `fetch_add` ritorna il valore precedente; il primo
+                // step ha indice 0, i successivi crescono -> il frontend non
+                // sovrascrive piu' lo step (upsert per stepIndex distinto).
+                let idx = self.next_step_index.fetch_add(1, Ordering::Relaxed);
+                // Registra la correlazione id -> (indice, nome) per il ToolResult.
+                self.tool_index
+                    .lock()
+                    .insert(id.clone(), (idx, name.clone()));
                 let mut e = self.base();
                 e.step = Some(AgentStep {
                     run_id: self.run_id.to_string(),
-                    // step_index non disponibile a livello evento: usiamo 0; il
-                    // valore autoritativo per la UI e' il run_id + ordine d'arrivo,
-                    // e l'id tool e' propagato nel payload (correlazione tool_result).
-                    step_index: 0,
+                    step_index: Self::step_index_u32(idx),
                     tool_name: name,
                     tool_input: serde_json::json!({ "id": id, "input": input }),
                     tool_result: None,
@@ -143,14 +178,27 @@ impl EventSink for SseEventSinkAdapter {
                 content,
                 is_error,
             } => {
+                // Recupera indice + nome dallo step Running aperto dal ToolUse
+                // correlato cosi' il frontend aggiorna LO STESSO step (stesso
+                // step_index, stesso tool_name) invece di crearne uno nuovo.
+                // Se la correlazione manca (ToolResult orfano) apriamo comunque
+                // un indice nuovo con nome vuoto per non collidere con altri step.
+                let (idx, name) = self
+                    .tool_index
+                    .lock()
+                    .get(&tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        (
+                            self.next_step_index.fetch_add(1, Ordering::Relaxed),
+                            String::new(),
+                        )
+                    });
                 let mut e = self.base();
                 e.step = Some(AgentStep {
                     run_id: self.run_id.to_string(),
-                    step_index: 0,
-                    // Per il tool_result il nome non e' rilevante in UI (lo step
-                    // Running precedente porta gia' nome/input); riportiamo il
-                    // tool_call_id per la correlazione lato frontend.
-                    tool_name: String::new(),
+                    step_index: Self::step_index_u32(idx),
+                    tool_name: name,
                     tool_input: serde_json::json!({ "id": tool_call_id }),
                     tool_result: Some(match &content {
                         serde_json::Value::String(s) => s.clone(),
@@ -247,6 +295,66 @@ mod tests {
         assert_eq!(step.status, AgentStepStatus::Running);
         assert_eq!(step.tool_input["id"], json!("tu_1"));
         assert_eq!(step.tool_input["input"], json!({"path": "x"}));
+        // Primo step: indice 0 (fetch_add ritorna il valore pre-incremento).
+        assert_eq!(step.step_index, 0);
+    }
+
+    #[test]
+    fn tool_use_indici_monotoni_crescenti() {
+        // Regressione del bug del progresso live: step_index hardcoded a 0 ->
+        // il frontend (upsert per stepIndex) sovrascriveva ogni step. Ora ogni
+        // tool_use deve avere un indice distinto e crescente.
+        let (sink, mut rx, _) = setup();
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            sink.emit(SseEvent::ToolUse {
+                id: id.to_string(),
+                name: format!("tool_{i}"),
+                input: json!({}),
+            });
+            let step = rx.try_recv().expect("evento emesso").step.expect("step");
+            assert_eq!(step.step_index, i as u32, "indice atteso {i}");
+        }
+    }
+
+    #[test]
+    fn tool_result_riusa_indice_e_nome_del_tool_use() {
+        // Parita' col path Python: il tool_result aggiorna LO STESSO step del
+        // tool_use correlato (stesso step_index, stesso tool_name).
+        let (sink, mut rx, _) = setup();
+        sink.emit(SseEvent::ToolUse {
+            id: "tu_42".to_string(),
+            name: "edit_file".to_string(),
+            input: json!({"path": "y"}),
+        });
+        let use_step = rx.try_recv().expect("tool_use").step.expect("step");
+        assert_eq!(use_step.step_index, 0);
+        assert_eq!(use_step.status, AgentStepStatus::Running);
+
+        sink.emit(SseEvent::ToolResult {
+            tool_call_id: "tu_42".to_string(),
+            content: json!("done"),
+            is_error: false,
+        });
+        let res_step = rx.try_recv().expect("tool_result").step.expect("step");
+        // Stesso indice e stesso nome del tool_use: il frontend aggiorna lo step.
+        assert_eq!(res_step.step_index, use_step.step_index);
+        assert_eq!(res_step.tool_name, "edit_file");
+        assert_eq!(res_step.status, AgentStepStatus::Completed);
+        assert_eq!(res_step.tool_result.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn tool_result_orfano_usa_indice_nuovo_nome_vuoto() {
+        // Nessun tool_use correlato: indice nuovo (non collide) e nome vuoto.
+        let (sink, mut rx, _) = setup();
+        sink.emit(SseEvent::ToolResult {
+            tool_call_id: "ignoto".to_string(),
+            content: json!("x"),
+            is_error: false,
+        });
+        let step = rx.try_recv().expect("evento emesso").step.expect("step");
+        assert_eq!(step.step_index, 0);
+        assert_eq!(step.tool_name, "");
     }
 
     #[test]

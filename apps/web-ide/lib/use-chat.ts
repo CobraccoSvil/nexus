@@ -30,7 +30,7 @@ import {
   useProjectStore,
 } from "./project-dispatcher";
 import { UUID_RE, type BusyAction, type MetaStepEntry } from "./use-chat/types";
-import { upsertSyntheticAssistantMessage, isStatusTerminal } from "./use-chat/helpers";
+import { upsertSyntheticAssistantMessage, isStatusTerminal, mergeIncomingStep } from "./use-chat/helpers";
 import { createTerminalMessage } from "./use-chat/run-summary";
 import { formatChatError } from "./use-chat/errors";
 
@@ -333,24 +333,17 @@ export function useChat(
         runId,
         (event) => {
           if (!event.step) return; // eventi trace non hanno step
+          // Difesa FIX 4: piu' step possono arrivare con lo stesso stepIndex
+          // (es. indice 0 ripetuto). mergeIncomingStep (punto unico, regola L)
+          // non collassa step distinti: correla per toolId quando presente,
+          // altrimenti per stepIndex senza sovrascrivere uno step gia' terminato
+          // con uno nuovo `running`.
           setAgentStepsMap((prev) => {
             const current = prev.get(runId) ?? [];
-            const existing = current.findIndex((s) => s.stepIndex === event.step!.stepIndex);
-            const next = existing >= 0
-              ? current.map((s, i) => (i === existing ? event.step! : s))
-              : [...current, event.step!];
-            return new Map(prev).set(runId, next);
+            return new Map(prev).set(runId, mergeIncomingStep(current, event.step!));
           });
           if (isPrimary) {
-            setAgentSteps((prev) => {
-              const existing = prev.findIndex((s) => s.stepIndex === event.step!.stepIndex);
-              if (existing >= 0) {
-                const next = [...prev];
-                next[existing] = event.step!;
-                return next;
-              }
-              return [...prev, event.step!];
-            });
+            setAgentSteps((prev) => mergeIncomingStep(prev, event.step!));
           }
           // Tool `nexus_open_file_in_editor`: il backend ritorna un JSON con
           // `_ui_action: "open_file"` + path. Intercettiamo qui per dispatchare
@@ -1035,15 +1028,9 @@ export function useChat(
             runId,
             (event) => {
               if (!event.step) return; // eventi trace non hanno step
-              setAgentSteps((prev) => {
-                const existing = prev.findIndex((s) => s.stepIndex === event.step!.stepIndex);
-                if (existing >= 0) {
-                  const next = [...prev];
-                  next[existing] = event.step!;
-                  return next;
-                }
-                return [...prev, event.step!];
-              });
+              // Difesa FIX 4 (punto unico, regola L): stessa logica del path
+              // di subscribe primario, niente collasso di step con indice ripetuto.
+              setAgentSteps((prev) => mergeIncomingStep(prev, event.step!));
             },
             async () => {
               try {

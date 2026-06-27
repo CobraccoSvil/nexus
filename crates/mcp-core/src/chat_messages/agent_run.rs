@@ -2777,21 +2777,20 @@ pub(crate) async fn spawn_agent_run(
             // Espressione finale del blocco 'compute (path Python): `result`.
             result
             }; // chiude il blocco 'compute (result = nativo | loop Python)
-            // Emetti is_final solo DOPO la fine del run (loop Python o primario
-            // nativo): e' il terminatore unico dello stream (il `Done`/is_final del
-            // grafo nativo non e' emesso dai nodi, lo emette QUI il finalizzatore,
-            // 1:1 con la chiusura del path Python). Cosi' il frontend non chiude lo
-            // stream SSE dopo il primo tentativo fallito perdendo i fallback.
-            let _ = tx_for_brain.send(AgentStepEvent {
-                run_id: run_id.to_string(),
-                step: None,
-                trace: None,
-                is_final: true,
-                token_delta: None,
-                thinking_delta: None,
-                meta_step: None,
-            });
-            channels_clone.remove(&run_id);
+            // NOTA (FIX ordine is_final): l'emissione di `is_final=true` + la
+            // rimozione del canale broadcast NON avviene piu' qui. Erano emessi
+            // PRIMA dell'INSERT chat_messages e dell'UPDATE agent_runs, creando una
+            // race: il frontend, ricevuto `is_final`, rileggeva il record dal DB
+            // (retry) prima che fosse persistito e poteva forzare status=failed.
+            // Ora il terminatore unico dello stream e' emesso DOPO le scritture DB
+            // (vedi sotto, dopo l'UPDATE agent_runs), cosi' quando il frontend
+            // riceve `is_final` il record (chat_messages + agent_runs) e' gia'
+            // persistito. Vale per ENTRAMBI i path (loop Python e primario nativo):
+            // questo blocco e' condiviso a valle del blocco 'compute. Il `Done`/
+            // is_final del grafo nativo non e' emesso dai nodi: il terminatore e'
+            // unico ed e' del finalizzatore (1:1 con la chiusura del path Python),
+            // cosi' il frontend non chiude lo stream SSE dopo il primo tentativo
+            // fallito perdendo i fallback.
 
             // Se il gateway ha re-instradato su provider locale per privacy
             // (il provider finale differ da quello richiesto ed è "vllm" o altro locale),
@@ -3083,6 +3082,25 @@ pub(crate) async fn spawn_agent_run(
             .bind(&result.model)
             .execute(&db_clone)
             .await;
+
+            // ── Terminatore unico dello stream (FIX ordine is_final) ───────────
+            // Emesso DOPO l'INSERT chat_messages e l'UPDATE agent_runs: quando il
+            // frontend riceve `is_final` e rilegge il run dal DB, il record e' gia'
+            // persistito (status canonico + final_answer), eliminando la race che
+            // poteva forzare status=failed sul retry DB del client. Vale per
+            // entrambi i path (loop Python e primario nativo): il blocco e'
+            // condiviso. `is_final` e' idempotente lato UI. La rimozione del canale
+            // segue subito dopo: nessun ulteriore evento va piu' emesso da qui.
+            let _ = tx_for_brain.send(AgentStepEvent {
+                run_id: run_id.to_string(),
+                step: None,
+                trace: None,
+                is_final: true,
+                token_delta: None,
+                thinking_delta: None,
+                meta_step: None,
+            });
+            channels_clone.remove(&run_id);
 
             // ── Monitor finale del run (regola H, indipendente dall'LLM) ───────
             // Porta la card `agent_run` allo stato terminale. Non cancelliamo i

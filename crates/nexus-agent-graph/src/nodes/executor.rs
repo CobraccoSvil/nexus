@@ -1560,6 +1560,21 @@ modo piu' specifico."
             turn_prompt_tokens + turn_completion_tokens + turn_cache_creation + turn_cache_read;
         let turn_total_cost = usage.total_cost_usd;
 
+        // ── Emissione Usage live (barra contesto / TokenUsageBar) ─────────────
+        // Il grafo nativo non emetteva mai SseEvent::Usage, quindi la barra
+        // contesto restava invisibile durante il run nativo (a differenza del
+        // path Python che la aggiorna a ogni turno). Emettiamo qui, subito dopo
+        // aver letto i token del turno dalla risposta del gateway. I valori sono
+        // del TURNO (reducer overwrite last-write, come lo stato: la cumulazione
+        // e' del finalize/ledger, non del grafo) -> parita' 1:1 col Python che
+        // emette per-turno. Su turno error l'usage e' zero (gateway_errored) e
+        // l'emissione e' un no-op informativo (best-effort, l'emit e' infallibile).
+        ctx.emit.emit(SseEvent::Usage {
+            prompt_tokens: turn_prompt_tokens,
+            completion_tokens: turn_completion_tokens,
+            total_tokens: turn_total_tokens,
+        });
+
         // Coda aggiornata cap 12: con loop chiuso new_signatures e' [] -> recent only.
         let updated_signatures = detect_signature_loop(&recent, &new_signatures).updated_signatures;
 

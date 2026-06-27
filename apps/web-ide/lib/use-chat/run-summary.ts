@@ -127,6 +127,20 @@ export function buildSemanticDetail(run: AgentRunInfo): string {
   return `\n\n**Riepilogo:**\n${lines.join("\n")}`;
 }
 
+/**
+ * Indica se la finalAnswer e' un epitaffio insignificante (placeholder di
+ * supersede/annullamento) anziche' una risposta reale del modello. Strutturale,
+ * non lessicale sul contenuto utile: confronta solo coi placeholder noti.
+ */
+function isEmptyOrEpitaph(finalAnswer?: string): boolean {
+  const fa = (finalAnswer ?? "").trim();
+  return (
+    fa.length === 0 ||
+    fa === "Superato da un nuovo run." ||
+    fa === "Operazione annullata."
+  );
+}
+
 export function createTerminalMessage(
   run: AgentRunInfo,
   pid: string,
@@ -147,25 +161,45 @@ export function createTerminalMessage(
     baseContent = statusSummary + semanticDetail;
   }
 
-  // Run CANCELLATO (es. superato da un nuovo messaggio, last-wins): il suo esito
-  // viene pubblicato DOPO il messaggio utente successivo, quindi senza
+  // Run CANCELLATO/SUPERATO (es. superato da un nuovo messaggio, last-wins): il
+  // suo esito viene pubblicato DOPO il messaggio utente successivo, quindi senza
   // un'intestazione esplicita sembra la risposta alla NUOVA domanda (incidente
-  // reale: l'epitaffio del run formatters letto come risposta all'error-fix).
+  // reale: l'epitaffio del run letto come risposta all'error-fix).
   // Etichetta basata sul FATTO strutturale run.status — mai sul testo.
   if (run.status === "cancelled") {
-    const fa = (run.finalAnswer ?? "").trim();
-    const hasRealAnswer =
-      fa.length > 0 && fa !== "Superato da un nuovo run." && fa !== "Operazione annullata.";
-    if (!hasRealAnswer) {
-      // Run superato/annullato SENZA una risposta vera: l'unico contenuto sarebbe
-      // l'epitaffio ("Superato da un nuovo run") o lo status grezzo — ambiguo e
-      // senza valore per l'utente. Non creare alcun messaggio in chat: il lavoro
-      // svolto resta comunque negli step del run e nel worklog di sessione.
-      return null;
+    if (isEmptyOrEpitaph(run.finalAnswer) && !(lastStreamingText?.trim())) {
+      // Run superato/annullato SENZA una risposta vera ne' testo streaming:
+      // NON ritornare null (la bolla sparirebbe e l'utente non vedrebbe l'esito,
+      // incidente reale tipico col provider primario in cooldown). Costruisci
+      // comunque un messaggio terminale minimo e informativo, distinguendo il
+      // supersede (placeholder "Superato da un nuovo run.") dall'annullamento
+      // manuale, sempre basandosi sul FATTO strutturale.
+      const fa = (run.finalAnswer ?? "").trim();
+      const minimal =
+        fa === "Superato da un nuovo run."
+          ? "Operazione interrotta (superata da una nuova richiesta)."
+          : "Operazione annullata.";
+      // Se nel frattempo il run ha comunque prodotto azioni, accodiamo il
+      // riepilogo semantico cosi' l'utente vede cosa e' stato fatto prima dello stop.
+      baseContent = `> **Attività precedente interrotta** — è il riepilogo di un lavoro che era in corso e si è interrotto perché nel frattempo è partito un nuovo turno (un tuo nuovo messaggio o un comando in background concluso). **Non è la risposta al tuo ultimo messaggio**.\n\n${minimal}${semanticDetail}`;
+    } else {
+      // C'e' una risposta reale (il run aveva gia' prodotto un esito prima del
+      // supersede): la mostriamo, ma con un'intestazione che chiarisce il contesto.
+      baseContent = `> **Attività precedente interrotta** — è il riepilogo di un lavoro che era già in corso e si è interrotto perché nel frattempo è partito un nuovo turno (un tuo nuovo messaggio o un comando in background concluso). **Non è la risposta al tuo ultimo messaggio**: se è rimasto incompleto, richiedilo di nuovo.\n\n${baseContent}`;
     }
-    // C'e' una risposta reale (il run aveva gia' prodotto un esito prima del
-    // supersede): la mostriamo, ma con un'intestazione che chiarisce il contesto.
-    baseContent = `> **Attività precedente interrotta** — è il riepilogo di un lavoro che era già in corso e si è interrotto perché nel frattempo è partito un nuovo turno (un tuo nuovo messaggio o un comando in background concluso). **Non è la risposta al tuo ultimo messaggio**: se è rimasto incompleto, richiedilo di nuovo.\n\n${baseContent}`;
+  }
+
+  // Difesa finale: per QUALUNQUE run terminato non lasciare mai un contenuto
+  // vuoto/insignificante (es. provider AI in cooldown/credito esaurito che
+  // chiude senza testo, reasoner che termina senza output). Senza questo,
+  // baseContent potrebbe ridursi a una stringa vuota e la bolla sparirebbe.
+  // Ricade sul riepilogo di stato (sempre non vuoto), con nota provider se nota.
+  if (!baseContent.trim()) {
+    const providerHint =
+      run.status === "provider_unavailable"
+        ? "Elaborazione interrotta: provider AI non disponibile (cooldown/credito)."
+        : statusSummary;
+    baseContent = providerHint + semanticDetail;
   }
 
   // Prependi l'avviso privacy se il provider non e' EU/locale
