@@ -191,6 +191,11 @@ pub struct LlmResponse {
     /// normalizzato: `end_turn`/`tool_use`/`max_tokens`/...). `None` se non
     /// riportato. Segnale per la chiusura turno (vedi `routing::signals`).
     pub stop_reason: Option<String>,
+    /// Ragionamento/pensiero intermedio aggregato dal gateway (reasoning_content
+    /// OpenAI-compat, thoughts Gemini, thinking Anthropic). `None` se il provider
+    /// non lo riporta. L'executor lo emette come `SseEvent::ThinkingDelta` per
+    /// mostrare il pensiero del modello in chat (visibilita' pre-porting).
+    pub reasoning: Option<String>,
 }
 
 /// Astrazione del gateway LLM. mcp-core la implementera' delegando a

@@ -283,6 +283,9 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
         model_used: Some(resp.model_used),
         assistant_content,
         stop_reason: Some(normalize_gw_finish_reason(&resp.finish_reason)),
+        // Pensiero aggregato dal gateway (prima SCARTATO -> ThinkingBlock vuoto):
+        // GwResponse.reasoning esiste, qui smettiamo solo di buttarlo (regola L).
+        reasoning: resp.reasoning,
     }
 }
 
@@ -470,6 +473,7 @@ fn replay_response_for_group(group: &[ReplayStep], req: &LlmRequest) -> LlmRespo
         },
         assistant_content,
         stop_reason: Some("tool_use".to_string()),
+        reasoning: None,
     }
 }
 

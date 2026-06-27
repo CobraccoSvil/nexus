@@ -100,6 +100,39 @@ pub fn has_productive_action_in_history(messages: &[Message]) -> bool {
         .any(|name| !EXPLORATION_ONLY_TOOLS.contains(&name))
 }
 
+/// Riepilogo conciso dei tool eseguiti nella history, per nome con conteggio:
+/// es. "5 azioni (write_file x3, run_command x2)". `None` se nessun tool_use.
+/// Punto unico (regola L) del riepilogo-lavoro: l'executor lo allega al messaggio
+/// quando il turno si interrompe (es. provider in cooldown), cosi' l'utente vede
+/// COSA e' stato fatto e non solo l'errore. Ordine = prima apparizione.
+pub fn summarize_actions_in_history(messages: &[Message]) -> Option<String> {
+    let names = ai_tool_use_names(messages);
+    if names.is_empty() {
+        return None;
+    }
+    let total = names.len();
+    let mut order: Vec<&str> = Vec::new();
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for n in &names {
+        if !counts.contains_key(n) {
+            order.push(n);
+        }
+        *counts.entry(n).or_insert(0) += 1;
+    }
+    let parts: Vec<String> = order
+        .iter()
+        .map(|n| {
+            let c = counts[n];
+            if c > 1 {
+                format!("{n} x{c}")
+            } else {
+                (*n).to_string()
+            }
+        })
+        .collect();
+    Some(format!("{total} azioni ({})", parts.join(", ")))
+}
+
 /// True se il run ha eseguito almeno un tool che MUTA filesystem/progetto.
 /// Vedi `has_filesystem_mutation_in_history`. La lista mutators arriva dalla
 /// config (setting `agent.tools.result_cache_mutators`, mig 0394).
@@ -1066,6 +1099,22 @@ mod tests {
                 input: json!({}),
             }],
         }
+    }
+
+    #[test]
+    fn summarize_azioni_conteggio_e_ordine() {
+        // Conteggio per nome, ordine di prima apparizione, formato "N azioni (...)".
+        let msgs = vec![
+            ai_with_tool("write_file"),
+            ai_with_tool("run_command"),
+            ai_with_tool("write_file"),
+        ];
+        assert_eq!(
+            summarize_actions_in_history(&msgs).as_deref(),
+            Some("3 azioni (write_file x2, run_command)")
+        );
+        // Nessun tool_use -> None (turno senza azioni).
+        assert_eq!(summarize_actions_in_history(&[]), None);
     }
 
     fn ai_with_block_tool(name: &str) -> Message {

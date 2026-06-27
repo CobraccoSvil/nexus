@@ -290,6 +290,21 @@ function renderPayload(
       </div>
     );
   }
+  if (kind === "executor_call") {
+    // Heartbeat di interrogazione modello: metadati leggibili (provider/model sono
+    // gia' nel badge a destra), NON il JSON grezzo. Il PENSIERO del modello arriva
+    // nel ThinkingBlock via SseEvent::ThinkingDelta (emesso dall'executor).
+    const intent = payload.intent as string | undefined;
+    const iteration = payload.iteration as number | undefined;
+    const toolsCount = payload.tools_count as number | undefined;
+    return (
+      <div style={grid}>
+        {intent && <DefRow k="Intent" v={intent} tc={tc} />}
+        {typeof iteration === "number" && <DefRow k="Iterazione" v={`#${iteration}`} tc={tc} />}
+        {typeof toolsCount === "number" && <DefRow k="Tool disponibili" v={String(toolsCount)} tc={tc} />}
+      </div>
+    );
+  }
   // fallback: JSON grezzo.
   return (
     <pre style={{ fontSize: 10, overflowX: "auto", opacity: 0.8, margin: 0 }}>

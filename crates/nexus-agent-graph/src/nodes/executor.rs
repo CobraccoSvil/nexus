@@ -1435,7 +1435,15 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                     "agent_turn fallita"
                 );
                 gateway_errored = true;
-                let err_text = format!("[Errore provider {provider}: {err}]");
+                // Riepilogo del lavoro svolto PRIMA dell'interruzione: anche se il
+                // provider e' caduto (es. cooldown), l'utente deve sapere cosa e'
+                // stato fatto, non solo l'errore. Punto unico summarize_actions_in_history.
+                let err_text = match crate::routing::signals::summarize_actions_in_history(&messages) {
+                    Some(w) => format!(
+                        "[Errore provider {provider}: {err}]\n\nInterrotto dopo {iters_in} iterazioni. Lavoro svolto finora: {w}."
+                    ),
+                    None => format!("[Errore provider {provider}: {err}]"),
+                };
                 // provider_used/model_used None: nessuna cascade -> eff = richiesto
                 // (cascade_did_fallback=false -> sticky invariato, == Python).
                 crate::runtime::ports::LlmResponse {
@@ -1474,6 +1482,19 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             };
             if let Ok(r) = ctx.llm.complete(retry).await {
                 resp = r;
+            }
+        }
+
+        // Pensiero intermedio del modello (reasoning aggregato dal gateway): emesso
+        // come ThinkingDelta cosi' il ThinkingBlock della chat mostra il ragionamento
+        // di OGNI interrogazione (ripristino visibilita' pre-porting). Solo su risposta
+        // valida (non sull'errore sintetico). Riusa il canale gia' tradotto da event_sink.
+        if !gateway_errored {
+            if let Some(r) = resp.reasoning.as_deref() {
+                let r = r.trim();
+                if !r.is_empty() {
+                    ctx.emit.emit(SseEvent::ThinkingDelta { delta: r.to_string() });
+                }
             }
         }
 
