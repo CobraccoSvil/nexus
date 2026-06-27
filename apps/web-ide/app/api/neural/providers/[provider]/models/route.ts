@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 
-const BRAIN_URL = process.env.BRAIN_URL || "http://localhost:8001";
+// Il brain Python e' stato eliminato: gli endpoint neural sono ri-esposti in
+// mcp-core (porta 4000) sotto /api/neural/*. Stessa convenzione BACKEND_URL del
+// fallback /api/:path* (next.config.ts) — niente env var dedicata al brain.
+const CORE_URL = process.env.BACKEND_URL || "http://localhost:4000";
 
 export async function GET(
   request: Request,
@@ -9,7 +12,7 @@ export async function GET(
   const { provider } = await params;
 
   try {
-    const response = await fetch(`${BRAIN_URL}/providers/${provider}/models`, {
+    const response = await fetch(`${CORE_URL}/api/neural/providers/${provider}/models`, {
       method: "GET",
       headers: { "Content-Type": "application/json" },
     });

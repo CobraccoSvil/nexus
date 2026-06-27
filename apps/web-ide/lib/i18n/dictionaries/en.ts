@@ -112,7 +112,7 @@ export const en = {
 
     // Tooltips
     "tip.mcpCore": "Rust backend (Axum) — manages API, auth, settings and orchestration",
-    "tip.neuralCore": "Python backend (FastAPI + gRPC) — AI routing, embeddings, intent classification",
+    "tip.neuralCore": "AI endpoints in mcp-core (Rust) — AI routing, intent classification, provider health (under /api/neural)",
     "tip.database": "PostgreSQL — persistent storage for users, sessions, settings and runs",
     "tip.redis": "In-memory cache — sessions, job queues and AI response caching",
     "tip.openai": "GPT-4o, GPT-4o-mini — code generation and completions",
@@ -121,7 +121,7 @@ export const en = {
     "tip.runs": "Total number of recorded AI executions",
     "tip.db.header": "PostgreSQL — persistent storage for users, sessions, settings and runs",
     "tip.redis.header": "Redis — in-memory cache, sessions and job queues",
-    "tip.neural.header": "Neural Core — AI routing, embeddings, intent classification (Python/FastAPI)",
+    "tip.neural.header": "Neural Core — AI routing and intent classification served by mcp-core (Rust)",
     "tip.sidebar.explorer": "Explorer — browse project files and folders",
     "tip.sidebar.search": "Search — find text across the codebase",
     "tip.sidebar.sourceControl": "Source Control — view git changes and history",

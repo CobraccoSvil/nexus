@@ -16,9 +16,9 @@ export const runtime = "nodejs";
 const execAsync = promisify(exec);
 
 // Allowlist di sicurezza: solo i servizi Nexus possono essere controllati.
+// Il brain Python (nexus-neural-wsl) e' stato eliminato: rimosso dall'allowlist.
 const ALLOWED_SERVICES = new Set([
   "nexus-core-wsl",
-  "nexus-neural-wsl",
   "nexus-gateway",
   "nexus-chat-wsl",
   "nexus-plugin-wsl",

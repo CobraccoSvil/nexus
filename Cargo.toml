@@ -90,6 +90,10 @@ nexus-http = { path = "crates/nexus-http" }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 notify = { version = "6", features = ["serde"] }
+# PTY cross-platform per il WebSocket del terminale IDE (mcp-core). Apre una
+# shell reale (openpty) con resize/cwd/env; API SINCRONA, usata da un thread
+# dedicato che ponta i bytes su un canale tokio (vedi project_workspace/terminal_ws.rs).
+portable-pty = "0.9"
 # Proc-macro per il derive del reducer di stato del grafo (nexus-graph-derive).
 syn = { version = "2", features = ["full"] }
 quote = "1"

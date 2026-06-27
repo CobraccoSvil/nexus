@@ -7,7 +7,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let protos = [
-        "../../proto/neural_core.proto",
         "../../proto/mcp_service.proto",
         "../../proto/tool_runner.proto",
         "../../proto/agent_router.proto",

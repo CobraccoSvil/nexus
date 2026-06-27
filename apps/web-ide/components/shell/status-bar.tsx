@@ -8,9 +8,11 @@ import { FooterToastCenter } from "./footer-toast-center";
 type LiveHealth = {
   database: boolean;
   redis: boolean;
+  // neural_core: stato di mcp-core (porta 4000). Dopo l'eliminazione del brain
+  // Python gli agent run e gli endpoint AI (/api/neural) girano qui: questo LED
+  // rappresenta il Core. Il vecchio LED "Brain" + campo brain_rest sono rimossi.
   neural_core: boolean;
   tools_grpc?: boolean;
-  brain_rest?: boolean;
 };
 
 export function StatusBar({
@@ -65,16 +67,12 @@ export function StatusBar({
           Redis
         </span>
         <span title={
-          liveHealth.neural_core && liveHealth.brain_rest
-            ? "Brain (Python LangGraph) online — gRPC + REST ok"
-            : !liveHealth.neural_core && !liveHealth.brain_rest
-              ? "Brain offline — gRPC e REST irraggiungibili"
-              : !liveHealth.brain_rest
-                ? "Brain REST (:8001) offline — gli agent run non funzioneranno"
-                : "Brain gRPC (:50051) offline — la chat potrebbe non rispondere"
+          liveHealth.neural_core
+            ? "Core (mcp-core :4000) online — orchestratore, agent run ed endpoint AI (/api/neural) attivi"
+            : "Core (mcp-core :4000) offline — chat e agent run non funzioneranno"
         } style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-          <StatusDot ok={liveHealth.neural_core && !!liveHealth.brain_rest} />
-          Brain
+          <StatusDot ok={liveHealth.neural_core} />
+          Core
         </span>
         <span title={liveHealth.tools_grpc ? "MCP Tools (gRPC :50071) online" : "MCP Tools offline — l'AI non potrà eseguire tool (read_file, str_replace, ecc.)"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
           <StatusDot ok={!!liveHealth.tools_grpc} />

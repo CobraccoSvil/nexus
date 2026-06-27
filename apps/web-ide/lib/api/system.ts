@@ -6,12 +6,13 @@ export interface HealthResponse {
   status: string;
   components: {
     database: boolean;
+    /** Redis cache/broker */
     redis: boolean;
+    /** mcp-core (porta 4000): orchestratore + endpoint AI (/api/neural) + agent run.
+     *  Dopo l'eliminazione del brain Python questo e' l'unico LED del Core. */
     neural_core: boolean;
     /** gRPC ToolRunner :50071 — se false, l'AI non puo' eseguire tool MCP */
     tools_grpc?: boolean;
-    /** Brain REST :8001 — se false, gli agent run non funzioneranno */
-    brain_rest?: boolean;
   };
 }
 
@@ -63,7 +64,7 @@ export interface NexusServiceInfo {
   label: string;
   port: number;
   description: string;
-  /** LED della statusbar controllato da questo servizio (es. "Tools", "Brain", "OpenAI · Anthropic · …"). */
+  /** LED della statusbar controllato da questo servizio (es. "Tools", "Core", "OpenAI · Anthropic · …"). */
   led?: string;
   /** Servizio system (postgres, redis): mostrabile ma non controllabile senza root. */
   readonly?: boolean;

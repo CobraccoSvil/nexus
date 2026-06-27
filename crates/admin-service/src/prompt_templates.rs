@@ -14,6 +14,68 @@ use std::collections::HashSet;
 
 use crate::AppState;
 
+/// Token di servizio per autenticarsi al Nexus Gateway. Segreto (non porta/modello,
+/// quindi ammesso in env come negli altri call site del gateway, es.
+/// `NexusGatewayClient::from_db` in mcp-core). Fallback al token dev interno.
+fn gateway_service_token() -> String {
+    std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
+        .unwrap_or_else(|_| "dev-internal-token".to_string())
+}
+
+/// Esegue una completion testuale via Nexus Gateway (`POST /v1/complete`).
+///
+/// PUNTO UNICO (regola L) della chiamata al gateway per gli handler admin: prima
+/// le tre call site facevano POST diretti a `{brain_url}/generate` (brain Python
+/// eliminato). Risolve l'URL del gateway dal DB (`settings.nexus_gateway_port`,
+/// regola G: niente porta hardcoded) e instrada `{provider, model, prompt}` come
+/// richiesta `LlmRequest` del gateway: il `provider` diventa `pin_provider` per
+/// eseguire ESATTAMENTE il provider+modello gia' risolto a monte (niente secondo
+/// routing divergente, regola G). Ritorna il testo generato (`LlmResponse.content`).
+async fn gateway_generate(
+    db: &PgPool,
+    client: &nexus_http::NexusClient,
+    provider: &str,
+    model: &str,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
+    let gw_url = format!("http://127.0.0.1:{gw_port}");
+    let token = gateway_service_token();
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "pin_provider": provider,
+        "metadata": {
+            "tenant_id": "nexus",
+            "user_id": "admin-service",
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "feature": "admin",
+        },
+    });
+
+    let resp = client
+        .post(&format!("{gw_url}/v1/complete"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Nexus Gateway {status}: {text}");
+    }
+
+    let result: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("Nexus Gateway response parse: {e}"))?;
+
+    Ok(result["content"].as_str().unwrap_or("").to_string())
+}
+
 // TemplateCache e get_template_or_default: punto unico in nexus-types
 // (regola L / ADR 0026). Qui solo re-export, usato da main.rs come
 // `admin_service::prompt_templates::TemplateCache`.
@@ -477,31 +539,13 @@ Rispondi SOLO con il nuovo testo del prompt, senza preamboli."#,
         instruction = req.instruction.trim(),
     );
 
-    // Call brain service for LLM completion
-    let brain_url = std::env::var("NEURAL_CORE_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    // Completion LLM via Nexus Gateway (brain Python eliminato): punto unico
+    // gateway_generate, URL risolto dal DB (regola G).
+    let client = nexus_http::NexusClient::with_timeout(60);
 
-    let client = nexus_http::NexusClient::with_timeout(60).inner().clone();
-
-    let response = client
-        .post(format!("{brain_url}/generate"))
-        .json(&serde_json::json!({
-            "provider": provider,
-            "model": model,
-            "prompt": meta_prompt,
-        }))
-        .send()
+    let suggestion = gateway_generate(&state.db, &client, provider, model, &meta_prompt)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-
-    let suggestion = result["content"]
-        .as_str()
-        .unwrap_or("")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
         .trim()
         .trim_matches('"')
         .to_string();
@@ -543,25 +587,12 @@ Rispondi con SOLO un array JSON valido, senza commenti, senza markdown:
         tools_list = tools_list,
     );
 
-    if let Ok(tools_resp) = client
-        .post(format!("{}/generate", brain_url))
-        .json(&serde_json::json!({
-            "provider": provider,
-            "model": model,
-            "prompt": tools_prompt,
-        }))
-        .send()
-        .await
-    {
-        if let Ok(tools_result) = tools_resp.json::<serde_json::Value>().await {
-            if let Some(tools_text) = tools_result["content"].as_str() {
-                // Estrai array JSON dalla risposta (puo avere testo prima/dopo)
-                let cleaned = extract_json_array(tools_text);
-                if let Ok(tools) = serde_json::from_str::<Vec<SuggestedTool>>(&cleaned) {
-                    if !tools.is_empty() {
-                        suggested_tools = Some(tools);
-                    }
-                }
+    if let Ok(tools_text) = gateway_generate(&state.db, &client, provider, model, &tools_prompt).await {
+        // Estrai array JSON dalla risposta (puo avere testo prima/dopo)
+        let cleaned = extract_json_array(&tools_text);
+        if let Ok(tools) = serde_json::from_str::<Vec<SuggestedTool>>(&cleaned) {
+            if !tools.is_empty() {
+                suggested_tools = Some(tools);
             }
         }
     }
@@ -806,9 +837,9 @@ async fn run_batch_assign_tools_job(
     }
     .map_err(|e| e.to_string())?;
 
-    let brain_url =
-        std::env::var("NEURAL_CORE_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    let client = nexus_http::NexusClient::with_timeout(30).inner().clone();
+    // Completion LLM via Nexus Gateway (brain Python eliminato): punto unico
+    // gateway_generate, URL risolto dal DB (regola G).
+    let client = nexus_http::NexusClient::with_timeout(30);
 
     // Lista compatta token-saver (stesso formato di mcp-core): `server::tool` senza descrizioni lunghe.
     let mut tool_lines: Vec<String> = Vec::new();
@@ -879,86 +910,72 @@ Rispondi con SOLO un array JSON valido, nessun testo aggiuntivo:
 [{{"tool_name":"read_file","tool_server":"nexus_builtin"}},{{"tool_name":"browser.navigate","tool_server":"Nexus Browser Bridge (localci)","usage_context":"navigazione E2E"}}]"#,
         );
 
-        match client
-            .post(format!("{brain_url}/generate"))
-            .json(&serde_json::json!({
-                "provider": admin_provider,
-                "model": admin_model,
-                "prompt": prompt,
-            }))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if let Ok(result) = resp.json::<serde_json::Value>().await {
-                    let content_str = result["content"].as_str().unwrap_or("[]");
-                    let json_str = extract_json_array(content_str);
-                    match serde_json::from_str::<serde_json::Value>(&json_str) {
-                        Ok(tools_val) if tools_val.is_array() => {
-                            let Some(tools_arr) = tools_val.as_array() else { continue };
-                            let mut normalized: Vec<serde_json::Value> = Vec::new();
+        match gateway_generate(&state.db, &client, &admin_provider, &admin_model, &prompt).await {
+            Ok(content_text) => {
+                let content_str = if content_text.is_empty() { "[]" } else { content_text.as_str() };
+                let json_str = extract_json_array(content_str);
+                match serde_json::from_str::<serde_json::Value>(&json_str) {
+                    Ok(tools_val) if tools_val.is_array() => {
+                        let Some(tools_arr) = tools_val.as_array() else { continue };
+                        let mut normalized: Vec<serde_json::Value> = Vec::new();
 
-                            for (idx, item) in tools_arr.iter().enumerate() {
-                                let Some(obj) = item.as_object() else { continue };
-                                let tool_name = obj.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").trim();
-                                let tool_server = obj.get("tool_server").and_then(|v| v.as_str()).unwrap_or("").trim();
-                                if tool_name.is_empty() || tool_server.is_empty() {
-                                    continue;
-                                }
-                                let usage_context = obj
-                                    .get("usage_context")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty());
+                        for (idx, item) in tools_arr.iter().enumerate() {
+                            let Some(obj) = item.as_object() else { continue };
+                            let tool_name = obj.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").trim();
+                            let tool_server = obj.get("tool_server").and_then(|v| v.as_str()).unwrap_or("").trim();
+                            if tool_name.is_empty() || tool_server.is_empty() {
+                                continue;
+                            }
+                            let usage_context = obj
+                                .get("usage_context")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty());
 
-                                // Cap logic: allow beyond BASE_MAX only with usage_context
-                                if idx < BASE_MAX {
+                            // Cap logic: allow beyond BASE_MAX only with usage_context
+                            if idx < BASE_MAX {
+                                normalized.push(serde_json::json!({
+                                    "tool_name": tool_name,
+                                    "tool_server": tool_server,
+                                }));
+                            } else if normalized.len() < HARD_MAX {
+                                if let Some(uc) = usage_context {
                                     normalized.push(serde_json::json!({
                                         "tool_name": tool_name,
                                         "tool_server": tool_server,
+                                        "usage_context": uc,
                                     }));
-                                } else if normalized.len() < HARD_MAX {
-                                    if let Some(uc) = usage_context {
-                                        normalized.push(serde_json::json!({
-                                            "tool_name": tool_name,
-                                            "tool_server": tool_server,
-                                            "usage_context": uc,
-                                        }));
-                                    }
                                 }
                             }
-
-                            apply_meta_builtin_tools_substitution(
-                                catalog_mcp_tools_count,
-                                &tool_by_pair,
-                                &mut normalized,
-                            );
-
-                            let count = normalized.len();
-                            if count > 0 {
-                                let tools_val = serde_json::Value::Array(normalized);
-                                let _ = sqlx::query(
-                                    "UPDATE nexus_prompt_templates SET mcp_tools_json = $1, updated_at = NOW() WHERE key = $2",
-                                )
-                                .bind(&tools_val)
-                                .bind(key)
-                                .execute(&state.db)
-                                .await;
-                                assigned += 1;
-                                results.push(serde_json::json!({"key": key, "tools_count": count, "status": "ok"}));
-                            } else {
-                                skipped += 1;
-                                results.push(serde_json::json!({"key": key, "status": "empty_response"}));
-                            }
                         }
-                        _ => {
-                            errors += 1;
-                            results.push(serde_json::json!({"key": key, "status": "parse_error", "raw": &json_str[..json_str.len().min(120)]}));
+
+                        apply_meta_builtin_tools_substitution(
+                            catalog_mcp_tools_count,
+                            &tool_by_pair,
+                            &mut normalized,
+                        );
+
+                        let count = normalized.len();
+                        if count > 0 {
+                            let tools_val = serde_json::Value::Array(normalized);
+                            let _ = sqlx::query(
+                                "UPDATE nexus_prompt_templates SET mcp_tools_json = $1, updated_at = NOW() WHERE key = $2",
+                            )
+                            .bind(&tools_val)
+                            .bind(key)
+                            .execute(&state.db)
+                            .await;
+                            assigned += 1;
+                            results.push(serde_json::json!({"key": key, "tools_count": count, "status": "ok"}));
+                        } else {
+                            skipped += 1;
+                            results.push(serde_json::json!({"key": key, "status": "empty_response"}));
                         }
                     }
-                } else {
-                    errors += 1;
-                    results.push(serde_json::json!({"key": key, "status": "json_error"}));
+                    _ => {
+                        errors += 1;
+                        results.push(serde_json::json!({"key": key, "status": "parse_error", "raw": &json_str[..json_str.len().min(120)]}));
+                    }
                 }
             }
             Err(e) => {

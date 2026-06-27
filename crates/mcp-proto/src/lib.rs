@@ -1,7 +1,3 @@
-pub mod neural {
-    tonic::include_proto!("ai_orchestrator.neural");
-}
-
 pub mod mcp {
     tonic::include_proto!("ai_orchestrator.mcp");
 }

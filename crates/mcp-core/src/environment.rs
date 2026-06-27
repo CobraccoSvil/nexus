@@ -933,17 +933,6 @@ pub async fn gateway_reload_handler(
     {
         Ok(r) if r.status().is_success() => {
             let body: serde_json::Value = r.json().await.unwrap_or(json!({"reloaded": true}));
-            // Reload Brain settings too (disables/enables providers based on DB flags)
-            let neural_url = std::env::var("BRAIN_REST_URL")
-                .unwrap_or_else(|_| "http://localhost:8001".to_string());
-            let _ = client
-                .post(format!(
-                    "{}/reload-settings",
-                    neural_url.trim_end_matches('/')
-                ))
-                .json(&serde_json::json!({}))
-                .send()
-                .await;
             Ok(Json(body))
         }
         Ok(r) => {
@@ -1017,39 +1006,27 @@ fn sanitize_collection_suffix(raw: &str) -> String {
         .to_string()
 }
 
-async fn probe_embedding_dimensions(model: &str) -> Result<u64, ApiError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .build()
-        .unwrap_or_default();
-    let neural_url =
-        std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
-    let resp = client
-        .post(format!("{}/embed", neural_url.trim_end_matches('/')))
-        .json(&json!({ "model": model, "text": "dimension probe", "texts": [] }))
-        .send()
+async fn probe_embedding_dimensions(_model: &str) -> Result<u64, ApiError> {
+    // Embedder ONNX in-process (NexusBridge), stessa fonte di /api/embed e di
+    // tutti gli embed di mcp-core (regola L). Il brain Python (REST /embed) e'
+    // stato eliminato: nessuna chiamata HTTP esterna. L'embedder usa il modello
+    // locale (MiniLM), quindi `_model` non seleziona un backend remoto.
+    let bridge = crate::nexus_bridge::NexusBridge::global().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Embedder ONNX non inizializzato",
+        )
+    })?;
+    let probe = "dimension probe".to_string();
+    let vector = tokio::task::spawn_blocking(move || bridge.embed_one(&probe))
         .await
         .map_err(|e| {
             api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Neural Core non raggiungibile: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("embed probe join: {e}"),
             )
         })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            format!("Validazione fallita (HTTP {status}): {text}"),
-        ));
-    }
-
-    let payload: serde_json::Value = resp.json().await.unwrap_or(json!({}));
-    let dim = payload
-        .get("dimensions")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let dim = vector.len() as u64;
     if dim == 0 {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1215,59 +1192,18 @@ pub async fn providers_status_internal(
         })
         .collect();
 
-    // Cooldown snapshot — merge da due sorgenti:
-    //   1) provider_cooldown.rs: cooldown applicato da mcp-core (es. da
-    //      brain_agent_client.rs quando rileva stop_reason=error + classify
-    //      provider_error riconosce billing/rate_limit/overloaded).
-    //   2) brain REST endpoint /providers/billing-cooldown: cooldown applicato
-    //      LOCALMENTE dal brain Python in registry.py quando un provider
-    //      ritorna billing_error e il brain fa fallback interno (questo path
-    //      NON arriva mai a mcp-core, quindi senza questo merge il LED UI
-    //      restava verde anche se Anthropic aveva quota esaurita).
-    // La fusione fa l'unione delle due mappe: provider in cooldown su
-    // entrambi i layer prendono il max secs rimanente.
-    let mut cooldown_map: std::collections::HashMap<String, (u64, Option<String>)> =
+    // Cooldown snapshot — fonte unica locale (regola L): `provider_cooldown.rs`,
+    // lo stato canonico dei cooldown applicati da mcp-core (es. da
+    // brain_agent_client.rs quando rileva stop_reason=error + classify
+    // provider_error riconosce billing/rate_limit/overloaded). Lo stesso dato e'
+    // esposto da `/api/neural/providers/billing-cooldown`. Il vecchio merge col
+    // brain REST Python e' stato rimosso col brain stesso: ora la rilevazione
+    // billing/rate-limit vive interamente in-process in mcp-core.
+    let cooldown_map: std::collections::HashMap<String, (u64, Option<String>)> =
         crate::provider_cooldown::cooldown_snapshot()
             .into_iter()
             .map(|(name, secs, reason)| (name, (secs, reason)))
             .collect();
-    // Brain billing-cooldown polling (timeout corto, fail-soft).
-    let brain_url =
-        std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    let brain_url = brain_url.trim_end_matches('/').to_string();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(800))
-        .build()
-        .ok();
-    if let Some(client) = client {
-        let url = format!("{}/providers/billing-cooldown", brain_url);
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    if let Some(providers) = body.get("providers").and_then(|v| v.as_object()) {
-                        for (name, secs_val) in providers.iter() {
-                            if let Some(secs) = secs_val.as_u64() {
-                                let mins = secs.div_ceil(60);
-                                let reason = Some(format!(
-                                    "Quota provider esaurita (rilevato dal brain). Nexus userà un altro provider per ~{}min.",
-                                    mins
-                                ));
-                                cooldown_map
-                                    .entry(name.clone())
-                                    .and_modify(|existing| {
-                                        // Max delle due durate, mantieni la reason esistente se piu' specifica.
-                                        if secs > existing.0 {
-                                            existing.0 = secs;
-                                        }
-                                    })
-                                    .or_insert((secs, reason));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     let providers: Vec<Value> = KNOWN_PROVIDERS
         .iter()

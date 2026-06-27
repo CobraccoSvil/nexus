@@ -105,7 +105,7 @@ export const es: PartialDictionary = {
     "mon.unreachable": "Inalcanzable",
 
     "tip.mcpCore": "Backend Rust (Axum) — gestiona API, auth, configuración y orquestación",
-    "tip.neuralCore": "Backend Python (FastAPI + gRPC) — routing AI, embeddings, clasificación de intención",
+    "tip.neuralCore": "Endpoints AI en mcp-core (Rust) — routing AI, clasificación de intención, estado de proveedores (bajo /api/neural)",
     "tip.database": "PostgreSQL — almacenamiento persistente para usuarios, sesiones, configuración y ejecuciones",
     "tip.redis": "Caché en memoria — sesiones, colas de trabajo y caché de respuestas AI",
     "tip.openai": "GPT-4o, GPT-4o-mini — generación de código y completaciones",
@@ -114,7 +114,7 @@ export const es: PartialDictionary = {
     "tip.runs": "Número total de ejecuciones AI registradas",
     "tip.db.header": "PostgreSQL — almacenamiento persistente para usuarios, sesiones, configuración y ejecuciones",
     "tip.redis.header": "Redis — caché en memoria, sesiones y colas de trabajo",
-    "tip.neural.header": "Neural Core — routing AI, embeddings, clasificación de intención (Python/FastAPI)",
+    "tip.neural.header": "Neural Core — routing AI y clasificación de intención servidos por mcp-core (Rust)",
     "tip.sidebar.explorer": "Explorador — navegar archivos y carpetas del proyecto",
     "tip.sidebar.search": "Buscar — encontrar texto en el código",
     "tip.sidebar.sourceControl": "Control de código — ver cambios e historial git",

@@ -19,6 +19,7 @@ pub mod service_log_diagnose;
 pub mod service_observer;
 pub mod service_observer_remediation;
 pub mod services;
+pub mod terminal_ws;
 pub mod user_manager;
 pub mod wizard;
 pub mod workbench;
@@ -54,6 +55,9 @@ type ApiResult = Result<Json<Value>, ApiError>;
 pub use workbench::{
     create_terminal_session, get_workbench_state, open_project, update_workbench_state,
 };
+
+// WebSocket PTY del terminale IDE (porting 1:1 dal brain Python rimosso).
+pub use terminal_ws::terminal_ws_upgrade;
 
 pub use changes::get_project_changes;
 

@@ -1,15 +1,15 @@
 /* eslint-disable @typescript-eslint/no-require-imports -- custom server Next.js in CommonJS per proxy WebSocket */
-// Custom Next.js server — proxies WebSocket upgrades on /neural/* to the brain service.
+// Custom Next.js server — proxies WebSocket upgrades on /neural/* to mcp-core.
 // Regular HTTP requests are handled normally by Next.js.
-// This allows the browser to use wss://nexus.cobracco.it/neural/ws/terminal/...
-// instead of ws://localhost:8001/ws/terminal/... (which is unreachable from the browser).
+// Il brain Python e' stato eliminato: gli endpoint neural (incluso il WS del
+// terminale) sono ora ri-esposti in mcp-core (porta 4000) sotto /api/neural/*.
+// Questo permette al browser di usare wss://nexus.cobracco.it/neural/ws/terminal/...
+// che il proxy inoltra a mcp-core su /api/neural/ws/terminal/...
 
 const { createServer } = require("http");
 const { parse } = require("url");
 const next = require("next");
 const httpProxy = require("http-proxy");
-
-const BRAIN_URL = process.env.BRAIN_URL || "http://localhost:8001";
 
 // Porta di bind risolta ESCLUSIVAMENTE dal DB (settings.web_ide_port, regola G:
 // niente env, niente default hardcoded). DB irraggiungibile -> retry 5x5s, poi
@@ -49,9 +49,14 @@ const dev = process.env.NODE_ENV !== "production";
 const app = next({ dev, dir: __dirname });
 const handle = app.getRequestHandler();
 
-// Proxy for WebSocket upgrades — strips the /neural prefix before forwarding
+// URL di mcp-core: stessa convenzione del fallback /api/:path* (next.config.ts)
+// e del proxy SSO sotto. Niente nuova env var dedicata al brain (eliminato).
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:4000";
+
+// Proxy for WebSocket upgrades — riscrive il prefisso /neural in /api/neural
+// prima di inoltrare a mcp-core (vedi handler "upgrade" piu' sotto).
 const wsProxy = httpProxy.createProxyServer({
-  target: BRAIN_URL,
+  target: BACKEND_URL,
   ws: true,
   changeOrigin: true,
 });
@@ -69,7 +74,6 @@ wsProxy.on("error", (err, req, socket) => {
 // progressi del run agente non si vedono. http-proxy fa pipe streaming reale
 // (selfHandleResponse=false di default) -> nessun buffering, i chunk arrivano
 // appena emessi. Stesso target del fallback /api/:path* (BACKEND_URL = :4000).
-const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:4000";
 const sseProxy = httpProxy.createProxyServer({
   target: BACKEND_URL,
   changeOrigin: true,
@@ -134,9 +138,11 @@ app.prepare().then(async () => {
   server.on("upgrade", (req, socket, head) => {
     const url = req.url || "";
     if (url.startsWith("/neural/") || url === "/neural") {
-      // Strip the /neural prefix so the brain service sees /ws/terminal/...
-      req.url = url.slice("/neural".length) || "/";
-      console.log(`[ws-proxy] upgrade → ${BRAIN_URL}${req.url}`);
+      // Riscrive il prefisso /neural in /api/neural cosi' mcp-core vede
+      // /api/neural/ws/terminal/... (gli endpoint neural sono sotto quel prefisso
+      // dopo l'eliminazione del brain Python).
+      req.url = `/api/neural${url.slice("/neural".length) || "/"}`;
+      console.log(`[ws-proxy] upgrade → ${BACKEND_URL}${req.url}`);
       wsProxy.ws(req, socket, head);
     } else {
       socket.destroy();
@@ -144,6 +150,6 @@ app.prepare().then(async () => {
   });
 
   server.listen(PORT, "0.0.0.0", () => {
-    console.log(`> Ready on http://0.0.0.0:${PORT} (brain → ${BRAIN_URL})`);
+    console.log(`> Ready on http://0.0.0.0:${PORT} (neural → ${BACKEND_URL}/api/neural)`);
   });
 });

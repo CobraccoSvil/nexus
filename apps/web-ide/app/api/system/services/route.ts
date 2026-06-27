@@ -1,7 +1,7 @@
 /**
  * GET /api/system/services
  *
- * Ritorna lo stato dei servizi di sistema di Nexus (nexus-core, nexus-neural, ecc.)
+ * Ritorna lo stato dei servizi di sistema di Nexus (nexus-core, nexus-gateway, ecc.)
  * tramite `systemctl is-active`. Non dipende da mcp-core: funziona anche quando
  * l'orchestratore è down, permettendo all'utente di riavviarlo dall'IDE.
  *
@@ -46,8 +46,10 @@ export interface NexusServiceInfo {
 // led: nome del LED nella statusbar che questo servizio alimenta.
 // readonly: servizi system (root), mostrati ma non controllabili dall'IDE.
 const NEXUS_SERVICES: Omit<NexusServiceInfo, "state" | "sub_state">[] = [
-  { name: "nexus-core-wsl",       label: "Core (mcp-core)",  port: 4000, description: "Orchestratore + Tool Runner gRPC :50071", led: "Tools" },
-  { name: "nexus-neural-wsl",     label: "Brain",            port: 8001, description: "Motore AI Python (LangGraph)",             led: "Brain" },
+  // Il brain Python (nexus-neural-wsl, :8001) e' stato eliminato: gli endpoint
+  // AI sono ora ri-esposti in mcp-core (porta 4000) sotto /api/neural. Il LED
+  // "Brain" e' stato rimosso dalla statusbar (consolidato nel LED del Core).
+  { name: "nexus-core-wsl",       label: "Core (mcp-core)",  port: 4000, description: "Orchestratore + endpoint AI (/api/neural) + Tool Runner gRPC :50071", led: "Core" },
   { name: "nexus-gateway",        label: "LLM Gateway",      port: 4060, description: "Router provider AI",                      led: "OpenAI · Anthropic · …" },
   { name: "nexus-chat-wsl",       label: "Chat Service",     port: 4020, description: "Servizio chat e agenti" },
   { name: "nexus-plugin-wsl",     label: "Plugin Service",   port: 4050, description: "Connettori MCP" },

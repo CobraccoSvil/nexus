@@ -3,8 +3,9 @@
 import type { useThemeColors } from "../../lib/theme";
 
 type LiveHealth = {
+  // Stato di mcp-core (porta 4000). Dopo l'eliminazione del brain Python la chat
+  // e gli agent run girano qui: e' l'unico indicatore del Core.
   neural_core: boolean;
-  brain_rest?: boolean;
 };
 
 export function ShellOverlays({
@@ -58,8 +59,8 @@ export function ShellOverlays({
         </div>
       )}
 
-      {/* Banner Brain offline — visibile e prominente */}
-      {(!liveHealth.neural_core || !liveHealth.brain_rest) && (
+      {/* Banner Core offline — visibile e prominente */}
+      {!liveHealth.neural_core && (
         <div
           style={{
             position: "fixed",
@@ -80,11 +81,7 @@ export function ShellOverlays({
           }}
         >
           <span style={{ fontSize: 16 }}>!</span>
-          {!liveHealth.neural_core && !liveHealth.brain_rest
-            ? "Brain offline — la chat e gli agent run non funzioneranno"
-            : !liveHealth.brain_rest
-              ? "Brain REST offline — gli agent run non funzioneranno"
-              : "Brain gRPC offline — la chat potrebbe non rispondere"}
+          Core (mcp-core) offline — la chat e gli agent run non funzioneranno
         </div>
       )}
     </>

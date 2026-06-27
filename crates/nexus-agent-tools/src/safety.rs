@@ -155,7 +155,7 @@ static FORBIDDEN_PATTERNS: &[(&str, &str, &str, &str)] = &[
         "kill_brain_mcp",
         r"(?i)\b(?:pkill|killall|kill\s+-9|kill\s+-KILL)\b[^|;&]*\b(?:mcp-core|brain\.grpc|nexus|postgres-nexus)\b",
         "kill processi infrastruttura Nexus vietato",
-        "Non killare mcp-core, brain.grpc_server, postgres-nexus.",
+        "Non killare mcp-core, postgres-nexus.",
     ),
     // pkill/killall per NOME di runtime generico condiviso (node, python, ...):
     // colpisce per nome di processo, quindi non isola il progetto e uccide anche

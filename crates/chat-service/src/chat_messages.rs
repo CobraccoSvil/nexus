@@ -84,7 +84,7 @@ pub async fn send_message(
 
     // TODO: In full implementation, this would:
     // 1. Call billing service to reserve usage
-    // 2. Call orchestrator (neural core) for LLM inference
+    // 2. Call mcp-core orchestrator for LLM inference
     // 3. Optionally spawn agent loop for tool use
     // 4. Stream results via SSE through agent_channels
     // 5. Save assistant response

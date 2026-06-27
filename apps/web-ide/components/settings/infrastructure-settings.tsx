@@ -7,6 +7,8 @@ import type { EnvironmentCheck } from "../../lib/api-client";
 import { getEnvironmentStatus, fixEnvironment } from "../../lib/api-client";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+// Proxy via Next.js /neural/* → mcp-core :4000 /api/neural/* (il brain Python
+// e' stato eliminato; gli endpoint neural vivono ora in mcp-core).
 const NEURAL_BASE = "/neural";
 
 // ── Microservice definitions ──────────────────────────────────────────────────
@@ -49,11 +51,11 @@ const SERVICES: ServiceDef[] = [
   },
   {
     id: "neural-core",
-    name: "Neural Core (Brain)",
-    description: "Servizio AI — routing LLM, embedding, generazione documenti. gRPC + REST.",
+    name: "Neural Core (mcp-core)",
+    description: "Endpoint AI in mcp-core (Rust): routing LLM, classificazione intent, health provider. Esposti sotto /api/neural.",
     icon: "\uD83E\uDDE0",
     healthUrl: `${NEURAL_BASE}/health`,
-    settingKeys: ["neural_core_url"],
+    settingKeys: [],
     parseHealth: (d) => ({
       status: d.status === "ok" ? "ok" : "down",
       version: String(d.version || ""),

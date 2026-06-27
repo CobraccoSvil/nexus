@@ -28,10 +28,10 @@
 
 use serde_json::{json, Value};
 
-// Nota: `super::*` non e' piu' necessario. Serviva per i tipi `mcp_proto::neural`
-// (NeuralCoreServiceClient) del vecchio proxy gRPC: ora `NeuralCoreClient` non
-// incapsula piu' un canale gRPC, tutti i metodi delegano all'embedder ONNX
-// in-process o al Nexus LLM Gateway.
+// Nota: i tipi del vecchio proxy gRPC (`mcp_proto::neural`, generati da
+// proto/neural_core.proto) non esistono piu': il proto e' stato rimosso col
+// brain. `NeuralCoreClient` non incapsula piu' un canale gRPC, tutti i metodi
+// delegano all'embedder ONNX in-process o al Nexus LLM Gateway.
 use crate::nexus_gateway::{
     GwMessage, GwMetadata, GwRequest, GwResponse, NexusGatewayClient,
 };

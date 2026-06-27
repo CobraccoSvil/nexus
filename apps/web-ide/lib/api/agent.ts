@@ -161,7 +161,7 @@ export async function cancelAgentRun(
   });
 }
 
-// --- Neural Core (Python :8001) ---
+// --- Neural Core (mcp-core, endpoint AI sotto /api/neural :4000) ---
 
 export interface ProviderModelsResponse {
   provider: string;

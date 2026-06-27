@@ -50,7 +50,6 @@ pub struct AppState {
     pub redis: redis::aio::MultiplexedConnection,
     pub agent_channels: AgentChannels,
     pub terminal_consumers: TerminalConsumers,
-    pub neural_url: String,
     pub billing_url: String,
     pub plugin_url: String,
     pub core_url: String,
@@ -81,16 +80,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Chat Service: connected to Redis");
 
-    let neural_url = nexus_auth::get_setting(&db, "neural_core_url")
-        .await
-        .unwrap_or_else(|| std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string()));
-
     let state = AppState {
         db: db.clone(),
         redis: redis_conn,
         agent_channels: Arc::new(DashMap::new()),
         terminal_consumers: Arc::new(DashMap::new()),
-        neural_url,
         billing_url: std::env::var("BILLING_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:4040".to_string()),
         plugin_url: std::env::var("PLUGIN_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:4050".to_string()),
         core_url: std::env::var("CORE_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:4000".to_string()),

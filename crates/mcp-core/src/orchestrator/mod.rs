@@ -16,9 +16,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 // `NeuralCoreClient` non incapsula piu' un canale gRPC verso il brain: tutti i
-// suoi metodi delegano all'embedder ONNX in-process o al Nexus LLM Gateway. Per
-// questo non serve piu' ri-esportare `NeuralCoreServiceClient` (il tipo generato
-// dal proto): l'ultimo uso (`generate_document`) e' migrato in-process in
+// suoi metodi delegano all'embedder ONNX in-process o al Nexus LLM Gateway. Il
+// proto neural_core.proto e il tipo generato `NeuralCoreServiceClient` sono stati
+// rimossi col brain: l'ultimo uso (`generate_document`) e' migrato in-process in
 // `crate::docx_render`. `GenerateCompletion`/`GenerateAgentTurn` erano gia'
 // cablati al gateway in `neural_client.rs`.
 

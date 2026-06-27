@@ -5,7 +5,8 @@
 export const API_BASE = typeof window !== "undefined"
   ? ""
   : (process.env.NEXT_PUBLIC_API_URL || "");
-// Proxy tramite Next.js /api/neural/* → brain:8001 (evita CORS e NEXT_PUBLIC_* baked)
+// Proxy tramite le route Next.js /api/neural/* → mcp-core :4000 /api/neural/*
+// (il brain Python e' stato eliminato; evita CORS e NEXT_PUBLIC_* baked).
 export const NEURAL_BASE = "/api/neural";
 
 export function getApiBaseUrl(): string {

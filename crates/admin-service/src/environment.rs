@@ -89,43 +89,6 @@ async fn check_playwright_browser() -> EnvironmentCheck {
     }
 }
 
-async fn check_brain_service() -> EnvironmentCheck {
-    // Controlla sia il processo gRPC che l'endpoint REST /health
-    let proc_result = Command::new("pgrep")
-        .args(["-f", "brain.grpc_server|brain/grpc_server|brain.main|uvicorn"])
-        .output()
-        .await;
-
-    let proc_running = proc_result.map(|o| !o.stdout.is_empty()).unwrap_or(false);
-
-    // Verifica anche via HTTP che risponda
-    let http_result = timeout(
-        Duration::from_secs(3),
-        Command::new("curl")
-            .args(["-fsS", "http://localhost:8001/health"])
-            .output(),
-    )
-    .await;
-
-    let http_ok = matches!(http_result, Ok(Ok(ref o)) if o.status.success());
-
-    if http_ok || proc_running {
-        // Prova a leggere il PID
-        let pid = if proc_running {
-            Command::new("pgrep")
-                .args(["-f", "brain.grpc_server|brain/grpc_server|brain.main|uvicorn"])
-                .output()
-                .await
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().lines().next().unwrap_or("").to_string())
-                .unwrap_or_default()
-        } else { String::new() };
-        let detail = if pid.is_empty() { "Running".to_string() } else { format!("pid {pid}") };
-        EnvironmentCheck::ok("brain_service", "Nexus Brain (Python AI)", detail)
-    } else {
-        EnvironmentCheck::error("brain_service", "Nexus Brain (Python AI)", "not running")
-    }
-}
-
 fn check_backend_process() -> EnvironmentCheck {
     let pid = std::process::id();
     EnvironmentCheck::ok("backend_process", "Backend mcp-core", format!("pid {pid}"))
@@ -259,7 +222,6 @@ pub async fn get_environment_status(
         db_check,
         playwright_libs_check,
         playwright_browser_check,
-        brain_check,
         frontend_check,
         migrations_check,
         providers_check,
@@ -274,7 +236,6 @@ pub async fn get_environment_status(
         check_db(&state.db),
         check_playwright_libs(),
         check_playwright_browser(),
-        check_brain_service(),
         check_frontend_process(),
         check_migrations(&state.db),
         check_ai_providers(&state.db),
@@ -293,7 +254,6 @@ pub async fn get_environment_status(
         db_check,
         playwright_libs_check,
         playwright_browser_check,
-        brain_check,
         backend_check,
         frontend_check,
         migrations_check,

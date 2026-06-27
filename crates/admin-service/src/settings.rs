@@ -156,17 +156,9 @@ pub async fn bulk_update(
         }
     }
 
-    let has_api_key = body.settings.iter().any(|e| e.key.ends_with("_api_key"));
-    if has_api_key && errors.is_empty() {
-        let brain_url = std::env::var("NEURAL_CORE_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        tokio::spawn(async move {
-            let client = nexus_http::NexusClient::with_timeout(5).inner().clone();
-            match client.post(format!("{brain_url}/reload-settings")).json(&json!({"mcp_core_url": "http://localhost:4000"})).send().await {
-                Ok(r) => tracing::info!("Brain reload-settings: {}", r.status()),
-                Err(e) => tracing::warn!("Brain reload-settings failed: {e}"),
-            }
-        });
-    }
+    // Nota: il brain Python e' stato eliminato; la cache delle chiavi API e'
+    // ora gestita da mcp-core/nexus-gateway con TTL DB-driven (refresh entro
+    // ~60s). Nessun side-effect HTTP da invalidare qui (era best-effort).
 
     Json(json!({ "status": if errors.is_empty() { "ok" } else { "partial" }, "updated": updated, "errors": errors }))
 }

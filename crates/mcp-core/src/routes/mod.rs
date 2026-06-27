@@ -16,6 +16,7 @@ mod documents;
 mod knowledge;
 mod meta_docs;
 mod mutations;
+mod neural_compat;
 mod project_db;
 mod prompt_templates;
 mod protected;
@@ -50,6 +51,9 @@ pub fn build_app_router(state: AppState, cors: CorsLayer) -> Router {
     let router = Router::new();
     let router = public::merge(router, &state);
     let router = protected::merge(router, &state);
+    // Compat REST "neural-core" (`/api/neural/*`): forme 1:1 col brain Python
+    // rimosso, consumate dal frontend web-ide via proxy Next.js.
+    let router = neural_compat::merge(router, &state);
     let router = project_db::merge(router, &state);
     let router = knowledge::merge(router, &state);
     let router = meta_docs::merge(router, &state);

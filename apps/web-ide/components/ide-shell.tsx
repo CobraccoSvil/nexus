@@ -135,10 +135,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const tc = useThemeColors();
   const { promptDialog, confirmDialog, alertDialog } = useGlobalDialog();
   // Polling client-side dello health: il prop `dashboard` è uno snapshot SSR
-  // e non si aggiorna mai. Senza questo, i LED DB/Redis/Brain restano congelati
-  // sullo stato del primo render della pagina /ide.
-  const [liveHealth, setLiveHealth] = useState<{ database: boolean; redis: boolean; neural_core: boolean; tools_grpc?: boolean; brain_rest?: boolean }>(
-    dashboard.health ?? { database: false, redis: false, neural_core: false, tools_grpc: false, brain_rest: false }
+  // e non si aggiorna mai. Senza questo, i LED DB/Redis/Core restano congelati
+  // sullo stato del primo render della pagina /ide. Il vecchio LED "Brain"
+  // (brain_rest) e' stato rimosso: il brain Python e' stato eliminato e i suoi
+  // endpoint vivono ora in mcp-core (neural_core).
+  const [liveHealth, setLiveHealth] = useState<{ database: boolean; redis: boolean; neural_core: boolean; tools_grpc?: boolean }>(
+    dashboard.health ?? { database: false, redis: false, neural_core: false, tools_grpc: false }
   );
   useEffect(() => {
     let cancelled = false;
@@ -147,7 +149,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         const h = await getHealth();
         if (!cancelled) setLiveHealth(h.components);
       } catch {
-        if (!cancelled) setLiveHealth({ database: false, redis: false, neural_core: false, tools_grpc: false, brain_rest: false });
+        if (!cancelled) setLiveHealth({ database: false, redis: false, neural_core: false, tools_grpc: false });
       }
     };
     refresh();

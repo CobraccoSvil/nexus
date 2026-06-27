@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 
-const BRAIN_URL = process.env.BRAIN_URL || "http://localhost:8001";
+// Il brain Python e' stato eliminato: gli endpoint neural sono ri-esposti in
+// mcp-core (porta 4000) sotto /api/neural/*. Stessa convenzione BACKEND_URL del
+// fallback /api/:path* (next.config.ts) — niente env var dedicata al brain.
+const CORE_URL = process.env.BACKEND_URL || "http://localhost:4000";
 
 export async function GET(
   request: Request,
@@ -12,7 +15,7 @@ export async function GET(
   }
 
   const pathStr = paths.join("/");
-  const targetUrl = `${BRAIN_URL}/providers/${pathStr}`;
+  const targetUrl = `${CORE_URL}/api/neural/providers/${pathStr}`;
 
   try {
     console.log(`[API Proxy] GET ${targetUrl}`);
@@ -25,7 +28,7 @@ export async function GET(
     return NextResponse.json(data, { status: response.status });
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
-    console.error(`Brain GET /providers/${pathStr} error:`, msg);
+    console.error(`Neural GET /providers/${pathStr} error:`, msg);
     return NextResponse.json(
       { error: "Provider non disponibile" },
       { status: 503 }
@@ -39,7 +42,7 @@ export async function POST(
 ) {
   const { paths = [] } = await params;
   const pathStr = paths.join("/");
-  const targetUrl = `${BRAIN_URL}/providers/${pathStr}`;
+  const targetUrl = `${CORE_URL}/api/neural/providers/${pathStr}`;
 
   try {
     const body = await request.json().catch(() => null);
@@ -52,7 +55,7 @@ export async function POST(
     const data = await response.json();
     return NextResponse.json(data, { status: response.status });
   } catch (error) {
-    console.error(`Brain POST /providers/${pathStr} error:`, error);
+    console.error(`Neural POST /providers/${pathStr} error:`, error);
     return NextResponse.json(
       { error: "Provider non disponibile" },
       { status: 503 }

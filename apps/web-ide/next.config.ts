@@ -39,7 +39,6 @@ const nextConfig: NextConfig = {
     const adminService = process.env.ADMIN_SERVICE_URL || "http://localhost:4010";
     // chatService (4020), docService (4030), billingService (4040), pluginService (4050)
     // non ancora attivi — le loro route cadono nel fallback /api/:path* → backend
-    const brain = process.env.BRAIN_URL || "http://localhost:8001";
     return [
       // Embeddings validate/apply → mcp-core (porta 4000), non admin-service (4010)
       // Le route sono implementate in crates/mcp-core/src/environment.rs
@@ -95,9 +94,12 @@ const nextConfig: NextConfig = {
         source: "/auth/:path*",
         destination: `${backend}/auth/:path*`,
       },
+      // Il brain Python e' stato eliminato: gli endpoint neural sono ora ri-esposti
+      // in mcp-core (porta 4000) sotto il prefisso /api/neural/*. Il proxy /neural/*
+      // del frontend resta invariato lato client, ma punta al core con quel prefisso.
       {
         source: "/neural/:path*",
-        destination: `${brain}/:path*`,
+        destination: `${backend}/api/neural/:path*`,
       },
       {
         source: "/nexus/:path*",

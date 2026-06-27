@@ -5,8 +5,6 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
-// Tipi mcp_proto::neural ri-esportati da super::* (regola L, S73).
-
 use super::*;
 
 #[derive(Debug)]

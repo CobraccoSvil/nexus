@@ -16,13 +16,17 @@ interface TerminalTab {
 }
 
 // Derive the WebSocket base from the page origin so it works through HTTPS proxies.
-// Falls back to the env var for local dev (e.g. ws://localhost:8001).
+// Lato browser usa /neural: il custom server (server.js) riscrive /neural/* in
+// /api/neural/* e inoltra a mcp-core, dove il WS del terminale e' ora esposto
+// (il brain Python e' stato eliminato). Il path finale risulta
+// host/neural/ws/terminal/{id} -> proxy -> mcp-core/api/neural/ws/terminal/{id}.
+// Fallback env solo per SSR/dev (non usato dal browser).
 function getNeuralWsBase(): string {
   if (typeof window !== "undefined") {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     return `${proto}//${window.location.host}/neural`;
   }
-  return (process.env.NEXT_PUBLIC_NEURAL_URL || "http://localhost:8001").replace(/^http/, "ws");
+  return (process.env.NEXT_PUBLIC_NEURAL_URL || "http://localhost:4000").replace(/^http/, "ws");
 }
 const NEURAL_WS = getNeuralWsBase();
 

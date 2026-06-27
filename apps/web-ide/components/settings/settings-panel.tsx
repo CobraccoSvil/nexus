@@ -45,12 +45,13 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
   const [browseData, setBrowseData] = useState<BrowseDirectoriesResponse | null>(null);
   const [newDirectoryName, setNewDirectoryName] = useState("");
 
-  // Proxy via Next.js /neural/* → brain :8001 (server-side, no CORS)
+  // Proxy via Next.js /neural/* → mcp-core :4000 /api/neural/* (server-side, no CORS).
+  // Il brain Python e' stato eliminato: gli endpoint neural vivono ora in mcp-core.
   const NEURAL_BASE = "/neural";
 
   // "Testa" provider: smart-test che ricarica il provider in modo completo.
   //   1. Reset cooldown lato mcp-core (rimuove sia in-memory sia Redis).
-  //   2. Probe brain via /neural/providers/:name/health.
+  //   2. Probe provider via /neural/providers/:name/health (mcp-core).
   //   3. Se status=ok → il provider torna attivo immediatamente, l'UI vede
   //      LED verde tramite dispatcher SSE ProviderHealthChanged.
   //   4. Se status!=ok → il probe lo rimette automaticamente in cooldown.
@@ -68,7 +69,7 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
     } catch {
       // ignora — il provider potrebbe non essere in cooldown
     }
-    // Step 2: probe brain.
+    // Step 2: probe provider via mcp-core (/neural -> /api/neural).
     try {
       const res = await fetch(`${NEURAL_BASE}/providers/${provider}/health`);
       const data = await res.json();
@@ -82,8 +83,10 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
     }
   }, []);
 
-  // Ricarica le chiavi nel brain, AZZERA il cooldown lato mcp-core (utile
-  // dopo billing recharge/rate_limit risolto), poi ri-testa il provider.
+  // AZZERA il cooldown lato mcp-core (utile dopo billing recharge/rate_limit
+  // risolto), poi ri-testa il provider. La chiamata a /reload-settings ora e'
+  // un no-op lato mcp-core (il brain Python che ricaricava le chiavi non esiste
+  // piu'): resta innocua e non rompe il flusso.
   const handleReloadProvider = useCallback(async (provider: string) => {
     try {
       await fetch(`${NEURAL_BASE}/reload-settings`, {
@@ -181,7 +184,8 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
         const providerName = key.replace("_api_key", "");
         void handleReloadProvider(providerName);
       }
-      // Se si salva la configurazione DNS, ricarica le impostazioni del Neural Core
+      // Se si salva la configurazione DNS, invoca /reload-settings su mcp-core
+      // (no-op dopo l'eliminazione del brain, ma innocuo).
       if (key === "network_dns_servers") {
         try {
           await fetch(`${NEURAL_BASE}/reload-settings`, {

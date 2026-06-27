@@ -1,11 +1,14 @@
 import { NextResponse } from "next/server";
 
-const BRAIN_URL = process.env.BRAIN_URL || "http://localhost:8001";
+// Il brain Python e' stato eliminato: gli endpoint neural sono ri-esposti in
+// mcp-core (porta 4000) sotto /api/neural/*. Stessa convenzione BACKEND_URL del
+// fallback /api/:path* (next.config.ts) — niente env var dedicata al brain.
+const CORE_URL = process.env.BACKEND_URL || "http://localhost:4000";
 
 export async function GET() {
   try {
-    const targetUrl = `${BRAIN_URL}/health`;
-    console.log(`[API] Richiesta al Brain: ${targetUrl}`);
+    const targetUrl = `${CORE_URL}/api/neural/health`;
+    console.log(`[API] Richiesta neural a mcp-core: ${targetUrl}`);
 
     const response = await fetch(targetUrl, {
       method: "GET",
@@ -13,14 +16,14 @@ export async function GET() {
     });
 
     const data = await response.json();
-    console.log(`[API] Risposta dal Brain: status=${response.status}`);
+    console.log(`[API] Risposta neural da mcp-core: status=${response.status}`);
 
     return NextResponse.json(data, { status: response.status });
   } catch (error: unknown) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error("Brain health endpoint error:", errorMsg);
+    console.error("Neural (mcp-core) health endpoint error:", errorMsg);
     return NextResponse.json(
-      { error: `Brain non disponibile: ${errorMsg}` },
+      { error: `Neural (mcp-core) non disponibile: ${errorMsg}` },
       { status: 503 }
     );
   }
