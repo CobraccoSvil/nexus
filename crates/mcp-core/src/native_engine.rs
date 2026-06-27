@@ -1111,7 +1111,33 @@ async fn run_engine(
     // Resume HITL: nessun init (carica il checkpoint), applica il resume_delta.
     match mode {
         RunMode::New => {
-            let init = Some(build_initial_state(input, role));
+            let mut init_state = build_initial_state(input, role);
+            // Playbook matcher (punto unico, regola L): popola i passi del playbook
+            // che matcha il task, cosi' il planner genera i todo deterministici
+            // (es. nexus_visual_compare per la verifica figma) e il final_gate puo'
+            // applicare design_verify. Senza, `playbook_steps` resta vuoto: era
+            // l'anello mancante del porting (il matcher viveva nel brain Python).
+            // project_root None: i trigger con `project_markers` non sono valutati
+            // qui (root non risolta nel punto di costruzione dello state); i
+            // playbook senza markers — es. verify.design_align — matchano comunque.
+            if let Some(pm) = crate::playbook_engine::match_playbook(
+                &deps.db,
+                input.intent_hint.as_deref(),
+                &input.initial_msg,
+                None,
+            )
+            .await
+            {
+                tracing::info!(
+                    target: "mcp_core::native_engine",
+                    playbook = %pm.key,
+                    steps = pm.steps.len(),
+                    "playbook matchato -> playbook_steps popolati"
+                );
+                init_state.playbook_steps = Some(pm.steps);
+                init_state.playbook_key = Some(pm.key);
+            }
+            let init = Some(init_state);
             engine
                 .run_until_interrupt(input.run_id, init, &ctx)
                 .await

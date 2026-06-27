@@ -51,6 +51,7 @@ mod mutations_api;
 mod native_engine;
 mod neural_compat;
 mod nexus_bridge;
+mod playbook_engine;
 mod nexus_builtin;
 mod nexus_database_stats;
 mod nexus_gateway;
