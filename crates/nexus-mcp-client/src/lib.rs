@@ -292,8 +292,12 @@ pub async fn list_tools_stdio(
             "clientInfo": { "name": "ideai-mcp-client", "version": "1.0" }
         }),
     );
+    // Handshake MCP completo: initialize -> notifications/initialized -> tools/list.
+    // Senza la notifica i server strict ignorano il tools/list (regola H).
+    let initialized = build_jsonrpc_notification("notifications/initialized", json!({}));
     let list_msg = build_jsonrpc_with_id(2, "tools/list", json!({}));
-    let output = run_stdio_jsonrpc(command, args, env_vars, 2, &[init_msg, list_msg]).await?;
+    let output =
+        run_stdio_jsonrpc(command, args, env_vars, 2, &[init_msg, initialized, list_msg]).await?;
 
     // Prende l'ultima risposta JSON valida con "result"
     for line in output.lines().rev() {
@@ -328,12 +332,16 @@ pub async fn call_tool_stdio(
             "clientInfo": { "name": "ideai-mcp-client", "version": "1.0" }
         }),
     );
+    // Handshake MCP completo: initialize -> notifications/initialized -> tools/call.
+    // Senza la notifica i server strict ignorano il tools/call (regola H).
+    let initialized = build_jsonrpc_notification("notifications/initialized", json!({}));
     let call_msg = build_jsonrpc_with_id(
         2,
         "tools/call",
         json!({ "name": tool_name, "arguments": arguments }),
     );
-    let output = run_stdio_jsonrpc(command, args, env_vars, 2, &[init_msg, call_msg]).await?;
+    let output =
+        run_stdio_jsonrpc(command, args, env_vars, 2, &[init_msg, initialized, call_msg]).await?;
 
     for line in output.lines().rev() {
         if let Ok(v) = serde_json::from_str::<Value>(line) {
@@ -354,6 +362,21 @@ fn build_jsonrpc_with_id(id: u64, method: &str, params: Value) -> String {
     json!({
         "jsonrpc": "2.0",
         "id": id,
+        "method": method,
+        "params": params
+    })
+    .to_string()
+}
+
+/// Notifica JSON-RPC (SENZA campo `id`: per le notification MCP non si attende
+/// risposta). Necessaria per `notifications/initialized`, che i server MCP strict
+/// (es. @playwright/mcp) esigono DOPO `initialize` e PRIMA di qualunque
+/// `tools/call` / `tools/list`: senza, ignorano le richieste e rispondono solo
+/// all'handshake (l'agente vedeva solo {protocolVersion,serverInfo} e il tool non
+/// veniva mai eseguito). Regola H: conformita' alla spec MCP, non un workaround.
+fn build_jsonrpc_notification(method: &str, params: Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
         "method": method,
         "params": params
     })
