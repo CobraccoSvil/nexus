@@ -166,6 +166,223 @@ pub async fn gateway_vision_complete(
     })
 }
 
+// ── Batch API (delega al gateway: POST /v1/batch + GET stato/risultati) ──────
+
+/// Singola richiesta di un batch: `custom_id` + system/user prompt risolti dal
+/// chiamante. Il `model` (per `LlmRequest` del gateway) e' deciso a monte dal
+/// purpose risolto (regola G), comune a tutto il batch, e viene aggiunto qui.
+pub struct GwBatchRequest {
+    /// Identificatore univoco scelto dal chiamante (echeggiato in ogni risultato).
+    pub custom_id: String,
+    /// Prompt di sistema (opzionale): il gateway lo estrae come campo `system`
+    /// del body Messages Anthropic.
+    pub system: Option<String>,
+    /// Prompt utente con il contenuto del file/snippet da analizzare.
+    pub prompt: String,
+}
+
+/// Esito di una singola richiesta del batch, ricollegato al suo `custom_id`.
+/// Esattamente uno tra `content` ed `error` e' valorizzato.
+pub struct GwBatchResult {
+    pub custom_id: String,
+    /// Testo della risposta in caso di successo (vuoto se errore).
+    pub content: String,
+    /// Messaggio d'errore in caso di fallimento del singolo item.
+    pub error: Option<String>,
+}
+
+/// Stato di avanzamento del batch ritornato da `GET /v1/batch/{provider}/{id}`.
+/// `results` valorizzato solo quando `status == "ended"`.
+pub struct GwBatchStatus {
+    /// Stato canonico del gateway: `"in_progress"` | `"ended"`.
+    pub status: String,
+    /// Risultati per `custom_id` (presenti solo a batch terminato).
+    pub results: Vec<GwBatchResult>,
+}
+
+impl GwBatchStatus {
+    /// `true` se il batch e' terminato (risultati pronti).
+    pub fn is_ended(&self) -> bool {
+        self.status == "ended"
+    }
+}
+
+/// Costruisce il client HTTP del gateway con il timeout batch (riuso del punto
+/// unico di trasporto del crate, regola L).
+fn batch_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))
+}
+
+/// Sottomette un batch al gateway (`POST /v1/batch`) pinnando provider+modello
+/// decisi a monte dal purpose (regola G). Converte le richieste interne
+/// (`custom_id`/`system`/`prompt`) nel contratto del gateway
+/// (`{provider, requests:[{custom_id, model, messages, max_tokens}]}`) e ritorna
+/// il `batch_id`. `Err(messaggio)` se URL/token non risolvibili, il gateway e'
+/// irraggiungibile o risponde con errore (il chiamante rigira l'errore al modello).
+///
+/// Solo i provider con batch supportato dal gateway sono validi (oggi:
+/// `anthropic`). Il gateway risponde 400/501 per gli altri: l'errore HTTP
+/// risale onestamente al chiamante (niente fallback inventato).
+pub async fn gateway_batch_submit(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    requests: &[GwBatchRequest],
+    max_tokens: u32,
+) -> Result<String, String> {
+    let base_url = resolve_gateway_url(db).await;
+    let token = resolve_gateway_token();
+
+    let items: Vec<Value> = requests
+        .iter()
+        .map(|r| {
+            let mut messages: Vec<Value> = Vec::new();
+            if let Some(sys) = &r.system {
+                if !sys.is_empty() {
+                    messages.push(json!({ "role": "system", "content": sys }));
+                }
+            }
+            messages.push(json!({ "role": "user", "content": r.prompt }));
+            json!({
+                "custom_id": r.custom_id,
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                // Metadata richiesto dal contratto LlmRequest del gateway.
+                "metadata": { "feature": "batch_analyze_code" },
+            })
+        })
+        .collect();
+    let body = json!({ "provider": provider, "requests": items });
+
+    let client = batch_http_client()?;
+    let resp = client
+        .post(format!("{base_url}/v1/batch"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "gateway LLM irraggiungibile ({base_url}): {e}. \
+                 Verifica che il nexus-gateway sia attivo."
+            )
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "gateway /v1/batch ha risposto HTTP {} (provider {provider}): {detail}",
+            status.as_u16()
+        ));
+    }
+
+    let parsed: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("risposta gateway /v1/batch non valida: {e}"))?;
+    parsed
+        .get("batch_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("gateway /v1/batch senza campo 'batch_id': {parsed}"))
+}
+
+/// Recupera stato + (se terminato) risultati di un batch
+/// (`GET /v1/batch/{provider}/{batch_id}`). Mappa `results[].response.content`
+/// in `GwBatchResult.content` (parita' col contratto storico atteso dal tool);
+/// gli item con `error` valorizzato producono `error`. `Err(messaggio)` su
+/// gateway irraggiungibile o risposta non valida.
+pub async fn gateway_batch_status(
+    db: &PgPool,
+    provider: &str,
+    batch_id: &str,
+) -> Result<GwBatchStatus, String> {
+    let base_url = resolve_gateway_url(db).await;
+    let token = resolve_gateway_token();
+
+    let client = batch_http_client()?;
+    let resp = client
+        .get(format!("{base_url}/v1/batch/{provider}/{batch_id}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "gateway LLM irraggiungibile ({base_url}): {e}. \
+                 Verifica che il nexus-gateway sia attivo."
+            )
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "gateway /v1/batch/{provider}/{batch_id} ha risposto HTTP {}: {detail}",
+            status.as_u16()
+        ));
+    }
+
+    let parsed: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("risposta gateway stato batch non valida: {e}"))?;
+    Ok(parse_batch_status(&parsed))
+}
+
+/// Parsa la risposta JSON di `GET /v1/batch/{provider}/{id}` nel tipo del crate.
+/// Funzione pura testabile: mappa `response.content` su `content`, altrimenti
+/// `error`. Lo stato sconosciuto e' trattato come `in_progress` (fail-safe:
+/// non si interrompe il polling prima del tempo).
+fn parse_batch_status(body: &Value) -> GwBatchStatus {
+    let status = body
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("in_progress")
+        .to_string();
+    let results: Vec<GwBatchResult> = body
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let custom_id = item.get("custom_id").and_then(Value::as_str)?.to_string();
+                    if let Some(content) = item
+                        .get("response")
+                        .and_then(|r| r.get("content"))
+                        .and_then(Value::as_str)
+                    {
+                        Some(GwBatchResult {
+                            custom_id,
+                            content: content.to_string(),
+                            error: None,
+                        })
+                    } else {
+                        let error = item
+                            .get("error")
+                            .map(|e| match e.as_str() {
+                                Some(s) => s.to_string(),
+                                None => e.to_string(),
+                            })
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        Some(GwBatchResult {
+                            custom_id,
+                            content: String::new(),
+                            error: Some(error),
+                        })
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    GwBatchStatus { status, results }
+}
+
 /// Risolve l'URL del gateway da `settings.nexus_gateway_port` (mig 0239) in modo
 /// TOLLERANTE (no panic): se la lettura fallisce ricade sulla porta di default
 /// documentata. L'override di emergenza `NEXUS_GATEWAY_PORT` (stesso usato
@@ -197,4 +414,82 @@ async fn resolve_gateway_url(db: &PgPool) -> String {
 /// Il fallback dev e' coerente con gli altri call site interni.
 fn resolve_gateway_token() -> String {
     std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN").unwrap_or_else(|_| "dev-internal-token".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_status_in_progress_senza_risultati() {
+        let body = json!({
+            "status": "in_progress",
+            "request_counts": { "processing": 2, "succeeded": 0 },
+            "results": []
+        });
+        let parsed = parse_batch_status(&body);
+        assert_eq!(parsed.status, "in_progress");
+        assert!(!parsed.is_ended());
+        assert!(parsed.results.is_empty());
+    }
+
+    #[test]
+    fn parse_status_ended_mappa_content_e_error() {
+        // Un item con response.content (successo) e uno con error (fallito).
+        let body = json!({
+            "status": "ended",
+            "results": [
+                {
+                    "custom_id": "file-0",
+                    "response": { "content": "analisi ok", "model_used": "claude-x" }
+                },
+                {
+                    "custom_id": "file-1",
+                    "error": { "type": "invalid_request_error", "message": "boom" }
+                }
+            ]
+        });
+        let parsed = parse_batch_status(&body);
+        assert!(parsed.is_ended());
+        assert_eq!(parsed.results.len(), 2);
+
+        let ok = parsed
+            .results
+            .iter()
+            .find(|r| r.custom_id == "file-0")
+            .unwrap();
+        assert_eq!(ok.content, "analisi ok");
+        assert!(ok.error.is_none());
+
+        let ko = parsed
+            .results
+            .iter()
+            .find(|r| r.custom_id == "file-1")
+            .unwrap();
+        assert!(ko.content.is_empty());
+        assert!(ko.error.as_ref().unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn parse_status_error_stringa_diretta() {
+        // Il gateway puo' anche ritornare error come stringa semplice.
+        let body = json!({
+            "status": "ended",
+            "results": [
+                { "custom_id": "c-1", "error": "timeout" }
+            ]
+        });
+        let parsed = parse_batch_status(&body);
+        let item = &parsed.results[0];
+        assert_eq!(item.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn parse_status_sconosciuto_e_in_progress() {
+        // Stato mancante -> in_progress (fail-safe: non interrompe il polling).
+        let body = json!({ "results": [] });
+        let parsed = parse_batch_status(&body);
+        assert_eq!(parsed.status, "in_progress");
+        assert!(!parsed.is_ended());
+    }
 }

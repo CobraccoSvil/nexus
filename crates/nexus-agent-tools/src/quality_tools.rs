@@ -5,7 +5,19 @@
 use serde_json::Value;
 use sqlx::Row;
 
+use super::gateway_client::{
+    gateway_batch_status, gateway_batch_submit, GwBatchRequest,
+};
 use super::ToolContextCore;
+use nexus_types::routing_client::resolve_purpose_via_http;
+
+/// Purpose del routing per il batch-analyze (regola G: modello dal DB, non
+/// hardcoded). Tier-only in `nexus_purpose_model` (mig 0102/0136).
+const BATCH_PURPOSE: &str = "anthropic_batch";
+
+/// `max_tokens` di generazione per ogni richiesta del batch. Non e' un nome di
+/// modello (regola G): e' il tetto di output, allineato al default del gateway.
+const BATCH_MAX_TOKENS: u32 = 4096;
 
 pub async fn tool_scan_code_quality(ctx: &ToolContextCore, input: &Value) -> String {
     let file_path = input.get("file_path").and_then(Value::as_str);
@@ -164,7 +176,7 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
     let system_prompt = batch_role_prompt(&ctx.db, task).await;
 
     // Leggi il contenuto dei file non forniti
-    let mut requests: Vec<serde_json::Value> = Vec::new();
+    let mut requests: Vec<GwBatchRequest> = Vec::new();
     for (i, file_obj) in files_arr.iter().enumerate() {
         let path_str = match file_obj.get("path").and_then(Value::as_str) {
             Some(p) => p.to_string(),
@@ -198,100 +210,74 @@ pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> St
                 }
             }
         };
-        requests.push(serde_json::json!({
-            "custom_id": format!("file-{}", i),
-            "system": system_prompt.clone(),
-            "prompt": format!("File: {}\n\n```\n{}\n```\n\nEsegui il task '{}' su questo file.", path_str, &content[..content.len().min(32000)], task),
-        }));
+        requests.push(GwBatchRequest {
+            custom_id: format!("file-{i}"),
+            system: Some(system_prompt.clone()),
+            prompt: format!(
+                "File: {}\n\n```\n{}\n```\n\nEsegui il task '{}' su questo file.",
+                path_str,
+                &content[..content.len().min(32000)],
+                task
+            ),
+        });
     }
 
     if requests.is_empty() {
         return "[batch_analyze_code] Nessun file valido trovato".to_string();
     }
 
-    let brain_http_url =
-        std::env::var("BRAIN_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    let client = reqwest::Client::new();
-
-    // Sottomette il batch
-    let submit_resp = match client
-        .post(format!("{brain_http_url}/batch-analyze/submit"))
-        .json(&serde_json::json!({ "requests": requests }))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return format!("[batch_analyze_code] Errore sottomissione batch: {e}"),
-    };
-    let batch_id = match submit_resp.json::<serde_json::Value>().await {
-        Ok(v) => match v.get("batch_id").and_then(Value::as_str) {
-            Some(id) => id.to_string(),
-            None => return format!("[batch_analyze_code] Risposta batch non valida: {v}"),
-        },
-        Err(e) => return format!("[batch_analyze_code] Errore parsing risposta submit: {e}"),
+    // Provider/modello dal purpose (regola G: niente modello hardcoded). Il batch
+    // del gateway oggi supporta solo Anthropic: se il purpose risolve un altro
+    // provider, il gateway risponde 400/501 e l'errore risale onestamente al
+    // modello (niente fallback inventato, regola H).
+    let (provider, model) = match resolve_purpose_via_http(&ctx.db, BATCH_PURPOSE).await {
+        Ok(pm) => pm,
+        Err(e) => {
+            return format!(
+                "[batch_analyze_code] modello batch non risolvibile (purpose '{BATCH_PURPOSE}'): {e}. \
+                 Verifica nexus_purpose_model.{BATCH_PURPOSE} (mig 0102/0136)."
+            );
+        }
     };
 
-    // Poll con backoff esponenziale (max 10 minuti)
+    // Sottomette il batch al gateway Rust (POST /v1/batch).
+    let batch_id =
+        match gateway_batch_submit(&ctx.db, &provider, &model, &requests, BATCH_MAX_TOKENS).await {
+            Ok(id) => id,
+            Err(e) => return format!("[batch_analyze_code] Errore sottomissione batch: {e}"),
+        };
+
+    // Poll con backoff esponenziale (max 10 minuti) su GET /v1/batch/{provider}/{id}.
     let mut wait_secs = 2u64;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
-    loop {
+    let results = loop {
         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
         wait_secs = (wait_secs * 2).min(60);
 
-        let status_resp = match client
-            .get(format!("{brain_http_url}/batch-analyze/{batch_id}/status"))
-            .send()
-            .await
-        {
-            Ok(r) => r,
+        let snapshot = match gateway_batch_status(&ctx.db, &provider, &batch_id).await {
+            Ok(s) => s,
             Err(e) => return format!("[batch_analyze_code] Errore polling status: {e}"),
         };
-        let status_json = match status_resp.json::<serde_json::Value>().await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let processing_status = status_json
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if processing_status == "ended" {
-            break;
+        if snapshot.is_ended() {
+            break snapshot.results;
         }
         if tokio::time::Instant::now() >= deadline {
             return format!(
-                "[batch_analyze_code] Timeout: il batch {} non ha terminato in 10 minuti",
-                batch_id
+                "[batch_analyze_code] Timeout: il batch {batch_id} non ha terminato in 10 minuti"
             );
         }
-    }
-
-    // Recupera i risultati
-    let results_resp = match client
-        .get(format!("{brain_http_url}/batch-analyze/{batch_id}/results"))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return format!("[batch_analyze_code] Errore recupero risultati: {e}"),
-    };
-    let results: Vec<serde_json::Value> = match results_resp.json().await {
-        Ok(v) => v,
-        Err(e) => return format!("[batch_analyze_code] Errore parsing risultati: {e}"),
     };
 
-    // Formatta output
+    // Formatta output (custom_id -> file, preservando la forma storica).
     let mut output_parts: Vec<String> = Vec::new();
     for (i, file_obj) in files_arr.iter().enumerate() {
         let path_str = file_obj.get("path").and_then(Value::as_str).unwrap_or("?");
         let custom_id = format!("file-{i}");
-        if let Some(result) = results
-            .iter()
-            .find(|r| r.get("custom_id").and_then(Value::as_str) == Some(&custom_id))
-        {
-            if let Some(content) = result.get("content").and_then(Value::as_str) {
-                output_parts.push(format!("### {path_str}\n\n{content}"));
-            } else if let Some(err) = result.get("error").and_then(Value::as_str) {
+        if let Some(result) = results.iter().find(|r| r.custom_id == custom_id) {
+            if let Some(err) = &result.error {
                 output_parts.push(format!("### {path_str}\n\n[Errore: {err}]"));
+            } else if !result.content.is_empty() {
+                output_parts.push(format!("### {path_str}\n\n{}", result.content));
             }
         }
     }
