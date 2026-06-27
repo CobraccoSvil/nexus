@@ -39,6 +39,11 @@ pub(crate) mod rag_search;
 pub(crate) mod sandbox;
 pub(crate) mod semantic_tools;
 pub(crate) mod service;
+// Orchestrazione NATIVA dei sub-agenti (porting di /agent/subagent-run): vive in
+// mcp-core perche' richiede crate::native_engine (la gerarchia mcp-core ->
+// nexus-agent-tools impedisce a subagent.rs di chiamarlo). Intercetta i tool
+// dispatch_subagent* prima della delega.
+pub(crate) mod subagent_native;
 pub(crate) mod testing;
 pub(crate) mod tool_not_found;
 pub(crate) mod visual_compare;

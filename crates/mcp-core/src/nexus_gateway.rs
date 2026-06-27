@@ -172,6 +172,20 @@ impl NexusGatewayClient {
         }
     }
 
+    /// Costruisce il client risolvendo la porta del gateway dal DB (regola G:
+    /// niente porta hardcoded; il solo segreto del token resta in env, come in
+    /// `main.rs`). PUNTO UNICO (regola L) del cablaggio gateway riusato da
+    /// `build_native_deps` (run principale) e dall'orchestrazione sub-agente
+    /// nativa (`agent_tools::subagent_native`): prima la sequenza
+    /// `resolve_port -> format url -> NexusGatewayClient::new` era duplicata.
+    pub async fn from_db(db: &sqlx::PgPool) -> Self {
+        let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
+        let gw_url = format!("http://127.0.0.1:{gw_port}");
+        let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
+            .unwrap_or_else(|_| "dev-internal-token".to_string());
+        Self::new(gw_url, gw_token)
+    }
+
     pub async fn complete(&self, req: GwRequest) -> Result<GwResponse> {
         let resp = self
             .http

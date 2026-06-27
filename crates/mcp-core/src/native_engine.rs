@@ -193,6 +193,15 @@ pub struct NativeRunInput {
     pub automation_mode: String,
     /// Canale broadcast SSE del run (lo stesso di `run_via_brain`, `agent_channels`).
     pub step_tx: broadcast::Sender<AgentStepEvent>,
+    /// Run genitore quando questo run e' un SUB-RUN (sub-agente nativo). `None` per
+    /// il run principale. Propagato nello stato (`AgentState::parent_run_id`) per
+    /// far convergere il sub-run col path Python (`run_subagent`).
+    pub parent_run_id: Option<Uuid>,
+    /// Profondita' di annidamento del sub-agente (1 = sub-run chiamato dal main).
+    /// `None` per il run principale. Valorizza `AgentState::subagent_depth`: il
+    /// grafo nativo lo usa per il guard anti-esplosione del fan-out explore
+    /// (`UnderstandingNode`, `subagent_depth >= 1 -> skip`) e per l'anti-ricorsione.
+    pub subagent_depth: Option<i64>,
 }
 
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
@@ -882,6 +891,12 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         // routing) e' un miglioramento separato, valido per ENTRAMBI i motori
         // (fuori scope: andrebbe cambiato PRIMA lato Python, vedi nota costante).
         behavior_mode: Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE.to_string()),
+        // Sub-agente nativo (porting di `run_subagent`): valorizza parent/depth nello
+        // stato cosi' il grafo applica i guard di annidamento (UnderstandingNode skip
+        // del fan-out explore se depth>=1). `None` per il run principale -> stato
+        // INVARIATO (default None). Solo `dispatch_subagent` popola questi campi.
+        parent_run_id: input.parent_run_id.map(|u| u.to_string()),
+        subagent_depth: input.subagent_depth,
         ..Default::default()
     }
 }
@@ -1265,6 +1280,9 @@ mod tests {
             action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
             automation_mode: "automatic".to_string(),
             step_tx: tx,
+            // Run principale di test: nessun annidamento sub-agente.
+            parent_run_id: None,
+            subagent_depth: None,
         }
     }
 
@@ -1324,6 +1342,36 @@ mod tests {
         input.tools_json = serde_json::Value::Null;
         let state = build_initial_state(&input, RunRole::Primary);
         assert!(state.tools_json.is_none(), "tools null -> None");
+    }
+
+    /// Run PRINCIPALE (default): nessun parent/depth sub-agente nello stato.
+    #[test]
+    fn initial_state_principale_senza_parent_depth() {
+        let input = sample_input();
+        let state = build_initial_state(&input, RunRole::Primary);
+        assert_eq!(state.parent_run_id, None, "run principale: nessun parent");
+        assert_eq!(state.subagent_depth, None, "run principale: nessun depth");
+    }
+
+    /// SUB-RUN nativo: parent_run_id + subagent_depth propagati nello stato cosi'
+    /// il grafo applica i guard di annidamento (UnderstandingNode skip se depth>=1).
+    #[test]
+    fn initial_state_subrun_propaga_parent_e_depth() {
+        let mut input = sample_input();
+        let parent = Uuid::new_v4();
+        input.parent_run_id = Some(parent);
+        input.subagent_depth = Some(2);
+        let state = build_initial_state(&input, RunRole::Primary);
+        assert_eq!(
+            state.parent_run_id.as_deref(),
+            Some(parent.to_string().as_str()),
+            "sub-run: parent_run_id propagato"
+        );
+        assert_eq!(
+            state.subagent_depth,
+            Some(2),
+            "sub-run: subagent_depth propagato (anti-ricorsione/guard fan-out)"
+        );
     }
 
     /// FIX shadow LLM-Replay: nel ramo Shadow, con `intent_hint` OPERATIVO

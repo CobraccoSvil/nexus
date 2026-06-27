@@ -13,8 +13,8 @@ use super::semantic_tools::{
 use super::{
     archive_tools, attachment_inspector, attachments, command, dev_diagnostics, dispatcher,
     document_tools, figma_tools, files, git, knowledge, ports, project_db_query, rag_search,
-    sandbox, scaffold_verifier, service, shadcn_setup, subagent, testing, todos, tool_not_found,
-    vision_tools, visual_compare, AgentToolContext,
+    sandbox, scaffold_verifier, service, shadcn_setup, subagent_native, testing, todos,
+    tool_not_found, vision_tools, visual_compare, AgentToolContext,
 };
 
 /// Esegue un tool per conto dell'agente.
@@ -38,13 +38,17 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_list_ports" => ports::tool_nexus_list_ports(ctx, input).await,
         // PR-1 Plan/Act/Verify: emette/aggiorna la TODO list del planner.
         "nexus_todo_write" => todos::tool_nexus_todo_write(ctx, input).await,
-        // PR-3 sub-agents: delega a un sub-agent isolato (riabilita ex M55).
-        "dispatch_subagent" => subagent::tool_dispatch_subagent(ctx, input).await,
-        // Comp.0/3b: batch parallelo di sub-agent (base del DAG scheduler).
-        "dispatch_subagents" => subagent::tool_dispatch_subagents(ctx, input).await,
-        // PR-3 sub-agents: poll + resume per background runs.
-        "nexus_subagent_poll" => subagent::tool_nexus_subagent_poll(ctx, input).await,
-        "nexus_subagent_resume" => subagent::tool_nexus_subagent_resume(ctx, input).await,
+        // Sub-agents NATIVI (zero-Python): il sub-run gira sul grafo Rust
+        // (crate::native_engine::run_native) in-process, niente piu' chiamata al
+        // brain /agent/subagent-run. L'orchestrazione vive in mcp-core perche'
+        // richiede native_engine (regola gerarchia crate); le guard
+        // enabled/whitelist/depth/cost sono replicate DB-driven (regola G).
+        "dispatch_subagent" => subagent_native::tool_dispatch_subagent(ctx, input).await,
+        // Batch parallelo di sub-agent nativi (base del DAG scheduler).
+        "dispatch_subagents" => subagent_native::tool_dispatch_subagents(ctx, input).await,
+        // Poll (DB-only) + resume (ri-esecuzione nativa) dei sub-agent.
+        "nexus_subagent_poll" => subagent_native::tool_nexus_subagent_poll(ctx, input).await,
+        "nexus_subagent_resume" => subagent_native::tool_nexus_subagent_resume(ctx, input).await,
         "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
         "run_service" => service::tool_run_service(ctx, input, "service").await,
         "read_terminal_output" => service::tool_read_service_output(ctx, input).await,

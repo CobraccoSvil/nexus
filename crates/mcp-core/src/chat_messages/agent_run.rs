@@ -2053,6 +2053,10 @@ pub(crate) async fn spawn_agent_run(
                     action_oriented_min_score: primary_classifier.action_oriented_min_score,
                     automation_mode: automation_mode_for_brain.clone(),
                     step_tx: tx_for_brain.clone(),
+                    // Run PRINCIPALE (non sub-agente): nessun parent/depth. Solo
+                    // `dispatch_subagent` (subagent_native) popola questi campi.
+                    parent_run_id: None,
+                    subagent_depth: None,
                 };
                 match run_via_native(&state_for_finalize, &native_input).await {
                     Ok(outcome) => {
@@ -3249,6 +3253,9 @@ pub(crate) async fn spawn_agent_run(
                     // nulla), questo tx esiste solo per soddisfare la firma di
                     // NativeRunInput e viene scartato.
                     step_tx: shadow_tx,
+                    // Shadow del run PRINCIPALE: nessun parent/depth sub-agente.
+                    parent_run_id: None,
+                    subagent_depth: None,
                 };
                 let primary_run_id = run_id;
                 tokio::spawn(async move {
@@ -3527,13 +3534,8 @@ async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps
         port_registry: state.port_registry.clone(),
     };
 
-    // Client gateway dalla porta nel DB (regola G: niente env/porta hardcoded; il
-    // solo segreto del token resta in env, come in main.rs).
-    let gw_port = nexus_auth::resolve_port(&state.db, "nexus_gateway_port").await;
-    let gw_url = format!("http://127.0.0.1:{gw_port}");
-    let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| "dev-internal-token".to_string());
-    let gateway = crate::nexus_gateway::NexusGatewayClient::new(gw_url, gw_token);
+    // Client gateway dalla porta nel DB (regola G/L: punto unico del cablaggio).
+    let gateway = crate::nexus_gateway::NexusGatewayClient::from_db(&state.db).await;
 
     crate::native_engine::NativeDeps {
         db: state.db.clone(),

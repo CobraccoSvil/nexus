@@ -30,7 +30,10 @@ pub mod read_cache;
 pub mod safety;
 pub mod scaffold_verifier;
 pub mod shadcn_setup;
-pub mod subagent;
+// NB: l'orchestrazione dei sub-agenti vive in `mcp-core::agent_tools::subagent_native`
+// (richiede `native_engine`, non accessibile da qui per la gerarchia crate). Il
+// vecchio modulo `subagent` che chiamava il brain /agent/subagent-run e' stato
+// rimosso nel porting a grafo nativo (zero-Python).
 pub mod todos;
 pub mod tool_schema;
 pub mod url_scanner;
