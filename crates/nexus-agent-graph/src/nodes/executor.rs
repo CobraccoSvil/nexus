@@ -677,8 +677,24 @@ piu' specifico, oppure riprova con un modello piu' capace.",
         // modello piu' capace invece di bruciare iterazioni fino a iteration_cap.
         // Soglia DB-driven (g1_max_nudges, regola G); 4x = ben oltre il budget nudge,
         // quindi un run legittimo che progredisce non viene escalato per errore.
-        let g1_cap_effective = g1.cap_reached
-            || (unfulfilled_for_g1 && iters_in >= self.cfg.g1_max_nudges.saturating_mul(4));
+        // La soglia cresce col numero di escalation gia' fatte (auto_escalations):
+        // ogni modello promosso riceve un nuovo budget di iterazioni prima del cap
+        // successivo, evitando escalation "a raffica" che non darebbero a nessun
+        // modello una chance reale di convergere (la prima escalation azzera i
+        // contatori re-entry ma non iters_in, quindi una soglia fissa ri-scatterebbe
+        // subito). Cap assoluto iteration_cap resta la safety net finale.
+        let g1_escal_now = state
+            .extra
+            .get("auto_escalations")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let g1_loop_threshold = self
+            .cfg
+            .g1_max_nudges
+            .saturating_mul(4)
+            .saturating_mul(g1_escal_now + 1);
+        let g1_cap_effective =
+            g1.cap_reached || (unfulfilled_for_g1 && iters_in >= g1_loop_threshold);
         if matches!(head_gate(false, false, 0, g1_cap_effective), HeadGate::G1Cap) {
             // ESCALATION orchestratore (py:1962-1993): prima di arrenderci, l'
             // orchestratore PROMUOVE il turno a un modello piu' capace (catena DB
