@@ -184,14 +184,13 @@ pub async fn project_snapshot(
     let want = |t: &str| topics_filter.as_ref().is_none_or(|s| s.contains(t));
 
     // Seq corrente (cliente userra' come `since` per il successivo event-stream)
+    // Seq corrente reale del canale (P2): il client lo usa come `since` per
+    // riagganciare lo stream senza perdere eventi. Prima era hardcoded a 0 ->
+    // snapshot incoerente / SnapshotRequired ricorrenti.
     let current_seq = state
         .project_channels
         .get(&project_id)
-        .map(|ch| {
-            // Leggi seq senza incrementare
-            ch.tx.receiver_count(); // touch
-            0u64 // semplice: il client riceve solo eventi dopo aver fatto subscribe
-        })
+        .map(|ch| ch.current_seq())
         .unwrap_or(0);
 
     let mut snapshot = json!({

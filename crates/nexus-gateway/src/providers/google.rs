@@ -566,7 +566,17 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
         }
     }
 
+    // Buffer functionResponse: Gemini vuole TUTTE le functionResponse di un turno
+    // model multi-functionCall raggruppate in UN unico turno user (altrimenti HTTP
+    // 400 "number of function response parts is equal to function call parts").
+    let mut pending_fn_responses: Vec<GooglePart> = Vec::new();
     for msg in &req.messages {
+        if msg.role.as_str() != "tool" && !pending_fn_responses.is_empty() {
+            contents.push(GoogleContent {
+                role: Some("user".to_string()),
+                parts: std::mem::take(&mut pending_fn_responses),
+            });
+        }
         match msg.role.as_str() {
             "system" => {
                 system_instruction = Some(GoogleContent {
@@ -587,10 +597,8 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
                     .or_else(|| msg.tool_call_id.clone())
                     .unwrap_or_default();
                 let response = serde_json::json!({ "result": content_to_string(&msg.content) });
-                contents.push(GoogleContent {
-                    role: Some("user".to_string()),
-                    parts: vec![GooglePart::function_response(name, response)],
-                });
+                // Accumula: raggruppate sotto in UN turno user (Gemini parity).
+                pending_fn_responses.push(GooglePart::function_response(name, response));
             }
             // Assistant con tool-call: emette role=`model` con una part
             // `functionCall` per ciascuna call (parita' col Python ~807-817). La
@@ -643,6 +651,14 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
                 });
             }
         }
+    }
+    // Flush finale delle functionResponse accumulate (history che termina con
+    // uno o piu' tool-result): stesso raggruppamento in un unico turno user.
+    if !pending_fn_responses.is_empty() {
+        contents.push(GoogleContent {
+            role: Some("user".to_string()),
+            parts: std::mem::take(&mut pending_fn_responses),
+        });
     }
 
     // Fix hollow completion: alza il tetto di output del budget thinking cosi'

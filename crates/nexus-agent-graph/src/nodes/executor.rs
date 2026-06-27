@@ -594,6 +594,40 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // non divergono. Quando ON richiederanno il sotto-sistema sub-agenti.
 
         // ── (5) G1 cap/reentry: conteggio (g1_accounting) + decisione ─────────
+        // ── (4c) CAP ASSOLUTO iterazioni: safety net finale anti-runaway ────
+        // Chiude DETERMINISTICAMENTE il turno se il run ha raggiunto il tetto di
+        // iterazioni (iteration_cap, DB-driven), anche quando ogni altro meccanismo
+        // (G1 cap, progress_controller, forced-text) ha fallito: es. un modello che
+        // ignora tool_choice=required e continua a descrivere senza agire. Evita il
+        // runaway di iterazioni/costi osservato con gemini (45+ giri).
+        if iters_in >= self.cfg.iteration_cap {
+            let cap_text = format!(
+                "Raggiunto il numero massimo di iterazioni ({}) senza completare il \
+compito. Interrompo per evitare un ciclo infinito: riformula la richiesta in modo \
+piu' specifico, oppure riprova con un modello piu' capace.",
+                self.cfg.iteration_cap
+            );
+            tracing::warn!(
+                target: "nexus_agent_graph::executor",
+                iters = iters_in,
+                cap = self.cfg.iteration_cap,
+                "CAP ASSOLUTO iterazioni raggiunto -> chiusura deterministica"
+            );
+            return Ok(StateDelta {
+                messages: Some(vec![Message::Ai {
+                    content: MessageContent::text(cap_text.clone()),
+                    tool_calls: vec![],
+                }]),
+                result: Some(Some(cap_text)),
+                pending_tool_uses: Some(Some(vec![])),
+                stop_reason: Some(Some(StopReason::EndTurn)),
+                iterations: Some(Some(iters_in + 1)),
+                forced_close_unverified: Some(Some(true)),
+                ..Default::default()
+            }
+            .into_opaque());
+        }
+
         let mut g1_reroute_count = state.g1_reroute_count.unwrap_or(0);
         // Segnali derivati dai punti unici (regola L: non ricalcolati a mano).
         let unfulfilled_for_g1 = match closure_verdict_fulfilled(state) {
@@ -1490,11 +1524,27 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         // di OGNI interrogazione (ripristino visibilita' pre-porting). Solo su risposta
         // valida (non sull'errore sintetico). Riusa il canale gia' tradotto da event_sink.
         if !gateway_errored {
-            if let Some(r) = resp.reasoning.as_deref() {
-                let r = r.trim();
-                if !r.is_empty() {
-                    ctx.emit.emit(SseEvent::ThinkingDelta { delta: r.to_string() });
+            // Pensiero del modello: il reasoning aggregato (modelli "thinking")
+            // OPPURE, per i modelli non-thinking (gemini) che non lo emettono, il
+            // content testuale dei turni CON tool_call (ragionamento pre-azione) —
+            // cosi' il ThinkingBlock mostra SEMPRE cosa sta ragionando l'agente,
+            // senza duplicare la risposta conversazionale finale (turni senza tool).
+            let from_reasoning = resp
+                .reasoning
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let thinking = match from_reasoning {
+                Some(r) => Some(r),
+                None if !resp.tool_calls.is_empty() => {
+                    let c = resp.content.trim();
+                    if c.is_empty() { None } else { Some(c.to_string()) }
                 }
+                None => None,
+            };
+            if let Some(t) = thinking {
+                ctx.emit.emit(SseEvent::ThinkingDelta { delta: t });
             }
         }
 

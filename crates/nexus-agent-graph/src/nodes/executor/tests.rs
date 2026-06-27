@@ -1037,6 +1037,32 @@ async fn esplorazione_senza_candidato_aborta() {
 // ──────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn cap_assoluto_iterazioni_chiude() {
+    // REGRESSIONE loop G1 infinito: a iters_in >= iteration_cap il nodo chiude
+    // deterministicamente (EndTurn, forced_close_unverified) SENZA chiamare l'LLM,
+    // anche se il modello ignora il forcing e continua a descrivere.
+    let rc = Arc::new(StubRunControlStore::default());
+    let mut cfg = cfg_resolved();
+    cfg.iteration_cap = 10;
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("task complesso")],
+        iterations: Some(10), // == iteration_cap
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    assert!(out.result.as_deref().unwrap().contains("massimo di iterazioni"));
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn billing_fail_fast_chiude_loop_abort() {
     // Soglia esplorazione raggiunta + il PROVIDER IN USO in cooldown billing ->
     // chiusura onesta loop_abort PRIMA della chiamata LLM (py:2072-2092 + fix

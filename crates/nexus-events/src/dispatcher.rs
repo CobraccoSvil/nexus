@@ -47,6 +47,13 @@ impl ProjectChannel {
     pub fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
     }
+
+    /// Seq corrente del canale (ultimo numero di sequenza emesso), senza
+    /// incrementare. Punto unico (regola L) per lo snapshot SSE: il client lo usa
+    /// come `since` per riagganciare lo stream senza buchi/duplicati.
+    pub fn current_seq(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 pub type ProjectChannels = Arc<DashMap<Uuid, Arc<ProjectChannel>>>;
