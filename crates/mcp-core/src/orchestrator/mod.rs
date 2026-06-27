@@ -15,12 +15,12 @@ pub fn set_llm_classifier_enabled(val: bool) {
 use serde_json::Value;
 use uuid::Uuid;
 
-// Re-export: i submodule fanno `use super::*` e ottengono questi tipi senza
-// duplicare il blocco `use mcp_proto::neural::{...}` (regola L, S73).
-// `GenerateCompletion`/`GenerateAgentTurn` non transitano piu' dal brain gRPC
-// (cablati al Nexus LLM Gateway in `neural_client.rs`): qui resta solo il client
-// per gli RPC ancora serviti dal brain (generate_document, ...).
-pub(crate) use mcp_proto::neural::neural_core_service_client::NeuralCoreServiceClient;
+// `NeuralCoreClient` non incapsula piu' un canale gRPC verso il brain: tutti i
+// suoi metodi delegano all'embedder ONNX in-process o al Nexus LLM Gateway. Per
+// questo non serve piu' ri-esportare `NeuralCoreServiceClient` (il tipo generato
+// dal proto): l'ultimo uso (`generate_document`) e' migrato in-process in
+// `crate::docx_render`. `GenerateCompletion`/`GenerateAgentTurn` erano gia'
+// cablati al gateway in `neural_client.rs`.
 
 use crate::nexus_gateway::NexusGatewayClient;
 

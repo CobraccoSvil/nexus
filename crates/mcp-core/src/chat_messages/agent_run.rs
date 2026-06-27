@@ -1062,6 +1062,46 @@ async fn native_outcome_to_run_result(
     }
 }
 
+/// Costruisce un [`AgentRunResult`] FAILED ONESTO per il fallimento del motore
+/// nativo PRIMARIO (regola H: nessun fallback mascherato al brain). Converge sullo
+/// stesso finalizzatore del path normale (regola L) impostando `native_result`:
+/// status `Failed`, `final_answer` = messaggio diagnostico gia' sanificato (regola
+/// F: niente stack trace), `stop_reason = "error"`. `error_class = None` (non e'
+/// un errore provider classificabile: e' un fallimento di esecuzione del grafo) ->
+/// il loop di retry NON lo ritenta su altri provider (vedi `failed_retry`).
+fn native_engine_failure_result(
+    run_id: Uuid,
+    provider: &str,
+    model: &str,
+    final_answer: String,
+) -> crate::agent_types::AgentRunResult {
+    crate::agent_types::AgentRunResult {
+        run_id: run_id.to_string(),
+        status: AgentRunStatus::Failed,
+        steps: Vec::new(),
+        pending_actions: Vec::new(),
+        final_answer: Some(final_answer),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        iteration_count: 0,
+        nexus_override_applied: false,
+        nexus_agent_type: None,
+        nexus_q_value: None,
+        nexus_task_type: None,
+        provider_privacy_notice: None,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        total_cost: 0.0,
+        last_prompt_tokens: None,
+        error_class: None,
+        stop_reason: Some("error".to_string()),
+        hollow_completion: false,
+        hollow_no_tools: false,
+        hollow_completion_kind: String::new(),
+    }
+}
+
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
 /// Ritorna `SpawnOutcome::NotStarted` se il progetto non è caricabile (fallback al
 /// singolo turn) e `SpawnOutcome::Disambiguation` se l'intent e' ambiguo (turno
@@ -2009,14 +2049,17 @@ pub(crate) async fn spawn_agent_run(
             let mut native_result: Option<crate::agent_types::AgentRunResult> = None;
             let mut native_steps_persisted = false;
             if engine == Engine::Rust {
-                // ── Engine::Rust (cutover) — NON instradato in produzione ─────────
-                // select_engine ritorna SEMPRE Python (regola G). Se per dati DB
-                // venisse selezionato il motore nativo come PRIMARIO, lo si esegue;
-                // su QUALUNQUE errore si logga e si cade sul motore Python
-                // (fail-safe), come da confine strangler-fig. Il path nativo riusa
-                // gli stessi input gia' risolti a monte (regola L) + le dipendenze
-                // infra da AppState. NB: lo SHADOW non passa di qui — il suo primario
-                // resta Python (run_via_brain) e lo shadow Rust gira DOPO, aggiuntivo.
+                // ── Engine::Rust (cutover verso zero-Python) ──────────────────────
+                // Se `select_engine` seleziona il motore nativo come PRIMARIO, lo si
+                // esegue. Su Err NON si cade piu' sul motore Python (regola H): il
+                // brain sparira' (zero-Python) e un fallback automatico mascherava il
+                // fallimento del grafo nativo dietro un secondo run su un altro motore
+                // (esito disonesto, doppio costo). Su Err si finalizza il run come
+                // FAILED diagnosticato (`native_engine_failure_result`), convergendo
+                // sullo stesso finalizzatore (regola L). Il path nativo riusa gli
+                // stessi input gia' risolti a monte (regola L) + le dipendenze infra
+                // da AppState. NB: lo SHADOW non passa di qui — il suo primario resta
+                // Python (run_via_brain) e lo shadow Rust gira DOPO, aggiuntivo.
                 // ── Parita' PRIMARIO RUST col primario Python: action_oriented ──────
                 // Il primario nativo (RunRole::Primary) deve derivare action_oriented/
                 // report_only ESATTAMENTE come il primario Python (che riclassifica nel
@@ -2081,11 +2124,33 @@ pub(crate) async fn spawn_agent_run(
                         native_steps_persisted = true;
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        // Regola H (fix definitivo, non toppa): un errore del motore
+                        // nativo PRIMARIO e' un fallimento del run, NON un motivo per
+                        // cambiare motore. Il vecchio fallback automatico a
+                        // `run_via_brain` (Python) mascherava il problema del grafo
+                        // nativo dietro un secondo run su un altro motore (esito
+                        // disonesto, doppio costo, e — verso zero-Python — su un brain
+                        // che sparira'). Si finalizza come FAILED diagnosticato: il
+                        // run converge sullo STESSO finalizzatore (regola L) via
+                        // `native_result`, senza scendere nel loop Python.
+                        tracing::error!(
                             run_id = %run_id,
-                            error = %e,
-                            "motore nativo selezionato ma esecuzione fallita: fallback al motore Python"
+                            "motore nativo: esecuzione fallita — run finalizzato come failed (nessun fallback al brain, regola H)"
                         );
+                        let msg = format!(
+                            "Il motore nativo non e' riuscito a completare il run ({}). \
+                             Il run e' stato chiuso come non riuscito.",
+                            crate::brain_agent_client::sanitize_error_for_user(&e.to_string())
+                        );
+                        native_result = Some(native_engine_failure_result(
+                            run_id,
+                            &provider_clone,
+                            &model_clone,
+                            msg,
+                        ));
+                        // Gli step prodotti prima dell'errore sono gia' su agent_steps
+                        // (PgAgentStepStore): non re-inserirli (idempotenza).
+                        native_steps_persisted = true;
                     }
                 }
             }
@@ -3506,15 +3571,166 @@ pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
 /// (`ToolRunnerDeps` + client gateway) e le passa con gli input del run gia'
 /// risolti a monte (regola L: prompt/tools/history NON ricostruiti qui).
 ///
-/// NON instradato in produzione: `select_engine` ritorna SEMPRE `Python` (regola
-/// G), quindi questo path e' eseguibile/testato ma mai chiamato sul flusso reale
-/// — regressione NULLA. Su errore il chiamante fa fallback al motore Python.
+/// Su errore il chiamante NON fa piu' fallback al brain (regola H, verso
+/// zero-Python): un Err finalizza il run come FAILED diagnosticato
+/// (`native_engine_failure_result`), non maschera il fallimento del grafo dietro
+/// un secondo run su un altro motore.
 pub(crate) async fn run_via_native(
     state: &AppState,
     input: &crate::native_engine::NativeRunInput,
 ) -> anyhow::Result<crate::native_engine::NativeRunOutcome> {
     let deps = build_native_deps(state).await;
     crate::native_engine::run_native(&deps, input).await
+}
+
+/// RESUME di un run nativo (Engine::Rust) sospeso su `awaiting_confirmation`.
+///
+/// PUNTO UNICO (regola L) del resume nativo lato call site: riusa
+/// `build_native_deps` (stesso cablaggio infra di `run_via_native`) e delega al
+/// motore via [`crate::native_engine::resume_native`], che riparte dal checkpoint
+/// Postgres iniettando il `resume_message` di approvazione. Il GRAFO riprende dal
+/// nodo salvato nel checkpoint: l'`input` serve solo a popolare ctx + porte I/O
+/// (provider/model/session/canale SSE), NON a ricostruire lo stato (gia' nel
+/// checkpoint).
+pub(crate) async fn resume_via_native(
+    state: &AppState,
+    input: &crate::native_engine::NativeRunInput,
+    resume_message: &str,
+) -> anyhow::Result<crate::native_engine::NativeRunOutcome> {
+    let deps = build_native_deps(state).await;
+    crate::native_engine::resume_native(&deps, input, resume_message).await
+}
+
+/// RESUME completo di un run nativo (Engine::Rust) in `awaiting_confirmation`.
+///
+/// PUNTO UNICO (regola L) del resume HITL lato call site: e' l'analogo nativo del
+/// `POST /agent/approve` del brain (`resume_run`), ma l'esecuzione e' IN-PROCESS,
+/// quindi qui mcp-core deve anche FINALIZZARE l'esito (il brain lo fa da se' via
+/// stream). Riprende il grafo dal checkpoint Postgres (`resume_via_native`),
+/// mappa l'esito con `native_outcome_to_run_result` (mapping unico) e persiste lo
+/// stato terminale + emette `is_final` sul canale SSE del run.
+///
+/// `provider`/`model`/`session_id` sono i valori del run originale (dal record
+/// `agent_runs`): popolano ctx + porte I/O; il GRAFO riparte comunque dal nodo
+/// salvato nel checkpoint (prompt/tools/history NON sono ricostruiti, vivono nel
+/// checkpoint). Su un nuovo interrupt il run resta `awaiting_confirmation`
+/// (l'utente potra' riapprovare). Su errore del motore -> `failed` ONESTO (regola
+/// H: nessun fallback al brain qui, l'esecuzione nativa che fallisce e' un
+/// fallimento del run, non un motivo per cambiare motore).
+///
+/// NB (debito noto, documentato): il grafo nativo NON imposta ancora
+/// `awaiting_confirmation` in alcun nodo (il porting dell'`interrupt_before=
+/// ["executor"]` di graph.py non e' completo), quindi un run engine='rust' non
+/// raggiunge oggi questo stato; questa funzione e' l'aggancio corretto per quando
+/// quel nodo sara' portato. Il resume dei run PYTHON legacy resta sul brain.
+pub(crate) async fn confirm_native_run(
+    state: &AppState,
+    run_id: Uuid,
+    session_id: Uuid,
+    provider: String,
+    model: String,
+    automation_mode: String,
+    resume_message: &str,
+) -> Result<crate::agent_types::AgentRunStatus, String> {
+    // Canale SSE del run: riusa quello esistente (i client sono gia' agganciati);
+    // se assente (es. dopo un restart), creane uno nuovo registrato sotto run_id
+    // cosi' l'is_final finale sblocca eventuali reattach.
+    let tx = match state.agent_channels.get(&run_id) {
+        Some(ch) => ch.clone(),
+        None => {
+            let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
+            state.agent_channels.insert(run_id, tx.clone());
+            tx
+        }
+    };
+
+    // Input MINIMO per il resume: i campi di costruzione dello stato (prompt/
+    // tools/history/classifier) NON servono — il grafo riparte dal checkpoint.
+    // Restano provider/model/session per ctx + porte e il canale SSE.
+    let input = crate::native_engine::NativeRunInput {
+        run_id,
+        session_id,
+        provider: provider.clone(),
+        model: model.clone(),
+        system_text: String::new(),
+        initial_msg: String::new(),
+        conversation_history: Vec::new(),
+        tools_json: serde_json::json!([]),
+        intent_hint: None,
+        requires_tools: None,
+        agentic_score: None,
+        authorizes_changes: None,
+        classifier_resolved: false,
+        action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
+        automation_mode,
+        step_tx: tx.clone(),
+        parent_run_id: None,
+        subagent_depth: None,
+    };
+
+    let outcome = resume_via_native(state, &input, resume_message).await;
+
+    let status = match outcome {
+        Ok(outcome) => {
+            // Mapping unico esito->AgentRunResult (regola L), poi finalize essenziale.
+            let result = native_outcome_to_run_result(&state.db, run_id, outcome).await;
+            let status_str = result.status.as_str();
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
+                 prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
+                 nexus_task_type=$9, provider=$10, model=$11, completed_at=NOW() \
+                 WHERE id=$1",
+            )
+            .bind(run_id)
+            .bind(status_str)
+            .bind(result.final_answer.as_deref())
+            .bind(result.iteration_count as i32)
+            .bind(result.prompt_tokens as i32)
+            .bind(result.completion_tokens as i32)
+            .bind(result.total_tokens as i32)
+            .bind(result.total_cost)
+            .bind(result.nexus_task_type.as_deref())
+            .bind(&result.provider)
+            .bind(&result.model)
+            .execute(&state.db)
+            .await;
+            result.status
+        }
+        Err(e) => {
+            // Regola H: errore del motore nativo -> failed ONESTO, niente fallback
+            // al brain. Il contenuto dell'errore non finisce nei log (regola F):
+            // si logga solo che il resume e' fallito.
+            tracing::error!(run_id = %run_id, "confirm_native_run: resume nativo fallito");
+            let msg = format!(
+                "Il resume nativo del run e' fallito ({}). Il run e' stato chiuso come non riuscito.",
+                crate::brain_agent_client::sanitize_error_for_user(&e.to_string())
+            );
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET status='failed', final_answer=$2, completed_at=NOW() \
+                 WHERE id=$1",
+            )
+            .bind(run_id)
+            .bind(&msg)
+            .execute(&state.db)
+            .await;
+            crate::agent_types::AgentRunStatus::Failed
+        }
+    };
+
+    // is_final sul canale SSE: sblocca i client agganciati (run terminale o nuovo
+    // awaiting_confirmation). Best-effort: nessun subscriber -> ignorato.
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: true,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: None,
+    });
+    state.agent_channels.remove(&run_id);
+
+    Ok(status)
 }
 
 /// Assembla le `NativeDeps` (ToolRunner in-process + client gateway) da
@@ -3775,6 +3991,34 @@ mod tests_select_engine {
             "abort anti-loop -> failed_diagnosed (esito certo)"
         );
         assert_eq!(r.stop_reason.as_deref(), Some("loop_abort"));
+    }
+
+    #[test]
+    fn native_failure_result_e_failed_onesto_senza_retry_class() {
+        // Regola H: un Err del motore nativo -> FAILED diagnosticato, NIENTE
+        // error_class (cosi' il loop di retry non lo ritenta su altri provider) e
+        // stop_reason "error". Nessun fallback al brain mascherato.
+        let run = Uuid::new_v4();
+        let r = native_engine_failure_result(
+            run,
+            "anthropic",
+            "claude-x",
+            "Il motore nativo non e' riuscito a completare il run.".to_string(),
+        );
+        assert_eq!(r.status, AgentRunStatus::Failed);
+        assert!(
+            r.error_class.is_none(),
+            "niente error_class: il fallimento del grafo non e' un errore provider ritentabile"
+        );
+        assert_eq!(r.stop_reason.as_deref(), Some("error"));
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.model, "claude-x");
+        assert!(r.steps.is_empty());
+        assert!(r
+            .final_answer
+            .as_deref()
+            .unwrap_or_default()
+            .contains("non e' riuscito"));
     }
 }
 

@@ -100,6 +100,44 @@ where
         init: Option<S>,
         ctx: &C,
     ) -> Result<StepOutcome<S>, GraphError> {
+        self.run_inner(run_id, init, None, ctx).await
+    }
+
+    /// RESUME HITL: riprende un run sospeso su `awaiting_confirmation` dal suo
+    /// checkpoint, applicando PRIMA un `resume_delta` (l'input umano di
+    /// approvazione: tipicamente azzera `awaiting_confirmation` e inietta il
+    /// messaggio di conferma). Il delta passa per lo STESSO reducer
+    /// ([`GraphState::merge`], punto unico, regola L): nessuna scrittura diretta
+    /// dei campi qui. Poi il motore prosegue dal `next_node` salvato.
+    ///
+    /// Senza `resume_delta` che azzera il predicato di interrupt, lo stato
+    /// caricato avrebbe ancora `is_awaiting_confirmation() == true` e il motore
+    /// si re-interromperebbe al primo route (loop di conferma). Spetta dunque al
+    /// chiamante (mcp-core) costruire il delta che sblocca l'interrupt.
+    pub async fn resume_until_interrupt(
+        &self,
+        run_id: Uuid,
+        resume_delta: crate::state::StateDelta,
+        ctx: &C,
+    ) -> Result<StepOutcome<S>, GraphError> {
+        self.run_inner(run_id, None, Some(resume_delta), ctx).await
+    }
+
+    /// Loop interno condiviso tra avvio nuovo e resume (punto unico, regola L).
+    ///
+    /// `init`/`resume_delta` distinguono i tre ingressi:
+    /// - `init = Some(s)`: avvio nuovo da `entry` con stato `s`.
+    /// - `init = None`, `resume_delta = None`: resume "puro" dal checkpoint
+    ///   (recovery di un run interrotto, riparte dal `next_node` salvato).
+    /// - `init = None`, `resume_delta = Some(d)`: resume HITL — carica il
+    ///   checkpoint e applica `d` (input di approvazione) PRIMA di proseguire.
+    async fn run_inner(
+        &self,
+        run_id: Uuid,
+        init: Option<S>,
+        resume_delta: Option<crate::state::StateDelta>,
+        ctx: &C,
+    ) -> Result<StepOutcome<S>, GraphError> {
         // Risoluzione dello stato e del nodo di partenza.
         let (mut state, mut current) = match init {
             Some(s) => (s, self.entry),
@@ -109,6 +147,13 @@ where
                 .await?
                 .ok_or(GraphError::NoCheckpoint(run_id))?,
         };
+
+        // Resume HITL: applica l'input di approvazione allo stato caricato PRIMA
+        // di valutare l'interrupt o di proseguire. Passa per il reducer (punto
+        // unico): azzera `awaiting_confirmation` e inietta il messaggio.
+        if let Some(delta) = resume_delta {
+            state.merge(delta);
+        }
 
         // Resume di un run gia' concluso: l'ultimo checkpoint puntava a `End`.
         // Non c'e' nulla da rieseguire, il run e' gia' completo.

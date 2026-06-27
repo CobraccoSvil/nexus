@@ -13,9 +13,7 @@ use nexus_types::{api_error, parse_project_id, parse_user_id, ApiError, ApiResul
 use nexus_auth::Claims;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
 use tokio::fs;
-use uuid::Uuid;
 
 use crate::AppState;
 
@@ -115,118 +113,32 @@ pub async fn delete_document(
 }
 
 /// POST /api/documents/generate
-#[derive(Debug, Deserialize)]
-pub struct GenerateDocRequest {
-    pub project_id: String,
-    pub doc_type: String,
-    pub content_json: Value,
-    pub title: Option<String>,
-    pub standard: Option<String>,
-}
-
+///
+/// DEPRECATO (410 Gone). Questo handler duplicava la generazione documenti di
+/// mcp-core ma renderizzava il .docx chiamando il brain Python via REST
+/// (`POST {brain}/generate-document`) — un percorso AI-adiacente al brain, gia'
+/// rotto e mai instradato a runtime (vedi `apps/web-ide/next.config.ts` e
+/// `deploy/nginx-microservices.conf`: le route `/api/documents/*` cadono nel
+/// fallback verso mcp-core, porta 4000).
+///
+/// La generazione documenti vive ESCLUSIVAMENTE in mcp-core, che ora renderizza
+/// il .docx in-process in Rust (`crate::docx_render`, punto unico regola L) senza
+/// alcun round-trip al brain (verso zero-Python). Per evitare di mantenere QUI un
+/// secondo renderer che riapre la dipendenza dal brain (regola H: niente toppe,
+/// niente codice morto che chiama Python), l'endpoint risponde 410 indirizzando
+/// al percorso canonico. Il frontend non lo chiama (usa l'endpoint mcp-core).
 pub async fn generate_document(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    Json(req): Json<GenerateDocRequest>,
+    Json(_req): Json<Value>,
 ) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let pid = parse_project_id(&req.project_id)?;
-
-    let standard = req.standard.as_deref().unwrap_or("ieee830");
-
-    // Get project info
-    let root_row = sqlx::query("SELECT w.absolute_path, p.name FROM workspaces w JOIN projects p ON p.id = w.project_id WHERE w.project_id = $1 AND w.is_primary = TRUE")
-        .bind(pid).fetch_optional(&state.db).await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Progetto non trovato"))?;
-
-    let root_path: String = root_row.get("absolute_path");
-    let project_name: String = root_row.get("name");
-
-    // Determine version
-    let existing = sqlx::query("SELECT version FROM project_documents WHERE project_id = $1 AND doc_type = $2 ORDER BY created_at DESC LIMIT 1")
-        .bind(pid).bind(&req.doc_type).fetch_optional(&state.db).await.ok().flatten();
-
-    let version = match existing {
-        Some(r) => {
-            let v: String = r.try_get("version").unwrap_or_else(|_| "1.0.0".to_string());
-            bump_version(&v, "minor")
-        }
-        None => "1.0.0".to_string(),
-    };
-
-    let slug = req.doc_type.replace('_', "-");
-    let relative_path = format!("docs/{}-v{}.docx", slug, version);
-    let abs_output = format!("{}/{}", root_path, relative_path);
-    let content_str = serde_json::to_string(&req.content_json).unwrap_or_default();
-
-    let final_title = req.title.as_deref().filter(|t| !t.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| slug.replace('-', " "));
-
-    // Call brain REST for document generation
-    let brain_rest_url = std::env::var("NEURAL_CORE_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .unwrap_or_default();
-
-    let resp = client.post(format!("{brain_rest_url}/generate-document"))
-        .json(&json!({
-            "doc_type": req.doc_type,
-            "content_json": content_str,
-            "output_path": abs_output,
-            "standard": standard,
-            "title": final_title,
-            "project_name": project_name,
-        }))
-        .send().await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Brain: {e}")))?;
-
-    let result: Value = resp.json().await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Brain response: {e}")))?;
-
-    if let Some(err) = result.get("error").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err));
-    }
-
-    let page_count = result.get("page_count").and_then(Value::as_i64).unwrap_or(0);
-    let section_count = result.get("section_count").and_then(Value::as_i64).unwrap_or(0);
-
-    // Save to DB
-    let doc_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO project_documents (id, project_id, doc_type, title, version, file_path, structure_json, status, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', $8)"
-    )
-    .bind(doc_id).bind(pid).bind(&req.doc_type).bind(&final_title)
-    .bind(&version).bind(&relative_path).bind(&req.content_json).bind(user_id)
-    .execute(&state.db).await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
-
-    // Vectorize in background (embedding via mcp-core ONNX, punto unico)
-    let db2 = state.db.clone();
-    let qdrant_url = state.qdrant_url.clone();
-    let mcp_core_url2 = state.mcp_core_url.clone();
-    let content2 = req.content_json.clone();
-    let doc_type2 = req.doc_type.clone();
-    let version2 = version.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::vector::vectorize_document(&db2, &qdrant_url, &mcp_core_url2, pid, doc_id, &doc_type2, &version2, &content2).await {
-            tracing::warn!("Vettorializzazione fallita: {e}");
-        }
-    });
-
-    Ok(Json(json!({
-        "ok": true,
-        "document_id": doc_id.to_string(),
-        "file_path": relative_path,
-        "title": final_title,
-        "version": version,
-        "page_count": page_count,
-        "section_count": section_count,
-    })))
+    let _user_id = parse_user_id(&claims)?;
+    Err(api_error(
+        StatusCode::GONE,
+        "Endpoint deprecato: la generazione documenti e' servita da mcp-core \
+         (POST /api/projects/:id/documents/generate). doc-service non genera piu' \
+         documenti.",
+    ))
 }
 
 /// POST /api/documents/search
@@ -274,18 +186,4 @@ pub async fn search_documents(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Qdrant: {e}")))?;
 
     Ok(Json(json!({ "results": results, "query": req.query })))
-}
-
-fn bump_version(current: &str, bump_type: &str) -> String {
-    let parts: Vec<u32> = current.split('.').filter_map(|p| p.parse().ok()).collect();
-    let (major, minor, patch) = (
-        parts.first().copied().unwrap_or(1),
-        parts.get(1).copied().unwrap_or(0),
-        parts.get(2).copied().unwrap_or(0),
-    );
-    match bump_type {
-        "major" => format!("{}.0.0", major + 1),
-        "minor" => format!("{}.{}.0", major, minor + 1),
-        _ => format!("{}.{}.{}", major, minor, patch + 1),
-    }
 }

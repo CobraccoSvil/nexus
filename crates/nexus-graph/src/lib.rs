@@ -387,6 +387,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_hitl_applica_delta_e_prosegue() {
+        // Replica il flusso HITL reale: un run si ferma su awaiting_confirmation,
+        // poi il resume con un delta che AZZERA il flag deve far proseguire il
+        // motore fino a End (non re-interrompersi sul checkpoint ancora-in-attesa).
+        struct ConfirmNode;
+        #[async_trait]
+        impl GraphNode<TestState, TestCtx> for ConfirmNode {
+            fn id(&self) -> NodeId {
+                NodeId::Router
+            }
+            async fn run(
+                &self,
+                _state: &TestState,
+                _ctx: &TestCtx,
+            ) -> Result<StateDelta, NodeError> {
+                let mut delta = StateDelta::empty();
+                delta.set("awaiting_confirmation", serde_json::json!(true));
+                Ok(delta)
+            }
+        }
+
+        let checkpointer = Arc::new(MemoryCheckpointer::default());
+        let run_id = Uuid::new_v4();
+
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::Router, Arc::new(ConfirmNode));
+        nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));
+        let mut edges = HashMap::new();
+        // Router (setta awaiting) -> NoOp -> End. L'interrupt scatta dopo il route
+        // a NoOp; il resume riprende da NoOp.
+        edges.insert(NodeId::Router, Edge::Static(NodeId::NoOp));
+        edges.insert(NodeId::NoOp, Edge::Static(NodeId::End));
+
+        let engine = GraphEngine::new(nodes, edges, NodeId::Router, checkpointer.clone());
+        let ctx = TestCtx {
+            recursion_limit: 50,
+        };
+
+        // Primo run: si interrompe su awaiting_confirmation, resume_at = NoOp.
+        let outcome = engine
+            .run_until_interrupt(run_id, Some(TestState::default()), &ctx)
+            .await
+            .expect("deve interrompersi");
+        assert!(matches!(outcome, StepOutcome::Interrupted { .. }));
+
+        // Resume HITL: delta che azzera awaiting_confirmation. Senza di esso lo
+        // stato caricato avrebbe ancora il flag e il motore si re-interromperebbe.
+        let mut resume_delta = StateDelta::empty();
+        resume_delta.set("awaiting_confirmation", serde_json::json!(false));
+        let outcome = engine
+            .resume_until_interrupt(run_id, resume_delta, &ctx)
+            .await
+            .expect("il resume HITL deve proseguire");
+        assert!(
+            matches!(outcome, StepOutcome::Completed(_)),
+            "azzerato awaiting_confirmation, il run deve completare"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_hitl_re_interrupt_se_flag_non_azzerato_e_resta_un_nodo() {
+        // Difensivo: il re-interrupt scatta se, DOPO il route, lo stato e' ancora
+        // in attesa E resta un nodo non-End da eseguire. Qui il nodo successivo
+        // RI-setta awaiting_confirmation e instrada verso un altro nodo non-End:
+        // col delta vuoto lo stato resta in attesa -> il motore si re-interrompe.
+        struct ConfirmNode;
+        #[async_trait]
+        impl GraphNode<TestState, TestCtx> for ConfirmNode {
+            fn id(&self) -> NodeId {
+                NodeId::Router
+            }
+            async fn run(
+                &self,
+                _state: &TestState,
+                _ctx: &TestCtx,
+            ) -> Result<StateDelta, NodeError> {
+                let mut delta = StateDelta::empty();
+                delta.set("awaiting_confirmation", serde_json::json!(true));
+                Ok(delta)
+            }
+        }
+
+        let checkpointer = Arc::new(MemoryCheckpointer::default());
+        let run_id = Uuid::new_v4();
+
+        let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
+        nodes.insert(NodeId::Router, Arc::new(ConfirmNode));
+        // Understanding e' un nodo non-End: la sua presenza fa scattare il
+        // re-interrupt (resta un nodo da eseguire con awaiting ancora true).
+        nodes.insert(NodeId::Understanding, Arc::new(ConfirmNode));
+        nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));
+        let mut edges = HashMap::new();
+        // Router -> Understanding (interrupt qui) -> NoOp -> End.
+        edges.insert(NodeId::Router, Edge::Static(NodeId::Understanding));
+        edges.insert(NodeId::Understanding, Edge::Static(NodeId::NoOp));
+        edges.insert(NodeId::NoOp, Edge::Static(NodeId::End));
+
+        let engine = GraphEngine::new(nodes, edges, NodeId::Router, checkpointer.clone());
+        let ctx = TestCtx {
+            recursion_limit: 50,
+        };
+
+        engine
+            .run_until_interrupt(run_id, Some(TestState::default()), &ctx)
+            .await
+            .expect("deve interrompersi");
+
+        // Delta vuoto: il nodo Understanding ri-setta awaiting_confirmation e
+        // instrada verso NoOp (non-End) -> il motore si re-interrompe.
+        let outcome = engine
+            .resume_until_interrupt(run_id, StateDelta::empty(), &ctx)
+            .await
+            .expect("il resume non deve errorare");
+        assert!(
+            matches!(outcome, StepOutcome::Interrupted { .. }),
+            "flag ri-settato + nodo residuo -> re-interrupt"
+        );
+    }
+
+    #[tokio::test]
     async fn resume_senza_checkpoint_e_errore() {
         let mut nodes: HashMap<NodeId, Arc<dyn GraphNode<TestState, TestCtx>>> = HashMap::new();
         nodes.insert(NodeId::NoOp, Arc::new(NoOpNode));

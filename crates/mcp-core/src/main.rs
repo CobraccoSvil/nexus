@@ -26,6 +26,7 @@ mod deepseek_balance_sync;
 mod dispatcher_routes;
 mod dlp;
 mod documents;
+mod docx_render;
 mod domain;
 mod environment;
 mod file_mutations;

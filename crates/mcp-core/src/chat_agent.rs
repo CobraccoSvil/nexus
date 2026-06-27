@@ -543,7 +543,7 @@ pub async fn confirm_agent_run(
     let run = fetch_owned_run_row(
         &state.db,
         "SELECT user_id, status, session_id, project_id, provider, model,
-                pending_actions_json, run_message_id, automation_mode
+                pending_actions_json, run_message_id, automation_mode, engine
          FROM agent_runs WHERE id = $1",
         run_id,
         user_id,
@@ -570,9 +570,15 @@ pub async fn confirm_agent_run(
         ));
     }
 
-    // Approvato: delega la ripresa del loop al brain LangGraph via
-    // `POST /agent/approve/{thread_id}`. Il brain mantiene lo state del
-    // thread ed e' l'unica sorgente autoritativa del loop (Fase 4 refactor).
+    // Approvato: il resume va instradato al MOTORE su cui girava il run (regola L:
+    // un solo punto decide il motore, `agent_runs.engine`, lo stesso scritto a
+    // spawn da `select_engine`). I due motori hanno checkpoint NON
+    // interscambiabili, quindi un run nativo deve riprendere dal grafo nativo, non
+    // dal brain.
+    //   - engine='rust': resume IN-PROCESS sul grafo nativo (dal checkpoint
+    //     Postgres `nexus_graph_checkpoints`), finalizzato da mcp-core.
+    //   - altrimenti (python / NULL legacy): resume sul brain via
+    //     `POST /agent/approve/{thread_id}` (comportamento storico invariato).
     let pending_json: Option<Value> = run
         .try_get::<Option<Value>, _>("pending_actions_json")
         .unwrap_or(None);
@@ -586,33 +592,83 @@ pub async fn confirm_agent_run(
         pending_actions_str
     );
 
-    // Segna come running prima di chiamare il brain.
+    // Segna come running prima di riprendere (sia nativo sia brain).
     sqlx::query("UPDATE agent_runs SET status='running', completed_at=NULL WHERE id=$1")
         .bind(run_id)
         .execute(&state.db)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    match crate::brain_agent_client::resume_run(run_id, true, Some(resume_message)).await {
-        Ok(()) => Ok(Json(json!({
-            "runId": run_id.to_string(),
-            "status": "running",
-        }))),
-        Err(e) => {
-            tracing::error!(
-                "confirm_agent_run: brain resume_run fallito run_id={} err={}",
-                run_id,
-                e
-            );
-            // Riporta il run a awaiting_confirmation per non lasciarlo appeso.
-            let _ = sqlx::query("UPDATE agent_runs SET status='awaiting_confirmation' WHERE id=$1")
-                .bind(run_id)
-                .execute(&state.db)
-                .await;
-            Err(api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Brain non raggiungibile per approve: {e}"),
-            ))
+    let engine: String = run
+        .try_get::<Option<String>, _>("engine")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    if engine.eq_ignore_ascii_case("rust") {
+        // Resume nativo IN-PROCESS: ricostruisce ctx + porte dai dati del run e
+        // riprende dal checkpoint. Finalizzazione + is_final SSE dentro
+        // `confirm_native_run` (punto unico del resume nativo, regola L).
+        let session_id: Uuid = run.get::<Uuid, _>("session_id");
+        let provider: String = run.try_get("provider").unwrap_or_default();
+        let model: String = run.try_get("model").unwrap_or_default();
+        let automation_mode: String = run
+            .try_get::<Option<String>, _>("automation_mode")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        match crate::chat_messages::confirm_native_run(
+            &state,
+            run_id,
+            session_id,
+            provider,
+            model,
+            automation_mode,
+            &resume_message,
+        )
+        .await
+        {
+            Ok(final_status) => Ok(Json(json!({
+                "runId": run_id.to_string(),
+                "status": final_status.as_str(),
+            }))),
+            Err(e) => {
+                tracing::error!(run_id = %run_id, "confirm_agent_run: resume nativo fallito");
+                // confirm_native_run ha gia' marcato il run failed + emesso is_final;
+                // qui rispondiamo con l'errore senza riportare a awaiting (regola H:
+                // un fallimento del motore nativo e' un fallimento del run, onesto).
+                Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Resume nativo fallito: {e}"),
+                ))
+            }
+        }
+    } else {
+        // Resume LEGACY sul brain Python (engine='python' o NULL). Il brain
+        // mantiene lo state del thread ed e' l'unica sorgente del loop per quei run.
+        match crate::brain_agent_client::resume_run(run_id, true, Some(resume_message)).await {
+            Ok(()) => Ok(Json(json!({
+                "runId": run_id.to_string(),
+                "status": "running",
+            }))),
+            Err(e) => {
+                tracing::error!(
+                    "confirm_agent_run: brain resume_run fallito run_id={} err={}",
+                    run_id,
+                    e
+                );
+                // Riporta il run a awaiting_confirmation per non lasciarlo appeso.
+                let _ =
+                    sqlx::query("UPDATE agent_runs SET status='awaiting_confirmation' WHERE id=$1")
+                        .bind(run_id)
+                        .execute(&state.db)
+                        .await;
+                Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Brain non raggiungibile per approve: {e}"),
+                ))
+            }
         }
     }
 }

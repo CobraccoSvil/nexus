@@ -1,13 +1,27 @@
 //! Client HTTP verso il brain (Python/LangGraph) per l'agent orchestration.
 //!
-//! Quando `USE_BRAIN_ORCHESTRATOR=1`, `spawn_agent_run` in `chat_messages.rs`
-//! invoca `run_via_brain` al posto di `AgentLoop::run`. Il brain gestisce
-//! il loop tool_use, rimbalzando sui tool via il ToolRunner gRPC esposto da
-//! questo stesso mcp-core (closed loop).
+//! `spawn_agent_run` in `chat_messages.rs` invoca `run_via_brain` quando
+//! `select_engine` ritorna `Engine::Python`. Il brain gestisce il loop tool_use,
+//! rimbalzando sui tool via il ToolRunner gRPC esposto da questo stesso mcp-core
+//! (closed loop).
 //!
 //! Traduce gli eventi SSE del brain (`assistant_delta`, `tool_use`,
 //! `tool_result`, `end_turn`, `error`) in `AgentStepEvent` sullo stesso
 //! broadcast channel usato dalla UI — la web-ide non vede differenze.
+//!
+//! ## Stato verso zero-Python (regola H)
+//!
+//! Con il motore nativo Rust come PRIMARIO (`Engine::Rust`), `run_via_brain`
+//! resta chiamabile come SOLO percorso di ROLLBACK: un run con `engine='python'`
+//! (per-sessione o globale nel DB) continua a girare sul brain. NON e' piu' il
+//! FALLBACK automatico su errore del nativo: un Err del grafo nativo finalizza il
+//! run come FAILED diagnosticato (vedi `native_engine_failure_result` in
+//! `agent_run.rs`), non cade silenziosamente sul Python.
+//!
+//! Quando il brain Python verra' eliminato (zero-Python), `run_via_brain` e il
+//! resume brain (`resume_run`) non avranno piu' un backend: a quel punto
+//! `engine='python'` non sara' piu' un rollback supportato e questo modulo andra'
+//! rimosso insieme al brain.
 
 use std::time::Duration;
 
@@ -1432,7 +1446,7 @@ pub async fn run_via_brain(
 /// Rende un messaggio di errore API leggibile per l'utente finale.
 /// Rimuove i dettagli interni (indici messaggi, nomi interni di blocchi)
 /// e restituisce una descrizione sintetica.
-fn sanitize_error_for_user(raw: &str) -> String {
+pub(crate) fn sanitize_error_for_user(raw: &str) -> String {
     // Errore tool_use/tool_result mismatch (Anthropic)
     if raw.contains("tool_use ids were found without tool_result") {
         return "conversazione interrotta per un problema di sincronizzazione tra i passaggi interni dell'agente".to_string();
@@ -1502,6 +1516,11 @@ fn parse_sse_data(block: &str) -> Option<String> {
 /// Se `approved = true`, il brain riprende il loop e, se presente, inietta
 /// `resume_message` nello state. Se `approved = false`, il run viene marcato
 /// come cancellato lato brain.
+///
+/// RESUME LEGACY (engine='python'/NULL): `confirm_agent_run` instrada qui SOLO i
+/// run che giravano sul brain. I run nativi (`engine='rust'`) riprendono dal
+/// checkpoint del grafo Rust via `confirm_native_run` (i checkpoint dei due motori
+/// NON sono interscambiabili). Verra' rimossa con l'eliminazione del brain.
 pub async fn resume_run(
     thread_id: Uuid,
     approved: bool,

@@ -404,19 +404,9 @@ pub async fn handle_doc_generate(
     let slug = doc_type.replace('_', "-");
     let relative_path = format!("docs/{}-v{}.docx", slug, version);
     let abs_output = format!("{}/{}", root_path, relative_path);
-    let content_str = serde_json::to_string(&content).unwrap_or_default();
-
-    // Usa NeuralCoreClient per la generazione del documento
-    let neural_url = crate::auth::get_setting(db, "neural_core_url")
-        .await
-        .unwrap_or_else(|| {
-            std::env::var("NEURAL_CORE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
-        });
-
-    let neural = match crate::orchestrator::NeuralCoreClient::connect(&neural_url).await {
-        Ok(c) => c,
-        Err(e) => return format!("[Errore] Connessione a Neural Core fallita: {e}"),
+    let content_str = match serde_json::to_string(&content) {
+        Ok(s) => s,
+        Err(e) => return format!("[Errore] Serializzazione contenuto documento fallita: {e}"),
     };
 
     let final_title = if title.is_empty() {
@@ -425,18 +415,44 @@ pub async fn handle_doc_generate(
         title.clone()
     };
 
-    match neural
-        .generate_document(
-            &doc_type,
-            &content_str,
-            &abs_output,
-            &standard,
-            &final_title,
-            &project_name,
-        )
+    // Rendering .docx nel PUNTO UNICO Rust (regola L): nessun round-trip gRPC al
+    // brain Python. `render_document` e' sincrono e CPU-bound (zip + XML), quindi
+    // gira in `spawn_blocking` per non bloccare l'executor tokio. Verso zero-Python:
+    // questo era l'ultimo RPC AI-adiacente ancora servito dal brain.
+    let render_result = {
+        let doc_type = doc_type.clone();
+        let final_title = final_title.clone();
+        let project_name = project_name.clone();
+        let standard = standard.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::docx_render::render_document(
+                &doc_type,
+                &content_str,
+                &abs_output,
+                &standard,
+                &final_title,
+                &project_name,
+            )
+        })
         .await
-    {
-        Ok((_file_path, page_count, section_count)) => {
+    };
+
+    let render_result = match render_result {
+        Ok(r) => r,
+        Err(e) => return format!("[Errore] Task di rendering documento interrotto: {e}"),
+    };
+
+    match render_result {
+        Ok(crate::docx_render::RenderedDoc {
+            file_path,
+            page_count,
+            section_count,
+        }) => {
+            tracing::info!(
+                doc_type = %doc_type, file = %file_path, pages = page_count,
+                sections = section_count,
+                "nexus_doc_generate: .docx renderizzato in-process (renderer Rust)"
+            );
             // Salva nel DB. FIX 2: prima era `let _ =`, quindi se l'INSERT
             // falliva il .docx restava sul filesystem ma orfano dal catalogo: non
             // appariva nel pannello DOCUMENTI (che lista da project_documents) e

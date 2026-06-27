@@ -13,7 +13,6 @@ mod vector;
 #[derive(Clone)]
 pub struct AppState {
     pub db: sqlx::PgPool,
-    pub neural_url: String,
     pub qdrant_url: String,
     /// URL HTTP di mcp-core (porta 4000). doc-service fa embed via il PUNTO UNICO
     /// `mcp-core POST /api/embed` (ONNX MiniLM in-process, regola L), non piu' via
@@ -41,13 +40,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Document Service: connected to PostgreSQL");
 
-    let neural_url = nexus_auth::get_setting(&db, "neural_core_url")
-        .await
-        .unwrap_or_else(|| {
-            std::env::var("NEURAL_CORE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
-        });
-
     let qdrant_url = nexus_auth::get_setting(&db, "qdrant_url")
         .await
         .unwrap_or_else(|| {
@@ -64,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         db: db.clone(),
-        neural_url,
         qdrant_url,
         mcp_core_url,
     };

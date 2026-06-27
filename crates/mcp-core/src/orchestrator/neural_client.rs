@@ -18,22 +18,33 @@
 //!   `provider_health_probe`, `service_discovery`, `learned_instructions`,
 //!   `nexus-wiki`, ...) restano INVARIATI.
 //!
-//! Restano sul gRPC al brain solo `generate_document` (rendering .docx) e gli RPC
-//! batch/model-sync non toccati da questo refactoring.
+//! - `generate_document` (rendering .docx) -> renderer Rust in-process
+//!   (`crate::docx_render::render_document`). Era l'ultimo RPC AI-adiacente
+//!   ancora servito dal brain: il .docx viene ora assemblato interamente in
+//!   Rust (ZIP + OOXML), senza round-trip di rete (verso zero-Python).
+//!
+//! Restano sul gRPC al brain solo gli RPC batch/model-sync non toccati da questo
+//! refactoring.
 
 use serde_json::{json, Value};
 
-// Tipi mcp_proto::neural ri-esportati da super::* (regola L, S73).
-
-use super::*;
+// Nota: `super::*` non e' piu' necessario. Serviva per i tipi `mcp_proto::neural`
+// (NeuralCoreServiceClient) del vecchio proxy gRPC: ora `NeuralCoreClient` non
+// incapsula piu' un canale gRPC, tutti i metodi delegano all'embedder ONNX
+// in-process o al Nexus LLM Gateway.
 use crate::nexus_gateway::{
     GwMessage, GwMetadata, GwRequest, GwResponse, NexusGatewayClient,
 };
 
-#[derive(Clone)]
-pub struct NeuralCoreClient {
-    client: NeuralCoreServiceClient<tonic::transport::Channel>,
-}
+/// Client storico del neural-core. Non incapsula piu' un canale gRPC verso il
+/// brain: TUTTI i metodi rimasti delegano all'embedder ONNX in-process
+/// (`NexusBridge`) o al Nexus LLM Gateway (`NexusGatewayClient`). Resta una
+/// struct vuota (zero-sized) per preservare le firme dei call site storici
+/// (`NeuralCoreClient::connect(url).embed_text(...)` ecc.) senza propagare un
+/// refactoring piu' ampio. L'ultimo RPC gRPC al brain qui presente
+/// (`generate_document`) e' stato sostituito dal renderer Rust `docx_render`.
+#[derive(Clone, Default)]
+pub struct NeuralCoreClient;
 
 impl std::fmt::Debug for NeuralCoreClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,28 +53,19 @@ impl std::fmt::Debug for NeuralCoreClient {
 }
 
 impl NeuralCoreClient {
-    pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        // Default tonic decoding limit è 4MB: non basta per prompt grandi.
-        // Allineato al server Python (128MB) in neural_service.py::serve.
-        const MAX_MSG: usize = 128 * 1024 * 1024;
-        let client = NeuralCoreServiceClient::connect(url.to_string())
-            .await?
-            .max_decoding_message_size(MAX_MSG)
-            .max_encoding_message_size(MAX_MSG);
-        tracing::info!("Connected to Neural Core at {} (max msg 128MB)", url);
-        Ok(Self { client })
+    /// Costruisce il client. Non apre piu' alcun canale gRPC (il brain non e' nel
+    /// percorso): l'`url` e' accettato per compatibilita' di firma coi call site
+    /// che ancora leggono `settings.neural_core_url`, ma e' ignorato. Resta
+    /// `async`/`Result` per non toccare i ~5 call site esistenti.
+    pub async fn connect(_url: &str) -> anyhow::Result<Self> {
+        Ok(Self)
     }
 
-    /// Client NON connesso per i test unit: canale lazy verso un endpoint
-    /// irraggiungibile. Qualunque RPC fallirebbe al primo uso; serve solo a
-    /// costruire un `AgentToolContext` nei test di tool che non toccano il brain.
+    /// Variante per i test unit. Identica a `connect` ora che non c'e' piu' un
+    /// canale: nessun I/O, serve solo a costruire un `AgentToolContext`.
     #[cfg(test)]
     pub(crate) fn disconnected_for_tests() -> Self {
-        let channel =
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        Self {
-            client: NeuralCoreServiceClient::new(channel),
-        }
+        Self
     }
 
     pub async fn embed_text(&self, model: &str, text: &str) -> anyhow::Result<Vec<f32>> {
@@ -319,32 +321,6 @@ impl NeuralCoreClient {
         crate::provider_error_classifier::classify_text(error_text).stop_reason
     }
 
-    pub async fn generate_document(
-        &self,
-        doc_type: &str,
-        content_json: &str,
-        output_path: &str,
-        standard: &str,
-        title: &str,
-        project_name: &str,
-    ) -> anyhow::Result<(String, i32, i32)> {
-        let mut client = self.client.clone();
-        let resp = client
-            .generate_document(mcp_proto::neural::GenerateDocumentRequest {
-                doc_type: doc_type.to_string(),
-                content_json: content_json.to_string(),
-                output_path: output_path.to_string(),
-                standard: standard.to_string(),
-                title: title.to_string(),
-                project_name: project_name.to_string(),
-            })
-            .await?;
-        let inner = resp.into_inner();
-        if !inner.error.is_empty() {
-            anyhow::bail!("Document generation error: {}", inner.error);
-        }
-        Ok((inner.file_path, inner.page_count, inner.section_count))
-    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

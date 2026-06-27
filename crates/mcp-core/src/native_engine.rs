@@ -55,9 +55,18 @@
 //! 3. SSE: i nodi emettono via `ctx.emit` solo `MetaStep`; mancano
 //!    `AssistantDelta`/`ToolUse`/`ToolResult` e il terminatore `Done`, + la
 //!    finalizzazione di `agent_runs` e la gestione hollow nel call site.
-//! 4. Il ramo `engine != python` del call site deve fare `return` su `Ok` (oggi
-//!    prosegue nel loop `run_via_brain` -> doppio run); innocuo solo perche' mai
-//!    raggiunto.
+//! 4. CHIUSO. Il ramo `engine == rust` del call site esce dal `'compute` con
+//!    `break 'compute` su `Ok` (niente doppio-run); su `Err` finalizza FAILED
+//!    diagnosticato (`native_engine_failure_result`), NIENTE fallback automatico
+//!    al brain (regola H, verso zero-Python).
+//! 6. HITL (interrupt-resume): il MOTORE gestisce gia' l'interrupt
+//!    `awaiting_confirmation` (`run_until_interrupt` -> `Interrupted`) e il RESUME
+//!    dal checkpoint (`resume_until_interrupt`, cablato in `resume_native` +
+//!    `confirm_native_run`). RESTA da portare il NODO che IMPOSTA
+//!    `awaiting_confirmation` (l'`interrupt_before=["executor"]` di graph.py):
+//!    finche' nessun nodo nativo valorizza il flag, un run `engine='rust'` non
+//!    raggiunge l'HITL e il resume nativo non viene esercitato in produzione. Il
+//!    resume dei run PYTHON legacy resta sul brain (`resume_run`).
 //! 5. CLASSIFIER LLM nel `RouterNode` (TODO `router.rs`, FIX A): la
 //!    classificazione intent via LLM (`AgenticIntentClassifier`) NON e' ancora
 //!    portata. Senza `intent_hint` il RouterNode cade nel fallback
@@ -499,6 +508,18 @@ impl RunRole {
     }
 }
 
+/// Modalita' di ingresso del motore nativo (punto unico, regola L): distingue
+/// l'avvio nuovo dal resume HITL. Estrae la decisione "init Some/None +
+/// resume_delta" da `run_engine` in un solo enum, cosi' i tre call site
+/// (run nuovo, resume HITL, shadow) la esprimono in modo esplicito.
+enum RunMode {
+    /// Avvio nuovo: `build_initial_state` dal prompt -> parte da `entry`.
+    New,
+    /// Resume HITL: nessun initial_state (riparte dal checkpoint), `resume_delta`
+    /// sblocca l'interrupt (azzera `awaiting_confirmation` + inietta l'approvazione).
+    Resume { resume_delta: nexus_graph::StateDelta },
+}
+
 /// Costruisce le 14 impl concrete + gli 11 nodi (porte iniettate) + la
 /// `RoutingConfig` e la `PlannerConfig` DB-driven, e assembla il
 /// [`AgentGraphEngine`].
@@ -914,22 +935,69 @@ fn parse_automation_mode(s: &str) -> Option<nexus_agent_graph::AutomationMode> {
 /// Per il path primario `shadow=false` (`ExecMode::Real`): i tool hanno
 /// side-effect reali sul progetto.
 pub async fn run_native(deps: &NativeDeps, input: &NativeRunInput) -> anyhow::Result<NativeRunOutcome> {
-    let outcome = run_engine(deps, input, true, RunRole::Primary).await?;
+    let outcome = run_engine(deps, input, RunMode::New, RunRole::Primary).await?;
     Ok(map_outcome(outcome))
+}
+
+/// RESUME HITL di un run nativo PRIMARIO sospeso su `awaiting_confirmation`.
+///
+/// Riprende il run dal checkpoint Postgres (`nexus_graph_checkpoints`) iniettando
+/// l'input umano di approvazione (`resume_message`) come messaggio Human in coda +
+/// azzerando `awaiting_confirmation` — entrambi via il delta tipizzato del grafo,
+/// che passa per il reducer (punto unico, regola L: non si scrivono i campi a
+/// mano). PUNTO UNICO del resume nativo (regola L): riusa lo stesso
+/// `build_native_engine` del run nuovo e delega al motore
+/// [`AgentGraphEngine::resume_until_interrupt`], nessuna logica di loop duplicata.
+///
+/// Gli `input` portano provider/model/session/step_tx del run originale (li
+/// ricostruisce il call site dai dati persistiti su `agent_runs`); il GRAFO
+/// riparte comunque dal nodo salvato nel checkpoint, NON da `entry`: prompt/tools/
+/// history dell'`input` non vengono usati per ricostruire lo stato (gia' nel
+/// checkpoint), servono solo a popolare ctx + porte I/O.
+pub async fn resume_native(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+    resume_message: &str,
+) -> anyhow::Result<NativeRunOutcome> {
+    let resume_delta = build_resume_delta(resume_message);
+    let outcome = run_engine(deps, input, RunMode::Resume { resume_delta }, RunRole::Primary).await?;
+    Ok(map_outcome(outcome))
+}
+
+/// Costruisce il delta opaco del runtime che sblocca un interrupt HITL: azzera
+/// `awaiting_confirmation` e accoda il messaggio umano di approvazione (campo
+/// `messages`, reducer append). Costruito col delta TIPIZZATO del grafo ->
+/// `into_opaque` (punto unico tipizzato->opaco, regola L).
+fn build_resume_delta(resume_message: &str) -> nexus_graph::StateDelta {
+    use nexus_agent_graph::state::{Message, MessageContent};
+    let typed = nexus_agent_graph::state::StateDelta {
+        // Azzera il predicato di interrupt: senza, il motore si re-interrompe sul
+        // checkpoint ancora-in-attesa (loop di conferma).
+        awaiting_confirmation: Some(Some(false)),
+        // Accoda l'approvazione come turno utente: l'executor la rilegge nel
+        // contesto come ultimo messaggio (parita' col `resume_message` iniettato
+        // dal brain nello state al `/agent/approve`).
+        messages: Some(vec![Message::Human {
+            content: MessageContent::text(resume_message.to_string()),
+        }]),
+        ..Default::default()
+    };
+    typed.into_opaque()
 }
 
 /// Esegue il grafo nativo end-to-end e ritorna lo [`StepOutcome`] COMPLETO (lo
 /// stato finale, non solo il sommario): il run shadow ne ha bisogno per la
 /// proiezione canonica (conteggio tool, produced_work). Punto unico (regola L)
 /// dell'esecuzione del motore: sia il primario che lo shadow passano di qui,
-/// distinti solo dal `role` (e dal `new_run`).
+/// distinti solo dal `role` (e dal `mode`).
 ///
-/// `new_run` distingue nuovo run (Some initial_state) da resume (None, riparte dal
-/// checkpoint). `role` decide tools/emit/checkpointer + il flag `shadow` del ctx.
+/// `mode` distingue avvio nuovo (`RunMode::New`, initial_state dal prompt) da
+/// resume HITL (`RunMode::Resume`, riparte dal checkpoint applicando il delta di
+/// approvazione). `role` decide tools/emit/checkpointer + il flag `shadow` del ctx.
 async fn run_engine(
     deps: &NativeDeps,
     input: &NativeRunInput,
-    new_run: bool,
+    mode: RunMode,
     role: RunRole,
 ) -> anyhow::Result<StepOutcome<AgentState>> {
     let (engine, routing_cfg, llm, tools, emit) = build_native_engine(deps, input, role).await?;
@@ -950,16 +1018,21 @@ async fn run_engine(
         shadow: role.is_shadow(),
     };
 
-    let init = if new_run {
-        Some(build_initial_state(input, role))
-    } else {
-        None
-    };
-
-    engine
-        .run_until_interrupt(input.run_id, init, &ctx)
-        .await
-        .map_err(|e| anyhow::anyhow!("motore nativo: run_until_interrupt fallita: {e}"))
+    // Avvio nuovo: parte da `entry` con l'initial_state dal prompt.
+    // Resume HITL: nessun init (carica il checkpoint), applica il resume_delta.
+    match mode {
+        RunMode::New => {
+            let init = Some(build_initial_state(input, role));
+            engine
+                .run_until_interrupt(input.run_id, init, &ctx)
+                .await
+                .map_err(|e| anyhow::anyhow!("motore nativo: run_until_interrupt fallita: {e}"))
+        }
+        RunMode::Resume { resume_delta } => engine
+            .resume_until_interrupt(input.run_id, resume_delta, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("motore nativo: resume_until_interrupt fallita: {e}")),
+    }
 }
 
 /// Mappa lo [`StepOutcome`] del motore nel [`NativeRunOutcome`] del chiamante.
@@ -1194,7 +1267,7 @@ pub async fn run_shadow(
     let outcome = run_engine(
         deps,
         input,
-        true,
+        RunMode::New,
         RunRole::Shadow { primary_run_id },
     )
     .await?;
@@ -1617,6 +1690,36 @@ mod tests {
         assert!(!out.completed);
         // resume_at e' la label del nodo da cui riprendere (HITL).
         assert_eq!(out.resume_at.as_deref(), Some(NodeId::Executor.as_label()));
+    }
+
+    #[test]
+    fn build_resume_delta_azzera_await_e_accoda_messaggio() {
+        use nexus_graph::GraphState;
+        // Stato sospeso su HITL con un messaggio pregresso.
+        let mut state = AgentState {
+            awaiting_confirmation: Some(true),
+            messages: vec![Message::Human {
+                content: nexus_agent_graph::state::MessageContent::text("richiesta iniziale"),
+            }],
+            ..Default::default()
+        };
+        // Applica il delta di resume (via reducer, punto unico).
+        let delta = build_resume_delta("Azioni confermate dall'utente.");
+        state.merge(delta);
+
+        assert!(
+            !state.is_awaiting_confirmation(),
+            "il delta deve azzerare awaiting_confirmation (sblocca l'interrupt)"
+        );
+        // Il messaggio di approvazione e' ACCODATO (reducer append su messages).
+        assert_eq!(state.messages.len(), 2, "messaggio di approvazione accodato");
+        match state.messages.last() {
+            Some(Message::Human { content }) => {
+                let txt = serde_json::to_string(content).unwrap_or_default();
+                assert!(txt.contains("Azioni confermate"));
+            }
+            other => panic!("atteso Human in coda, trovato {other:?}"),
+        }
     }
 
     #[test]
