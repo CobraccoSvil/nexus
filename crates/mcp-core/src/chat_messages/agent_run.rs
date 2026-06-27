@@ -316,16 +316,21 @@ pub(crate) fn compose_turn_answer(
             }
             Some(a)
         }
-        _ if is_report_hollow(result) => build_action_recap(&result.steps)
-            .or_else(cooldown_exhaustion_note)
-            .or_else(|| {
-                Some(format!(
-                    "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
-                     il turno con un completamento vuoto dopo aver esaurito i tentativi \
-                     di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
-                    result.provider, result.model
-                ))
-            }),
+        // Anche un run NON-hollow con step eseguiti (es. troncato dal final_gate a
+        // max_cycles o da un loop G1) deve mostrare il recap: ha modificato file ma
+        // ha chiuso senza body -> mai lasciare la chat muta. Vedi finalize dello spawn.
+        _ if is_report_hollow(result) || !result.steps.is_empty() => {
+            build_action_recap(&result.steps)
+                .or_else(cooldown_exhaustion_note)
+                .or_else(|| {
+                    Some(format!(
+                        "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
+                         il turno con un completamento vuoto dopo aver esaurito i tentativi \
+                         di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
+                        result.provider, result.model
+                    ))
+                })
+        }
         _ => None,
     }
 }
@@ -2935,7 +2940,11 @@ pub(crate) async fn spawn_agent_run(
                 // un recap deterministico (ADR 0025) cosi' l'utente vede cosa e'
                 // stato fatto invece di un generico "nessuna risposta". Solo se
                 // non c'e' alcuna azione si usa il placeholder generico.
-                _ if report_hollow => build_action_recap(&result.steps)
+                // Un run con lavoro reale (step eseguiti) non puo' restare muto
+                // anche se NON e' hollow: il loop G1 troncato dal final_gate o la
+                // chiusura a max_cycles lasciano final_answer vuoto pur avendo gia'
+                // modificato file. Produci SEMPRE il recap deterministico.
+                _ if report_hollow || !result.steps.is_empty() => build_action_recap(&result.steps)
                     .or_else(cooldown_exhaustion_note)
                     .or_else(|| {
                         Some(format!(
@@ -4257,11 +4266,31 @@ mod tests_finalize_turn {
 
     #[test]
     fn compose_none_se_non_hollow_e_senza_risposta() {
-        // Run non-hollow senza final_answer (es. chat che chiude): nessun messaggio.
+        // Run non-hollow senza final_answer NE step (es. chat che chiude): nessun
+        // messaggio. Con 0 step la chat non ha nulla di concreto da riportare.
         let r = mk_result(
             AgentRunStatus::Completed, vec![], None, false, "", Some("chat"),
         );
         assert!(compose_turn_answer(&r).is_none());
+    }
+
+    #[test]
+    fn compose_recap_su_run_non_hollow_con_step_e_risposta_vuota() {
+        // Regressione run 04a2b2c6 (Beauty-Book): l'agente ripara l'app (step
+        // produttivi) ma gemini-2.5-pro entra in loop G1 e il final_gate chiude a
+        // max_cycles con final_answer vuoto. Il run NON e' hollow (c'e' lavoro
+        // reale) ma la chat restava MUTA (final_answer NULL nel DB). Ora un run
+        // con step eseguiti produce SEMPRE il recap: mai un completed senza nulla
+        // a schermo.
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![write_step()], None, false,
+            "", Some("fix"),
+        );
+        let msg = compose_turn_answer(&r).expect("recap atteso anche se non-hollow");
+        assert!(
+            msg.contains("a.ts"),
+            "il recap deve elencare il file toccato: {msg}"
+        );
     }
 
     #[test]
