@@ -47,6 +47,12 @@ pub struct G1Signals {
     pub unfulfilled: bool,
     /// Gli ultimi tool_result recenti indicano errore (`detect_recent_tool_error`).
     pub recent_error: bool,
+    /// L'errore NON e' nuovo ma PERSISTENTE/ricorrente: il modello ci gira intorno da
+    /// piu' iterazioni invece di reagirvi. Quando true, la re-entry viene contata ANCHE
+    /// con `recent_error` -> il cap G1 scatta e parte l'escalation. Senza, un
+    /// loop-su-errore non raggiunge mai il cap e va a `iteration_cap` (incidente
+    /// Beauty-Book: loop G1 fino a iter 54). Derivato dal chiamante (punto unico).
+    pub error_is_stale: bool,
     /// Contatore corrente `g1_reroute_count` (dallo state).
     pub current_count: i64,
     /// Cap massimo di re-entry G1 (`agent.g1_max_nudges`, default 3). DB-driven (regola G).
@@ -62,6 +68,7 @@ impl Default for G1Signals {
             action_oriented: false,
             unfulfilled: false,
             recent_error: false,
+            error_is_stale: false,
             current_count: 0,
             // Default sicuro identico al Python (_G1_NUDGE_DEFAULT_MAX = 3).
             max_nudges: 3,
@@ -96,7 +103,11 @@ pub fn g1_accounting(signals: &G1Signals) -> G1Accounting {
         && prev_stop_counts(signals.prev_stop_reason.as_deref())
         && !signals.has_pending
         && (signals.action_oriented || signals.unfulfilled)
-        && !signals.recent_error;
+        // Errore NUOVO -> NON conta (il modello sta reagendo legittimamente).
+        // Errore PERSISTENTE/stale -> conta: il modello e' bloccato in loop sullo
+        // stesso errore, contarlo fa scattare il cap G1 e l'escalation invece di
+        // bruciare iterazioni fino a iteration_cap.
+        && (!signals.recent_error || signals.error_is_stale);
 
     let updated_count = if is_reentry {
         signals.current_count + 1
@@ -126,6 +137,7 @@ mod tests {
             action_oriented: true,
             unfulfilled: false,
             recent_error: false,
+            error_is_stale: false,
             current_count: 0,
             max_nudges: 3,
         }
@@ -156,6 +168,19 @@ mod tests {
         let r = g1_accounting(&s);
         assert!(!r.is_reentry);
         assert_eq!(r.updated_count, 0);
+    }
+
+    #[test]
+    fn errore_stale_conta() {
+        // Errore PERSISTENTE (il modello ci gira intorno da iterazioni): la re-entry
+        // DEVE contare anche con recent_error, cosi' il cap G1 scatta e parte
+        // l'escalation invece del runaway fino a iteration_cap.
+        let mut s = reentry_signals();
+        s.recent_error = true;
+        s.error_is_stale = true;
+        let r = g1_accounting(&s);
+        assert!(r.is_reentry, "errore stale -> re-entry contata");
+        assert_eq!(r.updated_count, 1);
     }
 
     #[test]
@@ -229,6 +254,8 @@ mod golden {
         action_oriented: bool,
         unfulfilled: bool,
         recent_error: bool,
+        #[serde(default)]
+        error_is_stale: bool,
         current_count: i64,
         max_nudges: i64,
     }
@@ -260,6 +287,7 @@ mod golden {
                 action_oriented: c.input.action_oriented,
                 unfulfilled: c.input.unfulfilled,
                 recent_error: c.input.recent_error,
+                error_is_stale: c.input.error_is_stale,
                 current_count: c.input.current_count,
                 max_nudges: c.input.max_nudges,
             };

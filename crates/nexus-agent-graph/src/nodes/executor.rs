@@ -634,6 +634,7 @@ piu' specifico, oppure riprova con un modello piu' capace.",
             Some(fulfilled) => !fulfilled,
             None => detect_unfulfilled_intent(last_assistant_text(&messages).as_deref()),
         };
+        let g1_recent_error = detect_recent_tool_error(&messages, 4);
         let g1 = g1_accounting(&G1Signals {
             prev_stop_reason: state.stop_reason.map(stop_reason_str),
             iterations: iters_in,
@@ -644,7 +645,14 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                 .unwrap_or(false),
             action_oriented: turn_action_oriented(state.action_oriented),
             unfulfilled: unfulfilled_for_g1,
-            recent_error: detect_recent_tool_error(&messages, 4),
+            recent_error: g1_recent_error,
+            // Errore "stale": persiste oltre il doppio del budget di nudge G1 ->
+            // il modello e' bloccato in loop sull'errore, non ci sta reagendo a uno
+            // nuovo. Contarlo fa scattare il cap G1 + escalation invece di bruciare
+            // iterazioni fino a iteration_cap. Soglia derivata dal cap DB-driven
+            // g1_max_nudges (niente hardcoded, regola G).
+            error_is_stale: g1_recent_error
+                && iters_in >= self.cfg.g1_max_nudges.saturating_mul(2),
             current_count: g1_reroute_count,
             max_nudges: self.cfg.g1_max_nudges,
         });
