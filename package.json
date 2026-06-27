@@ -12,13 +12,9 @@
     "verify": "bash scripts/verify.sh",
     "smoke": "bash scripts/smoke-services.sh",
     "e2e:debug-chat": "node scripts/debug-console-agent-e2e.mjs",
-    "eval:prompts:smoke": "python3 evals/prompts/smoke_runner.py",
     "xtask": "cargo run -p xtask --",
     "prepare": "lefthook install || true",
-    "test:nexus-suite": "bash scripts/run-nexus-suite.sh",
     "test:contract": "cargo test -p mcp-core --tests",
-    "test:e2e": "python3 tests/e2e/nexus-suite/run_all.py",
-    "test:maturity": "python3 tests/nexus-maturity/v2/run_rubric.py",
     "test:ui-e2e": "playwright test --config=apps/web-ide/playwright.config.ts"
   },
   "devDependencies": {

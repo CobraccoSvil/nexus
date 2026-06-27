@@ -12,7 +12,7 @@ regola L): ~26 categorie (~160 chiavi) erano invisibili e non amministrabili.
 
 ## Censimento (strumento permanente)
 
-`scripts/audit_settings.py` (wrapper `scripts/audit-settings.sh`) incrocia:
+`cargo xtask audit-settings` (wrapper `scripts/audit-settings.sh`; portato da Python a Rust per lo zero-Python) incrocia:
 
 - **A1** chiavi nel DB live (`docker exec ... psql`), **A2** chiavi nelle
   migrazioni (parser INSERT/DELETE);

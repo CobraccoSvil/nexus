@@ -1,24 +1,17 @@
 # Test suite Nexus (PR-4)
 
-Quattro livelli di test che completano l'orchestratore Plan/Act/Verify + Sub-agents.
+Livelli di test che completano l'orchestratore Plan/Act/Verify + Sub-agents.
+
+NOTA (migrazione zero-Python): i Livelli 4 (E2E pytest, ex `tests/e2e/nexus-suite/`)
+e 5 (maturity rubric Python, ex `tests/nexus-maturity/v2/run_rubric.py`) sono stati
+RIMOSSI. Restano il Livello 3 (contract Rust) e il Livello 6 (UI Playwright). La
+cartella `tests/nexus-maturity/` conserva ancora gli helper shell (`collect.sh`,
+`monitor.sh`) e le run storiche.
 
 ## Layout
 
 ```
 tests/
-├── e2e/
-│   └── nexus-suite/                  # Livello 4: E2E scenari Python (pytest)
-│       ├── _helpers/                 # cfg, db, api, wait
-│       ├── conftest.py
-│       ├── run_all.py                # entry point
-│       ├── test_scaffold_and_bugfix.py        # scenari 1-2
-│       ├── test_subagent_isolation.py         # scenari 3-5
-│       ├── test_clarifying_and_instructions.py # scenari 6-9
-│       └── test_admin_orchestrator_api.py     # scenari 10-12
-├── nexus-maturity/
-│   └── v2/                           # Livello 5: rubric automatica D1-D12
-│       ├── run_rubric.py
-│       └── README.md
 └── README.md (questo file)
 
 crates/mcp-core/tests/                # Livello 3: contract test Rust
@@ -44,27 +37,10 @@ apps/web-ide/e2e/orchestrator/       # Livello 6: UI e2e Playwright
 
 ## Esecuzione
 
-### Tutto in un colpo
-
-```bash
-pnpm test:nexus-suite
-# alias di scripts/run-nexus-suite.sh
-```
-
-### Singolarmente
-
 ```bash
 # Livello 3: contract Rust
 pnpm test:contract
 # → cargo test -p mcp-core --tests
-
-# Livello 4: E2E Python
-pnpm test:e2e
-# → python3 tests/e2e/nexus-suite/run_all.py
-
-# Livello 5: maturity rubric su run specifico
-pnpm test:maturity -- --run-id <UUID>
-# → python3 tests/nexus-maturity/v2/run_rubric.py --run-id <UUID>
 
 # Livello 6: UI Playwright
 pnpm test:ui-e2e
@@ -119,5 +95,5 @@ Questo permette di lanciare la suite anche in ambienti parziali (es. solo unit-l
 ## CI/CD
 
 Vedi [.github/workflows/nexus-suite.yml](../.github/workflows/nexus-suite.yml):
-- **PR**: Livello 3 (contract) sempre, Livello 4 (E2E) se servizi up
-- **Nightly**: Livello 5 (maturity) + Livello 6 (Playwright) su worktree dedicata
+- **PR**: Livello 3 (contract Rust) sempre
+- **Nightly**: Livello 6 (Playwright) su worktree dedicata

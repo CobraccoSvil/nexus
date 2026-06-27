@@ -5,7 +5,9 @@
  * Perché /api/dev-login non è disponibile in production, qui:
  * 1. Legge jwt_secret da GET {CORE_URL}/internal/settings/jwt_secret
  * 2. Mints JWT HS256 come apps/web-ide/app/api/dev-login/route.ts (sub + role + exp)
- * 3. Registra sessions.token_hash tramite GET {SESSION_INSERT_URL}/insert-session (dev_login_server.py :9999)
+ * 3. Registra sessions.token_hash via INSERT diretto in Postgres (E2E_PSQL_CONN).
+ *    NOTA: l'ex dev_login_server :9999 (Python) e' stato RIMOSSO; oggi la via
+ *    canonica e' E2E_PSQL_CONN. Il tentativo a :9999 resta solo come best-effort.
  * 4. Chiama POST /api/chat/... come il browser (header Cookie: token=...)
  *
  * Env:
@@ -13,8 +15,8 @@
  *   E2E_USER_ID=uuid utente Nexus (opzionale se E2E_PSQL_CONN: si usa il primo admin)
  *   E2E_USER_ROLE=admin
  *   E2E_PROJECT_ID=uuid progetto (opzionale; altrimenti primo da /api/projects/mine)
- *   SESSION_INSERT_URL=http://127.0.0.1:9999 — dev_login_server insert-session
- *   E2E_PSQL_CONN=postgresql://user:pass@host:5432/db — fallback diretto INSERT in sessions se :9999 non risponde
+ *   SESSION_INSERT_URL=http://127.0.0.1:9999 — legacy (dev_login_server rimosso), best-effort
+ *   E2E_PSQL_CONN=postgresql://user:pass@host:5432/db — via canonica: INSERT diretto in sessions
  *   POLL_MS=800
  *   RUN_TIMEOUT_MS=180000
  *   SKIP_TOOL_ASSERT=0 — assert sui tool SSE/DB (legacy; oggi agent_steps spesso non viene popolato)
@@ -170,7 +172,7 @@ async function registerSession(token, userId) {
       bail(`insert-session su ${SESSION_INSERT_URL} irraggiungibile e psql fallito (${process.env.E2E_PSQL_CONN || "imposta E2E_PSQL_CONN"})`, dbErr);
     }
     bail(
-      `Nessuna sessione DB registrata: avvia dev_login_server.py su ${SESSION_INSERT_URL} oppure esporta E2E_PSQL_CONN (URI postgres completo per psql).`,
+      `Nessuna sessione DB registrata: esporta E2E_PSQL_CONN (URI postgres completo per psql). Il vecchio dev_login_server :9999 e' stato rimosso.`,
     );
   }
 }

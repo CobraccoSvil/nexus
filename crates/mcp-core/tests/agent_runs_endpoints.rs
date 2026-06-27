@@ -6,7 +6,7 @@
 //!
 //! Setup tipico:
 //!   1. `cargo build -p mcp-core --release && ./target/release/mcp-core &`
-//!   2. `bash /tmp/mint_jwt.sh`  (vedi tests/e2e/nexus-suite/_helpers/)
+//!   2. `bash /tmp/mint_jwt.sh`  (helper JWT admin per i test protetti)
 //!   3. `MCP_CORE_URL=http://localhost:4000 NEXUS_TEST_JWT=$(cat /tmp/nexus_jwt.txt) cargo test --test agent_runs_endpoints`
 
 use std::env;

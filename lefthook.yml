@@ -37,7 +37,6 @@ pre-commit:
     single_source_guard:
       glob:
         - "*.rs"
-        - "*.py"
         - "*.ts"
         - "*.tsx"
       run: bash -lc "bash scripts/check-single-source.sh"

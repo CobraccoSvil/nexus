@@ -2,8 +2,8 @@ name: nexus-suite
 
 # PR-4 — Test suite Plan/Act/Verify + Sub-agents.
 #
-# Livelli 3 (contract) e 4 (E2E) eseguiti su ogni PR.
-# Livelli 5 (maturity) e 6 (UI Playwright) eseguiti in nightly schedule.
+# Livello 3 (contract Rust) eseguito su ogni PR.
+# Livello 6 (UI Playwright) eseguito in nightly schedule.
 
 on:
   pull_request:
@@ -44,20 +44,6 @@ jobs:
           done
       - name: cargo test contract
         run: cargo test -p mcp-core --tests --release -- --nocapture
-
-  e2e-python:
-    name: "L4 E2E pytest"
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - name: Install deps
-        run: pip install pytest psycopg2-binary requests
-      - name: Run E2E suite (skip se servizi non disponibili)
-        run: python3 tests/e2e/nexus-suite/run_all.py
-        continue-on-error: true
 
   ui-playwright:
     name: "L6 UI e2e Playwright"

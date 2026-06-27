@@ -5,12 +5,13 @@ test). Aggiornato durante Fase 3 del branch `chore/backlog-closure` (2026-05-19)
 
 ## Strumenti di scansione
 
-```bash
-# Conteggio robusto PROD vs TEST (esclude correttamente blocchi #[cfg(test)]):
-python3 scripts/unwrap-perfile-v2.py all
+NOTA (migrazione zero-Python): gli script di scansione Python
+(`scripts/unwrap-perfile-v2.py`, `scripts/classify-unwrap.py`) sono stati RIMOSSI.
+Il conteggio resta riproducibile con un grep diretto sui crate, ad esempio:
 
-# Classificazione semantica (regex literal / Mutex / Option real / ecc.):
-python3 scripts/classify-unwrap.py
+```bash
+# Conteggio grezzo unwrap/expect fuori dai blocchi di test:
+rg -n --type rust '\.(unwrap|expect)\(' crates/ | rg -v '#\[cfg\(test\)\]'
 ```
 
 ## Baseline post-Fase-3 step 1+2 (2026-05-19)

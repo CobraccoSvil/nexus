@@ -7,9 +7,14 @@
 //!       * diff > 500 righe richiede label `big-refactor` nel messaggio
 //!       * nessun `tracing::*!` con campo `payload`, `prompt` o `response`
 //!         non-hashato nei file modificati.
+//!   - `audit-settings [--report|--gate|--json FILE|--no-db]`: censimento
+//!     configurazioni `settings` (DB live + migrazioni vs lettori vs UI).
+//!     Punto unico (regola L), gate ratchet vs audit-settings-baseline.json.
 //!
 //! Uscita non-zero se trova violazioni. Progettato per essere eseguito in CI
 //! senza dipendenze native pesanti.
+
+mod audit_settings;
 
 use std::process::Command;
 
@@ -25,9 +30,14 @@ fn main() -> Result<()> {
             let head = args.get(3).cloned().unwrap_or_else(|| "HEAD".into());
             lint_commits(&base, &head)
         }
+        "audit-settings" => {
+            let code = audit_settings::run(&args[2..])?;
+            std::process::exit(code);
+        }
         _ => {
             eprintln!("xtask — task runner interno");
             eprintln!("  lint-commits <base> <head>    Controlli redazionali sui commit");
+            eprintln!("  audit-settings [flags]        Censimento settings DB/codice/UI");
             Ok(())
         }
     }
