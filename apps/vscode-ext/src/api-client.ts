@@ -76,13 +76,13 @@ export class ApiClient {
   }
 
   classifyIntent(message: string): Promise<IntentResponse> {
-    return fetchJson(`${this.neuralUrl}/classify-intent`, {
+    return fetchJson(`${this.neuralUrl}/api/neural/classify-intent`, {
       method: "POST",
       body: JSON.stringify({ project_id: "vscode", profile_id: "default", message }),
     });
   }
 
   neuralHealth(): Promise<Record<string, string>> {
-    return fetchJson(`${this.neuralUrl}/health`);
+    return fetchJson(`${this.neuralUrl}/api/neural/health`);
   }
 }

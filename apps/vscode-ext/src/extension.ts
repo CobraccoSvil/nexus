@@ -6,7 +6,8 @@ import { MetricsTreeProvider } from "./metrics-view";
 export function activate(context: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration("ai-orchestrator");
   const mcpUrl = config.get<string>("mcpCoreUrl", "http://localhost:4000");
-  const neuralUrl = config.get<string>("neuralCoreUrl", "http://localhost:8001");
+  // neuralUrl punta a mcp-core: le chiamate neural usano il prefisso /api/neural (vedi ApiClient).
+  const neuralUrl = config.get<string>("neuralCoreUrl", "http://localhost:4000");
   const api = new ApiClient(mcpUrl, neuralUrl);
 
   // Chat sidebar
@@ -109,9 +110,9 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         if (neuralHealth.status === "fulfilled") {
-          parts.push(`Neural Core: ${neuralHealth.value.status}`);
+          parts.push(`Neural (mcp-core): ${neuralHealth.value.status}`);
         } else {
-          parts.push("Neural Core: OFFLINE");
+          parts.push("Neural (mcp-core): OFFLINE");
         }
 
         vscode.window.showInformationMessage(parts.join(" | "));

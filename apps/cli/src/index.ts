@@ -1,5 +1,7 @@
 const API_BASE = process.env.API_URL || "http://localhost:4000";
-const NEURAL_BASE = process.env.NEURAL_URL || "http://localhost:8001";
+// Neural ora e' servito da mcp-core sotto il prefisso /api/neural (il brain Python e' stato eliminato).
+// Override esplicito via NEURAL_URL, altrimenti deriva dall'URL del core.
+const NEURAL_BASE = process.env.NEURAL_URL || `${API_BASE}/api/neural`;
 
 const HELP = `
 AI-Orchestrator CLI v0.2.0
@@ -7,7 +9,7 @@ AI-Orchestrator CLI v0.2.0
 Usage: ai-orchestrator <command> [options]
 
 Commands:
-  health        Check platform health (MCP Core + Neural Core)
+  health        Check platform health (MCP Core + Neural)
   dashboard     Show dashboard metrics
   chat <msg>    Send a message to AI assistant
   analyze <f>   Analyze a source file for quality issues
@@ -18,7 +20,7 @@ Commands:
 
 Environment:
   API_URL       MCP Core URL (default: http://localhost:4000)
-  NEURAL_URL    Neural Core URL (default: http://localhost:8001)
+  NEURAL_URL    Neural (mcp-core) URL override (default: <API_URL>/api/neural)
 `;
 
 async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
@@ -40,16 +42,15 @@ async function cmdHealth() {
     const components = core.components as Record<string, boolean>;
     console.log(`  Database:  ${components.database ? "OK" : "OFFLINE"}`);
     console.log(`  Redis:     ${components.redis ? "OK" : "OFFLINE"}`);
-    console.log(`  Neural:    ${components.neural_core ? "OK" : "OFFLINE"}`);
   } catch (e) {
     console.log(`MCP Core:    OFFLINE (${(e as Error).message})`);
   }
 
   try {
     const neural = (await fetchJson(`${NEURAL_BASE}/health`)) as Record<string, string>;
-    console.log(`Neural Core: ${neural.status === "ok" ? "OK" : "ERROR"}`);
+    console.log(`Neural:      ${neural.status === "ok" ? "OK" : "ERROR"}`);
   } catch (e) {
-    console.log(`Neural Core: OFFLINE (${(e as Error).message})`);
+    console.log(`Neural:      OFFLINE (${(e as Error).message})`);
   }
 }
 

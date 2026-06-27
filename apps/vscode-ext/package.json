@@ -75,8 +75,8 @@
         },
         "ai-orchestrator.neuralCoreUrl": {
           "type": "string",
-          "default": "http://localhost:8001",
-          "description": "Neural Core REST URL"
+          "default": "http://localhost:4000",
+          "description": "Neural REST URL (mcp-core, endpoint /api/neural)"
         }
       }
     }
