@@ -1541,6 +1541,25 @@ modo piu' specifico."
                 .set_effective_model(&run_id, &eff_provider, &eff_model, mode)
                 .await;
         }
+        // ── usage del turno (py:3087-3125, 3320, 3476-3480) ───────────────────
+        // I token vengono dalla risposta LLM (post-escalation: `resp` e' gia' quella
+        // promossa se il signature-loop ha scalato). Il Python li EMETTE per-turno con
+        // reducer overwrite (last-write, non additivo: vedi state.py — solo messages/
+        // meta_steps sono `add`), quindi qui replichiamo: valori del turno, non
+        // cumulativi (la cumulazione e' del finalize/ledger). Senza questa
+        // propagazione l'esito nativo aveva SEMPRE total_tokens=0 nel DB (secondo
+        // bug osservato sul primario Rust, oltre all'hollow). `total_tokens` segue la
+        // formula del Python (prompt+completion+cache_*). Su turno error (gateway_errored)
+        // l'usage e' default (zero), parita' col Python che non somma nulla nell'except.
+        let usage = &resp.usage;
+        let turn_prompt_tokens = usage.prompt_tokens;
+        let turn_completion_tokens = usage.completion_tokens;
+        let turn_cache_creation = usage.cache_creation_tokens.unwrap_or(0);
+        let turn_cache_read = usage.cache_read_tokens.unwrap_or(0);
+        let turn_total_tokens =
+            turn_prompt_tokens + turn_completion_tokens + turn_cache_creation + turn_cache_read;
+        let turn_total_cost = usage.total_cost_usd;
+
         // Coda aggiornata cap 12: con loop chiuso new_signatures e' [] -> recent only.
         let updated_signatures = detect_signature_loop(&recent, &new_signatures).updated_signatures;
 
@@ -1710,6 +1729,13 @@ modo piu' specifico."
             g1_reroute_count: Some(Some(g1_reroute_count)),
             sticky_provider: Some(sticky_provider),
             sticky_model: Some(sticky_model),
+            // Usage del turno (py:3476-3480), overwrite last-write come il Python.
+            prompt_tokens: Some(Some(turn_prompt_tokens)),
+            completion_tokens: Some(Some(turn_completion_tokens)),
+            cache_creation_tokens: Some(Some(turn_cache_creation)),
+            cache_read_tokens: Some(Some(turn_cache_read)),
+            total_tokens: Some(Some(turn_total_tokens)),
+            total_cost_usd: Some(turn_total_cost),
             ..Default::default()
         };
         // Cutoff di generazione persistito solo al cambio fase (py:3458-3459).

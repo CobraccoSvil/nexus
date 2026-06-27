@@ -203,6 +203,35 @@ fn tools_to_openai_schema(tools: &[Value]) -> Value {
     Value::Array(converted)
 }
 
+/// Normalizza il `finish_reason` del gateway (vocabolario wire OpenAI-canonico
+/// prodotto da `nexus-gateway`: tutti i provider — anthropic/openai/mistral/google/
+/// deepseek — vengono ricondotti a `tool_calls`/`length`/`stop` lato server) al
+/// vocabolario della porta [`nexus_agent_graph::runtime::ports::LlmResponse`]
+/// (`tool_use`/`max_tokens`/`end_turn`), che e' lo stesso atteso dal punto unico
+/// `stop_reason_from_str` dell'executor (mappato 1:1 sul vocabolario Anthropic).
+///
+/// CAUSA DEL BUG "hollow primario" (2026-06-27): il gateway ritorna
+/// `finish_reason="tool_calls"` quando il modello chiama un tool, ma l'executor
+/// riconosceva solo `"tool_use"` (Anthropic-style) e cadeva nel default
+/// `_ => EndTurn`: il turno con tool_call diventava una chiusura, il
+/// `tool_dispatch` veniva saltato (`route_after_executor` instrada al dispatch SOLO
+/// su `StopReason::ToolUse`), il run finiva a `end_turn` con 0 step e content vuoto.
+/// Lo SHADOW non lo coglieva perche' il `ReplayLlmGateway` costruisce gia'
+/// `stop_reason="tool_use"` a mano (non passa dal `finish_reason` del gateway reale).
+///
+/// PUNTO UNICO (regola L): la traduzione wire->porta vive qui, l'unico confine fra
+/// il formato del gateway e la porta `LlmResponse`. Valori ignoti -> passthrough
+/// (robustezza: niente magic, una stringa sconosciuta cade poi sul default
+/// `end_turn` del punto unico executor, come oggi).
+fn normalize_gw_finish_reason(finish: &str) -> String {
+    match finish {
+        "tool_calls" => "tool_use".to_string(),
+        "length" => "max_tokens".to_string(),
+        "stop" => "end_turn".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Mappa la [`GwResponse`] del gateway nella [`LlmResponse`] della porta.
 ///
 /// - `tool_calls`: `GwToolCall` -> [`ToolUse`] (l'`arguments` stringa JSON e'
@@ -212,7 +241,9 @@ fn tools_to_openai_schema(tools: &[Value]) -> Value {
 ///   tool_use/tool_result);
 /// - `provider_used`/`model_used`: gli EFFETTIVI post cascade/sticky del gateway;
 /// - `usage`: cache_read/creation mappati (telemetria token);
-/// - `finish_reason` -> `stop_reason`.
+/// - `finish_reason` -> `stop_reason` NORMALIZZATO al vocabolario della porta
+///   ([`normalize_gw_finish_reason`]): `tool_calls`->`tool_use` e' load-bearing per
+///   instradare al `tool_dispatch` (vedi nota sul bug hollow).
 fn map_gw_response(resp: GwResponse) -> LlmResponse {
     let tool_calls: Vec<ToolUse> = resp
         .tool_calls
@@ -249,7 +280,7 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
         provider_used: Some(resp.provider_used),
         model_used: Some(resp.model_used),
         assistant_content,
-        stop_reason: Some(resp.finish_reason),
+        stop_reason: Some(normalize_gw_finish_reason(&resp.finish_reason)),
     }
 }
 
@@ -780,10 +811,49 @@ mod tests {
                 .expect("assistant_content deserializzabile in ContentBlock");
         }
 
-        // provider/model EFFETTIVI + stop_reason.
+        // provider/model EFFETTIVI + stop_reason NORMALIZZATO al vocabolario della
+        // porta: il gateway riporta finish_reason="tool_calls" (OpenAI-canonico),
+        // qui deve diventare "tool_use" (Anthropic-style atteso dall'executor) cosi'
+        // il `route_after_executor` instrada al tool_dispatch (FIX hollow primario).
         assert_eq!(out.provider_used.as_deref(), Some("anthropic"));
         assert_eq!(out.model_used.as_deref(), Some("claude-real"));
-        assert_eq!(out.stop_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    // ── normalizzazione finish_reason wire->porta (FIX hollow primario) ────────
+
+    #[test]
+    fn normalize_finish_reason_tool_calls_diventa_tool_use() {
+        // Il caso che causava l'hollow: tool_calls (gateway) -> tool_use (porta).
+        assert_eq!(normalize_gw_finish_reason("tool_calls"), "tool_use");
+    }
+
+    #[test]
+    fn normalize_finish_reason_stop_diventa_end_turn() {
+        assert_eq!(normalize_gw_finish_reason("stop"), "end_turn");
+    }
+
+    #[test]
+    fn normalize_finish_reason_length_diventa_max_tokens() {
+        assert_eq!(normalize_gw_finish_reason("length"), "max_tokens");
+    }
+
+    #[test]
+    fn normalize_finish_reason_ignoto_passthrough() {
+        // Robustezza: una stringa fuori contratto non viene inventata, passa cosi'
+        // com'e' (cadra' poi sul default end_turn del punto unico executor).
+        assert_eq!(normalize_gw_finish_reason("error"), "error");
+        assert_eq!(normalize_gw_finish_reason("boh"), "boh");
+    }
+
+    #[test]
+    fn map_gw_response_turno_tool_instrada_a_tool_use() {
+        // E2E del mapping: una GwResponse con finish_reason="tool_calls" e 1 tool_call
+        // -> LlmResponse con stop_reason "tool_use" + tool_calls popolato (il turno
+        // verra' instradato al dispatch, non chiuso a end_turn). Riproduce il run reale.
+        let out = map_gw_response(gw_resp_with_tool_call());
+        assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(out.tool_calls.len(), 1);
     }
 
     #[test]
