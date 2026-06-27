@@ -246,6 +246,15 @@ fn cooldown_note_from_snapshot(snap: &[(String, u64, Option<String>)]) -> Option
 /// JSON. Una risposta cosi' non e' una risposta: si passa al recap deterministico.
 fn looks_like_textual_tool_call(s: &str) -> bool {
     let trimmed = s.trim();
+    // Formato tool-call "template" di deepseek colato nel content invece di essere
+    // parsato come tool strutturato: <｜｜DSML｜｜tool_calls> ... <｜｜DSML｜｜invoke
+    // name=...> (barre fullwidth U+FF5C). Run 8d429b03 (Beauty-Book):
+    // deepseek-v4-pro sotto G1 nudge emette la tool-call come testo -> finiva
+    // grezza nel final_answer. Trattala come tool-call testuale: il finalizzatore
+    // usa il recap deterministico invece di mostrare il markup all'utente.
+    if trimmed.contains("\u{ff5c}\u{ff5c}DSML") {
+        return true;
+    }
     let mut lines = trimmed.splitn(2, '\n');
     let first = lines.next().unwrap_or("").trim();
     let rest = lines.next().unwrap_or("").trim();
@@ -4304,6 +4313,11 @@ mod tests_finalize_turn {
             "read_file e' un tool che legge i file."
         ));
         assert!(!super::looks_like_textual_tool_call("{\"ok\": true}"));
+        // Formato DSML di deepseek (tool-call colata nel content) -> rilevata.
+        assert!(super::looks_like_textual_tool_call(
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\n\
+             <\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"read_file\">"
+        ));
         // compose: con step produttivi -> recap, non la spazzatura.
         let r = mk_result(
             AgentRunStatus::Completed, vec![write_step()], Some(raw), false,
