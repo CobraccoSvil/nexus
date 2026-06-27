@@ -366,6 +366,20 @@ const {{ chromium }} = require('playwright');
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Il pacchetto `playwright` vive nella install centrale di Nexus (la
+    // node_modules del workspace == WorkingDirectory del servizio), NON nel
+    // progetto utente: un progetto Figma Make non ha (ne' deve avere) playwright
+    // tra le sue dipendenze. Puntiamo NODE_PATH a quella install cosi'
+    // visual_compare funziona su QUALSIASI progetto senza installare nulla nella
+    // project_root (isolamento progetti, regola E). I browser restano nella
+    // cache globale condivisa (~/.cache/ms-playwright). Non hardcoded: il path
+    // deriva dalla CWD del processo (il systemd unit fissa WorkingDirectory).
+    if let Ok(cwd) = std::env::current_dir() {
+        let nm = cwd.join("node_modules");
+        if nm.join("playwright").is_dir() {
+            cmd.env("NODE_PATH", &nm);
+        }
+    }
 
     let mut child = cmd
         .spawn()
