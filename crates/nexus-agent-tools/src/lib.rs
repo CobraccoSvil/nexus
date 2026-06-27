@@ -21,6 +21,7 @@ pub mod dev_diagnostics;
 pub mod dispatcher;
 pub mod document_tools;
 pub mod figma_tools;
+pub mod gateway_client;
 pub mod git;
 pub mod monitor;
 pub mod profile_tools;
