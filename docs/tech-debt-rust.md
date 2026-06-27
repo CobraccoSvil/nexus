@@ -118,6 +118,43 @@ Migrare i `Regex::new("...").unwrap()` annotati a `std::sync::LazyLock<Regex>`
 per evitare ricompilazione ad ogni chiamata. Miglioramento di performance, non
 fix di sicurezza — gestire come tech-debt separato.
 
+## Gate ratchet qualita codice (quality-scan)
+
+Gate automatico anti-god-file/god-function sul codice Rust del workspace,
+analogo a jscpd (`.dup-baseline.json`) e audit-settings. Punto unico (regola L):
+la logica di scansione vive in `mcp_quality::scan` (`crates/mcp-quality/src/scan.rs`);
+il sottocomando `xtask quality-scan` la consuma; `scripts/quality-scan.sh` e' il
+wrapper; `scripts/verify.sh` lo esegue come fase finale (saltabile con
+`VERIFY_SKIP_RUST=1`).
+
+Metriche sottoposte a gate (file di test esclusi) — possono solo SCENDERE
+rispetto a `scripts/quality-baseline.json`:
+
+- `total`            — findings totali (tutte le categorie)
+- `long_functions`   — funzioni > 50 righe
+- `complexity_high`  — funzioni con complessita ciclomatica > 20
+- `security`         — findings di categoria security
+
+Baseline iniziale (2026-06-27, post-porting zero-Python, 845 file non-test):
+
+  findings totali   : 10300
+  funzioni >50 righe:   876
+  complessita >20   :    43
+  security          :   133
+
+Uso:
+
+```bash
+bash scripts/quality-scan.sh --gate     # default: exit!=0 su regressione
+bash scripts/quality-scan.sh --update   # riallinea la baseline al ribasso dopo un refactor
+```
+
+Nota di attribuzione: il porting LangGraph->Rust (`nexus-agent-graph` +
+`nexus-gateway`) contribuisce solo ~15% dei findings, ~11% delle funzioni
+lunghe e ~9% della complessita estrema. Gli hotspot peggiori (complessita 104
+in `chat_messages/agent_run.rs`, 84 in `project_db_routes/connection.rs`, 63 in
+`project_workspace/wizard.rs`) sono codice `mcp-core` preesistente al porting.
+
 ### C3 — cluster HOT completati (2026-06-11)
 
 I cluster con compilazione per-file durante gli scan di progetto sono stati

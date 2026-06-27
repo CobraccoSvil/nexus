@@ -11,6 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 pub mod injection;
+pub mod scan;
 
 // --- Regex compilate una sola volta (pattern literal; safety: literal valido) ---
 

@@ -15,6 +15,7 @@
 //! senza dipendenze native pesanti.
 
 mod audit_settings;
+mod quality_scan;
 
 use std::process::Command;
 
@@ -34,10 +35,15 @@ fn main() -> Result<()> {
             let code = audit_settings::run(&args[2..])?;
             std::process::exit(code);
         }
+        "quality-scan" => {
+            let code = quality_scan::run(&args[2..])?;
+            std::process::exit(code);
+        }
         _ => {
             eprintln!("xtask — task runner interno");
             eprintln!("  lint-commits <base> <head>    Controlli redazionali sui commit");
             eprintln!("  audit-settings [flags]        Censimento settings DB/codice/UI");
+            eprintln!("  quality-scan [--gate|--update] Gate ratchet qualita codice Rust");
             Ok(())
         }
     }

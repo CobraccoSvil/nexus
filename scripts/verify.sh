@@ -53,4 +53,13 @@ fi
 # non e' raggiungibile lo script degrada da solo in modalita' --no-db.
 run_phase "audit settings (gate ratchet)" bash scripts/audit-settings.sh --gate
 
+# Gate ratchet qualita codice Rust: findings totali, funzioni >50 righe,
+# complessita >20, security possono solo scendere (baseline in
+# scripts/quality-baseline.json). Saltabile con VERIFY_SKIP_RUST=1.
+if [[ "$SKIP_RUST" != "1" ]]; then
+    run_phase "quality scan (gate ratchet)" bash scripts/quality-scan.sh --gate
+else
+    echo "-- verify: quality scan saltato (VERIFY_SKIP_RUST=1)"
+fi
+
 echo -e "${GREEN}OK verify: tutte le fasi passate${NC}"
