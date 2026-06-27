@@ -379,9 +379,13 @@ async fn main() -> anyhow::Result<()> {
     // NOTA: il cleanup dei processi 'running'/'starting' è già gestito dal blocco
     // di riconciliazione PID sopra (kill -0).
     {
-        let stale_seconds = run_reaper::stale_seconds_from_settings(&db).await;
-        // All'avvio non ci sono broadcast channel attivi: ignoriamo gli id reapati.
-        let _ = run_reaper::reap_stale_runs(&db, stale_seconds).await;
+        // All'avvio ogni run 'running' e' un ORFANO del processo precedente (il task
+        // che lo eseguiva — heartbeat updated_at incluso — e' morto col restart):
+        // li marchiamo tutti 'interrupted' SENZA time-gate, altrimenti un orfano con
+        // updated_at recente resterebbe 'running' e bloccherebbe i nuovi run sulla
+        // sessione (gate 409 / session_has_active_run). Esclude 'awaiting_confirmation'.
+        // No broadcast channel attivi qui: ignoriamo gli id reapati. (regola H/L/G)
+        let _ = run_reaper::reap_orphaned_runs_at_boot(&db).await;
     }
 
     let redis = cache::init_redis(&redis_url).await?;

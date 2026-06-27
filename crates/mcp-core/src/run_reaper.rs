@@ -75,7 +75,72 @@ pub async fn reap_stale_runs(db: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid>
         reaped.len(),
         stale_seconds
     );
+    finalize_reaped(db, reaped).await
+}
 
+/// Bootstrap recovery (regola H, causa radice del "run orfano blocca la sessione"):
+/// marca 'interrupted' TUTTI i run 'running' SENZA clausola temporale. Dopo un
+/// restart di mcp-core un run 'running' e' per definizione orfano (il task che lo
+/// eseguiva — heartbeat `updated_at` incluso — e' morto col processo precedente),
+/// indipendentemente da quanto e' recente `updated_at`: la guardia stale del
+/// reaper periodico (corretta a runtime, non uccide run lunghi vivi) e' SBAGLIATA
+/// al boot e lasciava sopravvivere gli orfani recenti, che poi bloccavano i nuovi
+/// run sulla sessione (gate 409 / session_has_active_run su status='running').
+/// Esclude 'awaiting_confirmation' (resumibile via checkpoint + /agent/approve).
+/// Da chiamare PRIMA del bind del listener HTTP: nessun run del processo corrente
+/// puo' ancora esistere, quindi ogni 'running' e' un orfano. Gated da
+/// `agent.run_recovery.reap_all_at_boot` (regola G, default true); se false ricade
+/// sul reap time-gated (compatibilita').
+pub async fn reap_orphaned_runs_at_boot(db: &PgPool) -> Vec<uuid::Uuid> {
+    if !reap_all_at_boot_enabled(db).await {
+        let stale = stale_seconds_from_settings(db).await;
+        return reap_stale_runs(db, stale).await;
+    }
+    let reaped: Vec<uuid::Uuid> = sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"
+        UPDATE agent_runs
+        SET status = 'interrupted',
+            final_answer = COALESCE(final_answer, $1),
+            completed_at = NOW()
+        WHERE status = 'running'
+          AND completed_at IS NULL
+        RETURNING id
+        "#,
+    )
+    .bind(INTERRUPTED_MSG)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    if reaped.is_empty() {
+        return reaped;
+    }
+    tracing::warn!(
+        "run_reaper: bootstrap, marcati {} run 'running' orfani come 'interrupted' (no time-gate)",
+        reaped.len()
+    );
+    finalize_reaped(db, reaped).await
+}
+
+/// Flag DB (regola G): il reaper di bootstrap marca TUTTI i 'running' (true,
+/// default) oppure ricade sul time-gating periodico (false). Niente hardcode di
+/// comportamento: il default true vale solo se il setting manca.
+async fn reap_all_at_boot_enabled(db: &PgPool) -> bool {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'agent.run_recovery.reap_all_at_boot'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    .unwrap_or(true)
+}
+
+/// Corpo comune (regola L) dei due reaper: per i run appena marcati 'interrupted'
+/// registra il worklog di sessione e inserisce il messaggio assistente. Ritorna
+/// gli id reapati cosi' il chiamante puo' sbloccare gli EventSource in ascolto.
+async fn finalize_reaped(db: &PgPool, reaped: Vec<uuid::Uuid>) -> Vec<uuid::Uuid> {
     // Worklog di sessione (mig 0411): anche il lavoro dei run interrotti
     // (crash/stallo) entra nella storia di lavoro — gli agent_steps sono gia'
     // in DB grazie alla persistenza incrementale del brain (M68). Il run
