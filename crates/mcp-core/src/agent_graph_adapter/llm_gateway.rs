@@ -265,6 +265,14 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
 /// LETTERALE: per i tool wrappati e' `"nexus_mcp_tool_call"` (il vero tool sta in
 /// `tool_input.tool_name`) — il replay NON lo spacchetta, restituisce la colonna
 /// `tool_name` cosi' com'e' (vedi [`ReplayLlmGateway`]).
+///
+/// `created_at_us`: timestamp di scrittura in MICROSECONDI epoch. E' il
+/// discriminante del TURNO REALE: gli step di uno stesso turno LLM del primario
+/// sono scritti nello stesso batch -> `created_at` quasi-identico (osservato:
+/// identico al microsecondo per i batch INSERT singoli, fino a ~2-3ms di jitter per
+/// INSERT separati nello stesso burst); turni/ondate diversi sono distanti >=
+/// centinaia di ms (osservato: minimo ~356ms, tipico secondi). Vedi
+/// [`group_steps_by_turn`].
 #[derive(Debug, Clone)]
 struct ReplayStep {
     /// Indice globale dello step (`iteration*1000 + idx_locale` per i primari Python).
@@ -273,6 +281,8 @@ struct ReplayStep {
     tool_name: String,
     /// Argomenti del tool (colonna `tool_input` JSONB).
     tool_input: Value,
+    /// `created_at` in MICROSECONDI epoch (discriminante del turno reale).
+    created_at_us: i64,
 }
 
 /// PUNTO UNICO della lettura degli step di replay da `agent_steps` (funzione
@@ -286,18 +296,24 @@ struct ReplayStep {
 /// ORDINAMENTO (FIX shadow LLM-Replay, difesa in profondita'): `created_at ASC,
 /// step_index ASC, id ASC`. Lo `step_index` del primario Python NON e' univoco
 /// per run (retry/fallback della cascade riusano lo stesso indice), quindi un
-/// ordinamento per solo `step_index` poteva MESCOLARE le ondate (gruppi-iterazione
-/// di `group_steps_by_iteration`) e produrre divergenza ("loop"). `created_at` da'
-/// l'ordine temporale reale; `step_index` poi `id` (PK UUID) sono tiebreak
-/// deterministici quando `created_at` collide. Il raggruppamento per quoziente
-/// `step_index / 1000` resta invariato (vedi `group_steps_by_iteration`); questo e'
-/// solo l'ordine di lettura.
+/// ordinamento per solo `step_index` poteva MESCOLARE le ondate (gruppi-turno di
+/// `group_steps_by_turn`) e produrre divergenza ("loop"). `created_at` da' l'ordine
+/// temporale reale; `step_index` poi `id` (PK UUID) sono tiebreak deterministici
+/// quando `created_at` collide. Il raggruppamento per TURNO REALE usa lo stesso
+/// `created_at` (vedi `group_steps_by_turn`), NON il quoziente `step_index / 1000`
+/// (inaffidabile su fonte sporca con indici riusati dalle ondate).
+///
+/// `created_at` e' letto come MICROSECONDI epoch (`EXTRACT(EPOCH ...) * 1e6`) cosi'
+/// il raggruppamento per turno lavora su un intero deterministico e indipendente
+/// dal fuso/tipo Rust del timestamp.
 async fn load_replay_steps(
     db: &PgPool,
     primary_run_id: Uuid,
 ) -> Result<Vec<ReplayStep>, PortError> {
-    let rows: Vec<(i64, String, Value)> = sqlx::query_as(
-        "SELECT step_index::bigint, tool_name, tool_input FROM agent_steps \
+    let rows: Vec<(i64, String, Value, i64)> = sqlx::query_as(
+        "SELECT step_index::bigint, tool_name, tool_input, \
+                (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_us \
+         FROM agent_steps \
          WHERE run_id = $1 \
          ORDER BY created_at ASC, step_index ASC, id ASC",
     )
@@ -308,10 +324,11 @@ async fn load_replay_steps(
 
     Ok(rows
         .into_iter()
-        .map(|(step_index, tool_name, tool_input)| ReplayStep {
+        .map(|(step_index, tool_name, tool_input, created_at_us)| ReplayStep {
             step_index,
             tool_name,
             tool_input,
+            created_at_us,
         })
         .collect())
 }
@@ -333,32 +350,53 @@ async fn load_primary_final_answer(
     Ok(row.and_then(|(fa,)| fa))
 }
 
-/// Raggruppa gli step (gia' ordinati per `step_index`) per ITERAZIONE = quoziente
-/// `step_index / 1000`. Ritorna i gruppi nell'ordine dei quozienti DISTINTI
-/// crescenti (i buchi sono ignorati: se il primario ha iterazioni senza tool, quei
-/// quozienti non compaiono). Ogni gruppo mantiene gli step nell'ordine `step_index`.
+/// Default della tolleranza di gap (microsecondi) usata da `group_steps_by_turn`
+/// quando il setting DB `agent.shadow.replay_turn_gap_ms` non e' valorizzato.
+/// 50ms (= 50_000 us): sta nel mezzo della separazione di oltre due ordini di
+/// grandezza misurata sui dati reali (intra-turno <= ~2.6ms vs inter-turno >=
+/// ~356ms). Regola G: la soglia operativa e' nel DB; questo e' solo il fallback
+/// documentato della funzione PURA.
+const DEFAULT_TURN_GAP_US: i64 = 50_000;
+
+/// Raggruppa gli step (gia' ordinati per `created_at` ASC, `step_index` ASC, `id`
+/// ASC da [`load_replay_steps`]) per TURNO REALE del primario, usando il GAP di
+/// `created_at`: due step consecutivi nello stesso turno LLM hanno `created_at`
+/// quasi-identico (scritti nello stesso batch dal brain), mentre turni/ondate
+/// diversi sono distanti. Un gap maggiore di `gap_us` (microsecondi) apre un turno
+/// nuovo; gap minore-uguale tiene lo step nel turno corrente.
 ///
-/// PURA (regola L): nessun I/O, esercitabile in isolamento. Assume lo schema
-/// `iteration*1000 + idx` (valido per i primari Python che lo shadow rigioca; il
-/// caso legacy sequenziale riguarda i primari Rust, mai shadowati).
-fn group_steps_by_iteration(steps: &[ReplayStep]) -> Vec<Vec<ReplayStep>> {
+/// Sostituisce il precedente raggruppamento per quoziente `step_index / 1000`, che
+/// era INAFFIDABILE sulla fonte sporca: il brain su retry/fallback dello stesso run
+/// RIUSA gli `step_index` (es. 3000-3003 in DUE ondate con `created_at` distanti),
+/// quindi il quoziente ACCORPAVA ondate diverse in un solo mega-turno -> tool
+/// esplorativi ripetuti in un turno -> `detect_signature_loop` spurio + stop_reason
+/// "loop" + `num_tool_calls` troncato. Il GAP temporale ricostruisce i turni reali.
+///
+/// PURA (regola L): nessun I/O. `gap_us` e' iniettato dal chiamante
+/// ([`ReplayLlmGateway::groups`], DB-driven con fallback [`DEFAULT_TURN_GAP_US`]).
+/// Ogni gruppo mantiene gli step nell'ordine di ingresso (= ordine temporale).
+fn group_steps_by_turn(steps: &[ReplayStep], gap_us: i64) -> Vec<Vec<ReplayStep>> {
     let mut groups: Vec<Vec<ReplayStep>> = Vec::new();
-    let mut current_quot: Option<i64> = None;
+    let mut prev_ts: Option<i64> = None;
     for s in steps {
-        let quot = s.step_index / 1000;
-        if current_quot != Some(quot) {
+        let new_turn = match prev_ts {
+            // Primo step, oppure salto temporale oltre la tolleranza -> turno nuovo.
+            None => true,
+            Some(prev) => s.created_at_us.saturating_sub(prev) > gap_us,
+        };
+        if new_turn {
             groups.push(Vec::new());
-            current_quot = Some(quot);
         }
         groups
             .last_mut()
             .expect("almeno un gruppo creato sopra")
             .push(s.clone());
+        prev_ts = Some(s.created_at_us);
     }
     groups
 }
 
-/// Costruisce la [`LlmResponse`] dell'executor da rigiocare per UN gruppo-iterazione
+/// Costruisce la [`LlmResponse`] dell'executor da rigiocare per UN gruppo-turno
 /// del primario. PURA: emette un `tool_use` per ogni step del gruppo (id sintetico
 /// `replay-{step_index}`, name = colonna `tool_name` LETTERALE, input = `tool_input`)
 /// e ricostruisce `assistant_content` riusando la STESSA forma di [`map_gw_response`]
@@ -439,10 +477,10 @@ fn neutral_auxiliary_response() -> LlmResponse {
 /// Gateway LLM di REPLAY per lo SHADOW (read-only, costo zero). NON chiama mai
 /// l'LLM reale:
 /// - per la chiamata dell'EXECUTOR (`purpose == "executor"`) consuma il prossimo
-///   gruppo-iterazione del primario (lazy-load di `agent_steps`) ed emette gli
-///   stessi tool_use, nello stesso ordine `step_index`. Esaurito il cursore,
-///   chiude con `agent_runs.final_answer` del primario (`stop_reason=end_turn`),
-///   cosi' lo shadow termina come il primario;
+///   gruppo-turno del primario (lazy-load di `agent_steps`, raggruppati per turno
+///   reale via gap di `created_at`) ed emette gli stessi tool_use, nello stesso
+///   ordine temporale. Esaurito il cursore, chiude con `agent_runs.final_answer`
+///   del primario (`stop_reason=end_turn`), cosi' lo shadow termina come il primario;
 /// - per le chiamate AUSILIARIE (planner/reflection/clarify_expand o `None`)
 ///   ritorna [`neutral_auxiliary_response`] (deterministica, zero I/O).
 ///
@@ -455,7 +493,7 @@ pub struct ReplayLlmGateway {
     db: PgPool,
     /// Run primario di cui RIGIOCARE le decisioni dell'executor (= thread_id).
     primary_run_id: Uuid,
-    /// Step del primario raggruppati per iterazione (lazy-load alla prima chiamata
+    /// Step del primario raggruppati per TURNO REALE (lazy-load alla prima chiamata
     /// executor). `OnceCell`: una sola lettura per run shadow.
     groups: OnceCell<Vec<Vec<ReplayStep>>>,
     /// Cursore sui gruppi-iterazione: indice del PROSSIMO gruppo da consumare.
@@ -478,14 +516,35 @@ impl ReplayLlmGateway {
         }
     }
 
-    /// Lazy-load (una sola volta) degli step del primario raggruppati per iterazione.
+    /// Lazy-load (una sola volta) degli step del primario raggruppati per TURNO
+    /// REALE. La tolleranza di gap e' DB-driven (regola G): setting
+    /// `agent.shadow.replay_turn_gap_ms` (millisecondi), default
+    /// [`DEFAULT_TURN_GAP_US`] / 1000 se assente/non parsabile.
     async fn groups(&self) -> Result<&Vec<Vec<ReplayStep>>, PortError> {
         self.groups
             .get_or_try_init(|| async {
                 let steps = load_replay_steps(&self.db, self.primary_run_id).await?;
-                Ok(group_steps_by_iteration(&steps))
+                let gap_us = self.turn_gap_us().await;
+                Ok(group_steps_by_turn(&steps, gap_us))
             })
             .await
+    }
+
+    /// Tolleranza di gap per il raggruppamento per turno, in MICROSECONDI, letta dal
+    /// setting `agent.shadow.replay_turn_gap_ms` (millisecondi nel DB). Fallback
+    /// [`DEFAULT_TURN_GAP_US`] se il setting e' assente, vuoto o non parsabile (la
+    /// lettura non deve mai far fallire lo shadow read-only). Regola G: nessun
+    /// hardcode della soglia operativa nella logica; il default e' solo la rete di
+    /// sicurezza documentata.
+    async fn turn_gap_us(&self) -> i64 {
+        crate::settings::get_setting(&self.db, "agent.shadow.replay_turn_gap_ms")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|ms| *ms >= 0)
+            .map(|ms| ms.saturating_mul(1000))
+            .unwrap_or(DEFAULT_TURN_GAP_US)
     }
 
     /// Lazy-load (una sola volta) del `final_answer` del primario.
@@ -495,7 +554,7 @@ impl ReplayLlmGateway {
             .await
     }
 
-    /// Replay della chiamata dell'executor: consuma il prossimo gruppo-iterazione;
+    /// Replay della chiamata dell'executor: consuma il prossimo gruppo-turno;
     /// se esausto, chiude con `final_answer` del primario (`stop_reason=end_turn`).
     async fn complete_executor(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
         let groups = self.groups().await?;
@@ -835,37 +894,103 @@ mod tests {
 
     // ── ReplayLlmGateway: raggruppamento + risposta replay (PURI) ─────────────
 
-    fn step(step_index: i64, tool_name: &str) -> ReplayStep {
+    /// Step di test con `created_at` esplicito in MICROSECONDI epoch: il
+    /// raggruppamento per turno lavora sul GAP di `created_at`, quindi i test
+    /// devono controllare il timestamp (non piu' il quoziente `step_index/1000`).
+    fn step_at(step_index: i64, tool_name: &str, created_at_us: i64) -> ReplayStep {
         ReplayStep {
             step_index,
             tool_name: tool_name.to_string(),
             tool_input: json!({"k": step_index}),
+            created_at_us,
         }
     }
 
     #[test]
-    fn group_steps_raggruppa_per_quoziente_1000() {
-        // iter 0 (step 0,1), iter 2 (step 2000) -> due gruppi distinti in ordine.
-        let steps = vec![step(0, "read_file"), step(1, "list_files"), step(2000, "edit_file")];
-        let groups = group_steps_by_iteration(&steps);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].len(), 2);
+    fn group_steps_turno_multi_tool_resta_unito() {
+        // Un turno LLM multi-tool: stesso created_at (batch INSERT singolo) -> 1
+        // gruppo con tutti i tool, ordine preservato. Default 50ms di gap.
+        let t = 1_000_000_000;
+        let steps = vec![
+            step_at(0, "read_file", t),
+            step_at(1, "list_files", t),
+            step_at(2, "grep", t),
+        ];
+        let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
+        assert_eq!(groups.len(), 1, "stesso created_at -> un solo turno");
+        assert_eq!(groups[0].len(), 3);
         assert_eq!(groups[0][0].tool_name, "read_file");
         assert_eq!(groups[0][1].tool_name, "list_files");
-        assert_eq!(groups[1].len(), 1);
-        assert_eq!(groups[1][0].tool_name, "edit_file");
+        assert_eq!(groups[0][2].tool_name, "grep");
     }
 
     #[test]
-    fn group_steps_buchi_non_contigui_in_ordine() {
-        // (e) gruppi non contigui: iter 0, 2, 3 (niente iter 1) -> 3 gruppi, ordine
-        // dei quozienti crescenti, i buchi sono ignorati.
-        let steps = vec![step(0, "a"), step(2000, "b"), step(3000, "c")];
-        let groups = group_steps_by_iteration(&steps);
-        assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0][0].tool_name, "a");
-        assert_eq!(groups[1][0].tool_name, "b");
-        assert_eq!(groups[2][0].tool_name, "c");
+    fn group_steps_due_ondate_stessi_step_index_turni_separati() {
+        // FIX shadow: due ondate (retry/fallback) RIUSANO gli step_index (3000-3003)
+        // ma con created_at distante. Il quoziente /1000 le accorpava in un
+        // mega-turno (loop spurio); il gap temporale le tiene SEPARATE.
+        // Ondata 1: step 3000-3003 a t. Ondata 2 (stessi indici): a t + 40s.
+        let t = 1_000_000_000;
+        let ond2 = t + 40_000_000; // +40s, ben oltre i 50ms di tolleranza
+        let steps = vec![
+            step_at(3000, "read_file", t),
+            step_at(3001, "read_file", t),
+            step_at(3002, "read_file", t),
+            step_at(3003, "read_file", t),
+            step_at(3000, "list_files", ond2),
+            step_at(3001, "list_files", ond2),
+            step_at(3002, "list_files", ond2),
+            step_at(3003, "read_file", ond2),
+        ];
+        let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
+        assert_eq!(groups.len(), 2, "due ondate -> due turni, NON un mega-turno");
+        assert_eq!(groups[0].len(), 4);
+        assert!(groups[0].iter().all(|s| s.tool_name == "read_file"));
+        assert_eq!(groups[1].len(), 4);
+        // Il secondo turno e' l'ondata 2 (list_files...), separata nel tempo.
+        assert_eq!(groups[1][0].tool_name, "list_files");
+    }
+
+    #[test]
+    fn group_steps_micro_jitter_intra_turno_resta_unito() {
+        // Caso reale 4531a1c7: step 1-4 stesso burst con jitter ~1.5-2ms tra loro
+        // (INSERT separati) -> DEVONO restare nello stesso turno (gap < 50ms), non
+        // spezzarsi in 4 turni-da-1-tool.
+        let base = 1_000_000_000;
+        let steps = vec![
+            step_at(1, "read_file", base),
+            step_at(2, "list_files", base + 1_974), // +1.974ms
+            step_at(3, "read_file", base + 3_479),  // +1.505ms
+            step_at(4, "list_files", base + 5_111), // +1.632ms
+        ];
+        let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
+        assert_eq!(groups.len(), 1, "micro-jitter intra-turno -> un solo turno");
+        assert_eq!(groups[0].len(), 4);
+    }
+
+    #[test]
+    fn group_steps_gap_sopra_soglia_spezza_turno() {
+        // Caso reale 6cfd2e34: gap minimo inter-turno osservato ~356ms (>50ms) deve
+        // spezzare; gap intra-turno ~2ms (<50ms) deve unire.
+        let base = 1_000_000_000;
+        let steps = vec![
+            step_at(3000, "list_files", base),
+            step_at(3001, "list_files", base), // batch identico -> stesso turno
+            // +356ms: nuovo turno (step 1-5, ondata diversa)
+            step_at(1, "nexus_run_notes", base + 356_000),
+            step_at(2, "list_files", base + 358_000), // +2ms dal precedente -> stesso turno
+        ];
+        let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2, "primo turno: i due list_files identici");
+        assert_eq!(groups[1].len(), 2, "secondo turno: run_notes + list_files");
+        assert_eq!(groups[1][0].tool_name, "nexus_run_notes");
+    }
+
+    #[test]
+    fn group_steps_vuoto_nessun_gruppo() {
+        let groups = group_steps_by_turn(&[], DEFAULT_TURN_GAP_US);
+        assert!(groups.is_empty());
     }
 
     #[test]
@@ -876,6 +1001,7 @@ mod tests {
             step_index: 1000,
             tool_name: "nexus_mcp_tool_call".to_string(),
             tool_input: json!({"tool_name": "build", "args": {}}),
+            created_at_us: 1_000_000_000,
         }];
         let req = LlmRequest {
             provider: "anthropic".to_string(),
@@ -951,27 +1077,6 @@ mod tests {
         run
     }
 
-    async fn insert_step(
-        pool: &PgPool,
-        run_id: Uuid,
-        step_index: i32,
-        tool_name: &str,
-        tool_input: Value,
-    ) {
-        sqlx::query(
-            "INSERT INTO agent_steps \
-             (id, run_id, step_index, tool_name, tool_input, status) \
-             VALUES (gen_random_uuid(), $1, $2, $3, $4, 'completed')",
-        )
-        .bind(run_id)
-        .bind(step_index)
-        .bind(tool_name)
-        .bind(tool_input)
-        .execute(pool)
-        .await
-        .expect("insert step");
-    }
-
     fn executor_req() -> LlmRequest {
         LlmRequest {
             provider: "anthropic".to_string(),
@@ -981,28 +1086,31 @@ mod tests {
         }
     }
 
-    /// (a) sequenza multi-iterazione: 2 gruppi (step 0,1 e 2000) -> 2 complete()
-    /// con i tool giusti, poi la 3a complete() = end_turn + final_answer del primario.
-    /// (b) conteggio tool per turno = primario (gruppo 0 ha 2 tool, gruppo 1 ne ha 1).
+    /// (a) sequenza multi-turno: 2 turni (turno 1 con 2 tool, turno 2 con 1 tool,
+    /// separati nel tempo) -> 2 complete() coi tool giusti, poi la 3a complete() =
+    /// end_turn + final_answer del primario. (b) conteggio tool per turno = primario.
+    /// I turni sono discriminati dal GAP di `created_at` (turno 1 stesso timestamp,
+    /// turno 2 a +2s).
     #[sqlx::test]
-    async fn replay_executor_sequenza_multi_iterazione(pool: PgPool) {
+    async fn replay_executor_sequenza_multi_turno(pool: PgPool) {
         create_tables(&pool).await;
         let run = insert_run(&pool, Some("FATTO")).await;
-        // iter 0: read_file (0) + list_files (1); iter 2: edit_file (2000).
-        insert_step(&pool, run, 0, "read_file", json!({"path": "a.rs"})).await;
-        insert_step(&pool, run, 1, "list_files", json!({})).await;
-        insert_step(&pool, run, 2000, "edit_file", json!({"path": "a.rs"})).await;
+        // Turno 1: read_file (0) + list_files (1) stesso created_at (batch).
+        insert_step_at(&pool, run, 0, "read_file", "2026-06-27T10:00:00Z").await;
+        insert_step_at(&pool, run, 1, "list_files", "2026-06-27T10:00:00Z").await;
+        // Turno 2: edit_file (2000) a +2s (oltre la tolleranza 50ms).
+        insert_step_at(&pool, run, 2000, "edit_file", "2026-06-27T10:00:02Z").await;
 
         let gw = ReplayLlmGateway::new(pool.clone(), run);
 
-        // 1a complete() (executor): gruppo iter 0 -> 2 tool nello stesso ordine.
+        // 1a complete() (executor): turno 1 -> 2 tool nello stesso ordine.
         let r1 = gw.complete(executor_req()).await.expect("turno 1");
         assert_eq!(r1.tool_calls.len(), 2, "conteggio tool turno 1 = primario");
         assert_eq!(r1.tool_calls[0].name, "read_file");
         assert_eq!(r1.tool_calls[1].name, "list_files");
         assert_eq!(r1.stop_reason.as_deref(), Some("tool_use"));
 
-        // 2a complete(): gruppo iter 2 -> 1 tool.
+        // 2a complete(): turno 2 -> 1 tool.
         let r2 = gw.complete(executor_req()).await.expect("turno 2");
         assert_eq!(r2.tool_calls.len(), 1, "conteggio tool turno 2 = primario");
         assert_eq!(r2.tool_calls[0].name, "edit_file");
@@ -1011,6 +1119,44 @@ mod tests {
         let r3 = gw.complete(executor_req()).await.expect("turno 3");
         assert!(r3.tool_calls.is_empty());
         assert_eq!(r3.content, "FATTO");
+        assert_eq!(r3.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    /// FIX shadow LLM-Replay E2E (regressione del MEGA-TURNO): due ondate
+    /// retry/fallback RIUSANO gli step_index (3000-3003) con `created_at` distanti.
+    /// Il vecchio raggruppamento per quoziente /1000 le ACCORPAVA in un solo turno da
+    /// 8 tool -> signature-loop spurio. Col raggruppamento per turno reale lo shadow
+    /// vede DUE turni separati (4 + 4 tool), come il primario. Riproduce 6cfd2e34.
+    #[sqlx::test]
+    async fn replay_executor_due_ondate_non_collassano_in_mega_turno(pool: PgPool) {
+        create_tables(&pool).await;
+        let run = insert_run(&pool, Some("done")).await;
+        // Ondata 1: step 3000-3003 stesso created_at.
+        insert_step_at(&pool, run, 3000, "read_file", "2026-06-27T10:50:53Z").await;
+        insert_step_at(&pool, run, 3001, "read_file", "2026-06-27T10:50:53Z").await;
+        insert_step_at(&pool, run, 3002, "read_file", "2026-06-27T10:50:53Z").await;
+        insert_step_at(&pool, run, 3003, "read_file", "2026-06-27T10:50:53Z").await;
+        // Ondata 2: STESSI step_index, +41s (gap enorme -> turno separato).
+        insert_step_at(&pool, run, 3000, "list_files", "2026-06-27T10:51:34Z").await;
+        insert_step_at(&pool, run, 3001, "list_files", "2026-06-27T10:51:34Z").await;
+        insert_step_at(&pool, run, 3002, "list_files", "2026-06-27T10:51:34Z").await;
+        insert_step_at(&pool, run, 3003, "read_file", "2026-06-27T10:51:34Z").await;
+
+        let gw = ReplayLlmGateway::new(pool.clone(), run);
+
+        // Turno 1: 4 tool (ondata 1), NON un mega-turno da 8.
+        let r1 = gw.complete(executor_req()).await.expect("turno 1");
+        assert_eq!(r1.tool_calls.len(), 4, "ondata 1 = un turno da 4 tool");
+        assert!(r1.tool_calls.iter().all(|t| t.name == "read_file"));
+
+        // Turno 2: gli altri 4 tool (ondata 2), turno distinto.
+        let r2 = gw.complete(executor_req()).await.expect("turno 2");
+        assert_eq!(r2.tool_calls.len(), 4, "ondata 2 = secondo turno da 4 tool");
+        assert_eq!(r2.tool_calls[0].name, "list_files");
+
+        // 3a: cursore esausto -> end_turn.
+        let r3 = gw.complete(executor_req()).await.expect("end_turn");
+        assert!(r3.tool_calls.is_empty());
         assert_eq!(r3.stop_reason.as_deref(), Some("end_turn"));
     }
 
@@ -1051,15 +1197,17 @@ mod tests {
         assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
     }
 
-    /// (e) gruppi non contigui (iter 0, 2, 3) consumati in ordine da complete()
-    /// successive, ignorando i buchi (iter 1 senza tool non lascia righe).
+    /// (e) tre turni distinti (un tool ciascuno, separati nel tempo) consumati in
+    /// ordine da complete() successive. Lo `step_index` e' irrilevante per i confini
+    /// di turno: conta solo il GAP di `created_at` (qui ogni tool a +1s dal
+    /// precedente -> tre turni). Verifica anche il caso single-tool-per-turno.
     #[sqlx::test]
-    async fn replay_executor_gruppi_non_contigui(pool: PgPool) {
+    async fn replay_executor_turni_separati_single_tool(pool: PgPool) {
         create_tables(&pool).await;
         let run = insert_run(&pool, Some("done")).await;
-        insert_step(&pool, run, 0, "a", json!({})).await;
-        insert_step(&pool, run, 2000, "b", json!({})).await;
-        insert_step(&pool, run, 3000, "c", json!({})).await;
+        insert_step_at(&pool, run, 0, "a", "2026-06-27T10:00:00Z").await;
+        insert_step_at(&pool, run, 2000, "b", "2026-06-27T10:00:01Z").await;
+        insert_step_at(&pool, run, 3000, "c", "2026-06-27T10:00:02Z").await;
 
         let gw = ReplayLlmGateway::new(pool.clone(), run);
         assert_eq!(gw.complete(executor_req()).await.unwrap().tool_calls[0].name, "a");
@@ -1072,7 +1220,8 @@ mod tests {
     }
 
     /// Inserisce uno step con `created_at` ESPLICITO (per testare l'ordinamento
-    /// temporale a parita'/duplicazione di `step_index`).
+    /// temporale e il raggruppamento per turno a parita'/duplicazione di
+    /// `step_index`). `tool_input` fisso a `{}` (irrilevante per questi test).
     async fn insert_step_at(
         pool: &PgPool,
         run_id: Uuid,
