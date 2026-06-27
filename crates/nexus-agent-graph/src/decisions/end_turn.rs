@@ -251,11 +251,23 @@ pub fn billing_fail_fast_message(
     exploration_count: i64,
     exploration_threshold: i64,
     exhausted: &[String],
+    current_provider: &str,
 ) -> Option<String> {
     if exploration_count < exploration_threshold {
         return None;
     }
     if exhausted.is_empty() {
+        return None;
+    }
+    // Fail-fast SOLO se il provider IN USO e' esso stesso esausto. Se il run usa
+    // un provider VALIDO (es. deepseek mentre anthropic/openai sono in cooldown),
+    // l'esplorazione lunga NON e' un problema di billing ma di loop/modello ->
+    // deve seguire l'anti-loop (guide/escalate), NON chiudere con "ricarica
+    // crediti" (fuorviante). Senza questo check il messaggio incolpava i crediti
+    // anche con un provider perfettamente funzionante.
+    if current_provider.is_empty()
+        || !exhausted.iter().any(|p| p.eq_ignore_ascii_case(current_provider))
+    {
         return None;
     }
     Some(format!(
@@ -396,7 +408,7 @@ mod tests {
     #[test]
     fn billing_fail_fast_scatta() {
         let exhausted = vec!["anthropic".to_string(), "openai".to_string()];
-        let msg = billing_fail_fast_message(6, 6, &exhausted);
+        let msg = billing_fail_fast_message(6, 6, &exhausted, "anthropic");
         assert!(msg.is_some());
         let m = msg.unwrap();
         assert!(m.contains("anthropic, openai"));
@@ -406,12 +418,23 @@ mod tests {
     #[test]
     fn billing_fail_fast_sotto_soglia() {
         let exhausted = vec!["anthropic".to_string()];
-        assert!(billing_fail_fast_message(5, 6, &exhausted).is_none());
+        assert!(billing_fail_fast_message(5, 6, &exhausted, "anthropic").is_none());
     }
 
     #[test]
     fn billing_fail_fast_nessun_esaurito() {
-        assert!(billing_fail_fast_message(6, 6, &[]).is_none());
+        assert!(billing_fail_fast_message(6, 6, &[], "deepseek").is_none());
+    }
+
+    #[test]
+    fn billing_fail_fast_provider_corrente_valido() {
+        // FIX: provider IN USO valido (deepseek) mentre anthropic/openai sono
+        // esausti -> NON e' billing -> None (prosegue all'anti-loop), niente
+        // messaggio "ricarica crediti" fuorviante.
+        let exhausted = vec!["anthropic".to_string(), "openai".to_string()];
+        assert!(billing_fail_fast_message(7, 6, &exhausted, "deepseek").is_none());
+        // Provider corrente esausto -> Some (caso legittimo).
+        assert!(billing_fail_fast_message(7, 6, &exhausted, "anthropic").is_some());
     }
 
     #[test]

@@ -93,6 +93,14 @@ static BUILD_ERROR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"\bTypeError\b").expect("regex TypeError valida"),
         // generico cargo/cc: `^\s*error:\s` (MULTILINE).
         Regex::new(r"(?m)^\s*error:\s").expect("regex error generico valida"),
+        // vite/rollup/esbuild: il bundler JS puo' USCIRE 0 anche quando il build
+        // FALLISCE (config con exit-code bugiardo). Questi pattern rendono
+        // count_build_errors > 0 -> il criterio build fallisce comunque (rete di
+        // sicurezza in criteria_runner::check_run_command).
+        Regex::new(r"(?i)could not resolve\b").expect("regex rollup resolve valida"),
+        Regex::new(r"(?i)\berror during build\b").expect("regex vite build valida"),
+        Regex::new(r"(?i)\bbuild failed\b").expect("regex vite failed valida"),
+        Regex::new(r"\[plugin:").expect("regex vite plugin valida"),
     ]
 });
 
@@ -946,6 +954,15 @@ mod tests {
         assert_eq!(count_build_errors("SyntaxError: bad\nTypeError: x"), 2);
         // generico cargo (a inizio riga).
         assert_eq!(count_build_errors("error: cannot find crate"), 1);
+        // vite/rollup: build che ESCE 0 ma FALLISCE (rete di sicurezza mig 0465).
+        assert!(
+            count_build_errors(
+                "error during build:\nCould not resolve \"./components/ui/sonner\" from \"src/app/App.tsx\""
+            ) >= 2,
+            "pattern vite (could not resolve + error during build) devono contare"
+        );
+        assert!(count_build_errors("[plugin:vite:import-analysis] x") >= 1);
+        assert!(count_build_errors("x Build failed in 312ms") >= 1);
     }
 
     // ── render_failed_block ────────────────────────────────────────────────────────

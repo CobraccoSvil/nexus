@@ -409,6 +409,16 @@ async fn setting_csv(db: &PgPool, key: &str, default: Vec<String>) -> Vec<String
     }
 }
 
+/// Legge un setting stringa dal DB col fallback al `default` se la chiave e'
+/// assente. NB: una stringa presente ma VUOTA viene restituita com'e' (stringa
+/// vuota), NON cade sul default: la semantica "vuoto = disabilitato" e'
+/// responsabilita' del chiamante (es. build_command vuoto -> nessun criterio).
+async fn setting_string(db: &PgPool, key: &str, default: &str) -> String {
+    nexus_auth::get_setting(db, key)
+        .await
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Costruisce la [`PlannerConfig`] DB-driven (regola G), 1:1 con le chiavi
 /// `orchestrator.*` lette dal brain (`orchestrator_config.py`). I campi che il
 /// brain NON popola da `orchestrator_config` restano al loro `Default`:
@@ -451,6 +461,20 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
 /// quando `build_command` e' risolto: si leggono comunque per fedelta'.
 async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
     let d = FinalGateConfig::default();
+    // Criterio BUILD (mig 0423 + 0465): il codice deve COMPILARE prima della
+    // chiusura. Portato dal brain Python (era REGREDITO al cutover Rust, che
+    // lasciava build_command=None -> criterio build mai costruito -> app con
+    // import non risolti / errori TS chiusa "completed"). Lo script auto-detect
+    // (npm/cargo, no-op se nessun target) e' nel setting globale, eseguito nel
+    // project_root dal tool run_command (working_dir None = cwd del progetto).
+    // Gate dal flag build_check_enabled (default true): OFF o comando vuoto ->
+    // None (niente criterio, non blocca i progetti senza build).
+    let build_command = if setting_bool(db, "agent.final_gate.build_check_enabled", true).await {
+        let cmd = setting_string(db, "agent.final_gate.build_command", "").await;
+        (!cmd.trim().is_empty()).then_some(cmd)
+    } else {
+        None
+    };
     FinalGateConfig {
         enabled: setting_bool(db, "agent.final_gate.enabled", d.enabled).await,
         max_cycles: setting_i64(db, "agent.final_gate.max_cycles", d.max_cycles).await,
@@ -461,8 +485,11 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
         no_orphan_min_ratio: setting_f64(db, "agent.no_orphan.min_ratio", d.no_orphan_min_ratio).await,
         import_staging_dirs: setting_csv(db, "agent.import_staging_dirs", d.import_staging_dirs).await,
         criteria_timeout_s: setting_f64(db, "orchestrator.verifier_timeout_s", d.criteria_timeout_s).await,
-        // Risolti per-progetto a monte (non ancora portati): default (None/vuoto).
-        build_command: d.build_command,
+        // Criterio build cablato sopra (mig 0423/0465). working_dir None: lo
+        // script auto-detect gestisce le sottodir (cd app/frontend). log_command
+        // / endpoint_criterion restano risolti per-progetto a monte (non ancora
+        // portati): default vuoto/None (niente criterio, non blocca).
+        build_command,
         build_working_dir: d.build_working_dir,
         log_command: d.log_command,
         endpoint_criterion: d.endpoint_criterion,
@@ -549,6 +576,8 @@ async fn load_todo_runner_config(db: &PgPool) -> TodoRunnerConfig {
             .await
             .unwrap_or(d.todo_isolation_kind),
         max_retries: setting_i64(db, "agent.continuous.todo_isolation_max_retries", d.max_retries).await,
+        dag_topological_enabled: setting_bool(db, "orchestrator.dag_topological_enabled", d.dag_topological_enabled).await,
+        dag_parallel_min_ready: setting_i64(db, "orchestrator.dag_parallel_min_ready", d.dag_parallel_min_ready).await,
         ..TodoRunnerConfig::default()
     }
 }
@@ -2137,9 +2166,17 @@ mod tests {
             "ECONNREFUSED,Traceback",
         )
         .await;
+        // Criterio build (mig 0423/0465): build_check_enabled + build_command dal DB.
+        set_setting(&pool, "agent.final_gate.build_check_enabled", "true").await;
+        set_setting(&pool, "agent.final_gate.build_command", "npm run build").await;
 
         let cfg = load_final_gate_config(&pool).await;
         assert!(!cfg.enabled, "enabled=false dal DB");
+        assert_eq!(
+            cfg.build_command.as_deref(),
+            Some("npm run build"),
+            "build_command letto dal DB col criterio build attivo (mig 0465)"
+        );
         assert_eq!(cfg.max_cycles, 4);
         assert!(!cfg.runtime_check_enabled);
         assert!((cfg.no_orphan_min_ratio - 0.7).abs() < f64::EPSILON);

@@ -760,9 +760,20 @@ la richiesta in modo piu' specifico.",
                 .billing_exhausted_providers()
                 .await
                 .unwrap_or_default();
-            if let Some(ff_msg) =
-                billing_fail_fast_message(exploration_count, exploration_threshold, &exhausted)
-            {
+            // Provider IN USO dal run (sticky se escalato, override, o ultimo
+            // usato): il fail-fast billing scatta solo se QUESTO e' esausto.
+            let current_provider = state
+                .sticky_provider
+                .as_deref()
+                .or(state.provider_override.as_deref())
+                .or(state.provider_used.as_deref())
+                .unwrap_or("");
+            if let Some(ff_msg) = billing_fail_fast_message(
+                exploration_count,
+                exploration_threshold,
+                &exhausted,
+                current_provider,
+            ) {
                 tracing::warn!(
                     target: "nexus_agent_graph::executor",
                     count = exploration_count,
@@ -785,53 +796,140 @@ la richiesta in modo piu' specifico.",
             }
         }
 
-        // (6a) ESPLORAZIONE a 2x soglia -> guide/abort (py:2093-2159).
+        // (6a) ESPLORAZIONE a 2x soglia -> Guide / ESCALATE / abort
+        // (py:2093-2159 + escalation dal loop di esplorazione). Prima di abortire,
+        // se l'asse e' gia' stato guidato si tenta la PROMOZIONE del modello: stesso
+        // pattern del cap G1 (punto unico pick_escalation_model + progress_controller
+        // Action::Escalate). Cosi' la discovery ripetuta non chiude piu' secca senza
+        // mai cambiare modello.
         if exploration_count >= 2 * exploration_threshold && progress_on {
+            // Candidato di escalation: provider/model correnti + escalation gia'
+            // fatte; gated a < 3 esattamente come il cap G1.
+            let expl_escal = state
+                .extra
+                .get("auto_escalations")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let expl_cur_provider = state
+                .provider_used
+                .clone()
+                .or_else(|| state.sticky_provider.clone())
+                .or_else(|| state.provider_override.clone());
+            let expl_cur_model = state
+                .model_used
+                .clone()
+                .or_else(|| state.sticky_model.clone())
+                .or_else(|| state.model_override.clone());
+            let expl_picked = if expl_escal < 3 {
+                let inputs = self
+                    .escalation
+                    .escalation_inputs(
+                        state.user_intent.as_deref(),
+                        expl_cur_provider.as_deref(),
+                        expl_cur_model.as_deref(),
+                    )
+                    .await
+                    .unwrap_or_default();
+                pick_escalation_model(
+                    &inputs.chain,
+                    expl_cur_provider.as_deref(),
+                    expl_cur_model.as_deref(),
+                    expl_escal,
+                    inputs.provider_in_cooldown,
+                    inputs.cross_provider.as_ref(),
+                )
+            } else {
+                None
+            };
             let dec = pc::decide(&ProgressSignals {
                 exploration_count,
                 exploration_threshold,
                 already_guided: progress_guided.clone(),
-                has_escalation_candidate: false,
+                has_escalation_candidate: expl_picked.is_some(),
+                escalations: expl_escal,
+                max_escalations: 3,
                 ..Default::default()
             });
-            if dec.action == Action::Guide {
-                force_action_hard = true;
-                progress_guided.insert("exploration".to_string());
-                if let Some(t) = &dec.nudge_text {
-                    messages.push(human_msg(t));
+            match dec.action {
+                Action::Guide => {
+                    force_action_hard = true;
+                    progress_guided.insert("exploration".to_string());
+                    if let Some(t) = &dec.nudge_text {
+                        messages.push(human_msg(t));
+                    }
+                    tracing::warn!(
+                        target: "nexus_agent_graph::executor",
+                        count = exploration_count,
+                        "progress_controller GUIDE esplorazione -> forza-azione"
+                    );
                 }
-                tracing::warn!(
-                    target: "nexus_agent_graph::executor",
-                    count = exploration_count,
-                    "progress_controller GUIDE esplorazione -> forza-azione"
-                );
-            } else {
-                let expl_text = format!(
-                    "Esplorazione ripetuta ({exploration_count} letture consecutive) senza \
-produrre un risultato, anche dopo il sollecito ad agire. Chiudo passando per la \
-verifica del flusso."
-                );
-                tracing::warn!(
-                    target: "nexus_agent_graph::executor",
-                    count = exploration_count,
-                    "progress_controller ABORT esplorazione"
-                );
-                return Ok(StateDelta {
-                    messages: Some(vec![Message::Ai {
-                        content: MessageContent::text(expl_text.clone()),
-                        tool_calls: vec![],
-                    }]),
-                    result: Some(Some(expl_text)),
-                    pending_tool_uses: Some(Some(vec![])),
-                    stop_reason: Some(Some(stop_reason_from_str(dec.stop_reason.as_deref()))),
-                    iterations: Some(Some(iters_in + 1)),
-                    consecutive_exploration_calls: Some(Some(exploration_count)),
-                    exploration_nudge_sent: Some(Some(exploration_nudge_sent)),
-                    progress_guided_axes: Some(Some(sorted(&progress_guided))),
-                    forced_close_unverified: Some(Some(true)),
-                    ..Default::default()
+                Action::Escalate => {
+                    // ESCALATION dal loop di esplorazione: prima era raggiungibile
+                    // SOLO dal cap G1 (re-entry "descrive ma non agisce"), mai dalla
+                    // discovery ripetuta. `expl_picked` e' Some (has_escalation_candidate).
+                    let pick = expl_picked.expect("Escalate implica candidato presente");
+                    tracing::warn!(
+                        target: "nexus_agent_graph::executor",
+                        count = exploration_count,
+                        from_provider = expl_cur_provider.as_deref().unwrap_or(""),
+                        to_provider = %pick.provider,
+                        to_model = %pick.model,
+                        "esplorazione: ESCALATION modello -> azzero contatori e ri-do il turno"
+                    );
+                    let esc_nudge = human_msg(
+                        "Il modello precedente ha continuato a esplorare senza produrre \
+un risultato. Ora rispondi tu, che sei un modello piu' capace: NON esplorare oltre, \
+ESEGUI subito il prossimo step concreto con un tool call (modifica file o comando di \
+esecuzione/verifica), oppure rispondi a parole se era una domanda.",
+                    );
+                    let mut extra_out = state.extra.clone();
+                    extra_out.insert("auto_escalations".to_string(), json!(expl_escal + 1));
+                    progress_guided.insert("exploration".to_string());
+                    return Ok(StateDelta {
+                        messages: Some(vec![esc_nudge]),
+                        sticky_provider: Some(Some(pick.provider)),
+                        sticky_model: Some(Some(pick.model)),
+                        g1_reroute_count: Some(Some(0)),
+                        action_nudge_count: Some(Some(0)),
+                        pending_tool_uses: Some(Some(vec![])),
+                        stop_reason: Some(Some(StopReason::G1Escalated)),
+                        iterations: Some(Some(iters_in + 1)),
+                        consecutive_exploration_calls: Some(Some(0)),
+                        exploration_nudge_sent: Some(Some(false)),
+                        progress_guided_axes: Some(Some(sorted(&progress_guided))),
+                        extra: Some(extra_out),
+                        ..Default::default()
+                    }
+                    .into_opaque());
                 }
-                .into_opaque());
+                _ => {
+                    let expl_text = format!(
+                        "Esplorazione ripetuta ({exploration_count} letture consecutive) senza \
+produrre un risultato, anche dopo il sollecito ad agire e l'escalation del modello. \
+Chiudo passando per la verifica del flusso."
+                    );
+                    tracing::warn!(
+                        target: "nexus_agent_graph::executor",
+                        count = exploration_count,
+                        "progress_controller ABORT esplorazione"
+                    );
+                    return Ok(StateDelta {
+                        messages: Some(vec![Message::Ai {
+                            content: MessageContent::text(expl_text.clone()),
+                            tool_calls: vec![],
+                        }]),
+                        result: Some(Some(expl_text)),
+                        pending_tool_uses: Some(Some(vec![])),
+                        stop_reason: Some(Some(stop_reason_from_str(dec.stop_reason.as_deref()))),
+                        iterations: Some(Some(iters_in + 1)),
+                        consecutive_exploration_calls: Some(Some(exploration_count)),
+                        exploration_nudge_sent: Some(Some(exploration_nudge_sent)),
+                        progress_guided_axes: Some(Some(sorted(&progress_guided))),
+                        forced_close_unverified: Some(Some(true)),
+                        ..Default::default()
+                    }
+                    .into_opaque());
+                }
             }
         } else if exploration_count >= 2 * exploration_threshold {
             // Controller OFF: abort legacy secco (py:2137-2159).

@@ -119,6 +119,10 @@ pub struct TodoRunnerConfig {
     /// DAG topologico abilitato (`dag_topological_enabled`, default false):
     /// passato a [`dag_scheduler::pick_next_todo`] (punto unico della selezione).
     pub dag_topological_enabled: bool,
+    /// Ampiezza minima del fronte ready per attivare il MULTICASTING (ondata
+    /// parallela). `orchestrator.dag_parallel_min_ready`, default 2 (con < 2 resta
+    /// il comportamento storico). Passato a [`dag_scheduler::should_parallelize`].
+    pub dag_parallel_min_ready: i64,
     /// Limite caratteri del summary compatto (default 600). Esposto per
     /// completezza; il Python usa la costante `_SUMMARY_MAX_CHARS`.
     pub summary_max_chars: usize,
@@ -134,6 +138,7 @@ impl Default for TodoRunnerConfig {
             on_failure: OnFailure::Stop,
             max_retries: 1,
             dag_topological_enabled: false,
+            dag_parallel_min_ready: 2,
             summary_max_chars: SUMMARY_MAX_CHARS,
         }
     }
@@ -480,6 +485,156 @@ impl TodoRunnerNode {
         }
     }
 
+    /// MULTICASTING: esegue l'ONDATA di todo ready come sub-run isolate IN
+    /// PARALLELO via un solo `dispatch_subagents` (max_parallel OMESSO -> tetto
+    /// `orchestrator.max_parallel_subagents`, punto unico del tool). Il fronte
+    /// parallelo arriva da [`dag_scheduler::compute_ready_layer`] (regola L).
+    /// Politica esito: successo -> completed; fallimento -> blocked + cascade-skip
+    /// dei discendenti; con `on_failure==Stop` un qualunque fallimento CHIUDE la
+    /// catena (parita' col ramo stop sequenziale), altrimenti (`Continue`) si
+    /// prosegue coi pending rimasti via [`Self::advance_patch`]. Il retry inline NON
+    /// e' nel wave (gate a monte: `on_failure != Retry`). Dispatch infrastrutturale
+    /// fallito / `results` non allineati -> ripristina i todo a Pending +
+    /// pass-through (fallback executor), come [`Self::dispatch_one`].
+    async fn dispatch_wave(
+        &self,
+        state: &AgentState,
+        run_id: &str,
+        todos: &[Todo],
+        ready: Vec<Todo>,
+        mode: ExecMode,
+    ) -> Result<OpaqueDelta, NodeError> {
+        // Cap all'ampiezza del batch del tool (dispatch_subagents: max 8 task).
+        let wave: Vec<Todo> = ready.into_iter().take(8).collect();
+        let prior = state.subagent_results.clone().unwrap_or_default();
+
+        // Marca in_progress + costruisci i task (ordine preservato = ordine results:
+        // join_all/chunks del tool conservano l'ordine d'ingresso).
+        let mut tasks: Vec<Value> = Vec::with_capacity(wave.len());
+        for t in &wave {
+            self.store
+                .mark_status(&t.id, TodoStatus::InProgress, mode)
+                .await
+                .map_err(port_err)?;
+            let tv = todo_value_of(todos, &t.id);
+            let blob = Self::build_context_blob(state, &tv, &prior);
+            let task_text = str_or_empty(tv.get("content")).trim().to_string();
+            tasks.push(json!({
+                "kind": self.cfg.todo_kind(),
+                "task": task_text,
+                "context": blob,
+                "expected_output_format":
+                    "riepilogo conciso delle modifiche applicate e dell'esito",
+            }));
+        }
+
+        tracing::info!(
+            target: "nexus_agent_graph::todo_runner",
+            wave = wave.len(),
+            "MULTICASTING: dispatch ondata parallela di sub-run"
+        );
+
+        let call = ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "dispatch_subagents".to_string(),
+            input: json!({ "tasks": tasks }),
+        };
+        let outcome = match self.tools.execute(call, mode).await {
+            Ok(o) => o,
+            Err(_) => return self.wave_dispatch_failed(&wave, mode).await,
+        };
+        if outcome.is_error {
+            return self.wave_dispatch_failed(&wave, mode).await;
+        }
+        let data = match &outcome.content {
+            Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(json!({})),
+            other => other.clone(),
+        };
+        let results = data
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if results.len() != wave.len() {
+            // results non allineati ai task -> trattato come dispatch fallito.
+            return self.wave_dispatch_failed(&wave, mode).await;
+        }
+
+        let mut accumulated = prior.clone();
+        let mut total_cost = 0.0_f64;
+        let mut any_failed = false;
+        for (t, result) in wave.iter().zip(results.iter()) {
+            let tv = todo_value_of(todos, &t.id);
+            let seq = tv.get("seq").cloned();
+            let content = str_or_empty(tv.get("content"));
+            let summary = compact(&str_or_empty(result.get("summary")), self.cfg.summary_max_chars);
+            let cost = cost_of(result, "cost_usd");
+            total_cost += cost;
+            let mut record = build_record(seq.as_ref(), &t.id, &content, &summary, cost);
+            if !result_failed(result) {
+                self.store
+                    .mark_status(&t.id, TodoStatus::Completed, mode)
+                    .await
+                    .map_err(port_err)?;
+                record.insert("status".to_string(), json!("completed"));
+            } else {
+                any_failed = true;
+                self.store
+                    .mark_status(&t.id, TodoStatus::Blocked, mode)
+                    .await
+                    .map_err(port_err)?;
+                self.cascade_skip(&t.id, todos, mode).await?;
+                record.insert("status".to_string(), json!("failed"));
+            }
+            accumulated.push(Value::Object(record));
+        }
+
+        // on_failure==Stop + almeno un fallito -> chiusura catena (parita' ramo stop).
+        if any_failed && self.cfg.on_failure == OnFailure::Stop {
+            let prev_cost = state.subagent_cost_cumulative_usd.unwrap_or(0.0);
+            tracing::warn!(
+                target: "nexus_agent_graph::todo_runner",
+                "wave: fallimento con on_failure=stop -> chiusura catena"
+            );
+            return Ok(StateDelta {
+                active_todo_id: Some(None),
+                stop_reason: Some(Some(StopReason::EndTurn)),
+                subagent_results: Some(Some(accumulated)),
+                subagent_cost_cumulative_usd: Some(Some(prev_cost + total_cost)),
+                ..Default::default()
+            }
+            .into_opaque());
+        }
+
+        // Nessun fallito o on_failure==Continue -> advance_patch decide re-entry
+        // (pending rimasti) vs end_turn (tutti terminali).
+        Ok(self
+            .advance_patch(run_id, accumulated, total_cost, 0)
+            .await?
+            .into_opaque())
+    }
+
+    /// Dispatch dell'ondata fallito a livello infrastrutturale (o `results` non
+    /// allineati): ripristina tutti i todo della wave a Pending e fa pass-through
+    /// (fallback executor classico), come [`Self::dispatch_one`] sul singolo.
+    async fn wave_dispatch_failed(
+        &self,
+        wave: &[Todo],
+        mode: ExecMode,
+    ) -> Result<OpaqueDelta, NodeError> {
+        for t in wave {
+            self.store
+                .mark_status(&t.id, TodoStatus::Pending, mode)
+                .await
+                .map_err(port_err)?;
+        }
+        tracing::warn!(
+            target: "nexus_agent_graph::todo_runner",
+            "wave: dispatch fallito, ripristino pending + fallback executor"
+        );
+        Ok(pass_through())
+    }
+
     /// Cascade-skip: marca tutti i discendenti di `todo_id` come `skipped`,
     /// delegando l'insieme dei discendenti al PUNTO UNICO
     /// [`dag_scheduler::descendants`] (regola L: niente DFS re-implementata qui).
@@ -556,6 +711,21 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
                 "nessun todo nel piano, chiudo"
             );
             return Ok(end_turn_no_active());
+        }
+
+        // (3a) MULTICASTING — ondata parallela del fronte ready (regola L:
+        // compute_ready_layer + should_parallelize sono il punto unico del fronte
+        // parallelo). Attivo solo con DAG topologico ON e on_failure != Retry (il
+        // retry inline resta sul ramo sequenziale dispatch_one, dove e' definito).
+        if self.cfg.dag_topological_enabled && self.cfg.on_failure != OnFailure::Retry {
+            let ready = dag_scheduler::compute_ready_layer(&todos);
+            let dag_cfg = dag_scheduler::DagConfig {
+                dag_parallel_min_ready: self.cfg.dag_parallel_min_ready,
+            };
+            if ready.len() >= 2 && dag_scheduler::should_parallelize(&ready, &todos, &dag_cfg) {
+                let mode = ctx.exec_mode();
+                return self.dispatch_wave(state, &run_id, &todos, ready, mode).await;
+            }
         }
 
         // (3b) pick_next None -> end_turn (PUNTO UNICO pick_next_todo, regola L).
@@ -1136,6 +1306,84 @@ mod tests {
         assert_eq!(marks[1], ("a".to_string(), TodoStatus::Completed));
         // Dispatch eseguito in Real (non shadow).
         assert_eq!(tools.seen.lock().unwrap()[0].1, ExecMode::Real);
+    }
+
+    // ── MULTICASTING: ondata parallela (dispatch_wave) ───────────────────────────
+
+    #[tokio::test]
+    async fn wave_parallelo_due_todo_completed() {
+        // DAG topologico ON + 2 todo pending senza dipendenze -> compute_ready_layer
+        // ritorna entrambi, should_parallelize=true -> UN solo dispatch_subagents con
+        // 2 task (ondata), non due dispatch sequenziali. Entrambi completed -> end_turn.
+        let store = Arc::new(StubTodoStore::with_todos(vec![
+            todo("a", TodoStatus::Pending, &[], 1),
+            todo("b", TodoStatus::Pending, &[], 2),
+        ]));
+        let payload = json!({"results": [
+            {"status": "completed", "summary": "fatto a", "cost_usd": 0.3},
+            {"status": "completed", "summary": "fatto b", "cost_usd": 0.2},
+        ]});
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![payload]));
+        let cfg = TodoRunnerConfig {
+            dag_topological_enabled: true,
+            dag_parallel_min_ready: 2,
+            ..TodoRunnerConfig::default()
+        };
+        let n = node(cfg, store.clone(), tools.clone());
+        let ctx = ctx_with(false, routing_cfg_on());
+        let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        {
+            let seen = tools.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "una sola chiamata dispatch per l'intera ondata");
+            assert_eq!(
+                seen[0].0.input["tasks"].as_array().unwrap().len(),
+                2,
+                "il dispatch porta 2 task in parallelo"
+            );
+        }
+        let results = out.subagent_results.expect("results");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["status"], json!("completed"));
+        assert_eq!(results[1]["status"], json!("completed"));
+        assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(out.subagent_cost_cumulative_usd, Some(0.5));
+        let marks = store.marks.lock().unwrap();
+        assert!(marks.contains(&("a".to_string(), TodoStatus::InProgress)));
+        assert!(marks.contains(&("b".to_string(), TodoStatus::Completed)));
+    }
+
+    #[tokio::test]
+    async fn wave_fallito_stop_chiude_catena() {
+        // Un fallito nell'ondata con on_failure=stop (default) -> blocked + chiusura
+        // catena (end_turn), parita' col ramo stop sequenziale.
+        let store = Arc::new(StubTodoStore::with_todos(vec![
+            todo("a", TodoStatus::Pending, &[], 1),
+            todo("b", TodoStatus::Pending, &[], 2),
+        ]));
+        let payload = json!({"results": [
+            {"status": "completed", "summary": "ok a", "cost_usd": 0.1},
+            {"status": "failed", "summary": "ko b"},
+        ]});
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![payload]));
+        // on_failure default = Stop
+        let cfg = TodoRunnerConfig {
+            dag_topological_enabled: true,
+            ..TodoRunnerConfig::default()
+        };
+        let n = node(cfg, store.clone(), tools.clone());
+        let ctx = ctx_with(false, routing_cfg_on());
+        let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(out.active_todo_id, None);
+        let results = out.subagent_results.expect("results");
+        assert_eq!(results.len(), 2);
+        let statuses: Vec<_> = results.iter().map(|r| r["status"].clone()).collect();
+        assert!(statuses.contains(&json!("completed")));
+        assert!(statuses.contains(&json!("failed")));
+        let marks = store.marks.lock().unwrap();
+        assert!(marks.contains(&("b".to_string(), TodoStatus::Blocked)));
     }
 
     // ── completed ultimo todo -> end_turn (niente prossimo) ──────────────────────

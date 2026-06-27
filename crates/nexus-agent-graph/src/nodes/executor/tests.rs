@@ -969,14 +969,78 @@ async fn g1_cap_senza_escalation_chiude_secco() {
     assert!(llm.seen.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn esplorazione_escalation_promuove_sticky() {
+    // REGRESSIONE: loop di esplorazione a 2x soglia, asse gia' guidato, con un
+    // candidato di escalation disponibile -> il nodo ESCALA il modello (sticky +
+    // g1_escalated + auto_escalations+1 + esplorazione azzerata) invece di abortire.
+    // Prima il ramo passava has_escalation_candidate=false hardcoded: qualunque esito
+    // != Guide cadeva nell'abort e il modello non veniva mai cambiato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_cross("google", "gemini-2.5-pro"));
+    let mut cfg = cfg_resolved();
+    cfg.progress_controller_enabled = true;
+    let (n, _m, _s) = node_esc(cfg, rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("sistema l'app")],
+        consecutive_exploration_calls: Some(12), // 2x soglia default (6)
+        progress_guided_axes: Some(vec!["exploration".into()]), // gia' guidato
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-x".into()),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_provider.as_deref(), Some("google"));
+    assert_eq!(out.sticky_model.as_deref(), Some("gemini-2.5-pro"));
+    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    assert_eq!(out.consecutive_exploration_calls, Some(0));
+    // LLM NON chiamato: escalation = sticky + nudge, il self-loop rientra.
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn esplorazione_senza_candidato_aborta() {
+    // Contro-prova: loop di esplorazione a 2x soglia, asse gia' guidato, SENZA
+    // candidato di escalation (porta vuota) -> abort coordinato verso final_gate,
+    // come prima del fix.
+    let rc = Arc::new(StubRunControlStore::default());
+    let mut cfg = cfg_resolved();
+    cfg.progress_controller_enabled = true;
+    let (n, _m, _s) = node(cfg, rc); // porta escalation vuota
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("sistema l'app")],
+        consecutive_exploration_calls: Some(12),
+        progress_guided_axes: Some(vec!["exploration".into()]),
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-x".into()),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::LoopAbort));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 //  PR-J2: 4 rami ON/seedati (billing fail-fast, next_actions, unfulfilled, upscale)
 // ──────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn billing_fail_fast_chiude_loop_abort() {
-    // Soglia esplorazione raggiunta + provider in cooldown billing -> chiusura
-    // onesta loop_abort PRIMA della chiamata LLM (py:2072-2092).
+    // Soglia esplorazione raggiunta + il PROVIDER IN USO in cooldown billing ->
+    // chiusura onesta loop_abort PRIMA della chiamata LLM (py:2072-2092 + fix
+    // provider-in-uso: cfr. billing_fail_fast_provider_corrente_valido).
     let rc = Arc::new(StubRunControlStore::default());
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::with_exhausted(&["anthropic", "openai"]));
@@ -989,6 +1053,10 @@ async fn billing_fail_fast_chiude_loop_abort() {
         messages: vec![human("task complesso")],
         consecutive_exploration_calls: Some(6), // == soglia default 6
         tools_json: Some(vec![json!({"name": "read_file"})]),
+        // Provider IN USO esausto: il fail-fast scatta solo se il provider corrente
+        // e' tra gli esausti (fix: non incolpare i crediti se il run usa un
+        // provider valido). Qui anthropic e' in cooldown -> abort onesto.
+        provider_used: Some("anthropic".into()),
         ..Default::default()
     };
     let delta = n.run(&state, &ctx).await.expect("run");
@@ -1599,7 +1667,12 @@ mod golden_end_turn {
                         .and_then(Value::as_array)
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    match billing_fail_fast_message(cnt, thr, &ex) {
+                    // Il golden (parita' storica) non porta current_provider: passa
+                    // il primo esausto, cosi' la semantica 3-param e' replicata
+                    // (esausti non vuoti -> current in esausti -> Some). Il fix
+                    // provider-in-uso e' coperto dagli unit test dedicati.
+                    let cur = ex.first().map(String::as_str).unwrap_or("");
+                    match billing_fail_fast_message(cnt, thr, &ex, cur) {
                         Some(s) => Value::String(s),
                         None => Value::Null,
                     }

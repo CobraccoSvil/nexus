@@ -174,7 +174,17 @@ impl FinalGateCriteriaRunnerAdapter {
         // exit_code STRUTTURATO dal punto unico (stesso parser del path gRPC).
         let actual_exit = crate::tool_runner_server::extract_exit_code(&raw);
         let expected_exit = expected.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
-        let passed = actual_exit.map(|a| a as i64) == Some(expected_exit);
+        let exit_ok = actual_exit.map(|a| a as i64) == Some(expected_exit);
+
+        // RETE DI SICUREZZA (regola H): alcuni build ESCONO 0 anche quando il
+        // bundling FALLISCE (es. `vite build` con "Could not resolve" / "error
+        // during build" che in certe config esce 0). Affidarsi al solo exit_code
+        // -> falso verde -> il final_gate chiude "completed" un'app rotta
+        // (incidente Beauty-Book). Se l'output contiene pattern di errore di
+        // build (punto unico count_build_errors, regola L) il criterio FALLISCE
+        // comunque, anche con exit 0.
+        let build_errors = nexus_agent_graph::count_build_errors(&raw);
+        let passed = exit_ok && build_errors == 0;
 
         // max_output_chars (parita' Python: default 600, floor 200). Il criterio
         // BUILD del nodo Rust lo valorizza (build_output_max_chars).
@@ -185,17 +195,23 @@ impl FinalGateCriteriaRunnerAdapter {
             .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS);
         let excerpt = truncate_chars(&raw, max_chars);
         let total_chars = raw.chars().count();
-        (
-            passed,
-            json!({
-                "command": cmd,
-                "exit_code": actual_exit,
-                "expected_exit": expected_exit,
-                "output_excerpt": excerpt,
-                "output_truncated": total_chars > max_chars,
-                "output_total_chars": total_chars,
-            }),
-        )
+        let mut ev = json!({
+            "command": cmd,
+            "exit_code": actual_exit,
+            "expected_exit": expected_exit,
+            "output_excerpt": excerpt,
+            "output_truncated": total_chars > max_chars,
+            "output_total_chars": total_chars,
+            "build_errors": build_errors,
+        });
+        // Exit-code bugiardo: exit ok ma errori nell'output -> esplicita il motivo
+        // per l'agente (altrimenti non sarebbe ovvio perche' il gate ha fallito).
+        if exit_ok && build_errors > 0 {
+            ev["verdict"] = json!(format!(
+                "Build uscito con exit ok ma l'output contiene {build_errors} errore/i di build (es. import non risolti): il bundle NON e' valido. Correggi gli errori sopra e riverifica."
+            ));
+        }
+        (passed, ev)
     }
 
     // ── service_logs_clean: run_command + match pattern sui log ───────────────
