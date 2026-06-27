@@ -668,7 +668,18 @@ piu' specifico, oppure riprova con un modello piu' capace.",
         }
         // G1 cap tramite il punto unico [`head_gate`] (regola L): qui superseded/
         // declared-done sono gia' esclusi (gestiti in testa), conta solo il cap.
-        if matches!(head_gate(false, false, 0, g1.cap_reached), HeadGate::G1Cap) {
+        // Oltre al cap re-entry "pulito" (g1.cap_reached), scatta anche su loop G1
+        // CONCLAMATO: molte iterazioni e output ancora non compiuto. Cattura il loop
+        // DESCRITTIVO con tool-call inutili intervallate (modello debole che descrive
+        // o chiama tool a vuoto), dove il pattern end_turn/tool_use alternato NON
+        // viene contato come re-entry da g1_accounting (e nudge_count non cresce
+        // perche' pending_tool_uses non e' vuoto). Cosi' scatta l'escalation a un
+        // modello piu' capace invece di bruciare iterazioni fino a iteration_cap.
+        // Soglia DB-driven (g1_max_nudges, regola G); 4x = ben oltre il budget nudge,
+        // quindi un run legittimo che progredisce non viene escalato per errore.
+        let g1_cap_effective = g1.cap_reached
+            || (unfulfilled_for_g1 && iters_in >= self.cfg.g1_max_nudges.saturating_mul(4));
+        if matches!(head_gate(false, false, 0, g1_cap_effective), HeadGate::G1Cap) {
             // ESCALATION orchestratore (py:1962-1993): prima di arrenderci, l'
             // orchestratore PROMUOVE il turno a un modello piu' capace (catena DB
             // intra-provider + cross-provider loop_fallback_default), azzerando il
