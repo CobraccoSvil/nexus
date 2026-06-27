@@ -167,6 +167,193 @@ pub(super) async fn collect_registered_services(slug: &str) -> Vec<serde_json::V
     services
 }
 
+// ── Pipeline analyzer (LLM via gateway) ────────────────────────────────────────
+
+/// Placeholder del template `agent.project.analyzer` (mig 0094). Stessa lista
+/// usata storicamente dal brain (`_render_analyzer_prompt`): la fonte e' il
+/// template DB, qui si fa solo la sostituzione testuale.
+const ANALYZER_CONFIG_CONTENT_MAX: usize = 8_000;
+
+/// Costruisce il prompt dell'analyzer sostituendo i placeholder `{{...}}` del
+/// template col payload del progetto. I file di config sono serializzati in JSON
+/// compatto (content troncato a [`ANALYZER_CONFIG_CONTENT_MAX`] char come nel
+/// rendering storico) e inseriti come stringa.
+fn render_analyzer_prompt(
+    template: &str,
+    repo_summary: &str,
+    lang_hint: &str,
+    frameworks_list: &[String],
+    config_files: &[serde_json::Value],
+    registered_services: &[serde_json::Value],
+) -> String {
+    let config_payload: Vec<serde_json::Value> = config_files
+        .iter()
+        .map(|f| {
+            let content = f
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(ANALYZER_CONFIG_CONTENT_MAX)
+                .collect::<String>();
+            json!({
+                "path": f.get("path").and_then(|p| p.as_str()).unwrap_or(""),
+                "content": content,
+                "truncated": f.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect();
+    let config_str = serde_json::to_string(&config_payload).unwrap_or_else(|_| "[]".to_string());
+    let services_str =
+        serde_json::to_string(registered_services).unwrap_or_else(|_| "[]".to_string());
+    let frameworks = if frameworks_list.is_empty() {
+        "nessuno rilevato".to_string()
+    } else {
+        frameworks_list.join(", ")
+    };
+    let lang = if lang_hint.is_empty() {
+        "non determinato"
+    } else {
+        lang_hint
+    };
+
+    template
+        .replace("{{lang_hint}}", lang)
+        .replace("{{frameworks_list}}", &frameworks)
+        .replace("{{repo_summary}}", repo_summary)
+        .replace("{{config_files_payload}}", &config_str)
+        .replace("{{registered_services}}", &services_str)
+}
+
+/// Esegue l'agente `agent.project.analyzer` interamente in Rust: carica il
+/// template dal DB, lo renderizza col payload, chiama il Nexus Gateway col
+/// modello del purpose `project_analyzer` (tier-routed) e parsa il JSON degli
+/// insights. Ritorna un `Value` con la stessa forma della vecchia risposta del
+/// brain (`status`/`insights`/`model_used`/`duration_ms`/`error`) cosi' il
+/// chiamante non cambia il codice a valle. `Err(messaggio)` per i fallimenti
+/// non recuperabili (template assente, routing non disponibile): il chiamante
+/// li marca come run `failed`.
+#[allow(clippy::too_many_arguments)]
+async fn run_analyzer_completion(
+    db: &sqlx::PgPool,
+    project_name: &str,
+    repo_summary: &str,
+    lang_hint: &str,
+    frameworks_list: &[String],
+    config_files: &[serde_json::Value],
+    registered_services: &[serde_json::Value],
+    started: std::time::Instant,
+) -> Result<serde_json::Value, String> {
+    // Template dal punto unico nexus_prompt_templates (regola L).
+    let template: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT content FROM nexus_prompt_templates \
+         WHERE key = 'agent.project.analyzer' AND is_active = TRUE \
+         ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("DB template analyzer: {e}"))?;
+    let template = template
+        .ok_or_else(|| "prompt agent.project.analyzer non trovato/attivo in DB".to_string())?;
+
+    let summary = if repo_summary.is_empty() {
+        format!("progetto {project_name}")
+    } else {
+        repo_summary.to_string()
+    };
+    let rendered = render_analyzer_prompt(
+        &template,
+        &summary,
+        lang_hint,
+        frameworks_list,
+        config_files,
+        registered_services,
+    );
+
+    // Modello risolto via routing per tier (purpose 'project_analyzer', mig 0461):
+    // best_model_for_tier sceglie il miglior modello del catalog escludendo i
+    // provider in cooldown -> sostituisce il loop chain manuale del brain (regola
+    // L). Niente nome modello hardcoded (regola G).
+    let (provider, model) =
+        match crate::internal_routing::resolve_purpose_model_db(db, "project_analyzer").await {
+            crate::internal_routing::PurposeResolution::Resolved {
+                provider,
+                model,
+                rationale,
+            } => {
+                tracing::info!("project_analyze: modello risolto {provider}/{model} ({rationale})");
+                (provider, model)
+            }
+            other => {
+                return Err(format!(
+                    "routing purpose 'project_analyzer' non risolvibile: {}",
+                    other.into_model("project_analyzer").err().unwrap_or_default()
+                ));
+            }
+        };
+
+    // Completion via Nexus Gateway, pinnando il provider deciso a monte (no
+    // secondo routing divergente; il cooldown e' gia' stato applicato dalla
+    // selezione per tier). Errore della singola chiamata -> status failed (non
+    // panic): il run resta tracciato.
+    let gw = crate::nexus_gateway::NexusGatewayClient::from_db(db).await;
+    let gw_req = crate::nexus_gateway::GwRequest {
+        model: format!("{provider}/{model}"),
+        messages: vec![crate::nexus_gateway::GwMessage {
+            role: "user".to_string(),
+            content: json!(rendered),
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        max_tokens: Some(8000),
+        pin_provider: Some(provider.clone()),
+        metadata: crate::nexus_gateway::GwMetadata {
+            feature: "project_analyzer".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let model_used = format!("{provider}/{model}");
+    match gw.complete(gw_req).await {
+        Ok(resp) => {
+            let content = resp.content.trim().to_string();
+            if content.is_empty() {
+                return Ok(json!({
+                    "status": "failed",
+                    "error": format!("{model_used}: risposta vuota"),
+                    "insights": null,
+                    "model_used": model_used,
+                    "duration_ms": started.elapsed().as_millis() as i64,
+                }));
+            }
+            // Parsing via il punto unico llm_json (gestisce fence/preamboli).
+            match crate::llm_json::parse_llm_json(&content) {
+                Ok(parsed) => Ok(json!({
+                    "status": "completed",
+                    "insights": parsed,
+                    "model_used": model_used,
+                    "duration_ms": started.elapsed().as_millis() as i64,
+                })),
+                Err(e) => Ok(json!({
+                    "status": "failed",
+                    "error": format!("{model_used}: output non parsabile come JSON: {e}"),
+                    "insights": null,
+                    "model_used": model_used,
+                    "duration_ms": started.elapsed().as_millis() as i64,
+                })),
+            }
+        }
+        Err(e) => Ok(json!({
+            "status": "failed",
+            "error": format!("{model_used}: {e}"),
+            "insights": null,
+            "model_used": model_used,
+            "duration_ms": started.elapsed().as_millis() as i64,
+        })),
+    }
+}
+
 // ── Handler HTTP ──────────────────────────────────────────────────────────────
 
 /// POST /api/projects/:id/deep-analyze — analisi AI profonda del progetto.
@@ -284,73 +471,32 @@ pub async fn deep_analyze_project(
         // 3. Servizi systemd registrati
         let services = collect_registered_services(&project_slug).await;
 
-        // 4. Chiama il brain (timeout 5 minuti — dato che siamo in background, non
-        //    proxy timeout, possiamo essere generosi)
-        let brain_url =
-            std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        let body = json!({
-            "project_id": project_id.to_string(),
-            "project_name": project_name,
-            "repo_summary": repo_summary,
-            "lang_hint": lang_hint,
-            "frameworks_list": frameworks_list,
-            "config_files": config_files,
-            "registered_services": services,
-            "provider_chain": [],
-        });
-
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
+        // 4. Esegue l'agente analyzer interamente in Rust (cutover brain->Rust):
+        //    template DB (punto unico nexus_prompt_templates) -> render placeholder
+        //    -> completion via Nexus Gateway -> parse JSON. Nessuna chiamata al
+        //    brain Python. La pipeline replica quella storica di /agent/project-analyze
+        //    (prompt agent.project.analyzer, mig 0094) ma il fallback per cooldown
+        //    e' delegato al routing per tier (best_model_for_tier via purpose
+        //    'project_analyzer', mig 0461) invece del loop chain manuale: il punto
+        //    unico vive nel selettore modello + gateway (regola L), non duplicato qui.
+        let brain_resp: serde_json::Value = match run_analyzer_completion(
+            &db,
+            &project_name,
+            &repo_summary,
+            &lang_hint,
+            &frameworks_list,
+            &config_files,
+            &services,
+            started,
+        )
+        .await
         {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = mark_failed(&db, run_id, &format!("client build: {e}"), 0).await;
-                return;
-            }
-        };
-        let response = match client
-            .post(format!(
-                "{}/agent/project-analyze",
-                brain_url.trim_end_matches('/')
-            ))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = mark_failed(
-                    &db,
-                    run_id,
-                    &format!("brain unreachable: {e}"),
-                    started.elapsed().as_millis() as i32,
-                )
-                .await;
-                return;
-            }
-        };
-
-        if !response.status().is_success() {
-            let st = response.status();
-            let txt = response.text().await.unwrap_or_default();
-            let _ = mark_failed(
-                &db,
-                run_id,
-                &format!("brain error {st}: {}", &txt[..txt.len().min(300)]),
-                started.elapsed().as_millis() as i32,
-            )
-            .await;
-            return;
-        }
-
-        let brain_resp: serde_json::Value = match response.json().await {
             Ok(v) => v,
             Err(e) => {
                 let _ = mark_failed(
                     &db,
                     run_id,
-                    &format!("brain json: {e}"),
+                    &e,
                     started.elapsed().as_millis() as i32,
                 )
                 .await;
@@ -815,5 +961,87 @@ fn parse_insight_object(obj: &serde_json::Map<String, Value>) -> InsightItem {
         body_md,
         category,
         file_paths,
+    }
+}
+
+#[cfg(test)]
+mod analyzer_tests {
+    use super::*;
+
+    #[test]
+    fn render_analyzer_prompt_sostituisce_tutti_i_placeholder() {
+        let template = "Lang: {{lang_hint}}\nFw: {{frameworks_list}}\n\
+                        Repo: {{repo_summary}}\nCfg: {{config_files_payload}}\n\
+                        Svc: {{registered_services}}";
+        let config = vec![json!({
+            "path": "package.json",
+            "content": "{\"name\":\"demo\"}",
+            "truncated": false
+        })];
+        let services = vec![json!({"unit": "demo.service", "active_state": "active"})];
+        let out = render_analyzer_prompt(
+            template,
+            "10 file in demo",
+            "typescript",
+            &["next".to_string(), "react".to_string()],
+            &config,
+            &services,
+        );
+        // Nessun placeholder residuo.
+        assert!(!out.contains("{{"), "placeholder non sostituiti: {out}");
+        assert!(out.contains("Lang: typescript"));
+        assert!(out.contains("Fw: next, react"));
+        assert!(out.contains("Repo: 10 file in demo"));
+        // Il payload config e' JSON con il path del file.
+        assert!(out.contains("package.json"));
+        assert!(out.contains("demo.service"));
+    }
+
+    #[test]
+    fn render_analyzer_prompt_valori_vuoti_hanno_default() {
+        let template = "{{lang_hint}}|{{frameworks_list}}";
+        let out = render_analyzer_prompt(template, "", "", &[], &[], &[]);
+        assert_eq!(out, "non determinato|nessuno rilevato");
+    }
+
+    #[test]
+    fn render_analyzer_prompt_tronca_content_config_lungo() {
+        let big = "x".repeat(ANALYZER_CONFIG_CONTENT_MAX + 500);
+        let config = vec![json!({"path": "Big", "content": big, "truncated": true})];
+        let out = render_analyzer_prompt("{{config_files_payload}}", "s", "go", &[], &config, &[]);
+        // Il content e' troncato al massimo consentito (conta le 'x' nel JSON).
+        let x_count = out.matches('x').count();
+        assert_eq!(x_count, ANALYZER_CONFIG_CONTENT_MAX);
+    }
+
+    #[test]
+    fn gateway_request_analyzer_pinna_provider_e_formatta_model() {
+        // Verifica la forma della richiesta inviata al gateway: model
+        // "provider/model", pin_provider valorizzato, feature di tracciamento.
+        let provider = "openai";
+        let model = "gpt-4.1-mini";
+        let req = crate::nexus_gateway::GwRequest {
+            model: format!("{provider}/{model}"),
+            messages: vec![crate::nexus_gateway::GwMessage {
+                role: "user".to_string(),
+                content: json!("prompt analyzer"),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            max_tokens: Some(8000),
+            pin_provider: Some(provider.to_string()),
+            metadata: crate::nexus_gateway::GwMetadata {
+                feature: "project_analyzer".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&req).expect("serializza GwRequest");
+        assert_eq!(wire["model"], "openai/gpt-4.1-mini");
+        assert_eq!(wire["pin_provider"], "openai");
+        assert_eq!(wire["max_tokens"], 8000);
+        assert_eq!(wire["metadata"]["feature"], "project_analyzer");
+        assert_eq!(wire["messages"][0]["role"], "user");
+        assert_eq!(wire["messages"][0]["content"], "prompt analyzer");
     }
 }

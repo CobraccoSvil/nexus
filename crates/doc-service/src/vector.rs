@@ -17,11 +17,15 @@ pub async fn delete_doc_points(qdrant_url: &str, point_ids: &[String]) -> anyhow
     Ok(())
 }
 
-/// Vectorize a document's sections into Qdrant
+/// Vectorize a document's sections into Qdrant.
+///
+/// Embedding via il PUNTO UNICO `mcp-core POST /api/embed` (ONNX MiniLM
+/// in-process, regola L): `mcp_core_url` e' l'URL HTTP di mcp-core, non piu'
+/// quello del brain Python.
 pub async fn vectorize_document(
     db: &sqlx::PgPool,
     qdrant_url: &str,
-    _neural_url: &str,
+    mcp_core_url: &str,
     project_id: Uuid,
     doc_id: Uuid,
     doc_type: &str,
@@ -29,8 +33,6 @@ pub async fn vectorize_document(
     content: &Value,
 ) -> anyhow::Result<()> {
     let collection = "project_docs";
-    let brain_rest_url = std::env::var("NEURAL_CORE_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
     let client = nexus_http::build_client();
 
     // Ensure collection exists
@@ -71,19 +73,15 @@ pub async fn vectorize_document(
 
         let text_to_embed = format!("{} {}: {}", section_number, section_title, section_content);
 
-        // Get embedding
+        // Get embedding (mcp-core ONNX /api/embed, punto unico)
         let embed_resp = client
-            .post(format!("{brain_rest_url}/embed"))
+            .post(format!("{mcp_core_url}/api/embed"))
             .json(&json!({ "text": text_to_embed }))
             .send()
             .await?;
 
         let embed_result: Value = embed_resp.json().await?;
-        let vector: Vec<f64> = embed_result
-            .get("vector")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_f64).collect())
-            .unwrap_or_default();
+        let vector: Vec<f64> = parse_embed_vector(&embed_result);
 
         if vector.is_empty() {
             continue;
@@ -200,4 +198,38 @@ pub async fn search_doc_points(
         .collect();
 
     Ok(results)
+}
+
+/// Estrae il vettore embedding dalla risposta JSON di `mcp-core POST /api/embed`
+/// nella forma single-text `{"vector":[...]}`. Punto di parsing condiviso dai
+/// call site di doc-service (regola L): isolato per essere testabile senza HTTP.
+fn parse_embed_vector(resp: &Value) -> Vec<f64> {
+    resp.get("vector")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod embed_tests {
+    use super::*;
+
+    #[test]
+    fn parse_embed_vector_legge_formato_mcp_core() {
+        // Forma di mcp-core /api/embed per {text}: {"model":..,"vector":[..],"dimensions":N}.
+        let resp = json!({
+            "model": "all-MiniLM-L6-v2",
+            "vector": [0.1, 0.2, -0.3],
+            "dimensions": 3
+        });
+        let v = parse_embed_vector(&resp);
+        assert_eq!(v, vec![0.1, 0.2, -0.3]);
+    }
+
+    #[test]
+    fn parse_embed_vector_vuoto_su_risposta_malformata() {
+        // Nessun campo "vector" -> vettore vuoto (il chiamante salta la sezione).
+        assert!(parse_embed_vector(&json!({"error": "x"})).is_empty());
+        assert!(parse_embed_vector(&json!({"vector": "non-array"})).is_empty());
+    }
 }

@@ -15,6 +15,11 @@ pub struct AppState {
     pub db: sqlx::PgPool,
     pub neural_url: String,
     pub qdrant_url: String,
+    /// URL HTTP di mcp-core (porta 4000). doc-service fa embed via il PUNTO UNICO
+    /// `mcp-core POST /api/embed` (ONNX MiniLM in-process, regola L), non piu' via
+    /// il brain Python. Letto da `settings.mcp_core_url` (mig 0190), override di
+    /// emergenza `MCP_CORE_URL` (regola G: niente porta hardcoded).
+    pub mcp_core_url: String,
 }
 
 #[tokio::main]
@@ -50,10 +55,18 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "http://127.0.0.1:6333".to_string())
         });
 
+    // URL mcp-core per gli embedding ONNX (override env > settings, regola G).
+    let mcp_core_url = std::env::var("MCP_CORE_URL").ok().unwrap_or(
+        nexus_auth::get_setting(&db, "mcp_core_url")
+            .await
+            .unwrap_or_else(|| "http://127.0.0.1:4000".to_string()),
+    );
+
     let state = AppState {
         db: db.clone(),
         neural_url,
         qdrant_url,
+        mcp_core_url,
     };
 
     let cors = CorsLayer::new()

@@ -205,15 +205,15 @@ pub async fn generate_document(
     .execute(&state.db).await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
 
-    // Vectorize in background
+    // Vectorize in background (embedding via mcp-core ONNX, punto unico)
     let db2 = state.db.clone();
     let qdrant_url = state.qdrant_url.clone();
-    let neural_url2 = state.neural_url.clone();
+    let mcp_core_url2 = state.mcp_core_url.clone();
     let content2 = req.content_json.clone();
     let doc_type2 = req.doc_type.clone();
     let version2 = version.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::vector::vectorize_document(&db2, &qdrant_url, &neural_url2, pid, doc_id, &doc_type2, &version2, &content2).await {
+        if let Err(e) = crate::vector::vectorize_document(&db2, &qdrant_url, &mcp_core_url2, pid, doc_id, &doc_type2, &version2, &content2).await {
             tracing::warn!("Vettorializzazione fallita: {e}");
         }
     });
@@ -246,12 +246,12 @@ pub async fn search_documents(
     let pid = parse_project_id(&req.project_id)?;
     let limit = req.limit.unwrap_or(5);
 
-    // Embed query via brain REST
-    let brain_rest_url = std::env::var("NEURAL_CORE_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-
+    // Embed query via mcp-core ONNX (POST /api/embed) — punto unico embedder
+    // (regola L): il brain Python non e' piu' coinvolto. Stesso formato di
+    // risposta dell'endpoint /embed storico ({"vector":[...]}), nessun cambio
+    // nel parsing a valle.
     let client = reqwest::Client::new();
-    let resp = client.post(format!("{brain_rest_url}/embed"))
+    let resp = client.post(format!("{}/api/embed", state.mcp_core_url))
         .json(&json!({ "text": req.query }))
         .send().await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding: {e}")))?;

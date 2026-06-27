@@ -131,8 +131,6 @@ pub async fn handle_doc_generate(
                 "nexus_doc_generate: content_json mancante, auto-generazione per {}",
                 doc_type
             );
-            let brain_rest = std::env::var("NEURAL_CORE_REST_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             // Leggi file chiave del progetto per il contesto
             let mut project_context = format!(
                 "Progetto: {}\nRoot: {}\nTipo documento: {}\n\n",
@@ -249,13 +247,6 @@ pub async fn handle_doc_generate(
                  Genera almeno 5 sezioni principali con sottosezioni. Ogni content deve essere almeno 2-3 frasi.\n\n\
                  CONTESTO PROGETTO:\n{}", doc_type_label, project_context
             );
-            let http = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => return format!("[Errore] Costruzione client HTTP fallita: {e}"),
-            };
             // Modello risolto tramite il ROUTING CANONICO per tier (punto unico
             // regola L): resolve_purpose_model_db applica tier-rule (mig 0203) ->
             // miglior modello del catalog fuori cooldown -> fallback statico ->
@@ -296,29 +287,36 @@ pub async fn handle_doc_generate(
                         return format!("[Errore] routing docs_generator non disponibile: {e}");
                     }
                 };
-            // json_mode: forza output JSON sintatticamente valido sui provider
-            // che lo supportano (Google/OpenAI). max_tokens alto: un documento
-            // strutturato lungo (~13k char) col default 4096 veniva TRONCATO, da
-            // cui il "JSON parse error" osservato. 16000 token coprono i casi reali.
-            let body = serde_json::json!({
-                "provider": gen_provider,
-                "model": gen_model,
-                "prompt": gen_prompt,
-                "json_mode": true,
-                "max_tokens": 16000
-            });
-            let resp = match http
-                .post(format!("{}/complete", brain_rest))
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => return format!("[Errore] Generazione automatica contenuto fallita: {e}"),
+            // Chiamata LLM al Nexus Gateway Rust (punto unico routing/cooldown,
+            // regola L): il brain Python non e' piu' coinvolto. Il provider+modello
+            // sono gia' decisi a monte via routing matrix DB (resolve_purpose_model_db
+            // sopra), quindi si pinna il provider per evitare un secondo routing
+            // divergente (regola G). max_tokens alto: un documento strutturato lungo
+            // (~13k char) col default veniva TRONCATO, da cui il "JSON parse error"
+            // osservato; 16000 token coprono i casi reali. Il prompt impone gia'
+            // output JSON puro e `parse_llm_json` sotto tollera fence/preamboli.
+            let gw = crate::nexus_gateway::NexusGatewayClient::from_db(db).await;
+            let gw_req = crate::nexus_gateway::GwRequest {
+                model: format!("{gen_provider}/{gen_model}"),
+                messages: vec![crate::nexus_gateway::GwMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!(gen_prompt),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                max_tokens: Some(16000),
+                pin_provider: Some(gen_provider.clone()),
+                metadata: crate::nexus_gateway::GwMetadata {
+                    feature: "docs_generator".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
             };
-            let resp_text = match resp.text().await {
-                Ok(t) => t,
-                Err(e) => return format!("[Errore] Lettura risposta brain fallita: {e}"),
+            let resp_text = match gw.complete(gw_req).await {
+                Ok(r) => r.content,
+                Err(e) => {
+                    return format!("[Errore] Generazione automatica contenuto fallita: {e}")
+                }
             };
             // FIX 5 (anti-malformazione): parsing tramite il punto unico
             // `llm_json::parse_llm_json` (gestisce fence ```json, wrapper
@@ -729,5 +727,43 @@ pub(super) async fn handle_doc_status(db: &PgPool, args: &Value) -> String {
         }
         Ok(_) => "[Errore] Documento non trovato".to_string(),
         Err(e) => format!("[Errore DB] {e}"),
+    }
+}
+
+#[cfg(test)]
+mod docs_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn doc_generate_gateway_request_pinna_provider() {
+        // La generazione contenuto documenti chiama il gateway pinnando il
+        // provider risolto dal purpose docs_generator (regola G/L). Verifica la
+        // forma wire della richiesta.
+        let provider = "openai";
+        let model = "gpt-4.1-nano";
+        let prompt = "Genera un documento strutturato JSON".to_string();
+        let req = crate::nexus_gateway::GwRequest {
+            model: format!("{provider}/{model}"),
+            messages: vec![crate::nexus_gateway::GwMessage {
+                role: "user".to_string(),
+                content: json!(prompt),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            max_tokens: Some(16000),
+            pin_provider: Some(provider.to_string()),
+            metadata: crate::nexus_gateway::GwMetadata {
+                feature: "docs_generator".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&req).expect("serializza GwRequest");
+        assert_eq!(wire["model"], "openai/gpt-4.1-nano");
+        assert_eq!(wire["pin_provider"], "openai");
+        assert_eq!(wire["max_tokens"], 16000);
+        assert_eq!(wire["metadata"]["feature"], "docs_generator");
+        // Niente tool: e' una generazione testuale JSON.
+        assert!(wire.get("tools").is_none());
     }
 }
