@@ -236,3 +236,52 @@ async fn provider_for_model_modello_disabilitato_o_ignoto_ritorna_none(pool: sql
     // Modello disabilitato -> None.
     assert_eq!(provider_for_model(&pool, "disabled-model").await, None);
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Test embedder ONNX in-process (cablaggio embed_text, regola L)
+//
+// Verifica che NeuralCoreClient::embed_text / embed_text_with_model usino
+// l'embedder in-process del NexusBridge (ONNX o HashEmbedder fallback) e NON
+// facciano piu' alcuna RPC gRPC verso il brain. Il client e' costruito con
+// `disconnected_for_tests()` (endpoint irraggiungibile 127.0.0.1:1): se il
+// metodo facesse ancora gRPC, fallirebbe la connessione. Il successo dimostra
+// l'assenza di round-trip di rete.
+// ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_embed_text_with_model_in_process_no_grpc() {
+    // Inizializza il bridge globale (idempotente). Nell'ambiente di test il
+    // modello ONNX di norma non e' presente -> HashEmbedder(256) come fallback;
+    // in entrambi i casi l'embedding e' in-process, senza brain.
+    crate::nexus_bridge::NexusBridge::init_global();
+
+    let client = NeuralCoreClient::disconnected_for_tests();
+
+    // embed_text_with_model: label coerente + vettore non vuoto, senza gRPC.
+    let (label, vector) = client
+        .embed_text_with_model("", "verifica embedding in-process")
+        .await
+        .expect("embed_text_with_model deve riuscire in-process (zero gRPC)");
+    // Model vuoto -> label canonico, identico a quello che il brain ritornava:
+    // gli hash di indicizzazione restano validi (nessun reindex).
+    assert_eq!(label, "all-MiniLM-L6-v2");
+    assert!(!vector.is_empty(), "il vettore non deve essere vuoto");
+
+    // embed_text (wrapper): stesso vettore, solo il valore.
+    let vector2 = client
+        .embed_text("", "verifica embedding in-process")
+        .await
+        .expect("embed_text deve riuscire in-process (zero gRPC)");
+    assert_eq!(
+        vector, vector2,
+        "embed_text e embed_text_with_model devono produrre lo stesso vettore"
+    );
+
+    // Model esplicito -> il label richiesto viene propagato (parita' con la
+    // logica dell'handler /api/embed).
+    let (label_explicit, _v) = client
+        .embed_text_with_model("custom-embedder", "x")
+        .await
+        .expect("embed con model esplicito deve riuscire");
+    assert_eq!(label_explicit, "custom-embedder");
+}

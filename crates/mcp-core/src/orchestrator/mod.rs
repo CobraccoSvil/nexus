@@ -18,8 +18,8 @@ use uuid::Uuid;
 // Re-export: i submodule fanno `use super::*` e ottengono questi tipi senza
 // duplicare il blocco `use mcp_proto::neural::{...}` (regola L, S73).
 pub(crate) use mcp_proto::neural::{
-    neural_core_service_client::NeuralCoreServiceClient, EmbedTextRequest,
-    GenerateAgentTurnRequest, GenerateCompletionRequest,
+    neural_core_service_client::NeuralCoreServiceClient, GenerateAgentTurnRequest,
+    GenerateCompletionRequest,
 };
 
 use crate::nexus_gateway::NexusGatewayClient;

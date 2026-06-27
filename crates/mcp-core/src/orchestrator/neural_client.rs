@@ -47,42 +47,48 @@ impl NeuralCoreClient {
         Ok(vector)
     }
 
-    /// Come `embed_text`, ma ritorna anche il nome del modello effettivamente
-    /// usato dal brain per generare il vettore. Serve a costruire una signature
-    /// dell'embedder (modello + dimensione) da incorporare negli hash di
-    /// indicizzazione: cosi' un cambio di embedder invalida automaticamente gli
-    /// hash e forza il reindex, senza interventi manuali sul DB.
+    /// Come `embed_text`, ma ritorna anche il nome del modello usato per
+    /// generare il vettore. Serve a costruire una signature dell'embedder
+    /// (modello + dimensione) da incorporare negli hash di indicizzazione:
+    /// cosi' un cambio di embedder invalida automaticamente gli hash e forza il
+    /// reindex, senza interventi manuali sul DB.
+    ///
+    /// Embedding ONNX MiniLM-384d IN-PROCESS (regola L: punto unico embedder,
+    /// lo stesso `NexusBridge::embedder()` usato da `/api/embed`,
+    /// `Orchestrator::embed_text` e dai tool ruvector). Niente piu' round-trip
+    /// gRPC verso il brain Python: il brain stesso (`brain/embeddings/service.py`)
+    /// ormai delega a `/api/embed` di mcp-core, quindi il gRPC `EmbedText` faceva
+    /// un giro inutile Rust -> brain -> HTTP -> mcp-core -> ONNX. Ora chiama
+    /// direttamente l'embedder locale.
+    ///
+    /// Label: replica la logica dell'handler `/api/embed` (label
+    /// `all-MiniLM-L6-v2` quando `model` e' vuoto, altrimenti il `model`
+    /// richiesto). Tutti i call site passano `""`, quindi il label resta
+    /// `all-MiniLM-L6-v2` -- identico a quello che il brain ritornava prima,
+    /// percio' gli hash di indicizzazione restano validi (nessun reindex).
+    /// I vettori sono identici (stesso modello ONNX, parita' validata).
     pub async fn embed_text_with_model(
         &self,
         model: &str,
         text: &str,
     ) -> anyhow::Result<(String, Vec<f32>)> {
-        let mut client = self.client.clone();
-        let resp = client
-            .embed_text(EmbedTextRequest {
-                model: model.to_string(),
-                text: text.to_string(),
-            })
-            .await?;
-        let json: Value = serde_json::from_str(&resp.into_inner().json)?;
-        let vector = json
-            .get("vector")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("invalid_embed_response"))?
-            .iter()
-            .filter_map(|value| value.as_f64().map(|num| num as f32))
-            .collect::<Vec<_>>();
+        let bridge = crate::nexus_bridge::NexusBridge::global().ok_or_else(|| {
+            anyhow::anyhow!("nexus bridge non inizializzato (embed_text_with_model)")
+        })?;
+        let used_model = if model.trim().is_empty() {
+            "all-MiniLM-L6-v2".to_string()
+        } else {
+            model.to_string()
+        };
+        // embed() e' CPU-bound sincrono: spawn_blocking per non bloccare il
+        // runtime async (stesso pattern di Orchestrator::embed_text).
+        let text = text.to_string();
+        let vector = tokio::task::spawn_blocking(move || bridge.embed_one(&text))
+            .await
+            .map_err(|e| anyhow::anyhow!("embed_text_with_model spawn_blocking join: {e}"))?;
         if vector.is_empty() {
             anyhow::bail!("empty_embed_vector");
         }
-        // Il brain ritorna il modello realmente usato (default risolto se input
-        // vuoto). Se assente, ripieghiamo su una etichetta neutra.
-        let used_model = json
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|m| !m.is_empty())
-            .unwrap_or("unknown")
-            .to_string();
         Ok((used_model, vector))
     }
 
