@@ -32,6 +32,13 @@ const PROVIDER_COLORS: Record<string, { base: string; label: string }> = {
   unknown: { base: "#94a3b8", label: "?" },
 };
 
+/** Colore brand base (#RRGGBB) per provider. Riusato dalle card meta-step per
+ *  l'accento della riga (colore differente in base al provider). */
+export function providerBaseColor(provider: string | null | undefined): string {
+  const key = (provider ?? "unknown").toLowerCase();
+  return (PROVIDER_COLORS[key] ?? PROVIDER_COLORS.unknown).base;
+}
+
 export interface ModelPricingEntry {
   provider: string;
   model: string;

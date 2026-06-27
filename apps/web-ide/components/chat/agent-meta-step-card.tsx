@@ -3,7 +3,7 @@
 import { useState, type CSSProperties } from "react";
 import { useEventOfKind } from "../../lib/project-dispatcher/hooks";
 import { useThemeColors } from "../../lib/theme";
-import { ProviderBadge } from "./provider-badge";
+import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
 
@@ -153,8 +153,12 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   // Scelte proposte dall'agente: ogni voce diventa un pulsante a tutta larghezza.
   next_actions: { icon: "→", label: "Prossimi passi", accent: NEXT_ACTION_ACCENT, defaultOpen: true },
   // Ogni tool eseguito dall'executor emette questo meta_step (vedi
-  // brain/agents/nodes tool_dispatch). Icona "◆" distinta dal chevron "▸".
+  // tool_dispatch del grafo). Icona "◆" distinta dal chevron "▸".
   tool_executed: { icon: "◆", label: "Tool", accent: "#10b981", defaultOpen: false },
+  // Heartbeat "Sto interrogando <provider>/<model>" emesso dall'executor del grafo
+  // (executor.rs kind=executor_call): la riga prende il colore del provider e il
+  // nome provider/modello e' mostrato nel badge a destra.
+  executor_call: { icon: "◇", label: "Modello", accent: "#64748b", defaultOpen: false },
 };
 
 const DEFAULT_DESC: KindDescriptor = {
@@ -319,11 +323,21 @@ export function AgentMetaStepCard({
     );
   };
 
+  // Provider/model per il turno (badge colorato per provider+costo).
+  const provider = (data.payload?.provider ?? data.payload?.to_provider ?? null) as string | null;
+  const model = (data.payload?.model ?? data.payload?.to_model ?? null) as string | null;
+
   // I meta_step tool arrivano col title gia' prefissato "tool <nome>": col label
   // "Tool" del descrittore diventerebbe "Tool tool <nome>". Rimuovo il prefisso
   // ridondante per i soli tool_executed.
-  const displayTitle =
+  let displayTitle =
     data.kind === "tool_executed" ? data.title.replace(/^tool\s+/i, "") : data.title;
+  // executor_call: il title backend e' "Sto interrogando <provider>/<model>"; il
+  // provider/model finisce nel badge colorato a destra, quindi lo rimuovo dal testo
+  // per non duplicarlo (resta "Sto interrogando").
+  if (data.kind === "executor_call" && provider && model) {
+    displayTitle = displayTitle.replace(`${provider}/${model}`, "").trim();
+  }
 
   // Dedup label/title: se il title comincia gia' col label (es. label "Fallback"
   // + title "Fallback su google/...") mostrare entrambi dava "Fallback Fallback su
@@ -336,12 +350,18 @@ export function AgentMetaStepCard({
   const showLabel = data.kind !== "tool_executed" && !titleStartsWithLabel;
   const titleToShow = titleLc && titleLc !== labelLc ? displayTitle : "";
 
-  // Provider/model per il turno (badge colorato per provider+costo).
-  const provider = (data.payload?.provider ?? data.payload?.to_provider ?? null) as string | null;
-  const model = (data.payload?.model ?? data.payload?.to_model ?? null) as string | null;
   const showBadge =
     (provider || model) &&
-    (data.kind === "routing" || data.kind === "tool_executed" || data.kind === "fallback");
+    (data.kind === "routing" ||
+      data.kind === "tool_executed" ||
+      data.kind === "fallback" ||
+      data.kind === "executor_call");
+
+  // Colore-accento della riga: per gli step di chiamata modello usa il colore del
+  // PROVIDER (ripristina il colore-per-provider richiesto in UI); altrimenti il
+  // colore del kind.
+  const accent =
+    data.kind === "executor_call" && provider ? providerBaseColor(provider) : desc.accent;
 
   return (
     <div
@@ -349,8 +369,8 @@ export function AgentMetaStepCard({
       style={{
         margin: "4px 0",
         borderRadius: 6,
-        border: `1px solid ${withAlpha(desc.accent, 0.3)}`,
-        background: withAlpha(desc.accent, 0.08),
+        border: `1px solid ${withAlpha(accent, 0.3)}`,
+        background: withAlpha(accent, 0.08),
         fontSize: 13,
       }}
     >
@@ -366,7 +386,7 @@ export function AgentMetaStepCard({
           padding: "5px 8px",
           background: "transparent",
           border: "none",
-          color: desc.accent,
+          color: accent,
           cursor: "pointer",
           textAlign: "left",
         }}
