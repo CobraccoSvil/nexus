@@ -6,7 +6,9 @@
 // Questo permette al browser di usare wss://nexus.cobracco.it/neural/ws/terminal/...
 // che il proxy inoltra a mcp-core su /api/neural/ws/terminal/...
 
-const { createServer } = require("http");
+const http = require("http");
+const net = require("net");
+const { createServer } = http;
 const { parse } = require("url");
 const next = require("next");
 const httpProxy = require("http-proxy");
@@ -52,19 +54,7 @@ const handle = app.getRequestHandler();
 // URL di mcp-core: stessa convenzione del fallback /api/:path* (next.config.ts)
 // e del proxy SSO sotto. Niente nuova env var dedicata al brain (eliminato).
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:4000";
-
-// Proxy for WebSocket upgrades — riscrive il prefisso /neural in /api/neural
-// prima di inoltrare a mcp-core (vedi handler "upgrade" piu' sotto).
-const wsProxy = httpProxy.createProxyServer({
-  target: BACKEND_URL,
-  ws: true,
-  changeOrigin: true,
-});
-
-wsProxy.on("error", (err, req, socket) => {
-  console.error("[ws-proxy] error:", err.message);
-  if (socket && !socket.destroyed) socket.destroy();
-});
+const BACKEND_WS = new URL(BACKEND_URL);
 
 // Proxy DIRETTO per gli endpoint SSE (text/event-stream) verso mcp-core.
 // Le rewrites di Next.js (next.config.ts -> /api/:path* -> :4000) BUFFERIZZANO
@@ -134,20 +124,68 @@ app.prepare().then(async () => {
     handle(req, res, parsedUrl);
   });
 
-  // Intercept WebSocket upgrade events on /neural/* paths
-  server.on("upgrade", (req, socket, head) => {
+  // Handler UNICO per gli upgrade WebSocket su /neural/* -> mcp-core.
+  // Inoltro RAW (net.connect): connessione TCP verso mcp-core, request-line +
+  // header riscritti a mano, poi pipe grezzo bidirezionale. La risposta
+  // "HTTP/1.1 101 ..." di mcp-core attraversa il pipe UNA sola volta verso il
+  // browser, che la consuma come handshake (http-proxy.ws() invece la
+  // re-inoltrava come payload del primo frame -> frame malformato -> 1002).
+  const upgradeHandler = (req, socket, head) => {
     const url = req.url || "";
-    if (url.startsWith("/neural/") || url === "/neural") {
-      // Riscrive il prefisso /neural in /api/neural cosi' mcp-core vede
-      // /api/neural/ws/terminal/... (gli endpoint neural sono sotto quel prefisso
-      // dopo l'eliminazione del brain Python).
-      req.url = `/api/neural${url.slice("/neural".length) || "/"}`;
-      console.log(`[ws-proxy] upgrade → ${BACKEND_URL}${req.url}`);
-      wsProxy.ws(req, socket, head);
-    } else {
+    if (!(url.startsWith("/neural/") || url === "/neural")) {
+      // In produzione non servono altri upgrade: niente HMR, niente WS interni.
       socket.destroy();
+      return;
     }
-  });
+    const targetPath = `/api/neural${url.slice("/neural".length) || "/"}`;
+    console.log(`[ws-proxy] upgrade → ${BACKEND_URL}${targetPath}`);
+
+    const upstream = net.connect(Number(BACKEND_WS.port), BACKEND_WS.hostname, () => {
+      const headers = { ...req.headers, host: BACKEND_WS.host };
+      let raw = `${req.method} ${targetPath} HTTP/1.1\r\n`;
+      for (const [k, v] of Object.entries(headers)) {
+        if (Array.isArray(v)) for (const vv of v) raw += `${k}: ${vv}\r\n`;
+        else raw += `${k}: ${v}\r\n`;
+      }
+      raw += "\r\n";
+      upstream.write(raw);
+      if (head && head.length) upstream.write(head);
+      upstream.setNoDelay(true);
+      socket.setNoDelay(true);
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+    });
+
+    const teardown = () => {
+      if (!socket.destroyed) socket.destroy();
+      if (!upstream.destroyed) upstream.destroy();
+    };
+    upstream.on("error", (err) => {
+      console.error("[ws-proxy] error:", err.message);
+      teardown();
+    });
+    socket.on("error", teardown);
+    upstream.on("close", teardown);
+    socket.on("close", teardown);
+  };
+
+  server.on("upgrade", upgradeHandler);
+
+  // Next.js (o librerie WS interne) registrano un PROPRIO listener 'upgrade' al
+  // primo handle() di una richiesta HTTP. Quel listener risponde con un SECONDO
+  // handshake 101 anche sui path /neural/, generando un doppio 101 verso il
+  // browser -> CloseFrame 1002 "Protocol Error" -> terminale in loop di
+  // riconnessione. /neural/ e' gestito interamente da upgradeHandler e in
+  // produzione non servono altri upgrade: blocchiamo l'aggiunta di qualunque
+  // altro listener 'upgrade' cosi' il nostro resta l'unico.
+  const onlyOurUpgrade = (orig) =>
+    function (event, listener) {
+      if (event === "upgrade" && listener !== upgradeHandler) return this;
+      return orig.call(this, event, listener);
+    };
+  server.on = onlyOurUpgrade(server.on.bind(server));
+  server.addListener = onlyOurUpgrade(server.addListener.bind(server));
+  server.prependListener = onlyOurUpgrade(server.prependListener.bind(server));
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`> Ready on http://0.0.0.0:${PORT} (neural → ${BACKEND_URL}/api/neural)`);

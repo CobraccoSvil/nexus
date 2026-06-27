@@ -396,6 +396,15 @@ async fn run_terminal_session(
         cmd.arg(arg);
     }
     cmd.cwd(&cwd);
+    // portable-pty NON eredita l'ambiente del processo (a differenza di
+    // std::process::Command). Senza PATH l'exec della shell relativa "bash" non
+    // viene risolto -> il processo esce subito (127) -> EOF immediato sul master
+    // -> il terminale si chiude all'istante e il frontend entra in loop di
+    // riconnessione. Replichiamo `os.environ.copy()` del brain ereditando
+    // l'ambiente, poi forziamo TERM.
+    for (key, value) in std::env::vars() {
+        cmd.env(key, value);
+    }
     cmd.env("TERM", "xterm-256color");
 
     let mut child = pair
@@ -405,6 +414,13 @@ async fn run_terminal_session(
     // Il lato slave non serve piu' al processo padre: chiuderlo evita che il
     // reader resti appeso quando la shell esce (EOF sul master).
     drop(pair.slave);
+    tracing::info!(
+        session_id = %session_id,
+        program = %plan.program,
+        args = ?plan.args,
+        cwd = %cwd.display(),
+        "terminal_ws: shell PTY avviata"
+    );
 
     let killer = child.clone_killer();
     let mut reader = pair
@@ -511,11 +527,22 @@ async fn run_terminal_session(
                         total_seen.fetch_add(bytes.len(), Ordering::Relaxed);
                         use futures::SinkExt;
                         if ws_sink.send(Message::Binary(bytes)).await.is_err() {
+                            tracing::warn!(session_id = %session_id, "terminal_ws: invio output al WS fallito (client disconnesso)");
                             break;
                         }
                     }
                     Some(PtyEvent::Exit(code)) => {
                         final_exit = code;
+                        let dbg_out: String = String::from_utf8_lossy(&ring.lock().snapshot())
+                            .chars()
+                            .take(400)
+                            .collect();
+                        tracing::warn!(
+                            session_id = %session_id,
+                            exit_code = ?code,
+                            output = %dbg_out,
+                            "terminal_ws: shell terminata (process_exit)"
+                        );
                         use futures::SinkExt;
                         let payload = serde_json::json!({
                             "type": "process_exit",
@@ -526,7 +553,10 @@ async fn run_terminal_session(
                             .await;
                         break;
                     }
-                    None => break,
+                    None => {
+                        tracing::warn!(session_id = %session_id, "terminal_ws: canale PTY chiuso (reader terminato, nessun Exit ricevuto)");
+                        break;
+                    }
                 }
             }
             // Input dal WebSocket.
@@ -554,9 +584,19 @@ async fn run_terminal_session(
                             break;
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(frame))) => {
+                        tracing::warn!(session_id = %session_id, ?frame, "terminal_ws: WS chiuso dal client (Close frame)");
+                        break;
+                    }
+                    None => {
+                        tracing::warn!(session_id = %session_id, "terminal_ws: WS stream terminato (None)");
+                        break;
+                    }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
+                    Some(Err(e)) => {
+                        tracing::warn!(session_id = %session_id, error = %e, "terminal_ws: errore lettura WS");
+                        break;
+                    }
                 }
             }
         }
