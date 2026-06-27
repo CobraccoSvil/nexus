@@ -14,18 +14,6 @@
       "port": 4000
     },
     {
-      "name": "Neural Core (Python gRPC)",
-      "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "brain.grpc_server.main"],
-      "port": 50051
-    },
-    {
-      "name": "Neural Core REST (debug)",
-      "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "brain.grpc_server.main", "--rest"],
-      "port": 8001
-    },
-    {
       "name": "Docker Infrastructure",
       "runtimeExecutable": "docker",
       "runtimeArgs": ["compose", "-f", "deploy/docker-compose.yml", "up", "-d"],

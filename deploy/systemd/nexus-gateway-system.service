@@ -4,7 +4,7 @@
 # provider AI. Storicamente veniva avviato da deploy-local.sh e supervisionato
 # dal task_watchdog di mcp-core via `setsid nohup`: questo significava che il
 # binario non si aggiornava ai commit (il watchdog rilanciava sempre la stessa
-# build vecchia) -> brain-nuovo parlava con gateway-vecchio -> LED provider
+# build vecchia) -> mcp-core-nuovo parlava con gateway-vecchio -> LED provider
 # rossi. Sotto systemd --system il restart e' garantito da PID 1 (immune alla
 # caduta del manager --user in WSL) e deploy-local.sh aggiorna sempre la build.
 #
@@ -12,10 +12,10 @@
 # aggiornato da deploy-local.sh a ogni build: la unit esegue sempre l'ultima
 # build.
 #
-# After=nexus-mcp-core: il gateway parte dopo mcp-core (che a sua volta attende
-# il brain). La dipendenza dal DB Postgres e' coperta dal bootstrap interno del
-# gateway (config/policy/chiavi risolte dal DB) + Restart=always come safety net
-# se il DB non e' ancora pronto al boot.
+# After=nexus-mcp-core: il gateway parte dopo mcp-core. La dipendenza dal DB
+# Postgres e' coperta dal bootstrap interno del gateway (config/policy/chiavi
+# risolte dal DB) + Restart=always come safety net se il DB non e' ancora pronto
+# al boot.
 #
 # Restart=always (vedi nexus-mcp-core-system.service per il razionale): la VM
 # WSL sospesa manda SIGTERM ai processi -> exit 0 graceful -> on-failure NON

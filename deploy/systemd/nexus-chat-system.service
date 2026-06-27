@@ -1,11 +1,11 @@
 # nexus-chat-service.service — chat-service di Nexus come unit systemd --SYSTEM.
 #
-# ADR 0028 livello 3 (2026-06-15). Parita' coi 4 servizi core (brain/mcp-core/
+# ADR 0028 livello 3 (2026-06-15). Parita' coi servizi core (mcp-core/
 # gateway/web-ide): la VM WSL sospesa manda SIGTERM ai processi -> il servizio
 # esce graceful (exit 0) e, girando solo come nohup di deploy-local.sh, NON
 # ripartiva. Sotto PID 1 con Restart=always riparte da solo, immune alla caduta
 # del manager systemd --user (che cade su exit.target alla chiusura della
-# sessione logind in WSL, linger inefficace). Vedi nexus-brain-system.service.
+# sessione logind in WSL, linger inefficace). Vedi nexus-mcp-core-system.service per il razionale.
 #
 # PORTA (regola G): chat-service legge la porta ESCLUSIVAMENTE dal DB via
 # nexus_auth::resolve_port(&db, "chat_service_port") (settings, default 4020,
@@ -16,9 +16,9 @@
 # da deploy-local.sh e dall'installer a ogni build): la unit esegue sempre
 # l'ultima build debug.
 #
-# After=nexus-mcp-core: il chat-service dipende da mcp-core (core_url) e dal
-# brain via mcp-core. La dipendenza dal DB Postgres e' coperta dal retry-loop
-# interno di resolve_port (5x5s) + Restart=always come safety net al boot.
+# After=nexus-mcp-core: il chat-service dipende da mcp-core (core_url). La
+# dipendenza dal DB Postgres e' coperta dal retry-loop interno di resolve_port
+# (5x5s) + Restart=always come safety net al boot.
 #
 # Installata da deploy/install-system-units.sh (sostituisce __USER__/__UID__).
 

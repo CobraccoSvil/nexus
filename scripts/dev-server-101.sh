@@ -77,7 +77,6 @@ load_env() {
 
   export DATABASE_URL="${DATABASE_URL:-}"
   export REDIS_URL="${REDIS_URL:-}"
-  export NEURAL_CORE_URL="${NEURAL_CORE_URL:-http://localhost:50051}"
   export QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
   export RUST_LOG="${RUST_LOG:-info}"
   export FRONTEND_URL="${FRONTEND_URL:-http://localhost:3000}"
@@ -89,7 +88,6 @@ ensure_infra() {
 }
 
 stop_backend() {
-  pkill -f "brain.grpc_server.main" 2>/dev/null || true
   pkill -f "$MCP_BIN" 2>/dev/null || true
   pkill -f "./target/release/mcp-core" 2>/dev/null || true
   pkill -f "target/release/mcp-core" 2>/dev/null || true
@@ -119,8 +117,6 @@ restart_backend() {
   fi
 
   cd "$PROJECT_DIR"
-  nohup python3 -m brain.grpc_server.main --rest > "$LOG_DIR/neural.log" 2>&1 &
-  sleep 5
   nohup "$MCP_BIN" > "$LOG_DIR/mcp.log" 2>&1 &
   sleep 3
   verify_deploy

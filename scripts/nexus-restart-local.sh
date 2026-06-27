@@ -29,7 +29,7 @@ log "Stop processi Nexus"
 # (target/debug). Il vecchio server Node (apps/nexus-gateway/dist/server.js)
 # e' stato eliminato; manteniamo solo il pattern Rust nello stop.
 for x in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp \
-  brain.grpc_server.main target/debug/nexus-gateway target/release/nexus-gateway "pnpm.*web-ide"; do
+  target/debug/nexus-gateway target/release/nexus-gateway "pnpm.*web-ide"; do
   stop "$x"
 done
 pkill -f "next-server" 2>/dev/null || true
@@ -41,11 +41,6 @@ cargo build --release -p mcp-core
 
 log "Build nexus-gateway release (Rust)"
 cargo build --release -p nexus-gateway --bin nexus-gateway
-
-log "Neural Core"
-setsid nohup env DATABASE_URL="$DATABASE_URL" NEXUS_BRAIN_BILLING="${NEXUS_BRAIN_BILLING:-off}" \
-  python3 -m brain.grpc_server.main --rest > /tmp/nexus-neural.log 2>&1 < /dev/null &
-sleep 5
 
 GW_PORT="${NEXUS_GATEWAY_PORT:-4060}"
 log "Nexus Gateway :${GW_PORT} (Rust)"

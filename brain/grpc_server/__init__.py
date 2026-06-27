@@ -1,2 +1,0 @@
-"""Neural core HTTP bootstrap."""
-

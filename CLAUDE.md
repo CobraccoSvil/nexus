@@ -12,7 +12,7 @@ Questo file raccoglie le direttive vincolanti per qualunque agente (umano o AI) 
 ## B. Build verification (direttiva #9)
 
 - Dopo ogni modifica non banale eseguire `pnpm verify` (orchestratore: `scripts/verify.sh`).
-- `pnpm verify` esegue: `turbo run typecheck lint test` + `cargo check --workspace` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace --no-fail-fast` + `pytest brain/tests` (suite Python auto-contenuta, skip esplicito con `VERIFY_SKIP_PY=1`).
+- `pnpm verify` esegue: `turbo run typecheck lint test` + `cargo check --workspace` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace --no-fail-fast`.
 - Un commit che rompe `pnpm verify` non può essere unito in `main`. L'hook `lefthook` pre-commit lo blocca localmente.
 - CI: `.github/workflows/verify.yml` esegue lo stesso gate su ogni push/PR.
 

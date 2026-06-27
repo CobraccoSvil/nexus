@@ -1,7 +1,6 @@
 [Unit]
 Description=IDEAI Core Platform (:4000)
-After=network.target postgresql.service redis.service nexus-neural.service
-Wants=nexus-neural.service
+After=network.target postgresql.service redis.service
 
 [Service]
 Type=simple

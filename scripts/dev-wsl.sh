@@ -40,7 +40,6 @@ cmd_stop() {
     pkill -f "doc-service"     2>/dev/null || true
     pkill -f "billing-service" 2>/dev/null || true
     pkill -f "plugin-service"  2>/dev/null || true
-    pkill -f "brain.grpc_server" 2>/dev/null || true
     pkill -f "next-server"     2>/dev/null || true
     pkill -f "next dev"        2>/dev/null || true
     pkill -f "tsx.*server.ts"  2>/dev/null || true
@@ -145,15 +144,6 @@ fi
 info "Build Rust (debug)..."
 cargo build --workspace 2>&1 | tail -5
 RUST_BIN="./target/debug"
-
-# ── Neural Core (Python) ───────────────────────────────────────────────────────
-info "Avvio Neural Core (Python, :8001 + gRPC :50051)..."
-pkill -f "brain.grpc_server" 2>/dev/null || true
-nohup python3 -m brain.grpc_server.main --rest \
-    > "$LOG_DIR/neural.log" 2>&1 &
-NEURAL_PID=$!
-echo $NEURAL_PID > "$LOG_DIR/neural.pid"
-sleep 4
 
 # ── Microservizi Rust ──────────────────────────────────────────────────────────
 start_rust_svc() {

@@ -1,6 +1,6 @@
 [Unit]
 Description=IDEAI Document Service (:4030)
-After=network.target postgresql.service nexus-neural.service nexus-core.service
+After=network.target postgresql.service nexus-core.service
 
 [Service]
 Type=simple

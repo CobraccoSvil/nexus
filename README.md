@@ -19,13 +19,12 @@ Enterprise monorepo scaffold for an AI-assisted development platform with:
 
 ## Quick start
 
-1. Install Node.js 20+, pnpm 9+, Python 3.11+, Rust 1.75+, and `protoc`.
+1. Install Node.js 20+, pnpm 9+, Rust 1.75+, and `protoc`.
 2. Copy `.env.example` to `.env` and adjust values.
 3. Run `pnpm install`.
 4. Run `docker compose -f deploy/docker-compose.yml up -d postgres redis qdrant shadow-db`.
 5. Start the Web IDE with `pnpm --filter @ai-orchestrator/web-ide dev`.
-6. Start the neural core with `python -m brain.grpc_server.main`.
-7. Build and run the Rust core with Cargo once Rust is installed.
+6. Build and run the Rust core with Cargo once Rust is installed.
 
 ## Database backups (WSL/dev)
 

@@ -1,21 +1,20 @@
 # nexus-mcp-core.service — mcp-core di Nexus come unit systemd --SYSTEM.
 #
-# ADR 0028 livello 3 (2026-06-12). Vedi nexus-brain-system.service per il
-# razionale completo: il manager systemd --user cade su exit.target quando la
-# sessione WSL si chiude (linger inefficace), uccidendo mcp-core durante una
-# chat. PID 1 (--system) e' stabile come i container Docker.
+# ADR 0028 livello 3 (2026-06-12). Razionale: il manager systemd --user cade su
+# exit.target quando la sessione WSL si chiude (linger inefficace), uccidendo
+# mcp-core durante una chat. PID 1 (--system) e' stabile come i container Docker.
 #
 # ExecStart usa il symlink stabile target/nexus-current/mcp-core (aggiornato da
 # deploy-local.sh a ogni build): la unit esegue sempre l'ultima build.
 # TimeoutStopSec=15 e' il safety net sopra il force-exit interno 10s
 # (fix shutdown-hang, main.rs).
 #
-# After=nexus-brain: mcp-core attende il brain (gRPC 50051). Non avendo Docker
-# un docker.service (Docker Desktop -> container come .scope), la dipendenza dal
-# DB Postgres e' coperta dal retry-loop interno (RoutingMatrixCache 5x5s) +
-# Restart=always come safety net se il DB non e' ancora pronto al boot.
+# Non avendo Docker un docker.service (Docker Desktop -> container come .scope),
+# la dipendenza dal DB Postgres e' coperta dal retry-loop interno
+# (RoutingMatrixCache 5x5s) + Restart=always come safety net se il DB non e'
+# ancora pronto al boot.
 #
-# Restart=always (vedi nexus-brain-system.service per il razionale): la VM WSL
+# Restart=always: la VM WSL
 # sospesa manda SIGTERM ai processi -> exit 0 graceful -> on-failure NON
 # riavviava. always riavvia anche su exit 0, lasciando intatti i `systemctl
 # stop/restart` del deploy. StartLimit: max 5 riavvii in 60s contro crash-loop.
@@ -28,8 +27,8 @@
 
 [Unit]
 Description=Nexus mcp-core (routing AI, agent runner, ToolRunner gRPC) [system-level, ADR 0028 L3]
-After=network-online.target nexus-brain.service
-Wants=network-online.target nexus-brain.service
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
 

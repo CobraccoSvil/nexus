@@ -9,7 +9,6 @@ on:
   pull_request:
     paths:
       - "crates/mcp-core/**"
-      - "brain/**"
       - "apps/web-ide/**"
       - "tests/**"
       - "db/migrations/**"

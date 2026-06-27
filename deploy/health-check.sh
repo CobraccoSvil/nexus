@@ -4,7 +4,7 @@
 # Verifica:
 #   1. SSH a PROD_HOST e PROXY_HOST raggiungibili
 #   2. systemd units active su PROD_HOST
-#   3. Porte applicative aperte su PROD_HOST (3000, 4000, 4010, 4020, 8001, 50051)
+#   3. Porte applicative aperte su PROD_HOST (3000, 4000, 4010, 4020)
 #   4. Endpoint interno /health su PROD_HOST -> 200
 #   5. Log core/webide ultimi 100 righe senza ERROR/panic
 #   6. Endpoint pubblico PUBLIC_URL/health attraverso .03 -> 200
@@ -61,7 +61,7 @@ if [ "$EXTERNAL_ONLY" != "1" ]; then
 
 # === 2. systemd units ========================================================
 log "systemd units su $PROD_HOST"
-for unit in nexus-neural nexus-core nexus-webide; do
+for unit in nexus-core nexus-webide; do
     check "$unit active" \
         remote_exec_quiet "$PROD_HOST" "systemctl is-active --quiet $unit"
 done
@@ -78,8 +78,6 @@ done
 log "Porte applicative su $PROD_HOST"
 check "Porta 3000 (web-ide)"      remote_exec_quiet "$PROD_HOST" "ss -tln 'sport = :3000' | grep -q :3000"
 check "Porta 4000 (mcp-core)"     remote_exec_quiet "$PROD_HOST" "ss -tln 'sport = :4000' | grep -q :4000"
-check "Porta 8001 (brain REST)"   remote_exec_quiet "$PROD_HOST" "ss -tln 'sport = :8001' | grep -q :8001"
-check "Porta 50051 (brain gRPC)"  remote_exec_quiet "$PROD_HOST" "ss -tln 'sport = :50051' | grep -q :50051"
 check "Porta 80 (nginx interno)"  remote_exec_quiet "$PROD_HOST" "ss -tln 'sport = :80' | grep -q :80"
 
 # === 4. Health interno =======================================================
@@ -91,7 +89,7 @@ check "curl http://127.0.0.1:3000/" \
 
 # === 5. Log scan =============================================================
 log "Scan log applicativi (ultime 100 righe)"
-for log_file in core.log webide.log neural.log; do
+for log_file in core.log webide.log; do
     if remote_exec_quiet "$PROD_HOST" "test -f /var/log/ideai/$log_file"; then
         check "$log_file senza ERROR/panic" \
             remote_exec_quiet "$PROD_HOST" \

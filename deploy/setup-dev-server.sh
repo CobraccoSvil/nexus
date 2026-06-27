@@ -153,7 +153,6 @@ cat > "$PROJECT_DIR/.env" << 'ENVEOF'
 # AI-Orchestrator v2 — Environment
 DATABASE_URL=postgres://orchestrator:orchestrator_dev_2024@localhost:5432/nexus
 REDIS_URL=redis://localhost:6379
-NEURAL_CORE_URL=http://localhost:50051
 QDRANT_URL=http://localhost:6333
 RUST_LOG=info
 
@@ -170,12 +169,7 @@ cat > "$PROJECT_DIR/start-all.sh" << 'STARTEOF'
 set -e
 cd "$(dirname "$0")"
 source .env
-export DATABASE_URL REDIS_URL NEURAL_CORE_URL QDRANT_URL RUST_LOG
-
-echo "Avvio Neural Core (Python gRPC + REST)..."
-python3.12 -m brain.grpc_server.main --rest &
-NEURAL_PID=$!
-sleep 2
+export DATABASE_URL REDIS_URL QDRANT_URL RUST_LOG
 
 echo "Avvio MCP Server Core (Rust :4000)..."
 cargo run -p mcp-core --release &
@@ -190,11 +184,9 @@ echo ""
 echo "=== Servizi avviati ==="
 echo "  Web IDE:      http://localhost:3000"
 echo "  MCP Core:     http://localhost:4000/api/health"
-echo "  Neural REST:  http://localhost:8001/health"
-echo "  Neural gRPC:  localhost:50051"
 echo ""
-echo "PID: Neural=$NEURAL_PID Rust=$RUST_PID Web=$WEB_PID"
-echo "Per fermare: kill $NEURAL_PID $RUST_PID $WEB_PID"
+echo "PID: Rust=$RUST_PID Web=$WEB_PID"
+echo "Per fermare: kill $RUST_PID $WEB_PID"
 wait
 STARTEOF
 chmod +x "$PROJECT_DIR/start-all.sh"
@@ -211,25 +203,22 @@ echo " 1. Clona il repo nella directory del progetto:"
 echo "    cd $PROJECT_DIR"
 echo "    git clone <repo-url> ."
 echo ""
-echo " 2. Installa dipendenze Python:"
-echo "    pip install sentence-transformers qdrant-client openai anthropic google-generativeai grpcio grpcio-tools protobuf fastapi uvicorn httpx numpy tiktoken"
-echo ""
-echo " 3. Installa dipendenze Node:"
+echo " 2. Installa dipendenze Node:"
 echo "    pnpm install"
 echo ""
-echo " 4. Compila il progetto Rust:"
+echo " 3. Compila il progetto Rust:"
 echo "    source ~/.cargo/env"
 echo "    cargo build --workspace"
 echo ""
-echo " 5. Esegui le migrazioni DB:"
+echo " 4. Esegui le migrazioni DB:"
 echo "    cargo run -p mcp-core  (le esegue automaticamente al primo avvio)"
 echo ""
-echo " 6. Configura le API key in $PROJECT_DIR/.env"
+echo " 5. Configura le API key in $PROJECT_DIR/.env"
 echo ""
-echo " 7. Avvia tutto:"
+echo " 6. Avvia tutto:"
 echo "    cd $PROJECT_DIR && ./start-all.sh"
 echo ""
-echo " 8. Avvia Claude Code:"
+echo " 7. Avvia Claude Code:"
 echo "    cd $PROJECT_DIR && claude"
 echo ""
 echo " Servizi disponibili:"

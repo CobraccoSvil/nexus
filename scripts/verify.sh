@@ -6,7 +6,6 @@
 #   2. cargo check workspace
 #   3. cargo clippy workspace con -D warnings
 #   4. cargo test workspace (no fail-fast)
-#   5. pytest brain (suite Python, auto-contenuta: nessun DB richiesto)
 #
 # Utilizzato sia dall'hook pre-commit (lefthook) sia dalla CI.
 # Uscita non-zero se qualunque fase fallisce. Stampa il nome della fase fallita.
@@ -33,7 +32,6 @@ run_phase() {
 
 SKIP_RUST="${VERIFY_SKIP_RUST:-0}"
 SKIP_TS="${VERIFY_SKIP_TS:-0}"
-SKIP_PY="${VERIFY_SKIP_PY:-0}"
 
 if [[ "$SKIP_TS" != "1" ]]; then
     run_phase "turbo typecheck+lint+test" pnpm exec turbo run typecheck lint test --continue
@@ -48,18 +46,6 @@ if [[ "$SKIP_RUST" != "1" ]]; then
     run_phase "cargo test --workspace --no-fail-fast" cargo test --workspace --no-fail-fast
 else
     echo "-- verify: Rust saltato (VERIFY_SKIP_RUST=1)"
-fi
-
-# Suite pytest del brain. Storicamente NON coperta dal gate: 9 test sono
-# marciti per settimane senza che nessuno se ne accorgesse (audit 11/06/2026).
-# -o addopts="" neutralizza il coverage gate di brain/pyproject.toml (pensato
-# per run dentro brain/, non dal root). Niente skip silenzioso se pytest
-# manca: fallire forte e' il punto di questa fase.
-if [[ "$SKIP_PY" != "1" ]]; then
-    run_phase "pytest brain" \
-        env PYTHONPATH="$ROOT_DIR" python3 -m pytest -o addopts="" brain/tests -q
-else
-    echo "-- verify: Python saltato (VERIFY_SKIP_PY=1)"
 fi
 
 # Gate ratchet configurazioni: settings morte/fantasma/invisibili possono solo

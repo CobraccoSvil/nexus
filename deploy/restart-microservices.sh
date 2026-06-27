@@ -9,7 +9,7 @@ export PATH=/home/administrator/.local/bin:/home/administrator/.cargo/bin:/usr/l
 export HOME=/home/administrator
 cd /opt/ai-orchestrator
 source .env
-export DATABASE_URL REDIS_URL NEURAL_CORE_URL QDRANT_URL RUST_LOG FRONTEND_URL
+export DATABASE_URL REDIS_URL QDRANT_URL RUST_LOG FRONTEND_URL
 
 SERVICE="${1:-all}"
 
@@ -36,7 +36,6 @@ start_service() {
 
 if [ "$SERVICE" = "all" ]; then
     echo "=== Stopping all services ==="
-    stop_service "brain.grpc_server"
     stop_service "mcp-core"
     stop_service "admin-service"
     stop_service "chat-service"
@@ -45,11 +44,6 @@ if [ "$SERVICE" = "all" ]; then
     stop_service "plugin-service"
     stop_service "next-server"
     sleep 2
-
-    echo "=== Starting Neural Core ==="
-    nohup python3 -m brain.grpc_server.main --rest > /tmp/neural.log 2>&1 &
-    echo "  PID: $!"
-    sleep 5
 
     echo "=== Starting Core Platform ==="
     start_service "mcp-core"
@@ -77,7 +71,7 @@ fi
 
 echo ""
 echo "=== Active Ports ==="
-ss -tlnp | grep -E '3000|4000|4010|4020|4030|4040|4050|8001|50051' || true
+ss -tlnp | grep -E '3000|4000|4010|4020|4030|4040|4050' || true
 echo ""
 echo "=== Health Checks ==="
 for port in 4000 4010 4020 4030 4040 4050; do

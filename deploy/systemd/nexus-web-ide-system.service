@@ -1,6 +1,6 @@
 # nexus-web-ide.service — Frontend Next.js di Nexus come unit systemd --SYSTEM.
 #
-# ADR 0028 livello 3 (2026-06-12). Vedi nexus-brain-system.service per il
+# ADR 0028 livello 3 (2026-06-12). Vedi nexus-mcp-core-system.service per il
 # razionale: i servizi --user cadono con la sessione WSL (exit.target). Il
 # web-ide era avviato da deploy-local.sh con setsid nohup (processo nudo) ->
 # stessa fragilita'. Qui passa sotto PID 1.
@@ -26,10 +26,10 @@ Group=__USER__
 # deploy-local.sh (node apps/web-ide/server.js lanciato da ROOT).
 WorkingDirectory=/home/__USER__/ideai
 # .env serve per DATABASE_URL: il web-ide risolve la propria porta dal DB
-# (regola G, niente default hardcoded). Stessa fonte di brain/mcp-core.
+# (regola G, niente default hardcoded). Stessa fonte di mcp-core.
 EnvironmentFile=-/home/__USER__/ideai/.env
 Environment=NODE_ENV=production
-# Restart=always (vedi nexus-brain-system.service per il razionale): copre
+# Restart=always (vedi nexus-mcp-core-system.service per il razionale): copre
 # l'exit 0 da SIGTERM esterno (VM WSL sospesa/congelata), che on-failure
 # ignorava lasciando il frontend giu' al risveglio. StartLimit: 5 riavvii/60s.
 ExecStart=/usr/bin/node /home/__USER__/ideai/apps/web-ide/server.js

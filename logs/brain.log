@@ -1,9 +1,0 @@
-2026-04-22 06:01:21,663 INFO __main__: Startup key reload: {'status': 'error', 'updated': [], 'errors': ['DATABASE_URL not set']}
-2026-04-22 06:01:21,664 INFO __main__: FastAPI HTTP server avviato su porta 8001
-2026-04-22 06:01:22,035 INFO brain.grpc_server.neural_service: Neural Core gRPC server listening on port 50051 (max msg 128 MB)
-INFO:     Started server process [5261]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8001): address already in use
-INFO:     Waiting for application shutdown.
-INFO:     Application shutdown complete.

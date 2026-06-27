@@ -29,7 +29,7 @@ fi
 # nell'ambiente sbagliato (incidente 2026-06-10: 10 unit prod abilitate in
 # --user locale, una in failed). Le unit prod restano gestite da
 # bootstrap-prod/deploy-prod.
-LOCAL_UNITS=(nexus-brain.service nexus-mcp-core.service)
+LOCAL_UNITS=(nexus-mcp-core.service)
 
 units=()
 for n in "${LOCAL_UNITS[@]}"; do
@@ -71,12 +71,7 @@ for src in "${units[@]}"; do
     # della unit stessa (non un legacy): killarlo innescherebbe Restart= +
     # restart dell'installer in race. In quel caso si salta direttamente al
     # restart finale.
-    case "$name" in
-        brain)
-            legacy_pattern='brain\.grpc_server\.main' ;;
-        *)
-            legacy_pattern="target/(debug|release)/${name}([[:space:]]|\$)" ;;
-    esac
+    legacy_pattern="target/(debug|release)/${name}([[:space:]]|\$)"
     if [ "$(systemctl --user is-active "$unit" 2>/dev/null)" != "active" ] \
         && pgrep -f "$legacy_pattern" >/dev/null 2>&1; then
         echo "==> ${name}: fermo il processo legacy (nohup) per la transizione..."

@@ -8,7 +8,7 @@
 #   4. Postgres 16 + Redis 7 (apt) + Qdrant (Docker singolo container)
 #   5. Setup DB nexus + nexus_shadow
 #   6. Genera /opt/ideai/.env (JWT_SECRET random + prompt API keys)
-#   7. Build iniziale Rust + Node + Python (delegato a deploy-prod.sh --all --first-build)
+#   7. Build iniziale Rust + Node (delegato a deploy-prod.sh --all --first-build)
 #   8. Patch nginx-microservices.conf con set_real_ip_from $PROXY_HOST
 #   9. Enable systemd units
 #   10. Smoke test interno
@@ -156,7 +156,6 @@ SHADOW_POSTGRES_URL=postgres://postgres_app:$DB_PASSWORD@localhost:5432/nexus_sh
 REDIS_URL=redis://localhost:6379
 QDRANT_URL=http://localhost:6334
 MCP_SERVER_PORT=4000
-NEURAL_CORE_URL=http://127.0.0.1:50051
 WEB_APP_PORT=3000
 ADMIN_SERVICE_PORT=4010
 CHAT_SERVICE_PORT=4020
@@ -182,7 +181,7 @@ ENV
 fi
 
 # === Step 7: Build iniziale ====================================================
-step 7 10 "Build iniziale (Rust + Node + Python)"
+step 7 10 "Build iniziale (Rust + Node)"
 
 if [ "$SKIP_BUILD" = "1" ]; then
     warn "  --skip-build: salto build (eseguire 'make deploy' dopo)"
@@ -199,9 +198,6 @@ else
         echo '  pnpm install + build web-ide...'
         pnpm install --frozen-lockfile --silent 2>&1 | tail -3
         pnpm --filter @ai-orchestrator/web-ide build 2>&1 | tail -5
-
-        echo '  pip install brain...'
-        ${DEPLOY_DIR}/.venv/bin/pip install -q -e 'brain[all]' 2>&1 | tail -3 || true
     "
     info "  OK  Build completato"
 fi
@@ -222,7 +218,7 @@ step 9 10 "systemd enable + start"
 
 remote_exec "$PROD_HOST" "
     sudo systemctl daemon-reload
-    for unit in nexus-neural nexus-core nexus-webide; do
+    for unit in nexus-core nexus-webide; do
         sudo systemctl enable --now \$unit
     done
     # Microservizi opzionali (best-effort, alcuni non sono ancora attivi)

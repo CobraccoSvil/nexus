@@ -6,7 +6,7 @@
 #   2. Acquisisci lock su PROD_HOST
 #   3. Sync sorgenti via git archive
 #   4. Backup binari correnti in bin/.previous/
-#   5. Build selettivo (Rust / web-ide / brain / nexus-gateway)
+#   5. Build selettivo (Rust / web-ide / nexus-gateway)
 #   6. Restart systemd selettivo
 #   7. Health check -- se fallisce: rollback binari + restart
 #   8. Log a /var/log/ideai/deploy.log
@@ -14,7 +14,6 @@
 # Flag (cumulabili):
 #   --rust       Rebuild Rust (mcp-core + microservizi)
 #   --web        Rebuild web-ide (Next.js)
-#   --brain      Pip install brain (Python)
 #   --gateway    Rebuild nexus-gateway (Rust)
 #   --all        Tutti i precedenti
 #
@@ -34,7 +33,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Flag defaults
 BUILD_RUST=0
 BUILD_WEB=0
-BUILD_BRAIN=0
 BUILD_GATEWAY=0
 SKIP_BUILD=0
 SKIP_HEALTH=0
@@ -45,9 +43,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --rust)         BUILD_RUST=1 ;;
         --web)          BUILD_WEB=1 ;;
-        --brain)        BUILD_BRAIN=1 ;;
         --gateway)      BUILD_GATEWAY=1 ;;
-        --all)          BUILD_RUST=1; BUILD_WEB=1; BUILD_BRAIN=1; BUILD_GATEWAY=1 ;;
+        --all)          BUILD_RUST=1; BUILD_WEB=1; BUILD_GATEWAY=1 ;;
         --no-build)     SKIP_BUILD=1 ;;
         --no-health)    SKIP_HEALTH=1 ;;
         --allow-dirty)  export ALLOW_DIRTY=1 ;;
@@ -64,8 +61,8 @@ done
 # Default: --all se nessun flag specificato
 if [ "$SKIP_BUILD" -eq 0 ] \
    && [ "$BUILD_RUST" -eq 0 ] && [ "$BUILD_WEB" -eq 0 ] \
-   && [ "$BUILD_BRAIN" -eq 0 ] && [ "$BUILD_GATEWAY" -eq 0 ]; then
-    BUILD_RUST=1; BUILD_WEB=1; BUILD_BRAIN=1; BUILD_GATEWAY=1
+   && [ "$BUILD_GATEWAY" -eq 0 ]; then
+    BUILD_RUST=1; BUILD_WEB=1; BUILD_GATEWAY=1
 fi
 
 print_header "Deploy Nexus -> $PROD_HOST (branch: $BRANCH)"
@@ -94,7 +91,6 @@ fi
 # Flag remoti
 R_RUST=$BUILD_RUST
 R_WEB=$BUILD_WEB
-R_BRAIN=$BUILD_BRAIN
 R_GATEWAY=$BUILD_GATEWAY
 R_SKIP_BUILD=$SKIP_BUILD
 
@@ -102,7 +98,6 @@ R_SKIP_BUILD=$SKIP_BUILD
 units_to_restart=""
 [ "$BUILD_RUST" -eq 1 ] && units_to_restart="$units_to_restart nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins"
 [ "$BUILD_WEB" -eq 1 ]  && units_to_restart="$units_to_restart nexus-webide"
-[ "$BUILD_BRAIN" -eq 1 ] && units_to_restart="$units_to_restart nexus-neural"
 [ "$BUILD_GATEWAY" -eq 1 ] && units_to_restart="$units_to_restart nexus-gateway"
 
 log "Acquisisco lock $LOCKFILE su $PROD_HOST"
@@ -114,7 +109,6 @@ DEPLOY_DIR="__DEPLOY_DIR__"
 COMMIT="__COMMIT__"
 R_RUST=__R_RUST__
 R_WEB=__R_WEB__
-R_BRAIN=__R_BRAIN__
 R_GATEWAY=__R_GATEWAY__
 R_SKIP_BUILD=__R_SKIP_BUILD__
 UNITS_TO_RESTART="__UNITS__"
@@ -160,12 +154,6 @@ if [ "$R_GATEWAY" -eq 1 ] && [ "$R_SKIP_BUILD" -eq 0 ]; then
     cp -f target/release/nexus-gateway bin/
 fi
 
-# === Build Brain (Python) ===
-if [ "$R_BRAIN" -eq 1 ] && [ "$R_SKIP_BUILD" -eq 0 ]; then
-    echo "[build] pip install -e brain[all] ..."
-    "$DEPLOY_DIR/.venv/bin/pip" install -q -e 'brain[all]' 2>&1 | tail -3 || true
-fi
-
 # === Restart systemd ===
 echo "[restart] units: $UNITS_TO_RESTART"
 for unit in $UNITS_TO_RESTART; do
@@ -177,7 +165,7 @@ done
 
 # === Log deploy ===
 sudo mkdir -p /var/log/ideai
-echo "$(date -u +%FT%TZ) commit=$COMMIT rust=$R_RUST web=$R_WEB brain=$R_BRAIN gateway=$R_GATEWAY units=\"$UNITS_TO_RESTART\"" \
+echo "$(date -u +%FT%TZ) commit=$COMMIT rust=$R_RUST web=$R_WEB gateway=$R_GATEWAY units=\"$UNITS_TO_RESTART\"" \
     | sudo tee -a /var/log/ideai/deploy.log >/dev/null
 
 echo "[done] deploy commit=$COMMIT in $(( $(date +%s) - BUILD_START ))s"
@@ -188,7 +176,6 @@ REMOTE_SCRIPT="${REMOTE_SCRIPT//__DEPLOY_DIR__/$DEPLOY_DIR}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__COMMIT__/$COMMIT}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__R_RUST__/$R_RUST}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__R_WEB__/$R_WEB}"
-REMOTE_SCRIPT="${REMOTE_SCRIPT//__R_BRAIN__/$R_BRAIN}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__R_GATEWAY__/$R_GATEWAY}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__R_SKIP_BUILD__/$R_SKIP_BUILD}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__UNITS__/$units_to_restart}"

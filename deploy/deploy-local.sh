@@ -4,7 +4,7 @@
 #
 #   --rust              build + restart solo backend Rust
 #   --web               build + restart solo web-ide (Next.js)
-#   --service <nome>    restart solo il servizio indicato (es. mcp-core, brain, nexus-gateway, web-ide)
+#   --service <nome>    restart solo il servizio indicato (es. mcp-core, nexus-gateway, web-ide)
 #   --menu              mostra menu interattivo per scegliere il servizio
 #                       (equivalente a --service senza nome)
 #   --debug             (DEFAULT su WSL) compila Rust in debug: stacktrace completi,
@@ -71,12 +71,10 @@ DEBUG_BUILD=true
 # Formato: nome|kind|descrizione
 #   kind = rust       → binario Rust in target/{release,debug}, gestito da start_service()
 #          web-ide    → Next.js, build + start_webide()
-#          brain      → Python module brain.grpc_server.main
 #          gateway    → Node.js dist/server.js con env var aggiuntive
 #          builtin    → microservizi Rust comuni (admin/chat/billing/...)
 SERVICES_CATALOG=(
     "mcp-core|rust|Routing AI, agent runner, ToolRunner gRPC (porta 4000)"
-    "brain|brain|Neural Core Python: classifier, agenti LangGraph, embeddings (porta 8001)"
     "web-ide|web-ide|Frontend Next.js (porta 3000)"
     "nexus-gateway|gateway|API gateway LLM (porta 4060) — Node.js"
     "admin-service|builtin|Backend admin UI (porta 4010)"
@@ -95,7 +93,7 @@ _detect_win_worktree() {
         "/mnt/d/Sviluppo/IDEAI"
     )
     for c in "${candidates[@]}"; do
-        if [ -d "$c/crates" ] && [ -d "$c/brain" ]; then
+        if [ -d "$c/crates" ]; then
             WIN_WORKTREE="$c"
             return
         fi
@@ -313,47 +311,6 @@ start_service_with_env() {
     fi
 }
 
-# Unit systemd --user del brain (auto-restart on-failure). Se installata
-# (deploy/install-brain-unit.sh), start/stop DEVONO passare da systemctl:
-# un pkill diretto sul processo gestito dalla unit verrebbe rilanciato da
-# Restart= entro 5s, creando doppia istanza sulla porta col nohup successivo.
-_brain_unit_installed() {
-    systemctl --user cat nexus-brain.service >/dev/null 2>&1
-}
-
-stop_brain() {
-    if _brain_unit_installed; then
-        systemctl --user stop nexus-brain.service 2>/dev/null || true
-    fi
-    # Defense-in-depth: ferma anche eventuali processi nohup legacy residui
-    # (transizione pre-unit). Innocuo se la unit e' gia' stoppata.
-    _stop_pattern 'brain.grpc_server.main' 'brain'
-}
-
-start_brain() {
-    local logfile="/tmp/nexus-neural.log"
-    # ADR 0028 L3: unit --system ha la precedenza (vedi start dei servizi Rust).
-    if [ -f "/etc/systemd/system/nexus-brain.service" ]; then
-        sudo systemctl restart nexus-brain.service
-        echo "  brain via systemd --system nexus-brain.service (PID1, ADR 0028 L3) log=${logfile}"
-        return
-    fi
-    if _brain_unit_installed; then
-        systemctl --user restart nexus-brain.service
-        echo "  brain via systemd nexus-brain.service (auto-restart on-failure) log=${logfile}"
-        return
-    fi
-    setsid nohup env \
-        DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
-        HF_HUB_OFFLINE=1 \
-        TRANSFORMERS_OFFLINE=1 \
-        python3 -m brain.grpc_server.main --rest \
-        > "$logfile" 2>&1 < /dev/null &
-    local pid=$!
-    disown || true
-    echo "  brain PID=${pid} log=${logfile} (nohup legacy: installa l'auto-restart con deploy/install-brain-unit.sh)"
-}
-
 stop_gateway() {
     # Migrazione Fase 6: il gateway e' il binario Rust (nexus-gateway). Ferma il
     # Rust e pulisce eventuali residui del vecchio server Node (eliminato).
@@ -401,7 +358,7 @@ start_gateway() {
     echo "  nexus-gateway (Rust, nohup legacy: installa l'auto-restart con deploy/install-system-units.sh) log=${logfile}"
 }
 
-# Ritorna il `kind` di un servizio (rust|brain|gateway|web-ide|builtin) o
+# Ritorna il `kind` di un servizio (rust|gateway|web-ide|builtin) o
 # vuoto se il nome non e' nel catalogo.
 service_kind() {
     local name="$1"
@@ -538,10 +495,6 @@ if [ -n "$SINGLE_SERVICE" ]; then
             cargo build ${CARGO_PROFILE_FLAG} -p "$SINGLE_SERVICE" 2>&1 | tail -5
             start_service_with_env "$SINGLE_SERVICE"
             ;;
-        brain)
-            stop_brain
-            start_brain
-            ;;
         gateway)
             build_gateway
             stop_gateway
@@ -601,20 +554,15 @@ build_webide
 
 log "Arresto servizi in esecuzione..."
 # I servizi Rust si fermano con stop_service (pattern target/<profilo>/<nome>).
-# brain e gateway NON sono binari Rust: vanno fermati con le loro funzioni
-# dedicate (pattern 'brain.grpc_server.main' / 'dist/server.js'), altrimenti
-# stop_service non li matcha e restano processi orfani (doppio brain).
+# Il gateway NON e' un binario Rust standard: va fermato con la sua funzione
+# dedicata (pattern 'dist/server.js'), altrimenti stop_service non lo matcha
+# e resta un processo orfano.
 for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp; do
     stop_service "$svc"
 done
-stop_brain
 stop_gateway
 stop_webide
 sleep 2
-
-log "Avvio Neural Core (Python, porte dal DB)..."
-start_brain
-sleep 4
 
 log "Avvio Nexus Gateway (Node.js, porta dal DB)..."
 build_gateway
@@ -656,8 +604,7 @@ for entry in \
     "billing_service_port:billing-service" \
     "plugin_service_port:plugin-service" \
     "browser_bridge_port:browser-bridge" \
-    "nexus_gateway_port:nexus-gateway" \
-    "brain_rest_port:brain"; do
+    "nexus_gateway_port:nexus-gateway"; do
     key="${entry%%:*}"; name="${entry#*:}"
     port="$(_db_port "$key")"
     if [ -z "$port" ]; then

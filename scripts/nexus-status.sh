@@ -10,6 +10,5 @@ curl -sS -o /dev/null -m 5 -w "  :3000 / -> %{http_code}\n" http://localhost:300
 echo ""
 echo "=== Processi ==="
 pgrep -af "target/release/mcp-core" | head -1
-pgrep -af "brain.grpc_server" | head -1
 pgrep -af "next-server" | head -1
 pgrep -af "nexus-gateway" | head -1

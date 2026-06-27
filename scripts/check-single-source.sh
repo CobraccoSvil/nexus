@@ -23,7 +23,7 @@ fail=0
 # combaciano con ALLOWED_GLOB. Esclude le directory di build.
 assert_single() {
   local label="$1" pattern="$2" allowed="$3"; shift 3
-  local dirs=("$@"); [[ ${#dirs[@]} -eq 0 ]] && dirs=(crates brain apps packages)
+  local dirs=("$@"); [[ ${#dirs[@]} -eq 0 ]] && dirs=(crates apps packages)
   local hits bad=""
   hits="$(grep -rEl --include='*.rs' --include='*.py' --include='*.ts' --include='*.tsx' \
     --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.next \
@@ -63,54 +63,14 @@ assert_single "infer_capabilities_from_name" 'fn infer_capabilities_from_name' '
 # Wave 5 (registry default: statici nella migrazione 0325; parte dinamica unica):
 assert_single "ensure_projects_base_root" 'fn ensure_projects_base_root' 'crates/nexus-types/src/lib.rs' crates
 
-# Wave 6a + Residuo R1: get_db_url() e' il punto unico della DB URL. Niente
-# default hardcoded "postgres://..." altrove (regola G). I 28 call site con
-# psycopg2.connect convergono via questa URL.
-assert_single "get_db_url" 'def get_db_url' 'brain/utils/db_pool.py' brain
-
-# Wave 5 (perf): db_pool.connect() e' un ThreadedConnectionPool — psycopg2.connect
-# diretto fuori dal punto unico riapre una connessione TCP per chiamata (baseline
-# misurata: ~14 ms/lettura). Esclusi: brain/tests/** (fixture con DB effimeri) e
-# postgres_checkpointer.py (pool asyncpg proprio di LangGraph). Per i DSN
-# applicativi di progetto usare db_pool.connect_external.
-psycopg2_connect_hits="$(grep -rEln --include='*.py' \
-  --exclude-dir=__pycache__ \
-  -e 'psycopg2\.connect\(' brain 2>/dev/null \
-  | grep -v '^brain/tests/' \
-  | grep -v 'postgres_checkpointer\.py' \
-  | grep -v '^brain/utils/db_pool\.py' || true)"
-if [[ -n "$psycopg2_connect_hits" ]]; then
-  echo "!! single-source [psycopg2.connect]: connessione diretta fuori dal pool (brain/utils/db_pool.py):" >&2
-  printf '  %s\n' $psycopg2_connect_hits >&2
-  fail=1
-else
-  echo "OK single-source [psycopg2.connect]"
-fi
-
-# Wave 6b (cache TTL Python, paritetica a nexus-cache lato Rust):
-assert_single "TtlCache python" 'class TtlCache' 'brain/utils/ttl_cache.py' brain
-
-# Wave 6c (estrazione JSON da output LLM):
-assert_single "extract_json_block" 'def extract_json_block' 'brain/utils/json_extract.py' brain
-
-# Wave 6e (intent canonici di routing):
-assert_single "ALLOWED_INTENTS" '^ALLOWED_INTENTS' 'brain/router/intents.py' brain
-
-# Wave 8a (chunker testo, punto unico Python paritetico a rag/chunker.rs Rust):
-assert_single "python chunk_text" '^def chunk_text' 'brain/utils/text_chunk.py' brain
-
-# Wave 8b (error classifier testuale Rust, paritetico a brain error_handler):
+# Wave 8b (error classifier testuale, punto unico Rust):
 assert_single "rust classify_text" 'pub fn classify_text' 'crates/mcp-core/src/provider_error_classifier.rs' crates
-
-# Wave 8a:
-# assert_single "python chunker" 'def _?chunk_text' 'brain/utils/text_chunk.py' brain
 
 # Wave 4+5 (2026-06-11): punti unici del consolidamento E1-E6
 assert_single "walk FS nexus_tools" 'pub fn walk_project_files' 'crates/nexus-tool-kit/src/fs_scan.rs' crates
 assert_single "catalog query Postgres" 'pub fn list_catalog_rows' 'crates/nexus-tool-kit/src/db_helper.rs' crates
 assert_single "registrazione progetto" 'pub async fn register_project_records' 'crates/nexus-tool-kit/src/project_register_common.rs' crates
 assert_single "endpoint MCP server condivisi" 'pub async fn list_servers_core' 'crates/nexus-mcp-client/src/server_endpoints.rs' crates
-assert_single "coda generate provider OpenAI-compat" '^def build_generate_result' 'brain/providers/_response_parsers.py' brain
 
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2

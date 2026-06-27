@@ -485,6 +485,74 @@ async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
     }
 }
 
+/// Costruisce la [`RoutingConfig`] DB-driven (regola G): legge dal DB i campi che
+/// il brain risolve da `orchestrator_config` / `_load_g1_max_nudges` /
+/// `_load_pending_steps_config`, col PUNTO UNICO `nexus_auth::get_setting` (helper
+/// `setting_*`). Il `recursion_limit` (u32) e' letto come faceva il blocco inline.
+/// Tutti gli ALTRI campi restano al `Default` (safe-default identico ai
+/// `_SAFE_DEFAULTS` del brain: valgono SOLO se la chiave manca o il DB e'
+/// irraggiungibile, mai come magic fallback nella logica).
+async fn load_routing_config(db: &PgPool) -> RoutingConfig {
+    let d = RoutingConfig::default();
+    let recursion_limit: u32 = nexus_auth::get_setting(db, "agent.graph.recursion_limit")
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(d.recursion_limit);
+    RoutingConfig {
+        recursion_limit,
+        g1_max_nudges: setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await,
+        todo_isolation_enabled: setting_bool(db, "agent.continuous.todo_isolation_enabled", d.todo_isolation_enabled).await,
+        pending_steps_detection_enabled: setting_bool(db, "agent.closure.pending_steps_detection_enabled", d.pending_steps_detection_enabled).await,
+        pending_steps_min_items: setting_i64(db, "agent.closure.pending_steps_min_items", d.pending_steps_min_items).await,
+        final_gate_software_intents: setting_csv(db, "agent.final_gate.software_intents", d.final_gate_software_intents).await,
+        ..RoutingConfig::default()
+    }
+}
+
+/// Costruisce la [`ExecutorConfig`] DB-driven (regola G): provider/model sono
+/// RISOLTI A MONTE (passati come parametri, mai letti dal nodo); i flag/soglie
+/// anti-loop + smart-upscale + direttiva di verifica vengono letti dal DB col
+/// PUNTO UNICO `nexus_auth::get_setting` (helper `setting_*`). Gli ALTRI campi
+/// (context window, reminder, ctx_mgmt, capability risolte a monte) restano al
+/// `Default` (safe-default identico ai safe-default del brain: valgono SOLO se la
+/// chiave manca o il DB e' irraggiungibile, mai come magic fallback). Le chiavi
+/// `agent.progress_controller_enabled` / `agent.repeated_action_force_diagnose_enabled`
+/// usano l'underscore: e' la chiave reale del setting nel DB.
+async fn load_executor_config(db: &PgPool, provider: &str, model: &str) -> ExecutorConfig {
+    let d = ExecutorConfig::default();
+    ExecutorConfig {
+        routing_provider: provider.to_string(),
+        routing_model: model.to_string(),
+        g1_max_nudges: setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await,
+        progress_controller_enabled: setting_bool(db, "agent.progress_controller_enabled", d.progress_controller_enabled).await,
+        repeated_action_threshold: setting_i64(db, "agent.repeated_action_threshold", d.repeated_action_threshold).await,
+        repeated_action_force_diagnose_enabled: setting_bool(db, "agent.repeated_action_force_diagnose_enabled", d.repeated_action_force_diagnose_enabled).await,
+        reallocation_threshold: setting_i64(db, "agent.loop.resource_reallocation_threshold", d.reallocation_threshold).await,
+        upscale_enabled: setting_bool(db, "agent.upscale.enabled", d.upscale_enabled).await,
+        upscale_overhead_ratio: setting_f64(db, "agent.upscale.target_overhead_ratio", d.upscale_overhead_ratio).await,
+        verification_directive_enabled: setting_bool(db, "agent.verification_directive_enabled", d.verification_directive_enabled).await,
+        ..ExecutorConfig::default()
+    }
+}
+
+/// Costruisce la [`TodoRunnerConfig`] DB-driven (regola G): legge dal DB il kind
+/// del sub-agent e il numero massimo di retry col PUNTO UNICO
+/// `nexus_auth::get_setting` (per `todo_isolation_kind`, campo String, il pattern
+/// `get_setting().unwrap_or(default)` come `planner_prompt_key`). Gli ALTRI campi
+/// (on_failure, dag_topological_enabled, summary_max_chars) restano al `Default`
+/// (safe-default identico ai `_SAFE_DEFAULTS` del brain: valgono SOLO se la chiave
+/// manca o il DB e' irraggiungibile, mai come magic fallback nella logica).
+async fn load_todo_runner_config(db: &PgPool) -> TodoRunnerConfig {
+    let d = TodoRunnerConfig::default();
+    TodoRunnerConfig {
+        todo_isolation_kind: nexus_auth::get_setting(db, "agent.continuous.todo_isolation_kind")
+            .await
+            .unwrap_or(d.todo_isolation_kind),
+        max_retries: setting_i64(db, "agent.continuous.todo_isolation_max_retries", d.max_retries).await,
+        ..TodoRunnerConfig::default()
+    }
+}
+
 /// Ruolo del run nel motore nativo: distingue il run PRIMARIO (side-effect
 /// reali, output SSE, checkpoint persistente) dal run SHADOW (read-only).
 ///
@@ -546,14 +614,7 @@ async fn build_native_engine(
     let db = deps.db.clone();
 
     // ── Config DB-driven (regola G) ──────────────────────────────────────────
-    let recursion_limit: u32 = nexus_auth::get_setting(&db, "agent.graph.recursion_limit")
-        .await
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or_else(|| RoutingConfig::default().recursion_limit);
-    let routing_cfg = RoutingConfig {
-        recursion_limit,
-        ..RoutingConfig::default()
-    };
+    let routing_cfg = load_routing_config(&db).await;
 
     let context_window = resolve_context_window(&db, &input.provider, &input.model).await;
 
@@ -646,11 +707,7 @@ async fn build_native_engine(
     let final_gate_cfg = load_final_gate_config(&db).await;
     let verifier_cfg = load_verifier_config(&db).await;
 
-    let exec_cfg = ExecutorConfig {
-        routing_provider: input.provider.clone(),
-        routing_model: input.model.clone(),
-        ..ExecutorConfig::default()
-    };
+    let exec_cfg = load_executor_config(&db, &input.provider, &input.model).await;
 
     let tool_dispatch_cfg = ToolDispatchConfig {
         context_window,
@@ -658,6 +715,7 @@ async fn build_native_engine(
     };
 
     let reflection_cfg = ReflectionConfig {
+        enabled: setting_bool(&db, "reflection_enabled", ReflectionConfig::default().enabled).await,
         provider: reflection_provider,
         model: reflection_model,
         ..ReflectionConfig::default()
@@ -677,7 +735,7 @@ async fn build_native_engine(
             todos.clone(),
         )),
         todo_runner: Arc::new(TodoRunnerNode::new(
-            TodoRunnerConfig::default(),
+            load_todo_runner_config(&db).await,
             todos.clone(),
             tools.clone(),
         )),

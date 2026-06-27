@@ -1,11 +1,11 @@
 # nexus-doc-service.service — doc-service di Nexus come unit systemd --SYSTEM.
 #
-# ADR 0028 livello 3 (2026-06-15). Parita' coi 4 servizi core (brain/mcp-core/
+# ADR 0028 livello 3 (2026-06-15). Parita' coi servizi core (mcp-core/
 # gateway/web-ide): la VM WSL sospesa manda SIGTERM ai processi -> il servizio
 # esce graceful (exit 0) e, girando solo come nohup di deploy-local.sh, NON
 # ripartiva. Sotto PID 1 con Restart=always riparte da solo, immune alla caduta
 # del manager systemd --user (che cade su exit.target alla chiusura della
-# sessione logind in WSL, linger inefficace). Vedi nexus-brain-system.service.
+# sessione logind in WSL, linger inefficace). Vedi nexus-mcp-core-system.service per il razionale.
 #
 # PORTA (regola G): doc-service legge la porta ESCLUSIVAMENTE dal DB via
 # nexus_auth::resolve_port(&db, "doc_service_port") (settings, default 4030,
@@ -16,9 +16,10 @@
 # da deploy-local.sh e dall'installer a ogni build): la unit esegue sempre
 # l'ultima build debug.
 #
-# After=nexus-mcp-core: il doc-service usa il brain (neural_url) per gli embedding
-# e Qdrant; condivide il DB con i servizi core. La dipendenza dal DB Postgres e'
-# coperta dal retry-loop interno di resolve_port (5x5s) + Restart=always al boot.
+# After=nexus-mcp-core: il doc-service usa mcp-core (endpoint /api/embed) per gli
+# embedding e Qdrant; condivide il DB con i servizi core. La dipendenza dal DB
+# Postgres e' coperta dal retry-loop interno di resolve_port (5x5s) +
+# Restart=always al boot.
 #
 # Installata da deploy/install-system-units.sh (sostituisce __USER__/__UID__).
 

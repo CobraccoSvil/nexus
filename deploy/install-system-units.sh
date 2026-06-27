@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ADR 0028 livello 3 — Sposta mcp-core, brain e web-ide da systemd --user a
+# ADR 0028 livello 3 — Sposta mcp-core e web-ide da systemd --user a
 # --SYSTEM (gestiti da PID 1, immuni dalla caduta del manager --user in WSL).
 #
 # Perche': in WSL il manager systemd --user (user@<UID>) raggiunge exit.target e
@@ -35,11 +35,11 @@ fi
 
 echo "==> Nexus -> systemd --system (utente=$USER_NAME uid=$USER_UID)"
 
-# 1. Disabilita le unit --user omonime (mcp-core/brain: stesso nome, scope
-#    diverso -> doppioni di porta) e ferma il web-ide legacy (nohup).
+# 1. Disabilita la unit --user omonima (mcp-core: stesso nome, scope diverso ->
+#    doppioni di porta) e ferma il web-ide legacy (nohup).
 USER_WANTS="$HOME_DIR/.config/systemd/user/default.target.wants"
-rm -f "$USER_WANTS/nexus-mcp-core.service" "$USER_WANTS/nexus-brain.service"
-runuser -l "$USER_NAME" -c "XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user stop nexus-mcp-core.service nexus-brain.service" 2>/dev/null || true
+rm -f "$USER_WANTS/nexus-mcp-core.service"
+runuser -l "$USER_NAME" -c "XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user stop nexus-mcp-core.service" 2>/dev/null || true
 pkill -f "apps/web-ide/server.js" 2>/dev/null || true
 # Ferma anche il gateway LLM avviato via nohup legacy (pre-systemd): libera la
 # 4060 per la unit systemd. Il watchdog del binario nuovo non lo rilancia; se per
@@ -49,7 +49,7 @@ pkill -x nexus-gateway 2>/dev/null || true
 echo "  unit --user disabilitate, web-ide + gateway nohup legacy fermati"
 
 # 2. Genera e installa le unit --system dei servizi CORE dai template.
-for svc in nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide; do
+for svc in nexus-mcp-core nexus-gateway nexus-web-ide; do
   src="$SRC/${svc}-system.service"
   [ -f "$src" ] || { echo "ERRORE: template mancante $src" >&2; exit 1; }
   sed -e "s/__USER__/$USER_NAME/g" -e "s/__UID__/$USER_UID/g" "$src" \
@@ -99,9 +99,9 @@ done
 # NB: i microservizi loggano su /tmp/nexus-<binario>.log (StandardOutput nelle
 #   loro unit), stessa logica root-owned 644.
 MICRO_LOGS="/tmp/nexus-chat-service.log /tmp/nexus-admin-service.log /tmp/nexus-plugin-service.log /tmp/nexus-doc-service.log /tmp/nexus-billing-service.log"
-touch /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
-chown root:root /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
-chmod 644 /tmp/nexus-neural.log /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
+touch /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
+chown root:root /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
+chmod 644 /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
 
 # 3bis. Disabilita i meccanismi di auto-restart APPLICATIVI di mcp-core: con i
 #   servizi a --system il restart e' gia' garantito da systemd (Restart=always),
@@ -113,15 +113,13 @@ docker exec -i ideai-postgres-nexus-1 psql -U nexus -d nexus -c \
   "UPDATE settings SET value='false' WHERE key IN ('agent.user_manager.autostart_enabled','agent.watchdog.enabled');" \
   >/dev/null 2>&1 && echo "  ensure_user_manager + services_watchdog disabilitati (ridondanti con --system)" || true
 
-# 4. Avvia: brain (gRPC 50051) prima, poi mcp-core, gateway e web-ide.
+# 4. Avvia: mcp-core, gateway e web-ide.
 #    Il gateway dipende da mcp-core (After=) -> parte nello stesso gruppo.
 #    I microservizi dipendono da mcp-core (After=) -> partono dopo.
 MICRO_UNITS="nexus-chat-service nexus-admin-service nexus-plugin-service nexus-doc-service nexus-billing-service"
 systemctl daemon-reload
-systemctl reset-failed nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS 2>/dev/null || true
-systemctl enable nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS >/dev/null 2>&1 || true
-systemctl start nexus-brain.service
-sleep 8
+systemctl reset-failed nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS 2>/dev/null || true
+systemctl enable nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS >/dev/null 2>&1 || true
 systemctl start nexus-mcp-core.service nexus-gateway.service nexus-web-ide.service
 sleep 5
 # Microservizi dopo mcp-core (leggono la porta dal DB, gia' pronto). Idempotente:
@@ -133,9 +131,8 @@ sleep 7
 # 5. Verifica.
 echo "==> Stato unit:"
 # shellcheck disable=SC2086
-systemctl is-active nexus-brain nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS || true
+systemctl is-active nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS || true
 echo "==> Health:"
-curl -s -o /dev/null -w "  brain(8001)=%{http_code}\n" --max-time 6 http://127.0.0.1:8001/health || true
 curl -s -o /dev/null -w "  mcp-core(4000)=%{http_code}\n" --max-time 6 http://127.0.0.1:4000/health || true
 curl -s -o /dev/null -w "  gateway(4060)=%{http_code}\n" --max-time 6 http://127.0.0.1:4060/providers || true
 curl -s -o /dev/null -w "  web-ide(3000)=%{http_code}\n" --max-time 6 http://127.0.0.1:3000/ || true
@@ -147,6 +144,6 @@ curl -s -o /dev/null -w "  doc-service(4030)=%{http_code}\n"     --max-time 6 ht
 curl -s -o /dev/null -w "  billing-service(4040)=%{http_code}\n" --max-time 6 http://127.0.0.1:4040/health || true
 
 echo
-echo "==> Fatto. Restart futuri:  sudo systemctl restart nexus-mcp-core nexus-brain nexus-gateway nexus-web-ide $MICRO_UNITS"
+echo "==> Fatto. Restart futuri:  sudo systemctl restart nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS"
 echo "==> Test di stabilita' definitivo: chiudi TUTTI i terminali WSL, attendi"
 echo "    1-2 min, poi  curl http://127.0.0.1:4000/health  deve dare 200."

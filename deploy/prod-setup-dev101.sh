@@ -17,14 +17,14 @@ echo "  IDEAI — Setup produzione su server-prod"
 echo "══════════════════════════════════════════════════"
 
 # ── 1. Struttura directory ────────────────────────────────────────────────────
-echo "[1/8] Struttura directory..."
+echo "[1/7] Struttura directory..."
 mkdir -p "${APP_PATH}"/{bin,logs,config,deploy}
 mkdir -p "${LOG_PATH}"
 chown -R "${APP_USER}:${APP_USER}" "${APP_PATH}" "${LOG_PATH}"
 echo "  ✓ ${APP_PATH} e ${LOG_PATH} pronti"
 
 # ── 2. Dipendenze sistema ─────────────────────────────────────────────────────
-echo "[2/8] Dipendenze sistema..."
+echo "[2/7] Dipendenze sistema..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
@@ -34,7 +34,7 @@ apt-get install -y -qq \
 echo "  ✓ Pacchetti installati"
 
 # ── 3. Rust ───────────────────────────────────────────────────────────────────
-echo "[3/8] Rust toolchain..."
+echo "[3/7] Rust toolchain..."
 if ! sudo -u "${APP_USER}" bash -lc "command -v cargo" &>/dev/null; then
     sudo -u "${APP_USER}" bash -c \
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet"
@@ -45,7 +45,7 @@ else
 fi
 
 # ── 4. Node.js + pnpm ─────────────────────────────────────────────────────────
-echo "[4/8] Node.js + pnpm..."
+echo "[4/7] Node.js + pnpm..."
 if ! command -v node &>/dev/null; then
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
     apt-get install -y -qq nodejs
@@ -55,22 +55,8 @@ if ! command -v pnpm &>/dev/null; then
 fi
 echo "  ✓ Node $(node --version), pnpm $(pnpm --version)"
 
-# ── 5. Python venv per Neural Core ────────────────────────────────────────────
-echo "[5/8] Python venv per Neural Core..."
-VENV="${APP_PATH}/.venv"
-if [ ! -d "$VENV" ]; then
-    sudo -u "${APP_USER}" python3 -m venv "$VENV"
-fi
-if [ -f "${APP_PATH}/brain/pyproject.toml" ]; then
-    sudo -u "${APP_USER}" bash -c "${VENV}/bin/pip install -q --upgrade pip && \
-        ${VENV}/bin/pip install -q -e '${APP_PATH}/brain[all]'"
-    echo "  ✓ Dipendenze Python installate"
-else
-    echo "  ⚠ brain/pyproject.toml non trovato — installa le dep manualmente dopo il deploy"
-fi
-
-# ── 6. Systemd units ──────────────────────────────────────────────────────────
-echo "[6/8] Systemd units..."
+# ── 5. Systemd units ──────────────────────────────────────────────────────────
+echo "[5/7] Systemd units..."
 
 install_unit() {
     local name="$1"
@@ -86,11 +72,11 @@ install_unit() {
 
 # Copia units dalla directory deploy (sincronizzate con il codice)
 if [ -d "${APP_PATH}/deploy/systemd" ]; then
-    for unit in nexus-neural nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins nexus-webide; do
+    for unit in nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins nexus-webide; do
         install_unit "$unit"
     done
     systemctl daemon-reload
-    for unit in nexus-neural nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins nexus-webide; do
+    for unit in nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins nexus-webide; do
         systemctl enable "$unit" 2>/dev/null || true
     done
     echo "  ✓ Tutte le units installate e abilitate"
@@ -98,8 +84,8 @@ else
     echo "  ⚠ deploy/systemd non trovato — esegui prima deploy-server-prod.sh"
 fi
 
-# ── 7. Nginx ──────────────────────────────────────────────────────────────────
-echo "[7/8] Nginx..."
+# ── 6. Nginx ──────────────────────────────────────────────────────────────────
+echo "[6/7] Nginx..."
 NGINX_CONF="/etc/nginx/sites-available/ideai"
 cp "${APP_PATH}/deploy/nginx-microservices.conf" "$NGINX_CONF" 2>/dev/null || \
     cp "${APP_PATH}/deploy/nginx-prod.conf"       "$NGINX_CONF" 2>/dev/null || true
@@ -113,8 +99,8 @@ else
     echo "  ⚠ Config nginx non trovata — copia manualmente in /etc/nginx/sites-available/ideai"
 fi
 
-# ── 8. Logrotate ──────────────────────────────────────────────────────────────
-echo "[8/8] Logrotate..."
+# ── 7. Logrotate ──────────────────────────────────────────────────────────────
+echo "[7/7] Logrotate..."
 cat > /etc/logrotate.d/ideai <<'LOGROTATE'
 /var/log/ideai/*.log {
     daily

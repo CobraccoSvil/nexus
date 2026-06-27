@@ -1,11 +1,11 @@
 # nexus-billing-service.service — billing-service di Nexus come unit systemd --SYSTEM.
 #
-# ADR 0028 livello 3 (2026-06-15). Parita' coi 4 servizi core (brain/mcp-core/
+# ADR 0028 livello 3 (2026-06-15). Parita' coi servizi core (mcp-core/
 # gateway/web-ide): la VM WSL sospesa manda SIGTERM ai processi -> il servizio
 # esce graceful (exit 0) e, girando solo come nohup di deploy-local.sh, NON
 # ripartiva. Sotto PID 1 con Restart=always riparte da solo, immune alla caduta
 # del manager systemd --user (che cade su exit.target alla chiusura della
-# sessione logind in WSL, linger inefficace). Vedi nexus-brain-system.service.
+# sessione logind in WSL, linger inefficace). Vedi nexus-mcp-core-system.service per il razionale.
 #
 # PORTA (regola G): billing-service legge la porta ESCLUSIVAMENTE dal DB via
 # nexus_auth::resolve_port(&db, "billing_service_port") (settings, default 4040,
