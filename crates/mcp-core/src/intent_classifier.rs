@@ -661,6 +661,20 @@ pub async fn classify(
     } else {
         resp.model_used
     };
+    // Osservabilita' del path RUST in-process (simmetrico al log del path Python
+    // `classifier LLM: ...`): permette di provare in produzione che il classifier
+    // attivo e' Rust (engine='rust', mig 0460). Niente contenuto sensibile: solo
+    // intent/score/confidence/model, mai il prompt (regola F).
+    tracing::info!(
+        engine = "rust",
+        intent = %validated.intent,
+        agentic_score = validated.agentic_score,
+        confidence = validated.confidence,
+        requires_tools = validated.requires_tools,
+        authorizes_changes = validated.authorizes_changes,
+        model_used = %validated.model_used,
+        "classifier intent (rust in-process)"
+    );
     cache.insert(key, validated.clone());
     validated
 }
@@ -978,5 +992,136 @@ mod tests {
         assert!(derive_report_only(false, None, false));
         // Con hint -> azione.
         assert!(!derive_report_only(false, Some("debug"), false));
+    }
+
+    // ── Parita' classifier Rust vs Python (test di integrazione, #[ignore]) ──
+    // Richiede servizi VIVI (DB, gateway su nexus_gateway_port, brain REST). Si
+    // esegue a mano per la validazione del cutover classifier_engine='rust':
+    //   cargo test --bin mcp-core -- --ignored --nocapture parita_classifier
+    // Non gira in `pnpm verify` (nessun servizio esterno in CI).
+    #[derive(serde::Deserialize)]
+    struct PyIntent {
+        intent: String,
+        agentic_score: f32,
+        requires_tools: bool,
+        authorizes_changes: bool,
+        #[serde(default)]
+        fallback_used: bool,
+    }
+
+    #[tokio::test]
+    #[ignore = "richiede DB+gateway+brain vivi; validazione manuale cutover"]
+    async fn parita_classifier_rust_vs_python() {
+        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let db = sqlx::PgPool::connect(&db_url).await.expect("connessione DB");
+        // Gateway: stesso default del runtime (porta dal DB, token dev).
+        let gw_port = nexus_auth::resolve_port(&db, "nexus_gateway_port").await;
+        let gw_url = format!("http://127.0.0.1:{gw_port}");
+        let token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
+            .unwrap_or_else(|_| "dev-internal-token".to_string());
+        let gateway = NexusGatewayClient::new(gw_url, token);
+        let brain_url = std::env::var("BRAIN_REST_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        let http = reqwest::Client::new();
+
+        let messages = [
+            "elenca i file nella cartella src",
+            "leggi il file src/main.rs e dimmi cosa fa",
+            "crea un file config.toml con la sezione [server]",
+            "correggi il bug di null pointer in user_service.py:42",
+            "ciao come stai",
+            "riassumi cosa hai fatto finora in questa chat",
+            "scrivi i test unitari per il modulo auth",
+            "esegui i test e fai in modo che passino tutti",
+            "verifica che il backend compili e riportami l'esito",
+            "fai un'applicazione web completa per gestire una palestra",
+            "configura un utente admin sul backend",
+            "refactora la funzione parse_config senza cambiarne il comportamento",
+        ];
+
+        println!("\n{:-<140}", "");
+        println!(
+            "{:<48} | {:^28} | {:^28} | {:^22}",
+            "MESSAGGIO", "RUST (intent/score/rt/auth/ao)", "PYTHON (intent/score/rt/auth/ao)", "PARITA'"
+        );
+        println!("{:-<140}", "");
+
+        let min_score = DEFAULT_ACTION_ORIENTED_MIN_SCORE;
+        let mut diffs_chiari = 0;
+        for m in messages {
+            let r = classify(&db, &gateway, m).await;
+            let r_ao = derive_action_oriented(
+                None,
+                Some(r.requires_tools),
+                Some(r.agentic_score),
+                min_score,
+            );
+
+            let py: PyIntent = http
+                .post(format!("{}/classify-intent-agentic", brain_url.trim_end_matches('/')))
+                .json(&serde_json::json!({ "message": m }))
+                .send()
+                .await
+                .expect("POST brain")
+                .json()
+                .await
+                .expect("JSON brain");
+            let p_ao = derive_action_oriented(
+                None,
+                Some(py.requires_tools),
+                Some(py.agentic_score),
+                min_score,
+            );
+
+            // Parita' "chiara": stesso intent e stesso action_oriented (i due
+            // segnali che governano il routing/governance). Le differenze di
+            // score sotto 0.15 e gli intent borderline non contano come rotture.
+            let r_ro = derive_report_only(true, None, r.authorizes_changes);
+            let p_ro = derive_report_only(true, None, py.authorizes_changes);
+            let intent_ok = r.intent == py.intent;
+            let ao_ok = r_ao == p_ao;
+            let ro_ok = r_ro == p_ro;
+            let score_gap = (r.agentic_score - py.agentic_score).abs();
+            let both_real = !r.fallback_used && !py.fallback_used;
+            let _ = (ro_ok, score_gap);
+            let verdict = if both_real && intent_ok && ao_ok {
+                "OK"
+            } else if !both_real {
+                "fallback (escl.)"
+            } else if ao_ok && !intent_ok {
+                "intent diff"
+            } else {
+                diffs_chiari += 1;
+                "ao DIFF"
+            };
+
+            println!(
+                "{:<46} | {:>10} {:.2} ao={} ro={} | {:>10} {:.2} ao={} ro={} | gap={:.2} {}",
+                truncate(m, 45),
+                r.intent,
+                r.agentic_score,
+                bool_c(r_ao),
+                bool_c(r_ro),
+                py.intent,
+                py.agentic_score,
+                bool_c(p_ao),
+                bool_c(p_ro),
+                score_gap,
+                verdict
+            );
+        }
+        println!("{:-<140}", "");
+        println!("Divergenze action_oriented sui casi non-fallback: {diffs_chiari}");
+    }
+
+    fn truncate(s: &str, n: usize) -> String {
+        if s.len() <= n {
+            s.to_string()
+        } else {
+            format!("{}…", &s[..n.saturating_sub(1)])
+        }
+    }
+    fn bool_c(b: bool) -> &'static str {
+        if b { "T" } else { "F" }
     }
 }
