@@ -562,6 +562,17 @@ impl NexusBridge {
         &self.embedder
     }
 
+    /// Pool PostgreSQL del bridge, se configurato (`init_global_with_pool`).
+    /// Punto unico (regola L) per i call site Rust che hanno accesso al solo
+    /// singleton globale e devono raggiungere il DB senza propagare un `PgPool`
+    /// lungo tutta la catena di costruzione. Usato da `NeuralCoreClient` per
+    /// risolvere il gateway via `NexusGatewayClient::from_db` (stesso pattern di
+    /// `embed_text_with_model` che attinge dal bridge globale). Ritorna `None`
+    /// se il bridge e' stato inizializzato senza pool (test / in-memory).
+    pub fn db(&self) -> Option<&PgPool> {
+        self.pool.as_deref()
+    }
+
     /// Embedding in-process di un singolo testo (ONNX MiniLM-384d).
     /// Punto unico per i call site Rust (regola L): evita di importare il trait
     /// `Embedder` ovunque e il round-trip HTTP/gRPC verso il brain Python. NB:

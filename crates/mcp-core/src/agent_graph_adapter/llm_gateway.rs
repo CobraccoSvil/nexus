@@ -177,7 +177,9 @@ fn force_tool_choice_to_value(force: Option<bool>) -> Option<Value> {
 /// (`input_schema`->`function.parameters`). Un tool gia' in formato OpenAI
 /// (chiave `function` presente) e' lasciato invariato. PUNTO UNICO della
 /// conversione (regola L): un solo posto traduce lo schema verso il gateway.
-fn tools_to_openai_schema(tools: &[Value]) -> Value {
+/// Riusato anche da `NeuralCoreClient::generate_agent_turn` (`tools_json`
+/// Anthropic-style dei probe/discovery) per non duplicare la traduzione.
+pub(crate) fn tools_to_openai_schema(tools: &[Value]) -> Value {
     let converted: Vec<Value> = tools
         .iter()
         .map(|t| {

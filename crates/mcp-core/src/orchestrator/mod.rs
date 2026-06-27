@@ -17,10 +17,10 @@ use uuid::Uuid;
 
 // Re-export: i submodule fanno `use super::*` e ottengono questi tipi senza
 // duplicare il blocco `use mcp_proto::neural::{...}` (regola L, S73).
-pub(crate) use mcp_proto::neural::{
-    neural_core_service_client::NeuralCoreServiceClient, GenerateAgentTurnRequest,
-    GenerateCompletionRequest,
-};
+// `GenerateCompletion`/`GenerateAgentTurn` non transitano piu' dal brain gRPC
+// (cablati al Nexus LLM Gateway in `neural_client.rs`): qui resta solo il client
+// per gli RPC ancora serviti dal brain (generate_document, ...).
+pub(crate) use mcp_proto::neural::neural_core_service_client::NeuralCoreServiceClient;
 
 use crate::nexus_gateway::NexusGatewayClient;
 

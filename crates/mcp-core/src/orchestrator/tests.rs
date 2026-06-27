@@ -285,3 +285,75 @@ async fn test_embed_text_with_model_in_process_no_grpc() {
         .expect("embed con model esplicito deve riuscire");
     assert_eq!(label_explicit, "custom-embedder");
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Test cablaggio gateway (generate_completion / generate_agent_turn, regola L)
+//
+// Verifica che i due metodi NON facciano piu' alcuna RPC gRPC verso il brain.
+// Il client e' costruito con `disconnected_for_tests()` (canale tonic verso
+// 127.0.0.1:1, irraggiungibile): se i metodi facessero ancora gRPC al brain,
+// l'errore sarebbe un transport-error tonic ("transport error" / "connection
+// refused"). Con bridge globale inizializzato SENZA pool DB, i metodi falliscono
+// invece a MONTE (risoluzione gateway dal pool del bridge), dimostrando che il
+// percorso e' quello gateway-in-process e non piu' il gRPC al brain.
+// ─────────────────────────────────────────────────────────────────
+
+/// Asserisce che un esito di `generate_completion`/`generate_agent_turn` non
+/// provenga MAI dal gRPC verso il brain. Due scenari ammessi (entrambi senza
+/// brain): (a) `Err` dalla risoluzione gateway via bridge (bridge senza pool);
+/// (b) `Ok` con Value d'errore costruito dal mapping quando il gateway HTTP non
+/// risponde (bridge con pool da altri test, gateway down). In nessun caso deve
+/// comparire un transport-error tonic verso il brain.
+fn assert_no_brain_grpc(outcome: anyhow::Result<serde_json::Value>) {
+    match outcome {
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            assert!(
+                msg.contains("gateway") || msg.contains("pool db") || msg.contains("bridge"),
+                "errore atteso dal cablaggio gateway, non dal gRPC al brain: {msg}"
+            );
+            assert!(
+                !msg.contains("transport error") && !msg.contains("tcp connect"),
+                "nessun errore di trasporto gRPC verso il brain deve comparire: {msg}"
+            );
+        }
+        Ok(v) => {
+            // Ramo (b): il mapping ha intercettato l'errore HTTP del gateway e ha
+            // prodotto la forma Value d'errore storica del brain (content
+            // "[Error: ...]" + error/error_class). Non c'e' stato gRPC al brain.
+            let content = v["content"].as_str().unwrap_or_default();
+            assert!(
+                content.starts_with("[Error:"),
+                "atteso Value d'errore dal mapping gateway (gateway HTTP down): {v}"
+            );
+            assert!(!v["error"].is_null(), "il Value d'errore deve avere `error`: {v}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_generate_completion_no_grpc_al_brain() {
+    crate::nexus_bridge::NexusBridge::init_global();
+    let client = NeuralCoreClient::disconnected_for_tests();
+    let outcome = client
+        .generate_completion("anthropic", "claude-x", "ping")
+        .await;
+    assert_no_brain_grpc(outcome);
+}
+
+#[tokio::test]
+async fn test_generate_agent_turn_no_grpc_al_brain() {
+    crate::nexus_bridge::NexusBridge::init_global();
+    let client = NeuralCoreClient::disconnected_for_tests();
+    let outcome = client
+        .generate_agent_turn(
+            "openai",
+            "gpt-x",
+            "[{\"role\":\"user\",\"content\":\"hi\"}]",
+            "[]",
+            256,
+            "",
+        )
+        .await;
+    assert_no_brain_grpc(outcome);
+}

@@ -1,10 +1,34 @@
-//! Client gRPC/HTTP verso il neural-core (brain Python).
+//! Client del neural-core.
+//!
+//! Storicamente questo client faceva da proxy gRPC verso il brain Python
+//! (porta 50051) per OGNI operazione AI. Due percorsi sono stati progressivamente
+//! cablati IN-PROCESS verso i punti unici Rust, eliminando il round-trip al brain:
+//!
+//! - `embed_text*`  -> embedder ONNX in-process (`NexusBridge::embedder`).
+//! - `generate_completion` / `generate_agent_turn` -> Nexus LLM Gateway Rust
+//!   (`NexusGatewayClient`, porta 4060) DIRETTAMENTE. Prima il giro era assurdo
+//!   (`mcp-core` gRPC -> `brain` `GenerateCompletion`/`GenerateAgentTurn` ->
+//!   `GatewayProvider` -> gateway): il brain non faceva altro che inoltrare al
+//!   gateway e ri-normalizzare la risposta. Ora mcp-core parla col gateway senza
+//!   intermediari (verso zero-Python). La FORMA del `Value` ritornato e'
+//!   identica a quella che il brain produceva (replica di
+//!   `brain/grpc_server/neural_service.py::GenerateCompletion/GenerateAgentTurn`
+//!   + `brain/providers/gateway_provider.py::_build_agent_result`), cosi' i call
+//!   site (`prompt_templates`, `chat_sessions`, `model_health_probe`,
+//!   `provider_health_probe`, `service_discovery`, `learned_instructions`,
+//!   `nexus-wiki`, ...) restano INVARIATI.
+//!
+//! Restano sul gRPC al brain solo `generate_document` (rendering .docx) e gli RPC
+//! batch/model-sync non toccati da questo refactoring.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 // Tipi mcp_proto::neural ri-esportati da super::* (regola L, S73).
 
 use super::*;
+use crate::nexus_gateway::{
+    GwMessage, GwMetadata, GwRequest, GwResponse, NexusGatewayClient,
+};
 
 #[derive(Clone)]
 pub struct NeuralCoreClient {
@@ -92,24 +116,78 @@ impl NeuralCoreClient {
         Ok((used_model, vector))
     }
 
+    /// Risolve il client del Nexus LLM Gateway dal pool DB del bridge globale
+    /// (`NexusGatewayClient::from_db`, PUNTO UNICO del cablaggio gateway —
+    /// regola L). Stesso pattern di `embed_text_with_model`: attinge al singleton
+    /// `NexusBridge` invece di propagare un `PgPool` lungo l'intera catena di
+    /// costruzione del `NeuralCoreClient` (clonato in decine di contesti).
+    /// La porta e' risolta da `settings` (regola G), non hardcoded.
+    async fn gateway(&self) -> anyhow::Result<NexusGatewayClient> {
+        let bridge = crate::nexus_bridge::NexusBridge::global()
+            .ok_or_else(|| anyhow::anyhow!("nexus bridge non inizializzato (gateway)"))?;
+        let db = bridge
+            .db()
+            .ok_or_else(|| anyhow::anyhow!("nexus bridge senza pool DB (gateway)"))?;
+        Ok(NexusGatewayClient::from_db(db).await)
+    }
+
+    /// Completion testuale one-shot. Cablata DIRETTAMENTE al Nexus LLM Gateway
+    /// (niente piu' gRPC al brain): costruisce un `GwRequest` con un solo turno
+    /// `user`, `pin_provider` = il provider gia' risolto a monte (regola G,
+    /// nessun secondo routing) e nessun tool.
+    ///
+    /// La FORMA del `Value` ritornato replica
+    /// `brain/grpc_server/neural_service.py::GenerateCompletion`:
+    /// `{provider, model, content, metadata:{usage, [error]}, error, error_class}`.
+    /// I call site leggono `content`, `metadata.usage` (billing
+    /// `extract_usage_numbers`), `metadata.error` / `error` (`completion_has_error`),
+    /// `error_class` (probe): tutte queste chiavi sono preservate.
     pub async fn generate_completion(
         &self,
         provider: &str,
         model: &str,
         prompt: &str,
     ) -> anyhow::Result<Value> {
-        let mut client = self.client.clone();
-        let resp = client
-            .generate_completion(GenerateCompletionRequest {
-                provider: provider.to_string(),
-                model: model.to_string(),
-                prompt: prompt.to_string(),
-            })
-            .await?;
-        let json: Value = serde_json::from_str(&resp.into_inner().json)?;
-        Ok(json)
+        let gw = self.gateway().await?;
+        let req = GwRequest {
+            model: model.to_string(),
+            messages: vec![GwMessage {
+                role: "user".to_string(),
+                content: json!(prompt),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            pin_provider: Some(provider.to_string()),
+            metadata: GwMetadata {
+                feature: "neural_completion".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match gw.complete(req).await {
+            Ok(resp) => Ok(completion_value_from_gw(provider, model, &resp)),
+            // Errore HTTP/timeout del gateway: NON propagare l'errore grezzo, ma
+            // costruire un Value d'errore nella STESSA forma che il brain
+            // ritornava (content "[Error: ...]" + error/error_class). I call site
+            // dipendono da questa forma per la detection "errore ingoiato"
+            // (provider_health_probe) e per `completion_has_error` (core).
+            Err(e) => Ok(error_completion_value(provider, model, &e.to_string())),
+        }
     }
 
+    /// Turno agentico (con tool support). Cablato DIRETTAMENTE al Nexus LLM
+    /// Gateway. `messages_json` (lista `{role, content, ...}`) e `tools_json`
+    /// (tool Anthropic-style `{name, description, input_schema}`) vengono mappati
+    /// nel contratto del gateway; `pin_provider` evita un secondo routing
+    /// (regola G); i tool sono tradotti nel dialetto OpenAI dal PUNTO UNICO
+    /// `tools_to_openai_schema` (regola L).
+    ///
+    /// La FORMA del `Value` ritornato replica
+    /// `neural_service.py::GenerateAgentTurn` +
+    /// `gateway_provider.py::_build_agent_result`: `{provider, model, content,
+    /// stop_reason, tool_use_blocks, assistant_content, usage, [error,
+    /// error_class]}`. `model_health_probe` legge `error_class`, `stop_reason` e
+    /// `tool_use_blocks[].name`; gli altri call site solo `content`.
     pub async fn generate_agent_turn(
         &self,
         provider: &str,
@@ -119,34 +197,103 @@ impl NeuralCoreClient {
         max_tokens: u32,
         system_text: &str,
     ) -> anyhow::Result<Value> {
-        let mut client = self.client.clone();
-        let resp = client
-            .generate_agent_turn(GenerateAgentTurnRequest {
-                provider: provider.to_string(),
-                model: model.to_string(),
-                messages_json: messages_json.to_string(),
-                tools_json: tools_json.to_string(),
-                max_tokens,
-                system_text: system_text.to_string(),
-            })
-            .await?;
-        let json: Value = serde_json::from_str(&resp.into_inner().json)?;
-        Ok(json)
+        let gw = self.gateway().await?;
+
+        // Messaggi grezzi -> GwMessage. I call site passano sempre
+        // `{role, content}` testuali (content stringa); la deserializzazione
+        // tollerante preserva eventuali tool_calls/tool_call_id futuri.
+        let raw_messages: Vec<Value> = if messages_json.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(messages_json)
+                .map_err(|e| anyhow::anyhow!("generate_agent_turn: messages_json invalido: {e}"))?
+        };
+        let messages: Vec<GwMessage> = raw_messages
+            .into_iter()
+            .map(gw_message_from_value)
+            .collect();
+
+        // system_text -> primo messaggio role=system (il gateway lo riconduce al
+        // system del provider). Anteporlo preserva il comportamento del brain che
+        // passava `system_text` a `generate_agent_turn_sync`.
+        let mut all_messages = Vec::with_capacity(messages.len() + 1);
+        if !system_text.trim().is_empty() {
+            all_messages.push(GwMessage {
+                role: "system".to_string(),
+                content: json!(system_text),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        all_messages.extend(messages);
+
+        // Tool Anthropic-style -> OpenAI (punto unico, regola L). Lista vuota
+        // ("[]") -> nessun tool.
+        let tools: Option<Value> = if tools_json.trim().is_empty() || tools_json.trim() == "[]" {
+            None
+        } else {
+            let parsed: Vec<Value> = serde_json::from_str(tools_json)
+                .map_err(|e| anyhow::anyhow!("generate_agent_turn: tools_json invalido: {e}"))?;
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(crate::agent_graph_adapter::llm_gateway::tools_to_openai_schema(&parsed))
+            }
+        };
+
+        let req = GwRequest {
+            model: model.to_string(),
+            messages: all_messages,
+            max_tokens: Some(max_tokens),
+            tools,
+            pin_provider: Some(provider.to_string()),
+            metadata: GwMetadata {
+                feature: "neural_agent_turn".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        match gw.complete(req).await {
+            Ok(resp) => Ok(agent_turn_value_from_gw(provider, model, &resp)),
+            Err(e) => Ok(error_agent_turn_value(provider, model, &e.to_string())),
+        }
     }
 
+    /// Health di un provider. Cablato al gateway: per `"system"` riflette lo stato
+    /// del gateway (sostituisce il vecchio `GetProviderHealth("system")` del
+    /// brain); per un provider specifico ritorna lo stato del gateway nella forma
+    /// `{status, reason?}` letta da `Orchestrator::run` (chiavi `status` ∈
+    /// {ready, ok} e `reason`/`skipReasons`). Il gateway possiede gia' il gate di
+    /// disponibilita' provider/cooldown (ADR 0020), quindi un `200` su `/health`
+    /// significa "instradabile"; la verifica fine del singolo provider avviene
+    /// comunque sul `complete` (errore -> error_class).
     pub async fn provider_health(&self, provider: &str) -> anyhow::Result<Value> {
-        let mut client = self.client.clone();
-        let resp = client
-            .get_provider_health(mcp_proto::neural::ProviderHealthRequest {
-                provider: provider.to_string(),
-            })
-            .await?;
-        let json: Value = serde_json::from_str(&resp.into_inner().json)?;
-        Ok(json)
+        let gw = self.gateway().await?;
+        if gw.is_healthy().await {
+            Ok(json!({
+                "status": "ok",
+                "service": "nexus-gateway",
+                "provider": provider,
+            }))
+        } else {
+            Ok(json!({
+                "status": "unavailable",
+                "service": "nexus-gateway",
+                "provider": provider,
+                "reason": "gateway_unreachable",
+            }))
+        }
     }
 
+    /// Salute complessiva del path AI. Ora riflette il Nexus LLM Gateway (non piu'
+    /// il brain): il brain non e' piu' nel percorso di completion/agent-turn. Usato
+    /// dall'health check UI (`/health` -> `neural_core`).
     pub async fn is_healthy(&self) -> bool {
-        self.provider_health("system").await.is_ok()
+        match self.gateway().await {
+            Ok(gw) => gw.is_healthy().await,
+            Err(_) => false,
+        }
     }
 
     /// Classificazione errori provider via il PUNTO UNICO Rust
@@ -197,5 +344,324 @@ impl NeuralCoreClient {
             anyhow::bail!("Document generation error: {}", inner.error);
         }
         Ok((inner.file_path, inner.page_count, inner.section_count))
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Mapping GwResponse -> forma Value storica del brain.
+//
+// Questi helper sono il PUNTO UNICO (regola L) della traduzione fra il contratto
+// del Nexus LLM Gateway (`GwResponse`) e la forma `Value` che i call site dei due
+// metodi `NeuralCoreClient` si aspettano (la stessa che il brain produceva). Sono
+// liberi (testabili senza rete) e usati SOLO da `generate_completion` /
+// `generate_agent_turn` sopra.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Costruisce il dict `usage` interno dalla `GwUsage` del gateway, replicando
+/// `gateway_provider.py::_usage_to_internal` (convenzione Anthropic
+/// `input_tokens`/`output_tokens` + chiavi cache opzionali). Questa forma e'
+/// letta da `billing::extract_usage_numbers` (cerca `input_tokens`/`output_tokens`
+/// sotto `metadata.usage` per le completion, sotto `usage` per gli agent-turn) e
+/// da `nexus-wiki::extract_usage_tokens`.
+fn usage_value_from_gw(resp: &GwResponse) -> Value {
+    let mut usage = serde_json::Map::new();
+    usage.insert("input_tokens".to_string(), json!(resp.usage.input_tokens));
+    usage.insert("output_tokens".to_string(), json!(resp.usage.output_tokens));
+    if let Some(cr) = resp.usage.cache_read_tokens {
+        if cr > 0 {
+            usage.insert("cache_read_tokens".to_string(), json!(cr));
+        }
+    }
+    if let Some(cc) = resp.usage.cache_creation_tokens {
+        if cc > 0 {
+            usage.insert("cache_creation_tokens".to_string(), json!(cc));
+        }
+    }
+    Value::Object(usage)
+}
+
+/// Forma `Value` di `generate_completion` (success), paritetica a
+/// `neural_service.py::GenerateCompletion`: `{provider, model, content,
+/// metadata:{usage}, error:null, error_class:null}`. Il provider/model "usati"
+/// dal gateway prevalgono su quelli richiesti (il pin li conferma comunque).
+fn completion_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> Value {
+    let used_provider = if resp.provider_used.is_empty() {
+        provider
+    } else {
+        resp.provider_used.as_str()
+    };
+    let used_model = if resp.model_used.is_empty() {
+        model
+    } else {
+        resp.model_used.as_str()
+    };
+    json!({
+        "provider": used_provider,
+        "model": used_model,
+        "content": resp.content,
+        "metadata": {
+            "usage": usage_value_from_gw(resp),
+        },
+        "error": Value::Null,
+        "error_class": Value::Null,
+    })
+}
+
+/// Forma `Value` d'errore di `generate_completion`, paritetica al ramo `except`
+/// del brain: `content` "[Error: ...]", `error` umano, `error_class` dal punto
+/// unico Rust `provider_error_classifier`. `completion_has_error` (core) e la
+/// detection "errore ingoiato" di `provider_health_probe` dipendono da questa
+/// forma (prefisso `[Error:` + `error`/`error_class` non-null).
+fn error_completion_value(provider: &str, model: &str, raw_error: &str) -> Value {
+    let class = crate::provider_error_classifier::classify_text(raw_error).stop_reason;
+    json!({
+        "provider": provider,
+        "model": model,
+        "content": format!("[Error: {raw_error}]"),
+        "metadata": {
+            "usage": json!({ "input_tokens": 0, "output_tokens": 0 }),
+            "error": raw_error,
+            "error_class": class,
+        },
+        "error": raw_error,
+        "error_class": class,
+    })
+}
+
+/// Converte i `tool_calls` (dialetto OpenAI) della `GwResponse` nei blocchi
+/// interni `(tool_use_blocks, assistant_tool_blocks)`, replicando
+/// `gateway_provider.py::_tool_calls_to_blocks`. Ogni tool-call
+/// `{id, function:{name, arguments(JSON string)}}` -> `{id, name, input(dict)}`
+/// (e il corrispondente blocco assistant `{type:"tool_use", ...}`).
+fn tool_blocks_from_gw(resp: &GwResponse) -> (Vec<Value>, Vec<Value>) {
+    let mut tool_use_blocks: Vec<Value> = Vec::new();
+    let mut assistant_blocks: Vec<Value> = Vec::new();
+    for tc in resp.tool_calls.iter().flatten() {
+        let input: Value =
+            serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
+        let block = json!({
+            "id": tc.id,
+            "name": tc.function.name,
+            "input": input,
+        });
+        tool_use_blocks.push(block.clone());
+        let mut assistant = serde_json::Map::new();
+        assistant.insert("type".to_string(), json!("tool_use"));
+        if let Value::Object(map) = block {
+            for (k, v) in map {
+                assistant.insert(k, v);
+            }
+        }
+        assistant_blocks.push(Value::Object(assistant));
+    }
+    (tool_use_blocks, assistant_blocks)
+}
+
+/// Forma `Value` di `generate_agent_turn` (success), paritetica a
+/// `neural_service.py::GenerateAgentTurn` + `gateway_provider.py::_build_agent_result`:
+/// `{provider, model, content, stop_reason, tool_use_blocks, assistant_content,
+/// usage, error:null, error_class:null}`. `stop_reason` = "tool_use" se ci sono
+/// tool-call, altrimenti "end_turn" (come il brain, che NON propaga il
+/// finish_reason grezzo qui ma lo deriva dalla presenza di tool-call).
+fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> Value {
+    let used_provider = if resp.provider_used.is_empty() {
+        provider
+    } else {
+        resp.provider_used.as_str()
+    };
+    let used_model = if resp.model_used.is_empty() {
+        model
+    } else {
+        resp.model_used.as_str()
+    };
+    let (tool_use_blocks, tool_assistant_blocks) = tool_blocks_from_gw(resp);
+
+    // assistant_content: blocco text (se content non vuoto) + blocchi tool_use,
+    // nello stesso ordine del brain (`_build_agent_result`).
+    let mut assistant_content: Vec<Value> = Vec::new();
+    if !resp.content.is_empty() {
+        assistant_content.push(json!({ "type": "text", "text": resp.content }));
+    }
+    assistant_content.extend(tool_assistant_blocks);
+
+    let stop_reason = if tool_use_blocks.is_empty() {
+        "end_turn"
+    } else {
+        "tool_use"
+    };
+
+    json!({
+        "provider": used_provider,
+        "model": used_model,
+        "content": resp.content,
+        "stop_reason": stop_reason,
+        "tool_use_blocks": tool_use_blocks,
+        "assistant_content": assistant_content,
+        "usage": usage_value_from_gw(resp),
+        "error": Value::Null,
+        "error_class": Value::Null,
+    })
+}
+
+/// Forma `Value` d'errore di `generate_agent_turn`, paritetica al ramo `except`
+/// del brain: `stop_reason="error"` + `error`/`error_class`. `evaluate_tool_probe`
+/// (model_health_probe) legge `error_class` e `stop_reason="error"`.
+fn error_agent_turn_value(provider: &str, model: &str, raw_error: &str) -> Value {
+    let class = crate::provider_error_classifier::classify_text(raw_error).stop_reason;
+    json!({
+        "provider": provider,
+        "model": model,
+        "content": format!("[Error: {raw_error}]"),
+        "stop_reason": "error",
+        "tool_use_blocks": [],
+        "assistant_content": [],
+        "usage": json!({ "input_tokens": 0, "output_tokens": 0 }),
+        "error": raw_error,
+        "error_class": class,
+    })
+}
+
+/// Converte un messaggio grezzo `{role, content, [tool_calls], [tool_call_id]}`
+/// in `GwMessage`. I call site passano sempre `{role, content}` testuali; i campi
+/// tool sono preservati se presenti (robustezza, retrocompatibile col contratto
+/// gateway). `role`/`content` mancanti -> default difensivi.
+fn gw_message_from_value(v: Value) -> GwMessage {
+    let role = v
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user")
+        .to_string();
+    let content = v.get("content").cloned().unwrap_or_else(|| json!(""));
+    let tool_calls = v
+        .get("tool_calls")
+        .and_then(|tc| serde_json::from_value(tc.clone()).ok());
+    let tool_call_id = v
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    GwMessage {
+        role,
+        content,
+        tool_calls,
+        tool_call_id,
+    }
+}
+
+#[cfg(test)]
+mod gateway_mapping_tests {
+    use super::*;
+    use crate::nexus_gateway::{GwToolCall, GwToolFunctionCall, GwUsage};
+
+    fn base_resp() -> GwResponse {
+        GwResponse {
+            content: String::new(),
+            tool_calls: None,
+            usage: GwUsage {
+                input_tokens: 12,
+                output_tokens: 34,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            },
+            model_used: "m-real".to_string(),
+            provider_used: "anthropic".to_string(),
+            latency_ms: 5,
+            finish_reason: "stop".to_string(),
+            privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
+        }
+    }
+
+    #[test]
+    fn completion_preserva_content_usage_e_chiavi_errore_null() {
+        let mut resp = base_resp();
+        resp.content = "ciao".to_string();
+        let v = completion_value_from_gw("openai", "gpt-x", &resp);
+        // content leggibile dai call site.
+        assert_eq!(v["content"], "ciao");
+        // billing::extract_usage_numbers legge metadata.usage.{input,output}_tokens.
+        assert_eq!(v["metadata"]["usage"]["input_tokens"], 12);
+        assert_eq!(v["metadata"]["usage"]["output_tokens"], 34);
+        // completion_has_error: error/metadata.error null -> nessun errore.
+        assert!(v["error"].is_null());
+        assert!(v["metadata"]["error"].is_null());
+        // provider/model "usati" dal gateway prevalgono.
+        assert_eq!(v["provider"], "anthropic");
+        assert_eq!(v["model"], "m-real");
+    }
+
+    #[test]
+    fn completion_errore_ha_prefisso_error_e_classe() {
+        let v = error_completion_value("anthropic", "claude-x", "HTTP 401 invalid api key");
+        let content = v["content"].as_str().unwrap();
+        assert!(content.starts_with("[Error:"));
+        assert!(!v["error"].is_null());
+        // 401 -> auth_error dal punto unico classifier.
+        assert_eq!(v["error_class"], "auth_error");
+        assert_eq!(v["metadata"]["error_class"], "auth_error");
+    }
+
+    #[test]
+    fn agent_turn_testuale_stop_reason_end_turn_e_no_tool_blocks() {
+        let mut resp = base_resp();
+        resp.content = "solo testo".to_string();
+        let v = agent_turn_value_from_gw("openai", "gpt-x", &resp);
+        assert_eq!(v["content"], "solo testo");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert!(v["tool_use_blocks"].as_array().unwrap().is_empty());
+        // assistant_content: un solo blocco text.
+        let ac = v["assistant_content"].as_array().unwrap();
+        assert_eq!(ac.len(), 1);
+        assert_eq!(ac[0]["type"], "text");
+        // usage top-level (extract_usage_tokens degli agent-turn).
+        assert_eq!(v["usage"]["input_tokens"], 12);
+    }
+
+    #[test]
+    fn agent_turn_con_tool_call_stop_reason_tool_use_e_blocchi_per_probe() {
+        let mut resp = base_resp();
+        resp.content = "procedo".to_string();
+        resp.tool_calls = Some(vec![GwToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: GwToolFunctionCall {
+                name: "nexus_probe_tool".to_string(),
+                arguments: r#"{"ok":true}"#.to_string(),
+            },
+        }]);
+        let v = agent_turn_value_from_gw("anthropic", "claude-x", &resp);
+        // model_health_probe::evaluate_tool_probe: stop_reason + tool_use_blocks[].name.
+        assert_eq!(v["stop_reason"], "tool_use");
+        let tub = v["tool_use_blocks"].as_array().unwrap();
+        assert_eq!(tub.len(), 1);
+        assert_eq!(tub[0]["name"], "nexus_probe_tool");
+        assert_eq!(tub[0]["id"], "call_1");
+        assert_eq!(tub[0]["input"]["ok"], true);
+        // assistant_content: blocco text + blocco tool_use.
+        let ac = v["assistant_content"].as_array().unwrap();
+        assert_eq!(ac.len(), 2);
+        assert_eq!(ac[0]["type"], "text");
+        assert_eq!(ac[1]["type"], "tool_use");
+        assert_eq!(ac[1]["name"], "nexus_probe_tool");
+    }
+
+    #[test]
+    fn agent_turn_errore_stop_reason_error_e_classe() {
+        let v = error_agent_turn_value("google", "gemini-x", "429 rate limit exceeded");
+        assert_eq!(v["stop_reason"], "error");
+        assert_eq!(v["error_class"], "rate_limit");
+        assert!(v["tool_use_blocks"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gw_message_da_value_testuale_e_con_tool() {
+        let m = gw_message_from_value(json!({"role":"user","content":"hi"}));
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, json!("hi"));
+        assert!(m.tool_calls.is_none());
+        // role mancante -> default user; content mancante -> stringa vuota.
+        let d = gw_message_from_value(json!({}));
+        assert_eq!(d.role, "user");
+        assert_eq!(d.content, json!(""));
     }
 }
