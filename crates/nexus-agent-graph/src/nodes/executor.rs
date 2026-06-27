@@ -1189,12 +1189,43 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
             if rp_count < rp_threshold {
                 progress_guided.remove("resource_reallocation");
             } else {
+                // Candidato escalation (stesso pattern di repeated_action/esplorazione).
+                let rp_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+                let rp_cur_provider = state.provider_used.clone()
+                    .or_else(|| state.sticky_provider.clone())
+                    .or_else(|| state.provider_override.clone());
+                let rp_cur_model = state.model_used.clone()
+                    .or_else(|| state.sticky_model.clone())
+                    .or_else(|| state.model_override.clone());
+                let rp_picked = if rp_escal < 3 {
+                    let inputs = self
+                        .escalation
+                        .escalation_inputs(
+                            state.user_intent.as_deref(),
+                            rp_cur_provider.as_deref(),
+                            rp_cur_model.as_deref(),
+                        )
+                        .await
+                        .unwrap_or_default();
+                    pick_escalation_model(
+                        &inputs.chain,
+                        rp_cur_provider.as_deref(),
+                        rp_cur_model.as_deref(),
+                        rp_escal,
+                        inputs.provider_in_cooldown,
+                        inputs.cross_provider.as_ref(),
+                    )
+                } else {
+                    None
+                };
                 let dec = pc::decide(&ProgressSignals {
                     reallocation_count: rp_count,
                     reallocation_threshold: rp_threshold,
                     has_active_resources,
                     already_guided: progress_guided.clone(),
-                    has_escalation_candidate: false,
+                    has_escalation_candidate: rp_picked.is_some(),
+                    escalations: rp_escal,
+                    max_escalations: 3,
                     ..Default::default()
                 });
                 match dec.action {
@@ -1231,7 +1262,39 @@ tool/le richieste a quella porta, senza allocarne di nuove."
                         }
                         .into_opaque());
                     }
-                    Action::Escalate | Action::ForceDiagnose | Action::Proceed => {}
+                    Action::Escalate => {
+                        let pick = rp_picked.expect("Escalate implica candidato presente");
+                        tracing::warn!(
+                            target: "nexus_agent_graph::executor",
+                            to_provider = %pick.provider,
+                            to_model = %pick.model,
+                            "ESCALATE resource_reallocation -> promuovo modello"
+                        );
+                        let esc_nudge = human_msg(
+                            "Hai richiesto porte ripetutamente invece di riusare i servizi attivi. \
+Ora rispondi tu, che sei un modello piu' capace: NON allocare nuove porte, usa \
+list_active_services per i servizi gia' attivi e le porte allocate, riusa quella del \
+servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
+                        );
+                        let mut extra_out = state.extra.clone();
+                        extra_out.insert("auto_escalations".to_string(), json!(rp_escal + 1));
+                        progress_guided.insert("resource_reallocation".to_string());
+                        return Ok(StateDelta {
+                            messages: Some(vec![esc_nudge]),
+                            sticky_provider: Some(Some(pick.provider)),
+                            sticky_model: Some(Some(pick.model)),
+                            g1_reroute_count: Some(Some(0)),
+                            action_nudge_count: Some(Some(0)),
+                            pending_tool_uses: Some(Some(vec![])),
+                            stop_reason: Some(Some(StopReason::G1Escalated)),
+                            iterations: Some(Some(iters_in + 1)),
+                            progress_guided_axes: Some(Some(sorted(&progress_guided))),
+                            extra: Some(extra_out),
+                            ..Default::default()
+                        }
+                        .into_opaque());
+                    }
+                    Action::ForceDiagnose | Action::Proceed => {}
                 }
             }
         }
