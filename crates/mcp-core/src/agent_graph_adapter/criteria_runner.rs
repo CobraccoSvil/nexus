@@ -118,6 +118,7 @@ impl FinalGateCriteriaRunnerAdapter {
         let timeout_s = c.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
         let (passed, mut evidence) = match c.criterion_type.as_str() {
             "run_command" => self.check_run_command(&c.spec, &c.expected, mode, timeout_s).await,
+            "design_verify" => Self::check_design_verify(&c.spec),
             "service_logs_clean" => {
                 self.check_service_logs_clean(&c.spec, mode, timeout_s).await
             }
@@ -149,6 +150,23 @@ impl FinalGateCriteriaRunnerAdapter {
     }
 
     // ── run_command (BUILD): exit_code vs expected ───────────────────────────
+
+    // design_verify (P5): resa visiva conforme al figma. PURO - lo similarity_score
+    // e' gia' nella spec (estratto dalla history da build_criteria), niente vision qui.
+    fn check_design_verify(spec: &Value) -> (bool, Value) {
+        let score = spec.get("similarity_score").and_then(Value::as_i64).unwrap_or(0);
+        let min = spec.get("min_score").and_then(Value::as_i64).unwrap_or(0);
+        let passed = score >= min;
+        let verdict = if passed {
+            "resa visiva conforme al design".to_string()
+        } else {
+            format!(
+                "resa visiva sotto soglia ({score}/{min}): continua ad allineare il layout \
+al figma ed esegui di nuovo nexus_visual_compare finche similarity_score >= {min}"
+            )
+        };
+        (passed, json!({ "similarity_score": score, "min_score": min, "verdict": verdict }))
+    }
 
     async fn check_run_command(
         &self,

@@ -493,6 +493,8 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
         build_working_dir: d.build_working_dir,
         log_command: d.log_command,
         endpoint_criterion: d.endpoint_criterion,
+        design_verify_enabled: setting_bool(db, "agent.final_gate.design_verify_enabled", d.design_verify_enabled).await,
+        design_verify_min_score: setting_i64(db, "agent.final_gate.design_verify_min_score", d.design_verify_min_score).await,
     }
 }
 

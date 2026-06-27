@@ -164,6 +164,13 @@ pub struct FinalGateConfig {
     /// `{type:"http", spec:{url, method, body?, headers?}, expected:{status?,
     /// body_contains?}, timeout_s}` (vedi `_resolve_endpoint_check`).
     pub endpoint_criterion: Option<CriterionSpec>,
+    /// P5: gate design_verify abilitato (agent.final_gate.design_verify_enabled,
+    /// default true). Si applica SOLO se nella history c'e' un nexus_visual_compare
+    /// (task figma): None = non-figma -> non blocca.
+    pub design_verify_enabled: bool,
+    /// P5: soglia minima di similarity_score (0-100) per chiudere un task figma
+    /// (agent.final_gate.design_verify_min_score, default 70).
+    pub design_verify_min_score: i64,
 }
 
 impl Default for FinalGateConfig {
@@ -185,6 +192,8 @@ impl Default for FinalGateConfig {
             import_staging_dirs: vec!["figma_export".to_string()],
             criteria_timeout_s: 30.0,
             endpoint_criterion: None,
+            design_verify_enabled: true,
+            design_verify_min_score: 70,
         }
     }
 }
@@ -345,6 +354,38 @@ impl FinalGateNode {
         //     Risolve "build verde ma login ancora 500" (incidente Beauty-Book).
         if let Some(endpoint_crit) = &self.cfg.endpoint_criterion {
             criteria.push(endpoint_crit.clone());
+        }
+
+        // (6) design_verify (P5): per i task figma l'agente non puo' chiudere con
+        //     una resa visiva sotto soglia che HA GIA' misurato con nexus_visual_compare.
+        //     Deterministico: prende l'ultimo similarity_score dalla history (niente
+        //     vision nel gate). None (nessun confronto) = task non-figma -> non blocca.
+        if self.cfg.design_verify_enabled {
+            let mut last_score: Option<i64> = None;
+            for m in &state.messages {
+                if let Message::Tool { content, .. } = m {
+                    if let Ok(v) =
+                        serde_json::from_str::<Value>(content.flatten_text().trim())
+                    {
+                        if let Some(sc) =
+                            v.get("similarity_score").and_then(Value::as_i64)
+                        {
+                            last_score = Some(sc);
+                        }
+                    }
+                }
+            }
+            if let Some(score) = last_score {
+                criteria.push(CriterionSpec {
+                    criterion_type: "design_verify".to_string(),
+                    spec: json!({
+                        "similarity_score": score,
+                        "min_score": self.cfg.design_verify_min_score,
+                    }),
+                    expected: json!({ "min_score": self.cfg.design_verify_min_score }),
+                    timeout_s: None,
+                });
+            }
         }
 
         criteria
