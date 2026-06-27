@@ -184,8 +184,13 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
 
           const newEntries: DebugEntry[] = [];
           for (const ev of res.events) {
-            if (seenLogIdsRef.current.has(ev.id)) continue;
-            seenLogIdsRef.current.add(ev.id);
+            // P4: chiave composta (id + createdAt + prefisso testo). ev.id
+            // non e' garantito univoco dal backend: con la sola id le righe
+            // NUOVE con id duplicato venivano scartate. Cosi' anche le righe
+            // post-restart (createdAt diverso) non si perdono.
+            const dedupKey = `${ev.id}|${ev.createdAt ?? ""}|${(ev.text || "").slice(0, 50)}`;
+            if (seenLogIdsRef.current.has(dedupKey)) continue;
+            seenLogIdsRef.current.add(dedupKey);
 
             const lines = (ev.text || "").split(/\r?\n/);
             const parsed = parseLines(lines, shortName);

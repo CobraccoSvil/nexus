@@ -452,14 +452,18 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   // Il badge usa il valore "live" dal dispatcher (selectProblemsBadge), ma per
   // la lista completa serve refetch via API perche' l'evento non contiene items.
   const problemsBadgeFromDispatcher = useProjectStore(selectProblemsBadge);
+  // P2-fe: reagisce a OGNI evento FindingsUpdated (findingsUpdate.ts cambia
+  // sempre), non al solo badge numerico - che restava uguale nel caso "1
+  // risolto + 1 nuovo" (lista mai aggiornata) e con badge 0 saltava (lista
+  // non svuotata). Il refetch e' la fonte di verita'.
+  const findingsUpdate = useProjectStore((s) => s.findingsUpdate);
   useEffect(() => {
-    if (!activeProject) return;
-    if (problemsBadgeFromDispatcher === 0) return; // skip stato iniziale
+    if (!activeProject || !findingsUpdate) return;
     void getProjectProblems(activeProject.id)
       .then((res) => setProblemItems(res.items ?? []))
       .catch(() => { /* ignora */ });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [problemsBadgeFromDispatcher]);
+  }, [findingsUpdate]);
 
   // Auto-refresh gitState quando arriva GitStatusChanged dal dispatcher.
   // Il payload e' magro (branch, ahead, behind, modified_count) ma noi

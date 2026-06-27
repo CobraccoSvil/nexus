@@ -1056,12 +1056,45 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 progress_guided.remove("repeated_action");
                 progress_diagnosed.remove("repeated_action");
             } else if let Some(label) = ra_label {
+                // Candidato escalation (stesso pattern di esplorazione/G1 cap):
+                // prima di abortire su azione ripetuta, promuovi a un modello piu'
+                // capace invece di arrenderti.
+                let ra_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+                let ra_cur_provider = state.provider_used.clone()
+                    .or_else(|| state.sticky_provider.clone())
+                    .or_else(|| state.provider_override.clone());
+                let ra_cur_model = state.model_used.clone()
+                    .or_else(|| state.sticky_model.clone())
+                    .or_else(|| state.model_override.clone());
+                let ra_picked = if ra_escal < 3 {
+                    let inputs = self
+                        .escalation
+                        .escalation_inputs(
+                            state.user_intent.as_deref(),
+                            ra_cur_provider.as_deref(),
+                            ra_cur_model.as_deref(),
+                        )
+                        .await
+                        .unwrap_or_default();
+                    pick_escalation_model(
+                        &inputs.chain,
+                        ra_cur_provider.as_deref(),
+                        ra_cur_model.as_deref(),
+                        ra_escal,
+                        inputs.provider_in_cooldown,
+                        inputs.cross_provider.as_ref(),
+                    )
+                } else {
+                    None
+                };
                 let dec = pc::decide(&ProgressSignals {
                     repeated_action: Some((label.clone(), ra_count)),
                     already_guided: progress_guided.clone(),
                     already_diagnosed: progress_diagnosed.clone(),
                     force_diagnose_enabled: self.cfg.repeated_action_force_diagnose_enabled,
-                    has_escalation_candidate: false,
+                    has_escalation_candidate: ra_picked.is_some(),
+                    escalations: ra_escal,
+                    max_escalations: 3,
                     ..Default::default()
                 });
                 match dec.action {
@@ -1107,7 +1140,44 @@ indicalo esplicitamente."
                         }
                         .into_opaque());
                     }
-                    Action::Escalate | Action::Proceed => {}
+                    Action::Escalate => {
+                        // Azione ripetuta a vuoto dopo guide/diagnose: promuovi il
+                        // modello e ri-do il turno (stesso pattern del cap G1). Il
+                        // nudge copre anche il caso 'lavoro gia' fatto': invece di
+                        // ripetere la verifica, concludi positivamente.
+                        let pick = ra_picked.expect("Escalate implica candidato presente");
+                        tracing::warn!(
+                            target: "nexus_agent_graph::executor",
+                            to_provider = %pick.provider,
+                            to_model = %pick.model,
+                            "ESCALATE repeated_action -> promuovo modello"
+                        );
+                        let esc_nudge = human_msg(
+                            "Hai ripetuto la stessa azione senza progresso. Ora rispondi tu, \
+che sei un modello piu' capace: cambia approccio ed ESEGUI il prossimo step concreto; \
+se invece il lavoro e' gia' fatto e funzionante (es. l'app si avvia e risponde), NON \
+ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilogo.",
+                        );
+                        let mut extra_out = state.extra.clone();
+                        extra_out.insert("auto_escalations".to_string(), json!(ra_escal + 1));
+                        progress_guided.insert("repeated_action".to_string());
+                        return Ok(StateDelta {
+                            messages: Some(vec![esc_nudge]),
+                            sticky_provider: Some(Some(pick.provider)),
+                            sticky_model: Some(Some(pick.model)),
+                            g1_reroute_count: Some(Some(0)),
+                            action_nudge_count: Some(Some(0)),
+                            pending_tool_uses: Some(Some(vec![])),
+                            stop_reason: Some(Some(StopReason::G1Escalated)),
+                            iterations: Some(Some(iters_in + 1)),
+                            progress_guided_axes: Some(Some(sorted(&progress_guided))),
+                            progress_diagnosed_axes: Some(Some(sorted(&progress_diagnosed))),
+                            extra: Some(extra_out),
+                            ..Default::default()
+                        }
+                        .into_opaque());
+                    }
+                    Action::Proceed => {}
                 }
             }
         }
