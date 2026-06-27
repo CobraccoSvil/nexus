@@ -2211,8 +2211,11 @@ mod tests {
         assert_eq!(cfg.import_staging_dirs, vec!["figma_export", "staging"]);
         assert!((cfg.criteria_timeout_s - 45.0).abs() < f64::EPSILON);
         assert_eq!(cfg.runtime_error_patterns, vec!["ECONNREFUSED", "Traceback"]);
-        // Risolti per-progetto a monte: restano None/vuoto (non ancora portati).
-        assert!(cfg.build_command.is_none());
+        // log_command / endpoint_criterion sono risolti per-progetto a monte: non
+        // ancora portati al config DB, restano vuoto/None. build_command INVECE e'
+        // ora letto dal DB col criterio build (mig 0465): vedi assert sopra. Il
+        // vecchio assert build_command.is_none() era un residuo pre-0465 rimasto
+        // contraddittorio nel cutover (mai eseguito a freddo finora).
         assert!(cfg.log_command.is_empty());
         assert!(cfg.endpoint_criterion.is_none());
     }
