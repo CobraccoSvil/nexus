@@ -938,6 +938,130 @@ async fn resolve_disambiguation_reply(
     )
 }
 
+/// Mappa l'esito del motore nativo Rust ([`crate::native_engine::NativeRunOutcome`])
+/// nello STESSO [`AgentRunResult`] prodotto da `run_via_brain`, cosi' il primario
+/// nativo converge sul finalizzatore unico (regola L): NESSUNA seconda forma di
+/// finalize, NESSUN ramo `if engine` nel persistente.
+///
+/// Gli step sono RICOSTRUITI da `agent_steps` (il grafo Rust li ha gia' persistiti
+/// per-superstep via `PgAgentStepStore`, `ExecMode::Real`): il chiamante marca
+/// `native_steps_persisted=true` cosi' il finalizzatore NON li re-inserisce
+/// (eviterebbe doppioni; gli step_index del grafo sono `iteration*1000+idx`, non
+/// idempotenti con quelli del path Python). Il worklog usa comunque questi step.
+///
+/// Mappatura status (parita' con `derive_status` del path Python):
+/// - HITL (`completed=false`, `resume_at` valorizzato) -> `AwaitingConfirmation`;
+/// - forced-close anti-loop (`loop_*`/`g1_*`) -> `FailedDiagnosed`;
+/// - altrimenti -> `Completed` (il finalizzatore declassa poi l'hollow-senza-lavoro
+///   a `FailedDiagnosed`, identico al path Python).
+async fn native_outcome_to_run_result(
+    db: &PgPool,
+    run_id: Uuid,
+    outcome: crate::native_engine::NativeRunOutcome,
+) -> crate::agent_types::AgentRunResult {
+    use nexus_agent_graph::StopReason;
+
+    // Step gia' persistiti dal grafo: rileggili in ordine stabile (step_index).
+    // Best-effort: un errore di lettura -> nessuno step (il run resta valido).
+    #[derive(sqlx::FromRow)]
+    struct StepRow {
+        step_index: i32,
+        tool_name: String,
+        tool_input: Value,
+        tool_result: Option<String>,
+        status: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    }
+    let rows: Vec<StepRow> = sqlx::query_as::<_, StepRow>(
+        "SELECT step_index, tool_name, tool_input, tool_result, status, created_at \
+         FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
+    )
+    .bind(run_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let steps: Vec<AgentStep> = rows
+        .into_iter()
+        .map(|r| AgentStep {
+            run_id: run_id.to_string(),
+            step_index: r.step_index.max(0) as u32,
+            tool_name: r.tool_name,
+            tool_input: r.tool_input,
+            tool_result: r.tool_result,
+            status: match r.status.as_str() {
+                "failed" => AgentStepStatus::Failed,
+                "running" => AgentStepStatus::Running,
+                "skipped" => AgentStepStatus::Skipped,
+                _ => AgentStepStatus::Completed,
+            },
+            created_at: r.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    // Status canonico dall'esito del grafo.
+    let forced_close = matches!(
+        outcome.stop_reason,
+        Some(
+            StopReason::LoopDetected
+                | StopReason::LoopAbort
+                | StopReason::G1Escalated
+                | StopReason::G1CapReached
+        )
+    );
+    let status = if !outcome.completed && outcome.resume_at.is_some() {
+        AgentRunStatus::AwaitingConfirmation
+    } else if matches!(outcome.stop_reason, Some(StopReason::Error)) {
+        AgentRunStatus::Failed
+    } else if forced_close {
+        AgentRunStatus::FailedDiagnosed
+    } else {
+        AgentRunStatus::Completed
+    };
+
+    // stop_reason in forma snake_case (serde dell'enum) per la colonna agent_runs
+    // / la telemetria: stesso vocabolario del path Python.
+    let stop_reason: Option<String> = outcome
+        .stop_reason
+        .and_then(|r| match serde_json::to_value(r) {
+            Ok(Value::String(s)) => Some(s),
+            _ => None,
+        });
+
+    let provider = outcome.provider_used.clone().unwrap_or_default();
+    let model = outcome.model_used.clone().unwrap_or_default();
+
+    crate::agent_types::AgentRunResult {
+        run_id: run_id.to_string(),
+        status,
+        steps,
+        pending_actions: Vec::new(),
+        final_answer: outcome.final_answer,
+        provider,
+        model,
+        iteration_count: outcome.iterations.max(0) as u32,
+        nexus_override_applied: false,
+        nexus_agent_type: None,
+        nexus_q_value: None,
+        provider_privacy_notice: None,
+        prompt_tokens: outcome.prompt_tokens.max(0) as u32,
+        completion_tokens: outcome.completion_tokens.max(0) as u32,
+        total_tokens: outcome.total_tokens.max(0) as u32,
+        total_cost: outcome.total_cost,
+        last_prompt_tokens: None,
+        error_class: None,
+        stop_reason,
+        // Intent del turno: pilota la decisione hollow/conversational del
+        // finalizzatore (parita' col nexus_task_type del path Python).
+        nexus_task_type: outcome.user_intent,
+        // Il grafo nativo non emette i segnali hollow del path Python (sono una
+        // detection del client SSE): default false. Un completamento vuoto resta
+        // gestito dal finalizzatore (final_answer assente -> placeholder/recap).
+        hollow_completion: false,
+        hollow_no_tools: false,
+        hollow_completion_kind: String::new(),
+    }
+}
+
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
 /// Ritorna `SpawnOutcome::NotStarted` se il progetto non è caricabile (fallback al
 /// singolo turn) e `SpawnOutcome::Disambiguation` se l'intent e' ambiguo (turno
@@ -1876,11 +2000,18 @@ pub(crate) async fn spawn_agent_run(
                 })
                 .execute(&db_clone)
                 .await;
+            // DEBITO 2 (return su Ok) + 3 (finalize): l'esito del PRIMARIO nativo
+            // converge sul medesimo `result` del path Python -> stesso finalizzatore
+            // (regola L: un solo finalize). `native_result=Some` salta il loop di
+            // retry Python (NIENTE doppio-run); `native_steps_persisted` evita la
+            // re-INSERT degli step (il grafo li ha gia' persistiti).
+            let mut native_result: Option<crate::agent_types::AgentRunResult> = None;
+            let mut native_steps_persisted = false;
             if engine == Engine::Rust {
                 // ── Engine::Rust (cutover) — NON instradato in produzione ─────────
                 // select_engine ritorna SEMPRE Python (regola G). Se per dati DB
                 // venisse selezionato il motore nativo come PRIMARIO, lo si esegue;
-                // su QUALUNQUE errore si logga e si prosegue sul motore Python
+                // su QUALUNQUE errore si logga e si cade sul motore Python
                 // (fail-safe), come da confine strangler-fig. Il path nativo riusa
                 // gli stessi input gia' risolti a monte (regola L) + le dipendenze
                 // infra da AppState. NB: lo SHADOW non passa di qui — il suo primario
@@ -1919,8 +2050,15 @@ pub(crate) async fn spawn_agent_run(
                             provider_used = outcome.provider_used.as_deref().unwrap_or("-"),
                             model_used = outcome.model_used.as_deref().unwrap_or("-"),
                             resume_at = outcome.resume_at.as_deref().unwrap_or("-"),
-                            "motore nativo: run eseguito (path non instradato in produzione)"
+                            "motore nativo: run primario eseguito (path non instradato in produzione)"
                         );
+                        // Mappa l'esito sullo stesso AgentRunResult del path Python:
+                        // gli step sono gia' su agent_steps (PgAgentStepStore) ->
+                        // native_steps_persisted=true. Il run termina QUI (no loop
+                        // Python): il finalizzatore sotto opera su questo result.
+                        native_result =
+                            Some(native_outcome_to_run_result(&db_clone, run_id, outcome).await);
+                        native_steps_persisted = true;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1932,6 +2070,14 @@ pub(crate) async fn spawn_agent_run(
                 }
             }
 
+            // L'esito del run (`result`) viene dal PRIMARIO nativo (se ha girato e
+            // concluso) oppure dal loop di retry Python. Un blocco etichettato lascia
+            // il path Python INVARIATO (nessuna re-indentazione): il primario nativo
+            // esce subito con `break 'compute`, evitando il doppio-run (DEBITO 2).
+            let result: crate::agent_types::AgentRunResult = 'compute: {
+            if let Some(r) = native_result.take() {
+                break 'compute r;
+            }
             // ── Loop di retry con fallback automatico tra provider ───────────────
             // Se il run fallisce per "credit too low" / "quota exceeded", il provider
             // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
@@ -2543,9 +2689,14 @@ pub(crate) async fn spawn_agent_run(
                     }),
                 });
             }
-            // Emetti is_final solo DOPO la fine del retry loop, cosi' il
-            // frontend non chiude lo stream SSE dopo il primo tentativo fallito
-            // perdendo i successivi tentativi di fallback.
+            // Espressione finale del blocco 'compute (path Python): `result`.
+            result
+            }; // chiude il blocco 'compute (result = nativo | loop Python)
+            // Emetti is_final solo DOPO la fine del run (loop Python o primario
+            // nativo): e' il terminatore unico dello stream (il `Done`/is_final del
+            // grafo nativo non e' emesso dai nodi, lo emette QUI il finalizzatore,
+            // 1:1 con la chiusura del path Python). Cosi' il frontend non chiude lo
+            // stream SSE dopo il primo tentativo fallito perdendo i fallback.
             let _ = tx_for_brain.send(AgentStepEvent {
                 run_id: run_id.to_string(),
                 step: None,
@@ -2980,9 +3131,15 @@ pub(crate) async fn spawn_agent_run(
             // da chat_agent.rs:121,195 ma non scritta — dashboard "AI Workspace" mostrava
             // sempre storia vuota, reflection non poteva correlare step con outcome).
             // Gli step sono gia' raccolti in-memory dal brain_agent_client durante il loop SSE.
+            // DEBITO 3: il PRIMARIO nativo li ha gia' persistiti per-superstep
+            // (PgAgentStepStore) -> `native_steps_persisted` salta la re-INSERT (gli
+            // step_index del grafo non sono idempotenti con quelli del path Python:
+            // re-inserirli creerebbe doppioni). Il worklog ingest sotto resta SEMPRE
+            // attivo (legge `result.steps`, ricostruiti da DB nel path nativo).
             if !result.steps.is_empty() {
-                for step in &result.steps {
-                    let _ = sqlx::query(
+                if !native_steps_persisted {
+                    for step in &result.steps {
+                        let _ = sqlx::query(
                     "INSERT INTO agent_steps \
                      (id, run_id, step_index, tool_name, tool_input, tool_result, status, created_at) \
                      VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())",
@@ -2995,12 +3152,13 @@ pub(crate) async fn spawn_agent_run(
                 .bind(step.status.as_str())
                 .execute(&db_clone)
                 .await;
+                    }
+                    tracing::debug!(
+                        "agent_run {}: {} step persistiti in agent_steps",
+                        run_id,
+                        result.steps.len()
+                    );
                 }
-                tracing::debug!(
-                    "agent_run {}: {} step persistiti in agent_steps",
-                    run_id,
-                    result.steps.len()
-                );
 
                 // Worklog di sessione (mig 0411): deriva gli eventi operativi
                 // strutturati dagli step e rinfresca il digest provider-neutro
@@ -3498,6 +3656,132 @@ mod tests_select_engine {
     // Qui resta la garanzia che il confine select_engine ritorna SEMPRE Python in
     // Fase 0 (i due `select_engine_*` sopra), cosi' il path nativo non e'
     // raggiungibile in produzione: regressione NULLA.
+
+    // ── DEBITO 3: mapping NativeRunOutcome -> AgentRunResult (finalize unico) ─────
+
+    use nexus_agent_graph::StopReason;
+
+    /// Tabelle minimali per il mapping: agent_runs (guard) + agent_steps.
+    async fn create_steps_tables(pool: &sqlx::PgPool) {
+        sqlx::query("CREATE TABLE agent_runs (id UUID PRIMARY KEY)")
+            .execute(pool)
+            .await
+            .expect("create agent_runs");
+        sqlx::query(
+            "CREATE TABLE agent_steps ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 run_id UUID NOT NULL, \
+                 step_index INT NOT NULL, \
+                 tool_name TEXT NOT NULL, \
+                 tool_input JSONB NOT NULL DEFAULT '{}'::jsonb, \
+                 tool_result TEXT, \
+                 status TEXT NOT NULL DEFAULT 'completed', \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create agent_steps");
+    }
+
+    fn outcome_base() -> crate::native_engine::NativeRunOutcome {
+        crate::native_engine::NativeRunOutcome {
+            completed: true,
+            final_answer: Some("fatto".to_string()),
+            stop_reason: Some(StopReason::EndTurn),
+            provider_used: Some("anthropic".to_string()),
+            model_used: Some("claude-x".to_string()),
+            resume_at: None,
+            iterations: 2,
+            prompt_tokens: 100,
+            completion_tokens: 40,
+            total_tokens: 140,
+            total_cost: 0.0,
+            user_intent: Some("code".to_string()),
+        }
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_completed_legge_step_e_usage(pool: sqlx::PgPool) {
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        // Step gia' persistiti dal grafo (step_index = iteration*1000+idx).
+        for (si, name, st) in [(1000, "read_file", "completed"), (2000, "write_file", "failed")] {
+            sqlx::query(
+                "INSERT INTO agent_steps (run_id, step_index, tool_name, status) VALUES ($1,$2,$3,$4)",
+            )
+            .bind(run)
+            .bind(si)
+            .bind(name)
+            .bind(st)
+            .execute(&pool)
+            .await
+            .expect("insert step");
+        }
+
+        let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.model, "claude-x");
+        assert_eq!(r.iteration_count, 2);
+        assert_eq!(r.prompt_tokens, 100);
+        assert_eq!(r.total_tokens, 140);
+        // Intent del turno -> nexus_task_type (parita' col path Python).
+        assert_eq!(r.nexus_task_type.as_deref(), Some("code"));
+        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
+        // Step ricostruiti da DB in ordine di step_index, con status mappato.
+        assert_eq!(r.steps.len(), 2);
+        assert_eq!(r.steps[0].tool_name, "read_file");
+        assert_eq!(r.steps[0].status, AgentStepStatus::Completed);
+        assert_eq!(r.steps[1].tool_name, "write_file");
+        assert_eq!(r.steps[1].status, AgentStepStatus::Failed);
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_hitl_e_awaiting_confirmation(pool: sqlx::PgPool) {
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        let mut o = outcome_base();
+        o.completed = false;
+        o.resume_at = Some("executor".to_string());
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(
+            r.status,
+            AgentRunStatus::AwaitingConfirmation,
+            "interrupt HITL -> awaiting_confirmation"
+        );
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_forced_close_failed_diagnosed(pool: sqlx::PgPool) {
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        let mut o = outcome_base();
+        o.stop_reason = Some(StopReason::LoopAbort);
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(
+            r.status,
+            AgentRunStatus::FailedDiagnosed,
+            "abort anti-loop -> failed_diagnosed (esito certo)"
+        );
+        assert_eq!(r.stop_reason.as_deref(), Some("loop_abort"));
+    }
 }
 
 #[cfg(test)]

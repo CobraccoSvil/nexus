@@ -162,15 +162,23 @@ impl Default for PlannerConfig {
         Self {
             plan_phase_enabled: false,
             plan_behavior_modes: vec!["automatico".to_string(), "continuo".to_string()],
+            // DEBITO 4 (TODO Fase 5): allineato 1:1 ai `_SAFE_DEFAULTS["plan_intents"]`
+            // del brain (`orchestrator_config.py`, mig 0426): intent canonici del
+            // classifier + hook `fix_semplice`/`fix_complesso`. Era divergente
+            // (`scaffold`/`build`/`frontend` NON sono nei safe-default Python, e
+            // mancavano `scaffold_app`/`architecture`/`fix_*`): un default diverso
+            // produrrebbe un planner eleggibile su intent diversi quando il DB e'
+            // irraggiungibile. Override admin via setting `orchestrator.plan_intents`.
             plan_intents: vec![
                 "code".to_string(),
                 "implement".to_string(),
                 "fix".to_string(),
-                "debug".to_string(),
-                "scaffold".to_string(),
-                "build".to_string(),
                 "refactor".to_string(),
-                "frontend".to_string(),
+                "scaffold_app".to_string(),
+                "architecture".to_string(),
+                "debug".to_string(),
+                "fix_semplice".to_string(),
+                "fix_complesso".to_string(),
             ],
             plan_min_token_budget: 2000,
             planner_prompt_key: "agent.planner.base".to_string(),

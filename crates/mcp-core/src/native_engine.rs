@@ -196,6 +196,11 @@ pub struct NativeRunInput {
 }
 
 /// Esito di un run nativo, normalizzato per il chiamante.
+///
+/// I campi token/iterazioni/intent (oltre ai campi base) servono al call site per
+/// costruire un [`crate::agent_types::AgentRunResult`] COMPLETO e farlo convergere
+/// sullo STESSO finalizzatore del primario Python (regola L: un solo finalize):
+/// `agent_runs` (status/final_answer/usage), `chat_messages`, budget, worklog.
 #[derive(Debug, Clone)]
 pub struct NativeRunOutcome {
     /// `true` se il run e' arrivato a `End` (Completed); `false` se si e' fermato
@@ -211,6 +216,20 @@ pub struct NativeRunOutcome {
     pub model_used: Option<String>,
     /// Nodo da cui riprendere se `completed == false` (HITL): `None` se Completed.
     pub resume_at: Option<String>,
+    /// Numero di iterazioni dell'executor (campo `iterations` dello stato finale).
+    pub iterations: i64,
+    /// Token di prompt cumulativi (per il billing/usage in agent_runs).
+    pub prompt_tokens: i64,
+    /// Token di completion cumulativi.
+    pub completion_tokens: i64,
+    /// Token totali cumulativi.
+    pub total_tokens: i64,
+    /// Costo totale stimato in USD (0.0 se non calcolato a monte).
+    pub total_cost: f64,
+    /// Intent del turno (campo `user_intent` dello stato): pilota la decisione
+    /// hollow/conversational del finalizzatore (parita' col `nexus_task_type`
+    /// che il primario Python propaga nell'end_turn).
+    pub user_intent: Option<String>,
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -852,24 +871,28 @@ async fn run_engine(
 }
 
 /// Mappa lo [`StepOutcome`] del motore nel [`NativeRunOutcome`] del chiamante.
+/// Estrae anche usage/iterazioni/intent dallo stato finale (servono al
+/// finalizzatore condiviso, regola L).
 fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
-    match outcome {
-        StepOutcome::Completed(state) => NativeRunOutcome {
-            completed: true,
-            final_answer: state.result.clone(),
-            stop_reason: state.stop_reason,
-            provider_used: state.provider_used.clone(),
-            model_used: state.model_used.clone(),
-            resume_at: None,
-        },
-        StepOutcome::Interrupted { state, resume_at } => NativeRunOutcome {
-            completed: false,
-            final_answer: state.result.clone(),
-            stop_reason: state.stop_reason,
-            provider_used: state.provider_used.clone(),
-            model_used: state.model_used.clone(),
-            resume_at: Some(resume_at.as_label().to_string()),
-        },
+    let (state, completed, resume_at) = match outcome {
+        StepOutcome::Completed(state) => (state, true, None),
+        StepOutcome::Interrupted { state, resume_at } => {
+            (state, false, Some(resume_at.as_label().to_string()))
+        }
+    };
+    NativeRunOutcome {
+        completed,
+        final_answer: state.result.clone(),
+        stop_reason: state.stop_reason,
+        provider_used: state.provider_used.clone(),
+        model_used: state.model_used.clone(),
+        resume_at,
+        iterations: state.iterations.unwrap_or(0),
+        prompt_tokens: state.prompt_tokens.unwrap_or(0),
+        completion_tokens: state.completion_tokens.unwrap_or(0),
+        total_tokens: state.total_tokens.unwrap_or(0),
+        total_cost: state.total_cost_usd.unwrap_or(0.0),
+        user_intent: state.user_intent.clone(),
     }
 }
 

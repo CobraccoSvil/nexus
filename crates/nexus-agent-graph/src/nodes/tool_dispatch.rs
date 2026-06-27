@@ -102,7 +102,8 @@ use crate::decisions::tool_dispatch::{
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::runtime::ports::{
-    AgentStepStore, ContextOffload, ExecMode, RunControlStore, ToolCall, TodoStore, ToolExecutor,
+    AgentStepStore, ContextOffload, ExecMode, RunControlStore, SseEvent, ToolCall, TodoStore,
+    ToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, StopReason};
@@ -767,6 +768,21 @@ dell'utente.";
             .map(|(b, r)| tool_executed_meta_step(b, r.is_error, exec_provider, exec_model))
             .collect();
 
+        // ── SSE tool_result verso il frontend (parita' 1:1 con run_via_brain) ──
+        // Un evento per ogni risultato, correlato alla ToolUse via `tool_call_id`,
+        // 1:1 col `tool_result` del brain. Emesso DOPO i cap/troncamenti (5/9)
+        // cosi' il contenuto inviato all'utente coincide con quello consegnato al
+        // modello. Best-effort/infallibile: in shadow il sink iniettato nel ctx e'
+        // `NullEventSink` (no-op) -> nessun evento esce in Replay (gate gia'
+        // assicurato a monte da `build_native_engine`, qui niente `if shadow`).
+        for r in &results {
+            ctx.emit.emit(SseEvent::ToolResult {
+                tool_call_id: r.tool_use_id.clone(),
+                content: r.content.clone(),
+                is_error: r.is_error,
+            });
+        }
+
         // ── _dispatch_updates ─────────────────────────────────────────────────
         let mut delta = StateDelta {
             messages: Some(vec![tool_msg]),
@@ -1063,10 +1079,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::runtime::ports::{PortError, ToolOutcome};
+    use crate::runtime::ports::{PortError, SseEvent, ToolOutcome};
     use crate::runtime::test_doubles::{
-        NullEventSink, StubAgentStepStore, StubContextOffload, StubLlmGateway, StubRunControlStore,
-        StubTodoStore,
+        NullEventSink, RecordingEventSink, StubAgentStepStore, StubContextOffload, StubLlmGateway,
+        StubRunControlStore, StubTodoStore,
     };
     use crate::runtime::AgentNodeCtx;
     use crate::routing::config::RoutingConfig;
@@ -1129,6 +1145,16 @@ mod tests {
     }
 
     fn ctx_with(shadow: bool, cancel: CancellationToken) -> AgentNodeCtx {
+        ctx_with_emit(shadow, cancel, Arc::new(NullEventSink))
+    }
+
+    /// Come [`ctx_with`] ma con un [`EventSink`] iniettabile (per asserire gli
+    /// emit `ToolResult` del nodo): i test passano un `RecordingEventSink`.
+    fn ctx_with_emit(
+        shadow: bool,
+        cancel: CancellationToken,
+        emit: Arc<dyn crate::runtime::ports::EventSink>,
+    ) -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy");
@@ -1136,7 +1162,7 @@ mod tests {
             db: pool,
             llm: Arc::new(StubLlmGateway::with_text("non usato")),
             tools: Arc::new(MapToolExecutor::new()),
-            emit: Arc::new(NullEventSink),
+            emit,
             cfg: RoutingConfig::default(),
             cancel,
             run_id: Uuid::new_v4(),
@@ -1215,6 +1241,80 @@ mod tests {
         assert_eq!(out.pending_tool_uses, Some(vec![]));
         // Nessuno step persistito (uscita prima del dispatch).
         assert!(steps.steps.lock().unwrap().is_empty());
+    }
+
+    // ── DEBITO 3 (SSE primario): emit ToolResult per ogni risultato ──────────────
+
+    /// Dopo l'esecuzione, il nodo emette un `SseEvent::ToolResult` per ogni tool,
+    /// correlato via `tool_call_id`, con `is_error` coerente (ok vs errore).
+    #[tokio::test]
+    async fn tool_dispatch_emette_tool_result_per_ogni_tool() {
+        let tools = Arc::new(
+            MapToolExecutor::new()
+                .with(
+                    "read_file",
+                    ToolOutcome {
+                        tool_call_id: "a".into(),
+                        content: json!("contenuto ok"),
+                        is_error: false,
+                        ..Default::default()
+                    },
+                )
+                .with(
+                    "run_command",
+                    ToolOutcome {
+                        tool_call_id: "b".into(),
+                        content: json!("boom"),
+                        is_error: true,
+                        ..Default::default()
+                    },
+                ),
+        );
+        let (n, _steps, _rc) = node(ToolDispatchConfig::default(), tools);
+        let sink = Arc::new(RecordingEventSink::default());
+        let ctx = ctx_with_emit(false, CancellationToken::new(), sink.clone());
+        let st = state_with_pending(vec![
+            pending_tool("a", "read_file", json!({"path": "x"})),
+            pending_tool("b", "run_command", json!({"cmd": "ls"})),
+        ]);
+        let _ = n.run(&st, &ctx).await.expect("run ok");
+
+        let events = sink.events.lock().expect("lock");
+        let results: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| matches!(e, SseEvent::ToolResult { .. }))
+            .collect();
+        assert_eq!(results.len(), 2, "un ToolResult per tool, eventi: {events:?}");
+        assert!(
+            results.iter().any(|e| matches!(
+                e,
+                SseEvent::ToolResult { tool_call_id, is_error, .. }
+                    if tool_call_id == "a" && !*is_error
+            )),
+            "read_file -> ToolResult ok"
+        );
+        assert!(
+            results.iter().any(|e| matches!(
+                e,
+                SseEvent::ToolResult { tool_call_id, is_error, .. }
+                    if tool_call_id == "b" && *is_error
+            )),
+            "run_command -> ToolResult errore"
+        );
+    }
+
+    /// Shadow intatto: in shadow il sink iniettato e' NullEventSink (no-op). Qui
+    /// verifichiamo la proprieta' a livello di nodo: con NullEventSink (sink dello
+    /// shadow) il run non panica e nessun emit e' osservabile (by-construction).
+    #[tokio::test]
+    async fn tool_dispatch_shadow_sink_noop() {
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(ToolDispatchConfig::default(), tools);
+        let ctx = ctx_with(true, CancellationToken::new());
+        let st = state_with_pending(vec![pending_tool("a", "read_file", json!({}))]);
+        // shadow=true + NullEventSink (la combinazione di build_native_engine):
+        // gli emit cadono nel no-op, nessun panic.
+        let _ = n.run(&st, &ctx).await.expect("run shadow ok");
     }
 
     // ── (1) superseded via RunControlStore -> stop_reason superseded ─────────────

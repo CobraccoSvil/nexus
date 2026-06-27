@@ -1663,6 +1663,35 @@ modo piu' specifico."
             nudge_count += 1;
         }
 
+        // ── SSE verso il frontend (parita' 1:1 con run_via_brain) ─────────────
+        // L'executor ha deciso l'esito del turno: emette gli eventi che l'utente
+        // si aspetta dal canale chat. Best-effort, infallibile (il sink no-op
+        // dello shadow scarta tutto: in Replay nessun evento esce, garanzia gia'
+        // assicurata dal `NullEventSink` iniettato nel ctx shadow da
+        // `build_native_engine`; qui non si re-implementa alcun gate `shadow`).
+        //  - ToolUse: un evento per ogni blocco tool_use deciso (mappa il `tool_use`
+        //    del brain, che emette uno step Running per ogni tool richiesto).
+        //  - EndTurn: turno concluso senza tool pendenti (il modello ha terminato
+        //    la generazione). Il terminatore `Done` (is_final) NON e' dell'executor:
+        //    lo emette il finalizzatore del run quando il grafo raggiunge End
+        //    (l'executor puo' essere riattraversato in turni successivi), 1:1 con
+        //    `run_via_brain` che mette `is_final=true` solo a fine retry loop.
+        for tu in &pending_tool_uses {
+            let id = tu.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let name = tu.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            ctx.emit.emit(SseEvent::ToolUse {
+                id,
+                name,
+                input: tu.get("input").cloned().unwrap_or(Value::Null),
+            });
+        }
+        if pending_tool_uses.is_empty() && stop_reason_enum == StopReason::EndTurn {
+            ctx.emit.emit(SseEvent::EndTurn);
+        }
+
         let mut delta = StateDelta {
             messages: Some(vec![assistant_msg]),
             result: Some(Some(final_result)),

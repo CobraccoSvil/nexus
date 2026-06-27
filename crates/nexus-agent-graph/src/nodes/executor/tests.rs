@@ -14,11 +14,11 @@ use uuid::Uuid;
 
 use super::*;
 use crate::routing::config::RoutingConfig;
-use crate::runtime::ports::{LlmResponse, LlmUsage};
+use crate::runtime::ports::{LlmResponse, LlmUsage, SseEvent};
 use crate::runtime::test_doubles::{
-    NullEventSink, StubAgentStepStore, StubBillingCooldownPort, StubEscalationPort, StubLlmGateway,
-    StubMetaStepStore, StubModelUpscalePort, StubNextActionsDeriver, StubRunControlStore,
-    StubToolExecutor,
+    NullEventSink, RecordingEventSink, StubAgentStepStore, StubBillingCooldownPort,
+    StubEscalationPort, StubLlmGateway, StubMetaStepStore, StubModelUpscalePort,
+    StubNextActionsDeriver, StubRunControlStore, StubToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{ContentBlock, MessageContent, ToolUse};
@@ -41,6 +41,16 @@ fn cfg_resolved() -> ExecutorConfig {
 
 /// Ctx con un gateway LLM dato e shadow configurabile.
 fn ctx_with(llm: Arc<dyn crate::runtime::ports::LlmGateway>, shadow: bool) -> AgentNodeCtx {
+    ctx_with_emit(llm, shadow, Arc::new(NullEventSink))
+}
+
+/// Come [`ctx_with`] ma con un [`EventSink`] iniettabile (per asserire gli emit
+/// SSE del nodo): i test passano un `RecordingEventSink` e leggono `events`.
+fn ctx_with_emit(
+    llm: Arc<dyn crate::runtime::ports::LlmGateway>,
+    shadow: bool,
+    emit: Arc<dyn crate::runtime::ports::EventSink>,
+) -> AgentNodeCtx {
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://test:test@127.0.0.1:1/test")
         .expect("connect_lazy");
@@ -48,7 +58,7 @@ fn ctx_with(llm: Arc<dyn crate::runtime::ports::LlmGateway>, shadow: bool) -> Ag
         db: pool,
         llm,
         tools: Arc::new(StubToolExecutor::with_success(json!("{}"))),
-        emit: Arc::new(NullEventSink),
+        emit,
         cfg: RoutingConfig::default(),
         cancel: CancellationToken::new(),
         run_id: Uuid::new_v4(),
@@ -394,6 +404,110 @@ async fn happy_path_end_turn_testuale() {
     assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
     assert_eq!(out.result.as_deref(), Some("Ecco la risposta finale."));
     assert!(out.pending_tool_uses.unwrap().is_empty());
+}
+
+/// DEBITO 3 (SSE primario): quando il modello chiede un tool, l'executor emette
+/// `SseEvent::ToolUse` con id/name/input. Nessun `EndTurn` (il turno non e' chiuso).
+#[tokio::test]
+async fn executor_emette_tool_use_su_pending() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let canned = LlmResponse {
+        content: String::new(),
+        tool_calls: vec![ToolUse {
+            id: "tc1".into(),
+            name: "write_file".into(),
+            input: json!({"path": "a.rs"}),
+        }],
+        usage: LlmUsage::default(),
+        stop_reason: Some("tool_use".into()),
+        ..Default::default()
+    };
+    let llm = Arc::new(StubLlmGateway {
+        canned,
+        error: None,
+        seen: std::sync::Mutex::new(vec![]),
+    });
+    let sink = Arc::new(RecordingEventSink::default());
+    let ctx = ctx_with_emit(llm, false, sink.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("scrivi a.rs")],
+        action_oriented: Some(true),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        token_budget: Some(400),
+        ..Default::default()
+    };
+    let _ = n.run(&state, &ctx).await.expect("run");
+    let events = sink.events.lock().expect("lock");
+    // Almeno un ToolUse col tool richiesto; nessun EndTurn (turno con tool).
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SseEvent::ToolUse { name, id, .. } if name == "write_file" && id == "tc1"
+        )),
+        "atteso SseEvent::ToolUse(write_file), eventi: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SseEvent::EndTurn)),
+        "nessun EndTurn quando il turno richiede un tool"
+    );
+}
+
+/// DEBITO 3 (SSE primario): turno conversazionale concluso (end_turn senza tool)
+/// -> l'executor emette `SseEvent::EndTurn`. NON emette `Done` (il terminatore
+/// is_final e' del finalizzatore, non di un nodo intermedio).
+#[tokio::test]
+async fn executor_emette_end_turn_su_chiusura_testuale() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("Ecco la risposta finale."));
+    let sink = Arc::new(RecordingEventSink::default());
+    let ctx = ctx_with_emit(llm, false, sink.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let _ = n.run(&state, &ctx).await.expect("run");
+    let events = sink.events.lock().expect("lock");
+    assert!(
+        events.iter().any(|e| matches!(e, SseEvent::EndTurn)),
+        "atteso SseEvent::EndTurn sul turno concluso, eventi: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SseEvent::Done)),
+        "il terminatore Done non e' emesso da un nodo (lo emette il finalizzatore)"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SseEvent::ToolUse { .. })),
+        "nessun ToolUse su un turno solo-testo"
+    );
+}
+
+/// DEBITO 3 (shadow intatto): in shadow l'EventSink iniettato nel ctx e' il no-op
+/// (NullEventSink), quindi un `RecordingEventSink` collegato al ramo Real NON
+/// verrebbe usato. Qui verifichiamo la PROPRIETA' a livello di nodo: con
+/// `NullEventSink` (il sink dello shadow) nessun emit e' osservabile.
+#[tokio::test]
+async fn shadow_sink_noop_non_emette() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("risposta"));
+    // shadow=true + NullEventSink: e' la combinazione che build_native_engine
+    // costruisce per il run shadow. Un emit qui e' un no-op by-construction.
+    let ctx = ctx_with(llm, true);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        action_oriented: Some(false),
+        ..Default::default()
+    };
+    // Non deve panicare: gli emit cadono nel no-op. (La garanzia che lo shadow
+    // riceva NullEventSink e' nel punto unico build_native_engine.)
+    let _ = n.run(&state, &ctx).await.expect("run shadow");
 }
 
 #[tokio::test]
