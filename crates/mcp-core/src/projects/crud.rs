@@ -549,6 +549,12 @@ pub async fn delete_project(
     let project_name = context.details.name.clone();
     let project_slug = context.details.slug.clone();
 
+    // Droppa i database applicativi provisionati internamente da Nexus PRIMA del
+    // DELETE: il CASCADE rimuove anche project_database_config, quindi dopo il
+    // DELETE non si saprebbe piu' quali database fisici appartenevano al progetto.
+    // Best-effort idempotente: errori non bloccano (vedi `projects::cleanup`).
+    let db_drop = super::cleanup::drop_internal_app_databases(&state.db, project_id).await;
+
     // Elimina dal DB (cascade su workspaces, repositories, agent_runs, ecc.)
     sqlx::query("DELETE FROM projects WHERE id = $1 AND owner_user_id = $2")
         .bind(project_id)
@@ -611,6 +617,9 @@ pub async fn delete_project(
         // points). Sempre presente: best-effort idempotente, errori dei singoli
         // step non bloccano l'eliminazione.
         "externalCleanup": external_cleanup,
+        // Esito del drop dei database applicativi interni (postgres provisionati
+        // da Nexus). Best-effort: i database external non vengono toccati.
+        "databaseDrop": db_drop,
     })))
 }
 

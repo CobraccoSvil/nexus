@@ -39,6 +39,12 @@ pub use config::{
     set_primary_project_db_connection, set_project_db_config,
 };
 pub use connection::{detect_project_db, test_project_db_connection};
+
+// Punto unico (regola L) per estrarre il bersaglio fisico (host, port, dbname) da
+// una connection string / DSN postgres. Riusato dal cleanup di cancellazione
+// progetto (`projects::cleanup::drop_internal_app_databases`) per applicare i
+// guard di sicurezza sul nome del database prima del DROP.
+pub(crate) use shared::pg_physical_target;
 pub use migrations::{
     apply_project_migrations, list_project_migrations, request_ddl_override,
     rollback_project_migration,

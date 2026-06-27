@@ -480,6 +480,203 @@ async fn qdrant_delete_by_project(
     Ok(inner_status)
 }
 
+// ── Drop dei database applicativi interni ────────────────────────────────────
+
+/// Esito del drop dei database applicativi provisionati internamente da Nexus.
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct DbDropResult {
+    /// Nomi dei database droppati con successo.
+    pub dropped: Vec<String>,
+    /// Messaggi di errore o skip (best-effort, non bloccanti).
+    pub errors: Vec<String>,
+}
+
+/// Verifica se un nome di database e' ammesso come bersaglio di DROP.
+///
+/// Guard di sicurezza (regola E): mai droppare i database di sistema Postgres
+/// (`postgres`, `template0`, `template1`) ne' qualsiasi database di
+/// infrastruttura Nexus (prefissi `ideai`/`nexus`). Vuoto/whitespace sempre
+/// rifiutato. Il match e' case-insensitive.
+fn db_name_droppable(dbname: &str) -> bool {
+    let name = dbname.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    if matches!(name.as_str(), "postgres" | "template0" | "template1") {
+        return false;
+    }
+    if name.starts_with("ideai") || name.starts_with("nexus") {
+        return false;
+    }
+    true
+}
+
+/// Droppa i database applicativi che Nexus ha provisionato internamente per il
+/// progetto (`engine='postgres' AND hosting_mode='internal'`).
+///
+/// DA CHIAMARE PRIMA del `DELETE FROM projects`: il CASCADE rimuove anche
+/// `project_database_config`, quindi dopo il DELETE non si potrebbe piu' sapere
+/// quali database fisici appartenevano al progetto. I database `external` NON
+/// vengono toccati (sono di proprieta' dell'utente, non provisionati da Nexus).
+///
+/// Parsing del DSN (regola L): il `connection_secret` e' la URL postgres in
+/// chiaro come bytea (vedi `provision_internal_core`, che la scrive con
+/// `url.as_bytes()`). Il bersaglio fisico (host, port, dbname) viene estratto dal
+/// PUNTO UNICO `project_db_routes::pg_physical_target`; le credenziali vengono
+/// riusate parsando lo stesso DSN con `PgConnectOptions` di sqlx, senza
+/// re-implementare il parsing di user/password.
+///
+/// Drop: ci si connette al MEDESIMO server (host:port, stesse credenziali) ma al
+/// database di servizio `postgres` (lo stesso owner puo' droppare il proprio DB)
+/// ed esegue `DROP DATABASE IF EXISTS "<dbname>" WITH (FORCE)` (FORCE termina le
+/// connessioni residue, Postgres 13+).
+///
+/// Best-effort idempotente: ogni errore/skip e' loggato (WARN) e accumulato in
+/// `DbDropResult`, non blocca la cancellazione del progetto.
+pub async fn drop_internal_app_databases(db: &PgPool, project_id: Uuid) -> DbDropResult {
+    use std::str::FromStr;
+
+    let mut out = DbDropResult::default();
+
+    // Legge le sole connessioni interne postgres. `connection_secret` e' bytea.
+    let rows: Vec<(String, Option<Vec<u8>>)> = match sqlx::query_as(
+        r#"SELECT name, connection_secret
+           FROM project_database_config
+           WHERE project_id = $1
+             AND engine = 'postgres'
+             AND hosting_mode = 'internal'"#,
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                target: "project_cleanup",
+                project_id = %project_id,
+                "drop_internal_app_databases: query config fallita: {e}"
+            );
+            out.errors.push(format!("query project_database_config: {e}"));
+            return out;
+        }
+    };
+
+    for (name, secret) in rows {
+        let dsn = secret
+            .and_then(|b| String::from_utf8(b).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(dsn) = dsn else {
+            tracing::warn!(
+                target: "project_cleanup",
+                project_id = %project_id,
+                conn = %name,
+                "drop_internal_app_databases: connection_secret vuoto/non utf8, skip"
+            );
+            out.errors
+                .push(format!("connessione '{name}': secret vuoto o non leggibile"));
+            continue;
+        };
+
+        // Punto unico (regola L): estrazione host/port/dbname dal DSN.
+        let Some((host, port, dbname)) = crate::project_db_routes::pg_physical_target(&dsn) else {
+            tracing::warn!(
+                target: "project_cleanup",
+                project_id = %project_id,
+                conn = %name,
+                "drop_internal_app_databases: DSN non parsabile come postgres, skip"
+            );
+            out.errors
+                .push(format!("connessione '{name}': DSN non parsabile"));
+            continue;
+        };
+
+        // Guard di sicurezza (regola E): mai i DB di sistema o l'infrastruttura.
+        if !db_name_droppable(&dbname) {
+            tracing::warn!(
+                target: "project_cleanup",
+                project_id = %project_id,
+                conn = %name,
+                dbname = %dbname,
+                "drop_internal_app_databases: dbname protetto da guard, skip"
+            );
+            out.errors
+                .push(format!("database '{dbname}': protetto (guard sicurezza)"));
+            continue;
+        }
+
+        // Riusa le credenziali del DSN salvato; punta al database di servizio
+        // 'postgres' per poter eseguire il DROP del database applicativo.
+        let admin_opts = match sqlx::postgres::PgConnectOptions::from_str(&dsn) {
+            Ok(o) => o.database("postgres"),
+            Err(e) => {
+                tracing::warn!(
+                    target: "project_cleanup",
+                    project_id = %project_id,
+                    conn = %name,
+                    "drop_internal_app_databases: PgConnectOptions invalide: {e}"
+                );
+                out.errors
+                    .push(format!("connessione '{name}': opzioni non valide"));
+                continue;
+            }
+        };
+
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_with(admin_opts)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    target: "project_cleanup",
+                    project_id = %project_id,
+                    host = %host,
+                    port = port,
+                    "drop_internal_app_databases: connessione al server app fallita: {e}"
+                );
+                out.errors.push(format!(
+                    "server {host}:{port} (db '{dbname}'): connessione fallita"
+                ));
+                continue;
+            }
+        };
+
+        // Il dbname e' gia' validato dai guard; quoting con doppi apici per
+        // l'identificatore (non e' interpolazione di un valore utente arbitrario).
+        let drop_sql = format!("DROP DATABASE IF EXISTS \"{dbname}\" WITH (FORCE)");
+        match sqlx::query(&drop_sql).execute(&pool).await {
+            Ok(_) => {
+                tracing::info!(
+                    target: "project_cleanup",
+                    project_id = %project_id,
+                    host = %host,
+                    port = port,
+                    dbname = %dbname,
+                    "drop_internal_app_databases: database applicativo droppato"
+                );
+                out.dropped.push(dbname);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "project_cleanup",
+                    project_id = %project_id,
+                    dbname = %dbname,
+                    "drop_internal_app_databases: DROP DATABASE fallito: {e}"
+                );
+                out.errors
+                    .push(format!("DROP DATABASE \"{dbname}\": {e}"));
+            }
+        }
+        pool.close().await;
+    }
+
+    out
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -518,5 +715,34 @@ mod tests {
     fn slug_bad_first() {
         assert!(validate_slug("-foo").is_err());
         assert!(validate_slug(".foo").is_err());
+    }
+
+    #[test]
+    fn db_droppable_rifiuta_sistema_e_infra() {
+        // Database di sistema Postgres: mai droppabili.
+        assert!(!db_name_droppable("postgres"));
+        assert!(!db_name_droppable("Postgres"));
+        assert!(!db_name_droppable("template0"));
+        assert!(!db_name_droppable("template1"));
+        // Infrastruttura Nexus (prefissi riservati, case-insensitive).
+        assert!(!db_name_droppable("ideai"));
+        assert!(!db_name_droppable("ideai_meta"));
+        assert!(!db_name_droppable("IDEAI-postgres-nexus"));
+        assert!(!db_name_droppable("nexus"));
+        assert!(!db_name_droppable("nexus_main"));
+        assert!(!db_name_droppable("Nexus"));
+        // Vuoto / solo whitespace: rifiutato.
+        assert!(!db_name_droppable(""));
+        assert!(!db_name_droppable("   "));
+    }
+
+    #[test]
+    fn db_droppable_accetta_db_applicativi() {
+        // Database applicativi reali provisionati per un progetto utente.
+        assert!(db_name_droppable("beauty_book_app"));
+        assert!(db_name_droppable("freelance_app"));
+        assert!(db_name_droppable("myproject_app"));
+        // Nome che contiene (ma non inizia con) un prefisso riservato: ammesso.
+        assert!(db_name_droppable("my_nexus_clone_app"));
     }
 }
