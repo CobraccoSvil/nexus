@@ -1112,6 +1112,59 @@ export function useChat(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, sessionId]);
 
+  // Watchdog di liveness (robustezza, regola H). subscribeAgentStream ha gia'
+  // reconnect+poll+replay, MA tutti reagiscono a `onerror` dell'EventSource. Se
+  // lo stream muore in modo SILENZIOSO — tab in background sospeso dal browser,
+  // connessione zombie che non emette onerror — onDone/handleDisconnect non
+  // scattano mai e la UI resta su "Sto interrogando" all'infinito anche se il run
+  // e' gia' terminato nel DB (incidente Beauty-Book: run completed/failed, ma la
+  // chat congelata). Questo watchdog e' INDIPENDENTE dallo stream: mentre c'e' un
+  // run attivo, riconcilia con lo stato reale del DB (a intervalli regolari e al
+  // ritorno sul tab) e, se terminale, sblocca la UI come farebbe onDone. Le
+  // chiamate di chiusura sono idempotenti: una corsa con onDone e' innocua.
+  useEffect(() => {
+    if (!isLoading || !sessionId) return;
+    const runId = agentRun?.runId;
+    if (!runId) return;
+    let cancelled = false;
+
+    const reconcile = async () => {
+      if (cancelled || (typeof document !== "undefined" && document.visibilityState === "hidden")) {
+        return;
+      }
+      try {
+        const finalRun = await getAgentRun(runId);
+        if (cancelled || !isStatusTerminal(finalRun.status)) return;
+        // Run gia' terminato nel DB ma lo stream non ce l'ha notificato: chiudi.
+        setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
+        setAgentStepsMap((prev) => new Map(prev).set(runId, finalRun.steps));
+        setAgentRun(null);
+        setAgentSteps([]);
+        setIsLoading(false);
+        const syntheticMsg = createTerminalMessage(finalRun, projectId);
+        setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
+      } catch {
+        // Backend irraggiungibile: riprova al tick successivo (non arrenderti).
+      }
+    };
+
+    const interval = setInterval(reconcile, 20_000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void reconcile();
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisible);
+    }
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisible);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoading, sessionId, agentRun?.runId, projectId]);
+
   /** Chiude la modal di indicizzazione KB senza eseguire alcuna richiesta.
    *  Usato sia dal pulsante "Salta tutto" sia dopo il completamento di una
    *  indicizzazione confermata. */
