@@ -111,6 +111,35 @@ pub fn is_provider_in_cooldown(provider: &str) -> bool {
     false
 }
 
+/// True se la `reason` di un cooldown indica credito/quota esaurito (billing),
+/// non un errore transiente (rate-limit/timeout/rete). Punto unico (regola L)
+/// della classificazione billing di una reason di cooldown: stessa semantica
+/// della nota di esaurimento mostrata all'utente.
+pub fn reason_is_billing(reason: &str) -> bool {
+    let r = reason.to_lowercase();
+    r.contains("credit") || r.contains("quota") || r.contains("billing") || r.contains("balance")
+}
+
+/// True se il provider e' ATTUALMENTE in cooldown e la causa e' billing
+/// (credito/quota esaurito). Il re-probe dei provider in billing cooldown e'
+/// gestito ESCLUSIVAMENTE dal loop dedicato `billing_cooldown_recovery_loop`
+/// (re-probe a `BILLING_REPROBE_INTERVAL_S`): il probe periodico generico
+/// (`run_one_round`) li salta, cosi' non rinnova il cooldown lungo ne' martella
+/// il gateway con 500 a cascata (incidente Beauty-Book). I cooldown transient
+/// restano invece pingati dal probe periodico per il recovery rapido.
+pub fn is_provider_in_billing_cooldown(provider: &str) -> bool {
+    if !is_provider_in_cooldown(provider) {
+        return false;
+    }
+    let key = provider.to_lowercase();
+    PROVIDER_COOLDOWN_REASONS
+        .get()
+        .and_then(|s| s.lock().ok())
+        .and_then(|m| m.get(&key).cloned())
+        .map(|r| reason_is_billing(&r))
+        .unwrap_or(false)
+}
+
 /// Registra un fallimento per il provider e restituisce true se la soglia
 /// del circuit breaker e' stata superata (3+ fallimenti in 60s).
 fn record_provider_failure(provider: &str) -> bool {
@@ -666,6 +695,35 @@ mod tests {
             entry.unwrap().2.as_deref(),
             Some("billing_error from redis")
         );
+    }
+
+    #[test]
+    fn reason_is_billing_classifica_credito_quota() {
+        assert!(reason_is_billing("credit_balance_too_low"));
+        assert!(reason_is_billing("quota_exceeded"));
+        assert!(reason_is_billing("insufficient balance"));
+        assert!(reason_is_billing("BILLING required"));
+        assert!(!reason_is_billing("rate_limit"));
+        assert!(!reason_is_billing("timeout"));
+        assert!(!reason_is_billing("connection_error"));
+    }
+
+    #[test]
+    fn billing_cooldown_distinto_da_transient() {
+        // Il probe periodico salta i billing (gestiti dal recovery loop) ma
+        // continua a pingare i transient. is_provider_in_billing_cooldown e'
+        // il discriminante.
+        let p_bill = "__test_billing_cd_probe";
+        let p_trans = "__test_transient_cd_probe";
+        assert!(!is_provider_in_billing_cooldown(p_bill));
+        restore_cooldown(p_bill, 3600, "credit_balance_too_low");
+        assert!(is_provider_in_billing_cooldown(p_bill));
+        restore_cooldown(p_trans, 60, "rate_limit");
+        assert!(is_provider_in_cooldown(p_trans));
+        assert!(!is_provider_in_billing_cooldown(p_trans));
+        remove_cooldown(p_bill);
+        remove_cooldown(p_trans);
+        assert!(!is_provider_in_billing_cooldown(p_bill));
     }
 
     #[test]

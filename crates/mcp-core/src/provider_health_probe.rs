@@ -128,18 +128,27 @@ fn round_victims_drain() -> Vec<String> {
 
 /// Esegue un ciclo completo di probe per tutti i provider.
 ///
-/// Anche i provider in cooldown vengono pingati (a cadenza ridotta) per
-/// rilevare il recovery automatico: senza questo, un provider che torna
-/// a funzionare dopo billing recharge resterebbe "down" fino alla scadenza
-/// naturale del cooldown (anche 6h). Il costo extra e' trascurabile —
-/// stiamo parlando di una chiamata da ~1 token ogni 5 minuti.
+/// I provider in cooldown TRANSIENT (rate-limit/timeout/rete) vengono pingati
+/// per rilevare il recovery rapido. I provider in cooldown BILLING (credito/
+/// quota esaurito) vengono invece SALTATI: il loro re-probe e' gestito dal loop
+/// dedicato `billing_cooldown_recovery_loop` (ogni BILLING_REPROBE_INTERVAL_S).
+/// Sondarli ANCHE qui ogni ~5 min rinnovava il cooldown lungo (6h) e generava
+/// 500 a cascata sul gateway (incidente Beauty-Book): regola L, un solo punto
+/// ri-testa i billing.
 async fn run_one_round(orchestrator: &Orchestrator, db: &PgPool) {
     let _ = round_victims_drain(); // reset accumulator
     for provider in PROBED_PROVIDERS {
+        if crate::provider_cooldown::is_provider_in_billing_cooldown(provider) {
+            tracing::debug!(
+                "provider_health_probe: skip {provider} (billing cooldown — \
+                 gestito dal recovery loop dedicato)"
+            );
+            continue;
+        }
         let in_cooldown = is_provider_in_cooldown(provider);
         if in_cooldown {
             tracing::debug!(
-                "provider_health_probe: probe {provider} (era in cooldown — test recovery)"
+                "provider_health_probe: probe {provider} (era in cooldown transient — test recovery)"
             );
         }
         probe_one(orchestrator, db, provider).await;
