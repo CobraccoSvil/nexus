@@ -560,6 +560,15 @@ async fn load_executor_config(db: &PgPool, provider: &str, model: &str) -> Execu
         upscale_enabled: setting_bool(db, "agent.upscale.enabled", d.upscale_enabled).await,
         upscale_overhead_ratio: setting_f64(db, "agent.upscale.target_overhead_ratio", d.upscale_overhead_ratio).await,
         verification_directive_enabled: setting_bool(db, "agent.verification_directive_enabled", d.verification_directive_enabled).await,
+        // ── tool_choice forcing (ADR 0018 leva 2, mig 0300) ───────────────────
+        // Il porting Rust aveva PERSO questi tre campi: restavano ai Default del
+        // nodo (enabled=false, style=None) -> il force-action era INERTE per ogni
+        // provider (force_now sempre false). Ora il DB e' di nuovo l'unica fonte
+        // (regola G): i flag dai settings (default-DB-down nel `Default`), lo
+        // stile dal catalog via punto unico `capability::resolve_tool_choice_style`.
+        tool_choice_forcing_enabled: setting_bool(db, "agent.tool_choice_forcing_enabled", d.tool_choice_forcing_enabled).await,
+        tool_choice_forcing_max_iteration: setting_i64(db, "agent.tool_choice_forcing_max_iteration", d.tool_choice_forcing_max_iteration).await,
+        tool_choice_style: crate::capability::resolve_tool_choice_style(db, provider, model).await,
         ..ExecutorConfig::default()
     }
 }
@@ -1830,6 +1839,83 @@ mod tests {
         assert!(!out.completed);
         // resume_at e' la label del nodo da cui riprendere (HITL).
         assert_eq!(out.resume_at.as_deref(), Some(NodeId::Executor.as_label()));
+    }
+
+    /// REGRESSIONE (porting Python->Rust): `load_executor_config` aveva smesso di
+    /// popolare `tool_choice_style` / `tool_choice_forcing_enabled` /
+    /// `tool_choice_forcing_max_iteration`, lasciandoli ai `Default` del nodo
+    /// (style=None, enabled=false) -> il force-action era INERTE per ogni provider.
+    ///
+    /// Questo test esercita la STESSA catena decisionale dell'executor
+    /// (`provider_style_supports_forcing` + `should_force_tool_choice`) partendo da
+    /// un `ExecutorConfig` popolato come fa ora `load_executor_config`: per un
+    /// provider tool-capable con forcing ON e iteration <= max, la decisione deve
+    /// dare `Some(true)` (force "required"). Con i campi NON popolati (il bug)
+    /// darebbe `None`.
+    #[test]
+    fn force_tool_choice_attivo_con_executor_config_popolato() {
+        use nexus_agent_graph::decisions::{
+            provider_style_supports_forcing, should_force_tool_choice, turn_action_oriented,
+        };
+
+        // ExecutorConfig come lo costruisce load_executor_config DOPO il fix:
+        // style risolto dal catalog (anthropic -> anthropic_any), forcing ON, max=2.
+        let cfg = ExecutorConfig {
+            tool_choice_style: crate::capability::default_style_for_provider("anthropic")
+                .map(str::to_string),
+            tool_choice_forcing_enabled: true,
+            tool_choice_forcing_max_iteration: 2,
+            ..ExecutorConfig::default()
+        };
+
+        // Riproduce la logica di executor.rs (~1592-1605) con tools disponibili,
+        // turno d'azione, prima iterazione, non in discovery.
+        let supports = provider_style_supports_forcing(cfg.tool_choice_style.as_deref());
+        assert!(supports, "anthropic_any deve supportare il forcing");
+
+        let force_now = should_force_tool_choice(
+            true,                        // tools_available
+            turn_action_oriented(None),  // action_oriented (None -> true conservativo)
+            1,                           // iteration <= max
+            false,                       // in_discovery_phase
+            supports,
+            cfg.tool_choice_forcing_enabled,
+            cfg.tool_choice_forcing_max_iteration,
+        );
+        let force_tc: Option<bool> = if force_now { Some(true) } else { None };
+        assert_eq!(
+            force_tc,
+            Some(true),
+            "config popolato + provider tool-capable + iter<=max -> force required"
+        );
+    }
+
+    /// Controprova del bug: con `tool_choice_style=None` (i Default del nodo, ossia
+    /// lo stato PRE-fix in cui load_executor_config non popolava il campo) la
+    /// decisione resta `None` qualunque sia il resto -> force-action INERTE.
+    #[test]
+    fn force_tool_choice_inerte_con_style_none_regressione() {
+        use nexus_agent_graph::decisions::{
+            provider_style_supports_forcing, should_force_tool_choice, turn_action_oriented,
+        };
+        let cfg = ExecutorConfig {
+            tool_choice_style: None, // stato del bug
+            tool_choice_forcing_enabled: true,
+            tool_choice_forcing_max_iteration: 2,
+            ..ExecutorConfig::default()
+        };
+        let supports = provider_style_supports_forcing(cfg.tool_choice_style.as_deref());
+        assert!(!supports, "style None -> nessun supporto al forcing");
+        let force_now = should_force_tool_choice(
+            true,
+            turn_action_oriented(None),
+            1,
+            false,
+            supports,
+            cfg.tool_choice_forcing_enabled,
+            cfg.tool_choice_forcing_max_iteration,
+        );
+        assert!(!force_now, "con style None il force-action e' inerte (il bug)");
     }
 
     #[test]

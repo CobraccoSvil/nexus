@@ -11,6 +11,7 @@ mod billing;
 mod brain_agent_client;
 pub use nexus_build_graph as build_graph;
 mod cache;
+mod capability;
 mod catalog_sync_worker;
 mod change_drafts;
 mod chat_agent;
