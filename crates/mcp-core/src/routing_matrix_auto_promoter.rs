@@ -58,6 +58,11 @@ struct CatalogModel {
     /// modello con `agentic_thinking_policy='exclude'` non e' candidabile per
     /// gli slot che richiedono tool_use (il live lo scarta gia').
     agentic_thinking_policy: String,
+    /// Stato del pricing (mig 0477): 'unknown' (placeholder, costo 0 non
+    /// raffinato), 'priced' (costo reale > 0), 'free' (gratuito reale confermato
+    /// a mano). Disambigua il significato di input_cost==0 in cost_score: 'free'
+    /// vale costo reale 0, 'unknown' e' neutro (non un ottimo).
+    pricing_state: String,
 }
 
 #[derive(Debug, Clone)]
@@ -542,7 +547,7 @@ async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
         "SELECT provider, model, performance_tier,
                 input_cost_per_million_tokens::float8 AS input_cost,
                 context_window, supports_tool_use,
-                capabilities, agentic_thinking_policy
+                capabilities, agentic_thinking_policy, pricing_state
            FROM ai_price_catalog
           WHERE is_enabled = true",
     )
@@ -574,6 +579,9 @@ async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
                 agentic_thinking_policy: r
                     .try_get("agentic_thinking_policy")
                     .unwrap_or_else(|_| "none".into()),
+                pricing_state: r
+                    .try_get("pricing_state")
+                    .unwrap_or_else(|_| "unknown".into()),
             }
         })
         .collect())
@@ -736,12 +744,29 @@ fn cost_score(
     m: &CatalogModel,
     catalog: &[CatalogModel],
 ) -> f32 {
+    // pricing_state (mig 0477) disambigua il significato di input_cost==0:
+    //  - 'free'    = gratuito reale -> costo 0 effettivo: per 'asc' e' l'ottimo
+    //                (score 1.0); per 'desc' (costo alto = proxy capability) e' il
+    //                peggio (0.0). Resta FUORI dal pool min/max sotto: il suo 0 non
+    //                deve schiacciare la normalizzazione dei modelli 'priced'.
+    //  - 'unknown' = prezzo placeholder/ignoto -> score neutro 0.5, escluso dal
+    //                pool min/max (oggi sono comunque is_enabled=false, ma il
+    //                trattamento esplicito li rende non-ottimi anche se abilitati).
+    //  - 'priced'  = comportamento storico (normalizzazione lineare sul pool).
+    match m.pricing_state.as_str() {
+        "free" => return if req.cost_direction == "asc" { 1.0 } else { 0.0 },
+        "priced" => {}
+        _ => return 0.5, // 'unknown' e qualsiasi valore non riconosciuto: neutro.
+    }
+
     // Normalizza il costo sul pool di candidati passato (l'INTERO catalog
     // eleggibile ricevuto da score_model, NON filtrato per tier). min/max sono
-    // calcolati su quei costi; in pool piccoli la normalizzazione e' sensibile
-    // al range (nota per FASE 2).
+    // calcolati SOLO sui modelli 'priced' con costo > 0: 'free'/'unknown' non
+    // entrano nella normalizzazione. In pool piccoli la normalizzazione e'
+    // sensibile al range (nota per FASE 2).
     let costs: Vec<f64> = catalog
         .iter()
+        .filter(|c| c.pricing_state == "priced")
         .map(|c| c.input_cost)
         .filter(|c| *c > 0.0)
         .collect();
@@ -806,6 +831,9 @@ mod tests {
             supports_tool_use: tools,
             capabilities: caps.iter().map(|s| s.to_string()).collect(),
             agentic_thinking_policy: "none".into(),
+            // Default 'priced': gli helper di test usano costi reali > 0; lo stato
+            // 'free'/'unknown' viene impostato esplicitamente nei test dedicati.
+            pricing_state: "priced".into(),
         }
     }
 
@@ -890,6 +918,41 @@ mod tests {
         let s_cheap = cost_score(&r, &catalog[0], &catalog);
         let s_expensive = cost_score(&r, &catalog[1], &catalog);
         assert!(s_expensive > s_cheap);
+    }
+
+    #[test]
+    fn cost_score_free_is_optimal_for_asc() {
+        // Un modello 'free' (gratuito reale, costo 0) deve valere score massimo
+        // per cost_direction='asc' (costo basso = ottimo) e minimo per 'desc'.
+        let mut free = model("z", "free-model", "light", 0.0, 8192, true, vec![]);
+        free.pricing_state = "free".into();
+        let priced = model("a", "cheap", "light", 0.1, 8192, true, vec![]);
+        let catalog = vec![free.clone(), priced];
+
+        let r_asc = req("test", "veloce", vec![], false, "light", "asc");
+        assert!((cost_score(&r_asc, &catalog[0], &catalog) - 1.0).abs() < f32::EPSILON);
+
+        let r_desc = req("test", "approfondita", vec![], false, "heavy", "desc");
+        assert!((cost_score(&r_desc, &catalog[0], &catalog) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cost_score_unknown_is_neutral_and_excluded_from_pool() {
+        // Un modello 'unknown' (placeholder a costo 0) riceve score neutro 0.5 e
+        // NON contamina min/max del pool: i 'priced' restano normalizzati tra loro.
+        let mut unknown = model("z", "unknown-model", "light", 0.0, 8192, true, vec![]);
+        unknown.pricing_state = "unknown".into();
+        let cheap = model("a", "cheap", "light", 1.0, 8192, true, vec![]);
+        let expensive = model("b", "expensive", "heavy", 10.0, 200000, true, vec![]);
+        let catalog = vec![unknown.clone(), cheap, expensive];
+
+        let r = req("test", "veloce", vec![], false, "light", "asc");
+        // L'unknown e' neutro.
+        assert!((cost_score(&r, &catalog[0], &catalog) - 0.5).abs() < f32::EPSILON);
+        // Il piu' economico tra i 'priced' resta l'ottimo (score 1.0 per asc).
+        assert!((cost_score(&r, &catalog[1], &catalog) - 1.0).abs() < f32::EPSILON);
+        // Il piu' costoso tra i 'priced' resta il peggiore (score 0.0 per asc).
+        assert!((cost_score(&r, &catalog[2], &catalog) - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]

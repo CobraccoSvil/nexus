@@ -718,11 +718,14 @@ async fn sync_provider(
                     // entrino come 'medium' nel pool agentico. Vedi
                     // infer_tier_from_name + migrazione 0354.
                     let inferred_tier = infer_tier_from_name(provider, api_model);
+                    // pricing_state='unknown': costo 0 qui e' un PLACEHOLDER non
+                    // raffinato, NON un modello gratuito (regola H, mig 0477). Niente
+                    // promozione automatica a 'free': la distingue solo l'admin/seed.
                     let res = sqlx::query(
                         "INSERT INTO ai_price_catalog \
                          (provider, model, display_name, input_cost_per_million_tokens, \
-                          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, effective_from) \
-                         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, NOW()) \
+                          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, pricing_state, effective_from) \
+                         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, 'unknown', NOW()) \
                          ON CONFLICT (provider, model) DO NOTHING",
                     )
                     .bind(provider)

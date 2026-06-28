@@ -622,12 +622,19 @@ pub async fn create_price(
         .to_uppercase();
     let id = Uuid::new_v4();
 
+    // pricing_state derivato dal costo: > 0 -> 'priced', altrimenti 'unknown'
+    // (placeholder). Mai 'free' qui: il gratuito reale e' una scelta esplicita
+    // di seed/admin, non un effetto collaterale di un INSERT a costo 0 (mig 0477).
     sqlx::query(
         r#"
         INSERT INTO ai_price_catalog (
             id, provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
-            currency, effective_from, effective_to, is_enabled, created_by, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, TRUE), $10, NOW())
+            currency, effective_from, effective_to, is_enabled, created_by, pricing_state, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, TRUE), $10,
+            CASE WHEN COALESCE($4, 0) > 0 OR COALESCE($5, 0) > 0 THEN 'priced' ELSE 'unknown' END,
+            NOW()
+        )
         "#,
     )
     .bind(id)
@@ -659,6 +666,10 @@ pub async fn update_price(
 ) -> ApiResult {
     let price_id = parse_uuid(&id)?;
 
+    // pricing_state coerente col costo risultante: se il prezzo effettivo (post
+    // COALESCE) e' > 0 -> 'priced'. Altrimenti NON si degrada lo stato esistente:
+    // un 'free' confermato a mano resta 'free', un 'unknown' resta 'unknown'
+    // (mig 0477; mai promozione automatica a 'free').
     sqlx::query(
         r#"
         UPDATE ai_price_catalog
@@ -668,6 +679,11 @@ pub async fn update_price(
             effective_from = COALESCE($5, effective_from),
             effective_to = COALESCE($6, effective_to),
             is_enabled = COALESCE($7, is_enabled),
+            pricing_state = CASE
+                WHEN COALESCE($2, input_cost_per_million_tokens) > 0
+                  OR COALESCE($3, output_cost_per_million_tokens) > 0 THEN 'priced'
+                ELSE pricing_state
+            END,
             updated_at = NOW()
         WHERE id = $1
         "#,
