@@ -82,17 +82,29 @@ impl PgEscalationPort {
         }
     }
 
-    /// Catena intra-provider per `(provider, base_model)` dalla tabella mig 0128,
-    /// gia' filtrata `is_active=TRUE` e ordinata per `escalation_position` ASC.
-    /// Vuota su qualunque errore (best-effort) o se i parametri sono assenti.
+    /// Catena intra-provider per `(provider, base_model)` DERIVATA dal catalog
+    /// (vista `v_model_escalation_chain`, mig 0471 - punto unico, regola L).
+    /// Enumera TUTTI i modelli sani del provider con `escalation_rank` SUPERIORE
+    /// al modello corrente, ordinati `escalation_rank ASC` (dal piu' economico/
+    /// leggero al piu' capace): catena ricca multi-livello, sempre allineata al
+    /// catalog (un nuovo modello abilitato entra da solo). Resiliente: la vista
+    /// filtra `is_enabled = TRUE` (modelli auto-disabilitati esclusi -> mai
+    /// escalation verso modelli morti); `supports_tool_use = TRUE` perche'
+    /// l'escalation serve a uscire da loop agentici (un modello senza tool non
+    /// aiuta). `COALESCE(..., -1)`: se il modello corrente non e' (piu') nel
+    /// catalog, parte dall'intera catena del provider. Vuota su errore (fail-open).
     async fn chain_for(&self, provider: &str, base_model: &str) -> Vec<ChainEntry> {
         if provider.trim().is_empty() || base_model.trim().is_empty() {
             return Vec::new();
         }
         match sqlx::query_scalar::<_, String>(
-            "SELECT escalation_model FROM nexus_model_escalation_chain \
-             WHERE provider = $1 AND base_model = $2 AND is_active = TRUE \
-             ORDER BY escalation_position ASC",
+            "SELECT model FROM v_model_escalation_chain \
+             WHERE provider = $1 \
+               AND supports_tool_use = TRUE \
+               AND escalation_rank > COALESCE( \
+                     (SELECT escalation_rank FROM v_model_escalation_chain \
+                       WHERE provider = $1 AND model = $2), -1) \
+             ORDER BY escalation_rank ASC",
         )
         .bind(provider)
         .bind(base_model)
@@ -107,7 +119,7 @@ impl PgEscalationPort {
                 tracing::warn!(
                     provider = %provider,
                     error = %e,
-                    "escalation_port: lettura catena escalation fallita, fail-open catena vuota"
+                    "escalation_port: derivazione catena dal catalog fallita, fail-open catena vuota"
                 );
                 Vec::new()
             }
@@ -227,6 +239,64 @@ mod tests {
         .execute(pool)
         .await
         .expect("create nexus_purpose_model");
+        // Catalog + vista derivata (mig 0471): chain_for ora legge la vista, non la
+        // tabella seed. Colonne minime usate da v_model_escalation_chain.
+        sqlx::query(
+            "CREATE TABLE ai_price_catalog ( \
+                 provider TEXT NOT NULL, \
+                 model TEXT NOT NULL, \
+                 input_cost_per_million_tokens NUMERIC NOT NULL DEFAULT 0, \
+                 output_cost_per_million_tokens NUMERIC NOT NULL DEFAULT 0, \
+                 performance_tier TEXT NOT NULL DEFAULT 'medium', \
+                 speed_tier TEXT NOT NULL DEFAULT 'medium', \
+                 is_enabled BOOLEAN NOT NULL DEFAULT TRUE, \
+                 consecutive_failures INT NOT NULL DEFAULT 0, \
+                 consecutive_tool_failures INT NOT NULL DEFAULT 0, \
+                 supports_tool_use BOOLEAN NOT NULL DEFAULT TRUE, \
+                 supports_vision BOOLEAN NOT NULL DEFAULT FALSE, \
+                 agentic_thinking_policy TEXT NOT NULL DEFAULT 'allow', \
+                 capabilities JSONB NOT NULL DEFAULT '[]', \
+                 context_window INT NOT NULL DEFAULT 8192 \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create ai_price_catalog");
+        sqlx::query(
+            "CREATE VIEW v_model_escalation_chain AS SELECT \
+                 provider, model, performance_tier, speed_tier, is_enabled, \
+                 consecutive_failures, consecutive_tool_failures, supports_tool_use, \
+                 supports_vision, agentic_thinking_policy, capabilities, context_window, \
+                 (input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) AS blended_cost, \
+                 ((CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'heavy' THEN 2 ELSE 1 END) * 1000000 \
+                  + round((input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) * 1000))::bigint AS escalation_rank \
+             FROM ai_price_catalog WHERE is_enabled = TRUE",
+        )
+        .execute(pool)
+        .await
+        .expect("create v_model_escalation_chain");
+    }
+
+    /// Seed del catalog (sorgente della catena derivata). Tuple:
+    /// (provider, model, performance_tier, input_cost, is_enabled, supports_tool_use).
+    async fn seed_catalog(pool: &PgPool, rows: &[(&str, &str, &str, f64, bool, bool)]) {
+        for (provider, model, tier, in_cost, enabled, tool) in rows {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                 (provider, model, performance_tier, input_cost_per_million_tokens, \
+                  output_cost_per_million_tokens, is_enabled, supports_tool_use) \
+                 VALUES ($1, $2, $3, $4, 0, $5, $6)",
+            )
+            .bind(provider)
+            .bind(model)
+            .bind(tier)
+            .bind(in_cost)
+            .bind(enabled)
+            .bind(tool)
+            .execute(pool)
+            .await
+            .expect("insert catalog row");
+        }
     }
 
     /// Marca un provider come disponibile inserendone la API key in `settings`.
@@ -259,18 +329,25 @@ mod tests {
         }
     }
 
-    /// La catena rispetta `is_active=TRUE` e l'ordine `escalation_position` ASC.
+    /// La catena e' DERIVATA dal catalog (vista v_model_escalation_chain): enumera
+    /// i modelli del provider con escalation_rank > corrente, ordinati ASC
+    /// (economico/leggero -> capace), esclusi is_enabled=false e supports_tool_use=false.
     #[sqlx::test]
-    async fn chain_filtra_attive_e_ordina_per_posizione(pool: PgPool) {
+    async fn catena_derivata_dal_catalog_ordina_per_rank(pool: PgPool) {
         create_schema(&pool).await;
         set_api_key(&pool, "anthropic", "sk-live").await;
-        // Inserite fuori ordine + una posizione disattivata (NON deve comparire).
-        seed_chain(
+        seed_catalog(
             &pool,
             &[
-                ("anthropic", "claude-haiku-4-5", 2, "claude-opus-4-6", true),
-                ("anthropic", "claude-haiku-4-5", 1, "claude-sonnet-4-6", true),
-                ("anthropic", "claude-haiku-4-5", 3, "modello-disattivato", false),
+                // base corrente: rank piu' basso.
+                ("anthropic", "claude-haiku-4-5", "medium", 0.25, true, true),
+                // candidati sopra il base, costo crescente.
+                ("anthropic", "claude-sonnet-4-6", "medium", 3.0, true, true),
+                ("anthropic", "claude-opus-4-6", "heavy", 15.0, true, true),
+                // disabilitato -> escluso dalla vista (is_enabled=false).
+                ("anthropic", "claude-spento", "heavy", 1.0, false, true),
+                // senza tool_use -> escluso da chain_for (escalation = loop agentici).
+                ("anthropic", "claude-no-tool", "heavy", 1.0, true, false),
             ],
         )
         .await;
@@ -287,7 +364,7 @@ mod tests {
         assert_eq!(
             models,
             vec!["claude-sonnet-4-6", "claude-opus-4-6"],
-            "ordine per posizione ASC, solo is_active=TRUE"
+            "catena derivata ordinata per escalation_rank ASC, esclusi spento+no-tool"
         );
         // nexus_purpose_model vuota -> cross_provider None.
         assert!(inputs.cross_provider.is_none());
