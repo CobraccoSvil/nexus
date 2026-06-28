@@ -1386,8 +1386,18 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
             }
         }
 
-        // ── Forza-azione: rimuovi i read-only se oltre soglia esplorazione (py:2402) ─
-        if !tools_json.is_empty() && exploration_count >= exploration_threshold {
+        // ── Forza-azione: rimuovi i read-only oltre soglia esplorazione (py:2402)
+        // OPPURE quando il progress_controller ha forzato l'azione (`force_action_hard`:
+        // GUIDE/ForceDiagnose di `repeated_action` read-only su turno operativo). Causa
+        // radice della non-convergenza sui fix (regola H): senza questa estensione il
+        // forcing imponeva `tool_choice=required` ma LASCIAVA i read-only nella lista ->
+        // il modello, obbligato a chiamare UN tool, ri-chiamava `read_file` invece di
+        // `edit_file`/`run_command`, riaprendo il loop (read 2 volte -> ABORT a 0 file
+        // modificati). Rimuovendoli sotto force-action, l'unico tool disponibile diventa
+        // PRODUTTIVO e l'agente APPLICA la correzione. ─
+        if !tools_json.is_empty()
+            && (exploration_count >= exploration_threshold || force_action_hard)
+        {
             let productive: Vec<Value> = tools_json
                 .iter()
                 .filter(|t| {
