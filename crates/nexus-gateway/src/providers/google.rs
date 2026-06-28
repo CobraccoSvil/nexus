@@ -1177,6 +1177,14 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
         });
     }
 
+    // Riconciliazione invariante Gemini (punto unico, regola L): per ogni content
+    // `model` con N functionCall, il content `user` successivo deve avere
+    // ESATTAMENTE N functionResponse (stesso name/ordine). History interrotte o
+    // troncate violano l'invariante e Gemini risponde HTTP 400 INVALID_ARGUMENT
+    // ("number of function response parts is equal to function call parts"). La
+    // riconciliazione sintetizza i response mancanti e scarta quelli orfani.
+    reconcile_function_call_response_pairs(&mut contents);
+
     // Fix hollow completion: alza il tetto di output del budget thinking cosi'
     // i max_tokens richiesti restano interi per la risposta utente.
     let max_output_tokens = match (req.max_tokens, thinking) {
@@ -1243,6 +1251,133 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
         generation_config,
         tools,
         tool_config,
+    }
+}
+
+/// Testo (in inglese, neutro lato API) della risposta sintetica usata per le
+/// functionCall rimaste senza il loro functionResponse nella history (run
+/// interrotto/troncato). Non e' un dato di business: serve solo a far combaciare
+/// il conteggio cosi' Gemini non rifiuta l'intera richiesta con HTTP 400.
+const SYNTHETIC_TOOL_RESULT_MESSAGE: &str =
+    "tool result missing from history (truncated or interrupted run)";
+
+/// Ripristina l'invariante function-call/function-response richiesta da Gemini
+/// (`generateContent`): per OGNI content `role:"model"` che contiene M parts
+/// `functionCall`, il content IMMEDIATAMENTE successivo deve essere un
+/// `role:"user"` con ESATTAMENTE M parts `functionResponse`, una per functionCall
+/// (correlate per `name`, nello stesso ORDINE). Se questa invariante e' violata
+/// l'API risponde HTTP 400 INVALID_ARGUMENT ("Please ensure that the number of
+/// function response parts is equal to the number of function call parts ...").
+///
+/// Punto unico (regola L): tutta la riconciliazione vive qui, dopo che
+/// [`build_request_body`] ha costruito i `contents`. Funzione PURA (nessun IO,
+/// testabile in isolamento) che opera in-place e che e' robusta a tutti i casi
+/// scoperti che producevano il 400 in produzione:
+///   - functionCall senza functionResponse (call orfana da run troncato): si
+///     SINTETIZZA un functionResponse placeholder `{name, response:{error: ...}}`
+///     cosi' il conteggio combacia (regola H: non si manda a Google una richiesta
+///     destinata a fallire);
+///   - functionResponse orfano (name che non corrisponde ad alcuna functionCall
+///     del turno model precedente, es. tool_call_id sconosciuto): viene SCARTATO;
+///   - functionResponse presenti ma in ordine diverso: riordinati per matchare
+///     l'ordine delle functionCall (Gemini correla per name; piu' call con lo
+///     stesso name sono consumate FIFO).
+///
+/// I content senza alcuna functionCall (testo/immagini puri) restano invariati.
+///
+/// Itera con un indice esplicito perche' puo' INSERIRE un turno user (quando il
+/// turno model con functionCall non e' seguito da alcun turno di response): dopo
+/// un insert l'indice avanza oltre il turno appena inserito (privo di
+/// functionCall), evitando di ri-processarlo.
+fn reconcile_function_call_response_pairs(contents: &mut Vec<GoogleContent>) {
+    let mut i = 0;
+    while i < contents.len() {
+        // Estrai i nomi delle functionCall del turno model corrente, in ordine.
+        let call_names: Vec<String> = contents[i]
+            .parts
+            .iter()
+            .filter_map(|p| p.function_call.as_ref().map(|fc| fc.name.clone()))
+            .collect();
+        if call_names.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Recupera (consumando) le functionResponse del content successivo, se e'
+        // il turno user che le porta. Le indicizziamo per name in code FIFO cosi'
+        // piu' call con lo stesso nome consumano response distinte nell'ordine.
+        let mut by_name: std::collections::HashMap<String, VecDeque<GooglePart>> =
+            std::collections::HashMap::new();
+        let has_next_user_responses = contents
+            .get(i + 1)
+            .is_some_and(|c| c.parts.iter().any(|p| p.function_response.is_some()));
+        if has_next_user_responses {
+            let next_parts = std::mem::take(&mut contents[i + 1].parts);
+            for part in next_parts {
+                // Le part non-functionResponse in mezzo ai tool-result (raro)
+                // vengono scartate: il turno user di response e' dedicato ad essi.
+                if let Some(name) = part.function_response.as_ref().map(|fr| fr.name.clone()) {
+                    by_name.entry(name).or_default().push_back(part);
+                }
+            }
+        }
+
+        // Ricostruisci le response NELLO STESSO ORDINE delle call: per ogni call
+        // consuma una response con lo stesso name; se non c'e', sintetizzala.
+        let mut reconciled: Vec<GooglePart> = Vec::with_capacity(call_names.len());
+        for name in &call_names {
+            let matched = by_name.get_mut(name).and_then(|q| q.pop_front());
+            match matched {
+                Some(part) => reconciled.push(part),
+                None => reconciled.push(GooglePart::function_response(
+                    name.clone(),
+                    serde_json::json!({ "error": SYNTHETIC_TOOL_RESULT_MESSAGE }),
+                )),
+            }
+        }
+        // Tutte le response rimaste in `by_name` sono orfane (name senza call
+        // corrispondente) e vengono SCARTATE: non finiscono nel turno.
+
+        if has_next_user_responses {
+            // Sovrascrive il turno user successivo con i response riconciliati.
+            contents[i + 1].parts = reconciled;
+        } else {
+            // Nessun turno user con response dopo il model (history troncata
+            // subito dopo le call): inserisce un nuovo turno user di soli
+            // response sintetici per ripristinare l'invariante.
+            contents.insert(
+                i + 1,
+                GoogleContent {
+                    role: Some("user".to_string()),
+                    parts: reconciled,
+                },
+            );
+        }
+        // Salta sia il turno model sia il turno user di response (quest'ultimo
+        // non contiene functionCall e non va ri-processato come turno model).
+        i += 2;
+    }
+
+    // Passata finale: scarta le functionResponse che NON sono precedute da un
+    // turno model con functionCall (response orfane "di testa", caso degenere:
+    // un tool-result come primo messaggio, senza alcuna call). Inviarle a Gemini
+    // produrrebbe comunque un 400 (functionResponse senza functionCall). Le parts
+    // non-functionResponse dello stesso turno restano; un turno che resta senza
+    // parts viene rimosso del tutto per non spedire un content vuoto.
+    let mut j = 0;
+    while j < contents.len() {
+        let prev_is_model_with_calls = j
+            .checked_sub(1)
+            .and_then(|p| contents.get(p))
+            .is_some_and(|c| c.parts.iter().any(|p| p.function_call.is_some()));
+        if !prev_is_model_with_calls {
+            contents[j].parts.retain(|p| p.function_response.is_none());
+            if contents[j].parts.is_empty() {
+                contents.remove(j);
+                continue;
+            }
+        }
+        j += 1;
     }
 }
 
@@ -2916,16 +3051,20 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_tool_result_id_sconosciuto_usa_id_grezzo() {
-        // Se l'id non e' in history, il fallback usa l'id grezzo come name
-        // (Gemini rifiuterebbe, ma e' il fallback meno dannoso: niente panico).
+    fn round_trip_tool_result_orfano_senza_call_scartato() {
+        // Un tool-result SENZA alcun turno model con functionCall che lo preceda
+        // (id sconosciuto, history priva della call): la riconciliazione lo
+        // SCARTA invece di inviarlo a Gemini come functionResponse orfano (che
+        // produrrebbe comunque HTTP 400). Il turno user, rimasto senza parts,
+        // viene rimosso del tutto: il body non ha contents.
         let mut tool = msg("tool", "out");
         tool.tool_call_id = Some("call_orfano".to_string());
         let req = req_with_tools(vec![tool], true);
         let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
-        assert_eq!(
-            json["contents"][0]["parts"][0]["functionResponse"]["name"],
-            "call_orfano"
+        let contents = json["contents"].as_array().unwrap();
+        assert!(
+            contents.is_empty(),
+            "il functionResponse orfano di testa va scartato, contents = {contents:?}"
         );
     }
 
@@ -3022,5 +3161,224 @@ mod tests {
             "client_email": "nexus-sa@nexus-test.iam.gserviceaccount.com"
         })
         .to_string()
+    }
+
+    // --- Riconciliazione invariante functionCall/functionResponse (Gemini) ---
+
+    /// Helper: turno assistant con N tool-call (name, id) per i test di
+    /// riconciliazione. Gli arguments sono un oggetto vuoto serializzato.
+    fn assistant_with_calls(calls: &[(&str, &str)]) -> LlmMessage {
+        let mut a = msg("assistant", "");
+        a.tool_calls = Some(
+            calls
+                .iter()
+                .map(|(name, id)| LlmToolCall {
+                    id: (*id).to_string(),
+                    kind: "function".to_string(),
+                    function: ToolFunctionCall {
+                        name: (*name).to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                })
+                .collect(),
+        );
+        a
+    }
+
+    /// Helper: turno tool-result correlato a una tool-call via `tool_call_id`.
+    fn tool_result(tool_call_id: &str, text: &str) -> LlmMessage {
+        let mut t = msg("tool", text);
+        t.tool_call_id = Some(tool_call_id.to_string());
+        t
+    }
+
+    /// Helper: estrae i name delle functionResponse di un content (turno user).
+    fn response_names(content: &serde_json::Value) -> Vec<String> {
+        content["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["functionResponse"]["name"].as_str().map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_due_call_un_result_sintetizza_il_mancante() {
+        // CASO PRIMARIO osservato in prod: il turno model emette 2 functionCall
+        // ma la history (run troncato) porta un solo tool-result -> dopo la
+        // riconciliazione il turno user ha 2 functionResponse (1 sintetico),
+        // cosi' il conteggio combacia e Gemini non risponde 400.
+        let a = assistant_with_calls(&[("read_file", "call_1"), ("edit_file", "call_2")]);
+        let t = tool_result("call_1", "contenuto");
+        let req = req_with_tools(vec![a, t], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+
+        // contents[0] = model con 2 functionCall.
+        let model_parts = json["contents"][0]["parts"].as_array().unwrap();
+        let call_count = model_parts
+            .iter()
+            .filter(|p| p.get("functionCall").is_some())
+            .count();
+        assert_eq!(call_count, 2, "il turno model deve avere 2 functionCall");
+        assert_eq!(json["contents"][0]["role"], "model");
+
+        // contents[1] = user con 2 functionResponse (invariante ripristinata).
+        let user = &json["contents"][1];
+        assert_eq!(user["role"], "user");
+        let names = response_names(user);
+        assert_eq!(names, vec!["read_file", "edit_file"]);
+        // Il primo e' il result reale; il secondo e' il placeholder sintetico.
+        assert_eq!(
+            user["parts"][0]["functionResponse"]["response"]["result"],
+            "contenuto"
+        );
+        assert_eq!(
+            user["parts"][1]["functionResponse"]["response"]["error"],
+            SYNTHETIC_TOOL_RESULT_MESSAGE
+        );
+    }
+
+    #[test]
+    fn reconcile_tool_result_orfano_scartato() {
+        // Un tool-result il cui name NON corrisponde ad alcuna functionCall del
+        // turno model precedente e' orfano: va SCARTATO (altrimenti gonfia il
+        // conteggio e Gemini risponde 400). Qui la call e' "read_file" ma in
+        // history arriva ANCHE un result per "call_xxx" sconosciuto.
+        let a = assistant_with_calls(&[("read_file", "call_1")]);
+        let t_ok = tool_result("call_1", "ok");
+        // Result orfano: tool_call_id non presente fra le call -> il name si
+        // risolve all'id grezzo "call_orfano", che non matcha "read_file".
+        let t_orfano = tool_result("call_orfano", "spurio");
+        let req = req_with_tools(vec![a, t_ok, t_orfano], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+
+        // Un solo turno user, con UNA sola functionResponse (quella valida): la
+        // orfana e' stata scartata.
+        let user = &json["contents"][1];
+        assert_eq!(user["role"], "user");
+        let names = response_names(user);
+        assert_eq!(names, vec!["read_file"]);
+        assert_eq!(user["parts"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_caso_normale_invariato() {
+        // N functionCall == N functionResponse, stesso ordine: nessuna
+        // sintesi, nessuno scarto, l'output e' quello atteso (idempotente).
+        let a = assistant_with_calls(&[("read_file", "call_1"), ("list_dir", "call_2")]);
+        let t1 = tool_result("call_1", "file");
+        let t2 = tool_result("call_2", "elenco");
+        let req = req_with_tools(vec![a, t1, t2], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+
+        let user = &json["contents"][1];
+        let names = response_names(user);
+        assert_eq!(names, vec!["read_file", "list_dir"]);
+        assert_eq!(
+            user["parts"][0]["functionResponse"]["response"]["result"],
+            "file"
+        );
+        assert_eq!(
+            user["parts"][1]["functionResponse"]["response"]["result"],
+            "elenco"
+        );
+        // Esattamente 2 content: nessun turno spurio inserito.
+        assert_eq!(json["contents"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reconcile_call_senza_alcun_result_inserisce_turno_user_sintetico() {
+        // History che termina con il turno model di sole functionCall e NESSUN
+        // turno di response (run interrotto subito dopo le call): la
+        // riconciliazione deve INSERIRE un turno user di soli response sintetici.
+        let a = assistant_with_calls(&[("read_file", "call_1"), ("edit_file", "call_2")]);
+        let req = req_with_tools(vec![a], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+
+        assert_eq!(json["contents"].as_array().unwrap().len(), 2);
+        assert_eq!(json["contents"][0]["role"], "model");
+        let user = &json["contents"][1];
+        assert_eq!(user["role"], "user");
+        let names = response_names(user);
+        assert_eq!(names, vec!["read_file", "edit_file"]);
+        // Entrambe sintetiche (nessun result reale in history).
+        for k in 0..2 {
+            assert_eq!(
+                user["parts"][k]["functionResponse"]["response"]["error"],
+                SYNTHETIC_TOOL_RESULT_MESSAGE
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_response_in_ordine_diverso_riallineate_alle_call() {
+        // I tool-result arrivano in ordine inverso rispetto alle call: la
+        // riconciliazione li riallinea all'ordine delle functionCall (Gemini
+        // correla per name nello stesso ordine del turno model).
+        let a = assistant_with_calls(&[("alpha", "call_a"), ("beta", "call_b")]);
+        let t_beta = tool_result("call_b", "risultato-beta");
+        let t_alpha = tool_result("call_a", "risultato-alpha");
+        let req = req_with_tools(vec![a, t_beta, t_alpha], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+
+        let user = &json["contents"][1];
+        let names = response_names(user);
+        // Ordine allineato alle call (alpha, beta), non a quello dei result.
+        assert_eq!(names, vec!["alpha", "beta"]);
+        assert_eq!(
+            user["parts"][0]["functionResponse"]["response"]["result"],
+            "risultato-alpha"
+        );
+        assert_eq!(
+            user["parts"][1]["functionResponse"]["response"]["result"],
+            "risultato-beta"
+        );
+    }
+
+    #[test]
+    fn reconcile_assistant_testo_e_tool_calls_mappato_correttamente() {
+        // Un turno assistant con SIA testo SIA tool_calls: il content model deve
+        // avere la part testo + la part functionCall, e il turno user successivo
+        // deve avere il functionResponse correlato (conteggio call=1, resp=1).
+        let mut a = assistant_with_calls(&[("run_command", "call_1")]);
+        a.content = MessageContent::Text("Eseguo il comando per te".to_string());
+        let t = tool_result("call_1", "exit 0");
+        let req = req_with_tools(vec![a, t], true);
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+
+        let model = &json["contents"][0];
+        assert_eq!(model["role"], "model");
+        // Prima part: il testo dell'assistant; seconda: la functionCall.
+        assert_eq!(model["parts"][0]["text"], "Eseguo il comando per te");
+        assert_eq!(model["parts"][1]["functionCall"]["name"], "run_command");
+
+        // Una functionCall -> una functionResponse correlata.
+        let user = &json["contents"][1];
+        assert_eq!(user["role"], "user");
+        let names = response_names(user);
+        assert_eq!(names, vec!["run_command"]);
+        assert_eq!(
+            user["parts"][0]["functionResponse"]["response"]["result"],
+            "exit 0"
+        );
+    }
+
+    #[test]
+    fn reconcile_funzione_pura_idempotente_senza_tool() {
+        // Una history senza alcun tool: la riconciliazione non tocca nulla.
+        let mut contents = vec![
+            GoogleContent {
+                role: Some("user".to_string()),
+                parts: vec![GooglePart::text("ciao".to_string())],
+            },
+            GoogleContent {
+                role: Some("model".to_string()),
+                parts: vec![GooglePart::text("salve".to_string())],
+            },
+        ];
+        reconcile_function_call_response_pairs(&mut contents);
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0].parts[0].text.as_deref(), Some("ciao"));
+        assert_eq!(contents[1].parts[0].text.as_deref(), Some("salve"));
     }
 }
