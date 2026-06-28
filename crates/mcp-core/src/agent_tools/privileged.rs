@@ -31,14 +31,25 @@ pub async fn try_route_privileged_command(
     command: &str,
 ) -> Option<String> {
     let (had_sudo, rest) = strip_sudo_prefix(command);
+    // Normalizza il comando per il MATCHING (regola H, causa radice della
+    // non-convergenza sui fix che richiedono privilegi): gli LLM scrivono
+    // naturalmente `cd <dir> && npx playwright install --with-deps chromium 2>&1;
+    // echo "EXIT=$?"`. Senza normalizzazione, `has_shell_metachars` scartava ogni
+    // comando con decorazioni di shell -> il comando finiva nella shell isolata,
+    // Playwright/apt invocavano `sudo` direttamente (NOPASSWD assente) -> "sudo: a
+    // terminal is required" e loop fino ad ABORT. SICUREZZA: a valle instradiamo
+    // SEMPRE un purpose FISSO (mai il comando grezzo dell'agente), quindi eventuali
+    // segmenti scartati dopo `&&`/`;`/`|` (es. `&& rm -rf /`) NON vengono mai
+    // eseguiti; la normalizzazione serve solo a riconoscere l'INTENTO privilegiato.
+    let core = normalize_command_for_routing(&rest);
 
     // Dipendenze di sistema Playwright (`playwright install --with-deps` o
     // `playwright install-deps`): purpose a lista fissa gia' esistente.
-    if is_playwright_with_deps(&rest) {
+    if is_playwright_with_deps(&core) {
         return Some(run_playwright_deps(ctx).await);
     }
 
-    if let Some((subcommand, rest_tokens)) = apt_tokens(&rest) {
+    if let Some((subcommand, rest_tokens)) = apt_tokens(&core) {
         match subcommand.as_str() {
             "update" => return Some(run_apt_update(ctx).await),
             "install" => {
@@ -86,6 +97,66 @@ fn strip_sudo_prefix(cmd: &str) -> (bool, String) {
     } else {
         (false, trimmed.to_string())
     }
+}
+
+/// Normalizza un comando per il MATCHING privilegiato (NON per l'esecuzione):
+/// 1) rimuove un prefisso `cd <path> &&`; 2) isola il PRIMO segmento della catena
+/// shell (prima di `&&`/`||`/`;`/`|`); 3) rimuove le redirezioni di output
+/// (`2>&1`, `>/dev/null`, ...). A valle si instrada SEMPRE un purpose fisso, mai
+/// il comando grezzo: i segmenti scartati non vengono eseguiti (sicurezza).
+fn normalize_command_for_routing(rest: &str) -> String {
+    let after_cd = strip_cd_and_prefix(rest).unwrap_or_else(|| rest.trim());
+    let seg = first_shell_segment(after_cd);
+    strip_output_redirections(seg)
+}
+
+/// Se `s` inizia con `cd <path> &&`, ritorna la parte dopo il primo `&&` (gli LLM
+/// scrivono spesso `cd dir && cmd`). Conservativo: solo se il prefisso e' `cd `.
+fn strip_cd_and_prefix(s: &str) -> Option<&str> {
+    let t = s.trim_start();
+    if !t.starts_with("cd ") {
+        return None;
+    }
+    let idx = t.find("&&")?;
+    Some(t[idx + 2..].trim_start())
+}
+
+/// Primo segmento della catena shell: tronca al primo separatore di COMANDO
+/// (`&&`, `||`, `;`, `|`). Le redirezioni (`>`/`<`/`2>&1`) NON sono separatori e
+/// restano (le toglie `strip_output_redirections`).
+fn first_shell_segment(s: &str) -> &str {
+    let mut end = s.len();
+    for sep in ["&&", "||", ";", "|"] {
+        if let Some(i) = s.find(sep) {
+            if i < end {
+                end = i;
+            }
+        }
+    }
+    s[..end].trim()
+}
+
+/// Rimuove le redirezioni di output da un singolo comando (gia' privo di
+/// separatori). Gestisce sia l'operatore "puro" (`>`/`2>` + file successivo) sia
+/// quello attaccato al token (`2>&1`, `>/dev/null`).
+fn strip_output_redirections(s: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut skip_next = false;
+    for tok in s.split_whitespace() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(tok, ">" | ">>" | "<" | "2>" | "1>" | "2>>" | "&>") {
+            skip_next = true; // scarta l'operatore e il file target successivo
+            continue;
+        }
+        if tok.contains('>') || tok.contains('<') {
+            continue; // redirezione attaccata al token (2>&1, >/dev/null, ...)
+        }
+        out.push(tok);
+    }
+    out.join(" ")
 }
 
 /// True se il comando contiene metacaratteri shell (comando composito): in tal
@@ -286,5 +357,51 @@ mod tests {
         assert!(apt_tokens("npm install").is_none());
         let (had, _) = strip_sudo_prefix("npm install");
         assert!(!had);
+    }
+
+    #[test]
+    fn normalizza_cd_prefix_e_redirezioni_playwright() {
+        // Forma reale scritta dagli LLM (incidente Beauty-Book): cd + && + 2>&1 + ; echo.
+        let core = normalize_command_for_routing(
+            "cd /home/u/proj && npx playwright install --with-deps chromium 2>&1; echo \"EXIT=$?\"",
+        );
+        assert_eq!(core, "npx playwright install --with-deps chromium");
+        assert!(is_playwright_with_deps(&core));
+    }
+
+    #[test]
+    fn normalizza_apt_con_pipe() {
+        // `apt-get install -y libnss3 | tail -5` -> core "apt-get install -y libnss3".
+        let core = normalize_command_for_routing("apt-get install -y libnss3 | tail -5");
+        let (sub, rest) = apt_tokens(&core).unwrap();
+        assert_eq!(sub, "install");
+        assert_eq!(extract_packages(&rest).unwrap(), vec!["libnss3"]);
+    }
+
+    #[test]
+    fn normalizzazione_scarta_segmenti_pericolosi() {
+        // `apt-get install -y libnss3 && rm -rf /`: il core deve contenere SOLO
+        // l'install; il segmento `rm -rf /` viene scartato (a valle si instrada un
+        // purpose fisso, quindi non verrebbe comunque eseguito).
+        let core = normalize_command_for_routing("apt-get install -y libnss3 && rm -rf /");
+        assert_eq!(core, "apt-get install -y libnss3");
+        assert!(!core.contains("rm"));
+        let (sub, rest) = apt_tokens(&core).unwrap();
+        assert_eq!(sub, "install");
+        assert_eq!(extract_packages(&rest).unwrap(), vec!["libnss3"]);
+    }
+
+    #[test]
+    fn first_segment_non_tronca_su_redirezione() {
+        // `2>&1` NON e' un separatore di comando: il segmento resta intero, la
+        // redirezione la toglie strip_output_redirections.
+        assert_eq!(
+            first_shell_segment("npx playwright install --with-deps 2>&1"),
+            "npx playwright install --with-deps 2>&1"
+        );
+        assert_eq!(
+            strip_output_redirections("npx playwright install --with-deps 2>&1 > /dev/null"),
+            "npx playwright install --with-deps"
+        );
     }
 }
