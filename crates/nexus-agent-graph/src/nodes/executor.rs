@@ -1147,6 +1147,9 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                     repeated_action: Some((label.clone(), ra_count)),
                     repeated_action_edit_failed: ra_edit_failed,
                     repeated_action_read_only: ra_read_only,
+                    // Biforca il nudge read-only: su un task di fix orienta all'EDIT
+                    // (no rinuncia), su una domanda concludi con testo (punto unico).
+                    action_oriented: turn_action_oriented(state.action_oriented),
                     already_guided: progress_guided.clone(),
                     already_diagnosed: progress_diagnosed.clone(),
                     force_diagnose_enabled: self.cfg.repeated_action_force_diagnose_enabled,

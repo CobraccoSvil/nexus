@@ -101,6 +101,14 @@ pub struct ProgressSignals {
     /// contesto e' gia' stato raccolto). NON-convergenza, regola H. Per i tool
     /// produttivi resta la forza-azione correttiva (force_action=true).
     pub repeated_action_read_only: bool,
+    /// `true` se il turno corrente e' ACTION-ORIENTED (task di modifica/fix), come
+    /// derivato da `turn_action_oriented(state.action_oriented)`. Biforca il nudge
+    /// del ramo read-only: su un task di fix una lettura ripetuta NON va chiusa con
+    /// testo (l'agente rinuncerebbe a 0 file modificati), va invece orientata all'
+    /// EDIT (il contesto e' gia' stato letto -> applica la correzione). Su un task
+    /// informativo (action_oriented=false) resta il nudge "concludi con testo".
+    /// Default `true` (conservativo, identico a `turn_action_oriented(None)`).
+    pub action_oriented: bool,
     /// Riallocazione risorse: numero request_port ravvicinate (a prescindere dal
     /// label: il variare del label E' il sintomo del loop).
     pub reallocation_count: i64,
@@ -133,6 +141,8 @@ impl Default for ProgressSignals {
             repeated_action: None,
             repeated_action_edit_failed: false,
             repeated_action_read_only: false,
+            // Conservativo: identico a `turn_action_oriented(None) == true`.
+            action_oriented: true,
             reallocation_count: 0,
             reallocation_threshold: 3,
             has_active_resources: false,
@@ -277,10 +287,10 @@ lo stesso comando/edit."
     }
 }
 
-/// Nudge per la ripetizione identica di una LETTURA (read_file/list_files/grep):
-/// il contesto e' gia' stato raccolto, ripetere la stessa lettura non aggiunge
-/// nulla. Guida a CONCLUDERE con testo (NON a un'altra tool call). NON-convergenza,
-/// regola H.
+/// Nudge per la ripetizione identica di una LETTURA (read_file/list_files/grep)
+/// su un turno INFORMATIVO (action_oriented=false): il contesto e' gia' stato
+/// raccolto, ripetere la stessa lettura non aggiunge nulla. Guida a CONCLUDERE con
+/// testo (NON a un'altra tool call). NON-convergenza, regola H.
 fn repeated_read_only_nudge(label: &str, count: i64) -> String {
     format!(
         "STOP: hai gia' eseguito la stessa lettura ({label}) {count} volte con lo \
@@ -288,6 +298,22 @@ stesso bersaglio. Ripeterla NON aggiunge informazioni: il contenuto e' gia' nel 
 contesto sopra. NON rileggere e NON cercare altro. Rispondi ORA a parole con il \
 risultato richiesto in base a cio' che hai gia' raccolto; se ti serve davvero un \
 dato diverso, fai UNA lettura su un bersaglio DIVERSO, non la stessa."
+    )
+}
+
+/// Nudge per la lettura ripetuta su un turno ACTION-ORIENTED (task di modifica/fix):
+/// l'agente ha gia' ispezionato il file, ripeterne la lettura non avvicina al
+/// risultato. Diversamente dal ramo informativo, qui la chiusura con testo sarebbe
+/// una RINUNCIA (0 file modificati su un task di fix): il nudge orienta all'EDIT.
+/// Mantiene l'anti-loop (NON ri-leggere identico), ma verso l'AZIONE, non la resa.
+fn repeated_read_only_action_nudge(label: &str, count: i64) -> String {
+    format!(
+        "STOP: hai gia' letto/ispezionato lo stesso bersaglio ({label}) {count} volte. \
+Il contenuto e' GIA' nel contesto sopra: rileggerlo non avvicina al risultato. Questo \
+e' un task di MODIFICA, non una domanda: NON rileggere e NON rispondere a parole \
+descrivendo cosa faresti. ORA APPLICA la correzione con edit_file/write_file sul file \
+gia' letto. Se ti serve davvero un dettaglio diverso fai UNA lettura su un bersaglio \
+DIVERSO, poi procedi subito con l'edit."
     )
 }
 
@@ -403,11 +429,16 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
                     .unwrap_or_else(|| (String::new(), 0));
                 // edit_file/write_file FALLITO -> nudge SPECIFICO (copia
                 // l'old_string esatto dall'estratto gia' nell'errore); lettura
-                // ripetuta -> nudge "concludi con testo"; altrimenti generico.
+                // ripetuta -> nudge biforcato per action_oriented (su un fix orienta
+                // all'EDIT, su una domanda "concludi con testo"); altrimenti generico.
                 if signals.repeated_action_edit_failed {
                     repeated_action_edit_failed_nudge(&label, count)
                 } else if signals.repeated_action_read_only {
-                    repeated_read_only_nudge(&label, count)
+                    if signals.action_oriented {
+                        repeated_read_only_action_nudge(&label, count)
+                    } else {
+                        repeated_read_only_nudge(&label, count)
+                    }
                 } else {
                     repeated_action_nudge(&label, count)
                 }
@@ -418,15 +449,21 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
         // non c'e' un'azione correttiva diretta). Per repeated_action PRODUTTIVA
         // FORZIAMO una nuova tool call (force-action): un'azione ripetuta che fallisce
         // va CORRETTA, non ripetuta ne' abbandonata -> rimuove i read-only e impone
-        // tool_choice. Per repeated_action di SOLA LETTURA NON forziamo (forzare un
-        // altro read-only creerebbe un nuovo loop): il nudge guida a concludere con
-        // testo (NON-convergenza, regola H).
+        // tool_choice. Per repeated_action di SOLA LETTURA il comportamento e'
+        // ACTION-AWARE: su un task INFORMATIVO non forziamo (forzare un altro
+        // read-only creerebbe un nuovo loop -> il nudge guida a concludere con testo,
+        // NON-convergenza regola H); su un task di MODIFICA/fix forziamo invece la
+        // tool call cosi' l'agente APPLICA l'edit (il nudge orienta a edit_file/
+        // write_file) invece di rinunciare con 0 file modificati.
         let force = match axis {
             // resource_reallocation: SOFT (riusa-porte, nessuna azione correttiva).
             Axis::ResourceReallocation => false,
-            // repeated_action di SOLA LETTURA: NON forzare (forzerebbe un altro
-            // read-only -> nuovo loop); il nudge guida a concludere con testo.
-            Axis::RepeatedAction if signals.repeated_action_read_only => false,
+            // repeated_action di SOLA LETTURA su turno INFORMATIVO: NON forzare
+            // (forzerebbe un altro read-only -> nuovo loop); il nudge guida a
+            // concludere con testo. Su turno ACTION-ORIENTED invece forziamo l'edit.
+            Axis::RepeatedAction if signals.repeated_action_read_only && !signals.action_oriented => {
+                false
+            }
             _ => true,
         };
         let reason = match axis {
@@ -605,28 +642,64 @@ mod tests {
     }
 
     #[test]
-    fn repeated_action_read_only_guida_a_concludere_senza_forzare() {
-        // GUIDE di una LETTURA ripetuta (read_file/list_files): NON deve forzare
-        // un'altra tool call (forzerebbe un ennesimo read-only -> nuovo loop): deve
-        // guidare a CONCLUDERE con testo (NON-convergenza, regola H).
+    fn repeated_action_read_only_informativo_guida_a_concludere_senza_forzare() {
+        // GUIDE di una LETTURA ripetuta su un turno INFORMATIVO (action_oriented=false):
+        // NON deve forzare un'altra tool call (forzerebbe un ennesimo read-only ->
+        // nuovo loop): deve guidare a CONCLUDERE con testo (NON-convergenza, regola H).
         let signals = ProgressSignals {
             repeated_action: Some(("read_file: src/main.rs".to_string(), 2)),
             repeated_action_read_only: true,
+            action_oriented: false,
             ..Default::default()
         };
         let d = decide(&signals);
         assert_eq!(d.action, Action::Guide);
         assert!(
             !d.force_action,
-            "una lettura ripetuta NON deve forzare un'altra tool call"
+            "una lettura ripetuta informativa NON deve forzare un'altra tool call"
         );
         let nudge = d.nudge_text.as_deref().unwrap();
         assert!(
             nudge.contains("Rispondi ORA a parole"),
             "atteso nudge 'concludi con testo', ottenuto: {nudge}"
         );
-        // Non deve essere il nudge generico produttivo.
+        // Non deve essere il nudge generico produttivo ne' quello edit-oriented.
         assert!(!nudge.contains("cambia approccio"));
+        assert!(!nudge.contains("APPLICA la correzione"));
+    }
+
+    #[test]
+    fn repeated_action_read_only_action_oriented_orienta_all_edit() {
+        // GUIDE di una LETTURA ripetuta su un turno ACTION-ORIENTED (task di fix):
+        // NON deve chiudere con testo (sarebbe una RINUNCIA a 0 file modificati). Deve
+        // orientare all'EDIT e forzare la tool call, preservando l'anti-loop (no
+        // ri-lettura identica). Causa radice dell'incidente "porta hardcoded".
+        let signals = ProgressSignals {
+            repeated_action: Some(("read_file: vite.config.ts".to_string(), 2)),
+            repeated_action_read_only: true,
+            action_oriented: true,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::Guide);
+        assert!(
+            d.force_action,
+            "su un task di fix la lettura ripetuta deve forzare l'edit, non rinunciare"
+        );
+        let nudge = d.nudge_text.as_deref().unwrap();
+        // Orienta all'azione concreta (edit), NON alla chiusura testuale.
+        assert!(
+            nudge.contains("APPLICA la correzione"),
+            "atteso nudge orientato all'edit, ottenuto: {nudge}"
+        );
+        assert!(nudge.contains("edit_file/write_file"));
+        // NON deve orientare alla risposta a parole (sarebbe la rinuncia).
+        assert!(
+            !nudge.contains("Rispondi ORA a parole"),
+            "su un fix NON deve guidare a rispondere a parole, ottenuto: {nudge}"
+        );
+        // Anti-loop preservato: vieta comunque la ri-lettura identica.
+        assert!(nudge.contains("NON rileggere"));
     }
 
     #[test]

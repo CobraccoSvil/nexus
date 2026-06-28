@@ -48,6 +48,10 @@ struct DecideInput {
     repeated_action_edit_failed: bool,
     #[serde(default)]
     repeated_action_read_only: bool,
+    // Default `true` per parita' coi casi golden Python (che non hanno questo campo):
+    // identico a `turn_action_oriented(None)`. Non altera l'output dei casi esistenti.
+    #[serde(default = "default_action_oriented")]
+    action_oriented: bool,
     #[serde(default)]
     reallocation_count: i64,
     #[serde(default = "default_realloc_threshold")]
@@ -71,6 +75,9 @@ struct DecideInput {
 fn default_exploration_threshold() -> i64 {
     6
 }
+fn default_action_oriented() -> bool {
+    true
+}
 fn default_realloc_threshold() -> i64 {
     3
 }
@@ -88,6 +95,7 @@ impl From<DecideInput> for ProgressSignals {
             repeated_action: i.repeated_action,
             repeated_action_edit_failed: i.repeated_action_edit_failed,
             repeated_action_read_only: i.repeated_action_read_only,
+            action_oriented: i.action_oriented,
             reallocation_count: i.reallocation_count,
             reallocation_threshold: i.reallocation_threshold,
             has_active_resources: i.has_active_resources,

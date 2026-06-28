@@ -778,12 +778,13 @@ async fn forcing_early_action_scatta_se_turno_precedente_non_ha_agito() {
 }
 
 #[tokio::test]
-async fn lettura_ripetuta_identica_guida_a_concludere() {
+async fn lettura_ripetuta_identica_informativa_guida_a_concludere() {
     // FIX #2 loop-control (regola H): una LETTURA ripetuta identica (stesso path)
     // oltre soglia (repeated_action_threshold=2, default) scatta come repeated_action
-    // di SOLA LETTURA: il progress_controller inietta un nudge "concludi con testo"
-    // SENZA forzare un'altra tool call, ben prima del cap esplorazione 2x (=12) e
-    // dell'escalation. Cosi' il loop read-only non arriva a 14 iterazioni.
+    // di SOLA LETTURA. Su un turno INFORMATIVO (action_oriented=false) il
+    // progress_controller inietta un nudge "concludi con testo" SENZA forzare un'altra
+    // tool call, ben prima del cap esplorazione 2x (=12) e dell'escalation. Cosi' il
+    // loop read-only non arriva a 14 iterazioni.
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc); // progress_controller ON
     let llm = Arc::new(StubLlmGateway::with_text("Concludo a parole."));
@@ -815,6 +816,8 @@ async fn lettura_ripetuta_identica_guida_a_concludere() {
         thread_id: Some("r1".into()),
         messages,
         tools_json: Some(vec![json!({"name": "read_file"})]),
+        // Turno informativo: il nudge deve guidare a concludere con testo.
+        action_oriented: Some(false),
         ..Default::default()
     };
     let delta = n.run(&state, &ctx).await.expect("run");
@@ -824,11 +827,79 @@ async fn lettura_ripetuta_identica_guida_a_concludere() {
     let has_concludi = req.messages.iter().any(|m| {
         matches!(&m.content, Value::String(s) if s.contains("Rispondi ORA a parole"))
     });
-    assert!(has_concludi, "atteso nudge 'concludi con testo' per la lettura ripetuta");
+    assert!(has_concludi, "atteso nudge 'concludi con testo' per la lettura ripetuta informativa");
     // NON forza il tool (force_tool_choice None): il modello puo' chiudere con testo.
     assert_eq!(
         req.force_tool_choice, None,
-        "lettura ripetuta -> niente force-action (non un altro read-only)"
+        "lettura ripetuta informativa -> niente force-action (non un altro read-only)"
+    );
+}
+
+#[tokio::test]
+async fn lettura_ripetuta_identica_action_oriented_orienta_all_edit() {
+    // Raffinamento (regola H) del FIX #2: su un turno ACTION-ORIENTED (task di fix,
+    // es. "correggi la porta hardcoded in vite.config.ts") la lettura ripetuta NON
+    // deve guidare a "rispondere a parole" (sarebbe una RINUNCIA a 0 file modificati):
+    // deve orientare all'EDIT, mantenendo l'anti-loop (no ri-lettura identica) e
+    // forzando la tool call cosi' l'agente APPLICA la correzione.
+    let rc = Arc::new(StubRunControlStore::default());
+    // Stile provider che SUPPORTA il forcing (come i test forcing-early): cosi'
+    // force_action_hard del progress_controller si traduce in force_tool_choice.
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        progress_controller_enabled: true,
+        tool_choice_style: Some("anthropic_any".to_string()),
+        ..ExecutorConfig::default()
+    };
+    let (n, _m, _s) = node(cfg, rc); // progress_controller ON
+    let llm = Arc::new(StubLlmGateway::with_text("Applico l'edit."));
+    let ctx = ctx_with(llm.clone(), false);
+    let messages = vec![
+        human("correggi la porta hardcoded 35198 in vite.config.ts: usa la porta allocata"),
+        ai_tool("read_file", json!({"path": "vite.config.ts"})),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String("server: { port: 35198 }".into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        },
+        ai_tool("read_file", json!({"path": "vite.config.ts"})),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c2".into(),
+                content: Value::String("server: { port: 35198 }".into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        },
+    ];
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        tools_json: Some(vec![json!({"name": "read_file"}), json!({"name": "edit_file"})]),
+        // Turno di modifica: il nudge deve orientare all'edit, non alla resa.
+        action_oriented: Some(true),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _ = apply(state, delta);
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    // Nudge orientato all'EDIT iniettato, NON quello "rispondi a parole".
+    let has_edit_nudge = req.messages.iter().any(|m| {
+        matches!(&m.content, Value::String(s) if s.contains("APPLICA la correzione"))
+    });
+    assert!(has_edit_nudge, "atteso nudge orientato all'edit per la lettura ripetuta su un fix");
+    let has_concludi = req.messages.iter().any(|m| {
+        matches!(&m.content, Value::String(s) if s.contains("Rispondi ORA a parole"))
+    });
+    assert!(!has_concludi, "su un fix il nudge NON deve guidare a rispondere a parole");
+    // Forza la tool call: l'agente DEVE applicare l'edit, non rinunciare.
+    assert_eq!(
+        req.force_tool_choice, Some(true),
+        "lettura ripetuta su un fix -> force-action verso l'edit"
     );
 }
 
