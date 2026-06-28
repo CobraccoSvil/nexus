@@ -132,8 +132,12 @@ pub(crate) struct EligibilityFilter<'a> {
     /// `tool_choice` forzato). Per il path non-agentico (vision/embedding) il
     /// concetto di thinking non si applica -> `false`, niente pre-ordinamento.
     pub require_thinking_non_exclude: bool,
-    /// `Some("vision")` => `AND supports_vision = TRUE` (colonna canonica, la
-    /// vision NON e' nel jsonb capabilities). `Some(c)` => `capabilities @> ["c"]`.
+    /// Capability richiesta. Le capability con una COLONNA canonica dedicata
+    /// (vision + i media kind image_gen/audio_in/audio_out/video_gen, mig 0478)
+    /// si filtrano via `AND supports_<x> = TRUE` (vedi `capability_to_column`);
+    /// ogni altra capability => `capabilities @> ["c"]` nel jsonb. Quando la
+    /// capability richiesta NON e' un media kind, i modelli media vengono ESCLUSI
+    /// (un image-gen non risale la classifica dei purpose testuali).
     pub capability: Option<&'a str>,
     /// `>0` => `AND context_window >= N`.
     pub min_context_window: i64,
@@ -141,6 +145,37 @@ pub(crate) struct EligibilityFilter<'a> {
     pub exclude_providers: &'a [String],
     /// `true` => esclude anche i provider attualmente in cooldown (snapshot).
     pub apply_cooldown: bool,
+}
+
+/// PUNTO UNICO (regola L) del mapping capability -> colonna booleana canonica
+/// di `ai_price_catalog`. Ritorna il nome colonna per le capability che hanno
+/// una colonna dedicata (vision, mig 0318; i 4 media kind, mig 0478), `None`
+/// per le capability che vivono nel jsonb `capabilities` (chat/code/reasoning/...).
+///
+/// Aggiungere un nuovo media kind richiede UNA riga qui + la colonna in
+/// migrazione: nessun `if`/`match` duplicato sparso nei call site (regola L).
+/// I valori ritornati sono nomi-colonna STATICI (whitelist): vengono interpolati
+/// nella SQL ma NON derivano da input utente -> niente SQL injection.
+fn capability_to_column(capability: &str) -> Option<&'static str> {
+    match capability {
+        "vision" => Some("supports_vision"),
+        "image_gen" => Some("supports_image_gen"),
+        "audio_in" => Some("supports_audio_in"),
+        "audio_out" => Some("supports_audio_out"),
+        "video_gen" => Some("supports_video_gen"),
+        _ => None,
+    }
+}
+
+/// True se la capability e' un MEDIA kind (image/audio/video), non testuale
+/// (chat/code/reasoning) ne' vision. Punto unico (regola L) usato per decidere
+/// se ESCLUDERE i modelli media dalla selezione: i purpose testuali NON devono
+/// pescare un image-gen; un purpose media (es. generate_image) si'.
+fn is_media_capability(capability: &str) -> bool {
+    matches!(
+        capability,
+        "image_gen" | "audio_in" | "audio_out" | "video_gen"
+    )
 }
 
 /// Selezione TIER-CHAIN + `ORDER BY` SQL: semantica del routing LIVE.
@@ -178,11 +213,23 @@ pub(crate) async fn select_models_tierchain(
         tier_chain.iter().map(|t| Some(*t)).collect()
     };
 
-    let is_vision = filter.capability == Some("vision");
+    // PUNTO UNICO (regola L) del mapping capability -> colonna canonica del
+    // catalog. Le capability con una colonna booleana dedicata (vision + i media
+    // kind della mig 0478) si filtrano via colonna; ogni altra capability (chat,
+    // 'code', 'reasoning', ...) resta nel jsonb `capabilities`. Aggiungere un
+    // nuovo media kind = una riga qui (e la colonna in mig), niente if sparsi.
+    let capability_column: Option<&'static str> =
+        filter.capability.and_then(capability_to_column);
+    // jsonb solo per le capability SENZA colonna dedicata.
     let capability_json = filter
         .capability
-        .filter(|_| !is_vision)
+        .filter(|_| capability_column.is_none())
         .map(|c| format!("[\"{c}\"]"));
+    // Una capability media o vision e' "specializzata": NON va esclusa da se
+    // stessa. Le capability TESTUALI (chat/code/None/vision) NON devono pescare
+    // modelli media (un image-gen non e' un modello di testo): esclusione esplicita
+    // dei flag media quando la capability richiesta NON e' un media kind.
+    let requested_is_media = filter.capability.map(is_media_capability).unwrap_or(false);
 
     for tier in tiers {
         // $1 = array provider esclusi (sempre). Placeholder successivi assegnati
@@ -200,8 +247,17 @@ pub(crate) async fn select_models_tierchain(
         if filter.require_thinking_non_exclude {
             sql.push_str(" AND agentic_thinking_policy <> 'exclude'");
         }
-        if is_vision {
-            sql.push_str(" AND supports_vision = TRUE");
+        if let Some(col) = capability_column {
+            // `col` proviene da `capability_to_column` (whitelist statica di nomi
+            // colonna): nessun input utente interpolato, niente SQL injection.
+            sql.push_str(&format!(" AND {col} = TRUE"));
+        }
+        if !requested_is_media {
+            // I modelli media non risalgono la classifica dei purpose testuali.
+            sql.push_str(
+                " AND supports_image_gen = FALSE AND supports_audio_in = FALSE \
+                  AND supports_audio_out = FALSE AND supports_video_gen = FALSE",
+            );
         }
         if tier.is_some() {
             idx += 1;
@@ -388,6 +444,10 @@ mod tests {
                  is_enabled BOOLEAN NOT NULL DEFAULT true, \
                  supports_tool_use BOOLEAN NOT NULL DEFAULT true, \
                  supports_vision BOOLEAN NOT NULL DEFAULT false, \
+                 supports_image_gen BOOLEAN NOT NULL DEFAULT false, \
+                 supports_audio_in BOOLEAN NOT NULL DEFAULT false, \
+                 supports_audio_out BOOLEAN NOT NULL DEFAULT false, \
+                 supports_video_gen BOOLEAN NOT NULL DEFAULT false, \
                  agentic_thinking_policy TEXT NOT NULL DEFAULT 'none', \
                  performance_tier TEXT NOT NULL DEFAULT 'medium', \
                  capabilities JSONB NOT NULL DEFAULT '[]', \
@@ -566,6 +626,101 @@ mod tests {
         .await
         .expect("ok");
         assert_eq!(out, vec![("b".to_string(), "vision".to_string())]);
+    }
+
+    #[sqlx::test]
+    async fn tierchain_capability_none_esclude_media(pool: sqlx::PgPool) {
+        create_catalog_table(&pool).await;
+        // Un image-gen tool-capable (assurdo, ma testa che l'esclusione media
+        // scatti a prescindere) NON deve entrare nel routing chat (capability=None).
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, supports_image_gen, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
+             ('openai', 'dall-e-3', true, true, 'none', 'medium', 0.1), \
+             ('openai', 'gpt-4o', true, false, 'none', 'medium', 1.0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let f = EligibilityFilter {
+            require_tool_use: false,
+            require_thinking_non_exclude: false,
+            capability: None,
+            min_context_window: 0,
+            exclude_providers: &[],
+            apply_cooldown: false,
+        };
+        let out = select_models_tierchain(
+            &pool,
+            &f,
+            &["medium"],
+            "input_cost_per_million_tokens ASC",
+            5,
+        )
+        .await
+        .expect("ok");
+        // Solo il chat: il media (image-gen) e' escluso dai purpose testuali.
+        assert_eq!(out, vec![("openai".to_string(), "gpt-4o".to_string())]);
+    }
+
+    #[sqlx::test]
+    async fn tierchain_image_gen_via_supports_image_gen(pool: sqlx::PgPool) {
+        create_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, supports_image_gen, performance_tier) VALUES \
+             ('openai', 'gpt-4o', false, false, 'light'), \
+             ('openai', 'gpt-image-1', false, true, 'light')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        // Gemello del test vision: capability='image_gen' deve filtrare via colonna
+        // canonica supports_image_gen e selezionare SOLO il modello media.
+        let f = EligibilityFilter {
+            require_tool_use: false,
+            require_thinking_non_exclude: false,
+            capability: Some("image_gen"),
+            min_context_window: 0,
+            exclude_providers: &[],
+            apply_cooldown: false,
+        };
+        let out = select_models_tierchain(
+            &pool,
+            &f,
+            &["light"],
+            "is_featured DESC, input_cost_per_million_tokens ASC",
+            5,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(
+            out,
+            vec![("openai".to_string(), "gpt-image-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn capability_to_column_mappa_solo_le_capability_con_colonna() {
+        assert_eq!(capability_to_column("vision"), Some("supports_vision"));
+        assert_eq!(capability_to_column("image_gen"), Some("supports_image_gen"));
+        assert_eq!(capability_to_column("audio_in"), Some("supports_audio_in"));
+        assert_eq!(capability_to_column("audio_out"), Some("supports_audio_out"));
+        assert_eq!(capability_to_column("video_gen"), Some("supports_video_gen"));
+        // capability nel jsonb: nessuna colonna dedicata.
+        assert_eq!(capability_to_column("code"), None);
+        assert_eq!(capability_to_column("reasoning"), None);
+    }
+
+    #[test]
+    fn is_media_capability_distingue_media_da_testuali() {
+        assert!(is_media_capability("image_gen"));
+        assert!(is_media_capability("audio_in"));
+        assert!(is_media_capability("audio_out"));
+        assert!(is_media_capability("video_gen"));
+        // vision NON e' media (e' una capability di input testuale-multimodale).
+        assert!(!is_media_capability("vision"));
+        assert!(!is_media_capability("code"));
     }
 
     #[test]

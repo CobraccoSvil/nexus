@@ -103,6 +103,184 @@ fn is_chat_compatible_model(model: &str) -> bool {
     true
 }
 
+/// PUNTO UNICO (regola L) della classificazione MEDIA di un modello dal nome.
+///
+/// I provider espongono nelle loro `/v1/models` API anche modelli specializzati
+/// in generazione/comprensione di media (immagini, audio, video) che NON sono
+/// chat completion ma vanno comunque gestiti dal catalog per essere instradati
+/// PER CAPABILITY (image generation, trascrizione, sintesi vocale, ecc.). Questa
+/// funzione e' la sorgente UNICA delle regole "nome -> media kind": le STESSE
+/// regex sono replicate nel backfill della migrazione 0478 (un solo posto sa
+/// quali nomi sono media; il seed SQL e il codice condividono le regole).
+///
+/// Ritorna il media kind canonico (`"image_gen"`, `"audio_in"`, `"audio_out"`,
+/// `"video_gen"`) o `None` se il modello NON e' un media (chat/vision/embedding/
+/// realtime/instruct/moderation restano fuori da qui). Le colonne canoniche
+/// corrispondenti sono `supports_image_gen|audio_in|audio_out|video_gen`
+/// (mig 0478), gemelle di `supports_vision` (mig 0318).
+///
+/// Niente nome modello hardcoded come model-id di business (regola G): qui si
+/// classifica per FAMIGLIA/naming, come `is_chat_compatible_model` e
+/// `classify_capabilities`. L'ordine dei controlli e' per specificita': image
+/// prima (gpt-image vs gpt chat), poi audio_in (whisper/transcribe), poi
+/// audio_out (tts), poi video (veo/sora).
+pub(crate) fn classify_media_kind(model: &str) -> Option<&'static str> {
+    let m = model.to_ascii_lowercase();
+
+    // image_gen: dall-e / dalle / imagen / gpt-image / *-image* / nano-banana.
+    //   - "dall-e" e "dalle-" (OpenAI), "imagen" (Google), "gpt-image" (OpenAI),
+    //   - suffisso/infix "-image" (es. *-image, *-image-1), "nano-banana" (Gemini).
+    let is_image = m.contains("dall-e")
+        || m.contains("dalle")
+        || m.contains("imagen")
+        || m.contains("gpt-image")
+        || m.ends_with("-image")
+        || m.contains("-image-")
+        || m.contains("nano-banana");
+    if is_image {
+        return Some("image_gen");
+    }
+
+    // audio_in: trascrizione / speech-to-text. whisper, *-transcribe, transcribe-*,
+    //           voxtral (Mistral audio understanding).
+    let is_audio_in = m.contains("whisper")
+        || m.contains("-transcribe")
+        || m.contains("transcribe-")
+        || m.contains("voxtral");
+    if is_audio_in {
+        return Some("audio_in");
+    }
+
+    // audio_out: text-to-speech. suffisso "-tts", prefisso "tts-", infix "-tts-".
+    let is_audio_out = m.ends_with("-tts") || m.starts_with("tts-") || m.contains("-tts-");
+    if is_audio_out {
+        return Some("audio_out");
+    }
+
+    // video_gen: veo (Google), sora (OpenAI).
+    let is_video = m.contains("veo") || m.contains("sora");
+    if is_video {
+        return Some("video_gen");
+    }
+
+    None
+}
+
+/// Mappa il media kind canonico alla colonna booleana di `ai_price_catalog`
+/// (punto unico, regola L: un solo posto traduce kind -> colonna, sia qui per
+/// il sync sia, specularmente, in `model_selection.rs` per la WHERE). Ritorna
+/// `None` per un kind non riconosciuto (impossibile dai chiamanti interni che
+/// passano l'output di `classify_media_kind`, ma fail-safe).
+pub(crate) fn media_kind_column(kind: &str) -> Option<&'static str> {
+    match kind {
+        "image_gen" => Some("supports_image_gen"),
+        "audio_in" => Some("supports_audio_in"),
+        "audio_out" => Some("supports_audio_out"),
+        "video_gen" => Some("supports_video_gen"),
+        _ => None,
+    }
+}
+
+/// INSERT di un modello MEDIA scoperto via API discovery. Default sicuro:
+/// `is_enabled=false` (richiede abilitazione esplicita, come i chat nuovi),
+/// `supports_tool_use=false` e `is_thinking=false` (un media non e' agentico),
+/// `pricing_state='unknown'` (costo placeholder, regola H: non e' "gratis").
+/// Il flag `supports_<media>` corrispondente al `kind` viene messo a TRUE.
+/// Ritorna `Some(1)` se la riga e' stata inserita, `None` altrimenti.
+async fn insert_media_model(
+    db: &PgPool,
+    provider: &str,
+    api_model: &str,
+    kind: &str,
+) -> Option<u32> {
+    let Some(col) = media_kind_column(kind) else {
+        tracing::warn!(
+            "catalog_sync[{}]: media kind sconosciuto '{}' per '{}', skip insert",
+            provider,
+            kind,
+            api_model
+        );
+        return None;
+    };
+    let inferred_tier = infer_tier_from_name(provider, api_model);
+    // Colonna interpolata SOLO da `media_kind_column` (whitelist statica, niente
+    // input utente): nessuna SQL injection. I valori restano bind parametrici.
+    let sql = format!(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, display_name, input_cost_per_million_tokens, \
+          output_cost_per_million_tokens, currency, capabilities, performance_tier, \
+          is_enabled, supports_tool_use, is_thinking, {col}, pricing_state, effective_from) \
+         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, false, false, TRUE, 'unknown', NOW()) \
+         ON CONFLICT (provider, model) DO NOTHING"
+    );
+    match sqlx::query(&sql)
+        .bind(provider)
+        .bind(api_model)
+        .bind(api_model)
+        .bind(inferred_tier)
+        .execute(db)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            audit_log(
+                db,
+                provider,
+                api_model,
+                "inserted",
+                json!({"source": "api_discovery", "media_kind": kind}),
+            )
+            .await;
+            tracing::info!(
+                "catalog_sync[{}]: + nuovo modello MEDIA '{}' (kind={}, disabled, no probe)",
+                provider,
+                api_model,
+                kind
+            );
+            Some(1)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                "catalog_sync[{}]: insert media '{}' fallito: {}",
+                provider,
+                api_model,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Riallinea il flag `supports_<media>` di un media GIA' presente, sulle sole
+/// righe `capability_source='auto'` (le 'manual' restano intatte). Stesso
+/// principio del riallineamento `supports_vision` per i chat (regola H+L):
+/// una correzione della classificazione media si propaga ai modelli esistenti
+/// senza migrazione-dati manuale.
+async fn realign_media_flags(db: &PgPool, provider: &str, api_model: &str, kind: &str) {
+    let Some(col) = media_kind_column(kind) else {
+        return;
+    };
+    // Colonna da whitelist statica (media_kind_column): niente SQL injection.
+    let sql = format!(
+        "UPDATE ai_price_catalog SET {col} = TRUE, updated_at = NOW() \
+         WHERE provider = $1 AND model = $2 AND capability_source = 'auto' \
+           AND {col} <> TRUE"
+    );
+    if let Err(e) = sqlx::query(&sql)
+        .bind(provider)
+        .bind(api_model)
+        .execute(db)
+        .await
+    {
+        tracing::warn!(
+            "catalog_sync[{}]: realign media flag '{}' fallito: {}",
+            provider,
+            api_model,
+            e
+        );
+    }
+}
+
 /// Inferisce le capabilities di un modello dal nome quando l'API discovery
 /// non le ritorna esplicite (caso comune per Google Vertex). Restituisce una
 /// lista pronta per `capabilities` JSONB di ai_price_catalog.
@@ -699,17 +877,44 @@ async fn sync_provider(
 
     // 1. Nuovi modelli dall'API non presenti nel catalog -> INSERT
     for api_model in &api_models {
-        // Skip modelli non chat-compatibili (TTS, embedding, instruct legacy,
-        // hollow placeholder) — vedi `is_chat_compatible_model` per la
-        // blacklist consolidata da incidenti reali.
-        if !is_chat_compatible_model(api_model) {
+        // Classificazione MEDIA (punto unico, regola L): un modello image-gen/
+        // audio/video NON e' chat completion ma va comunque gestito dal catalog
+        // per essere instradato PER CAPABILITY. Prima questi venivano SCARTATI
+        // da `is_chat_compatible_model` (blacklist), rendendoli inesistenti per
+        // il routing media. Ora: se e' un media lo inseriamo coi suoi flag; se
+        // NON e' un media E non e' chat-compatibile (embedding/realtime/instruct/
+        // moderation) lo skippiamo come prima.
+        let media = classify_media_kind(api_model);
+        if media.is_none() && !is_chat_compatible_model(api_model) {
             tracing::debug!(
-                "catalog_sync[{}]: skip '{}' (non chat-compatible)",
+                "catalog_sync[{}]: skip '{}' (non chat-compatible, non media)",
                 provider,
                 api_model
             );
             continue;
         }
+
+        // Ramo MEDIA: insert dedicato, default sicuro (is_enabled=false), NIENTE
+        // probe chat (probe_model_on_insert chiamerebbe una completion: un media
+        // non e' chat -> sarebbe rumore/falso fallimento). NON applichiamo la
+        // chat model_selection_policy ne' il pruning chat: i media vivono dei
+        // loro flag supports_<media>. I media NON attraversano il `match`
+        // chat sottostante (re-enable/policy/probe): questo ramo e' terminale.
+        if let Some(kind) = media {
+            match catalog_models.contains_key(api_model) {
+                false if insert_new_disabled => {
+                    if let Some(n) = insert_media_model(db, provider, api_model, kind).await {
+                        inserted += n;
+                    }
+                }
+                // Media gia' presente: riallinea il flag supports_<media> sulle
+                // righe 'auto' (gemello del riallineamento supports_vision dei chat).
+                true => realign_media_flags(db, provider, api_model, kind).await,
+                false => {}
+            }
+            continue;
+        }
+
         match catalog_models.get(api_model) {
             None => {
                 if insert_new_disabled {
@@ -1006,6 +1211,13 @@ async fn sync_provider(
     // per sempre. `manual_locked` viene rispettato: se l'admin ha deciso di
     // tenerlo abilitato a mano, non lo tocchiamo.
     for (catalog_model, (is_enabled, manual_locked)) in &catalog_models {
+        // GATE MEDIA (regola L): un modello media (image-gen/audio/video) NON e'
+        // chat-compatibile per design e non rientra nella chat model_selection_policy:
+        // NON deve essere auto-disabilitato da questo prune chat. La sua eleggibilita'
+        // dipende dai flag supports_<media>, gestiti altrove (insert/realign + admin).
+        if classify_media_kind(catalog_model).is_some() {
+            continue;
+        }
         if *is_enabled && !manual_locked {
             // Prune self-healing (ADR 0025): un modello enabled va disabilitato se
             // non e' chat-compatibile (blacklist) OPPURE non passa la
@@ -1395,6 +1607,43 @@ mod tests {
         assert!(is_chat_compatible_model("claude-sonnet-4-6"));
         assert!(is_chat_compatible_model("gpt-4o"));
         assert!(is_chat_compatible_model("mistral-large-latest"));
+    }
+
+    #[test]
+    fn test_classify_media_kind() {
+        // image_gen: dall-e / imagen / gpt-image / *-image / nano-banana.
+        assert_eq!(classify_media_kind("dall-e-3"), Some("image_gen"));
+        assert_eq!(classify_media_kind("dall-e-2"), Some("image_gen"));
+        assert_eq!(classify_media_kind("imagen-3.0-generate-002"), Some("image_gen"));
+        assert_eq!(classify_media_kind("gpt-image-1"), Some("image_gen"));
+        assert_eq!(classify_media_kind("gemini-2.5-flash-image"), Some("image_gen"));
+        assert_eq!(classify_media_kind("gemini-nano-banana"), Some("image_gen"));
+        // audio_in: whisper / transcribe / voxtral.
+        assert_eq!(classify_media_kind("whisper-1"), Some("audio_in"));
+        assert_eq!(classify_media_kind("gpt-4o-transcribe"), Some("audio_in"));
+        assert_eq!(classify_media_kind("voxtral-small-latest"), Some("audio_in"));
+        // audio_out: tts.
+        assert_eq!(classify_media_kind("tts-1"), Some("audio_out"));
+        assert_eq!(classify_media_kind("tts-1-hd"), Some("audio_out"));
+        assert_eq!(classify_media_kind("gpt-4o-mini-tts"), Some("audio_out"));
+        // video_gen: veo / sora.
+        assert_eq!(classify_media_kind("veo-2.0"), Some("video_gen"));
+        assert_eq!(classify_media_kind("sora"), Some("video_gen"));
+        // NON-media (chat/vision/embedding) -> None.
+        assert_eq!(classify_media_kind("gpt-4o"), None);
+        assert_eq!(classify_media_kind("claude-sonnet-4-6"), None);
+        assert_eq!(classify_media_kind("gemini-2.5-pro"), None);
+        assert_eq!(classify_media_kind("text-embedding-3-small"), None);
+        assert_eq!(classify_media_kind("mistral-large-latest"), None);
+    }
+
+    #[test]
+    fn test_media_kind_column() {
+        assert_eq!(media_kind_column("image_gen"), Some("supports_image_gen"));
+        assert_eq!(media_kind_column("audio_in"), Some("supports_audio_in"));
+        assert_eq!(media_kind_column("audio_out"), Some("supports_audio_out"));
+        assert_eq!(media_kind_column("video_gen"), Some("supports_video_gen"));
+        assert_eq!(media_kind_column("bogus"), None);
     }
 
     #[test]
