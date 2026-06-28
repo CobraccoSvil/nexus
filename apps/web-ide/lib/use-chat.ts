@@ -12,6 +12,7 @@ import {
   getAgentRun,
   getChatMessages,
   getSessionMetaSteps,
+  getSessionTraces,
   getChatSessions,
   getSessionUsage,
   resendChatMessage,
@@ -281,7 +282,13 @@ export function useChat(
       }
 
       setSessionId(activeSessionId);
-      // Restore persisted traces for this session
+      // Ripristino tracce gateway LLM (AITraceEvent) a due livelli, convergenti
+      // sul DB (regola L). sessionStorage resta cache opportunistica (veloce,
+      // per-dispositivo, volatile): lo usiamo come primo riempimento per evitare
+      // un pannello vuoto durante la fetch. Subito dopo il DB
+      // (nexus_agent_traces, mig 0485) e' autoritativo e SOVRASCRIVE: cosi' un
+      // reload in un altro tab/dispositivo o dopo pulizia storage converge col
+      // rendering live invece di divergere.
       try {
         const saved = sessionStorage.getItem(`nexus:traces:${activeSessionId}`);
         if (saved) {
@@ -291,6 +298,27 @@ export function useChat(
           }
         }
       } catch { /* ignore */ }
+      try {
+        const { runs } = await getSessionTraces(activeSessionId);
+        const runEntries = runs ? Object.values(runs) : [];
+        if (runEntries.length > 0) {
+          // Le tracce arrivano raggruppate per runId (ordine HashMap non
+          // garantito tra run). Appiattiamo in un'unica timeline ordinata per
+          // timestamp dell'AITraceEvent: e' la stessa forma di `traces` prodotta
+          // live dall'accumulo SSE. Cap a 100 (FIFO) come il path live.
+          const flat = runEntries
+            .flat()
+            .filter((tr): tr is AITraceEvent => Boolean(tr && tr.runId))
+            .sort(
+              (a, b) =>
+                new Date(a.timestamp ?? 0).getTime() - new Date(b.timestamp ?? 0).getTime(),
+            );
+          const capped = flat.length > 100 ? flat.slice(flat.length - 100) : flat;
+          setTraces(capped);
+        }
+      } catch {
+        // best-effort: il pannello resta sull'eventuale cache sessionStorage
+      }
       const history = await getChatMessages(activeSessionId);
       setMessages(history.messages ?? []);
       // Ripristina la timeline meta_step persistita (plan/routing/clarify/

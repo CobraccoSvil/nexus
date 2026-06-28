@@ -33,7 +33,8 @@ use uuid::Uuid;
 
 use crate::agent_tools::AGENT_TOOLS_JSON;
 use crate::agent_types::{
-    AgentMetaStep, AgentRunResult, AgentRunStatus, AgentStep, AgentStepEvent, AgentStepStatus,
+    AITraceEvent, AgentMetaStep, AgentRunResult, AgentRunStatus, AgentStep, AgentStepEvent,
+    AgentStepStatus,
 };
 
 /// Behavior_mode con cui il PRIMARIO (brain Python) avvia ogni run agentico.
@@ -689,6 +690,15 @@ pub async fn run_via_brain(
     let mut buffer = String::new();
     let mut final_answer = String::new();
     let mut last_text_segment = String::new();
+    // Buffer del ragionamento (thinking) del run: accumula tutti i thinking_delta
+    // emessi live cosi' da PERSISTERLO nel metadata.reasoning del messaggio
+    // assistant (FIX D4). Senza questo il blocco "Ragionamento" sparisce al
+    // refresh (i thinking_delta sono solo eventi SSE volatili).
+    let mut accumulated_reasoning = String::new();
+    // Indice progressivo delle tracce gateway persistite del run (FIX D7): una
+    // traccia per end_turn (provider/model effettivi, token, stop_reason). Cosi'
+    // il trace panel sopravvive al refresh (prima viveva solo in sessionStorage).
+    let mut trace_seq: i32 = 0;
     let mut steps: Vec<AgentStep> = Vec::new();
     let mut iteration: u32 = 0;
     let mut ended = false;
@@ -877,6 +887,9 @@ pub async fn run_via_brain(
                         .unwrap_or("")
                         .to_string();
                     if !text.is_empty() {
+                        // Accumula per la persistenza (FIX D4): il blocco
+                        // "Ragionamento" deve sopravvivere al refresh.
+                        accumulated_reasoning.push_str(&text);
                         let _ = step_tx.send(AgentStepEvent {
                             run_id: run_id_str.clone(),
                             step: None,
@@ -1026,6 +1039,52 @@ pub async fn run_via_brain(
                                 .to_string(),
                         );
                     }
+                    // ── FIX D7: traccia gateway del turno ─────────────────────
+                    // Costruisce l'AITraceEvent con provider/model EFFETTIVI (post
+                    // cascade/escalation), token e stop_reason di questo turno, lo
+                    // emette LIVE (`agent_trace`) e lo PERSISTE su nexus_agent_traces
+                    // cosi' il trace panel sopravvive al refresh (prima viveva solo
+                    // in sessionStorage del browser). response_text troncato (regola
+                    // F: niente leak di contenuti integri nel payload persistito).
+                    let trace = AITraceEvent {
+                        run_id: run_id_str.clone(),
+                        iteration,
+                        provider: effective_provider.clone(),
+                        model: effective_model.clone(),
+                        messages_sent: conversation_history.len() as u32,
+                        tools_count: tools_json.as_array().map(|a| a.len()).unwrap_or(0) as u32,
+                        response_text: last_text_segment.chars().take(2000).collect(),
+                        tool_calls: Vec::new(),
+                        stop_reason: last_stop_reason.clone().unwrap_or_default(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        input_tokens: acc_prompt_tokens,
+                        output_tokens: acc_completion_tokens,
+                        cache_read_tokens: 0,
+                    };
+                    // Persistenza best-effort (punto unico trace_store, regola L).
+                    if let Ok(payload) = serde_json::to_value(&trace) {
+                        crate::trace_store::persist_trace(
+                            &db,
+                            session_id,
+                            run_id,
+                            trace_seq,
+                            &payload,
+                        )
+                        .await;
+                    }
+                    trace_seq += 1;
+                    // Emissione LIVE: lo STESSO evento che il frontend mostra nel
+                    // pannello tracce (chat_agent.rs mappa trace.is_some() ->
+                    // `agent_trace`). Live e refresh ora coincidono.
+                    let _ = step_tx.send(AgentStepEvent {
+                        run_id: run_id_str.clone(),
+                        step: None,
+                        trace: Some(trace),
+                        is_final: false,
+                        token_delta: None,
+                        thinking_delta: None,
+                        meta_step: None,
+                    });
                 }
                 "error" => {
                     let msg = evt
@@ -1440,6 +1499,13 @@ pub async fn run_via_brain(
         hollow_completion,
         hollow_no_tools,
         hollow_completion_kind: hollow_kind.to_string(),
+        // FIX D4: reasoning accumulato per la persistenza nel metadata del
+        // messaggio assistant. None se il modello non ha emesso thinking.
+        reasoning: if accumulated_reasoning.trim().is_empty() {
+            None
+        } else {
+            Some(accumulated_reasoning)
+        },
     }
 }
 
@@ -1578,6 +1644,8 @@ fn fail_result(run_id: &str, provider: &str, model: &str, msg: String) -> AgentR
         hollow_completion: false,
         hollow_no_tools: false,
         hollow_completion_kind: String::new(),
+        // Fallimento infrastrutturale: nessun reasoning prodotto (FIX D4).
+        reasoning: None,
     }
 }
 

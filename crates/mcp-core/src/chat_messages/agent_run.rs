@@ -100,22 +100,158 @@ fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
     Some(out)
 }
 
-/// Riepilogo conciso SEMPRE in coda alla risposta: conteggi REALI dagli step
-/// (file modificati, azioni eseguite), indipendenti dalla narrativa dell'agente.
-/// Cosi' l'utente capisce a colpo d'occhio cosa e' stato fatto anche quando la
-/// risposta e' interlocutoria/confusa o troncata. Lo stato del turno
-/// (completato/fallito) e' gia' nel badge; qui i fatti che lo completano. `None`
-/// se non c'e' alcuna azione concreta (es. turno conversazionale).
+/// Abbrevia un path file per la visualizzazione nel recap: normalizza i
+/// backslash Windows in slash, e se ci sono piu' di 2 segmenti mostra solo gli
+/// ultimi due preceduti da `.../`. Parita' 1:1 con la mappa di `buildSemanticDetail`
+/// (run-summary.ts righe 106-110): cosi' il recap persistito e quello live LIVE
+/// coincidono dopo un refresh.
+fn short_file_label(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
+    if parts.len() > 2 {
+        format!(".../{}", parts[parts.len() - 2..].join("/"))
+    } else {
+        path.to_string()
+    }
+}
+
+/// Riepilogo RICCO SEMPRE in coda alla risposta: conteggi e dettagli REALI dagli
+/// step (file modificati con nome breve, comandi eseguiti, file analizzati, esito
+/// step/errori), indipendenti dalla narrativa dell'agente. Cosi' l'utente capisce
+/// a colpo d'occhio cosa e' stato fatto anche quando la risposta e'
+/// interlocutoria/confusa o troncata.
+///
+/// PUNTO UNICO DEL RECAP (regola L / regola H): produce lo STESSO blocco oggi
+/// composto LIVE dal frontend in `apps/web-ide/lib/use-chat/run-summary.ts`
+/// `buildSemanticDetail` (righe 66-128). Prima divergeva: questo backend
+/// persisteva una riga secca ("N file modificati, M azioni eseguite") mentre il
+/// frontend live mostrava il blocco ricco -> dopo un refresh (che ricostruisce
+/// dal DB) la chat cambiava aspetto. Replicando il formato esatto qui, il
+/// `content` persistito in `chat_messages` coincide col recap mostrato LIVE,
+/// eliminando la divergenza F5.
+///
+/// `None` se non c'e' alcuna azione concreta (ne' file modificati, ne' comandi,
+/// ne' file analizzati): turno conversazionale, stessa decisione di
+/// `buildSemanticDetail` (return "" -> qui `None`).
 fn outcome_summary(steps: &[AgentStep]) -> Option<String> {
-    let (lines, files) = collect_actions(steps);
-    if lines.is_empty() {
+    const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "create_file", "patch_file"];
+    const CMD_TOOLS: &[&str] = &["run_in_terminal", "run_command"];
+    const READ_TOOLS: &[&str] = &["read_file", "search_in_files", "search_files"];
+    const IGNORE_TOOLS: &[&str] = &["supervisor_check"];
+
+    let mut modified_files: Vec<String> = Vec::new();
+    let mut commands: Vec<String> = Vec::new();
+    let mut analysis_count: usize = 0;
+    let mut error_count: usize = 0;
+    let mut completed_count: usize = 0;
+
+    for step in steps {
+        let tool = step.tool_name.as_str();
+        if IGNORE_TOOLS.contains(&tool) {
+            continue;
+        }
+        if step.status == AgentStepStatus::Failed {
+            error_count += 1;
+        }
+        if step.status == AgentStepStatus::Completed {
+            completed_count += 1;
+        }
+
+        if WRITE_TOOLS.contains(&tool) {
+            let path = step
+                .tool_input
+                .get("path")
+                .or_else(|| step.tool_input.get("file_path"))
+                .or_else(|| step.tool_input.get("filename"))
+                .and_then(|v| v.as_str());
+            if let Some(p) = path {
+                if !p.is_empty() && !modified_files.iter().any(|f| f == p) {
+                    modified_files.push(p.to_string());
+                }
+            }
+        } else if CMD_TOOLS.contains(&tool) {
+            let cmd = step
+                .tool_input
+                .get("command")
+                .or_else(|| step.tool_input.get("cmd"))
+                .or_else(|| step.tool_input.get("text"))
+                .and_then(|v| v.as_str());
+            if let Some(c) = cmd {
+                if !c.is_empty() {
+                    // Tronca comandi molto lunghi (parita' run-summary.ts: 80 char,
+                    // taglio a 77 + "...").
+                    let short = if c.chars().count() > 80 {
+                        format!("{}...", c.chars().take(77).collect::<String>())
+                    } else {
+                        c.to_string()
+                    };
+                    if !commands.iter().any(|x| x == &short) {
+                        commands.push(short);
+                    }
+                }
+            }
+        } else if READ_TOOLS.contains(&tool) {
+            analysis_count += 1;
+        }
+    }
+
+    // Turno conversazionale (nessuna azione significativa): nessun recap.
+    if modified_files.is_empty() && commands.is_empty() && analysis_count == 0 {
         return None;
     }
-    Some(format!(
-        "\n\n---\n_Riepilogo esecuzione: {} file modificati, {} azioni eseguite._",
-        files.len(),
-        lines.len()
-    ))
+
+    let mut lines: Vec<String> = Vec::new();
+    if !modified_files.is_empty() {
+        const MAX_FILES: usize = 5;
+        let shown: Vec<String> = modified_files
+            .iter()
+            .take(MAX_FILES)
+            .map(|f| format!("`{}`", short_file_label(f)))
+            .collect();
+        let extra = if modified_files.len() > MAX_FILES {
+            format!(" e altri {} file", modified_files.len() - MAX_FILES)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "- Modificati {} file: {}{}",
+            modified_files.len(),
+            shown.join(", "),
+            extra
+        ));
+    }
+    if !commands.is_empty() {
+        const MAX_CMDS: usize = 3;
+        let shown: Vec<String> = commands
+            .iter()
+            .take(MAX_CMDS)
+            .map(|c| format!("`{c}`"))
+            .collect();
+        let extra = if commands.len() > MAX_CMDS {
+            format!(" e altri {}", commands.len() - MAX_CMDS)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "- Eseguiti {} comandi: {}{}",
+            commands.len(),
+            shown.join(", "),
+            extra
+        ));
+    }
+    if analysis_count > 0 {
+        lines.push(format!("- Analizzati {analysis_count} file"));
+    }
+    let errors_suffix = if error_count > 0 {
+        format!(", {error_count} errori")
+    } else {
+        String::new()
+    };
+    lines.push(format!(
+        "- Risultato: {completed_count} step completati{errors_suffix}"
+    ));
+
+    Some(format!("\n\n**Riepilogo:**\n{}", lines.join("\n")))
 }
 
 /// Footer da appendere a un `final_answer` NON conclusivo (es. frase
@@ -348,6 +484,23 @@ pub(crate) fn compose_turn_answer(
                 })
         }
         _ => None,
+    }
+}
+
+/// Appende a `answer` il recap RICCO delle azioni del run (`outcome_summary`),
+/// se presente. PUNTO UNICO (regola L / regola H) dell'append del recap al
+/// content del messaggio assistant: prima lo spawn lo appendeva inline e il
+/// RESUME no, producendo due content divergenti (recap presente live/spawn,
+/// assente dopo un resume di conferma). Centralizzandolo qui i due percorsi
+/// producono lo stesso testo. `outcome_summary` e' a sua volta 1:1 con il
+/// `buildSemanticDetail` del frontend (FIX D3), cosi' live e refresh coincidono.
+pub(crate) fn append_outcome_summary(
+    answer: String,
+    steps: &[AgentStep],
+) -> String {
+    match outcome_summary(steps) {
+        Some(s) => format!("{answer}{s}"),
+        None => answer,
     }
 }
 
@@ -1080,6 +1233,8 @@ async fn native_outcome_to_run_result(
         hollow_completion: false,
         hollow_no_tools: false,
         hollow_completion_kind: String::new(),
+        // FIX D4: reasoning accumulato dal grafo nativo (reasoning_acc dello stato).
+        reasoning: outcome.reasoning,
     }
 }
 
@@ -1240,6 +1395,8 @@ fn native_engine_failure_result(
         hollow_completion: false,
         hollow_no_tools: false,
         hollow_completion_kind: String::new(),
+        // Fallimento del motore nativo: nessun reasoning utile (FIX D4).
+        reasoning: None,
     }
 }
 
@@ -3151,12 +3308,10 @@ pub(crate) async fn spawn_agent_run(
                 };
                 // Riepilogo esecuzione SEMPRE in coda (numeri reali dagli step):
                 // l'utente vede cosa e' stato fatto anche se la risposta e'
-                // interlocutoria/confusa. None per i turni senza azioni.
-                let effective_answer = match outcome_summary(&result.steps) {
-                    Some(s) => format!("{effective_answer}{s}"),
-                    None => effective_answer,
-                };
-                let meta = json!({
+                // interlocutoria/confusa. None per i turni senza azioni. Punto
+                // unico append_outcome_summary, condiviso col resume (regola L).
+                let effective_answer = append_outcome_summary(effective_answer, &result.steps);
+                let mut meta = json!({
                     "provider": &result.provider,
                     "model": &result.model,
                     "agentRunId": run_id.to_string(),
@@ -3174,6 +3329,21 @@ pub(crate) async fn spawn_agent_run(
                     "totalCost": result.total_cost,
                     "currency": "USD",
                 });
+                // FIX D4: persisti il ragionamento (thinking) accumulato del run.
+                // LIVE viaggiava solo come evento SSE `agent_thinking` (volatile):
+                // al refresh il blocco "Ragionamento" spariva. Salvandolo qui nel
+                // metadata.reasoning il frontend lo ricostruisce dal DB. Aggiunto
+                // SOLO se presente (niente campo/null per i run senza thinking).
+                if let Some(reasoning) = result
+                    .reasoning
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.insert("reasoning".to_string(), json!(reasoning));
+                    }
+                }
                 let _ = sqlx::query(
                 r#"INSERT INTO chat_messages
                    (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
@@ -4138,6 +4308,7 @@ mod tests_select_engine {
             total_tokens: 140,
             total_cost: 0.0,
             user_intent: Some("code".to_string()),
+            reasoning: None,
         }
     }
 
@@ -4363,6 +4534,7 @@ mod tests_finalize_turn {
             hollow_completion,
             hollow_no_tools: false,
             hollow_completion_kind: hollow_kind.into(),
+            reasoning: None,
         }
     }
 
@@ -4717,5 +4889,124 @@ mod tests_finalize_turn {
         };
         assert!(super::reconcile_run_cost_from_ledger(&mut r, &ledger));
         assert_eq!(r.total_tokens, 950, "total_tokens ricostruito da prompt+completion");
+    }
+
+    // ── D3: outcome_summary == buildSemanticDetail (recap unico ricco) ─────────
+    fn step(tool: &str, input: serde_json::Value, status: AgentStepStatus) -> AgentStep {
+        AgentStep {
+            run_id: "r".into(),
+            step_index: 0,
+            tool_name: tool.into(),
+            tool_input: input,
+            tool_result: None,
+            status,
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn outcome_summary_turno_conversazionale_e_none() {
+        // Nessuna azione concreta (solo un tool ignorato) -> None, parita' con
+        // buildSemanticDetail che ritorna "" (turno conversazionale).
+        let steps = vec![step(
+            "supervisor_check",
+            serde_json::json!({}),
+            AgentStepStatus::Completed,
+        )];
+        assert!(outcome_summary(&steps).is_none());
+        assert!(outcome_summary(&[]).is_none());
+    }
+
+    #[test]
+    fn outcome_summary_formato_ricco_completo() {
+        // Replica esatta del blocco di buildSemanticDetail (run-summary.ts).
+        let steps = vec![
+            step(
+                "write_file",
+                serde_json::json!({"path": "src/components/Header.tsx"}),
+                AgentStepStatus::Completed,
+            ),
+            step(
+                "edit_file",
+                serde_json::json!({"file_path": "a.ts"}),
+                AgentStepStatus::Completed,
+            ),
+            step(
+                "run_command",
+                serde_json::json!({"command": "pnpm build"}),
+                AgentStepStatus::Completed,
+            ),
+            step(
+                "read_file",
+                serde_json::json!({"path": "x"}),
+                AgentStepStatus::Completed,
+            ),
+        ];
+        let out = outcome_summary(&steps).expect("recap atteso");
+        assert!(out.starts_with("\n\n**Riepilogo:**\n"), "header esatto: {out}");
+        // Path con >2 segmenti -> nome breve ".../ultimi2"; path <=2 segmenti intero.
+        assert!(
+            out.contains("- Modificati 2 file: `.../components/Header.tsx`, `a.ts`"),
+            "lista file con nome breve: {out}"
+        );
+        assert!(
+            out.contains("- Eseguiti 1 comandi: `pnpm build`"),
+            "comando in backtick: {out}"
+        );
+        assert!(out.contains("- Analizzati 1 file"), "conteggio analisi: {out}");
+        assert!(
+            out.contains("- Risultato: 4 step completati"),
+            "esito completati: {out}"
+        );
+        assert!(!out.contains("errori"), "nessun errore -> niente suffisso: {out}");
+    }
+
+    #[test]
+    fn outcome_summary_tronca_file_e_comandi_e_conta_errori() {
+        // >5 file -> " e altri N file"; >3 comandi -> " e altri N"; comando lungo
+        // troncato a 77 + "..."; step failed conteggiati come errori.
+        let mut steps = Vec::new();
+        for i in 0..7 {
+            steps.push(step(
+                "write_file",
+                serde_json::json!({ "path": format!("dir/file{i}.ts") }),
+                AgentStepStatus::Completed,
+            ));
+        }
+        let long_cmd = "x".repeat(120);
+        steps.push(step(
+            "run_command",
+            serde_json::json!({ "command": long_cmd }),
+            AgentStepStatus::Failed,
+        ));
+        let out = outcome_summary(&steps).expect("recap atteso");
+        assert!(out.contains("- Modificati 7 file:"), "conteggio totale 7: {out}");
+        assert!(out.contains(" e altri 2 file"), "extra file: {out}");
+        let expected_short = format!("`{}...`", "x".repeat(77));
+        assert!(out.contains(&expected_short), "comando troncato a 77+...: {out}");
+        assert!(
+            out.contains("- Risultato: 7 step completati, 1 errori"),
+            "errori conteggiati: {out}"
+        );
+    }
+
+    #[test]
+    fn outcome_summary_normalizza_backslash_windows() {
+        // Path Windows: "\\" -> "/" prima della troncatura nome breve.
+        let steps = vec![step(
+            "create_file",
+            serde_json::json!({"filename": "src\\lib\\util.ts"}),
+            AgentStepStatus::Completed,
+        )];
+        let out = outcome_summary(&steps).expect("recap atteso");
+        assert!(out.contains("`.../lib/util.ts`"), "backslash normalizzati: {out}");
+    }
+
+    #[test]
+    fn short_file_label_due_segmenti_intero() {
+        // <=2 segmenti -> path intero (parita' col ternario di run-summary.ts).
+        assert_eq!(short_file_label("a/b"), "a/b");
+        assert_eq!(short_file_label("solo.ts"), "solo.ts");
+        assert_eq!(short_file_label("a/b/c/d.ts"), ".../c/d.ts");
     }
 }

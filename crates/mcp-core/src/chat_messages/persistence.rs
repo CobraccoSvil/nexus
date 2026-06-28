@@ -31,6 +31,11 @@ pub(crate) struct ChatMessageView {
     /// di mostrare un badge di stato PERSISTENTE (completato/fallito/interrotto/
     /// superato) senza un fetch separato e coerente al reload.
     pub(crate) run_status: Option<String>,
+    /// Ragionamento (thinking) del modello accumulato durante il run e persistito
+    /// in metadata.reasoning all'INSERT del messaggio assistant (D4). Permette al
+    /// refresh di ricostruire il blocco "Ragionamento" identico al live, che lo
+    /// alimenta dagli eventi SSE effimeri. None per i messaggi senza reasoning.
+    pub(crate) reasoning: Option<String>,
 }
 pub(crate) fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessageView, ApiError> {
     let id: Uuid = row
@@ -104,6 +109,11 @@ pub(crate) fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessage
         // Colonna opzionale presente solo nelle query che fanno il LEFT JOIN su
         // agent_runs (es. list_chat_messages). Altrove resta None senza errore.
         run_status: row.try_get::<Option<String>, _>("run_status").unwrap_or(None),
+        reasoning: metadata
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
     })
 }
 /// Rimuove i NULL byte (\0) dal testo. PostgreSQL jsonb li rifiuta con

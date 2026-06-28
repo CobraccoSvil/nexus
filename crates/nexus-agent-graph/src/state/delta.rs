@@ -168,6 +168,9 @@ pub struct StateDelta {
     /// Vedi `AgentState::result`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub result: Option<Option<String>>,
+    /// Vedi `AgentState::reasoning_acc` (FIX D4: reasoning persistito).
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub reasoning_acc: Option<Option<String>>,
     /// Vedi `AgentState::provider_used`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub provider_used: Option<Option<String>>,

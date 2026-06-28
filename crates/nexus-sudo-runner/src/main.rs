@@ -52,6 +52,14 @@ const PATH_ALLOWLIST: &[&str] = &[
 /// dare via meta-caratteri. Spazi sono il separatore ARG (split lato Rust).
 const ARG_SAFE_PATTERN: &str = r"^[a-zA-Z0-9._/=:@,+-]+$";
 
+/// Regex PIU' STRETTA per gli argomenti EXTRA passati dal chiamante (es. nomi
+/// pacchetto per apt-install). Primo carattere alfanumerico (vieta i flag come
+/// `--allow-unauthenticated`), niente slash/`=`/`:` (vieta path e versioni
+/// pinnate ambigue): solo nomi pacchetto Debian (`libnss3`, `libasound2t64`,
+/// `python3-dev`, `g++` -> no, `+` ammesso quindi `g++` ok). Applicata SOLO ai
+/// purpose con allows_extra_args=true, in aggiunta ad ARG_SAFE_PATTERN.
+const EXTRA_ARG_PACKAGE_PATTERN: &str = r"^[a-z0-9][a-z0-9._+-]*$";
+
 /// Limite default per stdout/stderr troncati nell'audit log.
 const DEFAULT_AUDIT_EXCERPT_MAX: usize = 4096;
 
@@ -71,6 +79,9 @@ async fn main() -> Result<()> {
         );
         std::process::exit(64);
     }
+    // Argomenti EXTRA dal chiamante (es. nomi pacchetto per apt-install).
+    // Ammessi SOLO se il purpose ha allows_extra_args=true (verificato sotto).
+    let extra_args: Vec<String> = args.iter().skip(2).cloned().collect();
 
     // ── 2. Connessione DB ────────────────────────────────────────────────
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -86,7 +97,7 @@ async fn main() -> Result<()> {
     // ── 3. Lookup purpose nel DB ─────────────────────────────────────────
     let row = sqlx::query(
         r#"
-        SELECT command_template, enabled
+        SELECT command_template, enabled, allows_extra_args
         FROM nexus_sudo_purposes
         WHERE name = $1
         "#,
@@ -111,9 +122,10 @@ async fn main() -> Result<()> {
     let command_template: String = row
         .try_get("command_template")
         .context("colonna command_template")?;
+    let allows_extra_args: bool = row.try_get("allows_extra_args").unwrap_or(false);
 
     // ── 4. Parsing + validazione allowlist + run ─────────────────────────
-    let (program, run_args) = match parse_and_validate(&command_template) {
+    let (program, mut run_args) = match parse_and_validate(&command_template) {
         Ok(v) => v,
         Err(e) => {
             // Audit del rifiuto prima di uscire (siamo gia' in contesto async)
@@ -130,6 +142,61 @@ async fn main() -> Result<()> {
             eprintln!("validazione fallita: {e}");
             std::process::exit(5);
         }
+    };
+
+    // ── 4b. Argomenti EXTRA dal chiamante (purpose parametrici) ──────────
+    // Ammessi SOLO se allows_extra_args=true; ciascuno deve passare il pattern
+    // nome-pacchetto stretto (defense-in-depth: anche se il DB e' compromesso,
+    // qui blocchiamo flag/path/metacaratteri).
+    if !extra_args.is_empty() {
+        if !allows_extra_args {
+            let _ = audit_log(
+                &pool,
+                &purpose_name,
+                &command_template,
+                None,
+                "",
+                &format!(
+                    "REJECTED: purpose non accetta argomenti extra ({} forniti)",
+                    extra_args.len()
+                ),
+                0,
+            )
+            .await;
+            eprintln!(
+                "purpose '{}' non accetta argomenti extra (allows_extra_args=false)",
+                purpose_name
+            );
+            std::process::exit(6);
+        }
+        let pkg_re = regex::Regex::new(EXTRA_ARG_PACKAGE_PATTERN).expect("regex valida");
+        for a in &extra_args {
+            if !pkg_re.is_match(a) {
+                let _ = audit_log(
+                    &pool,
+                    &purpose_name,
+                    &command_template,
+                    None,
+                    "",
+                    &format!("REJECTED: argomento extra '{a}' non valido"),
+                    0,
+                )
+                .await;
+                eprintln!(
+                    "argomento extra '{}' non valido (atteso nome pacchetto {})",
+                    a, EXTRA_ARG_PACKAGE_PATTERN
+                );
+                std::process::exit(7);
+            }
+            run_args.push(a.clone());
+        }
+    }
+
+    // Comando finale completo per l'audit log (template + args extra).
+    let full_command = if extra_args.is_empty() {
+        command_template.clone()
+    } else {
+        format!("{} {}", command_template.trim(), extra_args.join(" "))
     };
 
     let started = Instant::now();
@@ -160,7 +227,7 @@ async fn main() -> Result<()> {
     let _ = audit_log(
         &pool,
         &purpose_name,
-        &command_template,
+        &full_command,
         Some(exit_code),
         &stdout,
         &stderr,
@@ -278,4 +345,41 @@ fn truncate_safe(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}\n[...troncato a {} byte...]", &s[..end], max_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purpose_names_validi() {
+        assert!(is_valid_purpose_name("apt-install"));
+        assert!(is_valid_purpose_name("playwright-install-deps"));
+        assert!(!is_valid_purpose_name("Apt")); // uppercase
+        assert!(!is_valid_purpose_name("a b")); // spazio
+    }
+
+    #[test]
+    fn template_solo_programmi_allowlist() {
+        assert!(parse_and_validate("apt-get install -y").is_ok());
+        assert!(parse_and_validate("rm -rf /tmp/x").is_ok()); // rm e' in allowlist
+        assert!(parse_and_validate("curl http://x").is_err()); // curl NON in allowlist
+        assert!(parse_and_validate("apt-get install ; rm").is_err()); // metacarattere
+    }
+
+    /// Il pattern degli args extra (nomi pacchetto) deve accettare i nomi
+    /// pacchetto Debian e RIFIUTARE flag, path e metacaratteri.
+    #[test]
+    fn extra_arg_package_pattern() {
+        let re = regex::Regex::new(EXTRA_ARG_PACKAGE_PATTERN).expect("regex valida");
+        assert!(re.is_match("libnss3"));
+        assert!(re.is_match("libasound2t64"));
+        assert!(re.is_match("python3-dev"));
+        assert!(re.is_match("g++")); // '+' ammesso
+        assert!(!re.is_match("--allow-unauthenticated")); // flag rifiutato (inizia con -)
+        assert!(!re.is_match("/etc/passwd")); // path rifiutato (slash)
+        assert!(!re.is_match("foo;bar")); // metacarattere rifiutato
+        assert!(!re.is_match("Foo")); // uppercase rifiutato
+        assert!(!re.is_match("")); // vuoto rifiutato
+    }
 }

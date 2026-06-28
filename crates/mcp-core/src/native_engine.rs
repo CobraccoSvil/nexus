@@ -318,6 +318,11 @@ pub struct NativeRunOutcome {
     /// hollow/conversational del finalizzatore (parita' col `nexus_task_type`
     /// che il primario Python propaga nell'end_turn).
     pub user_intent: Option<String>,
+    /// Ragionamento (thinking) accumulato del run (campo `reasoning_acc` dello
+    /// stato): persistito nel `metadata.reasoning` del messaggio assistant cosi'
+    /// il blocco "Ragionamento" sopravvive al refresh (FIX D4). `None` se il
+    /// modello non ha prodotto thinking.
+    pub reasoning: Option<String>,
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -1207,6 +1212,10 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         total_tokens: state.total_tokens.unwrap_or(0),
         total_cost: state.total_cost_usd.unwrap_or(0.0),
         user_intent: state.user_intent.clone(),
+        reasoning: state
+            .reasoning_acc
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
     }
 }
 

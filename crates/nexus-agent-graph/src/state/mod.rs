@@ -190,6 +190,12 @@ pub struct AgentState {
     pub token_budget: Option<i64>,
     /// Risultato testuale finale del run.
     pub result: Option<String>,
+    /// Ragionamento (thinking) accumulato del run: concatenazione dei
+    /// `ThinkingDelta` emessi dall'executor a ogni interrogazione. LIVE viaggia
+    /// come evento SSE volatile; questo accumulatore lo rende persistibile nel
+    /// `metadata.reasoning` del messaggio assistant (FIX divergenza chat
+    /// post-refresh). `None`/vuoto se il modello non ha prodotto thinking.
+    pub reasoning_acc: Option<String>,
     /// Provider effettivamente usato.
     pub provider_used: Option<String>,
     /// Modello effettivamente usato.

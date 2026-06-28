@@ -274,6 +274,14 @@ pub struct AgentRunResult {
     /// `nexus_provider_empty_responses` (mig 0291).
     #[serde(default)]
     pub hollow_completion_kind: String,
+    /// Ragionamento (thinking) accumulato del run: concatenazione di tutti i
+    /// `thinking_delta` emessi durante l'esecuzione. LIVE viaggia come evento SSE
+    /// `agent_thinking` (volatile, perso al refresh); qui lo accumuliamo per
+    /// PERSISTERLO nel `metadata.reasoning` del messaggio assistant, cosi' dopo un
+    /// F5 il blocco di ragionamento resta visibile (FIX divergenza chat post-refresh).
+    /// `None` se il modello non ha prodotto thinking. Mai loggato in chiaro (regola F).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Evento di trace LLM: mostra i messaggi inviati al provider e la risposta ricevuta.

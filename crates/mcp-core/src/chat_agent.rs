@@ -528,6 +528,31 @@ pub async fn get_session_meta_steps(
     Ok(Json(json!({ "runs": runs })))
 }
 
+/// GET /api/chat/sessions/:session_id/traces -- ripristina le tracce gateway LLM
+/// (AITraceEvent: provider/model effettivi, token, stop_reason per iterazione)
+/// persistite per i run della sessione. Gemello di `get_session_meta_steps` ma
+/// per le tracce (nexus_agent_traces, mig 0485): serve a ricostruire il trace
+/// panel dopo un reload, dato che gli eventi SSE `agent_trace` vivono solo in
+/// memoria/sessionStorage e si perdono al refresh.
+/// Risposta: { runs: { "<run_id>": [AITraceEvent...] } }.
+pub async fn get_session_traces(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
+
+    // Punto unico (regola L): ownership + raggruppamento per run nel trace_store,
+    // speculare a get_session_meta_steps.
+    let runs = crate::trace_store::get_session_traces(&state.db, session_id, user_id)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "runs": runs })))
+}
+
 /// POST /api/chat/agent-runs/:run_id/confirm -- approva o annulla le pending actions.
 pub async fn confirm_agent_run(
     State(state): State<AppState>,

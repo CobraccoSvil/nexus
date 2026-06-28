@@ -685,8 +685,16 @@ pub async fn send_chat_message(
                                 .await;
                         let resume_status =
                             crate::chat_messages::agent_run::canonical_run_status(&result);
-                        if let Some(ref answer) = resume_answer {
-                            let meta = serde_json::json!({
+                        if let Some(answer) = resume_answer.clone() {
+                            // Recap RICCO in coda anche sul resume (FIX D3, regola L):
+                            // stesso punto unico append_outcome_summary dello spawn,
+                            // cosi' il content persistito coincide col recap live e
+                            // non diverge dopo un refresh.
+                            let answer = crate::chat_messages::agent_run::append_outcome_summary(
+                                answer,
+                                &result.steps,
+                            );
+                            let mut meta = serde_json::json!({
                                 "provider": &result.provider,
                                 "model": &result.model,
                                 "agentRunId": new_run_id.to_string(),
@@ -700,6 +708,18 @@ pub async fn send_chat_message(
                                 "totalCost": result.total_cost,
                                 "currency": "USD",
                             });
+                            // FIX D4: persisti il reasoning anche sul resume cosi'
+                            // il blocco "Ragionamento" sopravvive al refresh.
+                            if let Some(reasoning) = result
+                                .reasoning
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                if let Some(obj) = meta.as_object_mut() {
+                                    obj.insert("reasoning".to_string(), serde_json::json!(reasoning));
+                                }
+                            }
                             let _ = sqlx::query(
                                 r#"INSERT INTO chat_messages
                                    (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
@@ -707,7 +727,7 @@ pub async fn send_chat_message(
                             )
                             .bind(session_id_r)
                             .bind(project_id_r)
-                            .bind(answer)
+                            .bind(&answer)
                             .bind(meta)
                             .bind(msg_id_r)
                             .execute(&db_clone2)

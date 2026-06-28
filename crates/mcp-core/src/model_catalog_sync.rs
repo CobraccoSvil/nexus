@@ -668,6 +668,127 @@ pub(crate) async fn model_passes_selection_policy(
     row.map(|(ok,)| ok).unwrap_or(true)
 }
 
+/// Esito di una passata di reconciliation policy->catalog.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PolicyReconcileStats {
+    /// Modelli portati a is_enabled=true perche' rientrati nella policy.
+    pub enabled: u64,
+    /// Modelli portati a is_enabled=false perche' usciti dalla policy.
+    pub disabled: u64,
+}
+
+/// RECONCILIATION policy->catalog (regola H: causa radice, non toppa; regola L:
+/// punto unico = la `nexus_model_selection_policy`).
+///
+/// Il sync di discovery (`sync_provider`) abilita un modello SOLO quando lo
+/// "vede ricomparire" dall'API live. I modelli importati staticamente nel
+/// catalog (es. il dataset LiteLLM) che l'API non re-elenca non venivano MAI
+/// rivalutati contro la policy del provider e restavano col loro
+/// `is_enabled` iniziale per sempre (incidente google: 0/157 abilitati pur con
+/// policy corretta). Questa funzione riallinea `is_enabled` di OGNI riga del
+/// catalog alla policy del suo provider, ad ogni tick e al boot.
+///
+/// Semantica (un solo punto di verita', la stessa SQL di
+/// `model_passes_selection_policy`, applicata set-based via JOIN sulla tabella
+/// policy — niente logica duplicata):
+///   - "passa la policy" = ( model ~ ANY(allowed_patterns)
+///                           OR cardinality(allowed_patterns)=0 )
+///                         AND NOT ( model ~ ANY(denied_patterns) )
+///   - ABILITA i modelli che passano la policy e sono disabilitati MA NON per
+///     un fallimento: solo se `auto_disabled_reason IS NULL` oppure indica un
+///     motivo di POLICY (contiene 'policy'). I reason di fallimento
+///     runtime/probe/billing/missing_from_api/tool-capability NON vengono
+///     toccati: quelli li gestisce `model_health_probe` / i cicli dedicati.
+///   - DISABILITA i modelli abilitati che NON passano piu' la policy
+///     (auto_disabled_reason='fuori model_selection_policy').
+///   - RISPETTA i lock manuali: salta `capability_source='manual'` e la
+///     convenzione `auto_disabled_reason LIKE 'manual:%'`.
+///   - SALTA i modelli media (image-gen/audio/video): non sono chat-compatibili
+///     per design e non rientrano nella chat model_selection_policy; la loro
+///     eleggibilita' dipende dai flag `supports_<media>` (gestiti altrove).
+///     Si applica solo alle righe che NON hanno alcuna capability media.
+/// Predicato lock manuale: punto unico della convenzione (vedi sync_provider).
+/// Sia la colonna reale `capability_source='manual'` sia la convenzione
+/// `auto_disabled_reason LIKE 'manual:%'`.
+pub(crate) const RECONCILE_MANUAL_LOCKED_SQL: &str = "(c.capability_source = 'manual' \
+     OR (c.auto_disabled_reason IS NOT NULL AND c.auto_disabled_reason LIKE 'manual:%'))";
+/// Predicato media: una riga e' "media" se espone una capability non-chat.
+/// Queste righe sono escluse dalla reconciliation chat.
+pub(crate) const RECONCILE_IS_MEDIA_SQL: &str = "(c.supports_image_gen OR c.supports_audio_in \
+     OR c.supports_audio_out OR c.supports_video_gen)";
+/// "passa la policy" — stessa espressione di `model_passes_selection_policy`,
+/// ma set-based via JOIN. Se non esiste riga policy per il provider il JOIN
+/// non matcha e la riga non viene toccata (coerente con l'ammissione di
+/// default: provider non configurato = non si forza alcuna decisione).
+pub(crate) const RECONCILE_PASSES_POLICY_SQL: &str = "( c.model ~ ANY(p.allowed_patterns) \
+         OR cardinality(p.allowed_patterns) = 0 ) \
+     AND NOT ( c.model ~ ANY(p.denied_patterns) )";
+
+pub async fn reconcile_catalog_with_policy(db: &PgPool) -> anyhow::Result<PolicyReconcileStats> {
+    let manual = RECONCILE_MANUAL_LOCKED_SQL;
+    let media = RECONCILE_IS_MEDIA_SQL;
+    let passes = RECONCILE_PASSES_POLICY_SQL;
+
+    // ABILITA: rientrati nella policy, disabilitati per assenza/policy (non per
+    // fallimento). `auto_disabled_reason IS NULL` (mai disabilitato esplicito,
+    // tipico dei modelli importati staticamente) OPPURE reason di policy.
+    let enable_sql = format!(
+        "UPDATE ai_price_catalog c \
+         SET is_enabled = true, \
+             effective_from = NOW(), \
+             auto_disabled_at = NULL, \
+             auto_disabled_reason = NULL, \
+             updated_at = NOW() \
+         FROM nexus_model_selection_policy p \
+         WHERE p.provider = c.provider \
+           AND c.is_enabled = false \
+           AND NOT {manual} \
+           AND NOT {media} \
+           AND ( c.auto_disabled_reason IS NULL \
+                 OR c.auto_disabled_reason ILIKE '%policy%' ) \
+           AND ( {passes} )",
+    );
+    let enabled = sqlx::query(&enable_sql).execute(db).await?.rows_affected();
+
+    // DISABILITA: attualmente abilitati ma non piu' conformi alla policy.
+    let disable_sql = format!(
+        "UPDATE ai_price_catalog c \
+         SET is_enabled = false, \
+             auto_disabled_at = NOW(), \
+             auto_disabled_reason = 'fuori model_selection_policy', \
+             updated_at = NOW() \
+         FROM nexus_model_selection_policy p \
+         WHERE p.provider = c.provider \
+           AND c.is_enabled = true \
+           AND NOT {manual} \
+           AND NOT {media} \
+           AND NOT ( {passes} )",
+    );
+    let disabled = sqlx::query(&disable_sql).execute(db).await?.rows_affected();
+
+    if enabled > 0 || disabled > 0 {
+        tracing::info!(
+            "catalog_sync: policy reconciliation — enabled={} disabled={}",
+            enabled,
+            disabled,
+        );
+        // Audit aggregato (lo stile per-modello sarebbe troppo verboso su
+        // riallineamenti di massa). Una riga riepilogativa con i conteggi.
+        audit_log(
+            db,
+            "*",
+            "*",
+            "policy_reconciled",
+            json!({ "enabled": enabled, "disabled": disabled }),
+        )
+        .await;
+    } else {
+        tracing::debug!("catalog_sync: policy reconciliation — no changes");
+    }
+
+    Ok(PolicyReconcileStats { enabled, disabled })
+}
+
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
 /// `orchestrator` (Option) e' usato per il probe-on-insert dei nuovi modelli
 /// scoperti dall'API discovery — se None, i nuovi modelli vengono inseriti
@@ -706,6 +827,13 @@ pub async fn catalog_sync_loop(db: PgPool, orchestrator: Option<Arc<Orchestrator
         // escalava mai a un modello piu' capable per task lunghi.
         if let Err(e) = crate::models::auto_upgrade_models_and_routing(&db).await {
             tracing::warn!("catalog_sync: auto_upgrade_models_and_routing fallito: {e}");
+        }
+
+        // Reconciliation policy->catalog (regola H/L): riallinea is_enabled di
+        // OGNI riga del catalog alla policy del suo provider, anche per i
+        // modelli importati staticamente che il discovery API non re-elenca.
+        if let Err(e) = reconcile_catalog_with_policy(&db).await {
+            tracing::warn!("catalog_sync: reconcile_catalog_with_policy fallito: {e}");
         }
 
         // Sleep fino al prossimo tick (interval dinamico dalle settings).
@@ -1894,5 +2022,44 @@ mod tests {
                 "{model}: il metadata tool_use=false di LiteLLM va ignorato per la famiglia magistral"
             );
         }
+    }
+
+    // Invarianti della reconciliation policy->catalog. Test puri (no DB): le
+    // query SQL set-based sono il punto sensibile, qui ne fissiamo i predicati
+    // che proteggono lock manuali, media e whitelist dei reason di policy.
+    #[test]
+    fn test_reconcile_manual_lock_predicate() {
+        // Entrambi i segnali di lock manuale devono essere presenti: la colonna
+        // reale capability_source='manual' e la convenzione auto_disabled_reason
+        // LIKE 'manual:%'. Rimuoverne uno riabiliterebbe modelli lockati a mano.
+        assert!(RECONCILE_MANUAL_LOCKED_SQL.contains("capability_source = 'manual'"));
+        assert!(RECONCILE_MANUAL_LOCKED_SQL.contains("auto_disabled_reason LIKE 'manual:%'"));
+    }
+
+    #[test]
+    fn test_reconcile_media_excluded() {
+        // I modelli media non rientrano nella chat policy: tutte e quattro le
+        // capability media devono comparire nel predicato di esclusione.
+        for cap in [
+            "supports_image_gen",
+            "supports_audio_in",
+            "supports_audio_out",
+            "supports_video_gen",
+        ] {
+            assert!(
+                RECONCILE_IS_MEDIA_SQL.contains(cap),
+                "predicato media privo di {cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reconcile_passes_policy_matches_single_source() {
+        // La condizione "passa la policy" set-based deve essere la STESSA di
+        // model_passes_selection_policy (punto unico, regola L): allowed con
+        // fallback cardinality=0, e negazione dei denied.
+        assert!(RECONCILE_PASSES_POLICY_SQL.contains("c.model ~ ANY(p.allowed_patterns)"));
+        assert!(RECONCILE_PASSES_POLICY_SQL.contains("cardinality(p.allowed_patterns) = 0"));
+        assert!(RECONCILE_PASSES_POLICY_SQL.contains("NOT ( c.model ~ ANY(p.denied_patterns) )"));
     }
 }

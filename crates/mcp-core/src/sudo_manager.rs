@@ -60,6 +60,50 @@ impl SudoConfig {
 ///   - DB lookup fallisce (purpose non in whitelist)
 ///   - exit_code != 0 (audit salvato comunque dal runner stesso)
 pub async fn execute(db: &PgPool, purpose: &str) -> Result<SudoOutcome> {
+    execute_with_args(db, purpose, &[]).await
+}
+
+/// Pattern nome-pacchetto (DEVE combaciare con EXTRA_ARG_PACKAGE_PATTERN del
+/// runner): primo carattere alfanumerico (vieta i flag `--*`), niente
+/// path/metacaratteri. Punto unico lato mcp-core per validare gli args extra
+/// prima ancora di invocare il runner (fail-fast con messaggio chiaro).
+pub fn is_valid_package_name(s: &str) -> bool {
+    let re = regex::Regex::new(r"^[a-z0-9][a-z0-9._+-]*$").expect("regex valida");
+    re.is_match(s)
+}
+
+/// PUNTO UNICO (regola L) per installare pacchetti di sistema via APT.
+/// Valida i nomi pacchetto e delega al purpose parametrico 'apt-install'.
+/// Tutti i call site (instradamento run_command, tool dedicati, worker) devono
+/// passare da qui invece di costruire comandi apt a mano.
+pub async fn install_system_packages(db: &PgPool, packages: &[String]) -> Result<SudoOutcome> {
+    if packages.is_empty() {
+        return Err(anyhow!("nessun pacchetto specificato per l'installazione"));
+    }
+    for p in packages {
+        if !is_valid_package_name(p) {
+            return Err(anyhow!(
+                "nome pacchetto non valido: '{p}' (atteso ^[a-z0-9][a-z0-9._+-]*$)"
+            ));
+        }
+    }
+    execute_with_args(db, "apt-install", packages).await
+}
+
+/// Aggiorna l'indice dei pacchetti APT (purpose 'apt-update').
+pub async fn apt_update(db: &PgPool) -> Result<SudoOutcome> {
+    execute(db, "apt-update").await
+}
+
+/// Variante parametrica di [`execute`]: passa argomenti EXTRA al runner (es.
+/// nomi pacchetto per 'apt-install'). Gli extra sono accettati dal runner SOLO
+/// se il purpose ha allows_extra_args=true e ogni token passa il pattern
+/// nome-pacchetto stretto (defense-in-depth: validato sia qui sia nel runner).
+pub async fn execute_with_args(
+    db: &PgPool,
+    purpose: &str,
+    extra_args: &[String],
+) -> Result<SudoOutcome> {
     if !is_valid_purpose_name(purpose) {
         return Err(anyhow!(
             "purpose name non valido (atteso: ^[a-z][a-z0-9-]{{2,63}}$): {purpose}"
@@ -79,10 +123,12 @@ pub async fn execute(db: &PgPool, purpose: &str) -> Result<SudoOutcome> {
     }
 
     let started = std::time::Instant::now();
-    let output = Command::new("sudo")
-        .arg("--non-interactive")
-        .arg(&cfg.runner_path)
-        .arg(purpose)
+    let mut cmd = Command::new("sudo");
+    cmd.arg("--non-interactive").arg(&cfg.runner_path).arg(purpose);
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    let output = cmd
         .kill_on_drop(true)
         .output()
         .await

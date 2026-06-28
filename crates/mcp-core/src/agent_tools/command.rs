@@ -158,6 +158,17 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     let command_hints = super::command_hints::match_hints(&ctx.db, &command).await;
     let hints_prefix = super::command_hints::format_hints_prefix(&command_hints);
 
+    // ── Instradamento comandi privilegiati al Sudo Manager (ADR 0017) ──
+    // L'agente puo' installare dipendenze di sistema scrivendo naturalmente
+    // `sudo apt-get install -y <pkg>` / `apt install <pkg>` / `apt-get update`
+    // o `playwright install --with-deps`: invece di farlo fallire nella shell
+    // isolata (NOPASSWD e' concesso SOLO a nexus-sudo-runner, mai a sudo
+    // arbitrario), lo instradiamo al gestore privilegiato controllato. Il sudo
+    // arbitrario riceve un messaggio guida. Punto unico: privileged.rs (regola L).
+    if let Some(routed) = super::privileged::try_route_privileged_command(ctx, &command).await {
+        return format!("{}{}", hints_prefix, routed);
+    }
+
     if strict_migration_only_project(ctx).await
         && !shell_command_bypasses_migration_policy(&command)
         && shell_looks_like_sql_cli_with_ddl(&command)

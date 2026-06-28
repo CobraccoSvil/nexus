@@ -215,6 +215,13 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             )),
         )
         .route(
+            "/api/chat/sessions/:session_id/traces",
+            get(chat_agent::get_session_traces).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
             "/api/chat/agent-runs/:run_id/confirm",
             post(chat_agent::confirm_agent_run).layer(axum_mw::from_fn_with_state(
                 state.clone(),

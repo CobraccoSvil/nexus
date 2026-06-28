@@ -34,6 +34,7 @@ pub(crate) mod helpers;
 pub(crate) mod knowledge;
 pub(crate) mod port_scanner;
 pub(crate) mod ports;
+pub(crate) mod privileged;
 pub(crate) mod project_db_query;
 pub(crate) mod rag_search;
 pub(crate) mod sandbox;

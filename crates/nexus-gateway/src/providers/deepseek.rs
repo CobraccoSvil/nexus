@@ -116,14 +116,53 @@ fn strip_xml_tool_calls(content: &str) -> String {
 
 /// Risolve il dialetto reasoning per la richiesta.
 ///
-/// Inviamo `extra_body.thinking.type` SOLO quando il chiamante esprime una
-/// preferenza esplicita via `req.thinking` (regola: il gateway non conosce le
-/// capability del modello, non deve indovinare). Senza preferenza, DeepSeek usa
-/// il suo default (thinking ON sui dual-mode V4) -> dialetto base, niente
-/// extra_body. Con `req.thinking.enabled` => `enabled`; con false => `disabled`
-/// (parita' funzionale con `should_disable_thinking` del brain, qui guidato dal
-/// contratto invece che dalla capability).
+/// GATE THINKING+TOOL_CHOICE (incidente HTTP 400 "Thinking mode does not support
+/// tool_choice"): i dual-mode V4 girano in thinking ON di default, ma l'API
+/// DeepSeek RIFIUTA la combinazione thinking + `tool_choice`. Nei run agentici il
+/// force-action invia `tool_choice` ("required"/"none"/funzione) e, senza
+/// preferenza esplicita di thinking, il default ON produceva un 400 sistematico
+/// (status failed, iteration 1, 0 token). Quindi: SE la richiesta porta un
+/// `tool_choice` riconosciuto, FORZIAMO `thinking.type=disabled` (dialetto
+/// DeepSeek con `enabled=false`), a prescindere da `req.thinking`. E' la
+/// traduzione, al confine col provider, della policy catalog
+/// `agentic_thinking_policy='disable_for_tools'`: deepseek non puo' pensare
+/// MENTRE gli si vincola la scelta del tool. Regola G: nessun nome modello
+/// hardcoded — il gate scatta sul dialetto reasoning del provider (DeepSeek) +
+/// la presenza del vincolo, non su una stringa modello.
+///
+/// Senza `tool_choice`: comportamento storico. Inviamo `extra_body.thinking.type`
+/// SOLO quando il chiamante esprime una preferenza esplicita via `req.thinking`;
+/// altrimenti DeepSeek usa il suo default (thinking ON sui dual-mode V4) ->
+/// dialetto base, niente extra_body. Il riconoscimento del vincolo `tool_choice`
+/// delega al PUNTO UNICO di mapping ([`super::tool_choice::ToolChoice::from_openai`],
+/// regola L): non re-ispezioniamo il JSON grezzo qui.
 fn resolve_reasoning(req: &LlmRequest) -> ResolvedReasoning {
+    // Thinking OFF forzato quando la richiesta contiene TOOL (a prescindere da
+    // tool_choice). L'API DeepSeek in thinking mode impone due vincoli che il
+    // nostro agent-loop non soddisfa: (1) rifiuta thinking + `tool_choice`
+    // ("Thinking mode does not support tool_choice"); (2) pretende che il
+    // `reasoning_content` prodotto venga rimandato in ogni iterazione successiva
+    // ("The reasoning_content in the thinking mode must be passed back to the
+    // API"). Nei run agentici i tool sono SEMPRE presenti e con `tool_choice`
+    // anche solo "auto" il default thinking ON genera reasoning_content che il
+    // loop non ripropaga -> 400 al turno dopo. Disabilitare il thinking ogni
+    // volta che ci sono tool e' la traduzione al confine col provider della policy
+    // catalog `agentic_thinking_policy='disable_for_tools'` e azzera entrambi i
+    // 400. Punto unico per complete + stream.
+    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let has_tool_choice_constraint = req
+        .tool_choice
+        .as_ref()
+        .and_then(super::tool_choice::ToolChoice::from_openai)
+        .is_some();
+    if has_tools || has_tool_choice_constraint {
+        return ResolvedReasoning {
+            dialect: ReasoningDialect::DeepSeek,
+            enabled: false,
+            effort: None,
+        };
+    }
+
     match req.thinking.as_ref() {
         Some(t) => ResolvedReasoning {
             dialect: ReasoningDialect::DeepSeek,
@@ -375,6 +414,76 @@ mod tests {
         })));
         assert_eq!(r.dialect, ReasoningDialect::DeepSeek);
         assert!(!r.enabled);
+    }
+
+    #[test]
+    fn tool_choice_required_forza_thinking_off() {
+        // GATE: il force-action (tool_choice "required") DEVE disabilitare il
+        // thinking anche SENZA preferenza esplicita -> niente piu' HTTP 400
+        // "Thinking mode does not support tool_choice". Senza il gate qui il
+        // default DeepSeek (thinking ON) + tool_choice generava il 400.
+        let mut req = req_with_thinking(None);
+        req.tool_choice = Some(serde_json::json!("required"));
+        let r = resolve_reasoning(&req);
+        assert_eq!(r.dialect, ReasoningDialect::DeepSeek);
+        assert!(!r.enabled, "tool_choice presente -> thinking forzato OFF");
+    }
+
+    #[test]
+    fn tool_choice_funzione_forza_thinking_off() {
+        // Anche il forcing di un tool nominato innesca il gate (l'API rifiuta
+        // QUALSIASI tool_choice in thinking mode).
+        let mut req = req_with_thinking(None);
+        req.tool_choice =
+            Some(serde_json::json!({"type": "function", "function": {"name": "edit_file"}}));
+        let r = resolve_reasoning(&req);
+        assert!(!r.enabled);
+    }
+
+    #[test]
+    fn tool_choice_none_forza_thinking_off() {
+        // tool_choice="none" (turno testuale forzato) e' comunque un vincolo che
+        // l'API DeepSeek non accetta in thinking mode: thinking OFF.
+        let mut req = req_with_thinking(None);
+        req.tool_choice = Some(serde_json::json!("none"));
+        let r = resolve_reasoning(&req);
+        assert!(!r.enabled);
+    }
+
+    #[test]
+    fn tool_choice_vince_sulla_preferenza_thinking_on() {
+        // Anche se il chiamante ha chiesto thinking ON, la presenza di tool_choice
+        // ha la precedenza (l'API rifiuterebbe la combinazione): thinking OFF.
+        let mut req = req_with_thinking(Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+        }));
+        req.tool_choice = Some(serde_json::json!("required"));
+        let r = resolve_reasoning(&req);
+        assert!(!r.enabled);
+    }
+
+    #[test]
+    fn senza_tool_choice_comportamento_storico_invariato() {
+        // Nessun tool_choice: il gate non scatta, resta il comportamento storico
+        // (preferenza esplicita rispettata; assente -> default DeepSeek).
+        let r_on = resolve_reasoning(&req_with_thinking(Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+        })));
+        assert!(r_on.enabled);
+        let r_none = resolve_reasoning(&req_with_thinking(None));
+        assert_eq!(r_none.dialect, ReasoningDialect::None);
+    }
+
+    #[test]
+    fn tool_choice_non_riconosciuto_non_innesca_gate() {
+        // Una stringa tool_choice ignota non e' un vincolo riconosciuto dal punto
+        // unico: il gate non scatta, vale il comportamento storico (default).
+        let mut req = req_with_thinking(None);
+        req.tool_choice = Some(serde_json::json!("boh"));
+        let r = resolve_reasoning(&req);
+        assert_eq!(r.dialect, ReasoningDialect::None);
     }
 
     #[test]

@@ -361,6 +361,16 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         tracing::warn!("auto_upgrade_models_and_routing fallito: {e}");
     }
 
+    // Reconciliation policy->catalog (regola H/L): il sync LiteLLM e' un upsert
+    // di pricing/capabilities ma non riallinea is_enabled alla policy. Senza
+    // questo passo i modelli importati staticamente (non re-elencati dal
+    // discovery API) restano col loro is_enabled iniziale per sempre. La
+    // funzione e' il punto unico che applica la nexus_model_selection_policy a
+    // tutto il catalog.
+    if let Err(e) = crate::model_catalog_sync::reconcile_catalog_with_policy(db).await {
+        tracing::warn!("reconcile_catalog_with_policy fallito: {e}");
+    }
+
     Ok((added, updated, skipped))
 }
 

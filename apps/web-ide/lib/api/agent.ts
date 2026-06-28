@@ -1,14 +1,6 @@
 import { API_BASE, NEURAL_BASE, fetchJson, fetchJsonNoAuth } from "./_shared";
 import type { MetaStepEntry } from "../use-chat/types";
 
-interface AgentStepUsage {
-  promptTokens?: number;
-  completionTokens?: number;
-  totalTokens?: number;
-  cacheReadTokens?: number;
-  cacheCreationTokens?: number;
-}
-
 export interface AgentStep {
   stepIndex: number;
   toolName: string;
@@ -16,12 +8,9 @@ export interface AgentStep {
   toolResult?: string;
   status: "running" | "completed" | "failed" | "awaiting_confirmation" | "skipped" | "provider_unavailable";
   createdAt: string;
-  // Metriche estese
-  usage?: AgentStepUsage;
-  costUsd?: number;
-  latencyMs?: number;
-  temperature?: number;
-  topP?: number;
+  // FIX D2: rimossi i campi metriche per-step (usage/costUsd/latencyMs/
+  // temperature/topP): il motore Rust non li popola, la UI relativa era sempre
+  // vuota. I totali di run restano su AgentRunInfo (usage/totalCostUsd/...).
 }
 
 interface AITraceToolCall {
@@ -141,6 +130,20 @@ export async function getActiveRunForSession(
   sessionId: string,
 ): Promise<{ activeRun: AgentRunInfo | null }> {
   return fetchJson(`${API_BASE}/api/chat/sessions/${sessionId}/active-run`);
+}
+
+/** Tracce gateway LLM (AITraceEvent: provider/model effettivi, token, stop_reason
+ *  per iterazione) persistite per i run di una sessione, raggruppate per runId.
+ *  Usato per RIPRISTINARE il pannello tracce dopo un reload: gli eventi SSE
+ *  `agent_trace` (e la cache sessionStorage) sono volatili/per-dispositivo, qui
+ *  li rileggiamo dal DB (nexus_agent_traces, mig 0485) cosi' il pannello converge
+ *  con il rendering live. Il DB e' la fonte autoritativa (regola L).
+ *  Risposta backend: { runs: { "<runId>": AITraceEvent[] } } -- vedi
+ *  crates/mcp-core/src/chat_agent.rs::get_session_traces e trace_store.rs. */
+export async function getSessionTraces(
+  sessionId: string,
+): Promise<{ runs: Record<string, AITraceEvent[]> }> {
+  return fetchJson(`${API_BASE}/api/chat/sessions/${sessionId}/traces`);
 }
 
 export async function confirmAgentRun(

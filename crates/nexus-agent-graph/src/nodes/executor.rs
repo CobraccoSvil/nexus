@@ -1709,6 +1709,9 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             }
         }
 
+        // Thinking di QUESTO turno executor (FIX D4): catturato qui per essere
+        // accumulato nel delta finale (reasoning_acc), oltre che emesso LIVE.
+        let mut turn_thinking: Option<String> = None;
         // Pensiero intermedio del modello (reasoning aggregato dal gateway): emesso
         // come ThinkingDelta cosi' il ThinkingBlock della chat mostra il ragionamento
         // di OGNI interrogazione (ripristino visibilita' pre-porting). Solo su risposta
@@ -1734,6 +1737,10 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                 None => None,
             };
             if let Some(t) = thinking {
+                // Accumula per la persistenza (FIX D4): il blocco "Ragionamento"
+                // deve sopravvivere al refresh. Lo stesso testo viaggia LIVE come
+                // SseEvent::ThinkingDelta e finisce nel reasoning_acc dello stato.
+                turn_thinking = Some(t.clone());
                 ctx.emit.emit(SseEvent::ThinkingDelta { delta: t });
             }
         }
@@ -2085,9 +2092,25 @@ modo piu' specifico."
             ctx.emit.emit(SseEvent::EndTurn);
         }
 
+        // FIX D4: accumula il thinking di questo turno nel reasoning del run.
+        // Self-loop dell'executor: ogni iterazione concatena al valore portato
+        // dallo stato. Persistito a fine run nel metadata.reasoning del messaggio
+        // assistant (sopravvive al refresh). Se questo turno non ha prodotto
+        // thinking, il campo NON viene scritto (`None`) e resta invariato.
+        let reasoning_acc_delta: Option<Option<String>> = turn_thinking.as_ref().map(|t| {
+            let prev = state.reasoning_acc.as_deref().unwrap_or("");
+            let merged = if prev.is_empty() {
+                t.clone()
+            } else {
+                format!("{prev}\n\n{t}")
+            };
+            Some(merged)
+        });
+
         let mut delta = StateDelta {
             messages: Some(vec![assistant_msg]),
             result: Some(Some(final_result)),
+            reasoning_acc: reasoning_acc_delta,
             provider_used: Some(Some(eff_provider)),
             model_used: Some(Some(eff_model)),
             pending_tool_uses: Some(Some(pending_tool_uses)),

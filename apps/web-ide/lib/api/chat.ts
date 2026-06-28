@@ -37,6 +37,14 @@ export interface ChatMessage {
       PERSISTENTE sotto la risposta (completato/non riuscito/interrotto/in
       attesa), coerente anche dopo un reload. Undefined per i messaggi utente. */
   runStatus?: string;
+  /** Ragionamento (thinking) accumulato del run, persistito dal backend in
+      metadata.reasoning (NON come prefisso <nexus:thinking> nel content). LIVE
+      viaggiava solo come evento SSE `agent_thinking` (volatile): al refresh il
+      blocco "Ragionamento" spariva. Letto dal DB rende il blocco persistente e
+      convergente col live (regola L). Undefined per i messaggi senza thinking.
+      NB: richiede che la message view backend (to_message_view) lo esponga da
+      metadata->>'reasoning'. */
+  reasoning?: string;
   /** True quando il messaggio e' stato generato automaticamente dal sistema
       (es. auto-continuazione in modalita' "automatic"). La UI lo nasconde
       per non confondere l'utente: il backend lo persiste comunque per

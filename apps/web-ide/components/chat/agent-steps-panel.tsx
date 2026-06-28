@@ -234,35 +234,14 @@ function SingleRunPanel({
   const [expandedStepIndex, setExpandedStepIndex] = React.useState<number | null>(null);
   const displayLabel = label !== undefined ? label : `${run.provider}/${run.model}`;
 
-  // Calcola metriche totali dagli step
-  const calculateMetrics = () => {
-    let totalTokens = 0;
-    let totalCost = 0;
-    let maxLatency = 0;
-    let cacheHitCount = 0;
-
-    steps.forEach((step) => {
-      if (step.usage?.totalTokens) totalTokens += step.usage.totalTokens;
-      if (step.costUsd) totalCost += step.costUsd;
-      if (step.latencyMs) maxLatency = Math.max(maxLatency, step.latencyMs);
-      if (step.usage?.cacheReadTokens) cacheHitCount += step.usage.cacheReadTokens;
-    });
-
-    // Usa metriche del run se disponibili, altrimenti quelle calcolate
-    const totalTokensDisplay = run.usage?.totalTokens ?? totalTokens;
-    const totalCostDisplay = run.totalCostUsd ?? totalCost;
-    const cacheHitRate = run.cacheHitRate ?? (totalTokensDisplay > 0 ? (cacheHitCount / totalTokensDisplay) * 100 : 0);
-
-    return {
-      totalTokens: totalTokensDisplay,
-      totalCost: totalCostDisplay,
-      maxLatency,
-      cacheHitRate,
-      cacheReadTokens: run.usage?.cacheReadTokens ?? cacheHitCount,
-    };
+  // Metriche TOTALI del run (FIX D2): il motore Rust non popola metriche
+  // per-step (usage/costUsd/latencyMs), quindi l'aggregazione dagli step era
+  // sempre vuota. Leggiamo solo i totali di run, che esistono.
+  const metrics = {
+    totalTokens: run.usage?.totalTokens ?? 0,
+    totalCost: run.totalCostUsd ?? 0,
+    cacheHitRate: run.cacheHitRate ?? 0,
   };
-
-  const metrics = calculateMetrics();
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -352,16 +331,6 @@ function SingleRunPanel({
                 </div>
               )}
 
-              {/* Latency massima */}
-              {metrics.maxLatency > 0 && (
-                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ opacity: 0.6 }}>Latenza:</span>
-                  <span style={{ fontFamily: "monospace", fontWeight: 600, color: tc.text }}>
-                    {metrics.maxLatency}ms
-                  </span>
-                </div>
-              )}
-
               {/* Timestamp */}
               {run.createdAt && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4, gridColumn: "1 / -1" }}>
@@ -420,10 +389,11 @@ function SingleRunPanel({
             const recentGroups = groups.length > VISIBLE_RECENT ? groups.slice(groups.length - VISIBLE_RECENT) : groups;
 
             const renderGroup = ({ step, count, firstIndex, lastIndex }: GroupedStep) => {
-              const hasExtendedMetrics = step.usage || step.costUsd || step.latencyMs || step.temperature !== undefined;
+              // FIX D2: niente metriche per-step (il motore Rust non le popola).
+              // L'espandibilita' dipende solo da input/risultato del tool.
               const hasToolDetail = step.toolInput && Object.keys(step.toolInput).length > 0;
               const hasToolResult = Boolean(step.toolResult);
-              const isExpandable = hasExtendedMetrics || hasToolDetail || hasToolResult;
+              const isExpandable = hasToolDetail || hasToolResult;
               const isExpanded = expandedStepIndex === step.stepIndex;
               const statusBorderColor =
                 step.status === "failed" ? tc.error :
@@ -581,69 +551,14 @@ function SingleRunPanel({
                         </div>
                       )}
 
-                      {/* Metriche estese (se presenti) */}
-                      {hasExtendedMetrics && (
-                        <div
-                          style={{
-                            display: "grid",
-                            gridTemplateColumns: "1fr 1fr",
-                            gap: 6,
-                            paddingTop: 4,
-                            borderTop: `1px solid ${tc.border}30`,
-                          }}
-                        >
-                          {step.usage && (
-                            <>
-                              {step.usage.promptTokens !== undefined && (
-                                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                                  <span style={{ opacity: 0.7 }}>Token in:</span>
-                                  <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
-                                    {step.usage.promptTokens.toLocaleString()}
-                                  </span>
-                                </div>
-                              )}
-                              {step.usage.completionTokens !== undefined && (
-                                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                                  <span style={{ opacity: 0.7 }}>Token out:</span>
-                                  <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
-                                    {step.usage.completionTokens.toLocaleString()}
-                                  </span>
-                                </div>
-                              )}
-                              {step.usage.cacheReadTokens !== undefined && step.usage.cacheReadTokens > 0 && (
-                                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                                  <span style={{ opacity: 0.7 }}>Cache letti:</span>
-                                  <span style={{ fontFamily: "monospace", fontWeight: 500, color: "#22c55e" }}>
-                                    {step.usage.cacheReadTokens.toLocaleString()}
-                                  </span>
-                                </div>
-                              )}
-                            </>
-                          )}
-                          {step.costUsd !== undefined && (
-                            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Costo:</span>
-                              <span style={{ fontFamily: "monospace", fontWeight: 600 }}>
-                                ${step.costUsd.toFixed(6)}
-                              </span>
-                            </div>
-                          )}
-                          {step.latencyMs !== undefined && (
-                            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Latenza:</span>
-                              <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
-                                {step.latencyMs}ms
-                              </span>
-                            </div>
-                          )}
-                          {step.createdAt && (
-                            <div style={{ display: "flex", gap: 4, alignItems: "center", gridColumn: "1 / -1", fontSize: 10 }}>
-                              <span style={{ opacity: 0.6 }}>Eseguito:</span>
-                              <span style={{ fontFamily: "monospace", color: tc.textMuted }}>
-                                {new Date(step.createdAt).toLocaleTimeString()}
-                              </span>
-                            </div>
-                          )}
+                      {/* Timestamp di esecuzione (dato reale; le metriche
+                          per-step sono state rimosse, FIX D2). */}
+                      {step.createdAt && (
+                        <div style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 10, paddingTop: 4, borderTop: `1px solid ${tc.border}30` }}>
+                          <span style={{ opacity: 0.6 }}>Eseguito:</span>
+                          <span style={{ fontFamily: "monospace", color: tc.textMuted }}>
+                            {new Date(step.createdAt).toLocaleTimeString()}
+                          </span>
                         </div>
                       )}
                     </div>

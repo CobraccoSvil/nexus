@@ -98,6 +98,7 @@ mod sudo_routes;
 mod task_watchdog;
 mod tool_capability;
 mod tool_runner_server;
+mod trace_store;
 mod vector_memory;
 mod wiki;
 
@@ -764,6 +765,26 @@ async fn main() -> anyhow::Result<()> {
         let orch_sync = std::sync::Arc::new(state.orchestrator.clone());
         tokio::spawn(async move {
             model_catalog_sync::catalog_sync_loop(db_sync, Some(orch_sync)).await;
+        });
+    }
+
+    // Reconciliation policy->catalog al boot (regola H/L): i tick di sync hanno
+    // warm-up lungo (30s/5min). Allineare subito is_enabled alla
+    // model_selection_policy evita che il primo routing dopo l'avvio scarti
+    // modelli capaci ma rimasti disabilitati nel catalog statico (incidente
+    // google: gemini chat capaci is_enabled=false -> routing ripiega su modelli
+    // con context window insufficiente). Idempotente: no-op se gia' allineato.
+    {
+        let db_recon = state.db.clone();
+        tokio::spawn(async move {
+            match model_catalog_sync::reconcile_catalog_with_policy(&db_recon).await {
+                Ok(stats) => tracing::info!(
+                    "boot policy reconciliation: enabled={} disabled={}",
+                    stats.enabled,
+                    stats.disabled,
+                ),
+                Err(e) => tracing::warn!("boot reconcile_catalog_with_policy fallito: {e}"),
+            }
         });
     }
 

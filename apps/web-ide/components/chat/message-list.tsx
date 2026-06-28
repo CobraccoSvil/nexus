@@ -6,7 +6,8 @@ import type { ChatMessage, AgentRunInfo, AgentStep, SavedChatAttachment } from "
 import { getAgentRun, getAgentRunNextActions, getAttachmentRawUrl } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { MarkdownBlock } from "./markdown-renderer";
-import { NextActionsButtons, type NextActionChoice } from "./agent-meta-step-card";
+import { AgentMetaStepCard, NextActionsButtons, type NextActionChoice } from "./agent-meta-step-card";
+import type { MetaStepEntry } from "../../lib/use-chat/types";
 import { toolLabel } from "./tool-labels";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -447,6 +448,64 @@ function MessageNextActions({
   );
 }
 
+/**
+ * Card "decisioni del turno" (meta_step plan/routing/clarify/fallback/
+ * reflection/tool_executed) per UN messaggio assistant (FIX D6). Prima esisteva
+ * un unico blocco in chat-panel per il solo ultimo run; ora ogni messaggio
+ * assistant con runId mostra le sue decisioni, cosi' i turni passati restano
+ * leggibili dopo un reload (convergenza live/refresh, regola L). I next_actions
+ * sono esclusi (resi come pulsanti da MessageNextActions). Best-effort: se non
+ * ci sono decisioni non rende nulla.
+ */
+function MessageMetaSteps({ steps, tc }: { steps: MetaStepEntry[]; tc: ThemeColors }) {
+  const decisionSteps = steps.filter((m) => m.kind !== "next_actions");
+  if (!decisionSteps.length) return null;
+  return (
+    <div
+      style={{
+        marginTop: 6,
+        border: `1px solid ${tc.border}`,
+        borderRadius: 8,
+        background: tc.bgCard,
+        padding: "6px 10px",
+      }}
+      data-testid="message-meta-steps"
+    >
+      <div style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, marginBottom: 4 }}>
+        Decisioni del turno
+      </div>
+      {decisionSteps.map((m, idx) => (
+        <AgentMetaStepCard key={`meta-${m.kind}-${m.createdAt}-${idx}`} data={m} />
+      ))}
+    </div>
+  );
+}
+
+/** Raggruppa step consecutivi con stesso toolName e stesso status (esclude
+ *  supervisor_check, sempre singolo). Stessa logica del pannello live
+ *  (agent-steps-panel SingleRunPanel) per la parita' di rendering storico/live
+ *  (FIX D1). Ritorna gruppi con il count e il range di indici originali. */
+type StepGroup = { step: AgentStep; count: number; firstIndex: number; lastIndex: number };
+function groupConsecutiveSteps(steps: AgentStep[]): StepGroup[] {
+  const groups: StepGroup[] = [];
+  for (const step of steps) {
+    const last = groups[groups.length - 1];
+    if (
+      last &&
+      last.step.toolName === step.toolName &&
+      last.step.status === step.status &&
+      step.toolName !== "supervisor_check"
+    ) {
+      last.count += 1;
+      last.lastIndex = step.stepIndex;
+      last.step = step;
+    } else {
+      groups.push({ step, count: 1, firstIndex: step.stepIndex, lastIndex: step.stepIndex });
+    }
+  }
+  return groups;
+}
+
 function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -512,7 +571,8 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
           background: `${tc.bgCard}`,
           overflow: "hidden",
         }}>
-          {/* Header riepilogo run */}
+          {/* Header riepilogo run (parita' col live, FIX D1): provider/model +
+              badge di stato persistente + conteggi. */}
           <div style={{
             padding: "6px 10px",
             borderBottom: `1px solid ${tc.border}`,
@@ -526,17 +586,17 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
             <span style={{ fontWeight: 600, color: tc.text }}>
               {runInfo.provider}/{runInfo.model}
             </span>
-            <StepStatusBadge status={
-              runInfo.status === "completed" ? "completed" :
-              runInfo.status === "failed" ? "failed" : "running"
-            } tc={tc} />
+            <RunStatusBadge status={runInfo.status} tc={tc} />
             <span>{steps.length} step</span>
             {runInfo.iterationCount > 0 && <span>{runInfo.iterationCount} iterazioni</span>}
           </div>
 
-          {/* Lista step */}
+          {/* Lista step con raggruppamento consecutivo xN (parita' col live):
+              step adiacenti con stesso toolName e stesso status sono collassati
+              in una riga con badge x{count} e range N-M. */}
           <div style={{ padding: "4px 0" }}>
-            {steps.map((step) => {
+            {groupConsecutiveSteps(steps).map((g) => {
+              const step = g.step;
               const isExp = expandedIdx === step.stepIndex;
               const hasInput = step.toolInput && Object.keys(step.toolInput).length > 0;
               const hasResult = Boolean(step.toolResult);
@@ -546,7 +606,7 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
                 step.status === "running" ? tc.accent : "#22c55e";
 
               return (
-                <div key={step.stepIndex}>
+                <div key={`${step.stepIndex}-${g.count}`}>
                   {/* Riga step */}
                   <div
                     onClick={() => clickable && setExpandedIdx(isExp ? null : step.stepIndex)}
@@ -562,8 +622,8 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
                     onMouseEnter={(e) => { if (clickable && e.currentTarget instanceof HTMLElement) e.currentTarget.style.background = `${tc.border}18`; }}
                     onMouseLeave={(e) => { if (clickable && e.currentTarget instanceof HTMLElement) e.currentTarget.style.background = isExp ? `${tc.border}10` : "transparent"; }}
                   >
-                    <span style={{ minWidth: 22, textAlign: "right", opacity: 0.5, fontSize: 10, fontVariantNumeric: "tabular-nums" }}>
-                      {step.stepIndex + 1}.
+                    <span style={{ minWidth: 28, textAlign: "right", opacity: 0.5, fontSize: 10, fontVariantNumeric: "tabular-nums" }}>
+                      {g.count > 1 ? `${g.firstIndex + 1}–${g.lastIndex + 1}` : `${g.firstIndex + 1}.`}
                     </span>
                     {clickable && (
                       <span style={{ fontSize: 9, opacity: 0.5, minWidth: 10 }}>
@@ -574,6 +634,22 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
                       {toolLabel(step.toolName)}
                     </span>
                     <StepStatusBadge status={step.status} tc={tc} />
+                    {g.count > 1 && (
+                      <span style={{
+                        marginLeft: 2,
+                        background: step.status === "failed" ? `${tc.error}22` : "#22c55e22",
+                        color: step.status === "failed" ? tc.error : "#22c55e",
+                        border: `1px solid ${step.status === "failed" ? tc.error : "#22c55e"}44`,
+                        borderRadius: 10,
+                        padding: "0px 6px",
+                        fontSize: 10,
+                        fontWeight: 700,
+                        fontVariantNumeric: "tabular-nums",
+                        lineHeight: "16px",
+                      }}>
+                        x{g.count}
+                      </span>
+                    )}
                   </div>
 
                   {/* Dettaglio espanso */}
@@ -625,6 +701,20 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
               );
             })}
           </div>
+
+          {/* Footer esito (parita' col live): "Completato/Fallito - N step". */}
+          {(runInfo.status === "completed" || runInfo.status === "completed_verified" ||
+            runInfo.status === "failed" || runInfo.status === "failed_diagnosed") && (
+            <div style={{
+              padding: "5px 10px",
+              borderTop: `1px solid ${tc.border}`,
+              fontSize: 11,
+              fontWeight: 600,
+              color: (runInfo.status === "failed" || runInfo.status === "failed_diagnosed") ? tc.error : "#22c55e",
+            }}>
+              {(runInfo.status === "failed" || runInfo.status === "failed_diagnosed") ? "✗ Fallito" : "✓ Completato"} — {steps.length} step
+            </div>
+          )}
         </div>
       )}
 
@@ -811,6 +901,11 @@ export interface MessageListProps {
    *  blocco separato). `runId` identifica il run; i pulsanti vengono attaccati
    *  all'ultimo messaggio assistant di quel run. */
   nextActions?: { runId?: string; choices: NextActionChoice[] };
+  /** Timeline meta_step (plan/routing/clarify/fallback/reflection/tool_executed)
+   *  per runId. Resa come card collassabili sotto OGNI messaggio assistant con
+   *  runId (FIX D6), non piu' in un unico blocco "Decisioni del turno" per il
+   *  solo ultimo run. I next_actions sono esclusi (gestiti come pulsanti). */
+  metaStepsMap?: Map<string, MetaStepEntry[]>;
 }
 
 type CopyFeedbackState = { messageId: string; status: "success" | "error" } | null;
@@ -865,6 +960,7 @@ export function MessageList({
   lastUserRef,
   projectId,
   nextActions,
+  metaStepsMap,
 }: MessageListProps) {
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedbackState>(null);
   const copyFeedbackTimeoutRef = useRef<number | null>(null);
@@ -1092,11 +1188,18 @@ export function MessageList({
                   </div>
                 </details>
               ) : (() => {
-                const { thinking, text } = parseThinking(message.content ?? "");
+                // Ragionamento (D4): il backend persiste il thinking in
+                // metadata.reasoning (esposto come message.reasoning), NON come
+                // prefisso <nexus:thinking> nel content. Preferiamo quello quando
+                // presente; parseThinking resta SOLO come fallback per i vecchi
+                // messaggi che avessero il tag inline. Niente doppio rendering.
+                const parsed = parseThinking(message.content ?? "");
+                const reasoning = message.reasoning?.trim() || parsed.thinking;
+                const text = parsed.text;
                 const { toolUses, cleanText } = extractToolUseBlocks(text);
                 return (
                   <>
-                    {thinking && <ThinkingPanel thinking={thinking} />}
+                    {reasoning && <ThinkingPanel thinking={reasoning} />}
                     {cleanText.trim() && <MarkdownBlock content={cleanText} projectId={projectId} />}
                     {toolUses.length > 0 && <ToolUseBadges toolUses={toolUses} tc={tc} />}
                     {!cleanText.trim() && toolUses.length === 0 && (
@@ -1115,6 +1218,17 @@ export function MessageList({
               <div style={{ marginTop: 6 }}>
                 <RunStatusBadge status={message.runStatus} tc={tc} />
               </div>
+            )}
+
+            {/* Decisioni del turno (meta_step) per QUESTO messaggio (FIX D6):
+                card per-messaggio invece di un unico blocco per l'ultimo run.
+                Sorgente: metaStepsMap del run (live SSE o rilette dal DB al
+                bootstrap), cosi' restano dopo un reload e sui turni passati. */}
+            {!isUser && message.runId && metaStepsMap?.get(message.runId) && (
+              <MessageMetaSteps
+                steps={metaStepsMap.get(message.runId)!}
+                tc={tc}
+              />
             )}
 
             {/* Scelte di proseguimento: pulsanti attaccati a fine proposta DENTRO

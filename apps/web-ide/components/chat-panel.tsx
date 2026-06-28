@@ -19,10 +19,7 @@ import { IconButton } from "./icon-button";
 import { MessageList } from "./chat/message-list";
 import { SessionWorklogPanel } from "./chat/session-worklog-panel";
 import { AgentStepsPanel } from "./chat/agent-steps-panel";
-import {
-  AgentMetaStepCard as AgentMetaStepCardLazy,
-  extractLatestNextActions,
-} from "./chat/agent-meta-step-card";
+import { extractLatestNextActions } from "./chat/agent-meta-step-card";
 import { InlineTracePanel } from "./chat/inline-trace-panel";
 import { Composer } from "./chat/composer";
 import { MemoryPanel } from "./chat/memory-panel";
@@ -1130,6 +1127,7 @@ export function ChatPanel({
             positiveFeedback={positiveFeedback}
             lastUserRef={lastUserRef}
             projectId={projectId}
+            metaStepsMap={metaStepsMap}
             nextActions={(!agentRun && metaStepsMap.size > 0) ? (() => {
               // Scelte di proseguimento (next_actions) dell'ultimo run concluso:
               // passate a MessageList per essere rese DENTRO la bolla del
@@ -1209,47 +1207,11 @@ export function ChatPanel({
             />
           )}
 
-          {/* Meta-step persistenti: dopo che il run termina, agentRun viene
-              resettato a null e l'AgentStepsPanel scompare. Qui rendiamo i
-              meta_step (plan/routing/clarify/fallback/reflection) dell'ultimo
-              run di questa sessione anche post-completamento, cosi' l'utente
-              non li perde di vista quando arriva la risposta.
-              Scelta runId: ultimo assistant message con runId valorizzato
-              (fonte autoritativa = DB). Fallback all'ultima entry della Map
-              quando i messaggi non sono ancora arrivati. */}
-          {!agentRun && metaStepsMap.size > 0 && (() => {
-            const lastAssistantWithRun = [...messages]
-              .reverse()
-              .find((m) => m.role === "assistant" && m.runId);
-            const targetRunId = lastAssistantWithRun?.runId
-              ?? Array.from(metaStepsMap.keys()).pop();
-            const targetMetaSteps = targetRunId ? metaStepsMap.get(targetRunId) : undefined;
-            if (!targetMetaSteps || !targetMetaSteps.length) return null;
-            // I next_actions sono ora resi come pulsanti a fine risposta (sopra):
-            // qui restano solo le decisioni di processo (plan/routing/clarify/
-            // fallback/reflection/tool_executed).
-            const decisionSteps = targetMetaSteps.filter((m) => m.kind !== "next_actions");
-            if (!decisionSteps.length) return null;
-            return (
-              <div
-                style={{
-                  border: `1px solid ${tc.border}`,
-                  borderRadius: 10,
-                  background: tc.bgCard,
-                  padding: "8px 12px",
-                  alignSelf: "stretch",
-                }}
-                data-testid="agent-meta-steps-history"
-              >
-                <div style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, marginBottom: 4 }}>
-                  Decisioni del turno
-                </div>
-                {decisionSteps.map((m, idx) => (
-                  <AgentMetaStepCardLazy key={`hist-${m.kind}-${m.createdAt}-${idx}`} data={m} />
-                ))}
-              </div>
-            );
-          })()}
+          {/* FIX D6: il blocco unico "Decisioni del turno" (per il solo ultimo
+              run) e' stato rimosso. Le decisioni meta_step sono ora rese come
+              card per-messaggio dentro MessageList (MessageMetaSteps), sotto
+              OGNI messaggio assistant con runId: cosi' restano leggibili sui
+              turni passati e convergono live/refresh (regola L). */}
 
           {traces.length > 0 && <InlineTracePanel traces={traces} />}
 
