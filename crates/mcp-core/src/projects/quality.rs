@@ -610,6 +610,60 @@ pub async fn get_quality_findings(
     AxumPath(project_id): AxumPath<Uuid>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Pruning lazy dei findings su file non piu' esistenti (regola H). L'auto-scan
+    // per-file (maybe_auto_scan_file) aggiorna solo i file MODIFICATI e non rimuove
+    // i findings di file SPOSTATI/CANCELLATI (es. ristrutturazione src/pages ->
+    // src/app/pages): senza una scansione completa restano "stale" nel pannello come
+    // falsi positivi. Li rimuoviamo alla lettura. Guardia: pruna SOLO se la
+    // repository_root_path del progetto e' una dir accessibile, per non cancellare
+    // tutto se il filesystem e' temporaneamente irraggiungibile (host diverso/smontato).
+    if let Some(root) = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT repository_root_path FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    {
+        if std::path::Path::new(&root).is_dir() {
+            if let Ok(rows) = sqlx::query(
+                "SELECT id, file_path FROM project_quality_findings \
+                 WHERE project_id = $1 AND fixed_at IS NULL",
+            )
+            .bind(project_id)
+            .fetch_all(&state.db)
+            .await
+            {
+                let stale_ids: Vec<Uuid> = rows
+                    .iter()
+                    .filter_map(|r| {
+                        let fp: String = r.try_get("file_path").ok()?;
+                        if !fp.is_empty() && !std::path::Path::new(&fp).exists() {
+                            r.try_get::<Uuid, _>("id").ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !stale_ids.is_empty() {
+                    let _ = sqlx::query(
+                        "DELETE FROM project_quality_findings WHERE id = ANY($1)",
+                    )
+                    .bind(&stale_ids)
+                    .execute(&state.db)
+                    .await;
+                    tracing::info!(
+                        project_id = %project_id,
+                        pruned = stale_ids.len(),
+                        "quality-findings: rimossi findings stale su file non piu' esistenti"
+                    );
+                }
+            }
+        }
+    }
+
     let category = params
         .get("category")
         .cloned()
