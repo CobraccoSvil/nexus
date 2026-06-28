@@ -1233,17 +1233,30 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
     });
 
     // tool_choice mappato a `tool_config.function_calling_config.mode` via il
-    // punto unico (regola L). Lo iniettiamo solo quando ci sono `tools` e un
-    // vincolo riconosciuto. Ora coerente: mode=ANY ha senso perche' le
-    // functionDeclarations sono effettivamente presenti nel body.
-    let tool_config = req
-        .tool_choice
-        .as_ref()
-        .filter(|_| req.tools.is_some())
-        .and_then(super::tool_choice::to_google_function_calling_config)
-        .map(|function_calling_config| GoogleToolConfig {
+    // punto unico (regola L). Lo iniettiamo SEMPRE quando ci sono `tools`: se il
+    // chiamante fornisce un vincolo riconosciuto (auto/required/none/function) si
+    // usa quello, altrimenti si applica il DEFAULT ESPLICITO `mode=AUTO`.
+    //
+    // QUIRK GEMINI (fix definitivo, regola H): i modelli "thinking" (gemini-2.5/
+    // 3.x) con `tools` presenti ma SENZA `toolConfig` rispondono in modo NON
+    // deterministico con un turno vuoto (zero output token, finishReason STOP,
+    // nessuna functionCall) invece di chiamare il tool. Diagnosticato sul
+    // tool-probe di mcp-core (`generate_agent_turn` non invia `tool_choice`):
+    // ~1 richiesta su 3 tornava vuota -> a soglia tutti i gemini finivano
+    // auto-disabilitati con `tool_probe_failed`. Inviando esplicitamente
+    // `functionCallingConfig.mode=AUTO` il function calling torna deterministico
+    // (3/3 OK in verifica). Senza tool (`req.tools` None) nessun tool_config: un
+    // `toolConfig` orfano sarebbe rifiutato da Gemini.
+    let tool_config = req.tools.as_ref().map(|_| {
+        let function_calling_config = req
+            .tool_choice
+            .as_ref()
+            .and_then(super::tool_choice::to_google_function_calling_config)
+            .unwrap_or_else(super::tool_choice::default_google_function_calling_config);
+        GoogleToolConfig {
             function_calling_config,
-        });
+        }
+    });
 
     GenerateContentRequest {
         contents,
@@ -2909,10 +2922,31 @@ mod tests {
     }
 
     #[test]
+    fn tools_senza_tool_choice_emette_tool_config_auto() {
+        // QUIRK GEMINI (regressione): con tools presenti ma SENZA tool_choice
+        // (caso del tool-probe mcp-core via generate_agent_turn), il body DEVE
+        // comunque portare toolConfig(mode=AUTO). Senza questo, i modelli
+        // "thinking" Gemini rispondono in modo non deterministico con un turno
+        // vuoto invece di chiamare il tool -> auto-disable dei gemini.
+        let req = req_with_tools(vec![msg("user", "leggi x")], true);
+        assert!(req.tool_choice.is_none(), "il setup deve omettere tool_choice");
+        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+        // Le functionDeclarations restano presenti accanto al toolConfig.
+        assert_eq!(
+            json["tools"][0]["functionDeclarations"][0]["name"],
+            "read_file"
+        );
+    }
+
+    #[test]
     fn senza_tools_niente_campo_tools() {
         let req = req_with_tools(vec![msg("user", "ciao")], false);
         let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
         assert!(json.get("tools").is_none());
+        // Coerenza: senza tools nemmeno il toolConfig (un toolConfig orfano
+        // sarebbe rifiutato da Gemini).
+        assert!(json.get("toolConfig").is_none());
     }
 
     #[test]

@@ -120,6 +120,16 @@ pub fn to_google_function_calling_config(value: &Value) -> Option<Value> {
     }
 }
 
+/// `function_calling_config` di DEFAULT per Google quando ci sono `tools` ma il
+/// chiamante non ha fornito un `tool_choice` riconosciuto. Punto unico (regola L)
+/// del default Gemini: equivale ad `auto` lato semantica (il modello sceglie),
+/// ma a differenza dell'OMISSIONE del campo va inviato ESPLICITAMENTE perche' i
+/// modelli "thinking" Gemini, con tool presenti ma SENZA `toolConfig`, possono
+/// rispondere con un turno vuoto non deterministico invece di chiamare il tool.
+pub fn default_google_function_calling_config() -> Value {
+    json!({ "mode": "AUTO" })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +228,13 @@ mod tests {
         assert_eq!(f["allowedFunctionNames"][0], "search");
         // Valore ignoto -> None.
         assert_eq!(to_google_function_calling_config(&json!("boh")), None);
+    }
+
+    #[test]
+    fn default_google_e_mode_auto() {
+        // Il default esplicito (usato quando ci sono tool ma nessun tool_choice
+        // riconosciuto) e' mode=AUTO: il modello sceglie, ma il campo va inviato
+        // per il quirk dei Gemini "thinking".
+        assert_eq!(default_google_function_calling_config(), json!({"mode": "AUTO"}));
     }
 }
