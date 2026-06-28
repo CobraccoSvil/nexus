@@ -94,10 +94,22 @@ impl PgEscalationPort {
     /// l'escalation serve a uscire da loop agentici (un modello senza tool non
     /// aiuta). `COALESCE(..., -1)`: se il modello corrente non e' (piu') nel
     /// catalog, parte dall'intera catena del provider. Vuota su errore (fail-open).
+    ///
+    /// FINESTRA-AWARE (NON-convergenza, regola H): esclude i modelli con
+    /// `context_window` STRETTAMENTE minore di quello del modello corrente. Un
+    /// modello "piu' capace per rank" ma con finestra piu' PICCOLA (incidente reale
+    /// deepseek 1M -> deepseek-chat 131K) manderebbe in context-overflow un run gia'
+    /// vicino al limite di contesto, peggiorando lo stallo invece di risolverlo. Il
+    /// filtro vive qui (I/O) perche' la window e' gia' disponibile dalla vista; la
+    /// SELEZIONE resta nel modulo puro `pick_escalation_model` (confine regola L).
+    /// Se il modello corrente non e' nel catalog (`window=0`) il filtro e' inattivo
+    /// (nessun riferimento), coerente col fail-open.
     async fn chain_for(&self, provider: &str, base_model: &str) -> Vec<ChainEntry> {
         if provider.trim().is_empty() || base_model.trim().is_empty() {
             return Vec::new();
         }
+        // Window del modello corrente (0 se non in catalog -> filtro inattivo).
+        let current_window = self.model_window(provider, base_model).await;
         match sqlx::query_scalar::<_, String>(
             "SELECT model FROM v_model_escalation_chain \
              WHERE provider = $1 \
@@ -105,10 +117,12 @@ impl PgEscalationPort {
                AND escalation_rank > COALESCE( \
                      (SELECT escalation_rank FROM v_model_escalation_chain \
                        WHERE provider = $1 AND model = $2), -1) \
+               AND context_window >= $3 \
              ORDER BY escalation_rank ASC",
         )
         .bind(provider)
         .bind(base_model)
+        .bind(current_window)
         .fetch_all(&self.db)
         .await
         {
@@ -127,12 +141,45 @@ impl PgEscalationPort {
         }
     }
 
+    /// Context window (token) di `(provider, model)` dal catalog (vista
+    /// `v_model_escalation_chain`). `0` se il modello non e' nel catalog o su errore
+    /// (fail-open: il chiamante tratta `0` come "finestra ignota" -> nessun filtro
+    /// window-aware, comportamento storico). Punto unico (regola L) della lettura
+    /// della finestra per l'escalation finestra-aware (catena intra + cross-provider).
+    async fn model_window(&self, provider: &str, model: &str) -> i64 {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return 0;
+        }
+        sqlx::query_scalar::<_, i64>(
+            "SELECT context_window::bigint FROM v_model_escalation_chain \
+             WHERE provider = $1 AND model = $2 LIMIT 1",
+        )
+        .bind(provider)
+        .bind(model)
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+    }
+
     /// Candidato cross-provider (`loop_fallback_default`) dal router. Eleggibile
     /// SOLO la variante `Resolved` (tier-only, niente fallback hardcoded: ogni
     /// altro esito — NotFound / NoCapableModel / MatrixUnavailable — NON e' un
     /// candidato valido, regola G/H). `None` anche su sentinella o coppia vuota.
     /// Best-effort: ogni esito non-risolto -> `None`.
-    async fn cross_provider(&self) -> Option<CrossProviderCandidate> {
+    ///
+    /// FINESTRA-AWARE (NON-convergenza, regola H): se la coppia corrente e' nota e
+    /// ha una finestra nota (`current_window > 0`), il candidato cross-provider con
+    /// `context_window` STRETTAMENTE minore viene SCARTATO (evita il downgrade di
+    /// finestra che manda in overflow, come per la catena intra-provider). Se la
+    /// finestra del candidato e' ignota (`0`, non in catalog) il filtro e' inattivo
+    /// (fail-open: meglio offrire il cross-provider che restare bloccati).
+    async fn cross_provider(
+        &self,
+        current_provider: Option<&str>,
+        current_model: Option<&str>,
+    ) -> Option<CrossProviderCandidate> {
         let (provider, model) =
             match resolve_purpose_model_db(&self.db, "loop_fallback_default").await {
                 PurposeResolution::Resolved {
@@ -145,6 +192,24 @@ impl PgEscalationPort {
         }
         if provider.trim().is_empty() || model.trim().is_empty() {
             return None;
+        }
+        // Downgrade-finestra guard: scarta il cross-provider se ha finestra nota e
+        // STRETTAMENTE minore di quella corrente (entrambe note).
+        if let (Some(cp), Some(cm)) = (current_provider, current_model) {
+            let current_window = self.model_window(cp, cm).await;
+            if current_window > 0 {
+                let candidate_window = self.model_window(&provider, &model).await;
+                if candidate_window > 0 && candidate_window < current_window {
+                    tracing::info!(
+                        cross_provider = %provider,
+                        cross_model = %model,
+                        candidate_window,
+                        current_window,
+                        "escalation_port: cross-provider scartato (finestra piu' piccola della corrente)"
+                    );
+                    return None;
+                }
+            }
         }
         Some(CrossProviderCandidate { provider, model })
     }
@@ -161,8 +226,9 @@ impl EscalationPort for PgEscalationPort {
         model: Option<&str>,
     ) -> Result<EscalationInputs, PortError> {
         // Tier 2 (cross-provider): sempre risolto, indipendente dalla coppia
-        // corrente; e' il modulo puro a decidere se usarlo.
-        let cross_provider = self.cross_provider().await;
+        // corrente; e' il modulo puro a decidere se usarlo. Passiamo la coppia
+        // corrente per il filtro finestra-aware (scarta il downgrade di finestra).
+        let cross_provider = self.cross_provider(provider, model).await;
 
         // Tier 1 (intra-provider): solo se provider+model valorizzati.
         let (chain, provider_in_cooldown) = match (provider, model) {
@@ -270,6 +336,8 @@ mod tests {
 
     /// Seed del catalog (sorgente della catena derivata). Tuple:
     /// (provider, model, performance_tier, input_cost, is_enabled, supports_tool_use).
+    /// La `context_window` resta al default della tabella (8192): per i test che
+    /// esercitano il filtro finestra-aware usa [`seed_catalog_window`].
     async fn seed_catalog(pool: &PgPool, rows: &[(&str, &str, &str, f64, bool, bool)]) {
         for (provider, model, tier, in_cost, enabled, tool) in rows {
             sqlx::query(
@@ -287,6 +355,33 @@ mod tests {
             .execute(pool)
             .await
             .expect("insert catalog row");
+        }
+    }
+
+    /// Come [`seed_catalog`] ma con `context_window` esplicita (ultimo campo) per
+    /// esercitare il filtro finestra-aware. Tuple:
+    /// (provider, model, tier, input_cost, is_enabled, supports_tool_use, context_window).
+    async fn seed_catalog_window(
+        pool: &PgPool,
+        rows: &[(&str, &str, &str, f64, bool, bool, i64)],
+    ) {
+        for (provider, model, tier, in_cost, enabled, tool, window) in rows {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                 (provider, model, performance_tier, input_cost_per_million_tokens, \
+                  output_cost_per_million_tokens, is_enabled, supports_tool_use, context_window) \
+                 VALUES ($1, $2, $3, $4, 0, $5, $6, $7)",
+            )
+            .bind(provider)
+            .bind(model)
+            .bind(tier)
+            .bind(in_cost)
+            .bind(enabled)
+            .bind(tool)
+            .bind(window)
+            .execute(pool)
+            .await
+            .expect("insert catalog row con window");
         }
     }
 
@@ -341,6 +436,63 @@ mod tests {
         );
         // nexus_purpose_model vuota -> cross_provider None.
         assert!(inputs.cross_provider.is_none());
+    }
+
+    /// FINESTRA-AWARE (NON-convergenza, regola H): la catena intra-provider esclude
+    /// i modelli con `context_window` STRETTAMENTE minore di quello corrente. Il
+    /// modello corrente ha finestra grande (1M); il candidato "piu' capace per rank"
+    /// ma con finestra piccola (131K) NON deve entrare in catena (manderebbe in
+    /// overflow). Resta solo il candidato con finestra >= corrente.
+    #[sqlx::test]
+    async fn catena_esclude_finestra_piu_piccola(pool: PgPool) {
+        create_schema(&pool).await;
+        set_api_key(&pool, "deepseek", "sk-live").await;
+        seed_catalog_window(
+            &pool,
+            &[
+                // corrente: rank basso, finestra GRANDE (1M).
+                ("deepseek", "deepseek-v4-flash", "medium", 0.10, true, true, 1_000_000),
+                // piu' capace per rank ma finestra PICCOLA -> escluso (downgrade window).
+                ("deepseek", "deepseek-chat", "heavy", 1.0, true, true, 131_072),
+                // piu' capace E finestra >= corrente -> ammesso.
+                ("deepseek", "deepseek-reasoner", "heavy", 2.0, true, true, 1_000_000),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let inputs = port
+            .escalation_inputs(None, Some("deepseek"), Some("deepseek-v4-flash"))
+            .await
+            .expect("fail-open");
+        let models: Vec<&str> = inputs
+            .chain
+            .iter()
+            .map(|c| c.escalation_model.as_str())
+            .collect();
+        assert_eq!(
+            models,
+            vec!["deepseek-reasoner"],
+            "il candidato con finestra piu' piccola della corrente e' escluso"
+        );
+    }
+
+    /// FINESTRA-AWARE: `model_window` legge la finestra dalla vista; `0` se il
+    /// modello non e' in catalog (filtro inattivo -> fail-open). E' il punto unico
+    /// usato sia dal filtro catena sia dal guard downgrade del cross-provider.
+    #[sqlx::test]
+    async fn model_window_legge_la_finestra(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog_window(
+            &pool,
+            &[("deepseek", "deepseek-v4-flash", "medium", 0.10, true, true, 1_000_000)],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        assert_eq!(port.model_window("deepseek", "deepseek-v4-flash").await, 1_000_000);
+        // Modello non in catalog -> 0 (finestra ignota, filtro inattivo).
+        assert_eq!(port.model_window("deepseek", "ignoto").await, 0);
+        // Argomenti vuoti -> 0.
+        assert_eq!(port.model_window("", "x").await, 0);
     }
 
     /// Provider corrente NON disponibile (nessuna API key) -> catena Tier 1

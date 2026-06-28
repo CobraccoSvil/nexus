@@ -160,7 +160,8 @@ use crate::decisions::end_turn::{
 use crate::decisions::escalation::pick_escalation_model;
 use crate::decisions::g1_accounting::{g1_accounting, G1Signals};
 use crate::decisions::helpers::{
-    provider_style_supports_forcing, should_force_tool_choice, turn_action_oriented,
+    provider_style_supports_forcing, should_force_tool_choice, structural_unfulfilled_signal,
+    turn_action_oriented,
 };
 use crate::decisions::loop_signatures::{
     build_signature, detect_signature_loop, exploration_counter_update,
@@ -1096,6 +1097,15 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 .as_ref()
                 .map(|h| h.failed && matches!(h.tool_name.as_str(), "edit_file" | "write_file"))
                 .unwrap_or(false);
+            // Tool di SOLA LETTURA ripetuto identico (read_file/list_files/grep &
+            // co.): la GUIDE guida a CONCLUDERE con testo invece di forzare un altro
+            // read-only (NON-convergenza, regola H). Il set e' allineato a
+            // EXPLORATION_ONLY_TOOLS (punto unico, regola L): un tool ripetibile e'
+            // read-only se rientra fra quelli di sola esplorazione.
+            let ra_read_only = ra_hit
+                .as_ref()
+                .map(|h| EXPLORATION_ONLY_TOOLS.contains(&h.tool_name.as_str()))
+                .unwrap_or(false);
             let ra_threshold = self.cfg.repeated_action_threshold;
             let matched = ra_label.as_ref().map(|_| ra_count >= ra_threshold).unwrap_or(false);
             if !matched {
@@ -1136,6 +1146,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 let dec = pc::decide(&ProgressSignals {
                     repeated_action: Some((label.clone(), ra_count)),
                     repeated_action_edit_failed: ra_edit_failed,
+                    repeated_action_read_only: ra_read_only,
                     already_guided: progress_guided.clone(),
                     already_diagnosed: progress_diagnosed.clone(),
                     force_diagnose_enabled: self.cfg.repeated_action_force_diagnose_enabled,
@@ -1602,18 +1613,46 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         let in_discovery = !names_tc.is_empty()
             && names_tc.iter().all(|n| n == "nexus_mcp_tool_search");
         let supports_forcing = provider_style_supports_forcing(self.cfg.tool_choice_style.as_deref());
+        // Forcing "early action" TRANSITORIO (NON-convergenza, regola H): il
+        // forcing `tool_choice=required` non si applica a OGNI iterazione iniziale
+        // (cio' costringeva il modello a chiamare un tool anche quando il task era
+        // gia' soddisfatto -> ripetizione list_files/read_file -> escalation ->
+        // overflow su un task read-only banale). Si applica SOLO quando il turno
+        // PRECEDENTE non ha agito pur dovendo (il caso BUG-e: tool disponibili +
+        // action_oriented + nessuna tool call), segnalato dal punto unico
+        // [`structural_unfulfilled_signal`] (regola L) sullo `stop_reason` in
+        // ingresso (= esito del turno precedente). Cosi':
+        //   - turno precedente ToolUse -> ha agito -> NIENTE forcing early: il
+        //     modello PUO' chiudere con una risposta testuale quando il task e' fatto;
+        //   - turno precedente end_turn/stop con tool+action_oriented (BUG-e:
+        //     descrive senza agire) -> forcing early ON, esattamente come prima.
+        // Il primo turno (iters_in=0, nessun precedente) NON forza: `no_tool_call`
+        // sotto e' `prev != ToolUse` (vero a iter 0), ma `had_tools` del turno
+        // precedente non esiste -> il segnale strutturale resta governato da
+        // iters_in>=1 nel ramo BUG-e reale (turno gia' speso senza agire). La
+        // forza-azione HARD del progress_controller (`force_action_hard`, stalli
+        // esplorazione/repeated_action/g1) resta SEMPRE attiva: NON e' toccata qui.
+        let prev_acted = state.stop_reason == Some(StopReason::ToolUse);
+        let early_action_bug_e = structural_unfulfilled_signal(
+            !tools_json.is_empty(),
+            !prev_acted && iters_in >= 1,
+            turn_action_oriented(state.action_oriented),
+            iters_in,
+            self.cfg.tool_choice_forcing_max_iteration,
+        );
         // Forza-azione hard (progress_controller GUIDE) OPPURE forcing "early
-        // action" (funzione pura): in entrambi i casi `Some(true)`, py:2946-2969.
+        // action" condizionato a BUG-e: in entrambi i casi `Some(true)`, py:2946-2969.
         let force_now = (force_action_hard && supports_forcing)
-            || should_force_tool_choice(
-                !tools_json.is_empty(),
-                turn_action_oriented(state.action_oriented),
-                iters_in,
-                in_discovery,
-                supports_forcing,
-                self.cfg.tool_choice_forcing_enabled,
-                self.cfg.tool_choice_forcing_max_iteration,
-            );
+            || (early_action_bug_e
+                && should_force_tool_choice(
+                    !tools_json.is_empty(),
+                    turn_action_oriented(state.action_oriented),
+                    iters_in,
+                    in_discovery,
+                    supports_forcing,
+                    self.cfg.tool_choice_forcing_enabled,
+                    self.cfg.tool_choice_forcing_max_iteration,
+                ));
         let force_tc: Option<bool> = if force_now { Some(true) } else { None };
 
         // ── LLM CALL (py:2974-3107) ───────────────────────────────────────────

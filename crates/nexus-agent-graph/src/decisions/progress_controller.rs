@@ -95,6 +95,12 @@ pub struct ProgressSignals {
     /// radice del falso-stallo: la correzione dell'old_string e' un'azione
     /// LEGITTIMA, non una ripetizione da abortire.
     pub repeated_action_edit_failed: bool,
+    /// `true` se l'azione ripetuta e' un tool di SOLA LETTURA (read_file/list_files/
+    /// grep & co.). La GUIDE NON deve forzare un'altra tool call (forzerebbe un
+    /// ennesimo read-only -> nuovo loop): deve guidare a CONCLUDERE con testo (il
+    /// contesto e' gia' stato raccolto). NON-convergenza, regola H. Per i tool
+    /// produttivi resta la forza-azione correttiva (force_action=true).
+    pub repeated_action_read_only: bool,
     /// Riallocazione risorse: numero request_port ravvicinate (a prescindere dal
     /// label: il variare del label E' il sintomo del loop).
     pub reallocation_count: i64,
@@ -126,6 +132,7 @@ impl Default for ProgressSignals {
             g1_over_cap: false,
             repeated_action: None,
             repeated_action_edit_failed: false,
+            repeated_action_read_only: false,
             reallocation_count: 0,
             reallocation_threshold: 3,
             has_active_resources: false,
@@ -270,6 +277,20 @@ lo stesso comando/edit."
     }
 }
 
+/// Nudge per la ripetizione identica di una LETTURA (read_file/list_files/grep):
+/// il contesto e' gia' stato raccolto, ripetere la stessa lettura non aggiunge
+/// nulla. Guida a CONCLUDERE con testo (NON a un'altra tool call). NON-convergenza,
+/// regola H.
+fn repeated_read_only_nudge(label: &str, count: i64) -> String {
+    format!(
+        "STOP: hai gia' eseguito la stessa lettura ({label}) {count} volte con lo \
+stesso bersaglio. Ripeterla NON aggiunge informazioni: il contenuto e' gia' nel \
+contesto sopra. NON rileggere e NON cercare altro. Rispondi ORA a parole con il \
+risultato richiesto in base a cio' che hai gia' raccolto; se ti serve davvero un \
+dato diverso, fai UNA lettura su un bersaglio DIVERSO, non la stessa."
+    )
+}
+
 /// Nudge SPECIFICO per `edit_file`/`write_file` FALLITO ripetuto (causa radice
 /// del falso-stallo). NON dice "rileggi con read_file": l'estratto numerato del
 /// contenuto reale e' GIA' nel messaggio d'errore precedente (vedi
@@ -381,10 +402,12 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
                     .clone()
                     .unwrap_or_else(|| (String::new(), 0));
                 // edit_file/write_file FALLITO -> nudge SPECIFICO (copia
-                // l'old_string esatto dall'estratto gia' nell'errore), non quello
-                // generico "cambia approccio" che porta all'ABORT a vuoto.
+                // l'old_string esatto dall'estratto gia' nell'errore); lettura
+                // ripetuta -> nudge "concludi con testo"; altrimenti generico.
                 if signals.repeated_action_edit_failed {
                     repeated_action_edit_failed_nudge(&label, count)
+                } else if signals.repeated_action_read_only {
+                    repeated_read_only_nudge(&label, count)
                 } else {
                     repeated_action_nudge(&label, count)
                 }
@@ -392,10 +415,20 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
             Axis::G1Descriptive => g1_nudge(),
         };
         // Solo resource_reallocation resta SOFT (il nudge ordina di riusare le porte,
-        // non c'e' un'azione correttiva diretta). Per repeated_action FORZIAMO una
-        // nuova tool call (force-action): un'azione ripetuta che fallisce va CORRETTA,
-        // non ripetuta ne' abbandonata -> rimuove i read-only e impone tool_choice.
-        let force = !matches!(axis, Axis::ResourceReallocation);
+        // non c'e' un'azione correttiva diretta). Per repeated_action PRODUTTIVA
+        // FORZIAMO una nuova tool call (force-action): un'azione ripetuta che fallisce
+        // va CORRETTA, non ripetuta ne' abbandonata -> rimuove i read-only e impone
+        // tool_choice. Per repeated_action di SOLA LETTURA NON forziamo (forzare un
+        // altro read-only creerebbe un nuovo loop): il nudge guida a concludere con
+        // testo (NON-convergenza, regola H).
+        let force = match axis {
+            // resource_reallocation: SOFT (riusa-porte, nessuna azione correttiva).
+            Axis::ResourceReallocation => false,
+            // repeated_action di SOLA LETTURA: NON forzare (forzerebbe un altro
+            // read-only -> nuovo loop); il nudge guida a concludere con testo.
+            Axis::RepeatedAction if signals.repeated_action_read_only => false,
+            _ => true,
+        };
         let reason = match axis {
             Axis::RepeatedAction => {
                 format!("stallo {}: forza-azione correttiva (no ripetizione)", axis.as_str())
@@ -569,6 +602,31 @@ mod tests {
         assert_eq!(d.action, Action::Guide);
         let nudge = d.nudge_text.as_deref().unwrap();
         assert!(!nudge.contains("old_string ESATTO"));
+    }
+
+    #[test]
+    fn repeated_action_read_only_guida_a_concludere_senza_forzare() {
+        // GUIDE di una LETTURA ripetuta (read_file/list_files): NON deve forzare
+        // un'altra tool call (forzerebbe un ennesimo read-only -> nuovo loop): deve
+        // guidare a CONCLUDERE con testo (NON-convergenza, regola H).
+        let signals = ProgressSignals {
+            repeated_action: Some(("read_file: src/main.rs".to_string(), 2)),
+            repeated_action_read_only: true,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::Guide);
+        assert!(
+            !d.force_action,
+            "una lettura ripetuta NON deve forzare un'altra tool call"
+        );
+        let nudge = d.nudge_text.as_deref().unwrap();
+        assert!(
+            nudge.contains("Rispondi ORA a parole"),
+            "atteso nudge 'concludi con testo', ottenuto: {nudge}"
+        );
+        // Non deve essere il nudge generico produttivo.
+        assert!(!nudge.contains("cambia approccio"));
     }
 
     #[test]

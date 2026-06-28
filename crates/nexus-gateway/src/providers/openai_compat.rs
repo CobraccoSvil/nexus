@@ -121,7 +121,10 @@ impl OpenAiCompatClient {
         req: &LlmRequest,
         reasoning: &ResolvedReasoning,
     ) -> anyhow::Result<LlmResponse> {
-        let body = build_request_body(req, false, reasoning);
+        let mut body = build_request_body(req, false, reasoning);
+        if provider_requires_user_or_tool_last(&self.provider_name) {
+            strip_trailing_assistant(&mut body.messages);
+        }
         let start = Instant::now();
 
         let resp = self
@@ -166,7 +169,10 @@ impl OpenAiCompatClient {
         req: &LlmRequest,
         reasoning: &ResolvedReasoning,
     ) -> anyhow::Result<ChunkStream> {
-        let body = build_request_body(req, true, reasoning);
+        let mut body = build_request_body(req, true, reasoning);
+        if provider_requires_user_or_tool_last(&self.provider_name) {
+            strip_trailing_assistant(&mut body.messages);
+        }
 
         let resp = self
             .http
@@ -664,6 +670,36 @@ fn build_request_body(
             None
         },
     }
+}
+
+/// Alcuni provider OpenAI-compat stretti (es. Mistral) RIFIUTANO con HTTP 400
+/// ("Expected last role User or Tool (or Assistant with prefix True) ... but got
+/// assistant") una richiesta il cui ULTIMO messaggio ha role "assistant" senza
+/// tool-call pendenti. Nei run agentici la cronologia puo' terminare con un
+/// assistant interlocutorio o, in cascade/fallback, con la risposta di un altro
+/// provider. Rimuoviamo i trailing assistant SENZA tool_calls cosi' l'ultimo role
+/// e' user/tool; gli assistant CON tool_calls pendenti restano (parte valida del
+/// flusso tool). Porting del fix Python `_strip_trailing_assistant` perso nel
+/// cutover a Rust. Mantiene sempre almeno un messaggio.
+fn strip_trailing_assistant(messages: &mut Vec<WireMessage>) {
+    while messages.len() > 1 {
+        let drop_last = matches!(
+            messages.last(),
+            Some(m) if m.role == "assistant" && m.tool_calls.is_none()
+        );
+        if drop_last {
+            messages.pop();
+        } else {
+            break;
+        }
+    }
+}
+
+/// True per i provider che esigono come ULTIMO messaggio role `user` o `tool`
+/// (assistant trailing rifiutato dall'API). E' una proprieta' del PROVIDER, non
+/// del modello (regola G: nessun model_id hardcoded).
+fn provider_requires_user_or_tool_last(provider: &str) -> bool {
+    provider == "mistral"
 }
 
 /// Converte un [`crate::types::LlmMessage`] nel formato wire OpenAI.

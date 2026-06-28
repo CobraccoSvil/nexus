@@ -650,7 +650,12 @@ async fn retry_senza_forcing_su_errore() {
         thread_id: Some("r1".into()),
         messages: vec![human("scrivi")],
         action_oriented: Some(true),
-        iterations: Some(0),
+        // Forcing "early action" TRANSITORIO (NON-convergenza, regola H): scatta solo
+        // quando il turno PRECEDENTE non ha agito (BUG-e). iter=1 + prev end_turn (non
+        // ToolUse) + tool disponibili + action_oriented = segnale strutturale -> forcing
+        // ON sulla primaria.
+        iterations: Some(1),
+        stop_reason: Some(StopReason::EndTurn),
         tools_json: Some(vec![json!({"name": "write_file"})]),
         ..Default::default()
     };
@@ -662,6 +667,169 @@ async fn retry_senza_forcing_su_errore() {
     assert_eq!(calls[0].force_tool_choice, Some(true));
     assert_eq!(calls[1].force_tool_choice, Some(false));
     assert_eq!(out.result.as_deref(), Some("ok dopo retry"));
+}
+
+#[tokio::test]
+async fn forcing_early_action_non_scatta_se_turno_precedente_ha_agito() {
+    // FIX NON-convergenza (regola H): il forcing "early action" e' TRANSITORIO. Se il
+    // turno PRECEDENTE ha gia' agito (stop_reason ToolUse), il forcing NON scatta:
+    // il modello PUO' chiudere con una risposta testuale quando il task e' fatto.
+    // Prima il forcing scattava a OGNI iterazione iniziale (iter<=max) -> il modello
+    // era costretto a chiamare un tool anche su un task read-only gia' soddisfatto,
+    // generando il loop list_files/read_file -> escalation -> overflow.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        tool_choice_forcing_enabled: true,
+        tool_choice_style: Some("anthropic_any".to_string()),
+        ..ExecutorConfig::default()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("Ecco lo stack in 2 righe."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("elenca i file e dimmi lo stack")],
+        action_oriented: Some(true),
+        // Turno precedente HA agito (tool_use): il task e' gia' esplorato.
+        stop_reason: Some(StopReason::ToolUse),
+        iterations: Some(1),
+        tools_json: Some(vec![json!({"name": "list_files"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _ = apply(state, delta);
+    // Il forcing NON e' applicato: il modello e' libero di chiudere con testo.
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        req.force_tool_choice, None,
+        "turno precedente che ha agito -> niente forcing early -> chiusura testuale possibile"
+    );
+}
+
+#[tokio::test]
+async fn forcing_early_action_non_scatta_al_primo_turno() {
+    // Al PRIMO turno (iter=0, nessun precedente) il forcing early NON scatta: un task
+    // banale puo' essere risposto direttamente. La forza-azione resta affidata ai
+    // nudge del progress_controller / al G1 anti-descrittivo sulle iterazioni dove
+    // il modello descrive senza agire (BUG-e reale), non al primo giro.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        tool_choice_forcing_enabled: true,
+        tool_choice_style: Some("anthropic_any".to_string()),
+        ..ExecutorConfig::default()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("Risposta diretta."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("domanda semplice")],
+        action_oriented: Some(true),
+        iterations: Some(0),
+        tools_json: Some(vec![json!({"name": "list_files"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _ = apply(state, delta);
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        req.force_tool_choice, None,
+        "primo turno -> niente forcing early (nessun BUG-e: il turno precedente non esiste)"
+    );
+}
+
+#[tokio::test]
+async fn forcing_early_action_scatta_se_turno_precedente_non_ha_agito() {
+    // BUG-e PRESERVATO (regola H): se il turno precedente NON ha agito pur dovendo
+    // (prev end_turn + tool disponibili + action_oriented), il forcing early scatta
+    // ancora -> il modello e' obbligato ad agire invece di descrivere. E' la
+    // condizione che f2daab6 ripristinava; qui resta intatta, solo resa transitoria.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        tool_choice_forcing_enabled: true,
+        tool_choice_style: Some("anthropic_any".to_string()),
+        ..ExecutorConfig::default()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = llm_tool_call("write_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("scrivi il file")],
+        action_oriented: Some(true),
+        stop_reason: Some(StopReason::EndTurn), // turno precedente: descrive, non agisce
+        iterations: Some(1),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _ = apply(state, delta);
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        req.force_tool_choice, Some(true),
+        "BUG-e preservato: turno precedente che non ha agito -> forcing early ON"
+    );
+}
+
+#[tokio::test]
+async fn lettura_ripetuta_identica_guida_a_concludere() {
+    // FIX #2 loop-control (regola H): una LETTURA ripetuta identica (stesso path)
+    // oltre soglia (repeated_action_threshold=2, default) scatta come repeated_action
+    // di SOLA LETTURA: il progress_controller inietta un nudge "concludi con testo"
+    // SENZA forzare un'altra tool call, ben prima del cap esplorazione 2x (=12) e
+    // dell'escalation. Cosi' il loop read-only non arriva a 14 iterazioni.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // progress_controller ON
+    let llm = Arc::new(StubLlmGateway::with_text("Concludo a parole."));
+    let ctx = ctx_with(llm.clone(), false);
+    // read_file stesso path 2 volte, entrambe RIUSCITE (la rilettura riuscita
+    // ripetuta E' lo stallo da fermare per i read-only).
+    let messages = vec![
+        human("dimmi cosa contiene il file"),
+        ai_tool("read_file", json!({"path": "src/main.rs"})),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String("fn main() {}".into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        },
+        ai_tool("read_file", json!({"path": "src/main.rs"})),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c2".into(),
+                content: Value::String("fn main() {}".into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        },
+    ];
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _ = apply(state, delta);
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    // Nudge "concludi con testo" iniettato.
+    let has_concludi = req.messages.iter().any(|m| {
+        matches!(&m.content, Value::String(s) if s.contains("Rispondi ORA a parole"))
+    });
+    assert!(has_concludi, "atteso nudge 'concludi con testo' per la lettura ripetuta");
+    // NON forza il tool (force_tool_choice None): il modello puo' chiudere con testo.
+    assert_eq!(
+        req.force_tool_choice, None,
+        "lettura ripetuta -> niente force-action (non un altro read-only)"
+    );
 }
 
 #[tokio::test]
@@ -902,9 +1070,12 @@ async fn signature_loop_escalation_non_forza_tool_choice() {
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
-        // action_oriented + iter bassa -> should_force_tool_choice scatta sulla 1a.
+        // Forcing "early action" TRANSITORIO (NON-convergenza, regola H): scatta solo
+        // se il turno PRECEDENTE non ha agito (BUG-e). iter=1 + prev end_turn (non
+        // ToolUse) + tool + action_oriented -> should_force_tool_choice scatta sulla 1a.
         action_oriented: Some(true),
-        iterations: Some(0),
+        iterations: Some(1),
+        stop_reason: Some(StopReason::EndTurn),
         recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
         tools_json: Some(vec![json!({"name": "read_file"})]),
         ..Default::default()

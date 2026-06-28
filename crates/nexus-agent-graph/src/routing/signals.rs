@@ -458,18 +458,41 @@ pub fn detect_repeated_failed_command(
     })
 }
 
-/// Tool PRODUTTIVI tracciati da `detect_repeated_action` -> chiavi argomento
-/// che ne definiscono il BERSAGLIO (path/comando).
+/// Tool tracciati da `detect_repeated_action` -> chiavi argomento che ne
+/// definiscono il BERSAGLIO (path/comando/pattern).
 ///
 /// PUNTO UNICO (regola L): qualunque call site che debba decidere "questa azione
 /// e' la stessa di prima?" passa da qui. Il bersaglio da solo NON basta a definire
 /// l'identita' per i tool di edit (vedi [`repeated_action_content_key`]).
+///
+/// Oltre ai tool PRODUTTIVI (scrittura/comando) sono inclusi i tool di SOLA
+/// LETTURA con bersaglio (read_file/list_files/grep & co.): la ripetizione
+/// IDENTICA di una lettura (stesso path/pattern) e' un loop di esplorazione che
+/// non converge (NON-convergenza, regola H) e va fermato dal progress_controller
+/// ben prima del cap esplorazione 2x. Per questi tool la ripetizione conta a
+/// prescindere dall'esito (vedi [`is_read_only_repeatable_tool`]): rileggere con
+/// SUCCESSO lo stesso file e' proprio lo stallo da interrompere.
 fn repeated_action_keys(name: &str) -> Option<&'static [&'static str]> {
     match name {
         "write_file" | "edit_file" => Some(&["path", "file_path"]),
         "run_command" | "run_service" | "run_in_terminal" => Some(&["command"]),
+        // Tool di sola lettura con bersaglio: bersaglio = path o pattern.
+        "read_file" | "read_file_lines" | "list_files" => Some(&["path", "file_path", "dir"]),
+        "grep" | "search_in_files" => Some(&["pattern", "query", "path"]),
         _ => None,
     }
+}
+
+/// True se `name` e' un tool di SOLA LETTURA per cui la ripetizione identica conta
+/// come stallo a PRESCINDERE dall'esito (a differenza dei tool produttivi, dove la
+/// PRIMA occorrenza riuscita esclude la signature come "ridondanza innocua"). Per i
+/// read-only la rilettura riuscita ripetuta E' lo stallo (l'agente non avanza):
+/// quindi NON va esclusa dal conteggio. Punto unico (regola L) della distinzione.
+fn is_read_only_repeatable_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "read_file_lines" | "list_files" | "grep" | "search_in_files"
+    )
 }
 
 /// Chiave dell'argomento di CONTENUTO che, insieme al bersaglio, definisce
@@ -590,7 +613,11 @@ pub fn detect_repeated_action_detailed(
             last_sig = Some(sig.clone());
             // Esito strutturale dell'occorrenza corrente (primo tool_result dopo).
             let outcome = tool_result_outcome_after(recent, idx, 3);
-            if outcome == Some(false) {
+            // FALSO-DOPPIONE (solo tool PRODUTTIVI): la prima occorrenza RIUSCITA
+            // esclude la signature (ridondanza innocua). Per i tool di SOLA LETTURA
+            // la rilettura RIUSCITA ripetuta E' lo stallo (l'agente non avanza),
+            // quindi NON va esclusa: conta come ripetizione (regola H).
+            if outcome == Some(false) && !is_read_only_repeatable_tool(name) {
                 succeeded.insert(sig.clone());
             }
             // Memorizza l'esito dell'ULTIMA occorrenza vista (None -> non fallita).
@@ -1479,6 +1506,47 @@ mod tests {
             human_tool_result(None, true, "old_string non trovato"),
         ];
         assert_eq!(detect_repeated_action(&msgs, 24), (None, 0));
+    }
+
+    #[test]
+    fn repeated_action_read_only_riuscito_e_stallo() {
+        // FIX #2 (NON-convergenza, regola H): una LETTURA ripetuta IDENTICA, anche
+        // RIUSCITA entrambe le volte, e' stallo per i read-only (l'agente rilegge
+        // lo stesso file senza avanzare). A differenza dei produttivi, la prima
+        // occorrenza riuscita NON la esclude dal conteggio.
+        let msgs = vec![
+            ai_tool_input("read_file", json!({"path": "src/main.rs"})),
+            human_tool_result(Some(0), false, "fn main() {}"),
+            ai_tool_input("read_file", json!({"path": "src/main.rs"})),
+            human_tool_result(Some(0), false, "fn main() {}"),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24).expect("stallo read-only atteso");
+        assert_eq!(hit.label, "read_file: src/main.rs");
+        assert_eq!(hit.count, 2);
+        assert_eq!(hit.tool_name, "read_file");
+        // Letture su path DIVERSI: esplorazione legittima, nessuno stallo.
+        let diversi = vec![
+            ai_tool_input("read_file", json!({"path": "a.rs"})),
+            human_tool_result(Some(0), false, "..."),
+            ai_tool_input("read_file", json!({"path": "b.rs"})),
+            human_tool_result(Some(0), false, "..."),
+        ];
+        let hit2 = detect_repeated_action_detailed(&diversi, 24);
+        assert_eq!(hit2.map(|h| h.count), Some(1), "path diversi -> nessuno stallo");
+    }
+
+    #[test]
+    fn repeated_action_grep_identico_e_stallo() {
+        // grep stesso pattern ripetuto -> stallo (bersaglio = pattern).
+        let msgs = vec![
+            ai_tool_input("grep", json!({"pattern": "TODO", "path": "src"})),
+            human_tool_result(Some(0), false, "match..."),
+            ai_tool_input("grep", json!({"pattern": "TODO", "path": "src"})),
+            human_tool_result(Some(0), false, "match..."),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24).expect("stallo grep atteso");
+        assert_eq!(hit.tool_name, "grep");
+        assert_eq!(hit.count, 2);
     }
 
     #[test]
