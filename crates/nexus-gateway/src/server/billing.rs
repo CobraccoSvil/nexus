@@ -279,20 +279,25 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
         "price_missing": price_missing,
     });
 
+    // run_id (= request_id nei metadata): abilita il breakdown costo per run /
+    // sessione (M71). NULL se il chiamante non lo passa o non e' un UUID valido.
+    let run_uuid = Uuid::parse_str(req.metadata.request_id.trim()).ok();
+
     let res = sqlx::query(
         r#"
         INSERT INTO ai_usage_ledger (
-            user_id, project_id, provider, model,
+            user_id, project_id, run_id, provider, model,
             prompt_tokens, completion_tokens, total_tokens,
             input_cost, output_cost, total_cost,
             currency, status, details
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'finalized', $12
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'finalized', $13
         )
         "#,
     )
     .bind(user_uuid)
     .bind(project_uuid)
+    .bind(run_uuid)
     .bind(provider)
     .bind(model)
     .bind(prompt_tokens)

@@ -663,7 +663,32 @@ async fn build_native_engine(
     //    agent_steps, ausiliari neutralizzati): nessuna chiamata LLM reale ->
     //    num_tool_calls converge col primario, costo zero, zero RNG-divergenza.
     let llm: Arc<dyn LlmGateway> = match role {
-        RunRole::Primary => Arc::new(GatewayLlmAdapter::new(deps.gateway.clone())),
+        RunRole::Primary => {
+            // Identita' del run per il ledger di billing: ricavata dalla sessione
+            // (chat_sessions.project_id/user_id). Senza, il gateway scarta la
+            // registrazione usage (record_usage_to_ledger esce su tenant vuoto) e
+            // il costo risulta sempre 0. Lettura puntuale (una volta per run).
+            let (proj_id, usr_id) = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
+                "SELECT project_id, user_id FROM chat_sessions WHERE id = $1",
+            )
+            .bind(input.session_id)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+            .map(|(p, u)| {
+                (
+                    p.map(|x| x.to_string()).unwrap_or_default(),
+                    u.map(|x| x.to_string()).unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+            Arc::new(GatewayLlmAdapter::new(
+                deps.gateway.clone(),
+                proj_id,
+                usr_id,
+            ))
+        }
         RunRole::Shadow { primary_run_id } => {
             Arc::new(ReplayLlmGateway::new(db.clone(), primary_run_id))
         }
@@ -1852,7 +1877,7 @@ mod tests {
     fn gateway_client_costruibile() {
         // Sanity: il client gateway e' costruibile (l'adapter lo avvolge senza I/O).
         let gw = NexusGatewayClient::new("http://127.0.0.1:1".to_string(), "tok".to_string());
-        let _adapter = GatewayLlmAdapter::new(gw);
+        let _adapter = GatewayLlmAdapter::new(gw, String::new(), String::new());
     }
 
     // ── SHADOW (F4): proiezione canonica + persistenza telemetria ─────────────

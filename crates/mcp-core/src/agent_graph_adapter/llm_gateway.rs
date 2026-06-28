@@ -48,19 +48,37 @@ use crate::nexus_gateway::{
 pub struct GatewayLlmAdapter {
     /// Client del gateway LLM concreto a cui la `complete` delega.
     gateway: NexusGatewayClient,
+    /// Project id (UUID stringa) del run -> `GwMetadata.tenant_id`. Senza, il
+    /// gateway NON registra l'usage nel ledger (record_usage_to_ledger esce se
+    /// tenant_id e' vuoto): era la causa del "costo sempre a 0" post-cutover.
+    project_id: String,
+    /// User id (UUID stringa) owner del run -> `GwMetadata.user_id`.
+    user_id: String,
 }
 
 impl GatewayLlmAdapter {
-    /// Costruisce l'adapter sul client gateway concreto.
-    pub fn new(gateway: NexusGatewayClient) -> Self {
-        Self { gateway }
+    /// Costruisce l'adapter sul client gateway concreto con l'identita' del run
+    /// (project_id/user_id) necessaria al ledger di billing.
+    pub fn new(gateway: NexusGatewayClient, project_id: String, user_id: String) -> Self {
+        Self {
+            gateway,
+            project_id,
+            user_id,
+        }
     }
 }
 
 #[async_trait]
 impl LlmGateway for GatewayLlmAdapter {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
-        let gw_req = build_gw_request(&req);
+        let mut gw_req = build_gw_request(&req);
+        // Identita' del run per il ledger di billing. `build_gw_request` e' una fn
+        // pura (testata) che lascia tenant_id/user_id vuoti; li popoliamo qui dal
+        // contesto del run iniettato in `new()`. Senza questo il gateway scarta la
+        // registrazione usage (record_usage_to_ledger return su tenant vuoto) e il
+        // costo risultava sempre 0. request_id = run_id e' gia' valorizzato.
+        gw_req.metadata.tenant_id = self.project_id.clone();
+        gw_req.metadata.user_id = self.user_id.clone();
         let resp = self
             .gateway
             .complete(gw_req)
