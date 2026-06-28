@@ -1328,6 +1328,19 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_generate_image",
+    "description": "Genera un'immagine dal prompt testuale e la salva nel progetto sotto .nexus/generated/<nome>.png. Usalo quando l'utente chiede di creare/illustrare/generare un'immagine (logo, mockup, illustrazione, asset grafico). Il modello image-gen e' scelto dal sistema (purpose generate_image): non specificare nomi modello. Ritorna image_path (relativo alla root), model_used e provider_used.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "prompt": {"type": "string", "description": "Descrizione testuale dell'immagine da generare. Obbligatorio."},
+        "size": {"type": "string", "description": "Dimensione richiesta (opzionale). Valori tipici: '1024x1024', '1792x1024', '1024x1792'. Se omesso si usa il default del provider.", "enum": ["1024x1024", "1792x1024", "1024x1792"]},
+        "filename": {"type": "string", "description": "Nome file desiderato senza percorso (opzionale): viene salvato in .nexus/generated/ con estensione .png. Se omesso si genera un nome timestampato."}
+      },
+      "required": ["prompt"]
+    }
+  },
+  {
     "name": "nexus_visual_compare",
     "description": "Confronta screenshot dell'app locale con design Figma via vision model. Ritorna similarity_score (0-100), differences[], screenshot_path. Usa per iterare layout/stile fino a soglia (default 85).",
     "input_schema": {

@@ -12,8 +12,8 @@ use super::semantic_tools::{
 };
 use super::{
     archive_tools, attachment_inspector, attachments, command, dev_diagnostics, dispatcher,
-    document_tools, figma_tools, files, git, knowledge, ports, project_db_query, rag_search,
-    sandbox, scaffold_verifier, service, shadcn_setup, subagent_native, testing, todos,
+    document_tools, figma_tools, files, git, image_tools, knowledge, ports, project_db_query,
+    rag_search, sandbox, scaffold_verifier, service, shadcn_setup, subagent_native, testing, todos,
     tool_not_found, vision_tools, visual_compare, AgentToolContext,
 };
 
@@ -178,6 +178,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_describe_image_attachment" => {
             vision_tools::tool_nexus_describe_image_attachment(ctx, input).await
         }
+        // PR6b-2: genera un'immagine dal prompt e la salva path-safe nel progetto.
+        "nexus_generate_image" => image_tools::tool_nexus_generate_image(ctx, input).await,
         "nexus_install_shadcn_components" => {
             shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await
         }

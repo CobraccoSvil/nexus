@@ -166,6 +166,156 @@ pub async fn gateway_vision_complete(
     })
 }
 
+// ── Image generation (delega al gateway: POST /v1/images/generations) ────────
+
+/// Corpo di `POST /v1/images/generations` (sottoinsieme usato dai tool del
+/// crate). Wire-compatibile con `GwImageRequest` di mcp-core::nexus_gateway /
+/// `ImageGenRequest` del gateway: stesso contratto serde (`model`, `prompt`,
+/// `n`, `size`, `pin_provider`, `metadata`). NON dipende da quel tipo per non
+/// introdurre un ciclo di crate (vedi nota di modulo).
+#[derive(Serialize)]
+struct GwImageRequestBody {
+    model: String,
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
+    /// Pin esplicito del provider deciso a monte (routing per capability nel
+    /// purpose `generate_image`): il gateway esegue ESATTAMENTE quel provider
+    /// senza secondo routing (parita' con `gateway_vision_complete`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin_provider: Option<String>,
+    metadata: GwMetadata,
+}
+
+/// Una immagine generata, come la riporta il gateway. Deserializzazione
+/// tollerante: almeno uno tra `b64_json` e `url` e' valorizzato.
+#[derive(Deserialize, Default)]
+struct GwGeneratedImageBody {
+    #[serde(default)]
+    b64_json: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    mime: Option<String>,
+}
+
+/// Risposta di `POST /v1/images/generations` (solo i campi consumati dal tool).
+#[derive(Deserialize)]
+struct GwImageResponseBody {
+    #[serde(default)]
+    images: Vec<GwGeneratedImageBody>,
+    #[serde(default)]
+    model_used: String,
+    #[serde(default)]
+    provider_used: String,
+}
+
+/// Esito di una generazione immagine al gateway: la prima immagine prodotta
+/// (base64 inline) + l'etichetta provider/model realmente eseguita.
+pub struct GwImageOut {
+    /// Base64 (`b64_json`) della prima immagine. `None` se il provider ha
+    /// risposto solo con una `url` temporanea (il chiamante non puo' salvarla
+    /// path-safe: errore esplicito a monte).
+    pub b64_json: Option<String>,
+    /// URL temporanea della prima immagine, se il provider non ha inviato il
+    /// base64 inline. Riportata per trasparenza al modello agente.
+    pub url: Option<String>,
+    /// MIME dichiarato dal provider (es. `image/png`), se presente.
+    pub mime: Option<String>,
+    /// Etichetta `provider/model` realmente eseguita dal gateway.
+    pub model_used: String,
+}
+
+/// Genera un'immagine via il gateway pinnando il provider deciso a monte dal
+/// purpose `generate_image` (regola G: provider/model gia' risolti, nessun
+/// modello hardcoded qui). Gemella di [`gateway_vision_complete`]: riusa la
+/// risoluzione porta/token del crate (regola L, niente routing duplicato) e
+/// rigira l'errore HTTP al chiamante (regola H: niente fallback inventato; se
+/// il provider non genera immagini il gateway risponde 5xx col motivo).
+///
+/// - `provider`/`model`: risolti dal purpose via routing.
+/// - `size`: dimensione richiesta (es. `1024x1024`), opzionale.
+/// - `feature`: etichetta di tracciamento (di norma il nome del purpose).
+pub async fn gateway_image_generate(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    prompt: &str,
+    size: Option<String>,
+    feature: &str,
+) -> Result<GwImageOut, String> {
+    let base_url = resolve_gateway_url(db).await;
+    let token = resolve_gateway_token();
+
+    let body = GwImageRequestBody {
+        model: model.to_string(),
+        prompt: prompt.to_string(),
+        // Una sola immagine: il tool salva un file per chiamata.
+        n: Some(1),
+        size,
+        pin_provider: Some(provider.to_string()),
+        metadata: GwMetadata {
+            feature: feature.to_string(),
+            ..Default::default()
+        },
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+
+    let resp = client
+        .post(format!("{base_url}/v1/images/generations"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "gateway LLM irraggiungibile ({base_url}): {e}. \
+                 Verifica che il nexus-gateway sia attivo."
+            )
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "gateway /v1/images/generations ha risposto HTTP {} ({provider}/{model}): {detail}",
+            status.as_u16()
+        ));
+    }
+
+    let parsed: GwImageResponseBody = resp
+        .json()
+        .await
+        .map_err(|e| format!("risposta gateway image-gen non valida: {e}"))?;
+
+    let first = parsed
+        .images
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("il gateway non ha restituito immagini ({provider}/{model})"))?;
+
+    let model_used = if parsed.model_used.is_empty() {
+        format!("{provider}/{model}")
+    } else if parsed.provider_used.is_empty() {
+        parsed.model_used
+    } else {
+        format!("{}/{}", parsed.provider_used, parsed.model_used)
+    };
+
+    Ok(GwImageOut {
+        b64_json: first.b64_json,
+        url: first.url,
+        mime: first.mime,
+        model_used,
+    })
+}
+
 // ── Batch API (delega al gateway: POST /v1/batch + GET stato/risultati) ──────
 
 /// Singola richiesta di un batch: `custom_id` + system/user prompt risolti dal

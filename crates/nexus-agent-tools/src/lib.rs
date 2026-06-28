@@ -23,6 +23,7 @@ pub mod document_tools;
 pub mod figma_tools;
 pub mod gateway_client;
 pub mod git;
+pub mod image_tools;
 pub mod monitor;
 pub mod profile_tools;
 pub mod quality_tools;
