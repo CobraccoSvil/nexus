@@ -1366,6 +1366,19 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_generate_video",
+    "description": "Genera un video dal prompt testuale (text-to-video) e lo salva nel progetto sotto .nexus/generated/<nome>.mp4. Usalo quando l'utente chiede di creare/generare un video, una clip, un'animazione o un filmato da una descrizione. Il modello video-gen e' scelto dal sistema (purpose generate_video): non specificare nomi modello. La generazione e' asincrona e puo' richiedere minuti. Ritorna video_path (relativo alla root), model_used e provider_used.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "prompt": {"type": "string", "description": "Descrizione testuale del video da generare. Obbligatorio."},
+        "duration_seconds": {"type": "integer", "description": "Durata richiesta del video in secondi (opzionale). Se omessa si usa il default del provider."},
+        "filename": {"type": "string", "description": "Nome file desiderato senza percorso (opzionale): viene salvato in .nexus/generated/ con estensione .mp4. Se omesso si genera un nome timestampato."}
+      },
+      "required": ["prompt"]
+    }
+  },
+  {
     "name": "nexus_visual_compare",
     "description": "Confronta screenshot dell'app locale con design Figma via vision model. Ritorna similarity_score (0-100), differences[], screenshot_path. Usa per iterare layout/stile fino a soglia (default 85).",
     "input_schema": {

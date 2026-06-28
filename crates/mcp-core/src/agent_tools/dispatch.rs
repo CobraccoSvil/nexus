@@ -14,7 +14,7 @@ use super::{
     archive_tools, attachment_inspector, attachments, audio_tools, command, dev_diagnostics,
     dispatcher, document_tools, figma_tools, files, git, image_tools, knowledge, ports,
     project_db_query, rag_search, sandbox, scaffold_verifier, service, shadcn_setup,
-    subagent_native, testing, todos, tool_not_found, vision_tools, visual_compare,
+    subagent_native, testing, todos, tool_not_found, video_tools, vision_tools, visual_compare,
     AgentToolContext,
 };
 
@@ -185,6 +185,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_transcribe_audio" => audio_tools::tool_nexus_transcribe_audio(ctx, input).await,
         // PR6d: sintetizza un testo in audio (text-to-speech) e lo salva nel progetto.
         "nexus_text_to_speech" => audio_tools::tool_nexus_text_to_speech(ctx, input).await,
+        // PR6e: genera un video dal prompt (text-to-video, Veo async) e lo salva nel progetto.
+        "nexus_generate_video" => video_tools::tool_nexus_generate_video(ctx, input).await,
         "nexus_install_shadcn_components" => {
             shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await
         }

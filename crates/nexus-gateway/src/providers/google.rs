@@ -33,7 +33,7 @@ use crate::provider::{ChunkStream, LlmProvider};
 use crate::types::{
     GeneratedImage, ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk,
     LlmToolCall, LlmUsage, MessageContent, SensitivityTier, ToolCallDelta, ToolCallDeltaFunction,
-    ToolFunctionCall,
+    ToolFunctionCall, VideoGenRequest, VideoGenResponse,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -63,6 +63,21 @@ const THINKING_BUDGET_FLOOR: u32 = 128;
 
 /// TTL della cache settings (60s, come gli altri provider).
 const SETTINGS_TTL: Duration = Duration::from_secs(60);
+
+/// Chiave settings (regola G) del timeout del poll-loop video-gen, in secondi.
+/// Letta dal DB (mig 0482): oltre questo tempo il poll-loop si interrompe con
+/// errore esplicito (regola H: niente attesa infinita).
+const VIDEO_POLL_TIMEOUT_SETTING: &str = "media.video.poll_timeout_s";
+
+/// Timeout del poll-loop video usato SOLO se il setting e' illeggibile dal DB
+/// (fallback graceful documentato, regola G/H). Allineato al default '300' della
+/// mig 0482; non e' un "magic default" di routing.
+const VIDEO_POLL_TIMEOUT_DB_DOWN_FALLBACK: u64 = 300;
+
+/// Intervallo tra due GET di poll dell'operation long-running Veo (~5s). Non e'
+/// configurabile: e' un dettaglio di cortesia verso l'API, non una policy di
+/// business. Il LIMITE complessivo (timeout) e' invece DB-driven.
+const VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Location Vertex usata se `google_vertex_location` e' assente in DB. Parita'
 /// col brain (`google_provider.py` ~97: default "europe-west4"). NON e' un
@@ -162,6 +177,21 @@ impl GoogleProvider {
         let budget = parsed.unwrap_or(THINKING_BUDGET_DB_DOWN_FALLBACK);
         self.thinking_budget.insert((), budget);
         budget
+    }
+
+    /// Timeout del poll-loop video-gen dai settings (regola G), in secondi. Se il
+    /// DB e' irraggiungibile o la chiave assente, ricade sul fallback documentato
+    /// (regola H: il LIMITE esiste sempre, mai attesa infinita). Non cachato: e'
+    /// letto una sola volta per richiesta (le video-gen sono rare).
+    async fn configured_video_poll_timeout_secs(&self) -> u64 {
+        let Some(db) = self.db.as_ref() else {
+            return VIDEO_POLL_TIMEOUT_DB_DOWN_FALLBACK;
+        };
+        nexus_auth::get_setting(db, VIDEO_POLL_TIMEOUT_SETTING)
+            .await
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(VIDEO_POLL_TIMEOUT_DB_DOWN_FALLBACK)
     }
 
     /// Risolve il backend Google dai settings (regola G), con cache TTL 60s.
@@ -672,6 +702,105 @@ impl LlmProvider for GoogleProvider {
         let latency_ms = start.elapsed().as_millis() as u64;
         Ok(from_predict_response(parsed, req.model.clone(), latency_ms))
     }
+
+    fn supports_video_gen(&self) -> bool {
+        true
+    }
+
+    /// Genera un video con Veo via `:predictLongRunning` (ASYNC). A differenza
+    /// dell'image-gen (`:predict` sincrono) il flusso e' a tre fasi:
+    ///   1. START: POST `:predictLongRunning` -> ritorna un `operation name`;
+    ///   2. POLL: GET `{operation_name}` in loop ogni ~5s finche' `done:true`
+    ///      (timeout DB-driven, regola H: niente attesa infinita);
+    ///   3. ESTRAZIONE: dalla `response` dell'operation prende il primo video
+    ///      (`bytesBase64Encoded` inline, altrimenti `gcsUri` come URL).
+    ///
+    /// Backend: SOLO Vertex (`:predictLongRunning` e' un'azione aiplatform). Il
+    /// backend Gemini API-key NON espone Veo via questo dialetto -> bail esplicito
+    /// (regola H: errore onesto, niente fallback al dialetto sbagliato). Riusa
+    /// `resolved_backend()` + `vertex_action_endpoint` + `VertexAuth` (regola L).
+    /// Regola G: il `model` arriva dal chiamante.
+    async fn generate_video(&self, req: &VideoGenRequest) -> anyhow::Result<VideoGenResponse> {
+        let backend = self.resolved_backend().await?;
+        let (project, location, auth) = match backend.as_ref() {
+            GoogleBackend::Vertex {
+                project,
+                location,
+                auth,
+                ..
+            } => (project, location, auth),
+            GoogleBackend::Gemini => anyhow::bail!(
+                "video-generation (Veo) supportata solo dal backend Vertex; \
+                 imposta google_provider_backend='vertex' nei settings"
+            ),
+        };
+
+        let start = Instant::now();
+        let poll_timeout = Duration::from_secs(self.configured_video_poll_timeout_secs().await);
+
+        // 1. START: :predictLongRunning -> operation name.
+        let token = auth.access_token().await?;
+        let body = build_predict_long_running_request(&req.prompt, req.duration_seconds);
+        let start_url = vertex_action_endpoint(project, location, &req.model, "predictLongRunning");
+        let resp = self
+            .http
+            .post(start_url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Regola F: body d'errore propagato al caller (cooldown lo classifica),
+            // non loggato qui in chiaro.
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+        }
+        let start_parsed: LongRunningStartResponse = resp.json().await?;
+        let operation_name = start_parsed.name.filter(|s| !s.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(":predictLongRunning non ha restituito un operation name")
+        })?;
+
+        // 2. POLL: GET {operation_name} finche' done o timeout (regola H).
+        let poll_url = format!(
+            "https://{location}-aiplatform.googleapis.com/v1/{operation_name}"
+        );
+        loop {
+            if start.elapsed() >= poll_timeout {
+                anyhow::bail!(
+                    "video-generation: timeout dopo {}s in attesa dell'operation Veo (setting {})",
+                    poll_timeout.as_secs(),
+                    VIDEO_POLL_TIMEOUT_SETTING
+                );
+            }
+            tokio::time::sleep(VIDEO_POLL_INTERVAL).await;
+
+            // Token rinfrescato ad ogni giro (la cache interna evita refresh inutili):
+            // i poll lunghi possono superare la scadenza del token.
+            let poll_token = auth.access_token().await?;
+            let poll_resp = self.http.get(&poll_url).bearer_auth(&poll_token).send().await?;
+            let poll_status = poll_resp.status();
+            if !poll_status.is_success() {
+                let text = poll_resp.text().await.unwrap_or_default();
+                anyhow::bail!("google HTTP {} (poll): {}", poll_status.as_u16(), text);
+            }
+            let op: LongRunningOperation = poll_resp.json().await?;
+            match parse_operation_response(op)? {
+                OperationOutcome::Pending => continue,
+                OperationOutcome::Done(video) => {
+                    let latency_ms = start.elapsed().as_millis() as u64;
+                    return Ok(VideoGenResponse {
+                        video_base64: video.video_base64,
+                        url: video.url,
+                        mime: video.mime,
+                        model_used: req.model.clone(),
+                        provider_used: "google".to_string(),
+                        latency_ms,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Costruisce il corpo `:predict` per Imagen: `{instances:[{prompt}], parameters:{sampleCount}}`.
@@ -711,6 +840,84 @@ fn from_predict_response(
         provider_used: "google".to_string(),
         latency_ms,
     }
+}
+
+/// Costruisce il corpo `:predictLongRunning` per Veo: `{instances:[{prompt}],
+/// parameters:{sampleCount:1, durationSeconds?}}`. Funzione PURA (testabile senza
+/// rete). `durationSeconds` omesso quando `duration_seconds` e' assente (default
+/// lato API). `sampleCount` sempre 1: il tool salva un file per chiamata.
+fn build_predict_long_running_request(
+    prompt: &str,
+    duration_seconds: Option<u32>,
+) -> PredictLongRunningRequest {
+    PredictLongRunningRequest {
+        instances: vec![PredictInstance {
+            prompt: prompt.to_string(),
+        }],
+        parameters: PredictVideoParameters {
+            sample_count: 1,
+            duration_seconds,
+        },
+    }
+}
+
+/// Video estratto dalla `response` di una operation Veo conclusa.
+#[derive(Debug)]
+struct ParsedVideo {
+    video_base64: Option<String>,
+    url: Option<String>,
+    mime: String,
+}
+
+/// Esito del parsing di un giro di poll dell'operation long-running.
+#[derive(Debug)]
+enum OperationOutcome {
+    /// L'operation non e' ancora conclusa (`done` assente/false): continua il poll.
+    Pending,
+    /// L'operation e' conclusa con successo: il video estratto.
+    Done(ParsedVideo),
+}
+
+/// Interpreta una [`LongRunningOperation`] (un giro di poll). Funzione PURA
+/// (testabile senza rete):
+///   - `done != true` -> [`OperationOutcome::Pending`] (continua il poll);
+///   - `error` valorizzato -> `Err` esplicito (regola H: l'errore dell'operation
+///     risale onestamente, niente video vuoto);
+///   - `done == true` senza error -> estrae il primo video dalla `response`
+///     (`bytesBase64Encoded` inline, altrimenti `gcsUri`), `Err` se nessuno dei due.
+fn parse_operation_response(op: LongRunningOperation) -> anyhow::Result<OperationOutcome> {
+    if let Some(err) = op.error {
+        let code = err.code.unwrap_or_default();
+        let message = err.message.unwrap_or_default();
+        anyhow::bail!("operation Veo fallita (code {code}): {message}");
+    }
+    if op.done != Some(true) {
+        return Ok(OperationOutcome::Pending);
+    }
+    let response = op
+        .response
+        .ok_or_else(|| anyhow::anyhow!("operation Veo conclusa ma senza campo 'response'"))?;
+    let first = response
+        .videos
+        .into_iter()
+        .find(|v| {
+            v.bytes_base64_encoded
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+                || v.gcs_uri.as_deref().is_some_and(|s| !s.is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("operation Veo conclusa ma senza video (ne' bytes ne' gcsUri)")
+        })?;
+    let mime = first
+        .mime_type
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "video/mp4".to_string());
+    Ok(OperationOutcome::Done(ParsedVideo {
+        video_base64: first.bytes_base64_encoded.filter(|s| !s.is_empty()),
+        url: first.gcs_uri.filter(|s| !s.is_empty()),
+        mime,
+    }))
 }
 
 /// Costruisce la lista ORDINATA di region candidate per Vertex (mig 0476) dal
@@ -1727,6 +1934,71 @@ struct PredictPrediction {
     mime_type: Option<String>,
 }
 
+// --- Video generation Veo (`:predictLongRunning` + poll) -------------------
+
+/// Corpo della richiesta `:predictLongRunning` Veo. Riusa [`PredictInstance`]
+/// (stesso `{prompt}` dell'image-gen). `parameters` sempre presente (almeno
+/// `sampleCount`).
+#[derive(Debug, Serialize)]
+struct PredictLongRunningRequest {
+    instances: Vec<PredictInstance>,
+    parameters: PredictVideoParameters,
+}
+
+#[derive(Debug, Serialize)]
+struct PredictVideoParameters {
+    #[serde(rename = "sampleCount")]
+    sample_count: u32,
+    #[serde(rename = "durationSeconds", skip_serializing_if = "Option::is_none")]
+    duration_seconds: Option<u32>,
+}
+
+/// Risposta di START `:predictLongRunning`: `{ "name": "projects/.../operations/<id>" }`.
+#[derive(Debug, Deserialize)]
+struct LongRunningStartResponse {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Risposta di POLL `GET {operation_name}`: `{ "done": bool, "response": {...},
+/// "error": {...} }`. `done` assente => operation ancora in corso.
+#[derive(Debug, Deserialize)]
+struct LongRunningOperation {
+    #[serde(default)]
+    done: Option<bool>,
+    #[serde(default)]
+    response: Option<LongRunningVideoResponse>,
+    #[serde(default)]
+    error: Option<LongRunningError>,
+}
+
+/// `response` di una operation Veo conclusa. Veo espone i video sotto
+/// `videos[]` (alcune versioni usano `generatedSamples[]`/`predictions[]`): per
+/// l'MVP leggiamo `videos[]`, la forma documentata della Vertex Veo API.
+#[derive(Debug, Deserialize)]
+struct LongRunningVideoResponse {
+    #[serde(default)]
+    videos: Vec<LongRunningVideo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LongRunningVideo {
+    #[serde(rename = "bytesBase64Encoded", default)]
+    bytes_base64_encoded: Option<String>,
+    #[serde(rename = "gcsUri", default)]
+    gcs_uri: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LongRunningError {
+    #[serde(default)]
+    code: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1852,6 +2124,91 @@ mod tests {
         assert_eq!(out.images.len(), 1);
         assert_eq!(out.images[0].b64_json.as_deref(), Some("AAAA"));
         assert_eq!(out.images[0].mime.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn predict_long_running_request_veo_instances_e_parameters() {
+        let body = build_predict_long_running_request("un drone sul mare", Some(8));
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["instances"][0]["prompt"], "un drone sul mare");
+        assert_eq!(json["parameters"]["sampleCount"], 1);
+        assert_eq!(json["parameters"]["durationSeconds"], 8);
+        // duration assente -> durationSeconds omesso, sampleCount comunque presente.
+        let body2 = build_predict_long_running_request("una citta'", None);
+        let json2 = serde_json::to_value(&body2).unwrap();
+        assert_eq!(json2["parameters"]["sampleCount"], 1);
+        assert!(json2["parameters"].get("durationSeconds").is_none());
+    }
+
+    #[test]
+    fn parse_operation_pending_quando_done_assente_o_false() {
+        // done assente -> Pending.
+        let op: LongRunningOperation = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(matches!(
+            parse_operation_response(op).unwrap(),
+            OperationOutcome::Pending
+        ));
+        // done:false -> Pending.
+        let op2: LongRunningOperation = serde_json::from_str(r#"{"done": false}"#).unwrap();
+        assert!(matches!(
+            parse_operation_response(op2).unwrap(),
+            OperationOutcome::Pending
+        ));
+    }
+
+    #[test]
+    fn parse_operation_done_estrae_bytes_e_mime() {
+        let raw = r#"{
+            "done": true,
+            "response": {
+                "videos": [
+                    {"bytesBase64Encoded": "QUJD", "mimeType": "video/mp4"}
+                ]
+            }
+        }"#;
+        let op: LongRunningOperation = serde_json::from_str(raw).unwrap();
+        let OperationOutcome::Done(video) = parse_operation_response(op).unwrap() else {
+            panic!("attesa operation conclusa");
+        };
+        assert_eq!(video.video_base64.as_deref(), Some("QUJD"));
+        assert_eq!(video.url, None);
+        assert_eq!(video.mime, "video/mp4");
+    }
+
+    #[test]
+    fn parse_operation_done_gcs_uri_senza_bytes() {
+        // Solo gcsUri (niente bytes inline): url valorizzata, mime di default.
+        let raw = r#"{
+            "done": true,
+            "response": {
+                "videos": [
+                    {"gcsUri": "gs://bucket/out.mp4"}
+                ]
+            }
+        }"#;
+        let op: LongRunningOperation = serde_json::from_str(raw).unwrap();
+        let OperationOutcome::Done(video) = parse_operation_response(op).unwrap() else {
+            panic!("attesa operation conclusa");
+        };
+        assert_eq!(video.video_base64, None);
+        assert_eq!(video.url.as_deref(), Some("gs://bucket/out.mp4"));
+        assert_eq!(video.mime, "video/mp4");
+    }
+
+    #[test]
+    fn parse_operation_error_propaga_errore_esplicito() {
+        let raw = r#"{"error": {"code": 7, "message": "permission denied"}}"#;
+        let op: LongRunningOperation = serde_json::from_str(raw).unwrap();
+        let err = parse_operation_response(op).unwrap_err().to_string();
+        assert!(err.contains("permission denied"), "err = {err}");
+        assert!(err.contains("code 7"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_operation_done_senza_video_e_errore() {
+        let raw = r#"{"done": true, "response": {"videos": []}}"#;
+        let op: LongRunningOperation = serde_json::from_str(raw).unwrap();
+        assert!(parse_operation_response(op).is_err());
     }
 
     #[test]

@@ -44,7 +44,7 @@ use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
 use crate::types::{
     ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, RequestMetadata, TranscribeRequest,
-    TranscribeResponse, TtsRequest, TtsResponse,
+    TranscribeResponse, TtsRequest, TtsResponse, VideoGenRequest, VideoGenResponse,
 };
 
 use super::billing::{enforce_quota, record_usage_to_ledger, QuotaExceeded};
@@ -756,6 +756,149 @@ fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
     }
 }
 
+// ── Video generation ─────────────────────────────────────────────────────────
+
+/// `POST /v1/videos` (auth richiesta): genera un video con il provider scelto.
+/// Risolve il provider (pin esplicito oppure il primo sano che dichiara
+/// `supports_video_gen()`), enforce quota PRIMA della chiamata, delega a
+/// `provider.generate_video`. Ritorna [`VideoGenResponse`].
+///
+/// DIFFERENZA CHIAVE rispetto a image/audio: il backend Veo e' ASYNC
+/// long-running. Il poll-loop e' incapsulato DENTRO `provider.generate_video`
+/// (start + poll con timeout DB-driven, regola H), quindi questo handler resta
+/// sincrono per il client: ritorna solo quando il video e' pronto o al timeout.
+///
+/// Routing: volutamente SEMPLICE (il routing per-capability fine vive in
+/// mcp-core, regola L), gemello di [`generate_image`]: con `pin_provider` esegue
+/// quel provider; senza pin sceglie il primo provider video-capable non in
+/// cooldown. Nessun fallback cross-provider in questo PR.
+///
+/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
+/// non si applica al video-gen, il cui costo e' al secondo di video (non
+/// riportato in token dal provider, non censito in `ai_price_catalog`). Per non
+/// INVENTARE costi (regola G/H: niente fallback nascosto), in questo PR il ledger
+/// NON viene scritto per i video, allineato al pattern image-gen / audio. TODO PR
+/// successiva: costo per-secondo-video in `ai_price_catalog`.
+pub async fn generate_video(
+    State(state): State<AppState>,
+    Json(body): Json<VideoGenRequest>,
+) -> Response {
+    if body.prompt.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "prompt required" })),
+        )
+            .into_response();
+    }
+    match run_generate_video(&state, &body).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Pipeline video-gen: risolve provider video-capable, enforce quota, genera
+/// (il poll-loop async vive dentro `provider.generate_video`).
+async fn run_generate_video(
+    state: &AppState,
+    body: &VideoGenRequest,
+) -> Result<VideoGenResponse, PipelineError> {
+    let providers = state.runtime_snapshot().await.providers;
+
+    // Risoluzione provider (punto unico testabile, regola L): pin esplicito o
+    // primo video-capable non in cooldown.
+    let provider =
+        select_video_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
+    let model = strip_model_prefix(&body.model);
+
+    // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
+    // provider+model, regola L): stima dal prompt come singolo messaggio user.
+    let quota_req = video_gen_to_llm_request(body, &model);
+    enforce_quota(&state.db, &quota_req, provider.name(), &model)
+        .await
+        .map_err(|e| {
+            if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
+                PipelineError::quota(&q.scope, &q.reason)
+            } else {
+                PipelineError::provider(format!("quota check fallito: {e}"))
+            }
+        })?;
+
+    // Richiesta col modello reale risolto per il provider.
+    let mut req = body.clone();
+    req.model = model;
+
+    provider
+        .generate_video(&req)
+        .await
+        .map_err(|e| PipelineError::provider(e.to_string()))
+}
+
+/// Seleziona il provider per il video-gen (punto unico, regola L). Gemello di
+/// [`select_image_provider`]: con `pin` ESATTAMENTE quel provider, che DEVE
+/// essere configurato e video-capable (regola H: errore esplicito, niente delega
+/// a chi non genera video, niente ripiego silenzioso). Senza pin: il PRIMO
+/// provider video-capable non in cooldown. Nessun fallback cross-provider qui.
+fn select_video_provider(
+    providers: &[Arc<dyn LlmProvider>],
+    pin: Option<&str>,
+    cooldown: &CooldownManager,
+) -> Result<Arc<dyn LlmProvider>, PipelineError> {
+    if let Some(pin) = pin {
+        let Some(p) = providers.iter().find(|p| p.name() == pin) else {
+            return Err(PipelineError::provider(format!(
+                "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
+            )));
+        };
+        if !p.supports_video_gen() {
+            return Err(PipelineError::provider(format!(
+                "provider \"{pin}\" non supporta la generazione di video"
+            )));
+        }
+        return Ok(p.clone());
+    }
+    providers
+        .iter()
+        .find(|p| p.supports_video_gen() && !cooldown.is_in_cooldown(p.name()))
+        .cloned()
+        .ok_or_else(|| {
+            PipelineError::provider("nessun provider sano supporta la generazione di video")
+        })
+}
+
+/// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` da una
+/// [`VideoGenRequest`]: il prompt diventa l'unico messaggio user (stima char/4
+/// del punto unico billing). Gemella di [`image_gen_to_llm_request`]: niente
+/// costo inventato (regola G/H), il ledger non viene scritto a valle.
+fn video_gen_to_llm_request(body: &VideoGenRequest, model: &str) -> LlmRequest {
+    use crate::types::{LlmMessage, MessageContent};
+    LlmRequest {
+        model: model.to_string(),
+        messages: vec![LlmMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text(body.prompt.clone()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+        }],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        response_format: None,
+        stream: None,
+        thinking: None,
+        tool_choice: None,
+        pin_provider: body.pin_provider.clone(),
+        metadata: RequestMetadata {
+            tenant_id: body.metadata.tenant_id.clone(),
+            user_id: body.metadata.user_id.clone(),
+            request_id: body.metadata.request_id.clone(),
+            sensitivity_tier: body.metadata.sensitivity_tier,
+            feature: body.metadata.feature.clone(),
+        },
+    }
+}
+
 // ── Audio transcription ──────────────────────────────────────────────────────
 
 /// `POST /v1/audio/transcriptions` (auth richiesta): trascrive un audio col
@@ -1353,6 +1496,8 @@ mod tests {
         audio_capable: bool,
         /// Se il provider dichiara `supports_audio_out()` (default `false`).
         audio_out_capable: bool,
+        /// Se il provider dichiara `supports_video_gen()` (default `false`).
+        video_capable: bool,
     }
 
     impl FakeProvider {
@@ -1365,6 +1510,7 @@ mod tests {
                 image_capable: false,
                 audio_capable: false,
                 audio_out_capable: false,
+                video_capable: false,
             })
         }
 
@@ -1378,6 +1524,7 @@ mod tests {
                 image_capable: false,
                 audio_capable: false,
                 audio_out_capable: false,
+                video_capable: false,
             })
         }
 
@@ -1391,6 +1538,7 @@ mod tests {
                 image_capable: true,
                 audio_capable: false,
                 audio_out_capable: false,
+                video_capable: false,
             })
         }
 
@@ -1404,6 +1552,7 @@ mod tests {
                 image_capable: false,
                 audio_capable: true,
                 audio_out_capable: false,
+                video_capable: false,
             })
         }
 
@@ -1417,6 +1566,21 @@ mod tests {
                 image_capable: false,
                 audio_capable: false,
                 audio_out_capable: true,
+                video_capable: false,
+            })
+        }
+
+        /// Variante video-capable per i test di routing video-gen.
+        fn video(name: &str, behaviour: Behaviour) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                behaviour,
+                calls: AtomicUsize::new(0),
+                models_result: None,
+                image_capable: false,
+                audio_capable: false,
+                audio_out_capable: false,
+                video_capable: true,
             })
         }
     }
@@ -1523,6 +1687,26 @@ mod tests {
                 Behaviour::Ok => Ok(TtsResponse {
                     audio_base64: "QUFBQQ==".to_string(),
                     mime: "audio/mpeg".to_string(),
+                    model_used: req.model.clone(),
+                    provider_used: self.name.clone(),
+                    latency_ms: 0,
+                }),
+                Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+            }
+        }
+        fn supports_video_gen(&self) -> bool {
+            self.video_capable
+        }
+        async fn generate_video(
+            &self,
+            req: &VideoGenRequest,
+        ) -> anyhow::Result<VideoGenResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behaviour {
+                Behaviour::Ok => Ok(VideoGenResponse {
+                    video_base64: Some("QUFBQQ==".to_string()),
+                    url: None,
+                    mime: "video/mp4".to_string(),
                     model_used: req.model.clone(),
                     provider_used: self.name.clone(),
                     latency_ms: 0,
@@ -2004,5 +2188,91 @@ mod tests {
         assert_eq!(out.model_used, "gpt-4o-mini-tts");
         assert_eq!(out.mime, "audio/mpeg");
         assert!(!out.audio_base64.is_empty());
+    }
+
+    // ── Routing video-gen ────────────────────────────────────────────────────
+
+    #[test]
+    fn select_video_provider_senza_pin_sceglie_primo_video_capable_sano() {
+        // openai NON video-capable, google video-capable: vince google.
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let google: Arc<dyn LlmProvider> = FakeProvider::video("google", Behaviour::Ok);
+        let built = vec![openai, google];
+        let cooldown = CooldownManager::new();
+        let p = select_video_provider(&built, None, &cooldown).unwrap();
+        assert_eq!(p.name(), "google");
+    }
+
+    #[test]
+    fn select_video_provider_senza_pin_salta_quello_in_cooldown() {
+        let google: Arc<dyn LlmProvider> = FakeProvider::video("google", Behaviour::Ok);
+        let other: Arc<dyn LlmProvider> = FakeProvider::video("other", Behaviour::Ok);
+        let built = vec![google, other];
+        let cooldown = CooldownManager::new();
+        cooldown.mark_billing("google", Some("credit balance too low".into()));
+        // google video-capable ma in cooldown -> vince other.
+        let p = select_video_provider(&built, None, &cooldown).unwrap();
+        assert_eq!(p.name(), "other");
+    }
+
+    #[test]
+    fn select_video_provider_senza_capable_e_errore() {
+        // Nessun provider video-capable -> errore esplicito (regola H).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let built = vec![openai];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_video_provider(&built, None, &cooldown) else {
+            panic!("senza provider video-capable deve fallire");
+        };
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("nessun provider"));
+    }
+
+    #[test]
+    fn select_video_provider_pin_non_capable_e_errore_non_fallback() {
+        // Pin su openai (non video-capable) anche se google capable e' presente:
+        // errore esplicito, niente ripiego su google (regola G/H).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let google: Arc<dyn LlmProvider> = FakeProvider::video("google", Behaviour::Ok);
+        let built = vec![openai, google];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_video_provider(&built, Some("openai"), &cooldown) else {
+            panic!("pin su provider non video-capable deve fallire");
+        };
+        assert!(err.message.contains("non supporta"));
+    }
+
+    #[test]
+    fn select_video_provider_pin_non_configurato_e_errore() {
+        let google: Arc<dyn LlmProvider> = FakeProvider::video("google", Behaviour::Ok);
+        let built = vec![google];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_video_provider(&built, Some("openai"), &cooldown) else {
+            panic!("pin su provider non configurato deve fallire");
+        };
+        assert!(err.message.contains("openai"));
+    }
+
+    #[tokio::test]
+    async fn fake_provider_genera_video() {
+        let google = FakeProvider::video("google", Behaviour::Ok);
+        let req = VideoGenRequest {
+            model: "veo-3.1-generate-001".into(),
+            prompt: "un drone sul mare".into(),
+            duration_seconds: Some(8),
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "video".into(),
+            },
+        };
+        let out = google.generate_video(&req).await.unwrap();
+        assert_eq!(out.provider_used, "google");
+        assert_eq!(out.model_used, "veo-3.1-generate-001");
+        assert_eq!(out.mime, "video/mp4");
+        assert!(out.video_base64.is_some());
     }
 }

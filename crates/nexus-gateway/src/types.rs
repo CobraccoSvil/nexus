@@ -303,6 +303,55 @@ pub struct ImageGenResponse {
     pub latency_ms: u64,
 }
 
+/// Richiesta di generazione video (`VideoGenRequest`, text-to-video). Speculare a
+/// [`ImageGenRequest`] ma per il task video-gen: niente messaggi/tool, solo un
+/// `prompt` testuale + la durata opzionale. Regola G: il `model` arriva sempre
+/// dal chiamante (nessun default hardcoded). `pin_provider` ha la stessa
+/// semantica di [`ImageGenRequest::pin_provider`] (bypass routing, esecuzione di
+/// QUEL provider).
+///
+/// DIFFERENZA CHIAVE rispetto a image-gen: il backend (Vertex Veo) e' ASYNC
+/// long-running (`:predictLongRunning` -> operation -> poll). Per l'MVP il polling
+/// e' incapsulato DENTRO il gateway (richiesta/risposta sincrona per il client):
+/// l'handler fa start + poll-loop con timeout DB-driven, poi ritorna il video.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoGenRequest {
+    pub model: String,
+    pub prompt: String,
+    /// Durata richiesta del video in secondi (default lato provider se assente).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u32>,
+    /// Pin esplicito del provider da eseguire (bypass routing). Quando `Some`, il
+    /// gateway esegue ESATTAMENTE quel provider; quando `None`, sceglie il primo
+    /// provider sano che dichiara `supports_video_gen()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
+    pub metadata: RequestMetadata,
+}
+
+/// Risposta di generazione video (`VideoGenResponse`). Il provider Veo puo'
+/// restituire i byte del video inline (base64) oppure una `gcsUri` (URL Google
+/// Cloud Storage). Entrambi opzionali, almeno uno valorizzato: il chiamante che
+/// puo' salvare path-safe usa `video_base64`, altrimenti riporta la `url` con una
+/// nota (regola H: niente fetch nascosto di una URL esterna). Speculare a
+/// [`ImageGenResponse`]/[`TtsResponse`] per i campi di tracciamento.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoGenResponse {
+    /// Video codificato base64 inline (Veo `bytesBase64Encoded`). `None` quando il
+    /// provider risponde solo con una `gcsUri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_base64: Option<String>,
+    /// URL del video (Veo `gcsUri`), quando il provider non emette i byte inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// MIME del video prodotto (es. `video/mp4`): dal campo `mimeType` del
+    /// provider quando presente, altrimenti un default coerente.
+    pub mime: String,
+    pub model_used: String,
+    pub provider_used: String,
+    pub latency_ms: u64,
+}
+
 /// Richiesta di trascrizione audio (`TranscribeRequest`, speech-to-text).
 /// Speculare a [`ImageGenRequest`] ma per il task audio-in: niente messaggi/tool,
 /// solo l'audio (base64) + il modello. Regola G: il `model` arriva sempre dal

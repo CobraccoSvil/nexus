@@ -2,6 +2,14 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Margine (secondi) aggiunto al poll-timeout del gateway per calcolare il
+/// timeout HTTP della chiamata video-gen. Copre connessione, ultimo giro di poll
+/// e download del payload: garantisce che il client non stacchi PRIMA del
+/// poll-loop lato gateway (regola H). Non e' un parametro di business (il LIMITE
+/// vero e' il setting DB `media.video.poll_timeout_s`), solo una rete di sicurezza
+/// di trasporto.
+const VIDEO_HTTP_TIMEOUT_MARGIN_SECS: u64 = 30;
+
 /// HTTP client per il Nexus LLM Gateway (porta 4060).
 #[derive(Clone)]
 pub struct NexusGatewayClient {
@@ -123,6 +131,47 @@ pub struct GwGeneratedImage {
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct GwImageResponse {
     pub images: Vec<GwGeneratedImage>,
+    pub model_used: String,
+    pub provider_used: String,
+    pub latency_ms: u64,
+}
+
+/// Richiesta di generazione video al gateway (`POST /v1/videos`). Speculare a
+/// [`GwImageRequest`] ma per il task video-gen: prompt + durata opzionale.
+/// Regola G: il `model` arriva dal chiamante (nessun default hardcoded).
+///
+/// NOTA TIMEOUT: il backend Veo e' ASYNC e il gateway incapsula il poll-loop
+/// (timeout DB-driven `media.video.poll_timeout_s`). La chiamata HTTP del client
+/// verso il gateway DEVE quindi avere un timeout >= del poll-timeout, altrimenti
+/// il client stacca prima che il video sia pronto: vedi
+/// [`NexusGatewayClient::generate_video`], che usa un timeout per-richiesta
+/// dedicato anziche' quello del client condiviso (300s).
+#[allow(dead_code)]
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct GwVideoRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u32>,
+    /// Pin esplicito del provider (bypass routing nel gateway). Stessa semantica
+    /// di [`GwImageRequest::pin_provider`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
+    pub metadata: GwMetadata,
+}
+
+/// Risposta di `POST /v1/videos` del gateway. Il video e' inline in base64
+/// (`video_base64`) oppure referenziato via `url` (gcsUri) + il MIME prodotto.
+/// Vedi nota su [`GwVideoRequest`].
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct GwVideoResponse {
+    #[serde(default)]
+    pub video_base64: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub mime: String,
     pub model_used: String,
     pub provider_used: String,
     pub latency_ms: u64,
@@ -351,6 +400,51 @@ impl NexusGatewayClient {
             .map_err(|e| anyhow::anyhow!("Nexus Gateway image response parse: {e}"))
     }
 
+    /// Genera un video via gateway (`POST /v1/videos`). Speculare a
+    /// [`Self::generate_image`] ma per il backend ASYNC Veo: il gateway incapsula
+    /// il poll-loop (start + poll con timeout DB-driven). Per non staccare prima
+    /// che il video sia pronto, questa chiamata usa un timeout PER-RICHIESTA
+    /// dedicato ([`req.send().timeout()`] sovrascrive il timeout del client
+    /// condiviso, 300s) calcolato come poll-timeout + margine.
+    ///
+    /// `poll_timeout_secs`: il valore del setting `media.video.poll_timeout_s`
+    /// risolto dal chiamante (regola G: nessun default hardcoded qui; il chiamante
+    /// lo legge dal DB). Il timeout HTTP e' `poll_timeout_secs + margine`, sempre
+    /// >= del poll-loop lato gateway (regola H: il client non stacca prima).
+    ///
+    /// Pronta per il wiring: il tool agente che la consuma vive in
+    /// `nexus-agent-tools` e re-implementa il trasporto wire-compatibile.
+    #[allow(dead_code)]
+    pub async fn generate_video(
+        &self,
+        req: GwVideoRequest,
+        poll_timeout_secs: u64,
+    ) -> Result<GwVideoResponse> {
+        // Margine sul poll-loop del gateway: la connessione + l'ultimo giro di
+        // poll + il download del video non devono cadere nel timeout HTTP.
+        let http_timeout =
+            std::time::Duration::from_secs(poll_timeout_secs.saturating_add(VIDEO_HTTP_TIMEOUT_MARGIN_SECS));
+        let resp = self
+            .http
+            .post(format!("{}/v1/videos", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.service_token))
+            .timeout(http_timeout)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Nexus Gateway {status}: {body}");
+        }
+
+        resp.json::<GwVideoResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway video response parse: {e}"))
+    }
+
     /// Trascrive audio via gateway (`POST /v1/audio/transcriptions`). Speculare a
     /// [`Self::generate_image`]: stesso Bearer service token, stesso status-check
     /// con propagazione del body d'errore al caller (regola H: errore esplicito se
@@ -541,6 +635,62 @@ mod tests {
         // size None -> campo omesso.
         assert!(json.get("size").is_none());
         assert_eq!(json["pin_provider"], "openai");
+    }
+
+    #[test]
+    fn parse_video_response_dal_gateway() {
+        // Forma di POST /v1/videos: video_base64 oppure url + mime + tracciamento.
+        let raw = r#"{
+            "video_base64": "QUJD",
+            "mime": "video/mp4",
+            "model_used": "veo-3.1-generate-001",
+            "provider_used": "google",
+            "latency_ms": 42000
+        }"#;
+        let parsed: GwVideoResponse = serde_json::from_str(raw).expect("parse video response");
+        assert_eq!(parsed.provider_used, "google");
+        assert_eq!(parsed.model_used, "veo-3.1-generate-001");
+        assert_eq!(parsed.mime, "video/mp4");
+        assert_eq!(parsed.latency_ms, 42000);
+        assert_eq!(parsed.video_base64.as_deref(), Some("QUJD"));
+        assert_eq!(parsed.url, None);
+    }
+
+    #[test]
+    fn parse_video_response_gcs_uri_senza_bytes() {
+        let raw = r#"{
+            "url": "gs://bucket/out.mp4",
+            "mime": "video/mp4",
+            "model_used": "veo-3.1-generate-001",
+            "provider_used": "google",
+            "latency_ms": 50000
+        }"#;
+        let parsed: GwVideoResponse = serde_json::from_str(raw).expect("parse video response");
+        assert_eq!(parsed.video_base64, None);
+        assert_eq!(parsed.url.as_deref(), Some("gs://bucket/out.mp4"));
+    }
+
+    #[test]
+    fn video_request_serializza_campi_e_omette_opzionali() {
+        let req = GwVideoRequest {
+            model: "veo-3.1-generate-001".into(),
+            prompt: "un drone sul mare".into(),
+            duration_seconds: None,
+            pin_provider: Some("google".into()),
+            metadata: GwMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "video".into(),
+            },
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["model"], "veo-3.1-generate-001");
+        assert_eq!(json["prompt"], "un drone sul mare");
+        // duration_seconds None -> campo omesso.
+        assert!(json.get("duration_seconds").is_none());
+        assert_eq!(json["pin_provider"], "google");
     }
 
     #[test]

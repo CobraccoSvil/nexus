@@ -31,6 +31,22 @@ const GATEWAY_DEFAULT_PORT: u16 = 4060;
 /// grandi, cold start del provider).
 const GATEWAY_HTTP_TIMEOUT_SECS: u64 = 60;
 
+/// Chiave settings (regola G) del timeout del poll-loop video-gen lato gateway,
+/// in secondi. La stessa letta dal provider Google nel gateway (mig 0482): unica
+/// fonte di verita' condivisa. Il client usa questo valore per dimensionare il
+/// proprio timeout HTTP >= del poll-loop (regola H: il client non stacca prima).
+const VIDEO_POLL_TIMEOUT_SETTING: &str = "media.video.poll_timeout_s";
+
+/// Timeout del poll-loop video usato SOLO se il setting e' illeggibile dal DB
+/// (fallback graceful documentato, regola G/H). Allineato al default '300' della
+/// mig 0482.
+const VIDEO_POLL_TIMEOUT_DB_DOWN_FALLBACK: u64 = 300;
+
+/// Margine (secondi) aggiunto al poll-timeout per il timeout HTTP del client
+/// video-gen: copre connessione + ultimo poll + download del video. Garantisce
+/// che il client non stacchi PRIMA del poll-loop lato gateway (regola H).
+const VIDEO_HTTP_TIMEOUT_MARGIN_SECS: u64 = 30;
+
 /// Metadati di tracciamento/tenancy della richiesta (`RequestMetadata` del
 /// gateway). I tool interni valorizzano solo `feature`; il resto va a default
 /// (stringhe vuote, tier 0), come gli altri call site interni di mcp-core
@@ -314,6 +330,165 @@ pub async fn gateway_image_generate(
         mime: first.mime,
         model_used,
     })
+}
+
+// ── Video generation (delega al gateway: POST /v1/videos) ────────────────────
+
+/// Corpo di `POST /v1/videos` (sottoinsieme usato dai tool del crate).
+/// Wire-compatibile con `GwVideoRequest` di mcp-core::nexus_gateway /
+/// `VideoGenRequest` del gateway: stesso contratto serde (`model`, `prompt`,
+/// `duration_seconds`, `pin_provider`, `metadata`). NON dipende da quel tipo per
+/// non introdurre un ciclo di crate (vedi nota di modulo).
+#[derive(Serialize)]
+struct GwVideoRequestBody {
+    model: String,
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_seconds: Option<u32>,
+    /// Pin esplicito del provider deciso a monte (routing per capability nel
+    /// purpose `generate_video`): il gateway esegue ESATTAMENTE quel provider
+    /// senza secondo routing (parita' con `gateway_image_generate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin_provider: Option<String>,
+    metadata: GwMetadata,
+}
+
+/// Risposta di `POST /v1/videos` (solo i campi consumati dal tool).
+#[derive(Deserialize)]
+struct GwVideoResponseBody {
+    #[serde(default)]
+    video_base64: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    mime: String,
+    #[serde(default)]
+    model_used: String,
+    #[serde(default)]
+    provider_used: String,
+}
+
+/// Esito di una generazione video al gateway: il video (base64 inline) oppure la
+/// URL (gcsUri) + il MIME + l'etichetta provider/model realmente eseguita.
+pub struct GwVideoOut {
+    /// Base64 del video. `None` se il provider ha risposto solo con una `url`
+    /// (gcsUri): il chiamante non puo' salvarla path-safe, la riporta con nota.
+    pub video_base64: Option<String>,
+    /// URL del video (gcsUri), se il provider non ha inviato i byte inline.
+    pub url: Option<String>,
+    /// MIME del video prodotto (es. `video/mp4`): per scegliere l'estensione.
+    pub mime: String,
+    /// Etichetta `provider/model` realmente eseguita dal gateway.
+    pub model_used: String,
+}
+
+/// Genera un video via il gateway pinnando il provider deciso a monte dal purpose
+/// `generate_video` (regola G: provider/model gia' risolti, nessun modello
+/// hardcoded qui). Gemella di [`gateway_image_generate`] ma per il backend ASYNC
+/// Veo: il gateway incapsula il poll-loop (start + poll con timeout DB-driven).
+///
+/// TIMEOUT (regola H): il client legge il setting `media.video.poll_timeout_s` dal
+/// DB e dimensiona il proprio timeout HTTP a `poll_timeout + margine`, sempre >=
+/// del poll-loop lato gateway: cosi' il client non stacca PRIMA che il video sia
+/// pronto. Rigira l'errore HTTP al chiamante (niente fallback inventato; se il
+/// provider non genera video o il poll va in timeout il gateway risponde col motivo).
+///
+/// - `provider`/`model`: risolti dal purpose via routing.
+/// - `duration_seconds`: durata richiesta del video, opzionale.
+/// - `feature`: etichetta di tracciamento (di norma il nome del purpose).
+pub async fn gateway_generate_video(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    prompt: &str,
+    duration_seconds: Option<u32>,
+    feature: &str,
+) -> Result<GwVideoOut, String> {
+    let base_url = resolve_gateway_url(db).await;
+    let token = resolve_gateway_token();
+    let poll_timeout = resolve_video_poll_timeout(db).await;
+
+    let body = GwVideoRequestBody {
+        model: model.to_string(),
+        prompt: prompt.to_string(),
+        duration_seconds,
+        pin_provider: Some(provider.to_string()),
+        metadata: GwMetadata {
+            feature: feature.to_string(),
+            ..Default::default()
+        },
+    };
+
+    // Timeout HTTP >= poll-loop lato gateway (regola H): il client non stacca
+    // prima che il video sia pronto.
+    let http_timeout =
+        Duration::from_secs(poll_timeout.saturating_add(VIDEO_HTTP_TIMEOUT_MARGIN_SECS));
+    let client = reqwest::Client::builder()
+        .timeout(http_timeout)
+        .build()
+        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+
+    let resp = client
+        .post(format!("{base_url}/v1/videos"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "gateway LLM irraggiungibile ({base_url}): {e}. \
+                 Verifica che il nexus-gateway sia attivo."
+            )
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "gateway /v1/videos ha risposto HTTP {} ({provider}/{model}): {detail}",
+            status.as_u16()
+        ));
+    }
+
+    let parsed: GwVideoResponseBody = resp
+        .json()
+        .await
+        .map_err(|e| format!("risposta gateway video-gen non valida: {e}"))?;
+
+    let model_used = if parsed.model_used.is_empty() {
+        format!("{provider}/{model}")
+    } else if parsed.provider_used.is_empty() {
+        parsed.model_used
+    } else {
+        format!("{}/{}", parsed.provider_used, parsed.model_used)
+    };
+    let mime = if parsed.mime.is_empty() {
+        "video/mp4".to_string()
+    } else {
+        parsed.mime
+    };
+
+    Ok(GwVideoOut {
+        video_base64: parsed.video_base64,
+        url: parsed.url,
+        mime,
+        model_used,
+    })
+}
+
+/// Risolve il timeout del poll-loop video dal setting `media.video.poll_timeout_s`
+/// (mig 0482) in modo TOLLERANTE (no panic): se la lettura fallisce o il valore e'
+/// invalido ricade sul fallback documentato (regola G/H: il LIMITE esiste sempre).
+async fn resolve_video_poll_timeout(db: &PgPool) -> u64 {
+    match get_setting_checked(db, VIDEO_POLL_TIMEOUT_SETTING).await {
+        Ok(Some(raw)) => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|s| *s > 0)
+            .unwrap_or(VIDEO_POLL_TIMEOUT_DB_DOWN_FALLBACK),
+        _ => VIDEO_POLL_TIMEOUT_DB_DOWN_FALLBACK,
+    }
 }
 
 // ── Audio transcription (delega al gateway: POST /v1/audio/transcriptions) ───

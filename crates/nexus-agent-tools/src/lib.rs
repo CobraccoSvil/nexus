@@ -39,6 +39,7 @@ pub mod shadcn_setup;
 pub mod todos;
 pub mod tool_schema;
 pub mod url_scanner;
+pub mod video_tools;
 pub mod vision_tools;
 
 pub use context_core::ToolContextCore;

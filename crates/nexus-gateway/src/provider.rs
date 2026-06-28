@@ -11,7 +11,8 @@ use futures::stream::BoxStream;
 
 use crate::types::{
     ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, SensitivityTier,
-    TranscribeRequest, TranscribeResponse, TtsRequest, TtsResponse,
+    TranscribeRequest, TranscribeResponse, TtsRequest, TtsResponse, VideoGenRequest,
+    VideoGenResponse,
 };
 
 /// Stream di chunk prodotto da un provider in modalita' streaming. Ogni
@@ -115,5 +116,25 @@ pub trait LlmProvider: Send + Sync {
     /// fallisce visibilmente invece di restituire un risultato vuoto.
     async fn text_to_speech(&self, _req: &TtsRequest) -> anyhow::Result<TtsResponse> {
         anyhow::bail!("{}: text-to-speech non supportata", self.name())
+    }
+
+    /// Se il provider supporta la generazione di video (text-to-video).
+    ///
+    /// Default impl: `false`. I provider che la implementano lo sovrascrivono e
+    /// forniscono [`Self::generate_video`]. Permette al routing video-gen di
+    /// scegliere solo i provider capaci (regola H: niente delega silenziosa a un
+    /// provider che non genera video). Gemello di [`Self::supports_image_gen`].
+    fn supports_video_gen(&self) -> bool {
+        false
+    }
+
+    /// Genera un video dal `prompt`. A differenza di image/audio il backend e'
+    /// ASYNC long-running: l'implementazione incapsula start + poll-loop e ritorna
+    /// solo quando il video e' pronto (o al timeout). Default impl: errore
+    /// esplicito (regola H, come [`Self::generate_image`]): un provider che non
+    /// dichiara `supports_video_gen()` non deve mai essere chiamato; se accade,
+    /// fallisce visibilmente invece di restituire un risultato vuoto.
+    async fn generate_video(&self, _req: &VideoGenRequest) -> anyhow::Result<VideoGenResponse> {
+        anyhow::bail!("{}: video-generation non supportata", self.name())
     }
 }
