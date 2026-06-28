@@ -88,6 +88,13 @@ pub struct ProgressSignals {
     pub g1_over_cap: bool,
     /// Azione produttiva ripetuta identica oltre soglia: (label, conteggio).
     pub repeated_action: Option<(String, i64)>,
+    /// `true` se l'azione ripetuta e' un `edit_file`/`write_file` FALLITO (es.
+    /// `old_string` non corrispondente al file reale). Cambia il nudge da
+    /// generico ("cambia approccio") a SPECIFICO e attuabile: "copia l'old_string
+    /// ESATTO dall'estratto numerato gia' presente nell'errore qui sopra". Causa
+    /// radice del falso-stallo: la correzione dell'old_string e' un'azione
+    /// LEGITTIMA, non una ripetizione da abortire.
+    pub repeated_action_edit_failed: bool,
     /// Riallocazione risorse: numero request_port ravvicinate (a prescindere dal
     /// label: il variare del label E' il sintomo del loop).
     pub reallocation_count: i64,
@@ -118,6 +125,7 @@ impl Default for ProgressSignals {
             signature_loop_tool: None,
             g1_over_cap: false,
             repeated_action: None,
+            repeated_action_edit_failed: false,
             reallocation_count: 0,
             reallocation_threshold: 3,
             has_active_resources: false,
@@ -262,6 +270,24 @@ lo stesso comando/edit."
     }
 }
 
+/// Nudge SPECIFICO per `edit_file`/`write_file` FALLITO ripetuto (causa radice
+/// del falso-stallo). NON dice "rileggi con read_file": l'estratto numerato del
+/// contenuto reale e' GIA' nel messaggio d'errore precedente (vedi
+/// `build_old_string_not_found_message` in mcp-core). L'agente deve solo COPIARE
+/// da li' l'old_string esatto. Sostituisce il nudge generico "cambia approccio"
+/// che lasciava l'agente senza l'istruzione attuabile -> ABORT a 0 file modificati.
+fn repeated_action_edit_failed_nudge(label: &str, count: i64) -> String {
+    format!(
+        "STOP: '{label}' e' fallito {count} volte perche' l'old_string NON \
+corrisponde al testo reale del file. NON ripetere lo stesso old_string e NON \
+chiamare read_file: il contenuto attuale del file e' GIA' nell'errore qui sopra \
+(estratto numerato, riga per riga). COPIA da quell'estratto l'old_string ESATTO \
+\u{2014} spazi, newline e indentazione inclusi \u{2014} scegliendo abbastanza \
+righe da renderlo univoco, poi richiama edit_file con quell'old_string corretto. \
+Stai CORREGGENDO l'old_string, non ripetendo: e' l'azione giusta per sbloccarti."
+    )
+}
+
 /// Nudge di DIAGNOSI FORZATA (stadio tra GUIDE e ABORT). Vedi
 /// `_force_diagnose_nudge` Python (build/test-aware).
 fn force_diagnose_nudge(label: &str, count: i64) -> String {
@@ -354,7 +380,14 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
                     .repeated_action
                     .clone()
                     .unwrap_or_else(|| (String::new(), 0));
-                repeated_action_nudge(&label, count)
+                // edit_file/write_file FALLITO -> nudge SPECIFICO (copia
+                // l'old_string esatto dall'estratto gia' nell'errore), non quello
+                // generico "cambia approccio" che porta all'ABORT a vuoto.
+                if signals.repeated_action_edit_failed {
+                    repeated_action_edit_failed_nudge(&label, count)
+                } else {
+                    repeated_action_nudge(&label, count)
+                }
             }
             Axis::G1Descriptive => g1_nudge(),
         };
@@ -386,15 +419,36 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
     }
 
     // Livello 1.5 — FORCE_DIAGNOSE: solo per repeated_action, dopo che la GUIDE
-    // soft non ha cambiato nulla e PRIMA di escalation/abort. Abilitato da flag.
-    if matches!(axis, Axis::RepeatedAction)
-        && signals.force_diagnose_enabled
+    // soft non ha cambiato nulla e PRIMA di escalation/abort.
+    //
+    // Per l'edit_file/write_file FALLITO la diagnosi forzata e' SEMPRE preferita a
+    // escalation/ABORT finche' l'estratto numerato (gia' presente nell'errore) non
+    // e' stato sfruttato: l'edit fallito NON e' una causa bloccante (dipendenza /
+    // credenziale / permesso), e' un old_string da correggere. Quindi non serve un
+    // modello piu' capace ne' una chiusura: serve copiare l'estratto. Per le altre
+    // ripetizioni resta il comportamento storico (governato dal flag).
+    let want_force_diagnose = matches!(axis, Axis::RepeatedAction)
         && !already_diagnosed
-    {
+        && (signals.force_diagnose_enabled || signals.repeated_action_edit_failed);
+    if want_force_diagnose {
         let (label, count) = signals
             .repeated_action
             .clone()
             .unwrap_or_else(|| (String::new(), 0));
+        // Per l'edit fallito riusa il nudge SPECIFICO (copia l'old_string esatto
+        // dall'estratto), non quello diagnostico generico.
+        let nudge = if signals.repeated_action_edit_failed {
+            repeated_action_edit_failed_nudge(&label, count)
+        } else {
+            force_diagnose_nudge(&label, count)
+        };
+        let reason = if signals.repeated_action_edit_failed {
+            "stallo repeated_action (edit fallito): correzione old_string forzata, \
+                niente ABORT finche' l'estratto non e' sfruttato"
+                .to_string()
+        } else {
+            "stallo repeated_action: correzione forzata prima di escalation/abort".to_string()
+        };
         return ProgressDecision {
             action: Action::ForceDiagnose,
             axis: Some(axis),
@@ -402,10 +456,9 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
             // non in testo o resa. La scappatoia "dichiarati bloccato" resta solo nel
             // ramo non-build del nudge, per cause realmente bloccanti.
             force_action: true,
-            nudge_text: Some(force_diagnose_nudge(&label, count)),
+            nudge_text: Some(nudge),
             stop_reason: None,
-            reason: "stallo repeated_action: correzione forzata prima di escalation/abort"
-                .to_string(),
+            reason,
         };
     }
 
@@ -479,6 +532,84 @@ mod tests {
         let d = decide(&signals);
         assert_eq!(d.action, Action::Guide);
         assert!(d.force_action, "repeated_action ora forza l'azione correttiva");
+    }
+
+    #[test]
+    fn repeated_action_edit_fallito_nudge_specifico() {
+        // GUIDE di un edit_file FALLITO: il nudge deve essere SPECIFICO (copia
+        // l'old_string esatto dall'estratto), non quello generico.
+        let signals = ProgressSignals {
+            repeated_action: Some(("edit_file: src/lib.rs".to_string(), 2)),
+            repeated_action_edit_failed: true,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::Guide);
+        assert!(d.force_action);
+        let nudge = d.nudge_text.as_deref().unwrap();
+        assert!(
+            nudge.contains("old_string ESATTO"),
+            "atteso nudge specifico edit-fallito, ottenuto: {nudge}"
+        );
+        assert!(nudge.contains("NON chiamare read_file"));
+        // Non deve essere il nudge generico.
+        assert!(!nudge.contains("cambia approccio"));
+    }
+
+    #[test]
+    fn repeated_action_non_edit_nudge_generico() {
+        // GUIDE di una ripetizione NON-edit (es. comando generico): resta il
+        // nudge generico, non quello edit-specifico.
+        let signals = ProgressSignals {
+            repeated_action: Some(("run_command: ls".to_string(), 2)),
+            repeated_action_edit_failed: false,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::Guide);
+        let nudge = d.nudge_text.as_deref().unwrap();
+        assert!(!nudge.contains("old_string ESATTO"));
+    }
+
+    #[test]
+    fn repeated_action_edit_fallito_force_diagnose_prima_di_abort() {
+        // Gia' guidato + budget escalation esaurito: per l'edit fallito si va a
+        // FORCE_DIAGNOSE (nudge specifico) PRIMA dell'ABORT, anche senza il flag
+        // force_diagnose_enabled, finche' l'estratto non e' sfruttato.
+        let mut guided = HashSet::new();
+        guided.insert("repeated_action".to_string());
+        let signals = ProgressSignals {
+            repeated_action: Some(("edit_file: src/lib.rs".to_string(), 2)),
+            repeated_action_edit_failed: true,
+            already_guided: guided,
+            has_escalation_candidate: false,
+            force_diagnose_enabled: false,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::ForceDiagnose);
+        assert!(d.nudge_text.as_deref().unwrap().contains("old_string ESATTO"));
+    }
+
+    #[test]
+    fn repeated_action_edit_fallito_abort_solo_dopo_diagnosi() {
+        // Gia' guidato E gia' diagnosticato, niente escalation: solo allora
+        // l'edit fallito puo' chiudere con ABORT (estratto ormai sfruttato).
+        let mut guided = HashSet::new();
+        guided.insert("repeated_action".to_string());
+        let mut diagnosed = HashSet::new();
+        diagnosed.insert("repeated_action".to_string());
+        let signals = ProgressSignals {
+            repeated_action: Some(("edit_file: src/lib.rs".to_string(), 2)),
+            repeated_action_edit_failed: true,
+            already_guided: guided,
+            already_diagnosed: diagnosed,
+            has_escalation_candidate: false,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::Abort);
+        assert_eq!(d.stop_reason.as_deref(), Some(ABORT_STOP_REASON));
     }
 
     #[test]

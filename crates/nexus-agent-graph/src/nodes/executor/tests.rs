@@ -297,12 +297,14 @@ async fn nudge_comando_fallito_a_tre() {
 #[tokio::test]
 async fn repeated_action_abort_chiude() {
     let rc = Arc::new(StubRunControlStore::default());
-    // progress_controller ON, soglia repeated_action 2, asse gia' guidato ->
-    // ABORT (niente escalation candidate).
+    // progress_controller ON, soglia repeated_action 2, asse gia' guidato E
+    // gia' diagnosticato -> ABORT (niente escalation candidate). Per un write
+    // FALLITO l'ABORT scatta solo DOPO che l'estratto e' stato sfruttato (GUIDE
+    // + FORCE_DIAGNOSE gia' emessi): qui simuliamo entrambi gia' passati.
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
     let ctx = ctx_with(llm.clone(), false);
-    // write_file ripetuto 2 volte SENZA mai riuscire (stallo), asse gia' guidato.
+    // write_file ripetuto 2 volte SENZA mai riuscire (stallo, stesso contenuto).
     let messages = vec![
         human("scrivi"),
         ai_tool("write_file", json!({"path": "b.rs"})),
@@ -328,6 +330,7 @@ async fn repeated_action_abort_chiude() {
         thread_id: Some("r1".into()),
         messages,
         progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
         tools_json: Some(vec![json!({"name": "write_file"})]),
         ..Default::default()
     };
@@ -338,6 +341,70 @@ async fn repeated_action_abort_chiude() {
     assert!(out.result.as_deref().unwrap().contains("ESITO: non completato"));
     // LLM non chiamato (abort prima del modello).
     assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn repeated_action_edit_fallito_diagnose_prima_di_abort() {
+    // Causa radice del falso-stallo: un write_file/edit_file FALLITO, asse GIA'
+    // guidato ma NON ancora diagnosticato, NON deve abortire: deve passare per
+    // FORCE_DIAGNOSE iniettando il nudge SPECIFICO ("copia l'old_string esatto")
+    // e RICHIAMARE l'LLM, cosi' l'agente ha la chance di correggere prima di
+    // chiudere a 0 file modificati.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("correggo"));
+    let ctx = ctx_with(llm.clone(), false);
+    let messages = vec![
+        human("modifica il file"),
+        ai_tool(
+            "edit_file",
+            json!({"path": "src/lib.rs", "old_string": "fn alpha() {}"}),
+        ),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String("old_string non trovato".into()),
+                is_error: true,
+                exit_code: None,
+            }]),
+        },
+        ai_tool(
+            "edit_file",
+            json!({"path": "src/lib.rs", "old_string": "fn alpha() {}"}),
+        ),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String("old_string non trovato".into()),
+                is_error: true,
+                exit_code: None,
+            }]),
+        },
+    ];
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state.clone(), delta);
+    // NON deve abortire.
+    assert_ne!(out.stop_reason, Some(StopReason::LoopAbort));
+    // L'asse e' stato segnato come diagnosticato (FORCE_DIAGNOSE).
+    assert!(out
+        .progress_diagnosed_axes
+        .as_deref()
+        .unwrap_or_default()
+        .contains(&"repeated_action".to_string()));
+    // L'LLM e' stato chiamato (la diagnosi prosegue, non chiude).
+    let req = llm.seen.lock().unwrap().last().cloned().expect("llm chiamato");
+    // Il prompt contiene il nudge SPECIFICO edit-fallito.
+    let has_specific_nudge = req.messages.iter().any(|m| {
+        matches!(&m.content, Value::String(s) if s.contains("old_string ESATTO"))
+    });
+    assert!(has_specific_nudge, "atteso il nudge specifico edit-fallito nel prompt");
 }
 
 #[tokio::test]

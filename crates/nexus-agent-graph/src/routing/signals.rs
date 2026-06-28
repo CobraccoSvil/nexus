@@ -19,6 +19,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 
 use crate::state::{AgentState, ContentBlock, Message, MessageContent};
 
@@ -457,8 +458,12 @@ pub fn detect_repeated_failed_command(
     })
 }
 
-/// Tool PRODUTTIVI tracciati da `_detect_repeated_action` -> chiavi argomento
-/// che ne definiscono l'identita' (`_REPEATED_ACTION_TOOLS` Python, 1:1).
+/// Tool PRODUTTIVI tracciati da `detect_repeated_action` -> chiavi argomento
+/// che ne definiscono il BERSAGLIO (path/comando).
+///
+/// PUNTO UNICO (regola L): qualunque call site che debba decidere "questa azione
+/// e' la stessa di prima?" passa da qui. Il bersaglio da solo NON basta a definire
+/// l'identita' per i tool di edit (vedi [`repeated_action_content_key`]).
 fn repeated_action_keys(name: &str) -> Option<&'static [&'static str]> {
     match name {
         "write_file" | "edit_file" => Some(&["path", "file_path"]),
@@ -467,19 +472,89 @@ fn repeated_action_keys(name: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Chiave dell'argomento di CONTENUTO che, insieme al bersaglio, definisce
+/// l'identita' COMPLETA di un'azione di scrittura.
+///
+/// Causa radice del falso-stallo (regola H): due `edit_file` sullo stesso path
+/// con `old_string` DIVERSI sono tentativi DISTINTI (uno e' la CORREZIONE
+/// dell'altro), non una ripetizione a vuoto. Senza il contenuto nella signature
+/// collassavano sulla stessa chiave -> count=2 -> stallo -> ABORT con "0 file
+/// modificati". Includendo l'hash del contenuto la soglia 2 conta solo gli edit
+/// DAVVERO identici (stesso path + stesso old_string), lasciando passare la
+/// correzione iterativa dell'old_string.
+///
+/// PUNTO UNICO (regola L): unico posto dove si decide quale argomento porta il
+/// "contenuto" di una scrittura. `run_command` & co. NON hanno contenuto separato
+/// (il comando E' gia' il bersaglio) -> `None`, signature = solo bersaglio.
+fn repeated_action_content_key(name: &str) -> Option<&'static str> {
+    match name {
+        "edit_file" => Some("old_string"),
+        "write_file" => Some("content"),
+        _ => None,
+    }
+}
+
+/// Discriminante stabile e compatto di un valore di contenuto: `sha1_hex12` dei
+/// byte del valore (stesso schema di [`crate::decisions::loop_signatures`]).
+/// Stringa vuota (o contenuto assente) -> `""`, cosi' due edit "senza contenuto"
+/// collassano sulla stessa signature (retro-compatibilita' del path-only).
+fn content_discriminant(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex12 = String::with_capacity(12);
+    for byte in digest.iter().take(6) {
+        hex12.push_str(&format!("{byte:02x}"));
+    }
+    hex12
+}
+
+/// Esito ricco di [`detect_repeated_action_detailed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatedActionHit {
+    /// Label leggibile per nudge/recap: `name: bersaglio` (bersaglio troncato a
+    /// 120 char). NON contiene il discriminante di contenuto (resta umano).
+    pub label: String,
+    /// Conteggio della signature vincente nella finestra recente.
+    pub count: i64,
+    /// Nome del tool ripetuto (`edit_file`, `write_file`, `run_command`, ...).
+    pub tool_name: String,
+    /// `true` se l'ULTIMA occorrenza della signature vincente e' FALLITA
+    /// (tool_result con errore). Discrimina "edit_file fallito da correggere"
+    /// dalle altre ripetizioni: alimenta il nudge specifico del controller.
+    pub failed: bool,
+}
+
 /// Rileva la ripetizione IDENTICA di un'azione produttiva (scrittura/comando),
-/// a prescindere dall'esito. Ritorna `(Some(label), count)` della signature piu'
-/// frequente (`name: valore` troncato a 120 char), `(None, 0)` se nessuna. Vedi
-/// `_detect_repeated_action` (lookback=24). FALSO-DOPPIONE: le signature la cui
-/// PRIMA occorrenza e' RIUSCITA (`tool_result_outcome_after == Some(false)`)
-/// sono ESCLUSE dal conteggio (ridondanza innocua, non stallo).
-pub fn detect_repeated_action(messages: &[Message], lookback: usize) -> (Option<String>, i64) {
+/// a prescindere dall'esito. Versione RICCA: ritorna [`RepeatedActionHit`] con
+/// label, conteggio, nome tool ed esito dell'ultima occorrenza.
+///
+/// IDENTITA' dell'azione (regola L, punto unico): bersaglio
+/// ([`repeated_action_keys`]) + discriminante di contenuto
+/// ([`repeated_action_content_key`] -> [`content_discriminant`]). Cosi' per i tool
+/// di edit due chiamate sullo stesso file con `old_string` diversi sono azioni
+/// DISTINTE (count 1 ciascuna): solo l'edit DAVVERO identico fa count>=2.
+///
+/// FALSO-DOPPIONE: le signature la cui PRIMA occorrenza e' RIUSCITA
+/// (`tool_result_outcome_after == Some(false)`) sono ESCLUSE dal conteggio
+/// (ridondanza innocua, non stallo). Lookback canonico 24.
+pub fn detect_repeated_action_detailed(
+    messages: &[Message],
+    lookback: usize,
+) -> Option<RepeatedActionHit> {
     if messages.is_empty() {
-        return (None, 0);
+        return None;
     }
     let recent = tail_messages(messages, lookback);
     let mut counts: Vec<(String, i64)> = Vec::new();
     let mut labels: Vec<(String, String)> = Vec::new();
+    // sig -> nome tool (per il ramo edit-fallito del controller).
+    let mut tool_names: Vec<(String, String)> = Vec::new();
+    // sig -> esito dell'ULTIMA occorrenza (true = fallita).
+    let mut last_failed: Vec<(String, bool)> = Vec::new();
     let mut succeeded: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_sig: Option<String> = None;
     for (idx, m) in recent.iter().enumerate() {
@@ -487,41 +562,75 @@ pub fn detect_repeated_action(messages: &[Message], lookback: usize) -> (Option<
             let Some(keys) = repeated_action_keys(name) else {
                 continue;
             };
-            // value = primo argomento non vuoto fra le chiavi candidate.
-            let mut value = String::new();
+            // bersaglio = primo argomento non vuoto fra le chiavi candidate.
+            let mut target = String::new();
             for k in keys {
                 if let Some(v) = input.get(*k).and_then(Value::as_str) {
                     let v = v.trim();
                     if !v.is_empty() {
-                        value = v.to_string();
+                        target = v.to_string();
                         break;
                     }
                 }
             }
-            if value.is_empty() {
+            if target.is_empty() {
                 continue;
             }
-            let sig = format!("{name}|{value}");
+            // Discriminante di contenuto (solo per i tool di edit): rende la
+            // signature sensibile al CONTENUTO. `run_command` & co. -> "".
+            let content = repeated_action_content_key(name)
+                .and_then(|ck| input.get(ck).and_then(Value::as_str))
+                .map(content_discriminant)
+                .unwrap_or_default();
+            let sig = format!("{name}|{target}|{content}");
             bump(&mut counts, &sig);
-            let label_value: String = value.chars().take(120).collect();
+            let label_value: String = target.chars().take(120).collect();
             set_label(&mut labels, &sig, format!("{name}: {label_value}"));
+            set_label(&mut tool_names, &sig, name.to_string());
             last_sig = Some(sig.clone());
-            // Esito strutturale: un successo marca la signature come riuscita.
-            if tool_result_outcome_after(recent, idx, 3) == Some(false) {
-                succeeded.insert(sig);
+            // Esito strutturale dell'occorrenza corrente (primo tool_result dopo).
+            let outcome = tool_result_outcome_after(recent, idx, 3);
+            if outcome == Some(false) {
+                succeeded.insert(sig.clone());
             }
+            // Memorizza l'esito dell'ULTIMA occorrenza vista (None -> non fallita).
+            set_failed(&mut last_failed, &sig, outcome == Some(true));
         }
     }
     // Rimuove le signature riuscite (mai stallo da abort).
     counts.retain(|(sig, _)| !succeeded.contains(sig));
-    pick_top(&counts, last_sig.as_deref()).map(|(sig, count)| {
-        let label = labels
-            .iter()
-            .find(|(s, _)| *s == sig)
-            .map(|(_, l)| l.clone())
-            .unwrap_or(sig);
-        (Some(label), count)
-    }).unwrap_or((None, 0))
+    let (sig, count) = pick_top(&counts, last_sig.as_deref())?;
+    let label = labels
+        .iter()
+        .find(|(s, _)| *s == sig)
+        .map(|(_, l)| l.clone())
+        .unwrap_or_else(|| sig.clone());
+    let tool_name = tool_names
+        .iter()
+        .find(|(s, _)| *s == sig)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_default();
+    let failed = last_failed
+        .iter()
+        .find(|(s, _)| *s == sig)
+        .map(|(_, f)| *f)
+        .unwrap_or(false);
+    Some(RepeatedActionHit {
+        label,
+        count,
+        tool_name,
+        failed,
+    })
+}
+
+/// Variante COMPATTA storica: `(Some(label), count)` o `(None, 0)`. Delega al
+/// punto unico [`detect_repeated_action_detailed`] (regola L). Conservata per i
+/// call site/test che non hanno bisogno di nome tool ed esito.
+pub fn detect_repeated_action(messages: &[Message], lookback: usize) -> (Option<String>, i64) {
+    match detect_repeated_action_detailed(messages, lookback) {
+        Some(hit) => (Some(hit.label), hit.count),
+        None => (None, 0),
+    }
 }
 
 // ── Helper di conteggio condivisi dai due detector di ripetizione ───────────
@@ -554,6 +663,16 @@ fn set_label(list: &mut Vec<(String, String)>, sig: &str, label: String) {
         entry.1 = label;
     } else {
         list.push((sig.to_string(), label));
+    }
+}
+
+/// Imposta/aggiorna l'esito (fallita?) dell'ULTIMA occorrenza di una signature.
+/// Sovrascrive sempre: alla fine resta l'esito della chiamata piu' recente.
+fn set_failed(list: &mut Vec<(String, bool)>, sig: &str, failed: bool) {
+    if let Some(entry) = list.iter_mut().find(|(s, _)| s == sig) {
+        entry.1 = failed;
+    } else {
+        list.push((sig.to_string(), failed));
     }
 }
 
@@ -1294,6 +1413,72 @@ mod tests {
         let (label, count) = detect_repeated_action(&stallo, 24);
         assert_eq!(label.as_deref(), Some("write_file: b.rs"));
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn repeated_action_edit_old_string_diverso_non_stallo() {
+        // Due edit_file sullo STESSO path ma con old_string DIVERSI: il secondo
+        // e' la CORREZIONE del primo, non una ripetizione a vuoto. Con la
+        // signature sensibile al contenuto sono azioni DISTINTE -> count 1
+        // ciascuna -> nessuno stallo (soglia 2 non raggiunta da nessuna).
+        let msgs = vec![
+            ai_tool_input(
+                "edit_file",
+                json!({"path": "src/lib.rs", "old_string": "fn alpha() {}"}),
+            ),
+            human_tool_result(None, true, "old_string non trovato"),
+            ai_tool_input(
+                "edit_file",
+                json!({"path": "src/lib.rs", "old_string": "fn beta() {}"}),
+            ),
+            human_tool_result(None, true, "old_string non trovato"),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24);
+        // La signature vincente ha count 1: sotto la soglia 2, l'executor non
+        // considera stallo. Verifichiamo che nessuna signature arrivi a 2.
+        assert_eq!(hit.as_ref().map(|h| h.count), Some(1));
+    }
+
+    #[test]
+    fn repeated_action_edit_old_string_identico_stallo() {
+        // Due edit_file IDENTICI (stesso path + stesso old_string) entrambi
+        // falliti: e' una ripetizione a vuoto reale -> count 2 -> stallo.
+        let msgs = vec![
+            ai_tool_input(
+                "edit_file",
+                json!({"path": "src/lib.rs", "old_string": "fn alpha() {}"}),
+            ),
+            human_tool_result(None, true, "old_string non trovato"),
+            ai_tool_input(
+                "edit_file",
+                json!({"path": "src/lib.rs", "old_string": "fn alpha() {}"}),
+            ),
+            human_tool_result(None, true, "old_string non trovato"),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24).expect("stallo atteso");
+        assert_eq!(hit.label, "edit_file: src/lib.rs");
+        assert_eq!(hit.count, 2);
+        assert_eq!(hit.tool_name, "edit_file");
+        assert!(hit.failed, "l'ultima occorrenza e' fallita");
+    }
+
+    #[test]
+    fn repeated_action_edit_identico_riuscito_non_stallo() {
+        // Stesso path + stesso old_string ma la PRIMA occorrenza RIESCE:
+        // ridondanza innocua (falso-doppione), nessuno stallo.
+        let msgs = vec![
+            ai_tool_input(
+                "edit_file",
+                json!({"path": "src/lib.rs", "old_string": "fn alpha() {}"}),
+            ),
+            human_tool_result(Some(0), false, "applied"),
+            ai_tool_input(
+                "edit_file",
+                json!({"path": "src/lib.rs", "old_string": "fn alpha() {}"}),
+            ),
+            human_tool_result(None, true, "old_string non trovato"),
+        ];
+        assert_eq!(detect_repeated_action(&msgs, 24), (None, 0));
     }
 
     #[test]

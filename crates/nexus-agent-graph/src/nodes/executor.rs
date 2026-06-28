@@ -16,7 +16,7 @@
 //!   ([`LoopDetection`], cap [`RECENT_SIGNATURES_CAP`], soglia [`LOOP_THRESHOLD`]),
 //!   [`exploration_counter_update`].
 //! - `routing::signals`: TUTTI i detector pre-LLM/G1 — [`detect_repeated_failed_command`],
-//!   [`detect_repeated_action`], [`count_recent_request_port`],
+//!   [`detect_repeated_action_detailed`], [`count_recent_request_port`],
 //!   [`has_active_resources_in_history`], [`detect_recent_tool_error`],
 //!   [`detect_unfulfilled_intent`], [`unfulfilled_signal`],
 //!   [`has_tool_calls_in_history`], lista [`EXPLORATION_ONLY_TOOLS`].
@@ -171,7 +171,7 @@ use crate::decisions::tool_dispatch::{
 };
 use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::routing::signals::{
-    count_recent_request_port, detect_recent_tool_error, detect_repeated_action,
+    count_recent_request_port, detect_recent_tool_error, detect_repeated_action_detailed,
     detect_repeated_failed_command, detect_unfulfilled_intent, has_active_resources_in_history,
     has_tool_calls_in_history, EXPLORATION_ONLY_TOOLS,
 };
@@ -1084,7 +1084,18 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
 
         // (6c) repeated_action (py:2230-2309).
         if progress_on {
-            let (ra_label, ra_count) = detect_repeated_action(&messages, 24);
+            // Punto unico (regola L): la rilevazione e' sensibile al CONTENUTO
+            // (signature = name+path+hash(old_string)), cosi' due edit_file sullo
+            // stesso file con old_string DIVERSI sono azioni distinte (count 1) e
+            // non scattano falsi stalli. `hit.failed` discrimina l'edit/write
+            // FALLITO per scegliere il nudge specifico "copia l'old_string esatto".
+            let ra_hit = detect_repeated_action_detailed(&messages, 24);
+            let ra_label = ra_hit.as_ref().map(|h| h.label.clone());
+            let ra_count = ra_hit.as_ref().map(|h| h.count).unwrap_or(0);
+            let ra_edit_failed = ra_hit
+                .as_ref()
+                .map(|h| h.failed && matches!(h.tool_name.as_str(), "edit_file" | "write_file"))
+                .unwrap_or(false);
             let ra_threshold = self.cfg.repeated_action_threshold;
             let matched = ra_label.as_ref().map(|_| ra_count >= ra_threshold).unwrap_or(false);
             if !matched {
@@ -1124,6 +1135,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 };
                 let dec = pc::decide(&ProgressSignals {
                     repeated_action: Some((label.clone(), ra_count)),
+                    repeated_action_edit_failed: ra_edit_failed,
                     already_guided: progress_guided.clone(),
                     already_diagnosed: progress_diagnosed.clone(),
                     force_diagnose_enabled: self.cfg.repeated_action_force_diagnose_enabled,

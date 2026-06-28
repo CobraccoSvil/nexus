@@ -45,6 +45,8 @@ struct DecideInput {
     #[serde(default)]
     repeated_action: Option<(String, i64)>,
     #[serde(default)]
+    repeated_action_edit_failed: bool,
+    #[serde(default)]
     reallocation_count: i64,
     #[serde(default = "default_realloc_threshold")]
     reallocation_threshold: i64,
@@ -82,6 +84,7 @@ impl From<DecideInput> for ProgressSignals {
             signature_loop_tool: i.signature_loop_tool,
             g1_over_cap: i.g1_over_cap,
             repeated_action: i.repeated_action,
+            repeated_action_edit_failed: i.repeated_action_edit_failed,
             reallocation_count: i.reallocation_count,
             reallocation_threshold: i.reallocation_threshold,
             has_active_resources: i.has_active_resources,

@@ -799,6 +799,136 @@ fn anchor_prefix(line: &str) -> &str {
     line[..safe].trim_end()
 }
 
+/// Render NUMERATO di una finestra di righe `[start, end)` con cap per byte.
+///
+/// PUNTO UNICO (regola L) del rendering "estratto numerato del file reale":
+/// usato sia dal ramo "old_string non trovato" sia dal ramo "old_string
+/// ambiguo (N occorrenze)", cosi' l'agente vede SEMPRE lo stesso formato
+/// `NNNN | testo` e puo' copiarne l'old_string esatto. Tronca in fondo se
+/// supera `max_bytes` (la testa, di solito piu' utile, resta visibile).
+/// Ritorna `(excerpt_senza_newline_finale, indice_ultima_riga_resa)`.
+fn render_numbered_window(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    max_bytes: usize,
+) -> (String, usize) {
+    let mut excerpt = String::new();
+    let mut bytes = 0usize;
+    let mut last_rendered_idx = start;
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let line_number = start + offset + 1;
+        let rendered = format!("{:>4} | {}\n", line_number, line);
+        if bytes + rendered.len() > max_bytes {
+            break;
+        }
+        bytes += rendered.len();
+        excerpt.push_str(&rendered);
+        last_rendered_idx = start + offset;
+    }
+    if excerpt.ends_with('\n') {
+        excerpt.pop();
+    }
+    (excerpt, last_rendered_idx)
+}
+
+/// Indici (0-based) di riga in cui INIZIA ciascuna occorrenza di `needle` in
+/// `content` (LF-normalizzato), limitate a `max_hits`. Una occorrenza che inizia
+/// su una riga ma si estende su piu' righe e' contata una sola volta (alla riga
+/// d'inizio). Usato dal ramo "old_string ambiguo" per mostrare il contesto delle
+/// prime N occorrenze, cosi' l'agente sceglie quella univoca.
+fn occurrence_start_lines(content: &str, needle: &str, max_hits: usize) -> Vec<usize> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<usize> = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = content[search_from..].find(needle) {
+        let abs = search_from + rel;
+        // Riga d'inizio = numero di '\n' prima dell'offset assoluto.
+        let line_idx = content[..abs].bytes().filter(|b| *b == b'\n').count();
+        hits.push(line_idx);
+        if hits.len() >= max_hits {
+            break;
+        }
+        // Avanza di almeno 1 byte per evitare loop su match a lunghezza zero
+        // (gia' escluso da needle non vuoto, ma per overlap progressivo).
+        search_from = abs + needle.len().max(1);
+        if search_from >= content.len() {
+            break;
+        }
+    }
+    hits
+}
+
+/// Costruisce il messaggio di errore quando `edit_file` trova `old_string` PIU'
+/// volte (deve essere univoco). Ramo reso actionable come il "non trovato":
+/// mostra l'ESTRATTO NUMERATO attorno alle prime occorrenze, cosi' l'agente puo'
+/// aggiungere righe di contesto e rendere l'old_string univoco SENZA chiamare
+/// read_file (il contenuto e' gia' qui). Riusa il punto unico
+/// [`render_numbered_window`].
+fn build_old_string_ambiguous_message(
+    content: &str,
+    old_string_lf: &str,
+    path_str: &str,
+    count: usize,
+) -> String {
+    const WINDOW_BEFORE: usize = 3;
+    const WINDOW_AFTER: usize = 6;
+    const MAX_HITS_SHOWN: usize = 3;
+    const MAX_BYTES_PER_HIT: usize = 900;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let hit_lines = occurrence_start_lines(content, old_string_lf, MAX_HITS_SHOWN);
+
+    // Fallback difensivo: se per qualche motivo non localizziamo le occorrenze
+    // (es. old_string che attraversa confini in modo inatteso), restiamo sul
+    // messaggio testuale storico — meglio che un estratto vuoto.
+    if hit_lines.is_empty() {
+        return format!(
+            "[Errore: old_string trovato {} volte in '{}'. Deve essere unico: aggiungi piu' contesto (righe circostanti) per renderlo univoco.]",
+            count, path_str
+        );
+    }
+
+    let mut blocks = String::new();
+    for (n, &hit) in hit_lines.iter().enumerate() {
+        let start = hit.saturating_sub(WINDOW_BEFORE);
+        let end = (hit + WINDOW_AFTER + 1).min(total_lines);
+        let (excerpt, _) = render_numbered_window(&lines, start, end, MAX_BYTES_PER_HIT);
+        blocks.push_str(&format!(
+            "Occorrenza {} (~riga {}):\n{}\n\n",
+            n + 1,
+            hit + 1,
+            excerpt
+        ));
+    }
+    let more = if count > hit_lines.len() {
+        format!(
+            " (mostrate le prime {} di {} occorrenze)",
+            hit_lines.len(),
+            count
+        )
+    } else {
+        String::new()
+    };
+    // Rimuove i due newline finali per pulizia.
+    let blocks = blocks.trim_end().to_string();
+
+    format!(
+        "[Errore: old_string trovato {count} volte in '{path}' \u{2014} deve essere UNICO.{more}\n\
+        \u{26a0} NON chiamare read_file: il contesto delle occorrenze e' gia' qui sotto.\n\
+        Aggiungi al tuo old_string abbastanza righe circostanti (prese dall'estratto numerato) \
+        da identificare UNA SOLA occorrenza, poi riprova:\n\n\
+        {blocks}]",
+        count = count,
+        path = path_str,
+        more = more,
+        blocks = blocks,
+    )
+}
+
 /// Costruisce il messaggio di errore quando `edit_file` non trova l'old_string.
 ///
 /// Strategia anti-loop: oltre a indicare la riga approssimativa (token-match
@@ -876,24 +1006,8 @@ fn build_old_string_not_found_message(content: &str, old_string_lf: &str, path_s
 
     // Render numerato + cap per byte (taglia in fondo se sfora MAX_BYTES, in
     // modo che la testa dell'estratto — di solito quella piu' utile — resti
-    // sempre visibile).
-    let mut excerpt = String::new();
-    let mut bytes = 0usize;
-    let mut last_rendered_idx = start;
-    for (offset, line) in lines[start..end].iter().enumerate() {
-        let line_number = start + offset + 1;
-        let rendered = format!("{:>4} | {}\n", line_number, line);
-        if bytes + rendered.len() > MAX_BYTES {
-            break;
-        }
-        bytes += rendered.len();
-        excerpt.push_str(&rendered);
-        last_rendered_idx = start + offset;
-    }
-    // Rimuovi il newline finale per coerenza visiva con il vecchio formato.
-    if excerpt.ends_with('\n') {
-        excerpt.pop();
-    }
+    // sempre visibile). Punto unico del rendering: render_numbered_window.
+    let (excerpt, last_rendered_idx) = render_numbered_window(&lines, start, end, MAX_BYTES);
 
     let lines_shown_end = last_rendered_idx + 1;
     let header_label = match similar_line_idx {
@@ -992,10 +1106,9 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
     let count = content.matches(old_string_lf.as_str()).count();
     match count {
         0 => build_old_string_not_found_message(&content, &old_string_lf, path_str),
-        n if n > 1 => format!(
-            "[Errore: old_string trovato {} volte in '{}'. Deve essere unico: aggiungi piu' contesto (righe circostanti) per renderlo univoco.]",
-            n, path_str
-        ),
+        n if n > 1 => {
+            build_old_string_ambiguous_message(&content, &old_string_lf, path_str, n)
+        }
         _ => {
             let new_content_lf = content.replacen(old_string_lf.as_str(), new_string_lf.as_str(), 1);
             // Ripristina gli EOL originali del file (CRLF se l'originale era CRLF).
@@ -1263,8 +1376,10 @@ pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> Strin
 // regressioni sull'estratto numerato attorno alla riga simile siano colte.
 #[cfg(test)]
 mod tests {
+    use super::build_old_string_ambiguous_message;
     use super::build_old_string_not_found_message;
     use super::is_critical_config;
+    use super::occurrence_start_lines;
 
     #[test]
     fn is_critical_config_riconosce_i_file_di_config() {
@@ -1343,5 +1458,41 @@ mod tests {
         // L'estratto di fallback parte dalla riga 1.
         assert!(msg.contains("   1 | alpha"),
             "fallback alle prime righe non emesso: {}", msg);
+    }
+
+    #[test]
+    fn occurrence_start_lines_localizza_le_occorrenze() {
+        let content = "fn a() {}\nlet x = foo();\nfn b() {}\nlet y = foo();\n";
+        let hits = occurrence_start_lines(content, "foo()", 5);
+        // foo() compare a riga 2 (idx 1) e riga 4 (idx 3).
+        assert_eq!(hits, vec![1, 3]);
+        // Cap rispettato.
+        let capped = occurrence_start_lines(content, "foo()", 1);
+        assert_eq!(capped, vec![1]);
+        // needle vuoto -> nessun hit (niente loop).
+        assert!(occurrence_start_lines(content, "", 5).is_empty());
+    }
+
+    #[test]
+    fn ramo_ambiguo_include_estratto_numerato() {
+        // old_string presente 3 volte: il messaggio deve mostrare l'estratto
+        // numerato delle prime occorrenze, NON solo testo generico.
+        let content = "header\nval = compute();\nmid1\nmid2\nval = compute();\nmid3\nval = compute();\nfooter\n";
+        let old_string = "val = compute();";
+
+        let msg = build_old_string_ambiguous_message(content, old_string, "src/lib.rs", 3);
+
+        // Header informa del conteggio e dell'obbligo di univocita'.
+        assert!(msg.contains("trovato 3 volte in 'src/lib.rs'"),
+            "conteggio mancante: {}", msg);
+        assert!(msg.contains("deve essere UNICO"), "vincolo univocita' mancante: {}", msg);
+        // Anti-loop: niente read_file, il contesto e' gia' qui.
+        assert!(msg.contains("NON chiamare read_file"), "anti-loop mancante: {}", msg);
+        // Estratto numerato presente con la riga reale dell'occorrenza.
+        assert!(msg.contains("| val = compute();"),
+            "riga numerata dell'occorrenza mancante: {}", msg);
+        // Etichette di occorrenza multipla.
+        assert!(msg.contains("Occorrenza 1"), "etichetta occorrenza 1 mancante: {}", msg);
+        assert!(msg.contains("Occorrenza 2"), "etichetta occorrenza 2 mancante: {}", msg);
     }
 }
