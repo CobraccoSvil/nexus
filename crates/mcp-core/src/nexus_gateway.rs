@@ -162,6 +162,40 @@ pub struct GwTranscribeResponse {
     pub latency_ms: u64,
 }
 
+/// Richiesta di sintesi vocale al gateway (`POST /v1/audio/speech`). Speculare a
+/// [`GwTranscribeRequest`] ma per il task audio-out: il testo da pronunciare + il
+/// modello. Regola G: il `model` arriva dal chiamante.
+///
+/// API client pronta per il wiring: vedi nota su [`GwTranscribeRequest`] (il tool
+/// agente vive in `nexus-agent-tools` e re-implementa il trasporto).
+#[allow(dead_code)]
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct GwTtsRequest {
+    pub model: String,
+    pub input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    /// Pin esplicito del provider (bypass routing nel gateway). Stessa semantica
+    /// di [`GwImageRequest::pin_provider`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
+    pub metadata: GwMetadata,
+}
+
+/// Risposta di `POST /v1/audio/speech` del gateway. L'audio sintetizzato e' in
+/// base64 (`audio_base64`) + il MIME prodotto. Vedi nota su [`GwTtsRequest`].
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct GwTtsResponse {
+    pub audio_base64: String,
+    pub mime: String,
+    pub model_used: String,
+    pub provider_used: String,
+    pub latency_ms: u64,
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct GwUsage {
     pub input_tokens: u32,
@@ -348,6 +382,34 @@ impl NexusGatewayClient {
             .map_err(|e| anyhow::anyhow!("Nexus Gateway transcribe response parse: {e}"))
     }
 
+    /// Sintetizza audio via gateway (`POST /v1/audio/speech`). Speculare a
+    /// [`Self::transcribe_audio`]: stesso Bearer service token, stesso status-check
+    /// con propagazione del body d'errore al caller (regola H: errore esplicito se
+    /// il provider non sintetizza -> il gateway ritorna 500 col motivo).
+    ///
+    /// Pronta per il wiring: vedi nota su [`GwTtsRequest`].
+    #[allow(dead_code)]
+    pub async fn text_to_speech(&self, req: GwTtsRequest) -> Result<GwTtsResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/audio/speech", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.service_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Nexus Gateway {status}: {body}");
+        }
+
+        resp.json::<GwTtsResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway tts response parse: {e}"))
+    }
+
     pub async fn is_healthy(&self) -> bool {
         self.http
             .get(format!("{}/health", self.base_url))
@@ -520,6 +582,49 @@ mod tests {
         assert_eq!(json["mime"], "audio/mpeg");
         // language None -> campo omesso.
         assert!(json.get("language").is_none());
+        assert_eq!(json["pin_provider"], "openai");
+    }
+
+    #[test]
+    fn parse_tts_response_dal_gateway() {
+        // Forma di POST /v1/audio/speech: audio base64 + mime + tracciamento.
+        let raw = r#"{
+            "audio_base64": "QUFBQQ==",
+            "mime": "audio/mpeg",
+            "model_used": "gpt-4o-mini-tts",
+            "provider_used": "openai",
+            "latency_ms": 1200
+        }"#;
+        let parsed: GwTtsResponse = serde_json::from_str(raw).expect("parse tts response");
+        assert_eq!(parsed.audio_base64, "QUFBQQ==");
+        assert_eq!(parsed.mime, "audio/mpeg");
+        assert_eq!(parsed.model_used, "gpt-4o-mini-tts");
+        assert_eq!(parsed.provider_used, "openai");
+        assert_eq!(parsed.latency_ms, 1200);
+    }
+
+    #[test]
+    fn tts_request_serializza_campi_e_omette_opzionali() {
+        let req = GwTtsRequest {
+            model: "gpt-4o-mini-tts".into(),
+            input: "ciao mondo".into(),
+            voice: Some("alloy".into()),
+            response_format: None,
+            pin_provider: Some("openai".into()),
+            metadata: GwMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "audio".into(),
+            },
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["model"], "gpt-4o-mini-tts");
+        assert_eq!(json["input"], "ciao mondo");
+        assert_eq!(json["voice"], "alloy");
+        // response_format None -> campo omesso.
+        assert!(json.get("response_format").is_none());
         assert_eq!(json["pin_provider"], "openai");
     }
 

@@ -1076,6 +1076,17 @@ async fn native_outcome_to_run_result(
     }
 }
 
+/// Riconosce il messaggio di errore provider sintetizzato dall'executor del
+/// grafo nativo (nexus-agent-graph, ramo "agent_turn fallita"): la
+/// `final_answer` inizia col marker `[Errore provider`. Punto unico di
+/// detection (regola L) per l'esito-certo: il marker e' emesso in un solo posto
+/// (executor.rs) e qui lo riconosciamo per declassare a Failed un run che
+/// altrimenti risulterebbe `completed` pur essendo fallito perche' il provider
+/// non era disponibile (cooldown / gateway irraggiungibile).
+pub(crate) fn is_provider_error_answer(answer: &str) -> bool {
+    answer.trim_start().starts_with("[Errore provider")
+}
+
 /// Costruisce un [`AgentRunResult`] FAILED ONESTO per il fallimento del motore
 /// nativo PRIMARIO (regola H: nessun fallback mascherato al brain). Converge sullo
 /// stesso finalizzatore del path normale (regola L) impostando `native_result`:
@@ -3059,6 +3070,24 @@ pub(crate) async fn spawn_agent_run(
                 && ((result.steps.is_empty()
                     && result.hollow_completion_kind.contains("EMPTY_ANSWER"))
                     || result.hollow_completion_kind == "RESIGNED");
+            // Esito CERTO (errore provider): un run che si chiuderebbe `completed`
+            // ma la cui unica risposta e' il messaggio di errore provider
+            // sintetizzato dall'executor (final_answer = "[Errore provider ...]")
+            // SENZA alcun token di completion prodotto, NON e' un successo: e' un
+            // fallimento infrastrutturale (provider in cooldown / gateway
+            // irraggiungibile). Il routing post-errore puo' richiudere il grafo
+            // con uno stop_reason non-Error (es. cap iterazioni -> EndTurn),
+            // perdendo a monte il segnale; qui lo recuperiamo da final_answer +
+            // 0 completion_tokens e declassiamo a Failed (non FailedDiagnosed: e'
+            // infrastrutturale, non una chiusura diagnostica del modello).
+            let provider_error_close = matches!(
+                result.status,
+                crate::agent_types::AgentRunStatus::Completed
+            ) && result.completion_tokens == 0
+                && result
+                    .final_answer
+                    .as_deref()
+                    .is_some_and(is_provider_error_answer);
             let status_canonical = if hollow_no_work {
                 tracing::warn!(
                     "agent_run {}: hollow senza lavoro ({}) — status declassato \
@@ -3067,6 +3096,13 @@ pub(crate) async fn spawn_agent_run(
                     result.hollow_completion_kind
                 );
                 crate::agent_types::AgentRunStatus::FailedDiagnosed
+            } else if provider_error_close {
+                tracing::warn!(
+                    "agent_run {}: chiusura con errore provider e 0 completion_tokens \
+                     — status declassato completed -> failed (esito certo)",
+                    run_id
+                );
+                crate::agent_types::AgentRunStatus::Failed
             } else {
                 result.status.clone()
             };

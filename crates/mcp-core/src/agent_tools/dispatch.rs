@@ -183,6 +183,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_generate_image" => image_tools::tool_nexus_generate_image(ctx, input).await,
         // PR6c: trascrive un audio allegato (speech-to-text) via gateway.
         "nexus_transcribe_audio" => audio_tools::tool_nexus_transcribe_audio(ctx, input).await,
+        // PR6d: sintetizza un testo in audio (text-to-speech) e lo salva nel progetto.
+        "nexus_text_to_speech" => audio_tools::tool_nexus_text_to_speech(ctx, input).await,
         "nexus_install_shadcn_components" => {
             shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await
         }

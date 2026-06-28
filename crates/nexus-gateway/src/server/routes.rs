@@ -44,7 +44,7 @@ use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
 use crate::types::{
     ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, RequestMetadata, TranscribeRequest,
-    TranscribeResponse,
+    TranscribeResponse, TtsRequest, TtsResponse,
 };
 
 use super::billing::{enforce_quota, record_usage_to_ledger, QuotaExceeded};
@@ -897,6 +897,147 @@ fn transcribe_to_llm_request(body: &TranscribeRequest, model: &str) -> LlmReques
     }
 }
 
+// ── Text-to-speech ───────────────────────────────────────────────────────────
+
+/// `POST /v1/audio/speech` (auth richiesta): sintetizza in audio un testo col
+/// provider scelto. Risolve il provider (pin esplicito oppure il primo sano che
+/// dichiara `supports_audio_out()`), enforce quota PRIMA della chiamata, delega a
+/// `provider.text_to_speech`. Ritorna [`TtsResponse`] (audio in base64).
+///
+/// Routing: volutamente SEMPLICE (il routing per-capability fine vive in
+/// mcp-core, regola L), gemello di [`generate_image`]/[`transcribe_audio`]: con
+/// `pin_provider` esegue quel provider; senza pin sceglie il primo provider
+/// audio-out-capable non in cooldown. Nessun fallback cross-provider in questo PR.
+///
+/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
+/// non si applica al TTS, il cui costo e' al carattere di input (non riportato in
+/// token dal provider). Per non INVENTARE costi (regola G/H: niente fallback
+/// nascosto), in questo PR il ledger NON viene scritto per la sintesi vocale,
+/// allineato al pattern image-gen / transcribe. TODO PR successiva: costo
+/// per-carattere-audio in `ai_price_catalog`.
+pub async fn text_to_speech(
+    State(state): State<AppState>,
+    Json(body): Json<TtsRequest>,
+) -> Response {
+    if body.input.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "input required" })),
+        )
+            .into_response();
+    }
+    match run_text_to_speech(&state, &body).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Pipeline audio-out: risolve provider audio-out-capable, enforce quota, sintetizza.
+async fn run_text_to_speech(
+    state: &AppState,
+    body: &TtsRequest,
+) -> Result<TtsResponse, PipelineError> {
+    let providers = state.runtime_snapshot().await.providers;
+
+    // Risoluzione provider (punto unico testabile, regola L): pin esplicito o
+    // primo audio-out-capable non in cooldown.
+    let provider =
+        select_audio_out_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
+    let model = strip_model_prefix(&body.model);
+
+    // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
+    // provider+model, regola L). A differenza di transcribe, qui l'input testuale
+    // E' noto: la stima riusa il pattern char/4 della chat sui caratteri
+    // dell'input. Coerente col pattern image-gen, NON scrive ledger: niente costo
+    // inventato (regola G/H).
+    let quota_req = tts_to_llm_request(body, &model);
+    enforce_quota(&state.db, &quota_req, provider.name(), &model)
+        .await
+        .map_err(|e| {
+            if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
+                PipelineError::quota(&q.scope, &q.reason)
+            } else {
+                PipelineError::provider(format!("quota check fallito: {e}"))
+            }
+        })?;
+
+    // Richiesta col modello reale risolto per il provider.
+    let mut req = body.clone();
+    req.model = model;
+
+    provider
+        .text_to_speech(&req)
+        .await
+        .map_err(|e| PipelineError::provider(e.to_string()))
+}
+
+/// Seleziona il provider per la sintesi vocale (punto unico, regola L). Gemello di
+/// [`select_audio_in_provider`]: con `pin` ESATTAMENTE quel provider, che DEVE
+/// essere configurato e audio-out-capable (regola H: errore esplicito, niente
+/// delega a chi non sintetizza, niente ripiego silenzioso). Senza pin: il PRIMO
+/// provider audio-out-capable non in cooldown. Nessun fallback cross-provider qui.
+fn select_audio_out_provider(
+    providers: &[Arc<dyn LlmProvider>],
+    pin: Option<&str>,
+    cooldown: &CooldownManager,
+) -> Result<Arc<dyn LlmProvider>, PipelineError> {
+    if let Some(pin) = pin {
+        let Some(p) = providers.iter().find(|p| p.name() == pin) else {
+            return Err(PipelineError::provider(format!(
+                "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
+            )));
+        };
+        if !p.supports_audio_out() {
+            return Err(PipelineError::provider(format!(
+                "provider \"{pin}\" non supporta la sintesi vocale"
+            )));
+        }
+        return Ok(p.clone());
+    }
+    providers
+        .iter()
+        .find(|p| p.supports_audio_out() && !cooldown.is_in_cooldown(p.name()))
+        .cloned()
+        .ok_or_else(|| {
+            PipelineError::provider("nessun provider sano supporta la sintesi vocale")
+        })
+}
+
+/// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` da una
+/// [`TtsRequest`]: a differenza di transcribe, qui il testo di input E' noto, e
+/// lo mettiamo come messaggio user cosi' la stima char/4 esistente lo conta.
+/// Gemella di [`image_gen_to_llm_request`]/[`transcribe_to_llm_request`]: niente
+/// costo inventato (regola G/H), il ledger non viene scritto a valle.
+fn tts_to_llm_request(body: &TtsRequest, model: &str) -> LlmRequest {
+    use crate::types::{LlmMessage, MessageContent};
+    LlmRequest {
+        model: model.to_string(),
+        messages: vec![LlmMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text(body.input.clone()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+        }],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        response_format: None,
+        stream: None,
+        thinking: None,
+        tool_choice: None,
+        pin_provider: body.pin_provider.clone(),
+        metadata: RequestMetadata {
+            tenant_id: body.metadata.tenant_id.clone(),
+            user_id: body.metadata.user_id.clone(),
+            request_id: body.metadata.request_id.clone(),
+            sensitivity_tier: body.metadata.sensitivity_tier,
+            feature: body.metadata.feature.clone(),
+        },
+    }
+}
+
 // ── Batch API ────────────────────────────────────────────────────────────────
 
 /// Base URL Anthropic per le chiamate batch. Allineata al provider non-batch
@@ -1210,6 +1351,8 @@ mod tests {
         image_capable: bool,
         /// Se il provider dichiara `supports_audio_in()` (default `false`).
         audio_capable: bool,
+        /// Se il provider dichiara `supports_audio_out()` (default `false`).
+        audio_out_capable: bool,
     }
 
     impl FakeProvider {
@@ -1221,6 +1364,7 @@ mod tests {
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
+                audio_out_capable: false,
             })
         }
 
@@ -1233,6 +1377,7 @@ mod tests {
                 models_result: Some(models_result),
                 image_capable: false,
                 audio_capable: false,
+                audio_out_capable: false,
             })
         }
 
@@ -1245,6 +1390,7 @@ mod tests {
                 models_result: None,
                 image_capable: true,
                 audio_capable: false,
+                audio_out_capable: false,
             })
         }
 
@@ -1257,6 +1403,20 @@ mod tests {
                 models_result: None,
                 image_capable: false,
                 audio_capable: true,
+                audio_out_capable: false,
+            })
+        }
+
+        /// Variante audio-out-capable per i test di routing text-to-speech.
+        fn audio_out(name: &str, behaviour: Behaviour) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                behaviour,
+                calls: AtomicUsize::new(0),
+                models_result: None,
+                image_capable: false,
+                audio_capable: false,
+                audio_out_capable: true,
             })
         }
     }
@@ -1347,6 +1507,22 @@ mod tests {
             match self.behaviour {
                 Behaviour::Ok => Ok(TranscribeResponse {
                     text: "ciao".to_string(),
+                    model_used: req.model.clone(),
+                    provider_used: self.name.clone(),
+                    latency_ms: 0,
+                }),
+                Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+            }
+        }
+        fn supports_audio_out(&self) -> bool {
+            self.audio_out_capable
+        }
+        async fn text_to_speech(&self, req: &TtsRequest) -> anyhow::Result<TtsResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behaviour {
+                Behaviour::Ok => Ok(TtsResponse {
+                    audio_base64: "QUFBQQ==".to_string(),
+                    mime: "audio/mpeg".to_string(),
                     model_used: req.model.clone(),
                     provider_used: self.name.clone(),
                     latency_ms: 0,
@@ -1741,5 +1917,92 @@ mod tests {
         assert_eq!(out.provider_used, "openai");
         assert_eq!(out.model_used, "whisper-1");
         assert_eq!(out.text, "ciao");
+    }
+
+    // ── Routing text-to-speech ───────────────────────────────────────────────
+
+    #[test]
+    fn select_audio_out_provider_senza_pin_sceglie_primo_audio_out_capable_sano() {
+        // openai NON audio-out-capable, eleven audio-out-capable: vince eleven.
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let eleven: Arc<dyn LlmProvider> = FakeProvider::audio_out("eleven", Behaviour::Ok);
+        let built = vec![openai, eleven];
+        let cooldown = CooldownManager::new();
+        let p = select_audio_out_provider(&built, None, &cooldown).unwrap();
+        assert_eq!(p.name(), "eleven");
+    }
+
+    #[test]
+    fn select_audio_out_provider_senza_pin_salta_quello_in_cooldown() {
+        let openai: Arc<dyn LlmProvider> = FakeProvider::audio_out("openai", Behaviour::Ok);
+        let eleven: Arc<dyn LlmProvider> = FakeProvider::audio_out("eleven", Behaviour::Ok);
+        let built = vec![openai, eleven];
+        let cooldown = CooldownManager::new();
+        cooldown.mark_billing("openai", Some("credit balance too low".into()));
+        // openai audio-out-capable ma in cooldown -> vince eleven.
+        let p = select_audio_out_provider(&built, None, &cooldown).unwrap();
+        assert_eq!(p.name(), "eleven");
+    }
+
+    #[test]
+    fn select_audio_out_provider_senza_capable_e_errore() {
+        // Nessun provider audio-out-capable -> errore esplicito (regola H).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let built = vec![openai];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_audio_out_provider(&built, None, &cooldown) else {
+            panic!("senza provider audio-out-capable deve fallire");
+        };
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("nessun provider"));
+    }
+
+    #[test]
+    fn select_audio_out_provider_pin_non_capable_e_errore_non_fallback() {
+        // Pin su openai (non audio-out-capable) anche se eleven capable e' presente:
+        // errore esplicito, niente ripiego su eleven (regola G/H).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let eleven: Arc<dyn LlmProvider> = FakeProvider::audio_out("eleven", Behaviour::Ok);
+        let built = vec![openai, eleven];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_audio_out_provider(&built, Some("openai"), &cooldown) else {
+            panic!("pin su provider non audio-out-capable deve fallire");
+        };
+        assert!(err.message.contains("non supporta"));
+    }
+
+    #[test]
+    fn select_audio_out_provider_pin_non_configurato_e_errore() {
+        let eleven: Arc<dyn LlmProvider> = FakeProvider::audio_out("eleven", Behaviour::Ok);
+        let built = vec![eleven];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_audio_out_provider(&built, Some("openai"), &cooldown) else {
+            panic!("pin su provider non configurato deve fallire");
+        };
+        assert!(err.message.contains("openai"));
+    }
+
+    #[tokio::test]
+    async fn fake_provider_sintetizza_audio() {
+        let openai = FakeProvider::audio_out("openai", Behaviour::Ok);
+        let req = TtsRequest {
+            model: "gpt-4o-mini-tts".into(),
+            input: "ciao mondo".into(),
+            voice: Some("alloy".into()),
+            response_format: Some("mp3".into()),
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "audio".into(),
+            },
+        };
+        let out = openai.text_to_speech(&req).await.unwrap();
+        assert_eq!(out.provider_used, "openai");
+        assert_eq!(out.model_used, "gpt-4o-mini-tts");
+        assert_eq!(out.mime, "audio/mpeg");
+        assert!(!out.audio_base64.is_empty());
     }
 }

@@ -341,6 +341,48 @@ pub struct TranscribeResponse {
     pub latency_ms: u64,
 }
 
+/// Richiesta di sintesi vocale (`TtsRequest`, text-to-speech). Speculare a
+/// [`ImageGenRequest`] ma per il task audio-out: niente messaggi/tool, solo il
+/// testo da pronunciare + il modello. Regola G: il `model` arriva sempre dal
+/// chiamante (nessun default hardcoded). `pin_provider` ha la stessa semantica di
+/// [`LlmRequest::pin_provider`] (bypass routing, esecuzione di QUEL provider).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtsRequest {
+    pub model: String,
+    /// Testo da convertire in audio.
+    pub input: String,
+    /// Voce del modello TTS (es. `alloy`, `nova`): opzionale, default lato
+    /// provider se assente. Non e' un nome modello (regola G): e' un timbro.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// Formato audio richiesto (es. `mp3`, `wav`, `opus`, `flac`): opzionale,
+    /// default lato provider (`mp3`) se assente.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    /// Pin esplicito del provider da eseguire (bypass routing). Quando `Some`, il
+    /// gateway esegue ESATTAMENTE quel provider; quando `None`, sceglie il primo
+    /// provider sano che dichiara `supports_audio_out()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
+    pub metadata: RequestMetadata,
+}
+
+/// Risposta di sintesi vocale (`TtsResponse`). Il provider risponde con BYTES
+/// binari (Content-Type `audio/mpeg`): il gateway li legge e li ritorna in base64
+/// al client, coerente con il resto del contratto JSON. Speculare a
+/// [`ImageGenResponse`] per i campi di tracciamento (model/provider/latency).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtsResponse {
+    /// Audio sintetizzato codificato base64 (il client lo decodifica e lo salva).
+    pub audio_base64: String,
+    /// MIME dell'audio prodotto (es. `audio/mpeg`): dal Content-Type della risposta
+    /// del provider, o derivato dal `response_format` richiesto.
+    pub mime: String,
+    pub model_used: String,
+    pub provider_used: String,
+    pub latency_ms: u64,
+}
+
 /// Voce della tabella di alias modello (`ModelAliasEntry`, da model-aliases.yaml).
 ///
 /// I tre campi modello sono `Option` perche' nello YAML possono valere `null`

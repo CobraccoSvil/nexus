@@ -383,6 +383,78 @@ impl OpenAiCompatClient {
             latency_ms,
         })
     }
+
+    /// Sintetizza audio via `POST {base_url}/audio/speech` (dialetto OpenAI Audio,
+    /// JSON in -> BYTES binari out). Punto unico del trasporto audio-out OpenAI-
+    /// compatibile (regola L): stesso `http` client e `bearer_auth(api_key)` di
+    /// [`Self::complete`], stesso status-check propagato al caller (che applica
+    /// `is_billing_error` + cooldown).
+    ///
+    /// Body JSON: `model`, `input`, `voice` (se presente), `response_format`.
+    /// Risposta: BYTES audio (NON JSON) + il Content-Type per il MIME reale.
+    /// Regola G: `model` arriva dal chiamante. Regola F: il body d'errore (che non
+    /// contiene il testo sintetizzato) e' propagato al caller, non loggato qui.
+    pub async fn speech(
+        &self,
+        model: &str,
+        input: &str,
+        voice: Option<&str>,
+        response_format: Option<&str>,
+    ) -> anyhow::Result<(Vec<u8>, String)> {
+        let mut body = serde_json::json!({
+            "model": model,
+            "input": input,
+        });
+        if let Some(v) = voice.filter(|v| !v.trim().is_empty()) {
+            body["voice"] = serde_json::Value::String(v.trim().to_string());
+        }
+        if let Some(fmt) = response_format.filter(|f| !f.trim().is_empty()) {
+            body["response_format"] = serde_json::Value::String(fmt.trim().to_string());
+        }
+
+        let resp = self
+            .http
+            .post(format!("{}/audio/speech", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+        }
+
+        // Content-Type per il MIME reale; se assente lo deriviamo dal formato
+        // richiesto (default mp3 -> audio/mpeg).
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| mime_from_audio_format(response_format).to_string());
+
+        // La risposta e' BINARIA: NON json(). Leggiamo i bytes.
+        let bytes = resp.bytes().await?.to_vec();
+        Ok((bytes, mime))
+    }
+}
+
+/// MIME audio dal `response_format` richiesto al TTS. Copre i formati emessi
+/// dall'API OpenAI Audio Speech. Default `audio/mpeg` (formato `mp3`, il default
+/// del provider). Funzione PURA (testabile).
+fn mime_from_audio_format(format: Option<&str>) -> &'static str {
+    match format.map(|f| f.trim().to_lowercase()).as_deref() {
+        Some("wav") => "audio/wav",
+        Some("opus") => "audio/opus",
+        Some("aac") => "audio/aac",
+        Some("flac") => "audio/flac",
+        Some("pcm") => "audio/pcm",
+        // mp3 o assente -> default mp3.
+        _ => "audio/mpeg",
+    }
 }
 
 /// MIME audio dall'estensione del filename multipart. Copre i formati accettati
@@ -1644,6 +1716,19 @@ mod tests {
         // Estensione non audio o assente -> None (default reqwest).
         assert_eq!(mime_from_filename("file.bin"), None);
         assert_eq!(mime_from_filename("senza_estensione"), None);
+    }
+
+    #[test]
+    fn mime_from_audio_format_mappa_formati_tts() {
+        assert_eq!(mime_from_audio_format(Some("mp3")), "audio/mpeg");
+        assert_eq!(mime_from_audio_format(Some("WAV")), "audio/wav");
+        assert_eq!(mime_from_audio_format(Some("opus")), "audio/opus");
+        assert_eq!(mime_from_audio_format(Some("aac")), "audio/aac");
+        assert_eq!(mime_from_audio_format(Some("flac")), "audio/flac");
+        assert_eq!(mime_from_audio_format(Some("pcm")), "audio/pcm");
+        // Formato assente o sconosciuto -> default mp3.
+        assert_eq!(mime_from_audio_format(None), "audio/mpeg");
+        assert_eq!(mime_from_audio_format(Some("xyz")), "audio/mpeg");
     }
 
     #[test]

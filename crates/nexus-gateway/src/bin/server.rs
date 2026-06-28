@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/stream", post(routes::stream))
         .route("/v1/images/generations", post(routes::generate_image))
         .route("/v1/audio/transcriptions", post(routes::transcribe_audio))
+        .route("/v1/audio/speech", post(routes::text_to_speech))
         .route("/v1/batch", post(routes::create_batch))
         .route("/v1/batch/:provider/:batch_id", get(routes::get_batch))
         .route("/admin/reload", post(routes::admin_reload))

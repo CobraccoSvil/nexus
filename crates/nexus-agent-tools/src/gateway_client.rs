@@ -441,6 +441,137 @@ pub async fn gateway_transcribe_audio(
     })
 }
 
+// ── Text-to-speech (delega al gateway: POST /v1/audio/speech) ────────────────
+
+/// Corpo di `POST /v1/audio/speech` (sottoinsieme usato dai tool del crate).
+/// Wire-compatibile con `GwTtsRequest` di mcp-core::nexus_gateway / `TtsRequest`
+/// del gateway: stesso contratto serde (`model`, `input`, `voice`,
+/// `response_format`, `pin_provider`, `metadata`). NON dipende da quel tipo per
+/// non introdurre un ciclo di crate (vedi nota di modulo).
+#[derive(Serialize)]
+struct GwTtsRequestBody {
+    model: String,
+    input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<String>,
+    /// Pin esplicito del provider deciso a monte (routing per capability nel
+    /// purpose `text_to_speech`): il gateway esegue ESATTAMENTE quel provider
+    /// senza secondo routing (parita' con `gateway_transcribe_audio`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin_provider: Option<String>,
+    metadata: GwMetadata,
+}
+
+/// Risposta di `POST /v1/audio/speech` (solo i campi consumati dal tool).
+#[derive(Deserialize)]
+struct GwTtsResponseBody {
+    #[serde(default)]
+    audio_base64: String,
+    #[serde(default)]
+    mime: String,
+    #[serde(default)]
+    model_used: String,
+    #[serde(default)]
+    provider_used: String,
+}
+
+/// Esito di una sintesi vocale al gateway: l'audio (base64) + il MIME prodotto +
+/// l'etichetta provider/model realmente eseguita.
+pub struct GwTtsOut {
+    /// Audio sintetizzato codificato base64 (il chiamante lo decodifica e salva).
+    pub audio_base64: String,
+    /// MIME dell'audio prodotto (es. `audio/mpeg`): per scegliere l'estensione.
+    pub mime: String,
+    /// Etichetta `provider/model` realmente eseguita dal gateway.
+    pub model_used: String,
+}
+
+/// Sintetizza in audio un testo via il gateway pinnando il provider deciso a monte
+/// dal purpose `text_to_speech` (regola G: provider/model gia' risolti, nessun
+/// modello hardcoded qui). Gemella di [`gateway_transcribe_audio`]: riusa la
+/// risoluzione porta/token del crate (regola L, niente routing duplicato) e
+/// rigira l'errore HTTP al chiamante (regola H: niente fallback inventato; se il
+/// provider non sintetizza il gateway risponde 5xx col motivo).
+///
+/// - `provider`/`model`: risolti dal purpose via routing.
+/// - `input`: testo da convertire in audio.
+/// - `voice`: timbro del modello TTS (es. `alloy`), opzionale.
+/// - `response_format`: formato audio (es. `mp3`, `wav`), opzionale.
+/// - `feature`: etichetta di tracciamento (di norma il nome del purpose).
+#[allow(clippy::too_many_arguments)]
+pub async fn gateway_text_to_speech(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    input: &str,
+    voice: Option<String>,
+    response_format: Option<String>,
+    feature: &str,
+) -> Result<GwTtsOut, String> {
+    let base_url = resolve_gateway_url(db).await;
+    let token = resolve_gateway_token();
+
+    let body = GwTtsRequestBody {
+        model: model.to_string(),
+        input: input.to_string(),
+        voice,
+        response_format,
+        pin_provider: Some(provider.to_string()),
+        metadata: GwMetadata {
+            feature: feature.to_string(),
+            ..Default::default()
+        },
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+
+    let resp = client
+        .post(format!("{base_url}/v1/audio/speech"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "gateway LLM irraggiungibile ({base_url}): {e}. \
+                 Verifica che il nexus-gateway sia attivo."
+            )
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "gateway /v1/audio/speech ha risposto HTTP {} ({provider}/{model}): {detail}",
+            status.as_u16()
+        ));
+    }
+
+    let parsed: GwTtsResponseBody = resp
+        .json()
+        .await
+        .map_err(|e| format!("risposta gateway tts non valida: {e}"))?;
+
+    let model_used = if parsed.model_used.is_empty() {
+        format!("{provider}/{model}")
+    } else if parsed.provider_used.is_empty() {
+        parsed.model_used
+    } else {
+        format!("{}/{}", parsed.provider_used, parsed.model_used)
+    };
+
+    Ok(GwTtsOut {
+        audio_base64: parsed.audio_base64,
+        mime: parsed.mime,
+        model_used,
+    })
+}
+
 // ── Batch API (delega al gateway: POST /v1/batch + GET stato/risultati) ──────
 
 /// Singola richiesta di un batch: `custom_id` + system/user prompt risolti dal

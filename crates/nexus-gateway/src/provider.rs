@@ -11,7 +11,7 @@ use futures::stream::BoxStream;
 
 use crate::types::{
     ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, SensitivityTier,
-    TranscribeRequest, TranscribeResponse,
+    TranscribeRequest, TranscribeResponse, TtsRequest, TtsResponse,
 };
 
 /// Stream di chunk prodotto da un provider in modalita' streaming. Ogni
@@ -97,5 +97,23 @@ pub trait LlmProvider: Send + Sync {
         _req: &TranscribeRequest,
     ) -> anyhow::Result<TranscribeResponse> {
         anyhow::bail!("{}: transcription non supportata", self.name())
+    }
+
+    /// Se il provider supporta la sintesi vocale (text-to-speech).
+    ///
+    /// Default impl: `false`. I provider che la implementano lo sovrascrivono e
+    /// forniscono [`Self::text_to_speech`]. Permette al routing audio-out di
+    /// scegliere solo i provider capaci (regola H: niente delega silenziosa a un
+    /// provider che non produce audio). Gemello di [`Self::supports_audio_in`].
+    fn supports_audio_out(&self) -> bool {
+        false
+    }
+
+    /// Sintetizza in audio il testo della richiesta. Default impl: errore
+    /// esplicito (regola H, come [`Self::transcribe_audio`]): un provider che non
+    /// dichiara `supports_audio_out()` non deve mai essere chiamato; se accade,
+    /// fallisce visibilmente invece di restituire un risultato vuoto.
+    async fn text_to_speech(&self, _req: &TtsRequest) -> anyhow::Result<TtsResponse> {
+        anyhow::bail!("{}: text-to-speech non supportata", self.name())
     }
 }

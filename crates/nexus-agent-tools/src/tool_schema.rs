@@ -1353,6 +1353,19 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_text_to_speech",
+    "description": "Converte un testo in un file audio (text-to-speech) e lo salva nel progetto sotto .nexus/generated/. Usalo quando l'utente chiede di leggere/pronunciare un testo, generare una voce, una nota vocale o un audio parlato. Il modello audio-out e' scelto dal sistema (purpose text_to_speech): non specificare nomi modello. Ritorna audio_path e model_used.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "text": {"type": "string", "description": "Testo da convertire in audio."},
+        "voice": {"type": "string", "description": "Voce/timbro del modello TTS (es. 'alloy', 'nova'), opzionale: se omessa usa il default del provider."},
+        "filename": {"type": "string", "description": "Nome file desiderato (senza estensione/directory), opzionale: se omesso usa un nome timestampato. L'estensione e' decisa dal sistema in base al formato audio."}
+      },
+      "required": ["text"]
+    }
+  },
+  {
     "name": "nexus_visual_compare",
     "description": "Confronta screenshot dell'app locale con design Figma via vision model. Ritorna similarity_score (0-100), differences[], screenshot_path. Usa per iterare layout/stile fino a soglia (default 85).",
     "input_schema": {

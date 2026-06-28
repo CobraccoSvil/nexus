@@ -19,7 +19,7 @@ use crate::provider::{ChunkStream, LlmProvider};
 use crate::providers::openai_compat::{OpenAiCompatClient, ReasoningDialect, ResolvedReasoning};
 use crate::types::{
     ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, SensitivityTier, TranscribeRequest,
-    TranscribeResponse,
+    TranscribeResponse, TtsRequest, TtsResponse,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -197,6 +197,35 @@ impl LlmProvider for OpenAiProvider {
             .transcribe(&req.model, audio_bytes, &filename, req.language.as_deref())
             .await
     }
+
+    fn supports_audio_out(&self) -> bool {
+        true
+    }
+
+    /// Delega al trasporto condiviso (`POST /audio/speech`, JSON in -> bytes out):
+    /// stesso client HTTP/auth della chat (regola L). Il modello (es.
+    /// `gpt-4o-mini-tts`, `tts-1`) arriva dal chiamante (regola G). I bytes audio
+    /// vengono codificati base64 per il contratto JSON del gateway.
+    async fn text_to_speech(&self, req: &TtsRequest) -> anyhow::Result<TtsResponse> {
+        let start = std::time::Instant::now();
+        let (bytes, mime) = self
+            .client
+            .speech(
+                &req.model,
+                &req.input,
+                req.voice.as_deref(),
+                req.response_format.as_deref(),
+            )
+            .await?;
+        let latency_ms = start.elapsed().as_millis() as u64;
+        Ok(TtsResponse {
+            audio_base64: B64.encode(&bytes),
+            mime,
+            model_used: req.model.clone(),
+            provider_used: self.name().to_string(),
+            latency_ms,
+        })
+    }
 }
 
 /// Nome file multipart per l'audio, derivato dal MIME dichiarato. OpenAI usa
@@ -232,9 +261,10 @@ mod tests {
         assert!(p.supports_streaming());
         assert_eq!(p.max_context_tokens(), 128_000);
         assert_eq!(p.tier_compatibility(), &[0, 1, 2]);
-        // Capability media: OpenAI genera immagini e trascrive audio.
+        // Capability media: OpenAI genera immagini, trascrive e sintetizza audio.
         assert!(p.supports_image_gen());
         assert!(p.supports_audio_in());
+        assert!(p.supports_audio_out());
     }
 
     #[test]
