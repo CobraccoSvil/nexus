@@ -127,10 +127,12 @@ pub(crate) struct EligibilityFilter<'a> {
     /// `true` => `AND supports_tool_use = TRUE` (path agentico).
     pub require_tool_use: bool,
     /// `true` => `AND agentic_thinking_policy <> 'exclude'` e abilita il
-    /// pre-ordinamento `(agentic_thinking_policy = 'none') DESC` (ADR 0025:
-    /// nei tool-loop il non-thinking nativo e' piu' affidabile sotto
-    /// `tool_choice` forzato). Per il path non-agentico (vision/embedding) il
-    /// concetto di thinking non si applica -> `false`, niente pre-ordinamento.
+    /// TIE-BREAKER `(agentic_thinking_policy = 'none') DESC` come ULTIMO criterio
+    /// di ORDER BY (ADR 0025, declassato: era pre-ordinamento PRIMARIO, ma con i
+    /// modelli forti moderni ormai tutti dual-mode escludeva i migliori a favore
+    /// dei completion/legacy; l'affidabilita' sotto `tool_choice` e' garantita dal
+    /// gateway). Per il path non-agentico (vision/embedding) il thinking non si
+    /// applica -> `false`, niente tie-breaker.
     pub require_thinking_non_exclude: bool,
     /// Capability richiesta. Le capability con una COLONNA canonica dedicata
     /// (vision + i media kind image_gen/audio_in/audio_out/video_gen, mig 0478)
@@ -182,8 +184,8 @@ fn is_media_capability(capability: &str) -> bool {
 ///
 /// Prova i tier di `tier_chain` in ordine (degradazione); il PRIMO tier con
 /// almeno un candidato eleggibile vince (corto-circuito). Entro quel tier
-/// ordina per `order_by` (preceduto da `(agentic_thinking_policy='none') DESC`
-/// se `require_thinking_non_exclude`) e ritorna i primi `limit`. `tier_chain`
+/// ordina per `order_by` (SEGUITO dal tie-breaker `(agentic_thinking_policy='none')
+/// DESC` se `require_thinking_non_exclude`) e ritorna i primi `limit`. `tier_chain`
 /// vuoto = qualunque tier (singola query).
 ///
 /// Punto unico (regola L) della WHERE di eleggibilita' del path live: prima
@@ -271,11 +273,23 @@ pub(crate) async fn select_models_tierchain(
             idx += 1;
             sql.push_str(&format!(" AND context_window >= ${idx}"));
         }
+        // ORDER BY: capacita'/costo (`order_by`) e' il criterio PRIMARIO. Il
+        // pre-ordinamento ADR 0025 (preferire i modelli nativamente non-thinking,
+        // `policy='none'`) e' declassato a TIE-BREAKER finale. Razionale (regola H,
+        // causa radice): i modelli forti moderni sono ORMAI TUTTI dual-mode
+        // (`disable_for_tools`: claude opus/sonnet, gpt-5.x, deepseek-v4), mentre i
+        // `none` rimasti sono i completion/legacy deboli (deepseek-coder/chat,
+        // codestral, gpt-4.1). Con `none` come criterio PRIMARIO il routing agentico
+        // sceglieva sistematicamente i modelli peggiori. L'affidabilita' sotto
+        // `tool_choice` forzato e' garantita a monte dal gateway (disabilita il
+        // thinking quando ci sono tool, vedi nexus-gateway providers). Resta come
+        // SPAREGGIO a parita' di `order_by` (preferenza conservata dove non costa).
         sql.push_str(" ORDER BY ");
+        sql.push_str(order_by);
         if filter.require_thinking_non_exclude {
-            sql.push_str("(agentic_thinking_policy = 'none') DESC, ");
+            sql.push_str(", (agentic_thinking_policy = 'none') DESC");
         }
-        sql.push_str(&format!("{order_by} LIMIT {limit}"));
+        sql.push_str(&format!(" LIMIT {limit}"));
 
         let mut q = sqlx::query_as::<_, (String, String)>(&sql).bind(&excluded);
         if let Some(t) = tier {
@@ -498,8 +512,8 @@ mod tests {
     #[sqlx::test]
     async fn tierchain_preferisce_policy_none_su_dual_mode(pool: sqlx::PgPool) {
         create_catalog_table(&pool).await;
-        // Stesso costo: deve vincere il nativamente non-thinking (policy='none')
-        // grazie al pre-ordinamento (ADR 0025).
+        // Stesso costo: il TIE-BREAKER (policy='none' DESC, ultimo criterio dopo
+        // order_by) fa vincere il nativamente non-thinking A PARITA' di order_by.
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
@@ -527,6 +541,44 @@ mod tests {
         .await
         .expect("ok");
         assert_eq!(out, vec![("b".to_string(), "nativo".to_string())]);
+    }
+
+    #[sqlx::test]
+    async fn tierchain_capacita_costo_vince_sul_tiebreaker_thinking(pool: sqlx::PgPool) {
+        create_catalog_table(&pool).await;
+        // REGRESSIONE (fix routing agentico, regola H): con i modelli forti moderni
+        // tutti dual-mode ('disable_for_tools') e i 'none' rimasti deboli/legacy, il
+        // criterio PRIMARIO deve essere order_by (qui: costo), NON la policy thinking.
+        // Il forte ed economico ('forte', disable_for_tools, 0.14) deve battere il
+        // debole piu' caro ('debole', none, 1.0): col vecchio pre-ordinamento PRIMARIO
+        // avrebbe vinto 'debole' (causa radice di "agentic usa deepseek-coder").
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
+             ('a', 'forte', true, 'disable_for_tools', 'medium', 0.14), \
+             ('b', 'debole', true, 'none', 'medium', 1.0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let f = EligibilityFilter {
+            require_tool_use: true,
+            require_thinking_non_exclude: true,
+            capability: None,
+            min_context_window: 0,
+            exclude_providers: &[],
+            apply_cooldown: false,
+        };
+        let out = select_models_tierchain(
+            &pool,
+            &f,
+            &["medium"],
+            "input_cost_per_million_tokens ASC",
+            1,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(out, vec![("a".to_string(), "forte".to_string())]);
     }
 
     #[sqlx::test]

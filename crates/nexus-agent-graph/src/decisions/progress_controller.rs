@@ -301,19 +301,25 @@ dato diverso, fai UNA lettura su un bersaglio DIVERSO, non la stessa."
     )
 }
 
-/// Nudge per la lettura ripetuta su un turno ACTION-ORIENTED (task di modifica/fix):
-/// l'agente ha gia' ispezionato il file, ripeterne la lettura non avvicina al
+/// Nudge per la lettura ripetuta su un turno ACTION-ORIENTED (task operativo):
+/// l'agente ha gia' ispezionato il bersaglio, ripeterne la lettura non avvicina al
 /// risultato. Diversamente dal ramo informativo, qui la chiusura con testo sarebbe
-/// una RINUNCIA (0 file modificati su un task di fix): il nudge orienta all'EDIT.
-/// Mantiene l'anti-loop (NON ri-leggere identico), ma verso l'AZIONE, non la resa.
+/// una RINUNCIA (0 azioni su un task operativo): il nudge orienta all'AZIONE concreta.
+/// L'azione risolutiva NON e' sempre un edit: molti task si chiudono con `run_command`
+/// (installare una dipendenza, avviare/riavviare un servizio, lanciare build/test/
+/// migrazioni). Orientare solo a edit_file lasciava l'agente bloccato sui task "comando"
+/// (incidente Playwright "Failed to install browsers": 6 iter di sola search -> ABORT a
+/// 0 azioni). Mantiene l'anti-loop (NON ri-leggere identico), ma verso l'AZIONE.
 fn repeated_read_only_action_nudge(label: &str, count: i64) -> String {
     format!(
         "STOP: hai gia' letto/ispezionato lo stesso bersaglio ({label}) {count} volte. \
 Il contenuto e' GIA' nel contesto sopra: rileggerlo non avvicina al risultato. Questo \
-e' un task di MODIFICA, non una domanda: NON rileggere e NON rispondere a parole \
-descrivendo cosa faresti. ORA APPLICA la correzione con edit_file/write_file sul file \
-gia' letto. Se ti serve davvero un dettaglio diverso fai UNA lettura su un bersaglio \
-DIVERSO, poi procedi subito con l'edit."
+e' un task OPERATIVO, non una domanda: NON rileggere e NON rispondere a parole \
+descrivendo cosa faresti. ORA ESEGUI l'azione che risolve il task: edit_file/write_file \
+se va modificato un file, oppure run_command se va eseguito un comando (installare una \
+dipendenza mancante, avviare/riavviare un servizio, lanciare build, test o migrazioni). \
+Se ti serve davvero un dettaglio diverso fai UNA lettura su un bersaglio DIVERSO, poi \
+procedi subito con l'azione."
     )
 }
 
@@ -687,12 +693,15 @@ mod tests {
             "su un task di fix la lettura ripetuta deve forzare l'edit, non rinunciare"
         );
         let nudge = d.nudge_text.as_deref().unwrap();
-        // Orienta all'azione concreta (edit), NON alla chiusura testuale.
+        // Orienta all'azione concreta (edit O comando), NON alla chiusura testuale.
         assert!(
-            nudge.contains("APPLICA la correzione"),
-            "atteso nudge orientato all'edit, ottenuto: {nudge}"
+            nudge.contains("ESEGUI l'azione"),
+            "atteso nudge orientato all'azione, ottenuto: {nudge}"
         );
         assert!(nudge.contains("edit_file/write_file"));
+        // Copre anche i task che si risolvono con un COMANDO (installazioni, build,
+        // restart): orientare solo a edit_file bloccava i task "comando" (Playwright).
+        assert!(nudge.contains("run_command"));
         // NON deve orientare alla risposta a parole (sarebbe la rinuncia).
         assert!(
             !nudge.contains("Rispondi ORA a parole"),

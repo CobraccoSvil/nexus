@@ -449,7 +449,22 @@ pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str 
                 "medium"
             }
         }
-        "deepseek" => "medium",
+        "deepseek" => {
+            // Distinzione di CAPACITA' reale (regola H, causa radice "agentic usa
+            // deepseek-coder"): deepseek-coder e deepseek-chat sono modelli
+            // completion/chat LEGACY (V2/V3) -> 'light'. Tenerli a 'medium' li
+            // metteva nello stesso pool agentico dei reasoning V4 e, essendo
+            // policy='none', li scavalcavano. I V4 sono i forti: pro -> 'heavy',
+            // flash (1M ctx, veloce) -> 'medium'.
+            if m.contains("coder") || m.contains("chat") {
+                "light"
+            } else if m.contains("pro") {
+                "heavy"
+            } else {
+                // deepseek-v4-flash, reasoner e successivi.
+                "medium"
+            }
+        }
         _ => "medium",
     }
 }
@@ -607,12 +622,20 @@ pub(crate) fn classify_capabilities(
     let uses_thinking_mode = is_reasoning_signal || is_hybrid_agentic(&p, &m) || gemini_25_thinking;
 
     // Policy agentica canonica (ADR 0025):
-    //   - exclude: reasoning-only SENZA function calling (deepseek-reasoner).
+    //   - exclude: NON eleggibile per i run agentici (tool-loop). Due casi:
+    //     (1) reasoning-only SENZA function calling (deepseek-reasoner);
+    //     (2) modelli COMPLETION/CHAT LEGACY tool-capable ma inadatti ai tool-loop
+    //         complessi (deepseek-coder = V2 completion, deepseek-chat = V3). Sui
+    //         task a tier light + capability 'code' (fix/fix_semplice/test) questi
+    //         'none' legacy scavalcavano i V4 reasoning (causa radice "agentic usa
+    //         deepseek-coder"). Restano eleggibili per i path NON agentici.
     //   - native:  reasoning con tool nativi (OpenAI o-series).
     //   - disable_for_tools: dual-mode (deepseek-v4, magistral, gemini-pro, claude
     //     opus/sonnet, qualunque thinking tool-capable) -> non-thinking nei tool-loop.
     //   - none: modello non-thinking standard.
-    let agentic_thinking_policy: &'static str = if p == "deepseek" && m.contains("reasoner") {
+    let agentic_thinking_policy: &'static str = if p == "deepseek"
+        && (m.contains("reasoner") || m.contains("coder") || m.contains("chat"))
+    {
         "exclude"
     } else if p == "openai" && reasoning_only_family {
         "native"
@@ -1965,6 +1988,13 @@ mod tests {
         };
         // Reasoning-only senza function calling -> exclude.
         assert_eq!(p("deepseek", "deepseek-reasoner"), "exclude");
+        // Legacy completion/chat: esclusi dall'agentico (inadatti ai tool-loop),
+        // restano per i path non-agentici.
+        assert_eq!(p("deepseek", "deepseek-coder"), "exclude");
+        assert_eq!(p("deepseek", "deepseek-chat"), "exclude");
+        // I V4 reasoning dual-mode restano eleggibili (disable_for_tools).
+        assert_eq!(p("deepseek", "deepseek-v4-flash"), "disable_for_tools");
+        assert_eq!(p("deepseek", "deepseek-v4-pro"), "disable_for_tools");
         // OpenAI o-series: tool nativi -> native.
         assert_eq!(p("openai", "o3-mini"), "native");
         // Dual-mode (thinking + tool-capable) -> disable_for_tools.
