@@ -102,6 +102,19 @@ pub fn has_productive_action_in_history(messages: &[Message]) -> bool {
         .any(|name| !EXPLORATION_ONLY_TOOLS.contains(&name))
 }
 
+/// Come [`has_productive_action_in_history`] ma limitata agli ULTIMI `lookback`
+/// messaggi: distingue "il run sta producendo lavoro ADESSO" da "ha agito all'inizio
+/// e ora gira a vuoto". Usata dal gate G1 loop-conclamato per NON abortire un run che
+/// ha appena eseguito azioni concrete (anti falso-negativo, regola H): un run reale
+/// aveva installato i browser Playwright + system-deps e fatto passare il test E2E,
+/// ma il gate lessicale "non compiuto" (su detect_unfulfilled_intent della NARRAZIONE)
+/// lo abortiva ignorando i 16 tool riusciti, sostituendo il successo con un messaggio
+/// di resa. Il segnale STRUTTURALE (tool produttivi recenti) prevale sul lessicale.
+pub fn has_recent_productive_action(messages: &[Message], lookback: usize) -> bool {
+    let start = messages.len().saturating_sub(lookback);
+    has_productive_action_in_history(&messages[start..])
+}
+
 /// Riepilogo conciso dei tool eseguiti nella history, per nome con conteggio:
 /// es. "5 azioni (write_file x3, run_command x2)". `None` se nessun tool_use.
 /// Punto unico (regola L) del riepilogo-lavoro: l'executor lo allega al messaggio

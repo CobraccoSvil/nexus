@@ -174,7 +174,7 @@ use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::routing::signals::{
     count_recent_request_port, detect_recent_tool_error, detect_repeated_action_detailed,
     detect_repeated_failed_command, detect_unfulfilled_intent, has_active_resources_in_history,
-    has_tool_calls_in_history, EXPLORATION_ONLY_TOOLS,
+    has_recent_productive_action, has_tool_calls_in_history, EXPLORATION_ONLY_TOOLS,
 };
 use crate::runtime::ports::{
     AgentStepStore, BillingCooldownPort, EscalationPort, LlmMessage, LlmRequest, MetaStepStore,
@@ -694,8 +694,24 @@ piu' specifico, oppure riprova con un modello piu' capace.",
             .g1_max_nudges
             .saturating_mul(4)
             .saturating_mul(g1_escal_now + 1);
-        let g1_cap_effective =
-            g1.cap_reached || (unfulfilled_for_g1 && iters_in >= g1_loop_threshold);
+        // Anti falso-negativo (regola H): il ramo "loop conclamato" si basa su
+        // `unfulfilled_for_g1`, che lato Rust ricade SEMPRE sul fallback LESSICALE
+        // `detect_unfulfilled_intent` (giudica la NARRAZIONE: "sto verificando...",
+        // "procedo a...") perche' `closure_verdict` non e' popolato nel grafo nativo.
+        // Senza guardia, un run che ha PRODOTTO lavoro (es. installato system-deps +
+        // browser e fatto passare i test E2E) veniva abortito a `iters>=soglia` solo
+        // perche' l'ultimo testo "sembrava" non compiuto, sostituendo il successo con
+        // un messaggio di resa. Il segnale STRUTTURALE prevale: NON chiudere come loop
+        // se nelle ultime iterazioni c'e' stato lavoro produttivo (tool non-esplorazione).
+        // Il cap re-entry "pulito" (`g1.cap_reached`) resta intatto; la safety net
+        // finale e' sempre `iteration_cap`. Lookback in messaggi (~5-6 iterazioni:
+        // AI tool_use + tool_result), ampio da non scattare su un run che ha appena
+        // agito, stretto da non mascherare un loop davvero a vuoto.
+        const G1_LOOP_PRODUCTIVE_LOOKBACK: usize = 16;
+        let g1_recent_productive =
+            has_recent_productive_action(&messages, G1_LOOP_PRODUCTIVE_LOOKBACK);
+        let g1_cap_effective = g1.cap_reached
+            || (unfulfilled_for_g1 && iters_in >= g1_loop_threshold && !g1_recent_productive);
         if matches!(head_gate(false, false, 0, g1_cap_effective), HeadGate::G1Cap) {
             // ESCALATION orchestratore (py:1962-1993): prima di arrenderci, l'
             // orchestratore PROMUOVE il turno a un modello piu' capace (catena DB

@@ -887,11 +887,11 @@ async fn lettura_ripetuta_identica_action_oriented_orienta_all_edit() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let _ = apply(state, delta);
     let req = llm.seen.lock().unwrap().last().cloned().unwrap();
-    // Nudge orientato all'EDIT iniettato, NON quello "rispondi a parole".
+    // Nudge orientato all'AZIONE iniettato, NON quello "rispondi a parole".
     let has_edit_nudge = req.messages.iter().any(|m| {
-        matches!(&m.content, Value::String(s) if s.contains("APPLICA la correzione"))
+        matches!(&m.content, Value::String(s) if s.contains("ESEGUI l'azione"))
     });
-    assert!(has_edit_nudge, "atteso nudge orientato all'edit per la lettura ripetuta su un fix");
+    assert!(has_edit_nudge, "atteso nudge orientato all'azione per la lettura ripetuta su un fix");
     let has_concludi = req.messages.iter().any(|m| {
         matches!(&m.content, Value::String(s) if s.contains("Rispondi ORA a parole"))
     });
