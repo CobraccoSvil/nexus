@@ -9,7 +9,9 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use crate::types::{LlmRequest, LlmResponse, LlmStreamChunk, SensitivityTier};
+use crate::types::{
+    ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, SensitivityTier,
+};
 
 /// Stream di chunk prodotto da un provider in modalita' streaming. Ogni
 /// elemento e' un chunk valido oppure un errore di trasporto/parsing.
@@ -55,5 +57,23 @@ pub trait LlmProvider: Send + Sync {
     /// rete/auth ritorna `Err` (il chiamante aggrega best-effort).
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         Ok(vec![])
+    }
+
+    /// Se il provider supporta la generazione di immagini (text-to-image).
+    ///
+    /// Default impl: `false`. I provider che la implementano lo sovrascrivono e
+    /// forniscono [`Self::generate_image`]. Permette al routing image-gen di
+    /// scegliere solo i provider capaci (regola H: niente delega silenziosa a un
+    /// provider che non genera immagini).
+    fn supports_image_gen(&self) -> bool {
+        false
+    }
+
+    /// Genera una o piu' immagini dal `prompt`. Default impl: errore esplicito
+    /// (regola H, come `create_batch_google` ritorna 501): un provider che non
+    /// dichiara `supports_image_gen()` non deve mai essere chiamato; se accade,
+    /// fallisce visibilmente invece di restituire un risultato vuoto.
+    async fn generate_image(&self, _req: &ImageGenRequest) -> anyhow::Result<ImageGenResponse> {
+        anyhow::bail!("{}: image-generation non supportata", self.name())
     }
 }

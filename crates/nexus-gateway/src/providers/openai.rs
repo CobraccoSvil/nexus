@@ -16,7 +16,7 @@ use sqlx::PgPool;
 
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::providers::openai_compat::{OpenAiCompatClient, ReasoningDialect, ResolvedReasoning};
-use crate::types::{LlmRequest, LlmResponse, SensitivityTier};
+use crate::types::{ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, SensitivityTier};
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
 const TIERS: &[SensitivityTier] = &[0, 1, 2];
@@ -157,6 +157,19 @@ impl LlmProvider for OpenAiProvider {
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         self.client.list_models().await
+    }
+
+    fn supports_image_gen(&self) -> bool {
+        true
+    }
+
+    /// Delega al trasporto condiviso (`POST /images/generations`): stesso client
+    /// HTTP/auth della chat (regola L). Il modello (es. `gpt-image-1`) arriva dal
+    /// chiamante (regola G).
+    async fn generate_image(&self, req: &ImageGenRequest) -> anyhow::Result<ImageGenResponse> {
+        self.client
+            .images_generations(&req.model, &req.prompt, req.n, req.size.as_deref())
+            .await
     }
 }
 

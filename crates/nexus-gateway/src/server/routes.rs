@@ -42,7 +42,7 @@ use crate::provider::LlmProvider;
 use crate::providers::is_billing_error;
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
-use crate::types::{LlmRequest, LlmResponse};
+use crate::types::{ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, RequestMetadata};
 
 use super::billing::{enforce_quota, record_usage_to_ledger, QuotaExceeded};
 use super::bootstrap::{build_runtime, GatewayConfig};
@@ -614,6 +614,145 @@ async fn build_sse_stream(
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
+// ── Image generation ─────────────────────────────────────────────────────────
+
+/// `POST /v1/images/generations` (auth richiesta): genera immagini con il
+/// provider scelto. Risolve il provider (pin esplicito oppure il primo sano che
+/// dichiara `supports_image_gen()`), enforce quota PRIMA della chiamata, delega a
+/// `provider.generate_image`. Ritorna [`ImageGenResponse`].
+///
+/// Routing: volutamente SEMPLICE (il routing per-capability fine vive in
+/// mcp-core, regola L): con `pin_provider` esegue quel provider; senza pin sceglie
+/// il primo provider image-capable non in cooldown. Nessun fallback cross-provider
+/// in questo PR.
+///
+/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e non
+/// si applica all'image-gen, il cui costo e' per-immagine (non riportato in token
+/// dai provider). Per non INVENTARE costi (regola G/H: niente fallback nascosto),
+/// in questo PR il ledger NON viene scritto per le immagini. TODO PR successiva:
+/// estendere il billing con un costo per-immagine censito in `ai_price_catalog`.
+pub async fn generate_image(
+    State(state): State<AppState>,
+    Json(body): Json<ImageGenRequest>,
+) -> Response {
+    if body.prompt.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "prompt required" })),
+        )
+            .into_response();
+    }
+    match run_generate_image(&state, &body).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Pipeline image-gen: risolve provider image-capable, enforce quota, genera.
+async fn run_generate_image(
+    state: &AppState,
+    body: &ImageGenRequest,
+) -> Result<ImageGenResponse, PipelineError> {
+    let providers = state.runtime_snapshot().await.providers;
+
+    // Risoluzione provider (punto unico testabile, regola L): pin esplicito o
+    // primo image-capable non in cooldown.
+    let provider = select_image_provider(
+        &providers,
+        body.pin_provider.as_deref(),
+        &state.cooldown,
+    )?;
+    let model = strip_model_prefix(&body.model);
+
+    // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
+    // provider+model, regola L): stima dal prompt come singolo messaggio user.
+    let quota_req = image_gen_to_llm_request(body, &model);
+    enforce_quota(&state.db, &quota_req, provider.name(), &model)
+        .await
+        .map_err(|e| {
+            if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
+                PipelineError::quota(&q.scope, &q.reason)
+            } else {
+                PipelineError::provider(format!("quota check fallito: {e}"))
+            }
+        })?;
+
+    // Richiesta col modello reale risolto per il provider.
+    let mut req = body.clone();
+    req.model = model;
+
+    provider
+        .generate_image(&req)
+        .await
+        .map_err(|e| PipelineError::provider(e.to_string()))
+}
+
+/// Seleziona il provider per l'image-gen (punto unico, regola L). Con `pin`:
+/// ESATTAMENTE quel provider, che DEVE essere configurato e image-capable
+/// (regola H: errore esplicito, niente delega a chi non genera immagini, niente
+/// ripiego silenzioso). Senza pin: il PRIMO provider image-capable non in
+/// cooldown. Nessun fallback cross-provider in questo PR.
+fn select_image_provider(
+    providers: &[Arc<dyn LlmProvider>],
+    pin: Option<&str>,
+    cooldown: &CooldownManager,
+) -> Result<Arc<dyn LlmProvider>, PipelineError> {
+    if let Some(pin) = pin {
+        let Some(p) = providers.iter().find(|p| p.name() == pin) else {
+            return Err(PipelineError::provider(format!(
+                "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
+            )));
+        };
+        if !p.supports_image_gen() {
+            return Err(PipelineError::provider(format!(
+                "provider \"{pin}\" non supporta la generazione di immagini"
+            )));
+        }
+        return Ok(p.clone());
+    }
+    providers
+        .iter()
+        .find(|p| p.supports_image_gen() && !cooldown.is_in_cooldown(p.name()))
+        .cloned()
+        .ok_or_else(|| {
+            PipelineError::provider("nessun provider sano supporta la generazione di immagini")
+        })
+}
+
+/// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` a partire da
+/// una [`ImageGenRequest`]: il prompt diventa l'unico messaggio user (cosi' la
+/// stima char/4 di `estimate_prompt_tokens` resta coerente col punto unico
+/// billing). Nessun `max_tokens` (le immagini non hanno completion in token).
+fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
+    use crate::types::{LlmMessage, MessageContent};
+    LlmRequest {
+        model: model.to_string(),
+        messages: vec![LlmMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text(body.prompt.clone()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+        }],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        response_format: None,
+        stream: None,
+        thinking: None,
+        tool_choice: None,
+        pin_provider: body.pin_provider.clone(),
+        metadata: RequestMetadata {
+            tenant_id: body.metadata.tenant_id.clone(),
+            user_id: body.metadata.user_id.clone(),
+            request_id: body.metadata.request_id.clone(),
+            sensitivity_tier: body.metadata.sensitivity_tier,
+            feature: body.metadata.feature.clone(),
+        },
+    }
+}
+
 // ── Batch API ────────────────────────────────────────────────────────────────
 
 /// Base URL Anthropic per le chiamate batch. Allineata al provider non-batch
@@ -923,6 +1062,8 @@ mod tests {
         /// Esito di `list_models`: `Some(Ok(..))` lista live, `Some(Err(..))`
         /// fallimento simulato, `None` => default del trait (lista vuota).
         models_result: Option<Result<Vec<String>, String>>,
+        /// Se il provider dichiara `supports_image_gen()` (default `false`).
+        image_capable: bool,
     }
 
     impl FakeProvider {
@@ -932,6 +1073,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 models_result: None,
+                image_capable: false,
             })
         }
 
@@ -942,6 +1084,18 @@ mod tests {
                 behaviour: Behaviour::Ok,
                 calls: AtomicUsize::new(0),
                 models_result: Some(models_result),
+                image_capable: false,
+            })
+        }
+
+        /// Variante image-capable per i test di routing image-gen.
+        fn image(name: &str, behaviour: Behaviour) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                behaviour,
+                calls: AtomicUsize::new(0),
+                models_result: None,
+                image_capable: true,
             })
         }
     }
@@ -997,6 +1151,28 @@ mod tests {
                 Some(Ok(m)) => Ok(m.clone()),
                 Some(Err(e)) => anyhow::bail!("{e}"),
                 None => Ok(vec![]),
+            }
+        }
+        fn supports_image_gen(&self) -> bool {
+            self.image_capable
+        }
+        async fn generate_image(
+            &self,
+            req: &ImageGenRequest,
+        ) -> anyhow::Result<ImageGenResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behaviour {
+                Behaviour::Ok => Ok(ImageGenResponse {
+                    images: vec![crate::types::GeneratedImage {
+                        b64_json: Some("AAAA".to_string()),
+                        url: None,
+                        mime: None,
+                    }],
+                    model_used: req.model.clone(),
+                    provider_used: self.name.clone(),
+                    latency_ms: 0,
+                }),
+                Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
             }
         }
     }
@@ -1214,5 +1390,91 @@ mod tests {
         assert_eq!(openai.calls.load(Ordering::SeqCst), 0);
         // Il fallimento ha marcato anthropic in cooldown (billing).
         assert!(cooldown.is_in_cooldown("anthropic"));
+    }
+
+    // ── Routing image generation ─────────────────────────────────────────────
+
+    #[test]
+    fn select_image_provider_senza_pin_sceglie_primo_image_capable_sano() {
+        // openai NON image-capable, google image-capable: senza pin vince google.
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let google: Arc<dyn LlmProvider> = FakeProvider::image("google", Behaviour::Ok);
+        let built = vec![openai, google];
+        let cooldown = CooldownManager::new();
+        let p = select_image_provider(&built, None, &cooldown).unwrap();
+        assert_eq!(p.name(), "google");
+    }
+
+    #[test]
+    fn select_image_provider_senza_pin_salta_quello_in_cooldown() {
+        let openai: Arc<dyn LlmProvider> = FakeProvider::image("openai", Behaviour::Ok);
+        let google: Arc<dyn LlmProvider> = FakeProvider::image("google", Behaviour::Ok);
+        let built = vec![openai, google];
+        let cooldown = CooldownManager::new();
+        cooldown.mark_billing("openai", Some("credit balance too low".into()));
+        // openai image-capable ma in cooldown -> vince google.
+        let p = select_image_provider(&built, None, &cooldown).unwrap();
+        assert_eq!(p.name(), "google");
+    }
+
+    #[test]
+    fn select_image_provider_senza_capable_e_errore() {
+        // Nessun provider image-capable -> errore esplicito (regola H).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let built = vec![openai];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_image_provider(&built, None, &cooldown) else {
+            panic!("senza provider image-capable deve fallire");
+        };
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("nessun provider"));
+    }
+
+    #[test]
+    fn select_image_provider_pin_non_capable_e_errore_non_fallback() {
+        // Pin su openai (non image-capable) anche se google capable e' presente:
+        // errore esplicito, niente ripiego su google (regola G/H).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let google: Arc<dyn LlmProvider> = FakeProvider::image("google", Behaviour::Ok);
+        let built = vec![openai, google];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_image_provider(&built, Some("openai"), &cooldown) else {
+            panic!("pin su provider non image-capable deve fallire");
+        };
+        assert!(err.message.contains("non supporta"));
+    }
+
+    #[test]
+    fn select_image_provider_pin_non_configurato_e_errore() {
+        let google: Arc<dyn LlmProvider> = FakeProvider::image("google", Behaviour::Ok);
+        let built = vec![google];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_image_provider(&built, Some("openai"), &cooldown) else {
+            panic!("pin su provider non configurato deve fallire");
+        };
+        assert!(err.message.contains("openai"));
+    }
+
+    #[tokio::test]
+    async fn fake_provider_genera_immagine() {
+        let google = FakeProvider::image("google", Behaviour::Ok);
+        let req = ImageGenRequest {
+            model: "imagen-3.0".into(),
+            prompt: "un gatto".into(),
+            n: Some(1),
+            size: None,
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "image".into(),
+            },
+        };
+        let out = google.generate_image(&req).await.unwrap();
+        assert_eq!(out.provider_used, "google");
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].b64_json.as_deref(), Some("AAAA"));
     }
 }

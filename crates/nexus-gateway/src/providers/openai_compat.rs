@@ -22,8 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::provider::ChunkStream;
 use crate::types::{
-    LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage, ToolCallDelta,
-    ToolCallDeltaFunction, ToolFunctionCall,
+    GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
+    LlmUsage, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall,
 };
 
 /// Dialetto di reasoning di un endpoint OpenAI-compatibile. Centralizza (regola
@@ -275,6 +275,83 @@ impl OpenAiCompatClient {
         }
         let body: serde_json::Value = resp.json().await?;
         Ok(parse_models_response(&body))
+    }
+
+    /// Genera immagini via `POST {base_url}/images/generations` (dialetto OpenAI
+    /// Images). Punto unico del trasporto image-gen OpenAI-compatibile (regola L):
+    /// stesso `http` client e `bearer_auth(api_key)` di [`Self::complete`], stesso
+    /// status-check propagato al caller (che applica `is_billing_error` + cooldown).
+    ///
+    /// Richiesta: `{model, prompt, n?, size?, response_format:"b64_json"}`.
+    /// Risposta: `{data:[{b64_json|url}], ...}` -> [`GeneratedImage`]. Regola G:
+    /// `model` arriva dal chiamante. Regola F: il body d'errore (che non contiene
+    /// prompt utente) e' propagato al caller, non loggato qui in chiaro.
+    pub async fn images_generations(
+        &self,
+        model: &str,
+        prompt: &str,
+        n: Option<u32>,
+        size: Option<&str>,
+    ) -> anyhow::Result<ImageGenResponse> {
+        let body = ImageGenWireRequest {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            n,
+            size: size.map(|s| s.to_string()),
+            // base64 inline: il gateway non dipende da URL temporanee del provider.
+            response_format: "b64_json".to_string(),
+        };
+        let start = Instant::now();
+
+        let resp = self
+            .http
+            .post(format!("{}/images/generations", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+        }
+
+        let parsed: ImagesResponse = resp.json().await?;
+        let latency_ms = start.elapsed().as_millis() as u64;
+        Ok(from_images_response(
+            parsed,
+            model.to_string(),
+            &self.provider_name,
+            latency_ms,
+        ))
+    }
+}
+
+/// Mappa una [`ImagesResponse`] del dialetto OpenAI Images nel contratto
+/// [`ImageGenResponse`]. Funzione PURA (testabile senza rete).
+fn from_images_response(
+    resp: ImagesResponse,
+    model_used: String,
+    provider_name: &str,
+    latency_ms: u64,
+) -> ImageGenResponse {
+    let images = resp
+        .data
+        .into_iter()
+        .map(|d| GeneratedImage {
+            b64_json: d.b64_json.filter(|s| !s.is_empty()),
+            url: d.url.filter(|s| !s.is_empty()),
+            // OpenAI Images non dichiara il mime: e' sempre PNG inline; lasciamo
+            // None per non inventare un valore (regola G/H).
+            mime: None,
+        })
+        .collect();
+    ImageGenResponse {
+        images,
+        model_used,
+        provider_used: provider_name.to_string(),
+        latency_ms,
     }
 }
 
@@ -741,6 +818,33 @@ struct ChatCompletionRequest {
 #[derive(Debug, Serialize)]
 struct StreamOptions {
     include_usage: bool,
+}
+
+/// Corpo della richiesta `POST /images/generations` (dialetto OpenAI Images).
+#[derive(Debug, Serialize)]
+struct ImageGenWireRequest {
+    model: String,
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
+    response_format: String,
+}
+
+/// Risposta di `POST /images/generations`: `{ "data": [{ "b64_json"|"url" }] }`.
+#[derive(Debug, Deserialize)]
+struct ImagesResponse {
+    #[serde(default)]
+    data: Vec<ImageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageData {
+    #[serde(default)]
+    b64_json: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1390,6 +1494,49 @@ mod tests {
         let json = serde_json::to_value(build_request_body(&req, false, &ResolvedReasoning::none()))
             .unwrap();
         assert!(json["messages"][0]["content"].is_string());
+    }
+
+    // --- Image generation (dialetto OpenAI Images) ------------------------
+
+    #[test]
+    fn images_response_mappa_b64_e_filtra_vuoti() {
+        let raw = r#"{
+            "data": [
+                {"b64_json": "AAAA"},
+                {"b64_json": ""},
+                {"url": "https://example.com/x.png"}
+            ]
+        }"#;
+        let parsed: ImagesResponse = serde_json::from_str(raw).unwrap();
+        let out = from_images_response(parsed, "gpt-image-1".to_string(), "openai", 7);
+        assert_eq!(out.model_used, "gpt-image-1");
+        assert_eq!(out.provider_used, "openai");
+        assert_eq!(out.latency_ms, 7);
+        assert_eq!(out.images.len(), 3);
+        assert_eq!(out.images[0].b64_json.as_deref(), Some("AAAA"));
+        // base64 vuoto -> None (non si propaga una stringa vuota).
+        assert!(out.images[1].b64_json.is_none());
+        assert!(out.images[1].url.is_none());
+        assert_eq!(out.images[2].url.as_deref(), Some("https://example.com/x.png"));
+        // OpenAI Images non dichiara il mime.
+        assert!(out.images[0].mime.is_none());
+    }
+
+    #[test]
+    fn images_request_body_imposta_response_format_b64() {
+        let body = ImageGenWireRequest {
+            model: "gpt-image-1".to_string(),
+            prompt: "un gatto".to_string(),
+            n: Some(2),
+            size: Some("1024x1024".to_string()),
+            response_format: "b64_json".to_string(),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["model"], "gpt-image-1");
+        assert_eq!(json["prompt"], "un gatto");
+        assert_eq!(json["n"], 2);
+        assert_eq!(json["size"], "1024x1024");
+        assert_eq!(json["response_format"], "b64_json");
     }
 
     #[test]

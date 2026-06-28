@@ -81,6 +81,53 @@ pub struct GwRequest {
     pub metadata: GwMetadata,
 }
 
+/// Richiesta di generazione immagine al gateway (`POST /v1/images/generations`).
+/// Speculare a [`GwRequest`] ma per il task image-gen: solo un `prompt` testuale.
+/// Regola G: il `model` arriva dal chiamante (nessun default hardcoded).
+///
+/// API client pronta per il wiring: i tool agente che la consumeranno arrivano
+/// nella PR successiva (PR6b-2), quindi qui e' ancora senza call site.
+#[allow(dead_code)]
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct GwImageRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Pin esplicito del provider (bypass routing nel gateway). Stessa semantica
+    /// di [`GwRequest::pin_provider`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
+    pub metadata: GwMetadata,
+}
+
+/// Una immagine generata, come la riporta il gateway. Almeno uno tra `b64_json`
+/// (base64 inline) e `url` (URL temporanea) e' valorizzato; `mime` quando il
+/// provider lo dichiara (Vertex `mimeType`). Vedi nota su [`GwImageRequest`].
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct GwGeneratedImage {
+    #[serde(default)]
+    pub b64_json: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub mime: Option<String>,
+}
+
+/// Risposta di `POST /v1/images/generations` del gateway. Speculare a
+/// [`GwResponse`] per i campi di tracciamento. Vedi nota su [`GwImageRequest`].
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct GwImageResponse {
+    pub images: Vec<GwGeneratedImage>,
+    pub model_used: String,
+    pub provider_used: String,
+    pub latency_ms: u64,
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct GwUsage {
     pub input_tokens: u32,
@@ -207,6 +254,35 @@ impl NexusGatewayClient {
             .map_err(|e| anyhow::anyhow!("Nexus Gateway response parse: {e}"))
     }
 
+    /// Genera immagini via gateway (`POST /v1/images/generations`). Speculare a
+    /// [`Self::complete`]: stesso Bearer service token, stesso status-check con
+    /// propagazione del body d'errore al caller (regola H: errore esplicito se il
+    /// provider non genera immagini -> il gateway ritorna 500 col motivo).
+    ///
+    /// Pronta per il wiring: i tool agente che la consumeranno arrivano nella PR
+    /// successiva (PR6b-2), quindi e' ancora senza call site.
+    #[allow(dead_code)]
+    pub async fn generate_image(&self, req: GwImageRequest) -> Result<GwImageResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/images/generations", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.service_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Nexus Gateway {status}: {body}");
+        }
+
+        resp.json::<GwImageResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway image response parse: {e}"))
+    }
+
     pub async fn is_healthy(&self) -> bool {
         self.http
             .get(format!("{}/health", self.base_url))
@@ -291,6 +367,53 @@ mod tests {
         let parsed: GwModelsResponse = serde_json::from_str(raw).expect("parse empty models");
         assert_eq!(parsed.provider, "deepseek");
         assert!(parsed.models.is_empty());
+    }
+
+    #[test]
+    fn parse_image_response_dal_gateway() {
+        // Forma di POST /v1/images/generations: images[] + tracciamento.
+        let raw = r#"{
+            "images": [
+                {"b64_json": "AAAA", "mime": "image/png"},
+                {"url": "https://example.com/x.png"}
+            ],
+            "model_used": "gpt-image-1",
+            "provider_used": "openai",
+            "latency_ms": 1234
+        }"#;
+        let parsed: GwImageResponse = serde_json::from_str(raw).expect("parse image response");
+        assert_eq!(parsed.provider_used, "openai");
+        assert_eq!(parsed.model_used, "gpt-image-1");
+        assert_eq!(parsed.latency_ms, 1234);
+        assert_eq!(parsed.images.len(), 2);
+        assert_eq!(parsed.images[0].b64_json.as_deref(), Some("AAAA"));
+        assert_eq!(parsed.images[0].mime.as_deref(), Some("image/png"));
+        assert_eq!(parsed.images[1].url.as_deref(), Some("https://example.com/x.png"));
+    }
+
+    #[test]
+    fn image_request_serializza_campi_e_omette_opzionali() {
+        let req = GwImageRequest {
+            model: "gpt-image-1".into(),
+            prompt: "un gatto".into(),
+            n: Some(1),
+            size: None,
+            pin_provider: Some("openai".into()),
+            metadata: GwMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "image".into(),
+            },
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["model"], "gpt-image-1");
+        assert_eq!(json["prompt"], "un gatto");
+        assert_eq!(json["n"], 1);
+        // size None -> campo omesso.
+        assert!(json.get("size").is_none());
+        assert_eq!(json["pin_provider"], "openai");
     }
 
     #[test]

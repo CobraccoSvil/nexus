@@ -25,13 +25,15 @@ use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::gcp_auth::{
-    vertex_endpoint, VertexAuth, SETTING_BACKEND, SETTING_VERTEX_CREDENTIALS_JSON,
-    SETTING_VERTEX_DISCOVERY_LOCATIONS, SETTING_VERTEX_LOCATION, SETTING_VERTEX_PROJECT,
+    vertex_action_endpoint, vertex_endpoint, VertexAuth, SETTING_BACKEND,
+    SETTING_VERTEX_CREDENTIALS_JSON, SETTING_VERTEX_DISCOVERY_LOCATIONS, SETTING_VERTEX_LOCATION,
+    SETTING_VERTEX_PROJECT,
 };
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::types::{
-    LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage, MessageContent,
-    SensitivityTier, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall,
+    GeneratedImage, ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk,
+    LlmToolCall, LlmUsage, MessageContent, SensitivityTier, ToolCallDelta, ToolCallDeltaFunction,
+    ToolFunctionCall,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -622,6 +624,92 @@ impl LlmProvider for GoogleProvider {
                 Ok(all)
             }
         }
+    }
+
+    fn supports_image_gen(&self) -> bool {
+        true
+    }
+
+    /// Genera immagini con Imagen via `:predict`. Riusa `resolved_backend()`
+    /// (regola L): per Vertex costruisce l'URL `:predict` con
+    /// [`vertex_action_endpoint`] e l'auth Bearer (`VertexAuth::access_token`); per
+    /// Gemini API-key usa `{base}/models/{model}:predict?key=`. NON usa il
+    /// fallback-region (l'image-gen non e' critico in questo PR): si invia sulla
+    /// `location` di prima scelta. Mappa `predictions[].bytesBase64Encoded` ->
+    /// [`GeneratedImage`]. Regola G: il `model` arriva dal chiamante.
+    async fn generate_image(&self, req: &ImageGenRequest) -> anyhow::Result<ImageGenResponse> {
+        let backend = self.resolved_backend().await?;
+        let body = build_predict_request(&req.prompt, req.n);
+        let start = Instant::now();
+
+        let builder = match backend.as_ref() {
+            GoogleBackend::Gemini => self
+                .http
+                .post(format!("{}/models/{}:predict", self.base_url, req.model))
+                .query(&[("key", &self.api_key)]),
+            GoogleBackend::Vertex {
+                project,
+                location,
+                auth,
+                ..
+            } => {
+                let token = auth.access_token().await?;
+                let url = vertex_action_endpoint(project, location, &req.model, "predict");
+                self.http.post(url).bearer_auth(token)
+            }
+        };
+
+        let resp = builder.json(&body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Regola F: body d'errore propagato al caller (cooldown lo classifica
+            // via is_billing_error), non loggato qui in chiaro.
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+        }
+
+        let parsed: PredictResponse = resp.json().await?;
+        let latency_ms = start.elapsed().as_millis() as u64;
+        Ok(from_predict_response(parsed, req.model.clone(), latency_ms))
+    }
+}
+
+/// Costruisce il corpo `:predict` per Imagen: `{instances:[{prompt}], parameters:{sampleCount}}`.
+/// `sampleCount` omesso quando `n` e' assente (default lato API).
+fn build_predict_request(prompt: &str, n: Option<u32>) -> PredictRequest {
+    PredictRequest {
+        instances: vec![PredictInstance {
+            prompt: prompt.to_string(),
+        }],
+        parameters: n.map(|sample_count| PredictParameters { sample_count }),
+    }
+}
+
+/// Mappa una [`PredictResponse`] Imagen nel contratto [`ImageGenResponse`].
+/// Funzione PURA (testabile senza rete): `bytesBase64Encoded` -> `b64_json`,
+/// `mimeType` -> `mime`. Scarta le prediction senza base64.
+fn from_predict_response(
+    resp: PredictResponse,
+    model_used: String,
+    latency_ms: u64,
+) -> ImageGenResponse {
+    let images = resp
+        .predictions
+        .into_iter()
+        .filter_map(|p| {
+            let b64 = p.bytes_base64_encoded.filter(|s| !s.is_empty())?;
+            Some(GeneratedImage {
+                b64_json: Some(b64),
+                url: None,
+                mime: p.mime_type.filter(|s| !s.is_empty()),
+            })
+        })
+        .collect();
+    ImageGenResponse {
+        images,
+        model_used,
+        provider_used: "google".to_string(),
+        latency_ms,
     }
 }
 
@@ -1603,6 +1691,42 @@ struct GoogleUsageMetadata {
     cached_content_token_count: Option<u32>,
 }
 
+// --- Image generation Imagen (`:predict`) ----------------------------------
+
+/// Corpo della richiesta `:predict` Imagen.
+#[derive(Debug, Serialize)]
+struct PredictRequest {
+    instances: Vec<PredictInstance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<PredictParameters>,
+}
+
+#[derive(Debug, Serialize)]
+struct PredictInstance {
+    prompt: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PredictParameters {
+    #[serde(rename = "sampleCount")]
+    sample_count: u32,
+}
+
+/// Risposta `:predict` Imagen: `{ "predictions": [{ "bytesBase64Encoded", "mimeType" }] }`.
+#[derive(Debug, Deserialize)]
+struct PredictResponse {
+    #[serde(default)]
+    predictions: Vec<PredictPrediction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PredictPrediction {
+    #[serde(rename = "bytesBase64Encoded", default)]
+    bytes_base64_encoded: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    mime_type: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,6 +1822,36 @@ mod tests {
         let p = GoogleProvider::new(Client::new(), "k", None);
         let backend = p.resolved_backend().await.expect("backend gemini");
         assert!(matches!(*backend, GoogleBackend::Gemini));
+    }
+
+    #[test]
+    fn predict_request_imagen_instances_e_sample_count() {
+        let body = build_predict_request("un gatto", Some(2));
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["instances"][0]["prompt"], "un gatto");
+        assert_eq!(json["parameters"]["sampleCount"], 2);
+        // n assente -> parameters omesso (default lato API).
+        let body2 = build_predict_request("un cane", None);
+        let json2 = serde_json::to_value(&body2).unwrap();
+        assert!(json2.get("parameters").is_none());
+    }
+
+    #[test]
+    fn predict_response_mappa_bytes_base64_e_mime() {
+        let raw = r#"{
+            "predictions": [
+                {"bytesBase64Encoded": "AAAA", "mimeType": "image/png"},
+                {"bytesBase64Encoded": ""}
+            ]
+        }"#;
+        let parsed: PredictResponse = serde_json::from_str(raw).unwrap();
+        let out = from_predict_response(parsed, "imagen-3.0".to_string(), 5);
+        assert_eq!(out.provider_used, "google");
+        assert_eq!(out.model_used, "imagen-3.0");
+        // La prediction con base64 vuoto e' scartata.
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].b64_json.as_deref(), Some("AAAA"));
+        assert_eq!(out.images[0].mime.as_deref(), Some("image/png"));
     }
 
     #[test]

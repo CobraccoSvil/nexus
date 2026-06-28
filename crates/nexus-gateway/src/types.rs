@@ -256,6 +256,53 @@ pub struct ProviderStatus {
     pub billing_error: Option<String>,
 }
 
+/// Richiesta di generazione immagine (`ImageGenRequest`). Speculare a
+/// [`LlmRequest`] ma per il task image-generation: niente messaggi/tool, solo un
+/// `prompt` testuale. Regola G: il `model` arriva sempre dal chiamante (nessun
+/// default hardcoded). `pin_provider` ha la stessa semantica di
+/// [`LlmRequest::pin_provider`] (bypass routing, esecuzione di QUEL provider).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenRequest {
+    pub model: String,
+    pub prompt: String,
+    /// Numero di immagini da generare (default lato provider se assente).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// Dimensione richiesta (es. "1024x1024"); il formato dipende dal provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Pin esplicito del provider da eseguire (bypass routing). Quando `Some`, il
+    /// gateway esegue ESATTAMENTE quel provider; quando `None`, sceglie il primo
+    /// provider sano che dichiara `supports_image_gen()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
+    pub metadata: RequestMetadata,
+}
+
+/// Una immagine generata. I provider espongono o il base64 inline (OpenAI
+/// `b64_json`, Vertex `bytesBase64Encoded`) o una URL temporanea (OpenAI
+/// `response_format=url`): entrambi opzionali, almeno uno valorizzato. `mime`
+/// presente quando il provider lo dichiara (Vertex `mimeType`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratedImage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+}
+
+/// Risposta di generazione immagine (`ImageGenResponse`). Speculare a
+/// [`LlmResponse`] per i campi di tracciamento (model/provider/latency).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenResponse {
+    pub images: Vec<GeneratedImage>,
+    pub model_used: String,
+    pub provider_used: String,
+    pub latency_ms: u64,
+}
+
 /// Voce della tabella di alias modello (`ModelAliasEntry`, da model-aliases.yaml).
 ///
 /// I tre campi modello sono `Option` perche' nello YAML possono valere `null`

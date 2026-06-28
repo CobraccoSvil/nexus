@@ -125,20 +125,27 @@ pub fn sign_jwt(claims: &JwtClaims, private_key_pem: &str) -> anyhow::Result<Str
     Ok(token)
 }
 
-/// Costruisce l'URL Vertex AI per l'azione `generateContent` /
-/// `streamGenerateContent`. project/location dai settings (regola G).
+/// Costruisce l'URL Vertex AI per una `action` arbitraria sul modello (punto
+/// unico, regola L): la chat usa `generateContent`/`streamGenerateContent`,
+/// l'image-gen usa `predict` (Imagen). project/location dai settings (regola G).
 ///
 /// `https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}`
-/// con `?alt=sse` per lo streaming.
+pub fn vertex_action_endpoint(project: &str, location: &str, model: &str, action: &str) -> String {
+    format!(
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}"
+    )
+}
+
+/// Costruisce l'URL Vertex AI per l'azione `generateContent` /
+/// `streamGenerateContent` (chat). Delega a [`vertex_action_endpoint`] e aggiunge
+/// `?alt=sse` per lo streaming. Firma invariata per i chiamanti chat esistenti.
 pub fn vertex_endpoint(project: &str, location: &str, model: &str, stream: bool) -> String {
     let action = if stream {
         "streamGenerateContent"
     } else {
         "generateContent"
     };
-    let mut url = format!(
-        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}"
-    );
+    let mut url = vertex_action_endpoint(project, location, model, action);
     if stream {
         url.push_str("?alt=sse");
     }
@@ -390,6 +397,17 @@ mod tests {
             url,
             "https://europe-west4-aiplatform.googleapis.com/v1/projects/nexus-test/locations/europe-west4/publishers/google/models/gemini-2.0-flash:generateContent"
         );
+    }
+
+    #[test]
+    fn vertex_action_endpoint_predict_per_imagen() {
+        let url = vertex_action_endpoint("nexus-test", "europe-west4", "imagen-3.0", "predict");
+        assert_eq!(
+            url,
+            "https://europe-west4-aiplatform.googleapis.com/v1/projects/nexus-test/locations/europe-west4/publishers/google/models/imagen-3.0:predict"
+        );
+        // Nessun ?alt=sse: e' una chiamata predict non-streaming.
+        assert!(!url.contains("alt=sse"));
     }
 
     #[test]
