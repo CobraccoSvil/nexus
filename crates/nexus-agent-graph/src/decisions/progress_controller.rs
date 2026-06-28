@@ -268,13 +268,14 @@ fn force_diagnose_nudge(label: &str, count: i64) -> String {
     if is_build_or_test_label(label) {
         format!(
             "STOP: hai ripetuto '{label}' {count} volte e il sollecito precedente \
-non ha cambiato nulla. Ri-eseguire il build NON e' un'azione diversa: \
-e' la stessa di prima. Identifica la CAUSA RADICE dagli errori \
-dell'ultima esecuzione (file:riga; la causa reale come tipo mancante / \
-import errato / simbolo non definito, non il sintomo) e correggi i file \
-segnalati. Se non puoi correggere (errore in dipendenza esterna o \
-codice generato non tuo), dichiara che sei bloccato e perche': il turno \
-chiudera' con la diagnosi, non con un'altra esecuzione."
+non ha cambiato nulla. Ri-eseguire il build NON e' un'azione diversa: e' la \
+stessa di prima. Un errore di build/test e' CORREGGIBILE: leggi gli errori \
+dell'ultima esecuzione (file:riga riportati qui sotto), individua la CAUSA \
+RADICE (tipo mancante / import errato / simbolo non definito, non il sintomo) \
+leggendo l'output del comando qui sopra, e CORREGGI ORA i file segnalati con una \
+tool call (edit_file/write_file); SOLO DOPO rie-esegui. NON chiudere il turno e \
+NON dichiararti bloccato: un errore di build/test si risolve correggendo il \
+codice, non e' una dipendenza mancante."
         )
     } else {
         format!(
@@ -357,13 +358,14 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
             }
             Axis::G1Descriptive => g1_nudge(),
         };
-        // Per repeated_action e resource_reallocation NON forziamo una nuova tool
-        // call: il nudge ordina di riusare/procedere. Per gli altri la forza-azione
-        // rimuove i read-only.
-        let force = !matches!(axis, Axis::RepeatedAction | Axis::ResourceReallocation);
+        // Solo resource_reallocation resta SOFT (il nudge ordina di riusare le porte,
+        // non c'e' un'azione correttiva diretta). Per repeated_action FORZIAMO una
+        // nuova tool call (force-action): un'azione ripetuta che fallisce va CORRETTA,
+        // non ripetuta ne' abbandonata -> rimuove i read-only e impone tool_choice.
+        let force = !matches!(axis, Axis::ResourceReallocation);
         let reason = match axis {
             Axis::RepeatedAction => {
-                format!("stallo {}: nudge anti-ripetizione (procedi/verifica)", axis.as_str())
+                format!("stallo {}: forza-azione correttiva (no ripetizione)", axis.as_str())
             }
             Axis::ResourceReallocation => {
                 format!("stallo {}: nudge riusa-porte (no nuova allocazione)", axis.as_str())
@@ -396,10 +398,13 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
         return ProgressDecision {
             action: Action::ForceDiagnose,
             axis: Some(axis),
-            force_action: false,
+            // Forza una tool call correttiva: la diagnosi deve sfociare in un edit,
+            // non in testo o resa. La scappatoia "dichiarati bloccato" resta solo nel
+            // ramo non-build del nudge, per cause realmente bloccanti.
+            force_action: true,
             nudge_text: Some(force_diagnose_nudge(&label, count)),
             stop_reason: None,
-            reason: "stallo repeated_action: diagnosi forzata prima di escalation/abort"
+            reason: "stallo repeated_action: correzione forzata prima di escalation/abort"
                 .to_string(),
         };
     }
@@ -462,14 +467,18 @@ mod tests {
     }
 
     #[test]
-    fn repeated_action_no_force_action() {
+    fn repeated_action_forza_azione_correttiva() {
+        // Un'azione ripetuta che fallisce (es. build) va CORRETTA, non ripetuta ne'
+        // abbandonata: la GUIDE forza una tool call (force_action=true) cosi' il
+        // modello DEVE agire. Prima era force=false (solo nudge testuale) -> un
+        // modello debole si arrendeva e scattava l'ABORT (incidente pnpm build).
         let signals = ProgressSignals {
             repeated_action: Some(("run_command: npm run build".to_string(), 3)),
             ..Default::default()
         };
         let d = decide(&signals);
         assert_eq!(d.action, Action::Guide);
-        assert!(!d.force_action);
+        assert!(d.force_action, "repeated_action ora forza l'azione correttiva");
     }
 
     #[test]

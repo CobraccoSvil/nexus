@@ -1135,17 +1135,27 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 match dec.action {
                     Action::Guide => {
                         progress_guided.insert("repeated_action".to_string());
+                        // Forza una tool call correttiva (dec.force_action ora true per
+                        // repeated_action): rimuove i read-only e impone tool_choice, cosi'
+                        // il modello DEVE agire invece di ripetere o descrivere/arrendersi.
+                        if dec.force_action {
+                            force_action_hard = true;
+                        }
                         if let Some(t) = &dec.nudge_text {
                             messages.push(human_msg(t));
                         }
-                        tracing::warn!(target: "nexus_agent_graph::executor", "GUIDE repeated_action");
+                        tracing::warn!(target: "nexus_agent_graph::executor", "GUIDE repeated_action (force-action)");
                     }
                     Action::ForceDiagnose => {
                         progress_diagnosed.insert("repeated_action".to_string());
+                        // La diagnosi deve sfociare in un edit, non in testo/resa.
+                        if dec.force_action {
+                            force_action_hard = true;
+                        }
                         if let Some(t) = &dec.nudge_text {
                             messages.push(human_msg(t));
                         }
-                        tracing::warn!(target: "nexus_agent_graph::executor", "FORCE_DIAGNOSE repeated_action");
+                        tracing::warn!(target: "nexus_agent_graph::executor", "FORCE_DIAGNOSE repeated_action (force-action)");
                     }
                     Action::Abort => {
                         // Recap M44 deterministico. modified_files_from_steps e' I/O
