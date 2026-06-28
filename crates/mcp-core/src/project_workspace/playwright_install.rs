@@ -439,6 +439,23 @@ test('app root risponde senza errori console', async ({ page }) => {
     })))
 }
 
+/// Sceglie l'eseguibile da ispezionare dentro una dir di revisione chromium.
+/// ORDINE: prima il Chromium COMPLETO (headed) reale `chrome-linux64/chrome`
+/// (usato da visual_compare e @playwright/mcp), poi l'headless shell. Il vecchio
+/// `chrome-linux/chrome` non esiste piu' nelle build Playwright correnti: era il
+/// bug d1 (preflight cieco al chromium completo). Funzione pura (testabile).
+fn pick_chromium_executable(chromium_dir: &Path) -> Option<PathBuf> {
+    const CANDIDATES: [&str; 3] = [
+        "chrome-linux64/chrome",
+        "chrome-headless-shell-linux64/chrome-headless-shell",
+        "chrome-linux/chrome",
+    ];
+    CANDIDATES
+        .iter()
+        .map(|c| chromium_dir.join(c))
+        .find(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
+}
+
 /// Detect chromium runtime libs mancanti via `ldd` sul chrome-headless-shell.
 /// Restituisce vec di nomi `.so` non risolti (es. "libnspr4.so", "libnss3.so").
 /// Empty vec = tutto OK.
@@ -451,30 +468,30 @@ async fn detect_missing_chromium_libs() -> Vec<String> {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
-    // Trova qualsiasi chromium_headless_shell-* / chromium-*
-    let mut chromium_dir: Option<PathBuf> = None;
+    // Trova la dir chromium con la revisione piu' alta. Prima si prendeva il
+    // PRIMO "chromium*" in ordine di read_dir (non deterministico), includendo
+    // anche le dir "chromium_headless_shell-*" che NON contengono il browser
+    // completo: il preflight finiva per controllare la dir sbagliata. Ora si
+    // ordina per revisione numerica decrescente, considerando sia il browser
+    // completo (chromium-*) sia l'headless shell (chromium_headless_shell-*).
+    let mut chromium_dirs: Vec<(u64, PathBuf)> = Vec::new();
     let mut iter = glob_root;
     while let Ok(Some(entry)) = iter.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("chromium") {
-            chromium_dir = Some(entry.path());
-            break;
+        let rev = name
+            .strip_prefix("chromium_headless_shell-")
+            .or_else(|| name.strip_prefix("chromium-"))
+            .and_then(|s| s.parse::<u64>().ok());
+        if let Some(rev) = rev {
+            chromium_dirs.push((rev, entry.path()));
         }
     }
-    let chromium_dir = match chromium_dir {
-        Some(p) => p,
+    chromium_dirs.sort_by_key(|(rev, _)| std::cmp::Reverse(*rev));
+    let chromium_dir = match chromium_dirs.into_iter().next() {
+        Some((_, p)) => p,
         None => return Vec::new(),
     };
-    // Trova l'eseguibile (chrome-headless-shell o chrome)
-    let candidates = [
-        "chrome-headless-shell-linux64/chrome-headless-shell",
-        "chrome-linux/chrome",
-    ];
-    let exe = candidates
-        .iter()
-        .map(|c| chromium_dir.join(c))
-        .find(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false));
-    let exe = match exe {
+    let exe = match pick_chromium_executable(&chromium_dir) {
         Some(p) => p,
         None => return Vec::new(),
     };
@@ -582,4 +599,54 @@ fn chromium_apt_packages_for(missing: &[String]) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = pkgs.into_iter().collect();
     v.sort();
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// d1: il preflight deve riconoscere il Chromium COMPLETO reale in
+    /// 'chrome-linux64/chrome' (prima era cieco a quel path: controllava solo
+    /// 'chrome-linux/chrome' obsoleto e l'headless shell).
+    #[test]
+    fn pick_chromium_executable_finds_full_chrome_linux64() {
+        let tmp = std::env::temp_dir().join(format!("nexus_pw_install_{}", uuid::Uuid::new_v4()));
+        let exe_dir = tmp.join("chrome-linux64");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(exe_dir.join("chrome"), b"x").unwrap();
+
+        let got = pick_chromium_executable(&tmp).expect("deve trovare il chromium completo");
+        assert!(
+            got.ends_with("chrome-linux64/chrome"),
+            "selezionato il path sbagliato: {got:?}"
+        );
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Se manca il browser completo ma c'e' l'headless shell, ripiega su quello.
+    #[test]
+    fn pick_chromium_executable_falls_back_to_headless_shell() {
+        let tmp = std::env::temp_dir().join(format!("nexus_pw_install_{}", uuid::Uuid::new_v4()));
+        let exe_dir = tmp.join("chrome-headless-shell-linux64");
+        fs::create_dir_all(&exe_dir).unwrap();
+        fs::write(exe_dir.join("chrome-headless-shell"), b"x").unwrap();
+
+        let got = pick_chromium_executable(&tmp).expect("deve trovare l'headless shell");
+        assert!(
+            got.ends_with("chrome-headless-shell-linux64/chrome-headless-shell"),
+            "selezionato il path sbagliato: {got:?}"
+        );
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn pick_chromium_executable_none_when_empty() {
+        let tmp = std::env::temp_dir().join(format!("nexus_pw_install_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        assert!(pick_chromium_executable(&tmp).is_none());
+        fs::remove_dir_all(&tmp).ok();
+    }
 }

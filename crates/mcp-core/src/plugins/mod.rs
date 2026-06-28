@@ -691,7 +691,10 @@ pub(super) fn parse_args_array(raw: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub(super) fn detect_legacy_catalog_slug(
+// Punto unico (regola L) per mappare (transport, command, args) -> slug del
+// catalog. Usato da plugins::install e da mcp_connectors::execute_mcp_tool per
+// l'iniezione args scoped sul server @playwright/mcp (slug "playwright-stdio").
+pub(crate) fn detect_legacy_catalog_slug(
     transport: &str,
     url: Option<&str>,
     command: Option<&str>,

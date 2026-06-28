@@ -129,7 +129,7 @@ fn build_mcp_config(
 
 /// POST /api/admin/plugins/integrate/draft
 pub async fn draft_plugin_integration(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
     Json(body): Json<IntegrateDraftRequest>,
 ) -> ApiResult {
@@ -144,7 +144,8 @@ pub async fn draft_plugin_integration(
     let scope = normalize_scope(body.default_scope.as_deref())?;
     let cfg = build_mcp_config(&body)?;
 
-    let tools = mcp_client::list_tools(&cfg).await.map_err(|e| {
+    let stdio_timeout = mcp_client::resolve_stdio_timeout(&state.db).await;
+    let tools = mcp_client::list_tools(&cfg, stdio_timeout).await.map_err(|e| {
         api_error(
             StatusCode::BAD_GATEWAY,
             format!("Tool discovery fallito: {e}"),

@@ -949,7 +949,8 @@ pub async fn test_plugin(State(state): State<AppState>, Extension(claims): Exten
 
     let resolution = build_plugin_resolution(&state.db, pid, user_id).await?;
 
-    let (success, tool_count, error_message, tools_payload) = match mcp_client::list_tools(&resolution.config).await {
+    let stdio_timeout = nexus_mcp_client::resolve_stdio_timeout(&state.db).await;
+    let (success, tool_count, error_message, tools_payload) = match mcp_client::list_tools(&resolution.config, stdio_timeout).await {
         Ok(tools) => {
             for tool in &tools {
                 let schema = serde_json::to_value(&tool.input_schema).unwrap_or(json!({}));

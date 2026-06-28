@@ -19,8 +19,10 @@ pub async fn test_plugin(
 
     let resolution = build_plugin_resolution(&state.db, plugin_instance_id, user_id).await?;
 
+    let stdio_timeout = mcp_client::resolve_stdio_timeout(&state.db).await;
     let (success, tool_count, error_message, tools_payload) = match mcp_client::list_tools(
         &resolution.config,
+        stdio_timeout,
     )
     .await
     {

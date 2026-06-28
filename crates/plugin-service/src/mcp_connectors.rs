@@ -277,7 +277,10 @@ pub async fn execute_mcp_tool(
         }
     }
 
-    match mcp_client::call_tool(&config, &body.tool_name, body.arguments.clone()).await {
+    let stdio_timeout = nexus_mcp_client::resolve_stdio_timeout(&state.db).await;
+    match mcp_client::call_tool(&config, &body.tool_name, body.arguments.clone(), stdio_timeout)
+        .await
+    {
         Ok(result) => Ok(Json(json!({
             "content": result.content,
             "isError": result.is_error,

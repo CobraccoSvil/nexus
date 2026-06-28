@@ -331,13 +331,30 @@ async fn capture_screenshot(
     cfg: &CompareSettings,
 ) -> Result<Vec<u8>, String> {
     const MARKER: &str = "NEXUS_SHOT_B64:";
+
+    // Preflight d1: risolviamo il Chromium COMPLETO dalla cache Playwright via
+    // il PUNTO UNICO (regola L). Se assente, ritorniamo subito un messaggio
+    // AZIONABILE invece dell'errore generico "cattura screenshot fallita" che
+    // costringeva l'agente a indovinare la causa. Passiamo executablePath allo
+    // script Node cosi' non dipendiamo dalla risoluzione browser interna di
+    // Playwright (che cerca path/revisioni non sempre allineati): e' la stessa
+    // strategia --executable-path applicata al server MCP @playwright/mcp.
+    let chromium_exe = crate::playwright_env::resolve_chromium_from_env().map_err(|e| {
+        format!(
+            "Chromium non disponibile per lo screenshot: {e}. \
+             Dopo l'installazione il browser vive in \
+             ~/.cache/ms-playwright/chromium-<rev>/chrome-linux64/chrome."
+        )
+    })?;
+    let exe_path = chromium_exe.to_string_lossy().to_string();
+
     let script = format!(
         r#"
 const {{ chromium }} = require('playwright');
 (async () => {{
   let browser;
   try {{
-    browser = await chromium.launch({{ headless: true, args: ['--no-sandbox'] }});
+    browser = await chromium.launch({{ headless: true, executablePath: {exe}, args: ['--no-sandbox'] }});
     const page = await browser.newPage({{ viewport: {{ width: {w}, height: {h} }} }});
     await page.goto({url}, {{ waitUntil: 'networkidle', timeout: {nav_timeout} }});
     await page.waitForTimeout({wait});
@@ -351,6 +368,7 @@ const {{ chromium }} = require('playwright');
   }}
 }})();
 "#,
+        exe = serde_json::to_string(&exe_path).unwrap_or_else(|_| "\"\"".to_string()),
         w = cfg.viewport_width,
         h = cfg.viewport_height,
         url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string()),

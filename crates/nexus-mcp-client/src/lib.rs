@@ -278,10 +278,14 @@ pub async fn call_tool_http(
 }
 
 /// Recupera la lista dei tool da un server MCP stdio.
+///
+/// `timeout` e' la finestra massima per ricevere la risposta `tools/list`; va
+/// risolto dal chiamante (DB-driven, regola G). Vedi `DEFAULT_STDIO_TIMEOUT`.
 pub async fn list_tools_stdio(
     command: &str,
     args: &[String],
     env_vars: &HashMap<String, String>,
+    timeout: std::time::Duration,
 ) -> Result<Vec<McpTool>, McpError> {
     let init_msg = build_jsonrpc_with_id(
         1,
@@ -296,15 +300,21 @@ pub async fn list_tools_stdio(
     // Senza la notifica i server strict ignorano il tools/list (regola H).
     let initialized = build_jsonrpc_notification("notifications/initialized", json!({}));
     let list_msg = build_jsonrpc_with_id(2, "tools/list", json!({}));
-    let output =
-        run_stdio_jsonrpc(command, args, env_vars, 2, &[init_msg, initialized, list_msg]).await?;
+    let output = run_stdio_jsonrpc(
+        command,
+        args,
+        env_vars,
+        2,
+        &[init_msg, initialized, list_msg],
+        timeout,
+    )
+    .await?;
 
-    // Prende l'ultima risposta JSON valida con "result"
-    for line in output.lines().rev() {
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
-            if v.get("result").is_some() && v["result"].get("tools").is_some() {
-                return parse_tools_response(v["result"].clone());
-            }
+    // Seleziona la risposta con l'id atteso (2 = tools/list) via punto unico,
+    // poi verifica che porti il campo "tools".
+    if let Some(result) = select_result_by_id(&output, 2) {
+        if result.get("tools").is_some() {
+            return parse_tools_response(result);
         }
     }
 
@@ -316,12 +326,18 @@ pub async fn list_tools_stdio(
 }
 
 /// Esegue un tool su un server MCP stdio.
+///
+/// `timeout` e' la finestra massima per ricevere la risposta `tools/call`; va
+/// risolto dal chiamante (DB-driven, regola G), con default `DEFAULT_STDIO_TIMEOUT`.
+/// Deve essere ampio abbastanza da coprire l'avvio di server lenti come
+/// `@playwright/mcp` (che lancia un browser): vedi BUG d2(A).
 pub async fn call_tool_stdio(
     command: &str,
     args: &[String],
     env_vars: &HashMap<String, String>,
     tool_name: &str,
     arguments: Value,
+    timeout: std::time::Duration,
 ) -> Result<McpToolResult, McpError> {
     let init_msg = build_jsonrpc_with_id(
         1,
@@ -340,15 +356,21 @@ pub async fn call_tool_stdio(
         "tools/call",
         json!({ "name": tool_name, "arguments": arguments }),
     );
-    let output =
-        run_stdio_jsonrpc(command, args, env_vars, 2, &[init_msg, initialized, call_msg]).await?;
+    let output = run_stdio_jsonrpc(
+        command,
+        args,
+        env_vars,
+        2,
+        &[init_msg, initialized, call_msg],
+        timeout,
+    )
+    .await?;
 
-    for line in output.lines().rev() {
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
-            if v.get("result").is_some() {
-                return parse_tool_result(v["result"].clone());
-            }
-        }
+    // Seleziona la risposta con l'id atteso (2 = tools/call) via punto unico:
+    // evita di scambiare la risposta di initialize (id=1) per il risultato del
+    // tool quando il server e' lento (BUG d2 cause A).
+    if let Some(result) = select_result_by_id(&output, 2) {
+        return parse_tool_result(result);
     }
 
     Err(McpError::Protocol(
@@ -389,6 +411,7 @@ async fn run_stdio_jsonrpc(
     env_vars: &HashMap<String, String>,
     expected_response_id: u64,
     messages: &[String],
+    timeout: std::time::Duration,
 ) -> Result<String, McpError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -422,13 +445,21 @@ async fn run_stdio_jsonrpc(
             .map_err(McpError::Io)?;
         stdin.write_all(b"\n").await.map_err(McpError::Io)?;
     }
-    drop(stdin);
-
+    // BUG d2(A) LIFECYCLE STDIO: NON si chiude stdin qui. Prima `drop(stdin)`
+    // avveniva SUBITO dopo l'invio dei messaggi: per server che avviano un
+    // browser lento (@playwright/mcp) la chiusura immediata di stdin + finestra
+    // breve faceva sì che si leggesse SOLO la risposta id=1 (initialize ->
+    // serverInfo) e mai la id=2 (tools/call). Ora stdin resta APERTO finche'
+    // non arriva la risposta con l'expected_response_id (o scade il timeout),
+    // poi viene chiuso. CAUTELA: lo `stdin` NON viene rimosso, viene solo
+    // spostato (drop esplicito DOPO il loop): i server che si chiudono su EOF
+    // (filesystem/github/postgres...) ricevono comunque l'EOF al termine, quindi
+    // non si deadlocka nessuno. La differenza e' solo QUANDO arriva l'EOF.
     let mut out_lines: Vec<String> = Vec::new();
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
 
-    let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+    let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
 
     let mut saw_expected_response = false;
@@ -454,6 +485,10 @@ async fn run_stdio_jsonrpc(
                         }
                     }
                 }
+                // next_line() ha ritornato Ok(None) (EOF) o Err: nessun break
+                // automatico, restiamo nel loop finche' deadline non scade. Va
+                // bene: se il processo e' morto, le branch successive degenerano
+                // e il timeout chiude pulito.
             }
             line = stderr_lines.next_line() => {
                 if let Ok(Some(l)) = line {
@@ -465,8 +500,42 @@ async fn run_stdio_jsonrpc(
         }
     }
 
+    // Chiusura stdin DOPO aver ricevuto la risposta attesa (o dopo il timeout):
+    // segnala EOF al server stdio in modo che possa terminare ordinatamente.
+    drop(stdin);
     let _ = child.kill().await;
     Ok(out_lines.join("\n"))
+}
+
+/// Seleziona il `result` della risposta JSON-RPC con l'`id` atteso da un output
+/// multi-linea (una riga = un messaggio JSON-RPC). Punto unico (regola L) per il
+/// post-processing delle risposte stdio: prima `call_tool_stdio` e
+/// `list_tools_stdio` prendevano l'ULTIMA riga con un `result` qualsiasi, senza
+/// verificare l'id; con server lenti come @playwright/mcp la prima/unica riga
+/// poteva essere la risposta a `initialize` (id=1) invece che a `tools/call`
+/// (id=2). Qui filtriamo per id atteso (BUG d2 cause A).
+///
+/// Strategia: scorre in ordine inverso (l'ultima risposta valida vince) e
+/// ritorna il `result` della prima riga con id == `expected_id` e un `result`.
+/// Se nessuna riga matcha l'id (server che non echeggia l'id come numero),
+/// ripiega sull'ultima riga con un `result` per retrocompatibilita'.
+fn select_result_by_id(output: &str, expected_id: u64) -> Option<Value> {
+    let mut fallback: Option<Value> = None;
+    for line in output.lines().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("result").is_none() {
+            continue;
+        }
+        if v.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            return v.get("result").cloned();
+        }
+        if fallback.is_none() {
+            fallback = v.get("result").cloned();
+        }
+    }
+    fallback
 }
 
 fn parse_tools_response(result: Value) -> Result<Vec<McpTool>, McpError> {
@@ -512,11 +581,44 @@ fn parse_tool_result(result: Value) -> Result<McpToolResult, McpError> {
 
 // -- Unified facade --
 
+/// Timeout di default per le chiamate stdio quando il chiamante non risolve il
+/// setting DB. NON e' un "magic fallback" di configurazione (regola G): la
+/// configurazione vera vive nel DB e viene passata esplicitamente da mcp-core /
+/// plugin-service; questo e' solo un floor di sicurezza per i pochi call site
+/// che non hanno accesso al pool DB. >=60s per coprire l'avvio di server lenti
+/// (browser di @playwright/mcp).
+pub const DEFAULT_STDIO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Chiave settings (DB) per il timeout delle chiamate stdio MCP.
+pub const STDIO_TIMEOUT_SETTING_KEY: &str = "agent.mcp.stdio_call_timeout_seconds";
+
+/// Risolve il timeout stdio dal DB (regola G). PUNTO UNICO (regola L): tutti i
+/// chiamanti della facade `call_tool`/`list_tools` su transport stdio risolvono
+/// il timeout qui, invece di hardcodarlo. Se il setting manca o non e' parsabile
+/// o il DB e' irraggiungibile, ripiega su `DEFAULT_STDIO_TIMEOUT` (floor di
+/// sicurezza documentato, non una scelta di modello/config nascosta).
+pub async fn resolve_stdio_timeout(db: &sqlx::PgPool) -> std::time::Duration {
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
+            .bind(STDIO_TIMEOUT_SETTING_KEY)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    match raw.as_deref().map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(secs)) if secs > 0 => std::time::Duration::from_secs(secs),
+        _ => DEFAULT_STDIO_TIMEOUT,
+    }
+}
+
 /// Chiama un tool su qualsiasi server MCP (HTTP o stdio) dato il config.
+///
+/// `timeout` si applica SOLO al transport stdio (HTTP ha il suo timeout fisso).
 pub async fn call_tool(
     config: &McpServerConfig,
     tool_name: &str,
     arguments: Value,
+    timeout: std::time::Duration,
 ) -> Result<McpToolResult, McpError> {
     match &config.transport {
         McpTransport::Http { url, headers } => {
@@ -526,7 +628,7 @@ pub async fn call_tool(
             command,
             args,
             env_vars,
-        } => call_tool_stdio(command, args, env_vars, tool_name, arguments).await,
+        } => call_tool_stdio(command, args, env_vars, tool_name, arguments, timeout).await,
         McpTransport::Builtin => Err(McpError::Protocol(
             "Builtin transport non deve passare per mcp_client".to_string(),
         )),
@@ -534,14 +636,68 @@ pub async fn call_tool(
 }
 
 /// Lista i tool da qualsiasi server MCP dato il config.
-pub async fn list_tools(config: &McpServerConfig) -> Result<Vec<McpTool>, McpError> {
+///
+/// `timeout` si applica SOLO al transport stdio (HTTP ha il suo timeout fisso).
+pub async fn list_tools(
+    config: &McpServerConfig,
+    timeout: std::time::Duration,
+) -> Result<Vec<McpTool>, McpError> {
     match &config.transport {
         McpTransport::Http { url, headers } => list_tools_http(url, headers).await,
         McpTransport::Stdio {
             command,
             args,
             env_vars,
-        } => list_tools_stdio(command, args, env_vars).await,
+        } => list_tools_stdio(command, args, env_vars, timeout).await,
         McpTransport::Builtin => Ok(vec![]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUG d2(A): con piu' risposte JSON-RPC sullo stdout, va scelta quella con
+    /// l'id atteso, NON la prima/ultima a caso. Qui id=1 e' initialize, id=2 e'
+    /// tools/call: il selettore deve ritornare il result di id=2.
+    #[test]
+    fn select_result_picks_expected_id() {
+        let line1 =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"Playwright"}}}"#;
+        let line2 =
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Result 42"}]}}"#;
+        let output = format!("{line1}\n{line2}");
+        let result = select_result_by_id(&output, 2).expect("deve trovare id=2");
+        assert!(result.get("content").is_some());
+        let parsed = parse_tool_result(result).unwrap();
+        assert!(parsed.content.contains("Result 42"));
+        assert!(!parsed.is_error);
+    }
+
+    /// Se arriva SOLO la risposta di initialize (id=1) e si attende id=2, NON
+    /// deve essere scambiata per il risultato del tool: fallback all'unica
+    /// risposta con result, ma e' chiaramente il serverInfo (non un tool result).
+    #[test]
+    fn select_result_does_not_confuse_initialize_when_only_one() {
+        let output = r#"{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"Playwright"}}}"#;
+        // expected_id=2 non presente: fallback ritorna l'unico result (id=1).
+        let result = select_result_by_id(output, 2).expect("fallback all'unico result");
+        // Il chiamante (list_tools_stdio) verifica poi la presenza di "tools":
+        // qui non c'e', quindi non verrebbe scambiato per una tool list.
+        assert!(result.get("tools").is_none());
+        assert!(result.get("content").is_none());
+    }
+
+    #[test]
+    fn select_result_none_when_no_result() {
+        let output = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"x"}}"#;
+        assert!(select_result_by_id(output, 2).is_none());
+    }
+
+    #[test]
+    fn select_result_skips_non_json_lines() {
+        let json = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[]}}"#;
+        let output = format!("stderr noise non-json\n{json}");
+        assert!(select_result_by_id(&output, 2).is_some());
     }
 }

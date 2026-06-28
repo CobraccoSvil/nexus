@@ -60,6 +60,7 @@ mod nexus_routing;
 mod nexus_tool_catalog;
 mod nexus_tools;
 mod orchestrator;
+mod playwright_env;
 pub mod playwright_live;
 mod plugins;
 mod port_registry;

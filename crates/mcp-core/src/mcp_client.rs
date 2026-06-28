@@ -6,5 +6,5 @@
 //! cosi' i call site interni a mcp-core non devono cambiare il path d'import.
 
 pub use nexus_mcp_client::{
-    call_tool, list_tools, McpServerConfig, McpTransport,
+    call_tool, list_tools, resolve_stdio_timeout, McpServerConfig, McpTransport,
 };

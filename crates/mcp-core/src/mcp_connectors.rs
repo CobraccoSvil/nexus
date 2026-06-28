@@ -160,7 +160,45 @@ pub async fn execute_mcp_tool(
     let transport: String = row.try_get("transport").unwrap_or_default();
     let name: String = row.try_get("name").unwrap_or_default();
     let plugin_instance_id: Option<Uuid> = row.try_get("plugin_instance_id").unwrap_or(None);
-    let config = build_config(&server_id, &name, &transport, &row);
+    let mut config = build_config(&server_id, &name, &transport, &row);
+
+    // BUG d2 (cause B+C): iniezione args SCOPED sul solo server MCP esterno
+    // @playwright/mcp (slug "playwright-stdio"). Lo slug e' riconosciuto dal
+    // punto unico detect_legacy_catalog_slug a partire da (transport, command,
+    // args) della row. Aggiungiamo --headless --isolated --no-sandbox e
+    // --executable-path <chromium dalla cache>, derivato dal punto unico
+    // playwright_env. NESSUN altro server viene toccato. Se il Chromium manca,
+    // si lascia il config invariato e si lascia che il server fallisca con il
+    // suo errore: NON sostituiamo silenziosamente (regola G/H).
+    {
+        let command: Option<String> = row.try_get("command").unwrap_or(None);
+        let args_val: Value = row.try_get::<Value, _>("args").unwrap_or(json!([]));
+        let slug = crate::plugins::detect_legacy_catalog_slug(
+            &transport,
+            None,
+            command.as_deref(),
+            &args_val,
+        );
+        if crate::playwright_env::is_playwright_mcp_slug(slug) {
+            if let mcp_client::McpTransport::Stdio { args, .. } = &mut config.transport {
+                match crate::playwright_env::playwright_mcp_extra_args() {
+                    Ok(extra) => {
+                        // Evita duplicazioni se gia' presenti (idempotente).
+                        if !args.iter().any(|a| a == "--executable-path") {
+                            args.extend(extra);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            server = %name,
+                            error = %e,
+                            "playwright-stdio: Chromium non risolto, args non iniettati"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     if let Some(plugin_instance_id) = plugin_instance_id {
         if let Ok(Some(policy_row)) = sqlx::query(
@@ -202,7 +240,8 @@ pub async fn execute_mcp_tool(
         }
     }
 
-    match mcp_client::call_tool(&config, tool_name, arguments).await {
+    let stdio_timeout = mcp_client::resolve_stdio_timeout(db).await;
+    match mcp_client::call_tool(&config, tool_name, arguments, stdio_timeout).await {
         Ok(result) => {
             if let Some(plugin_instance_id) = plugin_instance_id {
                 let _ = sqlx::query(

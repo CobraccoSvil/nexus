@@ -209,7 +209,8 @@ pub async fn test_server_core(
 
     let config = build_config(&server_id, &name, &transport, &row);
 
-    match crate::list_tools(&config).await {
+    let stdio_timeout = crate::resolve_stdio_timeout(db).await;
+    match crate::list_tools(&config, stdio_timeout).await {
         Ok(tools) => {
             // Salva/aggiorna tool cache nel DB (punto unico build_tool_upsert_args, S67).
             let tools_for_upsert = build_tool_upsert_args(&tools);
