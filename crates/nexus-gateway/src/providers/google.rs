@@ -26,7 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::gcp_auth::{
     vertex_endpoint, VertexAuth, SETTING_BACKEND, SETTING_VERTEX_CREDENTIALS_JSON,
-    SETTING_VERTEX_LOCATION, SETTING_VERTEX_PROJECT,
+    SETTING_VERTEX_DISCOVERY_LOCATIONS, SETTING_VERTEX_LOCATION, SETTING_VERTEX_PROJECT,
 };
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::types::{
@@ -69,6 +69,12 @@ const SETTINGS_TTL: Duration = Duration::from_secs(60);
 /// obbligatori dal DB.
 const VERTEX_DEFAULT_LOCATION: &str = "europe-west4";
 
+/// TTL della cache model->region funzionante per l'inference Vertex (mig 0476).
+/// Piu' lunga del TTL settings (60s): la mappa di disponibilita' di un modello in
+/// una region e' stabile per minuti, evitiamo di ri-pagare il fallback 404 ad
+/// ogni richiesta. Allo scadere si ricalcola provando di nuovo dalla prima region.
+const VERTEX_REGION_CACHE_TTL: Duration = Duration::from_secs(300);
+
 /// Backend Google risolto dai settings (regola G). `Gemini` usa l'API key in
 /// query param (`?key=...`); `Vertex` usa OAuth2 Service Account + endpoint
 /// regionale aiplatform.
@@ -79,7 +85,14 @@ enum GoogleBackend {
     /// Vertex AI: project/location + auth Service Account condivisa.
     Vertex {
         project: String,
+        /// Region di prima scelta per l'inference (data-residency UE). Resta il
+        /// primo elemento di `discovery_locations`.
         location: String,
+        /// Region candidate ORDINATE per preferenza (mig 0476): usate sia per il
+        /// discovery (list_models itera su tutte e unisce) sia per il fallback di
+        /// region in inference (la prima che risponde non-404 vince). Sempre non
+        /// vuoto: se il setting manca, contiene la sola `location`.
+        discovery_locations: Vec<String>,
         auth: Arc<VertexAuth>,
     },
 }
@@ -94,6 +107,10 @@ pub struct GoogleProvider {
     /// `Arc<GoogleBackend>` cosi' il `VertexAuth` (e la sua cache token) e'
     /// condiviso tra le richieste invece di ricreare l'auth ad ogni chiamata.
     backend: TtlCache<(), Arc<GoogleBackend>>,
+    /// Mappa model -> region Vertex funzionante (mig 0476, TTL 300s). Memorizza la
+    /// PRIMA region che ha risposto non-404 per quel modello, cosi' le richieste
+    /// successive non ri-pagano il fallback 404. Vuota per il backend Gemini.
+    vertex_model_region: TtlCache<String, String>,
 }
 
 impl GoogleProvider {
@@ -122,6 +139,7 @@ impl GoogleProvider {
             db,
             thinking_budget: TtlCache::new(SETTINGS_TTL),
             backend: TtlCache::new(SETTINGS_TTL),
+            vertex_model_region: TtlCache::new(VERTEX_REGION_CACHE_TTL),
         }
     }
 
@@ -187,6 +205,15 @@ impl GoogleProvider {
             } else {
                 location.trim().to_string()
             };
+            // Region candidate per discovery + fallback inference (mig 0476).
+            // CSV ordinato per preferenza; sempre non vuoto (se il setting manca
+            // si usa la sola `location`). La `location` di prima scelta e'
+            // garantita come PRIMO elemento (anteposta se assente dal CSV) cosi'
+            // l'inference parte sempre dalla region UE di data-residency.
+            let discovery_raw = nexus_auth::get_setting(db, SETTING_VERTEX_DISCOVERY_LOCATIONS)
+                .await
+                .unwrap_or_default();
+            let discovery_locations = build_discovery_locations(&discovery_raw, &location);
             let credentials = nexus_auth::get_setting(db, SETTING_VERTEX_CREDENTIALS_JSON)
                 .await
                 .unwrap_or_default();
@@ -200,11 +227,13 @@ impl GoogleProvider {
             tracing::info!(
                 project = %project,
                 location = %location,
+                discovery_locations = %discovery_locations.join(","),
                 "google provider: backend vertex"
             );
             GoogleBackend::Vertex {
                 project: project.trim().to_string(),
                 location,
+                discovery_locations,
                 auth: Arc::new(auth),
             }
         } else {
@@ -219,9 +248,15 @@ impl GoogleProvider {
     /// backend, con l'auth appropriata (query param `?key=` per Gemini, header
     /// `Authorization: Bearer` per Vertex). Punto unico per `complete`/`stream`
     /// (regola L): l'unico bivio gemini/vertex e' qui.
-    async fn build_post(
+    ///
+    /// Per Vertex la `region` e' un PARAMETRO esplicito (mig 0476): cosi'
+    /// l'helper di fallback puo' ricostruire la stessa richiesta su region diverse
+    /// senza duplicare la logica di auth/endpoint. Per Gemini `region` e' ignorato
+    /// (nessun concetto di region).
+    async fn build_post_in_region(
         &self,
         backend: &GoogleBackend,
+        region: &str,
         model: &str,
         stream: bool,
     ) -> anyhow::Result<RequestBuilder> {
@@ -231,14 +266,119 @@ impl GoogleProvider {
                 .post(self.endpoint(model, stream))
                 .query(&[("key", &self.api_key)])),
             GoogleBackend::Vertex {
-                project,
-                location,
-                auth,
+                project, auth, ..
             } => {
                 let token = auth.access_token().await?;
-                let url = vertex_endpoint(project, location, model, stream);
+                let url = vertex_endpoint(project, region, model, stream);
                 Ok(self.http.post(url).bearer_auth(token))
             }
+        }
+    }
+
+    /// Lista ORDINATA delle region da provare per un modello sul backend Vertex
+    /// (mig 0476): se la cache conosce gia' una region funzionante per quel
+    /// modello la usa da sola; altrimenti restituisce tutte le `discovery_locations`
+    /// nell'ordine di preferenza. Per il backend Gemini ritorna `None` (nessuna
+    /// region: si invia una volta sola sull'endpoint API key).
+    fn vertex_regions_for_model(&self, backend: &GoogleBackend, model: &str) -> Option<Vec<String>> {
+        let GoogleBackend::Vertex {
+            discovery_locations,
+            ..
+        } = backend
+        else {
+            return None;
+        };
+        if let Some(cached) = self.vertex_model_region.get(model) {
+            return Some(vec![cached]);
+        }
+        Some(discovery_locations.clone())
+    }
+
+    /// Invia la richiesta con FALLBACK di region per il backend Vertex (mig 0476).
+    ///
+    /// Prova le region nell'ordine di [`vertex_regions_for_model`]: costruisce la
+    /// richiesta con [`build_post_in_region`], la invia e ispeziona lo STATUS
+    /// PRIMA di consumare il body. Un 404 significa "modello non disponibile in
+    /// quella region": si passa alla successiva. Al primo status non-404 (200 o
+    /// errore reale) quella risposta vince; se 2xx la region viene cachata per il
+    /// modello (cosi' le richieste successive non ri-pagano i 404). Se TUTTE le
+    /// region danno 404 si ritorna l'errore dell'ultima.
+    ///
+    /// I modelli presenti in europe-west4 (prima region, UE) NON producono 404:
+    /// vincono al primo tentativo, comportamento INVARIATO (zero regressione su
+    /// gemini-2.5). Il fallback a 'global' scatta solo per i 3.x assenti in UE, e
+    /// SOLO se 'global' e' fra le `discovery_locations` (un deploy UE-only la
+    /// omette -> nessuna uscita dalla UE).
+    ///
+    /// Per il backend Gemini (nessuna region) invia una volta sola sull'endpoint
+    /// con API key: comportamento identico al passato.
+    async fn send_with_region_fallback(
+        &self,
+        backend: &GoogleBackend,
+        model: &str,
+        stream: bool,
+        body: &GenerateContentRequest,
+    ) -> anyhow::Result<reqwest::Response> {
+        let Some(regions) = self.vertex_regions_for_model(backend, model) else {
+            // Backend Gemini: nessuna region, un solo invio.
+            return Ok(self
+                .build_post_in_region(backend, "", model, stream)
+                .await?
+                .json(body)
+                .send()
+                .await?);
+        };
+
+        let mut last: Option<anyhow::Result<reqwest::Response>> = None;
+        for region in &regions {
+            let resp = self
+                .build_post_in_region(backend, region, model, stream)
+                .await?
+                .json(body)
+                .send()
+                .await;
+            match resp {
+                Ok(r) => {
+                    if r.status().as_u16() == 404 {
+                        // Modello non disponibile in questa region: prova la
+                        // successiva (regola G: niente fallback hardcoded, la
+                        // lista arriva dal DB). Non logghiamo il body (regola F).
+                        tracing::warn!(
+                            model = %model,
+                            region = %region,
+                            "vertex 404: modello assente in region, provo la successiva"
+                        );
+                        last = Some(Ok(r));
+                        continue;
+                    }
+                    // Primo status non-404: questa risposta vince. Se 2xx, cacha
+                    // la region per il modello cosi' le richieste successive
+                    // saltano direttamente qui.
+                    if r.status().is_success() {
+                        self.vertex_model_region
+                            .insert(model.to_string(), region.clone());
+                    }
+                    return Ok(r);
+                }
+                Err(e) => {
+                    // Errore di trasporto (non un 404 applicativo): lo trattiamo
+                    // come tentativo fallito e proviamo la region successiva,
+                    // conservandolo come ultimo esito.
+                    tracing::warn!(
+                        model = %model,
+                        region = %region,
+                        "vertex errore di trasporto, provo la region successiva"
+                    );
+                    last = Some(Err(anyhow::Error::new(e)));
+                }
+            }
+        }
+        // Tutte le region hanno dato 404 (o errore di trasporto): ritorna
+        // l'ultimo esito raccolto. `regions` non e' mai vuoto (discovery_locations
+        // garantito non vuoto), quindi `last` e' sempre `Some`.
+        match last {
+            Some(r) => r,
+            None => anyhow::bail!("vertex: nessuna region candidata per il modello {model}"),
         }
     }
 
@@ -287,11 +427,10 @@ impl LlmProvider for GoogleProvider {
         let body = build_request_body(req, thinking);
         let start = Instant::now();
 
+        // Invio con fallback di region per Vertex (mig 0476): la prima region
+        // non-404 vince; per Gemini e' un singolo invio invariato.
         let resp = self
-            .build_post(&backend, &req.model, false)
-            .await?
-            .json(&body)
-            .send()
+            .send_with_region_fallback(&backend, &req.model, false, &body)
             .await?;
 
         let status = resp.status();
@@ -313,11 +452,12 @@ impl LlmProvider for GoogleProvider {
         let thinking = resolve_thinking(req, configured);
         let body = build_request_body(req, thinking);
 
+        // Fallback di region risolto sullo STATUS HTTP iniziale (mig 0476): il 404
+        // arriva prima di qualunque byte di stream, quindi scegliamo la region
+        // PRIMA di iniziare a consumare lo stream. Solo a risposta non-404 (e poi
+        // 2xx) si avvia il consumo dei bytes piu' sotto.
         let resp = self
-            .build_post(&backend, &req.model, true)
-            .await?
-            .json(&body)
-            .send()
+            .send_with_region_fallback(&backend, &req.model, true, &body)
             .await?;
 
         let status = resp.status();
@@ -380,6 +520,7 @@ impl LlmProvider for GoogleProvider {
                 project,
                 location,
                 auth,
+                ..
             } => {
                 let token = match auth.access_token().await {
                     Ok(t) => t,
@@ -408,33 +549,113 @@ impl LlmProvider for GoogleProvider {
         // la normalizzazione a basename e' delegata al parser puro
         // [`parse_google_models_response`] (parita' col brain `list_models_live`).
         let backend = self.resolved_backend().await?;
-        let req = match backend.as_ref() {
-            GoogleBackend::Gemini => self
-                .http
-                .get(format!("{}/models", self.base_url))
-                .query(&[("key", &self.api_key)]),
-            GoogleBackend::Vertex {
-                project: _project,
-                location,
-                auth,
-            } => {
-                let token = auth.access_token().await?;
-                let url = format!(
-                    "https://{location}-aiplatform.googleapis.com/v1beta1/publishers/google/models"
-                );
-                self.http.get(url).bearer_auth(token)
+        match backend.as_ref() {
+            GoogleBackend::Gemini => {
+                let resp = self
+                    .http
+                    .get(format!("{}/models", self.base_url))
+                    .query(&[("key", &self.api_key)])
+                    .send()
+                    .await?;
+                let status = resp.status();
+                if !status.is_success() {
+                    // Regola F: il body d'errore non contiene prompt/response utente.
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("google GET models HTTP {}: {}", status.as_u16(), text);
+                }
+                let body: serde_json::Value = resp.json().await?;
+                Ok(parse_google_models_response(&body))
             }
-        };
-        let resp = req.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            // Regola F: il body d'errore non contiene prompt/response utente.
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google GET models HTTP {}: {}", status.as_u16(), text);
+            GoogleBackend::Vertex {
+                discovery_locations,
+                auth,
+                ..
+            } => {
+                // Discovery multi-region (mig 0476): interroghiamo OGNI region
+                // candidata e uniamo i risultati. europe-west4 NON espone i
+                // gemini-3.x, 'global' si': iterando le scopriamo entrambe. Una
+                // region che fallisce (non-2xx / rete) e' loggata WARN e saltata,
+                // senza far fallire l'intero discovery (degrado parziale).
+                let token = auth.access_token().await?;
+                let mut all: Vec<String> = Vec::new();
+                let mut ok_regions = 0usize;
+                for region in discovery_locations {
+                    let url = format!(
+                        "https://{region}-aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                    );
+                    let resp = self.http.get(url).bearer_auth(&token).send().await;
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            match r.json::<serde_json::Value>().await {
+                                Ok(body) => {
+                                    all.extend(parse_google_models_response(&body));
+                                    ok_regions += 1;
+                                }
+                                Err(_) => tracing::warn!(
+                                    region = %region,
+                                    "vertex discovery: risposta models non parsabile, salto"
+                                ),
+                            }
+                        }
+                        Ok(r) => tracing::warn!(
+                            region = %region,
+                            status = r.status().as_u16(),
+                            "vertex discovery: GET models non-2xx, salto la region"
+                        ),
+                        Err(_) => tracing::warn!(
+                            region = %region,
+                            "vertex discovery: errore di rete su GET models, salto la region"
+                        ),
+                    }
+                }
+                if ok_regions == 0 {
+                    anyhow::bail!(
+                        "vertex discovery: nessuna delle {} region ha risposto",
+                        discovery_locations.len()
+                    );
+                }
+                // Dedup mantenendo output deterministico (parita' col parser puro,
+                // che ordina+deduplica per ogni singola region; qui ri-uniamo le
+                // liste cross-region).
+                all.sort();
+                all.dedup();
+                Ok(all)
+            }
         }
-        let body: serde_json::Value = resp.json().await?;
-        Ok(parse_google_models_response(&body))
     }
+}
+
+/// Costruisce la lista ORDINATA di region candidate per Vertex (mig 0476) dal
+/// CSV del setting `google_vertex_discovery_locations` e dalla `location` di
+/// prima scelta. Funzione PURA (regola L, testabile senza rete):
+///   - split su ',', trim, scarta i vuoti;
+///   - dedup mantenendo l'ordine di prima apparizione;
+///   - garantisce `location` come PRIMO elemento (anteposta se assente dal CSV),
+///     cosi' l'inference parte sempre dalla region UE di data-residency;
+///   - se il CSV non produce alcuna region, ricade su `[location]`.
+/// Risultato sempre NON VUOTO.
+fn build_discovery_locations(csv: &str, location: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // La region di prima scelta e' sempre la prima candidata.
+    let location = location.trim();
+    if !location.is_empty() {
+        out.push(location.to_string());
+    }
+    for part in csv.split(',') {
+        let region = part.trim();
+        if region.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|r| r == region) {
+            out.push(region.to_string());
+        }
+    }
+    if out.is_empty() {
+        // Ne' location ne' CSV utili: fallback prudente alla default UE cosi' la
+        // lista resta sempre non vuota (l'inference ha almeno una region).
+        out.push(VERTEX_DEFAULT_LOCATION.to_string());
+    }
+    out
 }
 
 /// Estrae i nomi modello dalla risposta `models.list` di Google e li normalizza
@@ -2195,5 +2416,100 @@ mod tests {
             json["contents"][0]["parts"][0]["functionResponse"]["name"],
             "call_orfano"
         );
+    }
+
+    // --- Discovery + fallback di region Vertex (mig 0476) ------------------
+
+    #[test]
+    fn discovery_locations_da_csv_ordinato_e_dedup() {
+        // CSV ordinato per preferenza; la location (UE) resta prima, duplicati
+        // rimossi mantenendo l'ordine di prima apparizione.
+        let regions = build_discovery_locations("europe-west4,global,europe-west4", "europe-west4");
+        assert_eq!(regions, vec!["europe-west4", "global"]);
+    }
+
+    #[test]
+    fn discovery_locations_anteposta_location_se_assente_dal_csv() {
+        // Se il CSV non include la location di prima scelta, va comunque ANTEPOSTA
+        // (l'inference parte sempre dalla region UE di data-residency).
+        let regions = build_discovery_locations("global,us-central1", "europe-west4");
+        assert_eq!(regions, vec!["europe-west4", "global", "us-central1"]);
+    }
+
+    #[test]
+    fn discovery_locations_csv_vuoto_usa_sola_location() {
+        // Setting assente/vuoto -> si usa la sola location (nessun fallback fuori
+        // UE in un deploy che non configura il CSV).
+        let regions = build_discovery_locations("", "europe-west4");
+        assert_eq!(regions, vec!["europe-west4"]);
+        // Spazi e separatori spuri vengono ripuliti.
+        let regions2 = build_discovery_locations(" , ,  ", "europe-west4");
+        assert_eq!(regions2, vec!["europe-west4"]);
+    }
+
+    #[test]
+    fn discovery_locations_ue_only_non_include_global() {
+        // Deploy UE-only: CSV = sola europe-west4 -> nessuna region fuori UE,
+        // quindi in inference non c'e' alcun fallback a 'global'.
+        let regions = build_discovery_locations("europe-west4", "europe-west4");
+        assert_eq!(regions, vec!["europe-west4"]);
+        assert!(!regions.iter().any(|r| r == "global"));
+    }
+
+    #[test]
+    fn discovery_locations_mai_vuoto() {
+        // Caso limite: ne' location ne' CSV -> fallback alla default UE, lista
+        // sempre non vuota (l'inference ha almeno una region da provare).
+        let regions = build_discovery_locations("", "");
+        assert_eq!(regions, vec!["europe-west4"]);
+    }
+
+    #[test]
+    fn vertex_regions_gemini_ritorna_none() {
+        // Backend Gemini: nessuna region -> None (invio singolo su API key).
+        let p = GoogleProvider::new(Client::new(), "k", None);
+        assert!(p
+            .vertex_regions_for_model(&GoogleBackend::Gemini, "gemini-x")
+            .is_none());
+    }
+
+    #[test]
+    fn vertex_regions_usa_cache_se_presente() {
+        // Se la cache conosce una region per il modello, e' l'unica provata
+        // (le richieste successive saltano il fallback 404).
+        let p = GoogleProvider::new(Client::new(), "k", None);
+        let backend = GoogleBackend::Vertex {
+            project: "proj".to_string(),
+            location: "europe-west4".to_string(),
+            discovery_locations: vec!["europe-west4".to_string(), "global".to_string()],
+            auth: Arc::new(
+                VertexAuth::from_credentials_json(Client::new(), &sample_sa_json()).unwrap(),
+            ),
+        };
+        // Prima del cache hit: tutte le region candidate, in ordine.
+        let before = p
+            .vertex_regions_for_model(&backend, "gemini-3.5-flash")
+            .unwrap();
+        assert_eq!(before, vec!["europe-west4", "global"]);
+        // Dopo aver cachato 'global' per quel modello: solo 'global'.
+        p.vertex_model_region
+            .insert("gemini-3.5-flash".to_string(), "global".to_string());
+        let after = p
+            .vertex_regions_for_model(&backend, "gemini-3.5-flash")
+            .unwrap();
+        assert_eq!(after, vec!["global"]);
+        // Un modello diverso resta sull'ordine di discovery completo.
+        let other = p.vertex_regions_for_model(&backend, "gemini-2.5-pro").unwrap();
+        assert_eq!(other, vec!["europe-west4", "global"]);
+    }
+
+    fn sample_sa_json() -> String {
+        serde_json::json!({
+            "type": "service_account",
+            "project_id": "nexus-test",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY-----\n",
+            "client_email": "nexus-sa@nexus-test.iam.gserviceaccount.com"
+        })
+        .to_string()
     }
 }

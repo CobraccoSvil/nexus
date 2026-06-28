@@ -39,6 +39,11 @@ const TOKEN_REFRESH_MARGIN_SECS: i64 = 120;
 pub const SETTING_BACKEND: &str = "google_provider_backend";
 pub const SETTING_VERTEX_PROJECT: &str = "google_vertex_project";
 pub const SETTING_VERTEX_LOCATION: &str = "google_vertex_location";
+/// Region candidate per il DISCOVERY (list_models) e il fallback di region in
+/// inference (mig 0476). CSV ordinato per preferenza: la prima e' UE
+/// (data-residency), la prima che risponde non-404 vince. Assente => si usa la
+/// sola `SETTING_VERTEX_LOCATION`.
+pub const SETTING_VERTEX_DISCOVERY_LOCATIONS: &str = "google_vertex_discovery_locations";
 pub const SETTING_VERTEX_CREDENTIALS_JSON: &str = "google_vertex_credentials_json";
 
 /// Service Account Google deserializzato dal JSON in DB. Solo i campi usati per
