@@ -620,7 +620,7 @@ pub async fn send_chat_message(
                                 Err(_) => 120,
                             };
 
-                        let result = crate::brain_agent_client::run_via_brain(
+                        let mut result = crate::brain_agent_client::run_via_brain(
                             new_run_id,
                             session_id_r,
                             provider_r,
@@ -638,6 +638,37 @@ pub async fn send_chat_message(
                         )
                         .await;
                         channels2.remove(&new_run_id);
+
+                        // Riconciliazione costo/token dal ledger (punto unico,
+                        // regola L): se il path brain non propaga il costo ma il
+                        // gateway ha gia' scritto il ledger per il run, il metadata
+                        // del messaggio assistant (e quindi la UI) mostra il costo
+                        // reale invece di $0.00.
+                        let ledger_totals =
+                            crate::chat_messages::agent_run::fetch_ledger_totals(
+                                &db_clone2,
+                                new_run_id,
+                            )
+                            .await;
+                        let _ = crate::chat_messages::agent_run::reconcile_run_cost_from_ledger(
+                            &mut result,
+                            &ledger_totals,
+                        );
+                        // finalize_agent_run NON scrive token/costo: se il brain non
+                        // li ha persistiti su agent_runs ma il ledger li ha, allinea
+                        // qui (idempotente: tocca solo i run rimasti a 0, non
+                        // sovrascrive un valore gia' corretto del path Python).
+                        if result.total_cost > 0.0 {
+                            let _ = sqlx::query(
+                                "UPDATE agent_runs SET total_cost = $2, total_tokens = $3 \
+                                 WHERE id = $1 AND total_cost = 0",
+                            )
+                            .bind(new_run_id)
+                            .bind(result.total_cost)
+                            .bind(result.total_tokens as i32)
+                            .execute(&db_clone2)
+                            .await;
+                        }
 
                         // Esito CERTO anche sul resume (regola L + ADR 0025): stesso
                         // punto unico dello spawn principale. compose_turn_answer
