@@ -1341,6 +1341,18 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_transcribe_audio",
+    "description": "Trascrive un audio allegato alla chat (speech-to-text) e restituisce il testo. Usalo quando l'inspector ha rilevato kind=audio (mp3/wav/...) o l'utente allega una nota vocale/registrazione e chiede di trascriverla o di capirne il contenuto parlato. Il modello audio-in e' scelto dal sistema (purpose transcribe_audio): non specificare nomi modello. Ritorna text e model_used.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {"type": "string"},
+        "language": {"type": "string", "description": "Lingua dell'audio in ISO-639-1 (es. 'it', 'en'), opzionale: migliora accuratezza e velocita'. Se omessa il modello la rileva automaticamente."}
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
     "name": "nexus_visual_compare",
     "description": "Confronta screenshot dell'app locale con design Figma via vision model. Ritorna similarity_score (0-100), differences[], screenshot_path. Usa per iterare layout/stile fino a soglia (default 85).",
     "input_schema": {

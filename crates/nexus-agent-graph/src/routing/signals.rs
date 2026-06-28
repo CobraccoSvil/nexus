@@ -81,6 +81,7 @@ pub const EXPLORATION_ONLY_TOOLS: &[&str] = &[
     "nexus_extract_xlsx_data",
     "nexus_extract_pdf_text",
     "nexus_describe_image_attachment",
+    "nexus_transcribe_audio",
     "read_file",
     "list_files",
     "grep",

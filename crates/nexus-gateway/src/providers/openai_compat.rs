@@ -23,7 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::provider::ChunkStream;
 use crate::types::{
     GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
-    LlmUsage, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall,
+    LlmUsage, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall, TranscribeResponse,
 };
 
 /// Dialetto di reasoning di un endpoint OpenAI-compatibile. Centralizza (regola
@@ -326,6 +326,81 @@ impl OpenAiCompatClient {
             latency_ms,
         ))
     }
+
+    /// Trascrive audio via `POST {base_url}/audio/transcriptions` (dialetto OpenAI
+    /// Audio, MULTIPART/form-data). Punto unico del trasporto audio-in OpenAI-
+    /// compatibile (regola L): stesso `http` client e `bearer_auth(api_key)` di
+    /// [`Self::complete`], stesso status-check propagato al caller (che applica
+    /// `is_billing_error` + cooldown).
+    ///
+    /// Form: `file=<bytes>` (con `file_name` + mime), `model`, `response_format=json`,
+    /// `language` se presente. Risposta: `{"text":"..."}` -> [`TranscribeResponse`].
+    /// Regola G: `model` arriva dal chiamante. Regola F: il body d'errore (che non
+    /// contiene il payload audio) e' propagato al caller, non loggato qui.
+    pub async fn transcribe(
+        &self,
+        model: &str,
+        audio_bytes: Vec<u8>,
+        filename: &str,
+        language: Option<&str>,
+    ) -> anyhow::Result<TranscribeResponse> {
+        let mut part = reqwest::multipart::Part::bytes(audio_bytes).file_name(filename.to_string());
+        // MIME inferito dall'estensione del filename (gia' risolta dal chiamante in
+        // base al mime dichiarato). Se non riconosciuto, lasciamo che reqwest usi
+        // application/octet-stream: OpenAI inferisce comunque dal file_name.
+        if let Some(mime) = mime_from_filename(filename) {
+            part = part.mime_str(mime)?;
+        }
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("model", model.to_string())
+            .text("response_format", "json");
+        if let Some(lang) = language.filter(|l| !l.trim().is_empty()) {
+            form = form.text("language", lang.trim().to_string());
+        }
+
+        let start = Instant::now();
+        let resp = self
+            .http
+            .post(format!("{}/audio/transcriptions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .multipart(form)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+        }
+
+        let parsed: TranscriptionResponse = resp.json().await?;
+        let latency_ms = start.elapsed().as_millis() as u64;
+        Ok(TranscribeResponse {
+            text: parsed.text,
+            model_used: model.to_string(),
+            provider_used: self.provider_name.clone(),
+            latency_ms,
+        })
+    }
+}
+
+/// MIME audio dall'estensione del filename multipart. Copre i formati accettati
+/// dall'API OpenAI Audio. `None` per estensioni non riconosciute (reqwest usa il
+/// default; OpenAI inferisce dal file_name). Funzione PURA (testabile).
+fn mime_from_filename(filename: &str) -> Option<&'static str> {
+    let ext = filename.rsplit_once('.').map(|(_, e)| e.to_lowercase())?;
+    let mime = match ext.as_str() {
+        "mp3" | "mpga" | "mpeg" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "mp4" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "flac" => "audio/flac",
+        "webm" => "audio/webm",
+        _ => return None,
+    };
+    Some(mime)
 }
 
 /// Mappa una [`ImagesResponse`] del dialetto OpenAI Images nel contratto
@@ -845,6 +920,14 @@ struct ImageData {
     b64_json: Option<String>,
     #[serde(default)]
     url: Option<String>,
+}
+
+/// Risposta di `POST /audio/transcriptions` con `response_format=json`:
+/// `{ "text": "..." }`.
+#[derive(Debug, Deserialize)]
+struct TranscriptionResponse {
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1537,6 +1620,30 @@ mod tests {
         assert_eq!(json["n"], 2);
         assert_eq!(json["size"], "1024x1024");
         assert_eq!(json["response_format"], "b64_json");
+    }
+
+    // --- Audio transcription (dialetto OpenAI Audio) ----------------------
+
+    #[test]
+    fn transcription_response_estrae_text() {
+        let raw = r#"{ "text": "ciao mondo", "language": "it" }"#;
+        let parsed: TranscriptionResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.text, "ciao mondo");
+        // Risposta senza text -> stringa vuota (tollerante, non panico).
+        let vuoto: TranscriptionResponse = serde_json::from_str("{}").unwrap();
+        assert!(vuoto.text.is_empty());
+    }
+
+    #[test]
+    fn mime_from_filename_mappa_estensioni_audio() {
+        assert_eq!(mime_from_filename("audio.mp3"), Some("audio/mpeg"));
+        assert_eq!(mime_from_filename("a.WAV"), Some("audio/wav"));
+        assert_eq!(mime_from_filename("nota.m4a"), Some("audio/mp4"));
+        assert_eq!(mime_from_filename("voce.ogg"), Some("audio/ogg"));
+        assert_eq!(mime_from_filename("x.flac"), Some("audio/flac"));
+        // Estensione non audio o assente -> None (default reqwest).
+        assert_eq!(mime_from_filename("file.bin"), None);
+        assert_eq!(mime_from_filename("senza_estensione"), None);
     }
 
     #[test]

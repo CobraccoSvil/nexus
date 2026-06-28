@@ -316,6 +316,131 @@ pub async fn gateway_image_generate(
     })
 }
 
+// ── Audio transcription (delega al gateway: POST /v1/audio/transcriptions) ───
+
+/// Corpo di `POST /v1/audio/transcriptions` (sottoinsieme usato dai tool del
+/// crate). Wire-compatibile con `GwTranscribeRequest` di mcp-core::nexus_gateway /
+/// `TranscribeRequest` del gateway: stesso contratto serde (`model`,
+/// `audio_base64`, `mime`, `language`, `pin_provider`, `metadata`). NON dipende da
+/// quel tipo per non introdurre un ciclo di crate (vedi nota di modulo).
+#[derive(Serialize)]
+struct GwTranscribeRequestBody {
+    model: String,
+    audio_base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    /// Pin esplicito del provider deciso a monte (routing per capability nel
+    /// purpose `transcribe_audio`): il gateway esegue ESATTAMENTE quel provider
+    /// senza secondo routing (parita' con `gateway_image_generate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin_provider: Option<String>,
+    metadata: GwMetadata,
+}
+
+/// Risposta di `POST /v1/audio/transcriptions` (solo i campi consumati dal tool).
+#[derive(Deserialize)]
+struct GwTranscribeResponseBody {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    model_used: String,
+    #[serde(default)]
+    provider_used: String,
+}
+
+/// Esito di una trascrizione audio al gateway: il testo + l'etichetta
+/// provider/model realmente eseguita.
+pub struct GwTranscribeOut {
+    /// Testo trascritto dall'audio.
+    pub text: String,
+    /// Etichetta `provider/model` realmente eseguita dal gateway.
+    pub model_used: String,
+}
+
+/// Trascrive un audio via il gateway pinnando il provider deciso a monte dal
+/// purpose `transcribe_audio` (regola G: provider/model gia' risolti, nessun
+/// modello hardcoded qui). Gemella di [`gateway_image_generate`]: riusa la
+/// risoluzione porta/token del crate (regola L, niente routing duplicato) e
+/// rigira l'errore HTTP al chiamante (regola H: niente fallback inventato; se il
+/// provider non trascrive il gateway risponde 5xx col motivo).
+///
+/// - `provider`/`model`: risolti dal purpose via routing.
+/// - `audio_base64`: audio sorgente codificato base64 (costruito dal chiamante).
+/// - `mime`: MIME dell'audio (per il nome multipart), opzionale.
+/// - `language`: lingua ISO-639-1 dell'audio, opzionale.
+/// - `feature`: etichetta di tracciamento (di norma il nome del purpose).
+pub async fn gateway_transcribe_audio(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    audio_base64: String,
+    mime: Option<String>,
+    language: Option<String>,
+    feature: &str,
+) -> Result<GwTranscribeOut, String> {
+    let base_url = resolve_gateway_url(db).await;
+    let token = resolve_gateway_token();
+
+    let body = GwTranscribeRequestBody {
+        model: model.to_string(),
+        audio_base64,
+        mime,
+        language,
+        pin_provider: Some(provider.to_string()),
+        metadata: GwMetadata {
+            feature: feature.to_string(),
+            ..Default::default()
+        },
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+
+    let resp = client
+        .post(format!("{base_url}/v1/audio/transcriptions"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "gateway LLM irraggiungibile ({base_url}): {e}. \
+                 Verifica che il nexus-gateway sia attivo."
+            )
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "gateway /v1/audio/transcriptions ha risposto HTTP {} ({provider}/{model}): {detail}",
+            status.as_u16()
+        ));
+    }
+
+    let parsed: GwTranscribeResponseBody = resp
+        .json()
+        .await
+        .map_err(|e| format!("risposta gateway transcribe non valida: {e}"))?;
+
+    let model_used = if parsed.model_used.is_empty() {
+        format!("{provider}/{model}")
+    } else if parsed.provider_used.is_empty() {
+        parsed.model_used
+    } else {
+        format!("{}/{}", parsed.provider_used, parsed.model_used)
+    };
+
+    Ok(GwTranscribeOut {
+        text: parsed.text,
+        model_used,
+    })
+}
+
 // ── Batch API (delega al gateway: POST /v1/batch + GET stato/risultati) ──────
 
 /// Singola richiesta di un batch: `custom_id` + system/user prompt risolti dal

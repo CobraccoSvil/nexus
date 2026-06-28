@@ -42,9 +42,8 @@ tower-http.workspace = true
 async-trait = "0.1"
 serde_yaml = "0.9"
 thiserror = "1.0"
+# Decodifica dell'audio base64 (TranscribeRequest) prima dell'invio multipart al
+# provider; usata anche nei test di gcp_auth (header/payload JWT, senza rete).
+base64.workspace = true
 nexus-cache = { path = "../nexus-cache" }
 nexus-auth = { path = "../nexus-auth" }
-
-[dev-dependencies]
-# Decodifica i segmenti del JWT (header/payload) nei test di gcp_auth, senza rete.
-base64.workspace = true

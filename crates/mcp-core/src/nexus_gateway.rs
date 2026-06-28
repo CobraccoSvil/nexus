@@ -128,6 +128,40 @@ pub struct GwImageResponse {
     pub latency_ms: u64,
 }
 
+/// Richiesta di trascrizione audio al gateway (`POST /v1/audio/transcriptions`).
+/// Speculare a [`GwImageRequest`] ma per il task audio-in: l'audio arriva come
+/// base64 inline + il modello. Regola G: il `model` arriva dal chiamante.
+///
+/// API client pronta per il wiring: il tool agente che la consuma vive in
+/// `nexus-agent-tools` (audio_tools), che NON puo' dipendere da questo crate
+/// (ciclo) e re-implementa il trasporto wire-compatibile; qui e' senza call site.
+#[allow(dead_code)]
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct GwTranscribeRequest {
+    pub model: String,
+    pub audio_base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Pin esplicito del provider (bypass routing nel gateway). Stessa semantica
+    /// di [`GwImageRequest::pin_provider`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
+    pub metadata: GwMetadata,
+}
+
+/// Risposta di `POST /v1/audio/transcriptions` del gateway. Speculare a
+/// [`GwImageResponse`]. Vedi nota su [`GwTranscribeRequest`].
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct GwTranscribeResponse {
+    pub text: String,
+    pub model_used: String,
+    pub provider_used: String,
+    pub latency_ms: u64,
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct GwUsage {
     pub input_tokens: u32,
@@ -283,6 +317,37 @@ impl NexusGatewayClient {
             .map_err(|e| anyhow::anyhow!("Nexus Gateway image response parse: {e}"))
     }
 
+    /// Trascrive audio via gateway (`POST /v1/audio/transcriptions`). Speculare a
+    /// [`Self::generate_image`]: stesso Bearer service token, stesso status-check
+    /// con propagazione del body d'errore al caller (regola H: errore esplicito se
+    /// il provider non trascrive -> il gateway ritorna 500 col motivo).
+    ///
+    /// Pronta per il wiring: vedi nota su [`GwTranscribeRequest`].
+    #[allow(dead_code)]
+    pub async fn transcribe_audio(
+        &self,
+        req: GwTranscribeRequest,
+    ) -> Result<GwTranscribeResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/audio/transcriptions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.service_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Nexus Gateway {status}: {body}");
+        }
+
+        resp.json::<GwTranscribeResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway transcribe response parse: {e}"))
+    }
+
     pub async fn is_healthy(&self) -> bool {
         self.http
             .get(format!("{}/health", self.base_url))
@@ -413,6 +478,48 @@ mod tests {
         assert_eq!(json["n"], 1);
         // size None -> campo omesso.
         assert!(json.get("size").is_none());
+        assert_eq!(json["pin_provider"], "openai");
+    }
+
+    #[test]
+    fn parse_transcribe_response_dal_gateway() {
+        // Forma di POST /v1/audio/transcriptions: text + tracciamento.
+        let raw = r#"{
+            "text": "ciao mondo",
+            "model_used": "whisper-1",
+            "provider_used": "openai",
+            "latency_ms": 850
+        }"#;
+        let parsed: GwTranscribeResponse =
+            serde_json::from_str(raw).expect("parse transcribe response");
+        assert_eq!(parsed.text, "ciao mondo");
+        assert_eq!(parsed.model_used, "whisper-1");
+        assert_eq!(parsed.provider_used, "openai");
+        assert_eq!(parsed.latency_ms, 850);
+    }
+
+    #[test]
+    fn transcribe_request_serializza_campi_e_omette_opzionali() {
+        let req = GwTranscribeRequest {
+            model: "whisper-1".into(),
+            audio_base64: "AAAA".into(),
+            mime: Some("audio/mpeg".into()),
+            language: None,
+            pin_provider: Some("openai".into()),
+            metadata: GwMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "audio".into(),
+            },
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["model"], "whisper-1");
+        assert_eq!(json["audio_base64"], "AAAA");
+        assert_eq!(json["mime"], "audio/mpeg");
+        // language None -> campo omesso.
+        assert!(json.get("language").is_none());
         assert_eq!(json["pin_provider"], "openai");
     }
 

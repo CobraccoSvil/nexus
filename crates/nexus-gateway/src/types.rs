@@ -303,6 +303,44 @@ pub struct ImageGenResponse {
     pub latency_ms: u64,
 }
 
+/// Richiesta di trascrizione audio (`TranscribeRequest`, speech-to-text).
+/// Speculare a [`ImageGenRequest`] ma per il task audio-in: niente messaggi/tool,
+/// solo l'audio (base64) + il modello. Regola G: il `model` arriva sempre dal
+/// chiamante (nessun default hardcoded). `pin_provider` ha la stessa semantica di
+/// [`LlmRequest::pin_provider`] (bypass routing, esecuzione di QUEL provider).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscribeRequest {
+    pub model: String,
+    /// Audio sorgente codificato base64 (il gateway lo decodifica e lo invia come
+    /// multipart `file` al provider). Niente URL: il gateway non fa fetch esterni.
+    pub audio_base64: String,
+    /// MIME dell'audio (es. `audio/mpeg`, `audio/wav`): usato per nominare la part
+    /// multipart con l'estensione corretta. `None` => estensione generica.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    /// Lingua dell'audio in ISO-639-1 (es. `it`, `en`), opzionale: migliora
+    /// accuratezza/latency. `None` => il provider la rileva da solo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Pin esplicito del provider da eseguire (bypass routing). Quando `Some`, il
+    /// gateway esegue ESATTAMENTE quel provider; quando `None`, sceglie il primo
+    /// provider sano che dichiara `supports_audio_in()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_provider: Option<String>,
+    pub metadata: RequestMetadata,
+}
+
+/// Risposta di trascrizione audio (`TranscribeResponse`). Speculare a
+/// [`ImageGenResponse`] per i campi di tracciamento (model/provider/latency).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscribeResponse {
+    /// Testo trascritto dall'audio.
+    pub text: String,
+    pub model_used: String,
+    pub provider_used: String,
+    pub latency_ms: u64,
+}
+
 /// Voce della tabella di alias modello (`ModelAliasEntry`, da model-aliases.yaml).
 ///
 /// I tre campi modello sono `Option` perche' nello YAML possono valere `null`

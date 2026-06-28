@@ -172,6 +172,9 @@ pub fn estimate_tool_result_size_bytes(tool_name: &str, args: &Value) -> i64 {
             4_000
         }
         "nexus_describe_image_attachment" => 8_000,
+        // Trascrizione audio: testo variabile (proporzionale alla durata); stima
+        // come la descrizione immagine, sopra il default per non sottostimare.
+        "nexus_transcribe_audio" => 8_000,
         _ => 5_000,
     }
 }

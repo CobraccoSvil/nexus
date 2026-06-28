@@ -10,13 +10,17 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use nexus_cache::TtlCache;
 use reqwest::Client;
 use sqlx::PgPool;
 
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::providers::openai_compat::{OpenAiCompatClient, ReasoningDialect, ResolvedReasoning};
-use crate::types::{ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, SensitivityTier};
+use crate::types::{
+    ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, SensitivityTier, TranscribeRequest,
+    TranscribeResponse,
+};
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
 const TIERS: &[SensitivityTier] = &[0, 1, 2];
@@ -171,6 +175,45 @@ impl LlmProvider for OpenAiProvider {
             .images_generations(&req.model, &req.prompt, req.n, req.size.as_deref())
             .await
     }
+
+    fn supports_audio_in(&self) -> bool {
+        true
+    }
+
+    /// Decodifica l'audio base64 e delega al trasporto condiviso
+    /// (`POST /audio/transcriptions`, multipart): stesso client HTTP/auth della
+    /// chat (regola L). Il modello (es. `whisper-1`, `gpt-4o-transcribe`) arriva
+    /// dal chiamante (regola G). Il filename multipart deriva dal mime dichiarato
+    /// (estensione) cosi' OpenAI inferisce il formato dell'audio.
+    async fn transcribe_audio(
+        &self,
+        req: &TranscribeRequest,
+    ) -> anyhow::Result<TranscribeResponse> {
+        let audio_bytes = B64
+            .decode(req.audio_base64.trim())
+            .map_err(|e| anyhow::anyhow!("audio base64 non valido: {e}"))?;
+        let filename = audio_filename(req.mime.as_deref());
+        self.client
+            .transcribe(&req.model, audio_bytes, &filename, req.language.as_deref())
+            .await
+    }
+}
+
+/// Nome file multipart per l'audio, derivato dal MIME dichiarato. OpenAI usa
+/// l'estensione del `file_name` per inferire il formato; senza mime usiamo `.mp3`
+/// (formato piu' comune). Funzione PURA (testabile). Niente nome hardcoded di
+/// business: e' solo l'estensione tecnica del file multipart.
+fn audio_filename(mime: Option<&str>) -> String {
+    let ext = match mime.map(|m| m.trim().to_lowercase()).as_deref() {
+        Some("audio/mpeg" | "audio/mp3") => "mp3",
+        Some("audio/wav" | "audio/x-wav") => "wav",
+        Some("audio/mp4" | "audio/x-m4a" | "audio/m4a") => "m4a",
+        Some("audio/ogg" | "audio/opus") => "ogg",
+        Some("audio/flac" | "audio/x-flac") => "flac",
+        Some("audio/webm") => "webm",
+        _ => "mp3",
+    };
+    format!("audio.{ext}")
 }
 
 #[cfg(test)]
@@ -189,6 +232,21 @@ mod tests {
         assert!(p.supports_streaming());
         assert_eq!(p.max_context_tokens(), 128_000);
         assert_eq!(p.tier_compatibility(), &[0, 1, 2]);
+        // Capability media: OpenAI genera immagini e trascrive audio.
+        assert!(p.supports_image_gen());
+        assert!(p.supports_audio_in());
+    }
+
+    #[test]
+    fn audio_filename_dal_mime() {
+        assert_eq!(audio_filename(Some("audio/mpeg")), "audio.mp3");
+        assert_eq!(audio_filename(Some("audio/wav")), "audio.wav");
+        assert_eq!(audio_filename(Some("audio/mp4")), "audio.m4a");
+        assert_eq!(audio_filename(Some("audio/ogg")), "audio.ogg");
+        assert_eq!(audio_filename(Some("audio/flac")), "audio.flac");
+        // Mime assente o sconosciuto -> default mp3.
+        assert_eq!(audio_filename(None), "audio.mp3");
+        assert_eq!(audio_filename(Some("application/octet-stream")), "audio.mp3");
     }
 
     #[test]

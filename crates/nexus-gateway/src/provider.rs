@@ -11,6 +11,7 @@ use futures::stream::BoxStream;
 
 use crate::types::{
     ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, SensitivityTier,
+    TranscribeRequest, TranscribeResponse,
 };
 
 /// Stream di chunk prodotto da un provider in modalita' streaming. Ogni
@@ -75,5 +76,26 @@ pub trait LlmProvider: Send + Sync {
     /// fallisce visibilmente invece di restituire un risultato vuoto.
     async fn generate_image(&self, _req: &ImageGenRequest) -> anyhow::Result<ImageGenResponse> {
         anyhow::bail!("{}: image-generation non supportata", self.name())
+    }
+
+    /// Se il provider supporta la trascrizione audio (speech-to-text).
+    ///
+    /// Default impl: `false`. I provider che la implementano lo sovrascrivono e
+    /// forniscono [`Self::transcribe_audio`]. Permette al routing audio-in di
+    /// scegliere solo i provider capaci (regola H: niente delega silenziosa a un
+    /// provider che non trascrive audio). Gemello di [`Self::supports_image_gen`].
+    fn supports_audio_in(&self) -> bool {
+        false
+    }
+
+    /// Trascrive l'audio della richiesta. Default impl: errore esplicito (regola
+    /// H, come [`Self::generate_image`]): un provider che non dichiara
+    /// `supports_audio_in()` non deve mai essere chiamato; se accade, fallisce
+    /// visibilmente invece di restituire un risultato vuoto.
+    async fn transcribe_audio(
+        &self,
+        _req: &TranscribeRequest,
+    ) -> anyhow::Result<TranscribeResponse> {
+        anyhow::bail!("{}: transcription non supportata", self.name())
     }
 }

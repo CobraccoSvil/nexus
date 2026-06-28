@@ -15,6 +15,7 @@ pub mod archive_tools;
 pub mod attachment_inspector;
 pub mod attachment_settings;
 pub mod attachments;
+pub mod audio_tools;
 pub mod command_hints;
 pub mod context_core;
 pub mod dev_diagnostics;

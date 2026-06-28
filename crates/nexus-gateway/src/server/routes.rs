@@ -42,7 +42,10 @@ use crate::provider::LlmProvider;
 use crate::providers::is_billing_error;
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
-use crate::types::{ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, RequestMetadata};
+use crate::types::{
+    ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, RequestMetadata, TranscribeRequest,
+    TranscribeResponse,
+};
 
 use super::billing::{enforce_quota, record_usage_to_ledger, QuotaExceeded};
 use super::bootstrap::{build_runtime, GatewayConfig};
@@ -753,6 +756,147 @@ fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
     }
 }
 
+// ── Audio transcription ──────────────────────────────────────────────────────
+
+/// `POST /v1/audio/transcriptions` (auth richiesta): trascrive un audio col
+/// provider scelto. Risolve il provider (pin esplicito oppure il primo sano che
+/// dichiara `supports_audio_in()`), enforce quota PRIMA della chiamata, delega a
+/// `provider.transcribe_audio`. Ritorna [`TranscribeResponse`].
+///
+/// Routing: volutamente SEMPLICE (il routing per-capability fine vive in
+/// mcp-core, regola L), gemello di [`generate_image`]: con `pin_provider` esegue
+/// quel provider; senza pin sceglie il primo provider audio-capable non in
+/// cooldown. Nessun fallback cross-provider in questo PR.
+///
+/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
+/// non si applica alla trascrizione, il cui costo e' al minuto/secondo di audio
+/// (non riportato in token dal provider) e il testo risultante non e' noto a
+/// priori. Per non INVENTARE costi (regola G/H: niente fallback nascosto), in
+/// questo PR il ledger NON viene scritto per le trascrizioni, allineato al
+/// pattern image-gen. TODO PR successiva: costo per-durata-audio in
+/// `ai_price_catalog`.
+pub async fn transcribe_audio(
+    State(state): State<AppState>,
+    Json(body): Json<TranscribeRequest>,
+) -> Response {
+    if body.audio_base64.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "audio_base64 required" })),
+        )
+            .into_response();
+    }
+    match run_transcribe_audio(&state, &body).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Pipeline audio-in: risolve provider audio-capable, enforce quota, trascrive.
+async fn run_transcribe_audio(
+    state: &AppState,
+    body: &TranscribeRequest,
+) -> Result<TranscribeResponse, PipelineError> {
+    let providers = state.runtime_snapshot().await.providers;
+
+    // Risoluzione provider (punto unico testabile, regola L): pin esplicito o
+    // primo audio-capable non in cooldown.
+    let provider =
+        select_audio_in_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
+    let model = strip_model_prefix(&body.model);
+
+    // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
+    // provider+model, regola L). Il testo risultante non e' noto a priori e
+    // l'audio non e' tokenizzabile come prompt: usiamo una stima minima (un
+    // messaggio user vuoto). Coerente col pattern image-gen, che NON scrive
+    // ledger: niente costo inventato (regola G/H).
+    let quota_req = transcribe_to_llm_request(body, &model);
+    enforce_quota(&state.db, &quota_req, provider.name(), &model)
+        .await
+        .map_err(|e| {
+            if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
+                PipelineError::quota(&q.scope, &q.reason)
+            } else {
+                PipelineError::provider(format!("quota check fallito: {e}"))
+            }
+        })?;
+
+    // Richiesta col modello reale risolto per il provider.
+    let mut req = body.clone();
+    req.model = model;
+
+    provider
+        .transcribe_audio(&req)
+        .await
+        .map_err(|e| PipelineError::provider(e.to_string()))
+}
+
+/// Seleziona il provider per la trascrizione audio (punto unico, regola L).
+/// Gemello di [`select_image_provider`]: con `pin` ESATTAMENTE quel provider, che
+/// DEVE essere configurato e audio-capable (regola H: errore esplicito, niente
+/// delega a chi non trascrive, niente ripiego silenzioso). Senza pin: il PRIMO
+/// provider audio-capable non in cooldown. Nessun fallback cross-provider qui.
+fn select_audio_in_provider(
+    providers: &[Arc<dyn LlmProvider>],
+    pin: Option<&str>,
+    cooldown: &CooldownManager,
+) -> Result<Arc<dyn LlmProvider>, PipelineError> {
+    if let Some(pin) = pin {
+        let Some(p) = providers.iter().find(|p| p.name() == pin) else {
+            return Err(PipelineError::provider(format!(
+                "provider pinnato \"{pin}\" non configurato/abilitato nel gateway"
+            )));
+        };
+        if !p.supports_audio_in() {
+            return Err(PipelineError::provider(format!(
+                "provider \"{pin}\" non supporta la trascrizione audio"
+            )));
+        }
+        return Ok(p.clone());
+    }
+    providers
+        .iter()
+        .find(|p| p.supports_audio_in() && !cooldown.is_in_cooldown(p.name()))
+        .cloned()
+        .ok_or_else(|| {
+            PipelineError::provider("nessun provider sano supporta la trascrizione audio")
+        })
+}
+
+/// Costruisce una [`LlmRequest`] di sola STIMA per `enforce_quota` da una
+/// [`TranscribeRequest`]: un messaggio user vuoto (l'audio non e' un prompt
+/// testuale tokenizzabile e il testo risultante non e' noto a priori). Gemella di
+/// [`image_gen_to_llm_request`]: stima minima, niente costo inventato (regola G/H).
+fn transcribe_to_llm_request(body: &TranscribeRequest, model: &str) -> LlmRequest {
+    use crate::types::{LlmMessage, MessageContent};
+    LlmRequest {
+        model: model.to_string(),
+        messages: vec![LlmMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+        }],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        response_format: None,
+        stream: None,
+        thinking: None,
+        tool_choice: None,
+        pin_provider: body.pin_provider.clone(),
+        metadata: RequestMetadata {
+            tenant_id: body.metadata.tenant_id.clone(),
+            user_id: body.metadata.user_id.clone(),
+            request_id: body.metadata.request_id.clone(),
+            sensitivity_tier: body.metadata.sensitivity_tier,
+            feature: body.metadata.feature.clone(),
+        },
+    }
+}
+
 // ── Batch API ────────────────────────────────────────────────────────────────
 
 /// Base URL Anthropic per le chiamate batch. Allineata al provider non-batch
@@ -1064,6 +1208,8 @@ mod tests {
         models_result: Option<Result<Vec<String>, String>>,
         /// Se il provider dichiara `supports_image_gen()` (default `false`).
         image_capable: bool,
+        /// Se il provider dichiara `supports_audio_in()` (default `false`).
+        audio_capable: bool,
     }
 
     impl FakeProvider {
@@ -1074,6 +1220,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 models_result: None,
                 image_capable: false,
+                audio_capable: false,
             })
         }
 
@@ -1085,6 +1232,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 models_result: Some(models_result),
                 image_capable: false,
+                audio_capable: false,
             })
         }
 
@@ -1096,6 +1244,19 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 models_result: None,
                 image_capable: true,
+                audio_capable: false,
+            })
+        }
+
+        /// Variante audio-capable per i test di routing audio-in.
+        fn audio(name: &str, behaviour: Behaviour) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                behaviour,
+                calls: AtomicUsize::new(0),
+                models_result: None,
+                image_capable: false,
+                audio_capable: true,
             })
         }
     }
@@ -1168,6 +1329,24 @@ mod tests {
                         url: None,
                         mime: None,
                     }],
+                    model_used: req.model.clone(),
+                    provider_used: self.name.clone(),
+                    latency_ms: 0,
+                }),
+                Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+            }
+        }
+        fn supports_audio_in(&self) -> bool {
+            self.audio_capable
+        }
+        async fn transcribe_audio(
+            &self,
+            req: &TranscribeRequest,
+        ) -> anyhow::Result<TranscribeResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.behaviour {
+                Behaviour::Ok => Ok(TranscribeResponse {
+                    text: "ciao".to_string(),
                     model_used: req.model.clone(),
                     provider_used: self.name.clone(),
                     latency_ms: 0,
@@ -1476,5 +1655,91 @@ mod tests {
         assert_eq!(out.provider_used, "google");
         assert_eq!(out.images.len(), 1);
         assert_eq!(out.images[0].b64_json.as_deref(), Some("AAAA"));
+    }
+
+    // ── Routing audio transcription ──────────────────────────────────────────
+
+    #[test]
+    fn select_audio_provider_senza_pin_sceglie_primo_audio_capable_sano() {
+        // openai NON audio-capable, mistral audio-capable: senza pin vince mistral.
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let mistral: Arc<dyn LlmProvider> = FakeProvider::audio("mistral", Behaviour::Ok);
+        let built = vec![openai, mistral];
+        let cooldown = CooldownManager::new();
+        let p = select_audio_in_provider(&built, None, &cooldown).unwrap();
+        assert_eq!(p.name(), "mistral");
+    }
+
+    #[test]
+    fn select_audio_provider_senza_pin_salta_quello_in_cooldown() {
+        let openai: Arc<dyn LlmProvider> = FakeProvider::audio("openai", Behaviour::Ok);
+        let mistral: Arc<dyn LlmProvider> = FakeProvider::audio("mistral", Behaviour::Ok);
+        let built = vec![openai, mistral];
+        let cooldown = CooldownManager::new();
+        cooldown.mark_billing("openai", Some("credit balance too low".into()));
+        // openai audio-capable ma in cooldown -> vince mistral.
+        let p = select_audio_in_provider(&built, None, &cooldown).unwrap();
+        assert_eq!(p.name(), "mistral");
+    }
+
+    #[test]
+    fn select_audio_provider_senza_capable_e_errore() {
+        // Nessun provider audio-capable -> errore esplicito (regola H).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let built = vec![openai];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_audio_in_provider(&built, None, &cooldown) else {
+            panic!("senza provider audio-capable deve fallire");
+        };
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("nessun provider"));
+    }
+
+    #[test]
+    fn select_audio_provider_pin_non_capable_e_errore_non_fallback() {
+        // Pin su openai (non audio-capable) anche se mistral capable e' presente:
+        // errore esplicito, niente ripiego su mistral (regola G/H).
+        let openai: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let mistral: Arc<dyn LlmProvider> = FakeProvider::audio("mistral", Behaviour::Ok);
+        let built = vec![openai, mistral];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_audio_in_provider(&built, Some("openai"), &cooldown) else {
+            panic!("pin su provider non audio-capable deve fallire");
+        };
+        assert!(err.message.contains("non supporta"));
+    }
+
+    #[test]
+    fn select_audio_provider_pin_non_configurato_e_errore() {
+        let mistral: Arc<dyn LlmProvider> = FakeProvider::audio("mistral", Behaviour::Ok);
+        let built = vec![mistral];
+        let cooldown = CooldownManager::new();
+        let Err(err) = select_audio_in_provider(&built, Some("openai"), &cooldown) else {
+            panic!("pin su provider non configurato deve fallire");
+        };
+        assert!(err.message.contains("openai"));
+    }
+
+    #[tokio::test]
+    async fn fake_provider_trascrive_audio() {
+        let openai = FakeProvider::audio("openai", Behaviour::Ok);
+        let req = TranscribeRequest {
+            model: "whisper-1".into(),
+            audio_base64: "AAAA".into(),
+            mime: Some("audio/mpeg".into()),
+            language: Some("it".into()),
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "audio".into(),
+            },
+        };
+        let out = openai.transcribe_audio(&req).await.unwrap();
+        assert_eq!(out.provider_used, "openai");
+        assert_eq!(out.model_used, "whisper-1");
+        assert_eq!(out.text, "ciao");
     }
 }
