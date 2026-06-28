@@ -178,6 +178,13 @@ pub(crate) fn canonical_run_status(
             return AgentRunStatus::FailedDiagnosed;
         }
     }
+    // Esito certo (errore provider): un run chiuso `completed` la cui sola
+    // risposta e' il messaggio di errore provider (final_answer "[Errore
+    // provider ...]") senza completion_tokens e' un fallimento infrastrutturale,
+    // non un successo. Punto unico: is_provider_error_completion.
+    if is_provider_error_completion(result) {
+        return AgentRunStatus::Failed;
+    }
     result.status.clone()
 }
 
@@ -1085,6 +1092,22 @@ async fn native_outcome_to_run_result(
 /// non era disponibile (cooldown / gateway irraggiungibile).
 pub(crate) fn is_provider_error_answer(answer: &str) -> bool {
     answer.trim_start().starts_with("[Errore provider")
+}
+
+/// True se il run, pur risultando `Completed`, e' in realta' un fallimento per
+/// provider non disponibile: nessun token di completion prodotto E `final_answer`
+/// = messaggio di errore provider sintetizzato dall'executor. Punto unico (regola
+/// L) della regola "esito certo: errore provider -> Failed", invocato sia dal
+/// finalizzatore dello spawn principale sia da `canonical_run_status` (path resume).
+pub(crate) fn is_provider_error_completion(
+    result: &crate::agent_types::AgentRunResult,
+) -> bool {
+    matches!(result.status, crate::agent_types::AgentRunStatus::Completed)
+        && result.completion_tokens == 0
+        && result
+            .final_answer
+            .as_deref()
+            .is_some_and(is_provider_error_answer)
 }
 
 /// Costruisce un [`AgentRunResult`] FAILED ONESTO per il fallimento del motore
@@ -2144,7 +2167,7 @@ pub(crate) async fn spawn_agent_run(
                             provider_used = outcome.provider_used.as_deref().unwrap_or("-"),
                             model_used = outcome.model_used.as_deref().unwrap_or("-"),
                             resume_at = outcome.resume_at.as_deref().unwrap_or("-"),
-                            "motore nativo: run primario eseguito (path non instradato in produzione)"
+                            "motore nativo: run primario eseguito (path primario, zero-Python)"
                         );
                         // Mappa l'esito sullo stesso AgentRunResult del path Python:
                         // gli step sono gia' su agent_steps (PgAgentStepStore) ->
@@ -3072,22 +3095,13 @@ pub(crate) async fn spawn_agent_run(
                     || result.hollow_completion_kind == "RESIGNED");
             // Esito CERTO (errore provider): un run che si chiuderebbe `completed`
             // ma la cui unica risposta e' il messaggio di errore provider
-            // sintetizzato dall'executor (final_answer = "[Errore provider ...]")
-            // SENZA alcun token di completion prodotto, NON e' un successo: e' un
+            // sintetizzato dall'executor SENZA token di completion e' un
             // fallimento infrastrutturale (provider in cooldown / gateway
             // irraggiungibile). Il routing post-errore puo' richiudere il grafo
-            // con uno stop_reason non-Error (es. cap iterazioni -> EndTurn),
-            // perdendo a monte il segnale; qui lo recuperiamo da final_answer +
-            // 0 completion_tokens e declassiamo a Failed (non FailedDiagnosed: e'
-            // infrastrutturale, non una chiusura diagnostica del modello).
-            let provider_error_close = matches!(
-                result.status,
-                crate::agent_types::AgentRunStatus::Completed
-            ) && result.completion_tokens == 0
-                && result
-                    .final_answer
-                    .as_deref()
-                    .is_some_and(is_provider_error_answer);
+            // con uno stop_reason non-Error (cap iterazioni -> EndTurn), perdendo a
+            // monte il segnale; lo recuperiamo dal punto unico. Failed (non
+            // FailedDiagnosed): e' infrastrutturale, non una chiusura diagnostica.
+            let provider_error_close = is_provider_error_completion(&result);
             let status_canonical = if hollow_no_work {
                 tracing::warn!(
                     "agent_run {}: hollow senza lavoro ({}) — status declassato \
@@ -4275,6 +4289,67 @@ mod tests_finalize_turn {
             AgentRunStatus::Completed, vec![write_step()], None, true,
             "EMPTY_ANSWER", Some("fix"),
         );
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
+    }
+
+    #[test]
+    fn is_provider_error_answer_riconosce_marker() {
+        assert!(is_provider_error_answer("[Errore provider deepseek: gateway giu']"));
+        assert!(is_provider_error_answer("  [Errore provider openai: x]"));
+        assert!(!is_provider_error_answer("Ecco il risultato del task."));
+        assert!(!is_provider_error_answer("[INFO] qualcosa"));
+    }
+
+    #[test]
+    fn errore_provider_zero_token_declassato_a_failed() {
+        // Incidente Beauty-Book (run 8025e4e3): tutti i provider in cooldown,
+        // l'executor sintetizza "[Errore provider ...]" ma il routing post-errore
+        // richiude il grafo con stop_reason non-Error -> il run finiva `completed`.
+        // Con final_answer di errore + 0 completion_tokens deve essere Failed.
+        let r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some(
+                "[Errore provider deepseek: gateway LLM non raggiungibile]\n\n\
+                 Interrotto dopo 10 iterazioni. Lavoro svolto finora: 15 azioni.",
+            ),
+            false,
+            "",
+            Some("agentic_default"),
+        );
+        assert!(is_provider_error_completion(&r));
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Failed);
+    }
+
+    #[test]
+    fn errore_provider_con_token_non_declassato() {
+        // Falso positivo da evitare: il modello ha prodotto output (completion>0),
+        // non e' il caso "0 output per provider giu'": resta Completed.
+        let mut r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("[Errore provider x: transiente, ma poi ho risposto]"),
+            false,
+            "",
+            Some("agentic_default"),
+        );
+        r.completion_tokens = 10;
+        assert!(!is_provider_error_completion(&r));
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
+    }
+
+    #[test]
+    fn risposta_normale_resta_completed() {
+        let mut r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("Ho completato il task con successo."),
+            false,
+            "",
+            Some("agentic_default"),
+        );
+        r.completion_tokens = 42;
+        assert!(!is_provider_error_completion(&r));
         assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
     }
 
