@@ -1,0 +1,22 @@
+-- Consolidamento del concern QUALITY su un'unica fonte di verita' (regola L).
+--
+-- La tabella `quality_findings` (creata in 0001_initial_schema.sql) non e' mai
+-- stata scritta da alcun INSERT nel codice: era una tabella morta. I quality
+-- finding reali vivono in `project_quality_findings` (mig 0028), scritta da
+-- run_quality_scan / maybe_auto_scan_file e letta da get_quality_findings
+-- (pannello "Ottimizzazione") e ora anche da get_project_problems (pannello
+-- "Problemi").
+--
+-- Prima di questo drop i due call site che ancora leggevano la tabella morta
+-- sono stati ripuntati a project_quality_findings:
+--   - get_project_problems (crates/mcp-core/src/project_workspace/logs.rs):
+--     il pannello "Problemi" non mostrava i quality finding nonostante il
+--     design li prevedesse, perche' leggeva la tabella vuota.
+--   - dashboard() (crates/mcp-core/src/main.rs): contava da
+--     `quality_findings WHERE status = 'open'` (colonna inesistente), quindi la
+--     query falliva e l'errore veniva mascherato da unwrap_or(0) -> dashboard
+--     bloccata su 0.
+--
+-- DROP TABLE rimuove anche l'indice idx_quality_findings_project_file creato in
+-- 0001. Nessun'altra tabella o vista referenzia quality_findings.
+DROP TABLE IF EXISTS quality_findings;

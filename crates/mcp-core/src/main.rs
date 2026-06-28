@@ -1496,11 +1496,19 @@ async fn dashboard(State(state): State<AppState>) -> Json<serde_json::Value> {
     .ok()
     .flatten();
 
-    let quality_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM quality_findings WHERE status = 'open'")
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or(0);
+    // Conteggio quality finding APERTI dalla fonte unica `project_quality_findings`
+    // (regola L). La vecchia tabella `quality_findings` (mig 0001) non e' mai stata
+    // popolata ed e' stata droppata (mig 0487); per giunta la query precedente
+    // filtrava su `status = 'open'` — colonna mai esistita su quella tabella —
+    // quindi falliva sempre e `unwrap_or(0)` mascherava l'errore mostrando un
+    // cronico 0 in dashboard. "Aperto" = non risolto e non falso positivo.
+    let quality_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_quality_findings \
+         WHERE fixed_at IS NULL AND (is_false_positive = FALSE OR is_false_positive IS NULL)",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
 
     let shadow_db_status = sqlx::query_scalar::<_, String>(
         "SELECT status FROM jobs WHERE job_type = 'shadow_db_validation' ORDER BY created_at DESC LIMIT 1",

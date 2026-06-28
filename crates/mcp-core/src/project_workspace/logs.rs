@@ -12,12 +12,23 @@ pub async fn get_project_problems(
 
     let mut items = Vec::<Value>::new();
 
+    // PUNTO UNICO QUALITY (regola L): i quality finding hanno UNA sola tabella di
+    // verita', `project_quality_findings` (scritta da run_quality_scan /
+    // maybe_auto_scan_file, letta dal pannello "Ottimizzazione" via
+    // get_quality_findings). La vecchia `quality_findings` (mig 0001) non e' mai
+    // stata scritta da alcun INSERT — tabella morta — ed e' stata droppata
+    // (mig 0487). Il pannello "Problemi" e' la vista aggregata e include anche i
+    // quality finding, escludendo quelli gia' risolti (fixed_at) o marcati come
+    // falsi positivi (is_false_positive): stesso criterio di get_quality_findings
+    // e dell'evento FindingsUpdated emesso dall'auto-scan per-file.
     let quality_rows = sqlx::query(
         r#"
-        SELECT id, file_path, category, severity, finding, created_at
-        FROM quality_findings
+        SELECT id, file_path, category, severity, title, line_number, scanned_at
+        FROM project_quality_findings
         WHERE project_id = $1
-        ORDER BY created_at DESC
+          AND fixed_at IS NULL
+          AND (is_false_positive = FALSE OR is_false_positive IS NULL)
+        ORDER BY scanned_at DESC
         LIMIT 100
         "#,
     )
@@ -27,19 +38,15 @@ pub async fn get_project_problems(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     for row in quality_rows {
-        let finding = row.get::<Value, _>("finding");
         items.push(json!({
             "id": row.get::<Uuid, _>("id").to_string(),
             "severity": row.get::<String, _>("severity"),
-            "source": row.get::<String, _>("category"),
-            "message": finding.get("message")
-                .and_then(Value::as_str)
-                .or_else(|| finding.get("title").and_then(Value::as_str))
-                .unwrap_or("Quality finding"),
+            "source": format!("quality:{}", row.get::<String, _>("category")),
+            "message": row.get::<String, _>("title"),
             "filePath": row.get::<String, _>("file_path"),
-            "line": finding.get("line").and_then(Value::as_i64),
-            "column": finding.get("column").and_then(Value::as_i64),
-            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+            "line": row.try_get::<Option<i32>, _>("line_number").ok().flatten(),
+            "column": serde_json::Value::Null,
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("scanned_at").to_rfc3339(),
         }));
     }
 
