@@ -789,6 +789,148 @@ pub(crate) fn decide_tool_capability_gate(
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Gate di capability VISION sul routing del TURNO (regola L).
+//
+// RIPRISTINO REGRESSIONE Python->Rust (CLAUDE.md sezione I, "Smart routing
+// vision"): nel brain Python, se il messaggio corrente conteneva allegati
+// image/*, il router forzava un override sulla routing matrix verso un modello
+// con capabilities.vision=true. Dopo il cutover a Rust questo override NON era
+// stato reimplementato: l'unico uso di vision era il TOOL esplicito
+// nexus_describe_image_attachment (purpose vision_describe). Se l'agente non
+// chiamava quel tool, il modello del turno poteva non avere vision e l'immagine
+// veniva ignorata. Qui ripristiniamo l'override come PUNTO UNICO.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// PUNTO UNICO (regola L) che mappa "il turno corrente ha un allegato immagine"
+/// a un booleano strutturato. Deriva il segnale dai MIME-TYPE degli allegati del
+/// messaggio (segnale strutturato, niente parsing del testo del prompt) tramite
+/// `classify_attachment_kind` — il punto unico gia' esistente della
+/// classificazione mime->kind (chat_attachments.rs). Un turno "ha un'immagine"
+/// se almeno un allegato e' di kind "image".
+pub(crate) fn turn_has_image_attachment(attachments: &[crate::orchestrator::ChatAttachment]) -> bool {
+    attachments
+        .iter()
+        .any(|a| crate::chat_attachments::classify_attachment_kind(&a.mime_type) == "image")
+}
+
+/// Decisione del gate di capability VISION per il routing del turno.
+///
+/// Separa la LOGICA (pura, testabile senza DB) dall'I/O (query catalog +
+/// fallback al selettore vision), che resta nel chiamante
+/// `apply_vision_capability_gate`. Specularmente a `ToolCapabilityGate`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VisionCapabilityGate {
+    /// Il modello risolto va bene cosi' com'e'. Casi: il turno NON ha immagini
+    /// (override condizionale: zero regressione sul routing testuale), oppure il
+    /// modello risolto supporta gia' la vision.
+    KeepOriginal,
+    /// Il turno ha un'immagine ma il modello risolto NON supporta la vision: il
+    /// chiamante deve cercare un modello vision (capability='vision' ->
+    /// supports_vision=TRUE) col selettore unico, riusando le regole di
+    /// degradazione di tier esistenti.
+    NeedsVisionModel,
+}
+
+/// Decide se forzare un modello vision per il turno corrente.
+///
+/// Funzione PURA: nessun accesso DB. Il chiamante fornisce i fatti gia' letti
+/// (il turno ha un'immagine?, il modello risolto supporta la vision?).
+///
+/// Regole (override CONDIZIONALE — nessun effetto senza immagini):
+/// - turno SENZA immagini -> `KeepOriginal` (routing testuale invariato).
+/// - turno CON immagine + modello esplicitamente senza vision (`Some(false)`)
+///   -> `NeedsVisionModel`.
+/// - turno CON immagine + modello con vision (`Some(true)`) -> `KeepOriginal`.
+/// - turno CON immagine + capability ignota (`None`, modello assente dal
+///   catalog): CONSERVATIVO -> `NeedsVisionModel`. A differenza del gate
+///   tool-use (che resta conservativo "KeepOriginal" perche' un modello
+///   tool-capable mancante dal catalog e' raro e degradarlo sarebbe peggio),
+///   qui un modello senza riga catalog NON ha `supports_vision=TRUE` per
+///   costruzione: ignorare l'immagine e' il fallimento concreto che questo
+///   ripristino vuole evitare. Cerchiamo quindi un modello vision noto.
+pub(crate) fn decide_vision_capability_gate(
+    turn_has_image: bool,
+    model_supports_vision: Option<bool>,
+) -> VisionCapabilityGate {
+    if !turn_has_image {
+        return VisionCapabilityGate::KeepOriginal;
+    }
+    match model_supports_vision {
+        Some(true) => VisionCapabilityGate::KeepOriginal,
+        Some(false) | None => VisionCapabilityGate::NeedsVisionModel,
+    }
+}
+
+#[cfg(test)]
+mod vision_capability_gate_tests {
+    use super::{decide_vision_capability_gate, VisionCapabilityGate};
+    use crate::orchestrator::ChatAttachment;
+
+    fn img(mime: &str) -> ChatAttachment {
+        ChatAttachment {
+            id: None,
+            name: "x".to_string(),
+            mime_type: mime.to_string(),
+            size_bytes: 1,
+            text_content: String::new(),
+            base64_content: None,
+        }
+    }
+
+    #[test]
+    fn turno_con_immagine_su_modello_senza_vision_richiede_vision() {
+        // Ripristino regressione: image/* nel turno + modello senza vision ->
+        // si forza un modello vision.
+        let d = decide_vision_capability_gate(true, Some(false));
+        assert_eq!(d, VisionCapabilityGate::NeedsVisionModel);
+    }
+
+    #[test]
+    fn turno_con_immagine_su_modello_vision_resta_invariato() {
+        let d = decide_vision_capability_gate(true, Some(true));
+        assert_eq!(d, VisionCapabilityGate::KeepOriginal);
+    }
+
+    #[test]
+    fn turno_senza_immagini_non_tocca_il_routing() {
+        // Override CONDIZIONALE: zero regressione sul routing testuale, qualunque
+        // sia la capability del modello.
+        assert_eq!(
+            decide_vision_capability_gate(false, Some(false)),
+            VisionCapabilityGate::KeepOriginal
+        );
+        assert_eq!(
+            decide_vision_capability_gate(false, None),
+            VisionCapabilityGate::KeepOriginal
+        );
+    }
+
+    #[test]
+    fn turno_con_immagine_capability_ignota_e_conservativo_verso_vision() {
+        // Modello assente dal catalog: per costruzione non ha supports_vision=TRUE.
+        // Ignorare l'immagine e' il fallimento da evitare -> cerca un modello vision.
+        let d = decide_vision_capability_gate(true, None);
+        assert_eq!(d, VisionCapabilityGate::NeedsVisionModel);
+    }
+
+    #[test]
+    fn rilevamento_immagine_dai_mime_del_turno() {
+        // `turn_has_image_attachment` deriva il segnale dai MIME (punto unico
+        // classify_attachment_kind), non dal testo del prompt.
+        use super::turn_has_image_attachment;
+        assert!(turn_has_image_attachment(&[img("image/png")]));
+        assert!(turn_has_image_attachment(&[img("image/JPEG")]));
+        assert!(turn_has_image_attachment(&[
+            img("application/pdf"),
+            img("image/webp")
+        ]));
+        assert!(!turn_has_image_attachment(&[img("application/pdf")]));
+        assert!(!turn_has_image_attachment(&[img("text/plain")]));
+        assert!(!turn_has_image_attachment(&[]));
+    }
+}
+
 #[cfg(test)]
 mod tool_capability_gate_tests {
     use super::{compute_no_capable_provider, decide_tool_capability_gate, ToolCapabilityGate};

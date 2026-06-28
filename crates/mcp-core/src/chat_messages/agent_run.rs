@@ -1395,6 +1395,12 @@ pub(crate) async fn spawn_agent_run(
             context_message_count,
             None, // behavior_mode_session: nessun override per il pre-check routing
             None, // intent_hint: il pre-check classifica (non e' nel loop, no timeout client)
+            // turn_has_image: RIPRISTINO regressione Python->Rust (CLAUDE.md sez. I,
+            // "Smart routing vision"). Se il messaggio corrente allega un'immagine
+            // il routing forza un modello con supports_vision=TRUE. Segnale
+            // strutturato dai MIME del turno (punto unico turn_has_image_attachment),
+            // non dal testo del prompt.
+            crate::orchestrator::turn_has_image_attachment(&params.attachments),
         )
         .await;
 

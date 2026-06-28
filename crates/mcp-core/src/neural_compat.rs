@@ -148,6 +148,10 @@ pub async fn route_model(
             0,
             None,
             Some(intent.as_str()),
+            // /route-model non riceve gli allegati del turno (solo message/intent):
+            // nessun override vision possibile qui -> routing testuale invariato.
+            // Il path con immagine e' la chat reale (agent_run) che passa il segnale.
+            false,
         )
         .await;
 

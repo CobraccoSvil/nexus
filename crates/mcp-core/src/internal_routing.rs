@@ -460,6 +460,13 @@ pub struct RoutingDecideRequest {
     /// mcp-core classifica come prima.
     #[serde(default)]
     pub intent: Option<String>,
+    /// Il TURNO corrente contiene almeno un allegato image/*. RIPRISTINO della
+    /// regressione Python->Rust (CLAUDE.md sezione I, "Smart routing vision"): il
+    /// brain rileva gli allegati image/* del messaggio e lo segnala qui, cosi' il
+    /// routing forza un modello con supports_vision=TRUE. Default `false`: i
+    /// chiamati che non popolano il campo ottengono il routing testuale invariato.
+    #[serde(default)]
+    pub turn_has_image: bool,
 }
 
 /// Handler `POST /api/internal/routing/decide`.
@@ -507,6 +514,7 @@ pub async fn decide_routing(
                 .as_deref()
                 .filter(|v| !v.trim().is_empty()),
             body.intent.as_deref().filter(|v| !v.trim().is_empty()),
+            body.turn_has_image,
         )
         .await;
     // Se nessun provider e' utilizzabile, ritorna 503 ma comunque con il body
@@ -549,6 +557,8 @@ pub async fn decide_routing_get(
             0,
             q.mode.as_deref().filter(|v| !v.trim().is_empty()),
             None,
+            // GET di smoke test: nessun allegato -> routing testuale invariato.
+            false,
         )
         .await;
     (StatusCode::OK, Json(result)).into_response()

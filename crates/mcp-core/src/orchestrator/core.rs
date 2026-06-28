@@ -263,6 +263,13 @@ impl Orchestrator {
         // Intent gia' classificato dal chiamante (regola L). Propagato a
         // resolve_agent_provider e usato per gate/source senza ri-classificare.
         intent_hint: Option<&str>,
+        // Il TURNO corrente contiene almeno un allegato image/*. Segnale
+        // strutturato (derivato dai MIME via `turn_has_image_attachment`, mai dal
+        // testo del prompt) che attiva l'override media-aware sul routing: con
+        // un'immagine il modello del turno deve avere supports_vision=TRUE.
+        // RIPRISTINO REGRESSIONE Python->Rust (CLAUDE.md sezione I, "Smart routing
+        // vision"). `false` => nessun override (routing testuale invariato).
+        turn_has_image: bool,
     ) -> RoutingResolveResult {
         // Snapshot della routing matrix DB (cache 60s, lock-free clone Arc).
         // Se la matrice non e' caricata (DB down all'avvio), ritorniamo
@@ -343,6 +350,22 @@ impl Orchestrator {
         // nessun nome modello hardcoded (regola G).
         if intent != "chat" && !provider.is_empty() && !model.is_empty() {
             self.apply_tool_use_capability_gate(db, &mut provider, &mut model, intent, message)
+                .await;
+        }
+
+        // ── Gate di capability VISION (RIPRISTINO regressione Python->Rust) ───
+        // Override media-aware sul routing del TURNO (CLAUDE.md sezione I, "Smart
+        // routing vision"): se il messaggio corrente allega un'immagine, il
+        // modello del turno DEVE supportare la vision (supports_vision=TRUE),
+        // altrimenti l'immagine viene ignorata e l'agente "vede" solo il testo.
+        // Override CONDIZIONALE: se `turn_has_image == false` il gate e' un no-op
+        // (zero regressione sul routing testuale). Riusa il selettore unico
+        // (best_model_for_tier con capability='vision'), nessuna query vision
+        // duplicata, nessun nome modello hardcoded (regola G/L). Applicato DOPO
+        // il gate tool-use: per un run agentico+immagine cerchiamo un modello che
+        // sia sia vision sia tool-capable.
+        if turn_has_image && !provider.is_empty() && !model.is_empty() {
+            self.apply_vision_capability_gate(db, &mut provider, &mut model, intent, message)
                 .await;
         }
 
@@ -605,6 +628,102 @@ impl Orchestrator {
                             model,
                             intent,
                             tier,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gate di capability VISION per il routing del TURNO (RIPRISTINO regressione
+    /// Python->Rust, CLAUDE.md sezione I "Smart routing vision").
+    ///
+    /// Se il turno allega un'immagine e `(provider, model)` risolti puntano a un
+    /// modello con `ai_price_catalog.supports_vision = false` (o assente dal
+    /// catalog), sostituisce in-place con il miglior modello VISION dello stesso
+    /// tier dell'intent, riusando il SELETTORE UNICO `best_model_for_tier` con
+    /// capability `'vision'` (che mappa su `supports_vision = TRUE`, colonna
+    /// canonica — vista mig 0318/0372). Nessuna query vision duplicata, nessun
+    /// nome modello hardcoded (regola G/L).
+    ///
+    /// Override CONDIZIONALE: il chiamante invoca questo gate SOLO quando
+    /// `turn_has_image == true`; per i turni testuali il routing resta invariato.
+    /// Se nessun modello vision e' disponibile (tutti in cooldown, catalog senza
+    /// vision per quel tier) NON sostituisce ma logga un WARN esplicito (fail
+    /// visibile, regola G): il run prosegue col modello originale (l'immagine
+    /// resta investigabile via il tool `nexus_describe_image_attachment`).
+    async fn apply_vision_capability_gate(
+        &self,
+        db: &PgPool,
+        provider: &mut String,
+        model: &mut String,
+        intent: &str,
+        message: &str,
+    ) {
+        // Capability vision del modello risolto. None = modello assente dal
+        // catalog (per costruzione senza supports_vision=TRUE -> conservativo
+        // verso la sostituzione, vedi decide_vision_capability_gate).
+        let model_supports_vision: Option<bool> = sqlx::query_scalar::<_, bool>(
+            "SELECT supports_vision FROM ai_price_catalog \
+             WHERE provider = $1 AND model = $2 LIMIT 1",
+        )
+        .bind(&*provider)
+        .bind(&*model)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+
+        // Il chiamante ha gia' verificato turn_has_image == true.
+        match decide_vision_capability_gate(true, model_supports_vision) {
+            VisionCapabilityGate::KeepOriginal => {}
+            VisionCapabilityGate::NeedsVisionModel => {
+                // Tier dell'intent dalla cache (mig 0110), stesso meccanismo del
+                // gate tool-use. Default light/chat se l'intent non e' mappato.
+                let estimated_tokens = estimate_complexity(message);
+                let icap_arc = self.intent_capability.current_async().await.ok();
+                let tier = match icap_arc.as_deref() {
+                    Some(map) => match map.get(intent) {
+                        Some(c) => c.tier_for_tokens(estimated_tokens),
+                        None => "light".to_string(),
+                    },
+                    None => "light".to_string(),
+                };
+                // Run agentico (intent != "chat") -> serve un modello vision CHE
+                // sia anche tool-capable: passiamo requires_tool_use al selettore
+                // unico, cosi' non vanifichiamo il gate tool-use applicato prima.
+                let requires_tool_use = intent != "chat";
+                match best_model_for_tier(db, &tier, Some("vision"), requires_tool_use).await {
+                    Some((vp, vm)) => {
+                        tracing::info!(
+                            "routing(vision): {}/{} senza vision ma il turno ha un'immagine \
+                             -> override {}/{} (intent={}, tier={}, tool_use={})",
+                            provider,
+                            model,
+                            vp,
+                            vm,
+                            intent,
+                            tier,
+                            requires_tool_use,
+                        );
+                        *provider = vp;
+                        *model = vm;
+                    }
+                    None => {
+                        // Nessun modello vision disponibile per quel tier (run
+                        // agentico: nemmeno vision+tool-capable). Fail visibile:
+                        // non sostituiamo con un modello non-vision.
+                        tracing::warn!(
+                            "routing(vision): il turno ha un'immagine ma {}/{} non supporta la \
+                             vision e nessun modello supports_vision=TRUE e' disponibile \
+                             (intent={}, tier={}, tool_use={}). L'immagine resta investigabile \
+                             via nexus_describe_image_attachment — verifica ai_price_catalog \
+                             (supports_vision) e i provider in cooldown.",
+                            provider,
+                            model,
+                            intent,
+                            tier,
+                            requires_tool_use,
                         );
                     }
                 }
