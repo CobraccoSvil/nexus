@@ -86,15 +86,17 @@ fn derive_error_class(body: &ProviderErrorPayload) -> Result<(String, Option<u64
 
 /// Handler `POST /api/internal/provider-error`.
 /// Applica il cooldown appropriato in base alla classe dell'errore:
-///   - `billing_error` → cooldown lungo 6h (in-memory + Redis) + propagazione
-///                       al DB (`ai_price_catalog.is_enabled=false` e
-///                       `nexus_routing_matrix.is_active=false`). La recovery
-///                       loop in `billing_cooldown_recovery_loop` riabilita
-///                       quando il cooldown scade.
+///   - `billing_error` → cooldown lungo 6h (in-memory + Redis + TTL su
+///                       `nexus_provider_health.billing_cooldown_until`, la fonte
+///                       persistente GIUSTA perche' scade). NON disabilita piu' il
+///                       catalog/matrix: il routing salta i provider in cooldown
+///                       via `is_provider_in_cooldown`/`cooldown_snapshot`. La
+///                       `billing_cooldown_recovery_loop` (probe-then-reenable)
+///                       azzera il TTL quando il provider torna 200.
 ///   - `rate_limit`    → cooldown breve con retry_after o default 60s
 ///   - `overloaded` / `provider_error` → cooldown breve 60s
 pub async fn provider_error_handler(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Json(body): Json<ProviderErrorPayload>,
 ) -> impl IntoResponse {
     let provider = body.provider.trim().to_lowercase();
@@ -115,9 +117,8 @@ pub async fn provider_error_handler(
                 &provider,
                 &format!("brain bridge: {error_class}"),
             );
-            crate::provider_cooldown::propagate_billing_disable_to_db(&state.db, &provider).await;
             tracing::warn!(
-                "provider-error bridge: '{}' → COOLDOWN LUNGO + DB disable (billing_error)",
+                "provider-error bridge: '{}' → COOLDOWN LUNGO + TTL health (billing_error)",
                 provider
             );
         }

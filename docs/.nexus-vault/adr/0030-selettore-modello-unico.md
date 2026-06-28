@@ -236,18 +236,32 @@ detection-nome perche' e' un QUIRK DI PROTOCOLLO (`max_completion_tokens`, nient
 semantica, quindi non e' un concern della vista capability. Validato a runtime: i
 modelli tool-capable inviano i tool e rispondono con `tool_calls`.
 
-### Cooldown writer unico (#43)
+### Cooldown writer unico + billing come stato logico (#43, agg. mig 0473)
 
-La fonte persistente `nexus_provider_health` e' ora scritta SOLO da mcp-core
-(Rust): un unico writer per il cooldown (regola L,
-[[0020-gate-disponibilita-provider]]). `propagate_billing_disable_to_db` fa UPSERT
-di `billing_cooldown_until` (TTL DB-driven `cooldown_long_s`) e
-`propagate_billing_reenable_to_db` lo azzera. Il brain
-(`registry._mark_billing_cooldown`) non scrive piu' il DB: tiene la cache
-in-memory locale per la cascade immediata e notifica il bridge tramite la nuova
-`notify_provider_error_sync` (variante sync best-effort, perche' il call site e'
-in `generate_agent_turn_sync`). `_clear_billing_cooldown` pulisce solo la cache
-locale; la riabilitazione cross-process e' governata dal recovery loop Rust
-probe-then-reenable (piu' sicuro della riattivazione cieca, latenza
-~`billing_recovery_interval_s`). Validato E2E: `POST
-/api/internal/provider-error` -> riga in `nexus_provider_health` scritta da Rust.
+Il billing/credito esaurito e' uno STATO LOGICO TRANSITORIO con TTL, NON una
+disabilitazione persistente del catalog (regola H: e' transitorio, il top-up lo
+sblocca in minuti; `is_enabled` significa "il modello e' valido", non "ora senza
+credito"). Punto unico (regola L, [[0020-gate-disponibilita-provider]]):
+
+- `put_provider_in_long_cooldown` e' l'UNICO writer del cooldown billing su TUTTE
+  le fonti: store in-memory (gate del routing), Redis (restore al restart) e
+  `nexus_provider_health.billing_cooldown_until` (TTL DB-driven `cooldown_long_s`,
+  fonte persistente con scadenza, letta al boot da
+  `restore_billing_cooldowns_from_db`).
+- `remove_cooldown` e' l'UNICO clear: azzera in-memory + Redis + il TTL su
+  `nexus_provider_health`.
+- Il routing salta i provider in cooldown via `is_provider_in_cooldown` /
+  `cooldown_snapshot` (anche il LED frontend legge questo), SENZA bisogno di
+  `is_enabled=false` sul catalog ne' `is_active=false` sulla matrix.
+
+Le ex `propagate_billing_disable_to_db` / `propagate_billing_reenable_to_db`
+(che scrivevano `is_enabled=false` sul catalog e `is_active=false` sulla matrix,
+piu' la riabilitazione fragile via tag testuale `BILLING_COOLDOWN_TAG`) sono state
+RIMOSSE: erano un secondo meccanismo ridondante per lo stesso evento (regola L) e
+una persistenza ingiustificata che lasciava il provider spento dopo il top-up
+finche' un umano non lo riabilitava. La migrazione 0473 ha riacceso le righe
+spente per quel tag. La riabilitazione e' governata dal recovery loop Rust
+`billing_cooldown_recovery_loop` (probe-then-reenable: esce dal cooldown SOLO al
+primo 200 reale, latenza ~`billing_recovery_interval_s`), che ora scopre i
+provider da ri-probare da `nexus_provider_health WHERE billing_cooldown_until IS
+NOT NULL` invece che dalle righe taggate nel catalog/matrix.

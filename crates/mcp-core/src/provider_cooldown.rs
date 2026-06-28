@@ -164,6 +164,29 @@ pub fn remove_cooldown(provider: &str) {
                 .await;
         });
     }
+    // Azzera il TTL persistente su nexus_provider_health (fonte GIUSTA del
+    // billing cooldown: ha scadenza). Cosi' un restart non lo ripristina.
+    if let Some(pool) = DB_POOL.get() {
+        let pool = pool.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sqlx::query(
+                "UPDATE nexus_provider_health \
+                 SET billing_cooldown_until = NULL, updated_at = NOW() \
+                 WHERE LOWER(provider) = $1 AND billing_cooldown_until IS NOT NULL",
+            )
+            .bind(&key)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(
+                    "remove_cooldown: clear TTL nexus_provider_health fallito per '{}': {}",
+                    key,
+                    e
+                );
+            }
+        });
+    }
     tracing::info!(
         "Provider '{}' cooldown rimosso manualmente (admin)",
         provider
@@ -218,158 +241,15 @@ pub fn init_redis_client(client: redis::aio::MultiplexedConnection) {
     let _ = REDIS_CLIENT.set(client);
 }
 
-/// Etichetta usata in `auto_disabled_reason` (catalog) e `notes` (matrix)
-/// per identificare le righe disabilitate dalla propagazione del billing
-/// cooldown. La recovery loop le riconosce per riabilitarle quando il
-/// provider torna operativo (cooldown scaduto).
-pub const BILLING_COOLDOWN_TAG: &str = "auto_disable: billing_cooldown";
+/// Pool DB globale per la persistenza TTL del billing cooldown su
+/// `nexus_provider_health` (la fonte persistente GIUSTA: ha scadenza, non
+/// disabilita il catalog). Inizializzato da `main.rs` all'avvio.
+static DB_POOL: OnceLock<sqlx::PgPool> = OnceLock::new();
 
-/// Propaga il cooldown billing-error al DB: disabilita tutti i modelli del
-/// provider in `ai_price_catalog` e tutte le righe in `nexus_routing_matrix`.
-///
-/// Idempotente: aggiorna solo righe attualmente attive che non sono gia'
-/// state disabilitate manualmente (`auto_disabled_reason` non inizia con
-/// 'manual:'). Cosi' una scelta dell'admin non viene mai sovrascritta.
-pub async fn propagate_billing_disable_to_db(db: &sqlx::PgPool, provider: &str) {
-    let provider_lower = provider.to_lowercase();
-    let now_iso = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-    let catalog_res = sqlx::query(
-        "UPDATE ai_price_catalog \
-         SET is_enabled = false, \
-             auto_disabled_at = COALESCE(auto_disabled_at, now()), \
-             auto_disabled_reason = $2 \
-         WHERE LOWER(provider) = $1 \
-           AND is_enabled = true \
-           AND (auto_disabled_reason IS NULL OR auto_disabled_reason NOT LIKE 'manual:%')",
-    )
-    .bind(&provider_lower)
-    .bind(format!("{} ({})", BILLING_COOLDOWN_TAG, now_iso))
-    .execute(db)
-    .await;
-    let catalog_n = catalog_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
-    if let Err(ref e) = catalog_res {
-        tracing::warn!(
-            "propagate_billing_disable: catalog UPDATE fallita per '{}': {}",
-            provider,
-            e
-        );
-    }
-
-    let matrix_res = sqlx::query(
-        "UPDATE nexus_routing_matrix \
-         SET is_active = false, \
-             manual_override = true, \
-             notes = COALESCE(notes, '') || $2 \
-         WHERE LOWER(provider) = $1 AND is_active = true",
-    )
-    .bind(&provider_lower)
-    .bind(format!(" [{}: {}]", BILLING_COOLDOWN_TAG, now_iso))
-    .execute(db)
-    .await;
-    let matrix_n = matrix_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
-    if let Err(ref e) = matrix_res {
-        tracing::warn!(
-            "propagate_billing_disable: matrix UPDATE fallita per '{}': {}",
-            provider,
-            e
-        );
-    }
-
-    // Fonte PERSISTENTE del billing cooldown (letta al boot da
-    // restore_billing_cooldowns_from_db). WRITER UNICO (regola L/ADR 0020):
-    // questa tabella e' scritta SOLO qui (lato Rust). Prima la scriveva anche il
-    // brain (_mark_billing_cooldown via psycopg2), creando una seconda fonte che
-    // il gate non controllava; ora il brain notifica solo il bridge e Rust
-    // persiste. TTL = cooldown lungo DB-driven (cooldown_long_s).
-    let ttl_long_s = provider_health_timings().cooldown_long_s as i64;
-    let health_res = sqlx::query(
-        "INSERT INTO nexus_provider_health (provider, billing_cooldown_until, last_error, updated_at) \
-         VALUES ($1, NOW() + ($2 || ' seconds')::interval, $3, NOW()) \
-         ON CONFLICT (provider) DO UPDATE SET \
-           billing_cooldown_until = EXCLUDED.billing_cooldown_until, \
-           last_error = EXCLUDED.last_error, updated_at = NOW()",
-    )
-    .bind(&provider_lower)
-    .bind(ttl_long_s.to_string())
-    .bind("billing_cooldown")
-    .execute(db)
-    .await;
-    if let Err(ref e) = health_res {
-        tracing::warn!(
-            "propagate_billing_disable: nexus_provider_health UPSERT fallita per '{}': {}",
-            provider,
-            e
-        );
-    }
-
-    tracing::warn!(
-        target: "provider_cooldown",
-        provider = %provider,
-        catalog_disabled = catalog_n,
-        matrix_disabled = matrix_n,
-        "billing cooldown propagato al DB"
-    );
-}
-
-/// Riabilita il provider nel DB dopo che il cooldown e' scaduto.
-/// Tocca solo le righe disabilitate da `propagate_billing_disable_to_db`
-/// (riconosciute dall'etichetta `BILLING_COOLDOWN_TAG`).
-pub async fn propagate_billing_reenable_to_db(db: &sqlx::PgPool, provider: &str) {
-    let provider_lower = provider.to_lowercase();
-
-    let catalog_res = sqlx::query(
-        "UPDATE ai_price_catalog \
-         SET is_enabled = true, \
-             auto_disabled_at = NULL, \
-             auto_disabled_reason = NULL \
-         WHERE LOWER(provider) = $1 \
-           AND is_enabled = false \
-           AND auto_disabled_reason LIKE $2",
-    )
-    .bind(&provider_lower)
-    .bind(format!("{}%", BILLING_COOLDOWN_TAG))
-    .execute(db)
-    .await;
-    let catalog_n = catalog_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
-
-    let matrix_res = sqlx::query(
-        "UPDATE nexus_routing_matrix \
-         SET is_active = true, \
-             manual_override = false, \
-             notes = NULL \
-         WHERE LOWER(provider) = $1 \
-           AND is_active = false \
-           AND notes LIKE $2",
-    )
-    .bind(&provider_lower)
-    .bind(format!("%{}%", BILLING_COOLDOWN_TAG))
-    .execute(db)
-    .await;
-    let matrix_n = matrix_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
-
-    // Clear della fonte persistente (writer unico Rust): azzera il cooldown
-    // billing in nexus_provider_health cosi' il prossimo boot non lo ripristina.
-    let health_res = sqlx::query(
-        "UPDATE nexus_provider_health \
-         SET billing_cooldown_until = NULL, updated_at = NOW() \
-         WHERE LOWER(provider) = $1 AND billing_cooldown_until IS NOT NULL",
-    )
-    .bind(&provider_lower)
-    .execute(db)
-    .await;
-    let health_n = health_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
-
-    if catalog_n > 0 || matrix_n > 0 || health_n > 0 {
-        tracing::info!(
-            target: "provider_cooldown",
-            provider = %provider,
-            catalog_reenabled = catalog_n,
-            matrix_reenabled = matrix_n,
-            health_cleared = health_n,
-            "billing cooldown rimosso dal DB: provider riabilitato"
-        );
-    }
+/// Espone il pool DB a `provider_cooldown` per l'UPSERT/clear del TTL
+/// billing su `nexus_provider_health`. Idempotente (OnceLock).
+pub fn init_db_pool(pool: sqlx::PgPool) {
+    let _ = DB_POOL.set(pool);
 }
 
 /// Worker periodico: ogni `interval_secs` controlla i provider che hanno righe
@@ -402,14 +282,9 @@ pub async fn billing_cooldown_recovery_loop(
         ticker.tick().await;
 
         let providers_disabled: Vec<String> = match sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT LOWER(provider) FROM ai_price_catalog \
-             WHERE is_enabled = false AND auto_disabled_reason LIKE $1 \
-             UNION \
-             SELECT DISTINCT LOWER(provider) FROM nexus_routing_matrix \
-             WHERE is_active = false AND notes LIKE $2",
+            "SELECT LOWER(provider) FROM nexus_provider_health \
+             WHERE billing_cooldown_until IS NOT NULL",
         )
-        .bind(format!("{}%", BILLING_COOLDOWN_TAG))
-        .bind(format!("%{}%", BILLING_COOLDOWN_TAG))
         .fetch_all(&db)
         .await
         {
@@ -453,8 +328,8 @@ pub async fn billing_cooldown_recovery_loop(
                     );
                     // Esce SUBITO dal cooldown (anche se non ancora scaduto): il
                     // re-probe periodico ha rilevato che il credito e' tornato.
+                    // remove_cooldown azzera anche il TTL su nexus_provider_health.
                     remove_cooldown(&provider);
-                    propagate_billing_reenable_to_db(&db, &provider).await;
                 }
                 crate::provider_health_probe::ProbeOutcome::Billing(kind) => {
                     tracing::warn!(
@@ -551,6 +426,38 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
             "put_provider_in_long_cooldown: REDIS_CLIENT non inizializzato, cooldown solo in-memory per '{}'",
             provider,
         );
+    }
+    // Persistenza TTL su nexus_provider_health (fonte PERSISTENTE GIUSTA del
+    // billing cooldown: ha scadenza, non disabilita il catalog). E' la parte
+    // BUONA spostata qui dall'ex propagate_billing_disable_to_db: writer unico
+    // Rust (regola L/ADR 0020), letta al boot da restore_billing_cooldowns_from_db.
+    // TTL = cooldown lungo DB-driven (cooldown_long_s, gia' in long_secs).
+    if let Some(pool) = DB_POOL.get() {
+        let pool = pool.clone();
+        let provider = provider.to_lowercase();
+        let reason = reason.to_string();
+        let ttl_secs = (long_secs as i64).to_string();
+        tokio::spawn(async move {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO nexus_provider_health (provider, billing_cooldown_until, last_error, updated_at) \
+                 VALUES ($1, NOW() + ($2 || ' seconds')::interval, $3, NOW()) \
+                 ON CONFLICT (provider) DO UPDATE SET \
+                   billing_cooldown_until = EXCLUDED.billing_cooldown_until, \
+                   last_error = EXCLUDED.last_error, updated_at = NOW()",
+            )
+            .bind(&provider)
+            .bind(&ttl_secs)
+            .bind(&reason)
+            .execute(&pool)
+            .await
+            {
+                tracing::warn!(
+                    "put_provider_in_long_cooldown: UPSERT TTL nexus_provider_health fallito per '{}': {}",
+                    provider,
+                    e
+                );
+            }
+        });
     }
 }
 

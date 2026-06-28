@@ -396,6 +396,11 @@ async fn main() -> anyhow::Result<()> {
     // il provider e' realmente giu' (caso utente "LED openai verde").
     crate::provider_cooldown::init_redis_client(redis.clone());
 
+    // Espone il pool DB a `provider_cooldown` per la persistenza TTL del billing
+    // cooldown su nexus_provider_health (fonte GIUSTA: ha scadenza, non disabilita
+    // il catalog). Sostituisce l'ex propagazione is_enabled=false/is_active=false.
+    crate::provider_cooldown::init_db_pool(db.clone());
+
     // Ripristina cooldown billing provider sopravvissuti al riavvio (persistiti su Redis).
     {
         let mut conn = redis.clone();

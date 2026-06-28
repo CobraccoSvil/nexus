@@ -41,8 +41,7 @@ use tokio::time::sleep;
 
 use crate::orchestrator::Orchestrator;
 use crate::provider_cooldown::{
-    is_provider_in_cooldown, propagate_billing_disable_to_db, put_provider_in_long_cooldown,
-    put_provider_in_short_cooldown,
+    is_provider_in_cooldown, put_provider_in_long_cooldown, put_provider_in_short_cooldown,
 };
 
 /// Prompt minimale. Stesso usato da `provider_health_probe`.
@@ -473,7 +472,7 @@ async fn probe_one_model(
             //
             // Fix definitivo: mappare il `kind` rilevato dal classifier
             // direttamente sul cooldown di provider piu' appropriato.
-            apply_provider_wide_cooldown(db, provider, model, &kind).await;
+            apply_provider_wide_cooldown(provider, model, &kind).await;
             ProbeOutcome::ProviderWide
         }
         Classification::ModelSpecific(kind, _msg) => {
@@ -731,51 +730,51 @@ async fn tool_probe_one_model(
 ///
 /// Mappatura (allineata alle policy in `provider_cooldown`):
 /// - `quota_exceeded` / `credit_balance_too_low` / `billing_required` /
-///   `auth_error` -> cooldown lungo (6h, persistito su Redis): servono
-///   intervento manuale (ricarica credito, fix billing, rotazione chiave)
-///   e ritentare ogni pochi minuti e' inutile spreco di chiamate.
+///   `auth_error` -> cooldown lungo (6h, persistito su Redis + TTL su
+///   nexus_provider_health): servono intervento manuale (ricarica credito,
+///   fix billing, rotazione chiave) e ritentare ogni pochi minuti e' inutile
+///   spreco di chiamate.
 /// - `rate_limit` -> cooldown breve (60s): il provider torna disponibile
 ///   quasi subito; allinea il behaviour ai retry-after tipici di OpenAI.
 /// - `connection_error` -> cooldown breve (5 min): rete/DNS transient,
 ///   non vale la pena escludere il provider per ore.
 /// - altri `kind` -> nessun cooldown: lasciamo che il chiamante decida
 ///   (default conservativo per non sopprimere provider per cause ignote).
-async fn apply_provider_wide_cooldown(db: &PgPool, provider: &str, model: &str, kind: &str) {
-    // Errori persistenti (billing/quota/credito/auth): oltre al cooldown
-    // in-memory (volatile, perso al restart) PROPAGHIAMO la disabilitazione alla
-    // routing matrix + catalog nel DB. Cosi' l'executor (che sceglie il provider
-    // dalla matrix) smette di scegliere il provider morto: e' il fix strutturale
-    // del run "vuoto". La billing_cooldown_recovery_loop riabilita il provider
-    // (probe-then-reenable) quando il credito torna. I transienti (rate_limit/
-    // connection) restano solo in-memory: tornano da soli in pochi secondi.
+async fn apply_provider_wide_cooldown(provider: &str, model: &str, kind: &str) {
+    // Errori persistenti (billing/quota/credito/auth): mettono il provider in
+    // cooldown logico in-memory + TTL persistente su nexus_provider_health
+    // (scritto da put_provider_in_long_cooldown, la fonte GIUSTA perche' ha
+    // scadenza). NON disabilitano piu' il catalog/matrix: is_enabled significa
+    // "il modello e' valido", non "ora senza credito". Il routing salta i
+    // provider in cooldown via is_provider_in_cooldown/cooldown_snapshot senza
+    // bisogno di is_enabled=false. La billing_cooldown_recovery_loop riprova il
+    // provider (probe-then-reenable) e azzera il TTL quando il credito torna.
+    // I transienti (rate_limit/connection) restano solo in-memory: tornano da
+    // soli in pochi secondi.
     match kind {
         "quota_exceeded" => {
             tracing::info!(
                 "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
             );
             put_provider_in_long_cooldown(provider, "Quota provider esaurita (HTTP 429)");
-            propagate_billing_disable_to_db(db, provider).await;
         }
         "credit_balance_too_low" => {
             tracing::info!(
                 "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
             );
             put_provider_in_long_cooldown(provider, "Credito provider insufficiente");
-            propagate_billing_disable_to_db(db, provider).await;
         }
         "billing_required" => {
             tracing::info!(
                 "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
             );
             put_provider_in_long_cooldown(provider, "Billing provider non configurato");
-            propagate_billing_disable_to_db(db, provider).await;
         }
         "auth_error" => {
             tracing::info!(
                 "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
             );
             put_provider_in_long_cooldown(provider, "API key non valida");
-            propagate_billing_disable_to_db(db, provider).await;
         }
         "rate_limit" => {
             tracing::info!(
