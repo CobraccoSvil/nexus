@@ -2,10 +2,11 @@
 //!
 //! IMPLEMENTA (FASE 2b) `EscalationPort::escalation_inputs` risolvendo gli input
 //! dell'auto-escalation:
-//!   1. catena intra-provider da `nexus_model_escalation_chain` (mig 0128) via
-//!      `sqlx` — `WHERE provider=$1 AND base_model=$2 AND is_active=TRUE ORDER BY
-//!      escalation_position ASC`, 1:1 con il Python (`helpers.py:1737-1739` /
-//!      `__init__.py:3190-3196`);
+//!   1. catena intra-provider DERIVATA dalla vista `v_model_escalation_chain`
+//!      (mig 0471, punto unico regola L) — la vecchia tabella seed
+//!      `nexus_model_escalation_chain` (mig 0128) e' stata droppata (mig 0474);
+//!      `chain_for` enumera i modelli del provider con `escalation_rank`
+//!      superiore al corrente, ordinati ASC;
 //!   2. stato cooldown del provider corrente dalla FONTE UNICA del gate (ADR 0020,
 //!      `crate::provider_cooldown::is_provider_in_cooldown`);
 //!   3. candidato cross-provider risolvendo il purpose `loop_fallback_default`
@@ -39,8 +40,8 @@ use crate::provider_cooldown::is_provider_in_cooldown;
 /// trattate come "nessun candidato" (parita' col Python `helpers.py:1753-1754`).
 const SENTINELS: [&str; 2] = ["__router_unavailable__", "__no_capable_provider__"];
 
-/// Adapter [`EscalationPort`] -> `nexus_model_escalation_chain` (mig 0128) + gate
-/// cooldown (ADR 0020) + purpose `loop_fallback_default` (routing matrix).
+/// Adapter [`EscalationPort`] -> vista `v_model_escalation_chain` (mig 0471/0475)
+/// + gate cooldown (ADR 0020) + purpose `loop_fallback_default` (routing matrix).
 pub struct PgEscalationPort {
     /// Pool Postgres per la lettura della catena di escalation, dei provider
     /// disponibili (`settings`) e per la risoluzione del purpose cross-provider.
@@ -199,25 +200,14 @@ impl EscalationPort for PgEscalationPort {
 mod tests {
     use super::*;
 
-    /// Schema minimale per i test: la tabella della catena (mig 0128) + `settings`
-    /// (per la disponibilita' provider) + `nexus_purpose_model` VUOTA (cosi'
-    /// `resolve_purpose_model_db` ritorna `NotFound` -> `cross_provider = None`:
-    /// isoliamo il Tier 1 senza dipendere da catalog/routing).
+    /// Schema minimale per i test: `settings` (per la disponibilita' provider) +
+    /// `nexus_purpose_model` VUOTA (cosi' `resolve_purpose_model_db` ritorna
+    /// `NotFound` -> `cross_provider = None`: isoliamo il Tier 1 senza dipendere
+    /// da routing) + `ai_price_catalog` con la vista derivata `v_model_escalation_chain`
+    /// (mig 0471/0475), da cui `chain_for` legge la catena. La tabella seed
+    /// `nexus_model_escalation_chain` (mig 0128) e' stata droppata (mig 0474):
+    /// non esiste piu' qui.
     async fn create_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_model_escalation_chain ( \
-                 provider TEXT NOT NULL, \
-                 base_model TEXT NOT NULL, \
-                 escalation_position INT NOT NULL, \
-                 escalation_model TEXT NOT NULL, \
-                 capability_tier TEXT NOT NULL DEFAULT 'medium', \
-                 is_active BOOLEAN NOT NULL DEFAULT TRUE, \
-                 PRIMARY KEY (provider, base_model, escalation_position) \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_model_escalation_chain");
         sqlx::query(
             "CREATE TABLE settings ( \
                  key TEXT PRIMARY KEY, \
@@ -269,7 +259,8 @@ mod tests {
                  supports_vision, agentic_thinking_policy, capabilities, context_window, \
                  (input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) AS blended_cost, \
                  ((CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'heavy' THEN 2 ELSE 1 END) * 1000000 \
-                  + round((input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) * 1000))::bigint AS escalation_rank \
+                  + round((input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) * 1000))::bigint AS escalation_rank, \
+                 (CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'heavy' THEN 2 ELSE 1 END) AS performance_tier_ord \
              FROM ai_price_catalog WHERE is_enabled = TRUE",
         )
         .execute(pool)
@@ -309,24 +300,6 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert api key");
-    }
-
-    async fn seed_chain(pool: &PgPool, rows: &[(&str, &str, i32, &str, bool)]) {
-        for (provider, base, pos, model, active) in rows {
-            sqlx::query(
-                "INSERT INTO nexus_model_escalation_chain \
-                 (provider, base_model, escalation_position, escalation_model, capability_tier, is_active) \
-                 VALUES ($1, $2, $3, $4, 'medium', $5)",
-            )
-            .bind(provider)
-            .bind(base)
-            .bind(pos)
-            .bind(model)
-            .bind(active)
-            .execute(pool)
-            .await
-            .expect("insert chain row");
-        }
     }
 
     /// La catena e' DERIVATA dal catalog (vista v_model_escalation_chain): enumera
@@ -375,12 +348,9 @@ mod tests {
     #[sqlx::test]
     async fn provider_non_registrato_azzera_la_catena(pool: PgPool) {
         create_schema(&pool).await;
-        // NESSUNA api key per 'anthropic' -> provider non disponibile.
-        seed_chain(
-            &pool,
-            &[("anthropic", "claude-haiku-4-5", 1, "claude-sonnet-4-6", true)],
-        )
-        .await;
+        // NESSUNA api key per 'anthropic' -> provider non disponibile: la catena
+        // viene azzerata a monte (provider_available=false), prima ancora di
+        // leggere la vista, quindi non serve alcun seed del catalog.
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
             .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"))
@@ -397,11 +367,8 @@ mod tests {
     async fn provider_con_api_key_vuota_azzera_la_catena(pool: PgPool) {
         create_schema(&pool).await;
         set_api_key(&pool, "anthropic", "   ").await;
-        seed_chain(
-            &pool,
-            &[("anthropic", "claude-haiku-4-5", 1, "claude-sonnet-4-6", true)],
-        )
-        .await;
+        // API key vuota -> provider non disponibile: catena azzerata a monte,
+        // la vista non viene nemmeno interrogata (nessun seed catalog necessario).
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
             .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"))

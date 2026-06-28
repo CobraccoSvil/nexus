@@ -644,99 +644,85 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
         tracing::debug!("  {} / {} -> top = {}", p, fam, top);
     }
 
-    // ── Auto-popolamento escalation_* (fix 30/05/2026) ────────────────────
+    // ── Auto-popolamento escalation_* (LIVELLO A) ─────────────────────────
     // Mig 0120 popolo' solo alcuni intent legacy con threshold 100k. I nuovi
     // modelli scoperti via catalog_sync e i nuovi intent non avevano mai
     // escalation valorizzata, quindi `lookup_with_budget` non escalava mai.
-    // Qui scopriamo dinamicamente le coppie (base_stable, upgrade) per ogni
-    // provider e popoliamo le righe routing con escalation_* dove sono NULL.
-    if let Err(e) = auto_populate_escalations(db, &promotions).await {
+    // Dalla mig 0475 il target dell'escalation budget-aware e' DERIVATO dalla
+    // vista v_model_escalation_chain (stessa fonte del LIVELLO B, regola L):
+    // niente piu' coppie hardcoded, niente piu' dipendenza da `promotions`.
+    if let Err(e) = auto_populate_escalations(db).await {
         tracing::warn!("auto_populate_escalations failed: {e}");
     }
 
     Ok(())
 }
 
-/// Popola `escalation_*` nella routing matrix per le righe dove sono NULL.
+/// Popola `escalation_*` (LIVELLO A budget-aware) nella routing matrix per le
+/// righe dove `escalation_model_id` e' NULL, DERIVANDO il target dalla vista
+/// `v_model_escalation_chain` (mig 0471/0475) — un solo punto di verita',
+/// regola L. Niente piu' coppie hardcoded (vecchia const ESCALATION_PAIRS):
+/// e' la stessa fonte dati del LIVELLO B (loop intra-provider), cosi' un nuovo
+/// modello sincronizzato nel catalog entra automaticamente anche qui.
 ///
-/// Strategia: per ogni provider che ha BOTH una famiglia "stable" e una
-/// famiglia "preview/upgrade" (es. google: gemini-pro stable + gemini-pro-preview),
-/// aggiorna le routing entries con base_model nella stable famiglia per
-/// puntare l'escalation al top della famiglia upgrade.
+/// Per ogni riga eleggibile, il target e' il modello dello STESSO provider con
+/// `performance_tier` STRETTAMENTE superiore al modello corrente, il piu'
+/// economico tra quelli (`escalation_rank ASC`), tool-capable
+/// (`supports_tool_use = TRUE`, perche' l'escalation serve a uscire da loop
+/// agentici). La soglia di token e' DB-driven (regola G), letta dal setting
+/// `routing.escalation_budget_threshold_tokens` (valore di bootstrap 16000 in
+/// mig 0475; il default qui sotto e' lo stesso valore di bootstrap del setting,
+/// NON un magic-fallback di model-id).
 ///
-/// Coppie supportate (provider, base_label, escalation_label, threshold):
-///   - google: gemini-pro -> gemini-pro-preview (threshold 8000)
-///   - google: gemini-flash -> gemini-pro (threshold 6000)
-///   - anthropic: claude-sonnet -> claude-opus (threshold 50000)
-///   - anthropic: claude-haiku -> claude-sonnet (threshold 30000)
-///
-/// Threshold ragionevoli per default: prompt grandi/tool count alto. L'admin
-/// puo' override via UPDATE manuale (rispettato grazie a manual_override).
-async fn auto_populate_escalations(
-    db: &sqlx::PgPool,
-    promotions: &[(String, String, String)],
-) -> Result<(), String> {
-    // (provider, base_family_label, upgrade_family_label, threshold)
-    const ESCALATION_PAIRS: &[(&str, &str, &str, i32)] = &[
-        ("google", "gemini-pro", "gemini-pro-preview", 8000),
-        ("google", "gemini-flash", "gemini-pro", 6000),
-        ("anthropic", "claude-sonnet", "claude-opus", 50000),
-        ("anthropic", "claude-haiku", "claude-sonnet", 30000),
-        ("openai", "gpt-mini", "gpt-frontier", 20000),
-    ];
-    let mut populated = 0_usize;
-    for (provider, base_label, upgrade_label, threshold) in ESCALATION_PAIRS {
-        // Trova il top model per la famiglia base e per la famiglia upgrade
-        // (dai promotions appena calcolati).
-        let base_top = promotions
-            .iter()
-            .find(|(p, fam, _)| p == provider && fam == base_label)
-            .map(|(_, _, top)| top.clone());
-        let upgrade_top = promotions
-            .iter()
-            .find(|(p, fam, _)| p == provider && fam == upgrade_label)
-            .map(|(_, _, top)| top.clone());
-        let (Some(base_top), Some(upgrade_top)) = (base_top, upgrade_top) else {
-            // Famiglia upgrade non disponibile (es. preview non sbloccato sul
-            // progetto Vertex). Niente escalation auto: ammesso.
-            continue;
-        };
-        if base_top == upgrade_top {
-            continue;
-        }
-        // Popola escalation solo per le righe con model_id=base_top dove
-        // escalation_* e' NULL. Rispetta manual_override (admin pin).
-        let res = sqlx::query(
-            "UPDATE nexus_routing_matrix \
-             SET escalation_threshold_tokens = $1, \
-                 escalation_provider = $2, \
-                 escalation_model_id = $3, \
-                 updated_at = NOW() \
-             WHERE provider = $2 AND model_id = $4 \
-               AND escalation_model_id IS NULL \
-               AND (manual_override IS NULL OR manual_override = false)",
-        )
-        .bind(threshold)
-        .bind(provider)
-        .bind(&upgrade_top)
-        .bind(&base_top)
-        .execute(db)
-        .await
-        .map_err(|e| format!("auto_populate_escalations UPDATE: {e}"))?;
-        if res.rows_affected() > 0 {
-            populated += res.rows_affected() as usize;
-            tracing::info!(
-                "auto_populate_escalations: [{}] {} -> {} ({}+) | {} righe",
-                provider,
-                base_top,
-                upgrade_top,
-                threshold,
-                res.rows_affected()
-            );
-        }
-    }
-    if populated > 0 {
-        tracing::info!("auto_populate_escalations: {} righe popolate", populated);
+/// Rispetta i pin admin: salta le righe con `manual_override = true`.
+async fn auto_populate_escalations(db: &sqlx::PgPool) -> Result<(), String> {
+    // Soglia DB-driven (regola G). Default = valore di bootstrap del setting
+    // (mig 0475), usato solo se la chiave manca o non e' parsabile come i32.
+    const DEFAULT_THRESHOLD_TOKENS: i32 = 16000;
+    let threshold: i32 =
+        nexus_auth::get_setting(db, "routing.escalation_budget_threshold_tokens")
+            .await
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(DEFAULT_THRESHOLD_TOKENS);
+
+    // UNA query: deriva il target dalla vista. Il sub-select sceglie il modello
+    // dello stesso provider con tier strettamente superiore, tool-capable, il
+    // piu' economico (escalation_rank ASC). Se il modello corrente NON e' (piu')
+    // enabled nel catalog la subquery del tier ritorna NULL e la riga NON viene
+    // popolata: il routing non userebbe comunque un base disabilitato, quindi
+    // l'escalation sarebbe irrilevante (evita de-escalation insensate).
+    let res = sqlx::query(
+        "UPDATE nexus_routing_matrix m \
+         SET escalation_threshold_tokens = $1, \
+             escalation_provider = m.provider, \
+             escalation_model_id = ( \
+                 SELECT v.model FROM v_model_escalation_chain v \
+                 WHERE v.provider = m.provider AND v.supports_tool_use = TRUE \
+                   AND v.performance_tier_ord > ( \
+                       SELECT b.performance_tier_ord FROM v_model_escalation_chain b \
+                       WHERE b.provider = m.provider AND b.model = m.model_id) \
+                 ORDER BY v.escalation_rank ASC LIMIT 1), \
+             updated_at = NOW() \
+         WHERE m.escalation_model_id IS NULL \
+           AND (m.manual_override IS NULL OR m.manual_override = false) \
+           AND EXISTS ( \
+               SELECT 1 FROM v_model_escalation_chain v \
+               WHERE v.provider = m.provider AND v.supports_tool_use = TRUE \
+                 AND v.performance_tier_ord > ( \
+                     SELECT b.performance_tier_ord FROM v_model_escalation_chain b \
+                     WHERE b.provider = m.provider AND b.model = m.model_id))",
+    )
+    .bind(threshold)
+    .execute(db)
+    .await
+    .map_err(|e| format!("auto_populate_escalations UPDATE: {e}"))?;
+
+    if res.rows_affected() > 0 {
+        tracing::info!(
+            "auto_populate_escalations: {} righe popolate dalla vista (soglia {} token)",
+            res.rows_affected(),
+            threshold
+        );
     }
     Ok(())
 }
