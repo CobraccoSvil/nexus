@@ -236,10 +236,52 @@ pub(crate) async fn run_one_round(
         }
     }
 
+    // ── RE-PROBE candidati disabilitati per QUIRK GATEWAY ───────────────────
+    // FIX nodo strutturale (regola H): i modelli auto-disabilitati per un quirk
+    // del gateway (tool-probe fallito / malformed tool calls) NON venivano piu'
+    // caricati da load_enabled_models (WHERE is_enabled=true) -> mai ri-probati
+    // -> restavano disabilitati per sempre anche dopo che il quirk era corretto
+    // in produzione (es. mistral/google a 0 modelli abilitati). Qui ricarichiamo
+    // ESPLICITAMENTE quei candidati e, con backoff DB-driven, li ri-probiamo
+    // (chat-probe + tool-probe via le stesse funzioni del giro principale,
+    // regola L). Se entrambi passano, li riabilitiamo da soli.
+    let backoff_min = crate::settings::get_setting(db, "agent.model_reprobe.backoff_minutes")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|m| *m > 0)
+        .unwrap_or(REPROBE_BACKOFF_DEFAULT_MIN);
+    match load_reprobe_candidates(db).await {
+        Ok(candidates) => {
+            for cand in candidates {
+                // Provider in cooldown lungo: inutile re-probare (errori billing/
+                // quota gia' noti). Riprovato quando il provider torna su.
+                if is_provider_in_cooldown(&cand.provider) {
+                    continue;
+                }
+                match reprobe_one_candidate(orchestrator, db, &cand, backoff_min).await {
+                    ReprobeResult::Backoff => continue,
+                    ReprobeResult::Reenabled => {
+                        stats.reprobe_candidates += 1;
+                        stats.reprobe_reenabled += 1;
+                    }
+                    ReprobeResult::ProviderWide | ReprobeResult::StillBroken => {
+                        stats.reprobe_candidates += 1;
+                    }
+                }
+                sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("model_health_probe: impossibile leggere candidati re-probe: {e}");
+        }
+    }
+
     tracing::info!(
         "model_health_probe: round completato — total={} healthy={} provider_errors={} \
          model_errors={} auto_disabled={} skipped={} tool_probe_ok={} tool_probe_failed={} \
-         tool_probe_disabled={}",
+         tool_probe_disabled={} reprobe_candidates={} reprobe_reenabled={}",
         stats.total,
         stats.healthy,
         stats.provider_wide_errors,
@@ -249,6 +291,8 @@ pub(crate) async fn run_one_round(
         stats.tool_probe_ok,
         stats.tool_probe_failed,
         stats.tool_probe_disabled,
+        stats.reprobe_candidates,
+        stats.reprobe_reenabled,
     );
     stats
 }
@@ -267,6 +311,12 @@ pub struct ProbeRoundStats {
     pub tool_probe_failed: usize,
     /// FIX 1: modelli marcati supports_tool_use=false dal tool-probe (soglia).
     pub tool_probe_disabled: usize,
+    /// RE-PROBE: candidati disabilitati per quirk gateway considerati nel giro
+    /// (oltre il backoff). I candidati ancora in backoff NON sono conteggiati.
+    pub reprobe_candidates: usize,
+    /// RE-PROBE: candidati riabilitati (is_enabled=true) perche' chat-probe +
+    /// tool-probe sono ora entrambi OK (quirk gateway risolto).
+    pub reprobe_reenabled: usize,
 }
 
 enum ProbeOutcome {
@@ -334,6 +384,231 @@ async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<ProbeModel>> {
             consecutive_tool_failures: r.try_get("consecutive_tool_failures").unwrap_or(0),
         })
         .collect())
+}
+
+/// Default del backoff fra due re-probe consecutivi dello stesso candidato
+/// disabilitato (minuti). Usato solo se il setting DB e' assente/illeggibile.
+/// 30 min: con il loop del worker a >=5 min, un candidato viene riprovato al
+/// massimo ogni ~30 min finche' non torna sano (poi e' riabilitato e basta).
+const REPROBE_BACKOFF_DEFAULT_MIN: i64 = 30;
+
+/// Riga candidata al RE-PROBE: modello disabilitato per un QUIRK GATEWAY
+/// ri-testabile (tool-probe fallito / malformed tool calls), da riprovare dopo
+/// il backoff per riabilitarlo quando il quirk e' stato corretto in produzione.
+struct ReprobeCandidate {
+    provider: String,
+    model: String,
+    /// Reason che lo ha disabilitato (per audit log).
+    reason: String,
+    /// Timestamp dell'ultimo tentativo (= auto_disabled_at): governa il backoff.
+    auto_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Era stata degradata anche la tool-capability? Se sì, va ripristinata al
+    /// re-enable.
+    supports_tool_use: bool,
+}
+
+/// Predicato PURO (testabile senza DB) che decide se una riga del catalog e'
+/// un candidato al re-probe: deve essere disabilitata per un QUIRK GATEWAY
+/// ri-testabile e NON per una causa che non si risolve ri-probando subito
+/// (billing/quota -> cooldown; missing_from_api -> non esiste piu'; policy ->
+/// decisione amministrativa; lock manuale). Punto unico (regola L) del criterio
+/// di inclusione/esclusione: la query SQL e i test usano questa funzione.
+fn is_reprobe_candidate(
+    is_enabled: bool,
+    capability_source: &str,
+    reason: Option<&str>,
+) -> bool {
+    if is_enabled {
+        return false;
+    }
+    // Lock manuale: mai ri-probato in automatico (curatela admin).
+    if capability_source == "manual" {
+        return false;
+    }
+    let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) else {
+        return false;
+    };
+    if reason.starts_with("manual:") {
+        return false;
+    }
+    // Reason di QUIRK GATEWAY ri-testabile: tool-probe fallito o malformed tool
+    // calls dal runtime (lo stesso ciclo tool-capability, regola L).
+    reason.starts_with(crate::tool_capability::REASON_TOOL_PROBE_PREFIX)
+        || reason == crate::tool_capability::REASON_MALFORMED_TOOL_CALLS
+}
+
+/// Decide se il candidato ha atteso abbastanza dal suo ultimo tentativo
+/// (`auto_disabled_at`) per essere ri-probato. PURO/testabile. Se
+/// `auto_disabled_at` e' NULL (mai marcato) il candidato e' eleggibile subito.
+fn reprobe_due(
+    auto_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    backoff_min: i64,
+) -> bool {
+    match auto_disabled_at {
+        None => true,
+        Some(ts) => now.signed_duration_since(ts) >= chrono::Duration::minutes(backoff_min.max(1)),
+    }
+}
+
+/// Legge i candidati al re-probe dal catalog. Il filtro SQL replica
+/// `is_reprobe_candidate` (inclusi: reason che inizia con `tool_probe_failed:`
+/// oppure `malformed_tool_calls`; esclusi: is_enabled=true, capability_source=
+/// 'manual', reason `manual:%`, e implicitamente tutti gli altri reason del
+/// ciclo is_enabled — billing/quota cooldown, missing_from_api, %policy%,
+/// hollow_completion, not_chat_compatible — che NON vanno ri-probati cosi').
+async fn load_reprobe_candidates(db: &PgPool) -> sqlx::Result<Vec<ReprobeCandidate>> {
+    let predicate = crate::tool_capability::TOOL_REASON_PREDICATE_SQL;
+    let sql = format!(
+        "SELECT provider, model, auto_disabled_reason, auto_disabled_at, \
+                COALESCE(capability_source, 'auto') AS capability_source, \
+                COALESCE(supports_tool_use, false) AS supports_tool_use \
+           FROM ai_price_catalog \
+          WHERE is_enabled = false \
+            AND COALESCE(capability_source, 'auto') <> 'manual' \
+            AND auto_disabled_reason IS NOT NULL \
+            AND auto_disabled_reason NOT LIKE 'manual:%' \
+            AND {predicate} \
+          ORDER BY provider, model"
+    );
+    let rows = sqlx::query(&sql).fetch_all(db).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let reason: Option<String> = r
+                .try_get::<Option<String>, _>("auto_disabled_reason")
+                .ok()
+                .flatten();
+            let capability_source: String = r
+                .try_get("capability_source")
+                .unwrap_or_else(|_| "auto".to_string());
+            // PUNTO UNICO (regola L): il criterio di inclusione/esclusione vive
+            // in is_reprobe_candidate. La query lo replica per efficienza, ma il
+            // filtro Rust e' la fonte autorevole — cosi' SQL e codice non possono
+            // divergere e la funzione e' davvero usata (non solo testata).
+            if !is_reprobe_candidate(false, &capability_source, reason.as_deref()) {
+                return None;
+            }
+            Some(ReprobeCandidate {
+                provider: r.try_get("provider").unwrap_or_default(),
+                model: r.try_get("model").unwrap_or_default(),
+                reason: reason.unwrap_or_default(),
+                auto_disabled_at: r.try_get("auto_disabled_at").ok().flatten(),
+                supports_tool_use: r.try_get("supports_tool_use").unwrap_or(false),
+            })
+        })
+        .collect())
+}
+
+/// Esito del re-probe di UN candidato.
+enum ReprobeResult {
+    /// Backoff non ancora scaduto: nessun tentativo.
+    Backoff,
+    /// Chat-probe + tool-probe entrambi OK -> riabilitato (is_enabled=true).
+    Reenabled,
+    /// Errore provider-wide (billing/quota/rate): cooldown gia' applicato dal
+    /// chat-probe, nessuna azione sul candidato (riprovato al prossimo giro).
+    ProviderWide,
+    /// Ancora rotto (chat o tool falliti): timestamp di backoff aggiornato.
+    StillBroken,
+}
+
+/// Re-proba un singolo candidato disabilitato per quirk gateway. Riusa il
+/// chat-probe SENZA side-effect (`probe_model_on_insert`) e il tool-probe SENZA
+/// side-effect (`run_tool_probe`): solo qui decide il re-enable. Se entrambi
+/// passano riabilita il modello (is_enabled=true, reason NULL, contatori a 0,
+/// e ripristina supports_tool_use se era stato degradato).
+async fn reprobe_one_candidate(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    cand: &ReprobeCandidate,
+    backoff_min: i64,
+) -> ReprobeResult {
+    if !reprobe_due(cand.auto_disabled_at, chrono::Utc::now(), backoff_min) {
+        return ReprobeResult::Backoff;
+    }
+    let provider = cand.provider.as_str();
+    let model = cand.model.as_str();
+
+    // 1. Chat-probe (no side-effect). Se provider-wide -> cooldown gia' gestito
+    //    altrove, niente azione qui.
+    match probe_model_on_insert(orchestrator, provider, model).await {
+        ProbeOnInsertResult::Healthy => {}
+        ProbeOnInsertResult::ProviderDown(kind) => {
+            tracing::debug!(
+                "model_health_probe[reprobe]: {provider}/{model} chat-probe provider-wide '{kind}' -> rimando"
+            );
+            return ReprobeResult::ProviderWide;
+        }
+        ProbeOnInsertResult::ModelBroken(kind) | ProbeOnInsertResult::Inconclusive(kind) => {
+            touch_reprobe_backoff(db, provider, model).await;
+            tracing::debug!(
+                "model_health_probe[reprobe]: {provider}/{model} chat-probe ancora rotto ({kind}) -> resta disabilitato"
+            );
+            return ReprobeResult::StillBroken;
+        }
+    }
+
+    // 2. Tool-probe (no side-effect). Deve passare anch'esso: il quirk era
+    //    proprio sul tool-forcing.
+    let (verdict, _latency) = run_tool_probe(orchestrator, provider, model).await;
+    match verdict {
+        ToolProbeVerdict::Success => {}
+        ToolProbeVerdict::ProviderWide(kind) => {
+            tracing::debug!(
+                "model_health_probe[reprobe]: {provider}/{model} tool-probe provider-wide '{kind}' -> rimando"
+            );
+            return ReprobeResult::ProviderWide;
+        }
+        ToolProbeVerdict::ToolFailed(kind) => {
+            touch_reprobe_backoff(db, provider, model).await;
+            tracing::debug!(
+                "model_health_probe[reprobe]: {provider}/{model} tool-probe ancora rotto ({kind}) -> resta disabilitato"
+            );
+            return ReprobeResult::StillBroken;
+        }
+    }
+
+    // 3. Entrambi OK: riabilita. Ripristina supports_tool_use se era degradato.
+    let restore_tool = !cand.supports_tool_use;
+    let _ = sqlx::query(
+        "UPDATE ai_price_catalog \
+            SET is_enabled = true, \
+                effective_from = NOW(), \
+                auto_disabled_at = NULL, \
+                auto_disabled_reason = NULL, \
+                consecutive_failures = 0, \
+                consecutive_tool_failures = 0, \
+                supports_tool_use = CASE WHEN $3 THEN true ELSE supports_tool_use END, \
+                updated_at = NOW() \
+          WHERE provider = $1 AND model = $2 \
+            AND is_enabled = false \
+            AND COALESCE(capability_source, 'auto') <> 'manual'",
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(restore_tool)
+    .execute(db)
+    .await;
+    tracing::info!(
+        "model_health_probe[reprobe]: RE-ENABLE {provider}/{model} (era disabilitato per '{}', quirk gateway risolto: chat-probe + tool-probe OK)",
+        cand.reason
+    );
+    ReprobeResult::Reenabled
+}
+
+/// Aggiorna il timestamp di backoff (`auto_disabled_at`) a NOW() per un
+/// candidato che ha appena fallito il re-probe, cosi' il prossimo tentativo
+/// rispetta `backoff_min`. NON tocca is_enabled/reason: resta disabilitato.
+async fn touch_reprobe_backoff(db: &PgPool, provider: &str, model: &str) {
+    let _ = sqlx::query(
+        "UPDATE ai_price_catalog SET auto_disabled_at = NOW(), updated_at = NOW() \
+          WHERE provider = $1 AND model = $2 AND is_enabled = false",
+    )
+    .bind(provider)
+    .bind(model)
+    .execute(db)
+    .await;
 }
 
 /// Pinga un singolo modello e applica la logica di counter / auto-disable.
@@ -591,13 +866,17 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
 /// AGENTE (`generate_agent_turn`), forzando una tool call su un tool fittizio.
 /// Applica la stessa semantica del runtime (`tool_failure_action`): a soglia
 /// marca `supports_tool_use=false` SENZA toccare `is_enabled`.
-async fn tool_probe_one_model(
+/// Esegue il tool-probe (chiamata `generate_agent_turn` con tool-forcing) e
+/// ritorna SOLO il verdetto, SENZA side-effect su DB/contatori. Punto unico
+/// (regola L) della costruzione della richiesta di tool-probe e della latenza:
+/// sia `tool_probe_one_model` (che applica counter/degrado) sia il re-probe dei
+/// candidati disabilitati (che riabilita is_enabled) lo riusano, senza
+/// duplicare tools_json / messages_json / mapping errore->verdetto.
+async fn run_tool_probe(
     orchestrator: &Orchestrator,
-    db: &PgPool,
     provider: &str,
     model: &str,
-    threshold: i32,
-) -> ToolProbeOutcome {
+) -> (ToolProbeVerdict, i32) {
     // Tool fittizio minimale + tool_choice forzato. Mettiamo il tool_choice
     // nel JSON dei tools cosi' il brain lo inoltra al provider (lo schema
     // generate_agent_turn non ha un campo tool_choice dedicato: i provider
@@ -654,6 +933,17 @@ async fn tool_probe_one_model(
         }
         Err(_timeout) => ToolProbeVerdict::ToolFailed("tool_probe_timeout".into()),
     };
+    (verdict, latency_ms)
+}
+
+async fn tool_probe_one_model(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    threshold: i32,
+) -> ToolProbeOutcome {
+    let (verdict, latency_ms) = run_tool_probe(orchestrator, provider, model).await;
 
     // Persisti l'esito nello storico (diagnosticabile). error_kind prefissato
     // 'tool_probe:' per distinguerlo dal probe chat.
@@ -1094,6 +1384,100 @@ mod tests {
         assert!(matches!(
             evaluate_tool_probe(&v),
             ToolProbeVerdict::ToolFailed(ref k) if k == "stop_reason_error"
+        ));
+    }
+
+    // --- RE-PROBE candidati disabilitati per quirk gateway ------------------
+
+    #[test]
+    fn reprobe_candidate_tool_probe_failed_incluso() {
+        // (a) Modello disabilitato per tool_probe_failed: e' un quirk gateway
+        // ri-testabile -> candidato.
+        assert!(is_reprobe_candidate(
+            false,
+            "auto",
+            Some("tool_probe_failed:error")
+        ));
+        // malformed_tool_calls (degrado runtime) e' lo stesso ciclo -> candidato.
+        assert!(is_reprobe_candidate(
+            false,
+            "auto",
+            Some("malformed_tool_calls")
+        ));
+    }
+
+    #[test]
+    fn reprobe_candidate_billing_missing_policy_esclusi() {
+        // (b) Billing/quota -> cooldown, gestito altrove: NON ri-probato cosi'.
+        assert!(!is_reprobe_candidate(
+            false,
+            "auto",
+            Some("credit_balance_too_low")
+        ));
+        // missing_from_api -> il modello non esiste piu' nell'API: escluso.
+        assert!(!is_reprobe_candidate(
+            false,
+            "auto",
+            Some("missing_from_api")
+        ));
+        // %policy% -> decisione amministrativa, non un guasto: escluso.
+        assert!(!is_reprobe_candidate(
+            false,
+            "auto",
+            Some("fuori model_selection_policy (mig 0320)")
+        ));
+        // hollow_completion generico (ciclo is_enabled, non tool): escluso.
+        assert!(!is_reprobe_candidate(
+            false,
+            "auto",
+            Some("hollow_completion_runtime")
+        ));
+    }
+
+    #[test]
+    fn reprobe_candidate_lock_manuale_escluso() {
+        // (c) Lock manuale: mai ri-probato in automatico, da entrambi i segnali.
+        assert!(!is_reprobe_candidate(
+            false,
+            "manual",
+            Some("tool_probe_failed:error")
+        ));
+        assert!(!is_reprobe_candidate(
+            false,
+            "auto",
+            Some("manual:non_chat_endpoint")
+        ));
+    }
+
+    #[test]
+    fn reprobe_candidate_modello_abilitato_escluso() {
+        // Un modello gia' abilitato non e' candidato (lo testa il giro principale).
+        assert!(!is_reprobe_candidate(
+            true,
+            "auto",
+            Some("tool_probe_failed:error")
+        ));
+        // Reason assente: non e' un degrado tracciato, niente re-probe.
+        assert!(!is_reprobe_candidate(false, "auto", None));
+    }
+
+    #[test]
+    fn reprobe_due_rispetta_il_backoff() {
+        let now = chrono::Utc::now();
+        let backoff = 30;
+        // Mai marcato (NULL) -> eleggibile subito.
+        assert!(reprobe_due(None, now, backoff));
+        // Tentativo 10 min fa, backoff 30 min -> non ancora.
+        assert!(!reprobe_due(
+            Some(now - chrono::Duration::minutes(10)),
+            now,
+            backoff
+        ));
+        // Tentativo 31 min fa -> oltre il backoff, eleggibile.
+        assert!(reprobe_due(
+            Some(now - chrono::Duration::minutes(31)),
+            now,
+            backoff
         ));
     }
 }
