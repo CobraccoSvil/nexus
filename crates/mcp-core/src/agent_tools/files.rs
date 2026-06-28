@@ -398,6 +398,16 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
                 )
                 .await;
                 crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
+                // Ri-valuta le violazioni di governance risorse sul file appena scritto:
+                // se l'edit ha rimosso la porta/URL hardcoded, la diagnosi policy_violation
+                // viene chiusa e sparisce dal pannello Problemi (regola H: niente residui).
+                crate::security::resource_linter::revalidate_file_violations(
+                    &db_bg,
+                    project_id_bg,
+                    &root_bg.to_string_lossy(),
+                    &target_bg,
+                )
+                .await;
                 // Hook M2: se il file e' un .md di documentazione, registra in project_documents
                 let _ = upsert_project_document_if_doc(
                     &db_bg,
@@ -1171,6 +1181,16 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
                     tokio::spawn(async move {
                         let _ = crate::projects::reindex_single_file(&db_bg, &neural_bg, project_id_bg, &root_bg, &target_bg).await;
                         crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
+                        // Ri-valuta le violazioni di governance risorse sul file appena
+                        // modificato: chiude (e fa sparire dal pannello Problemi) le diagnosi
+                        // policy_violation risolte dall'edit (regola H: niente residui).
+                        crate::security::resource_linter::revalidate_file_violations(
+                            &db_bg,
+                            project_id_bg,
+                            &root_bg.to_string_lossy(),
+                            &target_bg,
+                        )
+                        .await;
                     });
                     let base = format!(
                         "File '{}' modificato con successo ({} byte → {} byte)",

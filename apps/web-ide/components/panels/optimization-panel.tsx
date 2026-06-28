@@ -3,7 +3,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useProjectStore, selectFilesRecent, useEventOfKind } from "../../lib/project-dispatcher/hooks";
-import { selectQualityScan } from "../../lib/project-dispatcher/store";
+import { selectQualityScan, selectFindingsUpdate } from "../../lib/project-dispatcher/store";
 import {
   runQualityScan,
   getQualityFindings,
@@ -605,6 +605,17 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
       setScanning(true);
     }
   }, [qualityScan, fetchFindings]);
+
+  // Reazione a FindingsUpdated via dispatcher SSE: emesso dall'auto-scan per-file
+  // (maybe_auto_scan_file) dopo ogni write/edit, inclusi i casi "file corretto"
+  // (0 finding nuovi) che prima lasciavano i problemi risolti nel pannello.
+  // Ricarica i findings cosi' la lista riflette lo stato reale senza scan manuale.
+  const findingsUpdate = useProjectStore(selectFindingsUpdate);
+  useEffect(() => {
+    if (!findingsUpdate) return;
+    void fetchFindings();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findingsUpdate]);
 
   const handleScan = async () => {
     setScanning(true);

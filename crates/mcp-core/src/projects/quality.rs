@@ -1329,9 +1329,6 @@ pub async fn maybe_auto_scan_file(
 
     // Esegue i checker sul file singolo via mcp_quality::analyze_source (crate esterna)
     let report = mcp_quality::analyze_source(path_str, &content);
-    if report.findings.is_empty() {
-        return;
-    }
 
     // Severità minima: low=0, medium=1, high=2
     let min_level: u8 = match threshold.as_str() {
@@ -1340,14 +1337,23 @@ pub async fn maybe_auto_scan_file(
         _ => 0, // "low" o qualsiasi altro valore
     };
 
-    // Elimina i finding precedenti per questo file e progetto
-    let _ = sqlx::query(
-        "DELETE FROM project_quality_findings WHERE project_id = $1 AND file_path = $2",
+    // Elimina SEMPRE i finding precedenti per questo file e progetto, PRIMA di
+    // qualsiasi early-return: quando il file e' stato CORRETTO (0 finding nuovi)
+    // i finding vecchi devono comunque sparire dal pannello. Il DELETE qui tocca
+    // SOLO i finding di QUESTO file (project_id + file_path), quindi non puo'
+    // toccare violazioni risorse/playwright (che vivono su altre tabelle).
+    // RETURNING id: serve a popolare resolved_ids nell'evento FindingsUpdated
+    // cosi' il frontend marca/rimuove i finding risolti senza ri-scansionare.
+    let deleted_ids: Vec<Uuid> = sqlx::query_scalar(
+        "DELETE FROM project_quality_findings \
+         WHERE project_id = $1 AND file_path = $2 \
+         RETURNING id",
     )
     .bind(project_id)
     .bind(path_str)
-    .execute(db)
-    .await;
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
 
     // Inserisce i nuovi finding filtrati per soglia
     let mut inserted = 0u32;
@@ -1379,11 +1385,160 @@ pub async fn maybe_auto_scan_file(
     }
 
     tracing::debug!(
-        "auto_scan_file: project={} file={} findings_raw={} inserted={} threshold={}",
+        "auto_scan_file: project={} file={} findings_raw={} deleted={} inserted={} threshold={}",
         project_id,
         path_str,
         report.findings.len(),
+        deleted_ids.len(),
         inserted,
         threshold
     );
+
+    // Notifica realtime: ribilancia badge + pannelli (Problemi via get_project_problems,
+    // Ottimizzazione via get_quality_findings). Emette anche quando inserted==0
+    // (file pulito): e' proprio il caso "problema risolto" che prima restava nel
+    // pannello. `resolved_ids` = finding cancellati di QUESTO file; il frontend li
+    // marca in-place. Solo se qualcosa e' cambiato (cancellato o inserito), per
+    // non generare rumore di eventi a ogni salvataggio innocuo.
+    if !deleted_ids.is_empty() || inserted > 0 {
+        emit_findings_updated_for_project(db, project_id, deleted_ids).await;
+    }
+}
+
+/// Emette `FindingsUpdated` ricalcolando i totali correnti del progetto dalla
+/// tabella `project_quality_findings` (fonte unica QUALITY). `resolved_ids` =
+/// finding rimossi in questo aggiornamento, usati dal frontend per marcare
+/// in-place. Punto unico per emettere l'evento dall'auto-scan per-file: usa il
+/// registry globale (`emit_global`) cosi' non serve propagare `&ProjectChannels`
+/// nei call site fire-and-forget in `files.rs`.
+async fn emit_findings_updated_for_project(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    resolved_ids: Vec<Uuid>,
+) {
+    // Totali correnti (esclusi i falsi positivi, coerente con get_quality_findings).
+    let counts: Option<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT \
+            COUNT(*) AS total, \
+            COUNT(*) FILTER (WHERE severity = 'high') AS critical, \
+            COUNT(*) FILTER (WHERE severity = 'medium') AS warnings \
+         FROM project_quality_findings \
+         WHERE project_id = $1 AND (is_false_positive = FALSE OR is_false_positive IS NULL)",
+    )
+    .bind(project_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let (total, critical, warnings) = counts.unwrap_or((0, 0, 0));
+    nexus_events::dispatcher::emit_global(
+        project_id,
+        nexus_events::ProjectEvent::FindingsUpdated {
+            scan_id: None,
+            total,
+            critical,
+            warnings,
+            resolved_ids,
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    /// Crea le tabelle minimali toccate da `maybe_auto_scan_file` su un DB di test.
+    async fn setup_schema(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .execute(pool)
+        .await
+        .expect("create settings");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS project_quality_findings (\
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                project_id UUID NOT NULL, \
+                scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+                file_path TEXT NOT NULL, \
+                category TEXT NOT NULL, \
+                severity TEXT NOT NULL, \
+                title TEXT NOT NULL, \
+                detail TEXT NOT NULL, \
+                line_number INTEGER, \
+                fixed_at TIMESTAMPTZ, \
+                is_false_positive BOOLEAN NOT NULL DEFAULT FALSE)",
+        )
+        .execute(pool)
+        .await
+        .expect("create project_quality_findings");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('quality_auto_scan', 'true')")
+            .execute(pool)
+            .await
+            .expect("seed quality_auto_scan");
+    }
+
+    /// Regressione del bug "i problemi risolti non vengono eliminati": un file
+    /// CORRETTO (senza piu' finding) deve far sparire i finding precedenti.
+    /// Prima del fix, `maybe_auto_scan_file` faceva `return` su `findings.is_empty()`
+    /// PRIMA del DELETE, lasciando il finding stantio nel pannello.
+    #[sqlx::test]
+    async fn auto_scan_file_pulito_cancella_finding_precedenti(pool: PgPool) {
+        setup_schema(&pool).await;
+        let project_id = Uuid::new_v4();
+
+        // File su disco SENZA finding (codice Rust banale).
+        let dir = std::env::temp_dir().join(format!("nexus_qtest_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir tmp");
+        let file_path = dir.join("clean.rs");
+        // Contenuto senza finding di analyze_source: funzione PRIVATA documentata
+        // (niente "public function without documentation", niente smell di base).
+        tokio::fs::write(
+            &file_path,
+            "/// Somma due interi.\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        )
+        .await
+        .expect("write file");
+        let path_str = file_path.to_string_lossy().to_string();
+
+        // Finding stantio gia' presente per quel file (simula problema poi corretto).
+        sqlx::query(
+            "INSERT INTO project_quality_findings \
+             (project_id, file_path, category, severity, title, detail) \
+             VALUES ($1, $2, 'maintainability', 'medium', 'vecchio', 'da rimuovere')",
+        )
+        .bind(project_id)
+        .bind(&path_str)
+        .execute(&pool)
+        .await
+        .expect("seed finding");
+
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_quality_findings WHERE project_id = $1 AND file_path = $2",
+        )
+        .bind(project_id)
+        .bind(&path_str)
+        .fetch_one(&pool)
+        .await
+        .expect("count before");
+        assert_eq!(before, 1, "il finding stantio deve esistere prima dello scan");
+
+        maybe_auto_scan_file(&pool, project_id, &file_path).await;
+
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_quality_findings WHERE project_id = $1 AND file_path = $2",
+        )
+        .bind(project_id)
+        .bind(&path_str)
+        .fetch_one(&pool)
+        .await
+        .expect("count after");
+        assert_eq!(
+            after, 0,
+            "su file pulito i finding precedenti devono essere cancellati"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }

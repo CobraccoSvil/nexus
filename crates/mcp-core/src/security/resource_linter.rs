@@ -303,52 +303,8 @@ pub async fn lint_project(
 
     let mut opened = 0usize;
     for f in &findings {
-        let (kind, rule) = f.kind.rule();
-        let sig = crate::security::resource_governance::violation_signature(
-            project_id,
-            Some(&f.rel_path),
-            &f.value,
-            &format!("{kind}/{rule}"),
-        );
-        let detail = format!(
-            "{}:{} {} ({}/{}) | {}\n-> {}",
-            f.rel_path,
-            f.line,
-            f.value,
-            kind,
-            rule,
-            f.snippet.chars().take(160).collect::<String>(),
-            violation_action_hint(&f.kind, &f.snippet),
-        );
-        let opened_id = crate::security::resource_governance::open_resource_violation(
-            db,
-            project_id,
-            kind,
-            rule,
-            f.port as f64,
-            Some(&f.rel_path),
-            &detail,
-            &sig,
-        )
-        .await;
-        if let Some(_id) = opened_id {
+        if open_lint_finding(db, project_id, f).await {
             opened += 1;
-            let entry = crate::security::AuditEntry {
-                project_id,
-                actor: "system",
-                actor_user_id: None,
-                actor_session_id: None,
-                action: "resource_lint_violation".to_string(),
-                resource_kind: if f.port > 0 { "port" } else { "network" },
-                resource_id: Some(f.value.clone()),
-                outcome: "detected",
-                details: serde_json::json!({
-                    "file": f.rel_path,
-                    "line": f.line,
-                    "rule": format!("{kind}/{rule}"),
-                }),
-            };
-            crate::security::record_audit(entry);
         }
     }
     if opened > 0 {
@@ -373,6 +329,189 @@ pub async fn lint_project(
         );
     }
     opened
+}
+
+/// Punto unico (regola L) di APERTURA di una diagnosi da un finding del linter:
+/// firma + detail azionabile + open_resource_violation + audit. Usato sia dal
+/// lint completo (`lint_project`) sia dalla ri-validazione per-file
+/// (`revalidate_file_violations`). Ritorna true se ha aperto una nuova diagnosi
+/// (dedup per firma a monte: non riapre violazioni gia' note).
+async fn open_lint_finding(db: &PgPool, project_id: Uuid, f: &ResourceLintFinding) -> bool {
+    let (kind, rule) = f.kind.rule();
+    let sig = crate::security::resource_governance::violation_signature(
+        project_id,
+        Some(&f.rel_path),
+        &f.value,
+        &format!("{kind}/{rule}"),
+    );
+    let detail = format!(
+        "{}:{} {} ({}/{}) | {}\n-> {}",
+        f.rel_path,
+        f.line,
+        f.value,
+        kind,
+        rule,
+        f.snippet.chars().take(160).collect::<String>(),
+        violation_action_hint(&f.kind, &f.snippet),
+    );
+    let opened_id = crate::security::resource_governance::open_resource_violation(
+        db,
+        project_id,
+        kind,
+        rule,
+        f.port as f64,
+        Some(&f.rel_path),
+        &detail,
+        &sig,
+    )
+    .await;
+    if opened_id.is_some() {
+        let entry = crate::security::AuditEntry {
+            project_id,
+            actor: "system",
+            actor_user_id: None,
+            actor_session_id: None,
+            action: "resource_lint_violation".to_string(),
+            resource_kind: if f.port > 0 { "port" } else { "network" },
+            resource_id: Some(f.value.clone()),
+            outcome: "detected",
+            details: serde_json::json!({
+                "file": f.rel_path,
+                "line": f.line,
+                "rule": format!("{kind}/{rule}"),
+            }),
+        };
+        crate::security::record_audit(entry);
+        true
+    } else {
+        false
+    }
+}
+
+/// Ri-valida le violazioni di governance risorse su UN file appena modificato
+/// (write/edit). Controparte per-file di `lint_project`: copre il caso "l'utente
+/// o l'agente corregge il file" che il linter periodico vede solo dopo minuti.
+///
+/// - apre eventuali violazioni NUOVE introdotte dall'edit (riuso `open_lint_finding`);
+/// - chiude (status='resolved') le diagnosi `policy_violation` aperte su QUESTO
+///   file che NON sono piu' presenti nel contenuto corrente, confrontando per
+///   firma (metric + file_path + value) — la stessa identita' usata in apertura.
+///
+/// Emette `FindingsUpdated` con gli id risolti cosi' il pannello Problemi si
+/// aggiorna in tempo reale. `abs_path` deve essere il path assoluto del file
+/// modificato; viene risolto in path relativo alla root del progetto per
+/// allineare la firma a quella prodotta dal lint completo.
+pub async fn revalidate_file_violations(
+    db: &PgPool,
+    project_id: Uuid,
+    root_path: &str,
+    abs_path: &Path,
+) {
+    // Flag DB-driven coerente con il linter periodico (regola G): opt-out per progetto.
+    let lint_on = sqlx::query_scalar::<_, bool>(
+        "SELECT port_lint_enabled FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(true);
+    if !lint_on {
+        return;
+    }
+
+    let root = Path::new(root_path);
+    // Path relativo alla root: deve combaciare con il rel_path del lint completo,
+    // altrimenti la firma non coincide e non chiuderemmo la diagnosi giusta.
+    let rel_path = match abs_path.strip_prefix(root) {
+        Ok(rel) => rel.to_string_lossy().to_string(),
+        // File fuori dalla root del progetto: non e' soggetto al lint progetto.
+        Err(_) => return,
+    };
+    if !should_lint_file(abs_path) {
+        return;
+    }
+
+    let allocated = allocated_ports_for_project(db, project_id).await;
+    // Contenuto corrente del file (se illeggibile/cancellato: nessun finding,
+    // quindi tutte le diagnosi aperte sul file vengono risolte).
+    let current = tokio::fs::read_to_string(abs_path).await.unwrap_or_default();
+    let findings = lint_file_content(&rel_path, &current, &allocated);
+
+    // 1) Apre eventuali violazioni nuove (dedup a monte: non riapre le note).
+    for f in &findings {
+        let _ = open_lint_finding(db, project_id, f).await;
+    }
+
+    // Firme ancora presenti: una diagnosi resta aperta solo se la sua firma
+    // compare ancora tra i finding correnti del file.
+    let present_sigs: std::collections::HashSet<String> = findings
+        .iter()
+        .map(|f| {
+            let (kind, rule) = f.kind.rule();
+            crate::security::resource_governance::violation_signature(
+                project_id,
+                Some(&f.rel_path),
+                &f.value,
+                &format!("{kind}/{rule}"),
+            )
+        })
+        .collect();
+
+    // 2) Diagnosi policy_violation aperte su QUESTO file (open/diagnosing/failed_remediation):
+    //    quelle la cui firma non e' piu' presente vanno risolte.
+    let open_rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, error_signature_hash FROM service_diagnoses \
+          WHERE project_id = $1 AND signal_kind = 'policy_violation' \
+            AND file_path = $2 \
+            AND status IN ('open', 'diagnosing', 'failed_remediation')",
+    )
+    .bind(project_id)
+    .bind(&rel_path)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let resolved_ids: Vec<Uuid> = open_rows
+        .into_iter()
+        .filter(|(_, sig)| !present_sigs.contains(sig))
+        .map(|(id, _)| id)
+        .collect();
+
+    if resolved_ids.is_empty() {
+        return;
+    }
+
+    let _ = sqlx::query(
+        "UPDATE service_diagnoses SET status = 'resolved', resolved_at = NOW() \
+          WHERE id = ANY($1)",
+    )
+    .bind(&resolved_ids)
+    .execute(db)
+    .await;
+
+    tracing::info!(
+        project_id = %project_id,
+        file = %rel_path,
+        resolved = resolved_ids.len(),
+        "resource_linter: violazioni risorse risolte dopo edit del file"
+    );
+
+    // Realtime: il pannello Problemi ascolta FindingsUpdated e ri-fetcha.
+    // total/critical/warnings restano 0: il pannello Problemi non li usa per
+    // i policy_violation (refetch via get_project_problems), ma resolved_ids
+    // permette al frontend di marcare in-place i problemi spariti.
+    nexus_events::dispatcher::emit_global(
+        project_id,
+        nexus_events::event::ProjectEvent::FindingsUpdated {
+            scan_id: None,
+            total: 0,
+            critical: 0,
+            warnings: 0,
+            resolved_ids,
+        },
+    );
 }
 
 /// Worker periodico: linta tutti i progetti con `port_lint_enabled=true` e
