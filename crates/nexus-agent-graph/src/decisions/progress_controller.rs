@@ -101,6 +101,18 @@ pub struct ProgressSignals {
     /// contesto e' gia' stato raccolto). NON-convergenza, regola H. Per i tool
     /// produttivi resta la forza-azione correttiva (force_action=true).
     pub repeated_action_read_only: bool,
+    /// `true` se l'azione ripetuta e' l'avvio di un SERVIZIO long-running
+    /// (`run_service`/`service_restart`) FALLITO: il servizio parte e muore subito
+    /// (porta occupata, config errata, dipendenza mancante), l'agente lo rilancia
+    /// IDENTICO e scatta il falso-stallo. Rilanciare un dev server che muore NON e'
+    /// un'azione produttiva: la causa va DIAGNOSTICATA leggendo l'output del servizio.
+    /// Cambia il nudge in SPECIFICO ("leggi i log del servizio, correggi la causa,
+    /// non rilanciare") e NON forza l'azione (force_action=false), cosi' i tool di
+    /// lettura log (read_service_output/tail_service_logs, read-only) restano
+    /// disponibili invece di essere rimossi dalla forza-azione; inoltre evita l'ABORT
+    /// (come per l'edit fallito) finche' la diagnosi non e' stata sfruttata: l'agente
+    /// NON deve arrendersi su un servizio che non parte, deve capire perche'.
+    pub repeated_action_service_failed: bool,
     /// `true` se il turno corrente e' ACTION-ORIENTED (task di modifica/fix), come
     /// derivato da `turn_action_oriented(state.action_oriented)`. Biforca il nudge
     /// del ramo read-only: su un task di fix una lettura ripetuta NON va chiusa con
@@ -141,6 +153,7 @@ impl Default for ProgressSignals {
             repeated_action: None,
             repeated_action_edit_failed: false,
             repeated_action_read_only: false,
+            repeated_action_service_failed: false,
             // Conservativo: identico a `turn_action_oriented(None) == true`.
             action_oriented: true,
             reallocation_count: 0,
@@ -341,6 +354,26 @@ Stai CORREGGENDO l'old_string, non ripetendo: e' l'azione giusta per sbloccarti.
     )
 }
 
+/// Nudge SPECIFICO per un SERVIZIO long-running (`run_service`/`service_restart`)
+/// FALLITO ripetuto: il servizio e' stato avviato piu' volte ma continua a uscire/
+/// non resta attivo. Rilanciarlo identico non cambia nulla: la causa va letta dai
+/// log del servizio. NON forza l'azione (cosi' read_service_output/tail_service_logs
+/// restano disponibili) e NON porta all'abort: l'agente non deve arrendersi, deve
+/// diagnosticare. Gemello di [`repeated_action_edit_failed_nudge`] per i servizi.
+fn repeated_action_service_failed_nudge(label: &str, count: i64) -> String {
+    format!(
+        "STOP: hai avviato '{label}' {count} volte ma il servizio NON resta attivo \
+(parte e muore subito). NON rilanciarlo di nuovo: e' la stessa azione di prima. \
+Leggi PRIMA l'output dell'avvio fallito \u{2014} usa read_service_output (o \
+tail_service_logs) sul servizio appena avviato \u{2014} per individuare la CAUSA \
+dell'uscita (porta gia' occupata, dipendenza non installata, errore di sintassi/\
+config in vite.config.ts/package.json, variabile d'ambiente mancante). CORREGGI \
+quella causa con edit_file/run_command, poi riavvia il servizio UNA sola volta. Se \
+la causa e' esterna e non risolvibile (porta riservata, credenziale, dipendenza non \
+installabile), dichiaralo esplicitamente: non e' un loop, e' un blocco da segnalare."
+    )
+}
+
 /// Nudge di DIAGNOSI FORZATA (stadio tra GUIDE e ABORT). Vedi
 /// `_force_diagnose_nudge` Python (build/test-aware).
 fn force_diagnose_nudge(label: &str, count: i64) -> String {
@@ -439,6 +472,8 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
                 // all'EDIT, su una domanda "concludi con testo"); altrimenti generico.
                 if signals.repeated_action_edit_failed {
                     repeated_action_edit_failed_nudge(&label, count)
+                } else if signals.repeated_action_service_failed {
+                    repeated_action_service_failed_nudge(&label, count)
                 } else if signals.repeated_action_read_only {
                     if signals.action_oriented {
                         repeated_read_only_action_nudge(&label, count)
@@ -464,6 +499,13 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
         let force = match axis {
             // resource_reallocation: SOFT (riusa-porte, nessuna azione correttiva).
             Axis::ResourceReallocation => false,
+            // SERVIZIO long-running fallito: NON forzare. La forza-azione rimuove i
+            // tool read-only, ma qui l'agente DEVE poterli usare (read_service_output/
+            // tail_service_logs) per leggere perche' il servizio e' morto; il nudge lo
+            // guida a diagnosticare e correggere, non a rilanciare. Forzare l'azione
+            // rimuoverebbe i log e lo costringerebbe a ri-avviare -> il loop che
+            // vogliamo spezzare.
+            Axis::RepeatedAction if signals.repeated_action_service_failed => false,
             // repeated_action di SOLA LETTURA su turno INFORMATIVO: NON forzare
             // (forzerebbe un altro read-only -> nuovo loop); il nudge guida a
             // concludere con testo. Su turno ACTION-ORIENTED invece forziamo l'edit.
@@ -505,22 +547,31 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
     // ripetizioni resta il comportamento storico (governato dal flag).
     let want_force_diagnose = matches!(axis, Axis::RepeatedAction)
         && !already_diagnosed
-        && (signals.force_diagnose_enabled || signals.repeated_action_edit_failed);
+        && (signals.force_diagnose_enabled
+            || signals.repeated_action_edit_failed
+            || signals.repeated_action_service_failed);
     if want_force_diagnose {
         let (label, count) = signals
             .repeated_action
             .clone()
             .unwrap_or_else(|| (String::new(), 0));
         // Per l'edit fallito riusa il nudge SPECIFICO (copia l'old_string esatto
-        // dall'estratto), non quello diagnostico generico.
+        // dall'estratto); per il servizio fallito il nudge diagnostico-servizio (leggi
+        // i log, correggi la causa); altrimenti quello diagnostico generico.
         let nudge = if signals.repeated_action_edit_failed {
             repeated_action_edit_failed_nudge(&label, count)
+        } else if signals.repeated_action_service_failed {
+            repeated_action_service_failed_nudge(&label, count)
         } else {
             force_diagnose_nudge(&label, count)
         };
         let reason = if signals.repeated_action_edit_failed {
             "stallo repeated_action (edit fallito): correzione old_string forzata, \
                 niente ABORT finche' l'estratto non e' sfruttato"
+                .to_string()
+        } else if signals.repeated_action_service_failed {
+            "stallo repeated_action (servizio fallito): diagnosi log-servizio forzata, \
+                niente ABORT e niente forza-azione (i log restano leggibili)"
                 .to_string()
         } else {
             "stallo repeated_action: correzione forzata prima di escalation/abort".to_string()
@@ -529,9 +580,10 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
             action: Action::ForceDiagnose,
             axis: Some(axis),
             // Forza una tool call correttiva: la diagnosi deve sfociare in un edit,
-            // non in testo o resa. La scappatoia "dichiarati bloccato" resta solo nel
-            // ramo non-build del nudge, per cause realmente bloccanti.
-            force_action: true,
+            // non in testo o resa. ECCEZIONE servizio fallito: NON forzare, cosi' i
+            // tool di lettura log (read-only) restano disponibili per capire perche'
+            // il servizio muore (forzare rimuoverebbe i log -> rilancio cieco -> loop).
+            force_action: !signals.repeated_action_service_failed,
             nudge_text: Some(nudge),
             stop_reason: None,
             reason,
@@ -630,6 +682,62 @@ mod tests {
         assert!(nudge.contains("NON chiamare read_file"));
         // Non deve essere il nudge generico.
         assert!(!nudge.contains("cambia approccio"));
+    }
+
+    #[test]
+    fn repeated_action_servizio_fallito_guida_diagnostica_senza_forzare() {
+        // GUIDE di un run_service FALLITO ripetuto (dev server che muore): il nudge
+        // deve essere SPECIFICO (leggi i log del servizio, correggi la causa) e NON
+        // deve forzare l'azione (cosi' read_service_output/tail_service_logs restano
+        // disponibili; forzare rimuoverebbe i read-only e costringerebbe a rilanciare).
+        let signals = ProgressSignals {
+            repeated_action: Some(("run_service: pnpm run dev".to_string(), 2)),
+            repeated_action_service_failed: true,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::Guide);
+        assert!(
+            !d.force_action,
+            "servizio fallito: NON forzare (i log devono restare leggibili)"
+        );
+        let nudge = d.nudge_text.as_deref().unwrap();
+        assert!(
+            nudge.contains("read_service_output"),
+            "atteso nudge diagnostico-servizio, ottenuto: {nudge}"
+        );
+        assert!(nudge.contains("NON rilanciarlo"));
+        // Non deve essere il nudge edit-specifico.
+        assert!(!nudge.contains("old_string ESATTO"));
+    }
+
+    #[test]
+    fn repeated_action_servizio_fallito_force_diagnose_niente_abort() {
+        // Dopo la GUIDE (asse gia' guidato), un servizio fallito NON deve abortire ne'
+        // escalare: deve restare in FORCE_DIAGNOSE (leggi i log e correggi), come per
+        // l'edit fallito. force_action resta OFF (i log devono restare leggibili).
+        let mut guided = HashSet::new();
+        guided.insert(Axis::RepeatedAction.as_str().to_string());
+        let signals = ProgressSignals {
+            repeated_action: Some(("run_service: pnpm run dev".to_string(), 3)),
+            repeated_action_service_failed: true,
+            already_guided: guided,
+            // C'e' un candidato di escalation con budget: senza il ramo servizio,
+            // cadrebbe in ESCALATE/ABORT invece di restare in diagnosi.
+            has_escalation_candidate: true,
+            escalations: 0,
+            max_escalations: 3,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(
+            d.action,
+            Action::ForceDiagnose,
+            "servizio fallito gia' guidato: diagnosi forzata, non abort/escalate"
+        );
+        assert!(!d.force_action, "i log del servizio devono restare leggibili");
+        let nudge = d.nudge_text.as_deref().unwrap();
+        assert!(nudge.contains("read_service_output"));
     }
 
     #[test]

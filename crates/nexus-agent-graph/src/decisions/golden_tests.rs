@@ -95,6 +95,9 @@ impl From<DecideInput> for ProgressSignals {
             repeated_action: i.repeated_action,
             repeated_action_edit_failed: i.repeated_action_edit_failed,
             repeated_action_read_only: i.repeated_action_read_only,
+            // Segnale Rust-only (run_service fallito): non presente nei golden Python,
+            // resta false -> non altera i casi di parita' esistenti.
+            repeated_action_service_failed: false,
             action_oriented: i.action_oriented,
             reallocation_count: i.reallocation_count,
             reallocation_threshold: i.reallocation_threshold,

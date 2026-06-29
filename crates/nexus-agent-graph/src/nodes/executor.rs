@@ -1127,6 +1127,16 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 .as_ref()
                 .map(|h| EXPLORATION_ONLY_TOOLS.contains(&h.tool_name.as_str()))
                 .unwrap_or(false);
+            // Avvio di un SERVIZIO long-running FALLITO ripetuto (run_service/
+            // service_restart): il servizio parte e muore subito, l'agente lo rilancia
+            // identico -> falso stallo. Il controller lo guida a leggere i log del
+            // servizio e correggere la causa (nudge specifico, force-action OFF cosi'
+            // i tool di lettura log restano), invece di forzare un rilancio cieco o
+            // arrendersi con ABORT (regola H, gemello dell'edit fallito).
+            let ra_service_failed = ra_hit
+                .as_ref()
+                .map(|h| h.failed && matches!(h.tool_name.as_str(), "run_service" | "service_restart"))
+                .unwrap_or(false);
             let ra_threshold = self.cfg.repeated_action_threshold;
             let matched = ra_label.as_ref().map(|_| ra_count >= ra_threshold).unwrap_or(false);
             if !matched {
@@ -1168,6 +1178,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                     repeated_action: Some((label.clone(), ra_count)),
                     repeated_action_edit_failed: ra_edit_failed,
                     repeated_action_read_only: ra_read_only,
+                    repeated_action_service_failed: ra_service_failed,
                     // Biforca il nudge read-only: su un task di fix orienta all'EDIT
                     // (no rinuncia), su una domanda concludi con testo (punto unico).
                     action_oriented: turn_action_oriented(state.action_oriented),
