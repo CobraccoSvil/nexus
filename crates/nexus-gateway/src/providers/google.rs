@@ -61,6 +61,15 @@ const THINKING_MIN_MAX_TOKENS: u32 = 256;
 /// `max(128, min(_tb_base, max_tokens))`).
 const THINKING_BUDGET_FLOOR: u32 = 128;
 
+/// Budget usato per DISABILITARE esplicitamente il thinking Gemini quando la
+/// richiesta porta tool (gate [`GoogleThinking::DisabledForTools`]). Su
+/// gemini-2.5-flash (i modelli dei run agentici) `thinkingBudget=0` spegne il
+/// thinking. QUIRK: gemini-2.5-pro rifiuta 0 (minimo documentato 128); i run
+/// agentici Nexus non usano pro, quindi 0 e' corretto e deterministico. Punto
+/// unico del valore di disabilitazione: se servisse un trattamento per-modello
+/// (es. pro -> 128) si interviene qui, non sparso nei call site (regola L).
+const THINKING_DISABLE_BUDGET: u32 = 0;
+
 /// TTL della cache settings (60s, come gli altri provider).
 const SETTINGS_TTL: Duration = Duration::from_secs(60);
 
@@ -982,30 +991,88 @@ pub fn parse_google_models_response(body: &serde_json::Value) -> Vec<String> {
     names
 }
 
-/// Esito della risoluzione del thinking Gemini per una richiesta. `None` =
-/// thinking disattivo; `Some(budget)` = `thinkingConfig` con quel budget e tetto
-/// di output alzato di conseguenza (fix hollow completion).
-type GoogleThinking = Option<u32>;
+/// Esito della risoluzione del thinking Gemini per una richiesta.
+///
+/// Tre stati distinti perche' Gemini distingue "thinkingConfig assente" da
+/// "thinkingConfig con budget 0":
+///   - [`GoogleThinking::Absent`]: NESSUN `thinkingConfig` nel body. Gemini usa il
+///     suo default (thinking ON sui modelli 2.5/3.x). Storicamente l'unico ramo
+///     per `req.thinking=None`. Usato solo quando NON ci sono tool e il chiamante
+///     non ha chiesto thinking esplicito.
+///   - [`GoogleThinking::DisabledForTools`]: `thinkingConfig { thinkingBudget: 0,
+///     includeThoughts: false }` ESPLICITO. Spegne il thinking di Gemini. E' il
+///     gate tool (vedi sotto): obbligatorio quando la richiesta porta tool, perche'
+///     il thinking ON + function-calling forzato produce MALFORMED_FUNCTION_CALL /
+///     turni vuoti -> cooldown -> probe disabilita tutti i gemini.
+///   - [`GoogleThinking::Enabled`]: `thinkingConfig { thinkingBudget: budget,
+///     includeThoughts: true }` con tetto di output alzato (fix hollow completion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoogleThinking {
+    /// Nessun `thinkingConfig` nel body (default provider).
+    Absent,
+    /// Thinking spento esplicitamente per via dei tool (`thinkingBudget=0`).
+    DisabledForTools,
+    /// Thinking attivo con `budget` token riservati al reasoning.
+    Enabled(u32),
+}
 
 /// Budget thinking effettivo per la richiesta (parita' col Python ~470-503).
 ///
-/// Replica le guardie del brain:
+/// GATE THINKING+TOOL (fix definitivo, regola H — incidente "google 0 enabled nel
+/// catalog"): i modelli Gemini 2.5/3.x girano in thinking ON di DEFAULT. Nei run
+/// agentici mcp-core passa `req.thinking=None` ma allega `tools` (+ spesso
+/// `tool_choice` per il force-action). Con `thinking=None` il ramo storico
+/// restituiva "thinkingConfig assente" -> Gemini applicava il suo default ON ->
+/// thinking + function-calling forzato e' incompatibile -> l'API risponde
+/// MALFORMED_FUNCTION_CALL (o turno vuoto) -> il provider va in cooldown -> il
+/// model_health_probe a soglia disabilita TUTTI i gemini. Soluzione: quando la
+/// richiesta porta tool (o un `tool_choice` riconosciuto) FORZIAMO il thinking OFF
+/// emettendo un `thinkingConfig` ESPLICITO con `thinkingBudget=0`
+/// (`DisabledForTools`). NON e' sufficiente lasciare il config assente: il default
+/// sarebbe comunque ON. E' la traduzione, al confine col provider, della stessa
+/// policy applicata a DeepSeek (`resolve_reasoning`, `disable_for_tools`). Regola
+/// G: il gate scatta sulla PRESENZA di tool/tool_choice, non su una stringa
+/// modello. Il riconoscimento del vincolo delega al PUNTO UNICO di mapping
+/// ([`super::tool_choice::ToolChoice::from_openai`], regola L).
+///
+/// QUIRK gemini-2.5-pro: alcune versioni del modello pro NON accettano
+/// `thinkingBudget=0` (rifiutano "thinking budget out of range", il minimo
+/// documentato e' 128). Sui run agentici Nexus usa i modelli `flash`
+/// (`thinkingBudget=0` disabilita correttamente). Se in futuro un modello pro
+/// entra nei run agentici e rifiuta il budget 0, il fix definitivo e' usare il
+/// floor minimo (128) per quel modello; vedi [`build_request_body`] dove il
+/// budget di disabilitazione e' centralizzato in [`THINKING_DISABLE_BUDGET`].
+///
+/// Senza tool: comportamento storico (parita' col brain):
 ///   - thinking attivo solo se `req.thinking.enabled`;
 ///   - budget esplicito nella request ha priorita' su quello configurato;
 ///   - se `max_tokens` < soglia minima (256), thinking disattivato (troppo poco
 ///     spazio anche solo per la risposta);
 ///   - clamp del budget a `max(128, min(budget, max_tokens))`.
 fn resolve_thinking(req: &LlmRequest, configured_budget: u32) -> GoogleThinking {
+    // GATE TOOL: prima di tutto. Stessa rilevazione di deepseek.rs::resolve_reasoning.
+    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let has_tool_choice_constraint = req
+        .tool_choice
+        .as_ref()
+        .and_then(super::tool_choice::ToolChoice::from_openai)
+        .is_some();
+    if has_tools || has_tool_choice_constraint {
+        return GoogleThinking::DisabledForTools;
+    }
+
     let enabled = req.thinking.as_ref().is_some_and(|t| t.enabled);
     if !enabled {
-        return None;
+        return GoogleThinking::Absent;
     }
     // Senza un tetto di output esplicito non sappiamo dimensionare il budget
     // (il Python alza max_output_tokens partendo da max_tokens richiesto): in
     // assenza, evitiamo di attivare il thinking per non rischiare hollow.
-    let max_tokens = req.max_tokens?;
+    let Some(max_tokens) = req.max_tokens else {
+        return GoogleThinking::Absent;
+    };
     if max_tokens < THINKING_MIN_MAX_TOKENS {
-        return None;
+        return GoogleThinking::Absent;
     }
     let base = req
         .thinking
@@ -1013,10 +1080,10 @@ fn resolve_thinking(req: &LlmRequest, configured_budget: u32) -> GoogleThinking 
         .and_then(|t| t.budget_tokens)
         .unwrap_or(configured_budget);
     if base == 0 {
-        return None;
+        return GoogleThinking::Absent;
     }
     let budget = base.min(max_tokens).max(THINKING_BUDGET_FLOOR);
-    Some(budget)
+    GoogleThinking::Enabled(budget)
 }
 
 /// Rimuove ricorsivamente le chiavi JSON-Schema non supportate da Gemini
@@ -1186,16 +1253,30 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
     reconcile_function_call_response_pairs(&mut contents);
 
     // Fix hollow completion: alza il tetto di output del budget thinking cosi'
-    // i max_tokens richiesti restano interi per la risposta utente.
+    // i max_tokens richiesti restano interi per la risposta utente. Solo quando il
+    // thinking e' ATTIVO: con thinking assente/disabilitato il tetto resta intatto.
     let max_output_tokens = match (req.max_tokens, thinking) {
-        (Some(mt), Some(budget)) => Some(mt.saturating_add(budget)),
+        (Some(mt), GoogleThinking::Enabled(budget)) => Some(mt.saturating_add(budget)),
         (mt, _) => mt,
     };
 
-    let thinking_config = thinking.map(|budget| ThinkingConfigWire {
-        include_thoughts: true,
-        thinking_budget: budget,
-    });
+    // Mapping enum -> wire `thinkingConfig` (punto unico, regola L):
+    //   - Absent          -> nessun thinkingConfig (Gemini usa il suo default ON).
+    //   - DisabledForTools -> thinkingConfig ESPLICITO budget 0 / includeThoughts
+    //     false: spegne il thinking ON di default, necessario col function-calling
+    //     (lasciarlo assente NON basterebbe, vedi resolve_thinking).
+    //   - Enabled(budget) -> thinkingConfig con budget e thoughts visibili.
+    let thinking_config = match thinking {
+        GoogleThinking::Absent => None,
+        GoogleThinking::DisabledForTools => Some(ThinkingConfigWire {
+            include_thoughts: false,
+            thinking_budget: THINKING_DISABLE_BUDGET,
+        }),
+        GoogleThinking::Enabled(budget) => Some(ThinkingConfigWire {
+            include_thoughts: true,
+            thinking_budget: budget,
+        }),
+    };
 
     let generation_config =
         if req.temperature.is_some() || max_output_tokens.is_some() || thinking_config.is_some() {
@@ -1214,9 +1295,12 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
     // inerte e il modello emette i control-token nel testo invece di una
     // functionCall. Parita' col brain `google_provider.py` (un solo elemento
     // Tool contenente tutte le declarations) e con openai_compat/anthropic, che
-    // dichiarano i tool nel body. NOTA thinking+tools: la policy
-    // disable_for_tools vive nel brain (punto unico, regola L); il gateway
-    // riceve gia' `req.thinking` risolto e non aggiunge gate qui.
+    // dichiarano i tool nel body. NOTA thinking+tools: il gate disable_for_tools
+    // e' applicato al confine col provider da [`resolve_thinking`], che con tool
+    // presenti restituisce `GoogleThinking::DisabledForTools` -> thinkingConfig
+    // esplicito budget 0 (vedi sopra). Necessario perche' qui i `tools` sono
+    // valorizzati: senza il gate Gemini userebbe il thinking ON di default,
+    // incompatibile col function-calling forzato.
     let tools = req.tools.as_ref().map(|defs| {
         let decls: Vec<GoogleFunctionDeclaration> = defs
             .iter()
@@ -2374,7 +2458,7 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
         assert_eq!(json["systemInstruction"]["parts"][0]["text"], "istruzione");
         // Solo lo user finisce in contents.
@@ -2421,7 +2505,7 @@ mod tests {
     fn tool_choice_required_diventa_mode_any() {
         // "required" -> tool_config.functionCallingConfig.mode = ANY.
         let req = req_tool_choice(serde_json::json!("required"), true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
             json["toolConfig"]["functionCallingConfig"]["mode"],
             "ANY"
@@ -2432,7 +2516,7 @@ mod tests {
             serde_json::json!({"type": "function", "function": {"name": "search"}}),
             true,
         );
-        let json2 = serde_json::to_value(build_request_body(&req2, None)).unwrap();
+        let json2 = serde_json::to_value(build_request_body(&req2, GoogleThinking::Absent)).unwrap();
         assert_eq!(json2["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
         assert_eq!(
             json2["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
@@ -2441,14 +2525,14 @@ mod tests {
 
         // "none" -> mode NONE.
         let req3 = req_tool_choice(serde_json::json!("none"), true);
-        let json3 = serde_json::to_value(build_request_body(&req3, None)).unwrap();
+        let json3 = serde_json::to_value(build_request_body(&req3, GoogleThinking::Absent)).unwrap();
         assert_eq!(json3["toolConfig"]["functionCallingConfig"]["mode"], "NONE");
     }
 
     #[test]
     fn tool_choice_senza_tools_non_aggiunge_tool_config() {
         let req = req_tool_choice(serde_json::json!("required"), false);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert!(json.get("toolConfig").is_none());
     }
 
@@ -2467,7 +2551,7 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
         // Nessun parametro di generazione -> generationConfig assente.
         assert!(json.get("generationConfig").is_none());
@@ -2566,7 +2650,7 @@ mod tests {
         // budget esplicito 2048, max_tokens 8000 -> thinking attivo, output alzato.
         let req = req_thinking(true, Some(2048), Some(8000), vec![msg("user", "ciao")]);
         let thinking = resolve_thinking(&req, 8192);
-        assert_eq!(thinking, Some(2048));
+        assert_eq!(thinking, GoogleThinking::Enabled(2048));
         let json = serde_json::to_value(build_request_body(&req, thinking)).unwrap();
         assert_eq!(json["generationConfig"]["thinkingConfig"]["includeThoughts"], true);
         assert_eq!(json["generationConfig"]["thinkingConfig"]["thinkingBudget"], 2048);
@@ -2578,7 +2662,7 @@ mod tests {
     fn thinking_disattivo_non_aggiunge_config() {
         let req = req_thinking(false, Some(2048), Some(8000), vec![msg("user", "ciao")]);
         let thinking = resolve_thinking(&req, 8192);
-        assert_eq!(thinking, None);
+        assert_eq!(thinking, GoogleThinking::Absent);
         let json = serde_json::to_value(build_request_body(&req, thinking)).unwrap();
         assert!(json["generationConfig"].get("thinkingConfig").is_none());
         // Output non alzato: resta il max_tokens richiesto.
@@ -2589,13 +2673,84 @@ mod tests {
     fn thinking_budget_usa_configurato_e_clampa() {
         // Budget configurato 50000 > max_tokens 4000 -> clamp a max_tokens.
         let req = req_thinking(true, None, Some(4000), vec![msg("user", "x")]);
-        assert_eq!(resolve_thinking(&req, 50_000), Some(4000));
+        assert_eq!(resolve_thinking(&req, 50_000), GoogleThinking::Enabled(4000));
         // max_tokens sotto soglia minima -> thinking disattivato.
         let req2 = req_thinking(true, Some(1024), Some(100), vec![msg("user", "x")]);
-        assert_eq!(resolve_thinking(&req2, 8192), None);
+        assert_eq!(resolve_thinking(&req2, 8192), GoogleThinking::Absent);
         // Nessun max_tokens -> non dimensionabile -> disattivato.
         let req3 = req_thinking(true, Some(1024), None, vec![msg("user", "x")]);
-        assert_eq!(resolve_thinking(&req3, 8192), None);
+        assert_eq!(resolve_thinking(&req3, 8192), GoogleThinking::Absent);
+    }
+
+    #[test]
+    fn gate_tool_forza_thinking_off_esplicito() {
+        // Fix incidente "google 0 enabled": una richiesta con `tools` (run
+        // agentico tipico: mcp-core passa thinking=None ma allega i tool) DEVE
+        // produrre un thinkingConfig ESPLICITO con budget 0 / includeThoughts
+        // false, a prescindere da req.thinking. Lasciarlo assente (ramo storico)
+        // farebbe usare a Gemini il thinking ON di default -> incompatibile col
+        // function-calling -> MALFORMED_FUNCTION_CALL -> cooldown.
+        let req = req_with_tools(vec![msg("user", "leggi x")], true);
+        // Sanity: nessuna preferenza esplicita di thinking nel contratto.
+        assert!(req.thinking.is_none());
+        assert!(req.tool_choice.is_none());
+        let thinking = resolve_thinking(&req, 8192);
+        assert_eq!(thinking, GoogleThinking::DisabledForTools);
+
+        let json = serde_json::to_value(build_request_body(&req, thinking)).unwrap();
+        let tc = &json["generationConfig"]["thinkingConfig"];
+        // thinkingConfig PRESENTE (non assente) e thinking spento.
+        assert!(!tc.is_null(), "thinkingConfig deve essere esplicito con i tool");
+        assert_eq!(tc["thinkingBudget"], 0);
+        assert_eq!(tc["includeThoughts"], false);
+        // max_output_tokens NON alzato dal budget (thinking spento).
+        assert_eq!(json["generationConfig"]["maxOutputTokens"], 1024);
+    }
+
+    #[test]
+    fn gate_tool_vince_su_thinking_richiesto_esplicito() {
+        // Anche se il chiamante chiede ESPLICITAMENTE thinking ON, la presenza dei
+        // tool ha la precedenza: il thinking resta spento (parita' col gate
+        // deepseek). Senza questa precedenza un chiamante "thinking on" sui tool
+        // ritroverebbe il 400/MALFORMED.
+        let mut req = req_with_tools(vec![msg("user", "leggi x")], true);
+        req.thinking = Some(crate::types::ThinkingConfig {
+            enabled: true,
+            budget_tokens: Some(4096),
+        });
+        req.max_tokens = Some(8000);
+        let thinking = resolve_thinking(&req, 8192);
+        assert_eq!(thinking, GoogleThinking::DisabledForTools);
+        let json = serde_json::to_value(build_request_body(&req, thinking)).unwrap();
+        assert_eq!(json["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
+        assert_eq!(json["generationConfig"]["thinkingConfig"]["includeThoughts"], false);
+        // Il tetto NON e' alzato del budget richiesto: thinking spento.
+        assert_eq!(json["generationConfig"]["maxOutputTokens"], 8000);
+    }
+
+    #[test]
+    fn gate_tool_scatta_anche_solo_con_tool_choice() {
+        // Rilevazione simmetrica a deepseek: anche senza `tools` ma con un
+        // `tool_choice` riconosciuto dal punto unico (ToolChoice::from_openai) il
+        // gate scatta. Copre il force-action ("required") senza ridichiarare i tool.
+        let mut req = req_with_tools(vec![msg("user", "x")], false);
+        assert!(req.tools.is_none());
+        req.tool_choice = Some(serde_json::json!("required"));
+        assert_eq!(resolve_thinking(&req, 8192), GoogleThinking::DisabledForTools);
+    }
+
+    #[test]
+    fn senza_tool_il_gate_non_scatta() {
+        // Controprova: senza tool e senza tool_choice il ramo storico resta
+        // intatto (thinking assente -> nessun thinkingConfig, default Gemini).
+        let req = req_with_tools(vec![msg("user", "x")], false);
+        assert!(req.tools.is_none());
+        assert!(req.tool_choice.is_none());
+        assert_eq!(resolve_thinking(&req, 8192), GoogleThinking::Absent);
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
+        // Nessun thinkingConfig: nel ramo storico Gemini usa il suo default.
+        let gc = &json["generationConfig"];
+        assert!(gc.is_null() || gc.get("thinkingConfig").is_none());
     }
 
     #[test]
@@ -2617,7 +2772,7 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
         assert_eq!(
             json["contents"][0]["parts"][0]["thoughtSignature"],
@@ -2644,7 +2799,7 @@ mod tests {
             pin_provider: None,
             metadata: metadata(),
         };
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert!(json["contents"][0]["parts"][0]
             .get("thoughtSignature")
             .is_none());
@@ -2744,7 +2899,7 @@ mod tests {
     #[test]
     fn vision_data_uri_diventa_inline_data() {
         let req = req_with(image_block("data:image/png;base64,QUJD"));
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         let parts = json["contents"][0]["parts"].as_array().unwrap();
         // Prima part: testo; seconda: inlineData con mimeType+data.
         assert_eq!(parts[0]["text"], "descrivi");
@@ -2757,7 +2912,7 @@ mod tests {
     #[test]
     fn vision_url_http_diventa_file_data() {
         let req = req_with(image_block("https://example.com/foto.jpg"));
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         let parts = json["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[1]["fileData"]["fileUri"], "https://example.com/foto.jpg");
         assert_eq!(parts[1]["fileData"]["mimeType"], "image/jpeg");
@@ -2783,7 +2938,7 @@ mod tests {
         msg.role = "assistant".to_string();
         msg.thinking_signature = Some("c2ln".to_string());
         let req = req_with(msg);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         let parts = json["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
         assert_eq!(parts[0]["thoughtSignature"], "c2ln");
@@ -2850,7 +3005,7 @@ mod tests {
         // I tool del contratto finiscono in tools[0].functionDeclarations con
         // nome/descrizione/parametri (parita' coi peer openai_compat/anthropic).
         let req = req_with_tools(vec![msg("user", "leggi x")], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         let decls = &json["tools"][0]["functionDeclarations"];
         assert_eq!(decls[0]["name"], "read_file");
         assert_eq!(decls[0]["description"], "legge un file");
@@ -2863,7 +3018,7 @@ mod tests {
         // Le chiavi JSON-Schema non supportate da Gemini vengono rimosse a TUTTI
         // i livelli di annidamento (properties + items), non solo alla radice.
         let req = req_with_tools(vec![msg("user", "leggi x")], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         let params = &json["tools"][0]["functionDeclarations"][0]["parameters"];
         // Radice ripulita.
         assert!(params.get("$schema").is_none());
@@ -2913,7 +3068,7 @@ mod tests {
         // le declarations mancavano e mode=ANY era inerte).
         let mut req = req_with_tools(vec![msg("user", "trova")], true);
         req.tool_choice = Some(serde_json::json!("required"));
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
         assert_eq!(
             json["tools"][0]["functionDeclarations"][0]["name"],
@@ -2930,7 +3085,7 @@ mod tests {
         // vuoto invece di chiamare il tool -> auto-disable dei gemini.
         let req = req_with_tools(vec![msg("user", "leggi x")], true);
         assert!(req.tool_choice.is_none(), "il setup deve omettere tool_choice");
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
         // Le functionDeclarations restano presenti accanto al toolConfig.
         assert_eq!(
@@ -2942,7 +3097,7 @@ mod tests {
     #[test]
     fn senza_tools_niente_campo_tools() {
         let req = req_with_tools(vec![msg("user", "ciao")], false);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert!(json.get("tools").is_none());
         // Coerenza: senza tools nemmeno il toolConfig (un toolConfig orfano
         // sarebbe rifiutato da Gemini).
@@ -3046,7 +3201,7 @@ mod tests {
             },
         }]);
         let req = req_with_tools(vec![a], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
         let part = &json["contents"][0]["parts"][0];
         assert_eq!(part["functionCall"]["name"], "read_file");
@@ -3071,7 +3226,7 @@ mod tests {
         let mut tool = msg("tool", "contenuto del file");
         tool.tool_call_id = Some("call_x".to_string());
         let req = req_with_tools(vec![a, tool], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         // Secondo content: il tool-result.
         let tr = &json["contents"][1];
         assert_eq!(tr["role"], "user");
@@ -3094,7 +3249,7 @@ mod tests {
         let mut tool = msg("tool", "out");
         tool.tool_call_id = Some("call_orfano".to_string());
         let req = req_with_tools(vec![tool], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         let contents = json["contents"].as_array().unwrap();
         assert!(
             contents.is_empty(),
@@ -3245,7 +3400,7 @@ mod tests {
         let a = assistant_with_calls(&[("read_file", "call_1"), ("edit_file", "call_2")]);
         let t = tool_result("call_1", "contenuto");
         let req = req_with_tools(vec![a, t], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
         // contents[0] = model con 2 functionCall.
         let model_parts = json["contents"][0]["parts"].as_array().unwrap();
@@ -3284,7 +3439,7 @@ mod tests {
         // risolve all'id grezzo "call_orfano", che non matcha "read_file".
         let t_orfano = tool_result("call_orfano", "spurio");
         let req = req_with_tools(vec![a, t_ok, t_orfano], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
         // Un solo turno user, con UNA sola functionResponse (quella valida): la
         // orfana e' stata scartata.
@@ -3303,7 +3458,7 @@ mod tests {
         let t1 = tool_result("call_1", "file");
         let t2 = tool_result("call_2", "elenco");
         let req = req_with_tools(vec![a, t1, t2], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
         let user = &json["contents"][1];
         let names = response_names(user);
@@ -3327,7 +3482,7 @@ mod tests {
         // riconciliazione deve INSERIRE un turno user di soli response sintetici.
         let a = assistant_with_calls(&[("read_file", "call_1"), ("edit_file", "call_2")]);
         let req = req_with_tools(vec![a], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
         assert_eq!(json["contents"].as_array().unwrap().len(), 2);
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3353,7 +3508,7 @@ mod tests {
         let t_beta = tool_result("call_b", "risultato-beta");
         let t_alpha = tool_result("call_a", "risultato-alpha");
         let req = req_with_tools(vec![a, t_beta, t_alpha], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
         let user = &json["contents"][1];
         let names = response_names(user);
@@ -3378,7 +3533,7 @@ mod tests {
         a.content = MessageContent::Text("Eseguo il comando per te".to_string());
         let t = tool_result("call_1", "exit 0");
         let req = req_with_tools(vec![a, t], true);
-        let json = serde_json::to_value(build_request_body(&req, None)).unwrap();
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
         let model = &json["contents"][0];
         assert_eq!(model["role"], "model");
