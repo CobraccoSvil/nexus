@@ -1975,13 +1975,21 @@ async fn rolling_summary_degrado_best_effort_history_invariata() {
     let state = state_cambio_fase();
     let _ = n.run(&state, &ctx).await.expect("run");
 
-    // Nessun collasso: i 6 messaggi originali restano (compress non riduce il
-    // NUMERO di messaggi, solo i contenuti dei tool_result; qui sono testuali).
+    // Degrado best-effort: il summarizer NON collassa il prefisso. L'invariante
+    // robusto (non un numero magico: altre iniezioni come il forced-RAG reminder
+    // possono aggiungere un messaggio) e' che la history NON e' ridotta a
+    // 1 summary + keep_recent (3, come nel caso col summarizer) e che il primo
+    // messaggio NON e' il riassunto.
     let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
-    assert_eq!(
-        req.messages.len(),
-        6,
-        "degrado best-effort: history invariata quando il summarizer fallisce"
+    assert!(
+        req.messages.len() >= 6,
+        "degrado best-effort: history non collassata (len={}, attesi >= 6 originali)",
+        req.messages.len()
+    );
+    let first = req.messages[0].content.as_str().unwrap_or_default();
+    assert!(
+        !first.contains("[RIASSUNTO"),
+        "nel degrado (summarizer fallito) NON deve comparire il messaggio di riassunto"
     );
 }
 
