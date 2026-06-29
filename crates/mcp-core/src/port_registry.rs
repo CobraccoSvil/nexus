@@ -440,24 +440,45 @@ impl PortRegistryCache {
     }
 }
 
+/// Vero se il file unit `~/.config/systemd/user/<unit>` esiste E dichiara ANCORA
+/// `port` tra le sue porte (Environment=PORT / ExecStart `--port`). Identifica le
+/// RISERVE dei servizi configurati ma temporaneamente fermi, da NON rilasciare
+/// come orfane. Punto unico (regola L) del parsing porte: riusa
+/// `extract_ports_from_unit_content`. False se il file non esiste piu' (servizio
+/// rimosso) o non dichiara piu' quella porta (mapping stale dopo riconfig).
+async fn service_unit_reserves_port(unit: &str, port: u16) -> bool {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
+    let path = format!("{home}/.config/systemd/user/{unit}");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => extract_ports_from_unit_content(&content).contains(&port),
+        Err(_) => false,
+    }
+}
+
 /// Rilascia le allocazioni porta auto-gestite ORFANE: oltre la grace period e
 /// SENZA alcun listener TCP. Sono i residui dei tentativi falliti degli agenti
 /// (es. `pnpm dev` su porte diverse) E i mapping stale lasciati da un servizio
-/// quando viene riavviato/ricreato su porte diverse (es. docker-compose
-/// rigenerato): in quest'ultimo caso l'allocazione conserva un `service_unit`
-/// valorizzato ma la porta non e' piu' quella reale del servizio, e il registro
-/// diverge dallo stato osservabile (porte fantasma nel pannello Run&Debug).
+/// riconfigurato su una porta diversa (l'allocazione conserva un `service_unit`
+/// ma la porta non e' piu' quella dichiarata dall'unit -> porta fantasma nel
+/// pannello Run&Debug).
 ///
-/// Criterio (regola H, causa radice della divergenza registro<->realta'):
-/// un'allocazione e' orfana se la sua porta non ha listener TCP da oltre la grace
-/// period, INDIPENDENTEMENTE da `service_unit`. Il probe TCP garantisce di non
-/// toccare mai una porta realmente in uso (servizio vivo). Le sole allocazioni
-/// preservate sono quelle `manual`: riserve intenzionali dell'utente, che restano
-/// anche se il servizio e' temporaneamente fermo. Ritorna il numero rilasciate.
+/// Criterio (regola H, DUE cause radice conciliate):
+///  - Porta con listener TCP -> in uso (servizio vivo), mai toccata.
+///  - Porta SENZA listener il cui `service_unit` punta a un file .service
+///    ESISTENTE che dichiara ANCORA quella porta -> NON orfana: e' la RISERVA di
+///    un servizio configurato ma fermo, preservata come le `manual`. Senza questo
+///    il pannello "Porte allocate" si svuotava di continuo per i servizi gestiti
+///    spenti (es. frontend.service in WSL/detached) e il link al servizio spariva.
+///  - Tutto il resto oltre la grace e senza listener (no `service_unit`, file unit
+///    mancante = servizio rimosso, o porta non piu' dichiarata dall'unit = mapping
+///    stale dopo riconfig) viene rilasciato.
+///
+/// Le `manual` (riserve esplicite dell'utente) restano sempre. Ritorna il numero
+/// rilasciate.
 pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     let grace = grace_secs.max(60);
-    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
-        "SELECT project_id, port FROM nexus_port_allocations \
+    let rows: Vec<(Uuid, i32, Option<String>)> = sqlx::query_as(
+        "SELECT project_id, port, service_unit FROM nexus_port_allocations \
          WHERE allocation_mode <> 'manual' AND created_at < NOW() - make_interval(secs => $1)",
     )
     .bind(grace as f64)
@@ -466,11 +487,18 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     .unwrap_or_default();
 
     let mut released = 0u64;
-    for (project_id, port) in rows {
+    for (project_id, port, service_unit) in rows {
         let p = port as u16;
         // Se qualcuno ascolta sulla porta, e' in uso: non la tocchiamo.
         if crate::project_workspace::port_recovery::tcp_probe(p, 200).await {
             continue;
+        }
+        // Riserva di un servizio configurato ma fermo: il file unit esiste ancora e
+        // dichiara questa porta -> non e' orfana, va preservata (come le `manual`).
+        if let Some(ref unit) = service_unit {
+            if service_unit_reserves_port(unit, p).await {
+                continue;
+            }
         }
         let n = sqlx::query(
             "DELETE FROM nexus_port_allocations \
@@ -803,7 +831,30 @@ fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dev_server_roots_to_kill, dev_server_signature};
+    use super::{dev_server_roots_to_kill, dev_server_signature, extract_ports_from_unit_content};
+
+    #[test]
+    fn extract_ports_riconosce_riserva_servizio_unit() {
+        // File unit tipico di un servizio gestito (beauty-book-frontend.service):
+        // la porta e' dichiarata in Environment=PORT e in ExecStart --port.
+        // `cleanup_orphaned_ports` usa questo parsing (via service_unit_reserves_port)
+        // per NON rilasciare la riserva di un servizio configurato ma fermo.
+        let frontend = "[Service]\n\
+                        Environment=PORT=35154\n\
+                        ExecStart=npx vite --port 35154 --host 0.0.0.0\n";
+        assert_eq!(extract_ports_from_unit_content(frontend), vec![35154]);
+
+        // Backend: porta in Environment=PORT e dentro un URL (NEXTAUTH_URL=...:35176).
+        let backend = "[Service]\n\
+                       Environment=PORT=35176\n\
+                       Environment=NEXTAUTH_URL=http://localhost:35176\n\
+                       ExecStart=/usr/bin/npm run start\n";
+        assert_eq!(extract_ports_from_unit_content(backend), vec![35176]);
+
+        // Nessuna porta dichiarata -> nessuna riserva (l'allocazione e' orfana).
+        let noport = "[Service]\nExecStart=/usr/bin/npm run start\n";
+        assert!(extract_ports_from_unit_content(noport).is_empty());
+    }
 
     // Helper: tuple (pid, start_time, ppid, signature).
     fn p(pid: u32, start: u64, ppid: u32, sig: &str) -> (u32, u64, u32, String) {

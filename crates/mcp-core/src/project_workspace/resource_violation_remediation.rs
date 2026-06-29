@@ -7,9 +7,14 @@
 //! 2026-06-11): la policy `auto_remediate` del catalogo (mig 0397) decide per
 //! regola; le classi a solo blocco (db/fs/container) non passano mai di qui.
 //!
-//! Anti-loop: flag globale + cooldown per firma + cap orario + cap tentativi
-//! per firma su finestra 24h cross-row -> stato terminale `failed_remediation`
-//! con notifica esplicita (il problema resta visibile nel pannello Problemi).
+//! Anti-loop: SOLO violazioni con un sorgente editabile (`file_path` reale)
+//! passano di qui; le violazioni RUNTIME del `port_enforcer` (kill di un processo
+//! che ha aperto una porta fuori bucket: `file_path` NULL o "-") NON hanno un file
+//! da correggere e venivano rilanciate all'infinito (la porta fuori-bucket cambia
+//! a ogni kill -> firma sempre nuova -> il cap-per-firma non converge mai). Oltre
+//! a questo: flag globale + cooldown per firma + cap orario + cap tentativi per
+//! firma su finestra 24h cross-row -> stato terminale `failed_remediation` con
+//! notifica esplicita (il problema resta visibile nel pannello Problemi).
 //! Prompt fuori-chat: template DB `agent.resource_violation.remediation`
 //! (mig 0399, regola D). Punto unico di avvio: `spawn_agent_run` (regola L).
 
@@ -55,6 +60,19 @@ pub(crate) fn remediation_gate(
         return GateDecision::AttemptsExhausted;
     }
     GateDecision::Proceed
+}
+
+/// Vero se la violazione e' riparabile editando un sorgente: deve avere un
+/// `file_path` reale. Le violazioni RUNTIME (il `port_enforcer` killa un processo
+/// che ha aperto una porta fuori dal bucket: `file_path` NULL o "-") NON hanno un
+/// sorgente da correggere; lanciare un run agente di remediation-by-edit e'
+/// inutile e genera un loop costoso (kill -> diagnosi runtime -> il re-lint non
+/// trova nulla da sistemare -> la diagnosi resta -> si ripete; per giunta la porta
+/// fuori-bucket cambia ogni volta, quindi il cap-per-firma non scatta mai). Quelle
+/// restano come diagnosi nel pannello, senza bruciare un run. Funzione pura
+/// (testabile), punto unico del criterio (regola L).
+pub(crate) fn violation_is_remediable_by_edit(file_path: Option<&str>) -> bool {
+    matches!(file_path, Some(p) if !p.is_empty() && p != "-")
 }
 
 /// Rendering del template di riparazione (funzione pura, testabile).
@@ -146,6 +164,7 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
                 AND d.status = 'open' \
                 AND p.enabled AND p.auto_remediate \
                 AND (d.cooldown_until IS NULL OR d.cooldown_until < NOW()) \
+                AND d.file_path IS NOT NULL AND d.file_path <> '-' AND d.file_path <> '' \
               ORDER BY d.ts ASC \
               LIMIT 20",
         )
@@ -158,6 +177,10 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     }
     let violations: Vec<ViolationRow> = rows
         .into_iter()
+        // Difesa in profondita' (oltre al filtro SQL): solo le violazioni con un
+        // sorgente editabile passano alla remediation-by-edit; le runtime senza
+        // file (kill del port_enforcer) restano diagnosi, niente run agente.
+        .filter(|(_, file_path, _, _)| violation_is_remediable_by_edit(file_path.as_deref()))
         .map(|(id, file_path, detail, sig)| ViolationRow {
             id,
             file_path,
@@ -497,6 +520,18 @@ async fn mark_failed_remediation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solo_violazioni_con_sorgente_sono_riparabili_by_edit() {
+        // Violazione con sorgente reale (porta hardcoded in un file): riparabile.
+        assert!(violation_is_remediable_by_edit(Some("vite.config.ts")));
+        assert!(violation_is_remediable_by_edit(Some("playwright.config.ts")));
+        // Violazioni RUNTIME (kill del port_enforcer): nessun file -> NON riparabili
+        // by-edit (causa radice del loop di remediation che bruciava provider).
+        assert!(!violation_is_remediable_by_edit(Some("-")));
+        assert!(!violation_is_remediable_by_edit(Some("")));
+        assert!(!violation_is_remediable_by_edit(None));
+    }
 
     #[test]
     fn gate_tutte_le_ramificazioni() {
