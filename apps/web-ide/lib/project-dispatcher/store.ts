@@ -595,12 +595,11 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
           [hint.highlight_panel]: Date.now() + hint.flash_duration_ms,
         };
       }
-      if (hint.badge_increment) {
-        const [panel, inc] = hint.badge_increment;
-        if (panel === "problems") {
-          next.problems = { ...next.problems, badge: next.problems.badge + inc };
-        }
-      }
+      // badge_increment per "problems" RIMOSSO (regola H): sommava +inc per ogni
+      // evento problema senza riconciliarsi col DB -> contatore gonfiato (es. 1128
+      // vs ~30 reali) durante sessioni con molti run. Il conteggio problemi e' ora
+      // derivato dalla lista reale (get_project_problems) lato UI; il badge da
+      // FindingsUpdated (p.total) resta per il pannello Ottimizzazione (quality).
     }
 
     // Notifica tutti i listener `subscribeAll` (hook universali useProjectEvents).

@@ -50,6 +50,11 @@ struct ObserverConfig {
     diagnose_max_per_hour: i64,
     /// Secondi di attesa dopo l'avvio prima del readiness check TCP (mig 0384).
     readiness_grace_seconds: i64,
+    /// Anomalie il cui `updated_at` e' piu' vecchio di questo (l'observer non le
+    /// ha piu' confermate via UPSERT per molti cicli: servizio sparito dal bus
+    /// --user, rinominato o non piu' anomalo) vengono chiuse come stantie.
+    /// Indipendente da systemctl (vedi limite WSL: bus --user cieco). 0 = off.
+    anomaly_stale_resolve_seconds: i64,
 }
 
 /// Stato runtime per unit, tra i cicli.
@@ -124,6 +129,11 @@ async fn load_config(db: &PgPool) -> ObserverConfig {
         diagnose_max_per_hour: i(s(db, "agent.observer.diagnose_max_per_hour").await, 5),
         readiness_grace_seconds: i(s(db, "agent.observer.readiness_grace_seconds").await, 12)
             .max(0),
+        anomaly_stale_resolve_seconds: i(
+            s(db, "agent.observer.anomaly_stale_resolve_seconds").await,
+            300,
+        )
+        .max(0),
     }
 }
 
@@ -560,6 +570,20 @@ fn evaluate_anomalies(
 
 // ── Persistenza diagnosi (service_diagnoses) ──────────────────────────────────
 
+/// Punto unico di apertura/aggiornamento di una diagnosi (regola L).
+///
+/// Per `signal_kind='anomaly'` esegue un UPSERT sull'indice univoco parziale
+/// `uniq_service_diagnoses_active_anomaly` (mig 0491): se esiste gia' una
+/// anomalia ATTIVA ('open'/'diagnosing') per la chiave
+/// (project_id, unit, COALESCE(metric,'')) la riga viene AGGIORNATA
+/// (value/threshold/detail freschi, `updated_at=NOW()`, `occurrences += 1`)
+/// invece di inserirne una nuova. Questo elimina la duplicazione causata dalla
+/// guardia in-memory `active_anomalies`, che si azzera a ogni restart di mcp-core
+/// lasciando l'anomalia 'open' nel DB e facendola ri-aprire come "nuova".
+///
+/// Per `crash`/`build_error` resta un INSERT puro: ogni evento e' distinto (firma
+/// errore propria) e il suo ciclo di vita lo governa il Debugger, quindi non
+/// rientra nel vincolo univoco parziale (limitato a signal_kind='anomaly').
 async fn persist_diagnosis(
     db: &PgPool,
     project_id: Uuid,
@@ -571,6 +595,38 @@ async fn persist_diagnosis(
     error_signature_hash: Option<&str>,
     detail: Option<&str>,
 ) -> Option<Uuid> {
+    if signal_kind == "anomaly" {
+        // UPSERT: una sola anomalia attiva per (project_id, unit, metric).
+        // Il target ON CONFLICT replica esattamente colonne+predicato
+        // dell'indice parziale uniq_service_diagnoses_active_anomaly.
+        return sqlx::query_scalar::<_, Uuid>(
+            r#"INSERT INTO service_diagnoses
+               (project_id, unit, signal_kind, metric, value, threshold,
+                error_signature_hash, status, detail)
+               VALUES ($1,$2,'anomaly',$3,$4,$5,$6,'open',$7)
+               ON CONFLICT (project_id, unit, COALESCE(metric, ''))
+                 WHERE signal_kind = 'anomaly' AND status IN ('open', 'diagnosing')
+               DO UPDATE SET
+                 value       = EXCLUDED.value,
+                 threshold   = EXCLUDED.threshold,
+                 detail      = EXCLUDED.detail,
+                 updated_at  = NOW(),
+                 occurrences = service_diagnoses.occurrences + 1
+               RETURNING id"#,
+        )
+        .bind(project_id)
+        .bind(unit)
+        .bind(metric)
+        .bind(value)
+        .bind(threshold)
+        .bind(error_signature_hash)
+        .bind(detail)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    }
+
     sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO service_diagnoses
            (project_id, unit, signal_kind, metric, value, threshold,
@@ -651,6 +707,30 @@ async fn resolve_anomalies_for_absent_units(
     )
     .bind(project_id)
     .bind(observed_units)
+    .execute(db)
+    .await;
+}
+
+/// Chiude le anomalie il cui `updated_at` e' piu' vecchio di `max_age_seconds`:
+/// l'observer non le ha piu' confermate (UPSERT a ogni tick) per molti cicli,
+/// quindi il servizio non e' piu' osservato (sparito dal bus --user, rinominato,
+/// fermo) o non e' piu' anomalo. Diversamente da `resolve_anomalies_for_absent_units`
+/// NON dipende da `list_user_services` (bus --user cieco in WSL): usa solo il
+/// tempo. Gira solo mentre l'observer e' attivo, quindi le anomalie REALI hanno
+/// `updated_at` fresco (UPSERT ogni `interval_s`) e non vengono mai toccate.
+/// 0 = disabilitato.
+async fn resolve_stale_anomalies_by_age(db: &PgPool, max_age_seconds: i64) {
+    if max_age_seconds <= 0 {
+        return;
+    }
+    let _ = sqlx::query(
+        r#"UPDATE service_diagnoses
+           SET status = 'resolved', resolved_at = NOW()
+           WHERE signal_kind = 'anomaly'
+             AND status IN ('open', 'diagnosing')
+             AND updated_at < NOW() - ($1::bigint * interval '1 second')"#,
+    )
+    .bind(max_age_seconds)
     .execute(db)
     .await;
 }
@@ -772,6 +852,13 @@ async fn run_cycle(
                 evaluate_anomalies(&active, cpu_pct, rss, restart_delta, error_per_min, cfg);
             let current: HashSet<String> = signals.iter().map(|s| s.metric.clone()).collect();
             for sig in &signals {
+                // L'evento SSE scatta SOLO sulla transizione healthy->anomaly
+                // (la guardia in-memory evita lo spam di notifiche entro lo stesso
+                // processo). La PERSISTENZA invece avviene a ogni tick: persist_diagnosis
+                // fa UPSERT (mig 0491), quindi aggiorna la riga canonica
+                // (value/updated_at/occurrences) senza creare duplicati. In questo
+                // modo dopo un restart di mcp-core, dove `active_anomalies` si svuota,
+                // l'anomalia ancora attiva viene riusata anziche' re-inserita.
                 if !st.active_anomalies.contains(&sig.metric) {
                     nexus_events::dispatcher::emit_global(
                         project_id,
@@ -783,19 +870,19 @@ async fn run_cycle(
                             severity: sig.severity.clone(),
                         },
                     );
-                    persist_diagnosis(
-                        &state.db,
-                        project_id,
-                        &unit,
-                        "anomaly",
-                        Some(&sig.metric),
-                        Some(sig.value),
-                        Some(sig.threshold),
-                        None,
-                        Some(&format!("active={active}")),
-                    )
-                    .await;
                 }
+                persist_diagnosis(
+                    &state.db,
+                    project_id,
+                    &unit,
+                    "anomaly",
+                    Some(&sig.metric),
+                    Some(sig.value),
+                    Some(sig.threshold),
+                    None,
+                    Some(&format!("active={active}")),
+                )
+                .await;
             }
             st.active_anomalies = current;
 
@@ -976,6 +1063,12 @@ async fn run_cycle(
             resolve_anomalies_for_absent_units(&state.db, project_id, &observed_units).await;
         }
     }
+
+    // Sweep globale per staleness: chiude le anomalie fantasma il cui updated_at
+    // e' troppo vecchio (servizio non piu' osservato per molti cicli: bus --user
+    // cieco in WSL, unit rimosso, o non piu' anomalo). Non dipende da systemctl,
+    // a differenza del sweep per-progetto qui sopra: usa solo il tempo.
+    resolve_stale_anomalies_by_age(&state.db, cfg.anomaly_stale_resolve_seconds).await;
 }
 
 #[cfg(test)]
@@ -995,6 +1088,7 @@ mod tests {
             diagnose_cooldown_seconds: 600,
             diagnose_max_per_hour: 5,
             readiness_grace_seconds: 12,
+            anomaly_stale_resolve_seconds: 300,
         }
     }
 
@@ -1048,5 +1142,133 @@ mod tests {
             "rosso normale"
         );
         assert_eq!(strip_ansi("nessun codice"), "nessun codice");
+    }
+
+    // Schema minimale di service_diagnoses + indice univoco parziale (mig 0491)
+    // per testare la deduplica dell'UPSERT senza dipendere dalla suite migrazioni.
+    async fn create_service_diagnoses(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE service_diagnoses ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 project_id UUID NOT NULL, \
+                 unit TEXT NOT NULL, \
+                 ts TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+                 signal_kind TEXT NOT NULL, \
+                 metric TEXT, \
+                 value DOUBLE PRECISION, \
+                 threshold DOUBLE PRECISION, \
+                 error_signature_hash TEXT, \
+                 status TEXT NOT NULL DEFAULT 'open', \
+                 detail TEXT, \
+                 occurrences INTEGER NOT NULL DEFAULT 1, \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+                 resolved_at TIMESTAMPTZ \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create service_diagnoses");
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX uniq_service_diagnoses_active_anomaly \
+                 ON service_diagnoses (project_id, unit, COALESCE(metric, '')) \
+                 WHERE signal_kind = 'anomaly' AND status IN ('open', 'diagnosing')",
+        )
+        .execute(pool)
+        .await
+        .expect("create unique partial index");
+    }
+
+    async fn count_open_anomalies(pool: &PgPool, project_id: Uuid, unit: &str, metric: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM service_diagnoses \
+             WHERE project_id=$1 AND unit=$2 AND metric=$3 \
+               AND signal_kind='anomaly' AND status='open'",
+        )
+        .bind(project_id)
+        .bind(unit)
+        .bind(metric)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+    }
+
+    #[sqlx::test]
+    async fn anomaly_upsert_non_duplica_e_incrementa_occurrences(pool: PgPool) {
+        create_service_diagnoses(&pool).await;
+        let project_id = Uuid::new_v4();
+        let unit = "beauty-book-frontend.service";
+
+        // Primo tick: apre l'anomalia.
+        let id1 = persist_diagnosis(
+            &pool, project_id, unit, "anomaly", Some("error_rate"),
+            Some(60.0), Some(10.0), None, Some("active=active"),
+        )
+        .await
+        .expect("prima diagnosi inserita");
+
+        // Tick successivi (simulano anche un restart che svuota active_anomalies):
+        // devono AGGIORNARE la stessa riga, non inserirne di nuove.
+        let id2 = persist_diagnosis(
+            &pool, project_id, unit, "anomaly", Some("error_rate"),
+            Some(177.0), Some(10.0), None, Some("active=active"),
+        )
+        .await
+        .expect("seconda diagnosi (upsert)");
+        let id3 = persist_diagnosis(
+            &pool, project_id, unit, "anomaly", Some("error_rate"),
+            Some(833.0), Some(10.0), None, Some("active=active"),
+        )
+        .await
+        .expect("terza diagnosi (upsert)");
+
+        assert_eq!(id1, id2, "stesso id: riga riusata, non duplicata");
+        assert_eq!(id1, id3, "stesso id sul terzo tick");
+
+        let open = count_open_anomalies(&pool, project_id, unit, "error_rate").await;
+        assert_eq!(open, 1, "una sola anomalia open per (unit, metric)");
+
+        let (value, occ): (f64, i32) = sqlx::query_as(
+            "SELECT value, occurrences FROM service_diagnoses WHERE id=$1",
+        )
+        .bind(id1)
+        .fetch_one(&pool)
+        .await
+        .expect("riga canonica");
+        assert_eq!(value, 833.0, "value aggiornato all'ultimo tick");
+        assert_eq!(occ, 3, "occurrences incrementato a ogni tick");
+
+        // Metrica diversa sulla stessa unit -> riga distinta (chiave diversa).
+        persist_diagnosis(
+            &pool, project_id, unit, "anomaly", Some("cpu"),
+            Some(95.0), Some(90.0), None, Some("active=active"),
+        )
+        .await
+        .expect("anomalia cpu distinta");
+        assert_eq!(
+            count_open_anomalies(&pool, project_id, unit, "cpu").await,
+            1,
+            "metrica diversa = anomalia separata"
+        );
+
+        // Dopo resolve, un nuovo tick puo' riaprire (l'indice copre solo gli attivi).
+        sqlx::query("UPDATE service_diagnoses SET status='resolved', resolved_at=NOW() WHERE id=$1")
+            .bind(id1)
+            .execute(&pool)
+            .await
+            .expect("resolve manuale");
+        let id_riaperta = persist_diagnosis(
+            &pool, project_id, unit, "anomaly", Some("error_rate"),
+            Some(500.0), Some(10.0), None, Some("active=active"),
+        )
+        .await
+        .expect("riapertura post-resolve");
+        assert_ne!(id_riaperta, id1, "nuova riga dopo resolve (storico preservato)");
+        assert_eq!(
+            count_open_anomalies(&pool, project_id, unit, "error_rate").await,
+            1,
+            "sempre una sola anomalia open dopo riapertura"
+        );
     }
 }

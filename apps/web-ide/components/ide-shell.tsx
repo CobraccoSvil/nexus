@@ -63,7 +63,6 @@ import {
   selectPorts,
   selectFilesRecent,
   selectGitStatus,
-  selectProblemsBadge,
   selectRunConfigsChangedAt,
 } from "../lib/project-dispatcher";
 import { isBinaryDocPath } from "../lib/file-kind";
@@ -448,10 +447,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     }
   }, [playwrightConfigChangedAt, activeProject]);
 
-  // Auto-refresh problemItems quando arriva FindingsUpdated dal dispatcher.
-  // Il badge usa il valore "live" dal dispatcher (selectProblemsBadge), ma per
-  // la lista completa serve refetch via API perche' l'evento non contiene items.
-  const problemsBadgeFromDispatcher = useProjectStore(selectProblemsBadge);
+  // Auto-refresh problemItems quando arriva FindingsUpdated dal dispatcher:
+  // l'evento non contiene gli items, quindi il refetch via API e' la fonte di
+  // verita' del conteggio (problemItems.length). Niente badge accumulato.
   // P2-fe: reagisce a OGNI evento FindingsUpdated (findingsUpdate.ts cambia
   // sempre), non al solo badge numerico - che restava uguale nel caso "1
   // risolto + 1 nuovo" (lista mai aggiornata) e con badge 0 saltava (lista
@@ -545,12 +543,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     editorGroups.find((group) => group.id === activeEditorGroupId) ?? editorGroups[0];
   const activeEditorTab =
     activeGroup?.tabs.find((tab) => tab.path === activeGroup.activePath) ?? null;
-  // Preferiamo il badge dal dispatcher (zero-latency, aggiornato live da
-  // FindingsUpdated) rispetto a problemItems.length che si aggiorna solo
-  // dopo che il refresh API completa.
-  const problemCount = problemsBadgeFromDispatcher > 0
-    ? problemsBadgeFromDispatcher
-    : problemItems.length;
+  // Conteggio problemi = LISTA reale dal DB (problemItems da get_project_problems),
+  // aggiornata via auto-refresh su FindingsUpdated. NON usiamo piu' il badge
+  // accumulato dal dispatcher: badge_increment sommava +inc per ogni evento problema
+  // senza riconciliarsi col DB, gonfiando il contatore (es. 1128 vs ~30 reali)
+  // durante sessioni con molti run. La fonte di verita' e' il DB.
+  const problemCount = problemItems.length;
 
   const cycleLayoutMode = useCallback(() => {
     setLayoutMode((current) => {

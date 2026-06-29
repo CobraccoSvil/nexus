@@ -87,11 +87,27 @@ pub async fn get_project_problems(
     // marcandoli erroneamente come severity='error' (30 falsi positivi visti
     // nel pannello su demo-wsl). Solo i job con status='failed' o stato
     // anomalo non standard devono apparire come problemi.
+    //
+    // SUPERSEDED (regola H): un job fallito di uno STESSO kind seguito da un esito
+    // di SUCCESSO piu' recente (stesso project+kind) non e' piu' un problema attivo
+    // — la suite e' tornata verde. Senza questo filtro i run storici falliti
+    // restavano nel pannello a vita gonfiandolo (es. 18 playwright_test failed
+    // delle 04:12 ancora elencati dopo il passed delle 04:40). Il NOT EXISTS li
+    // esclude appena un run success dello stesso kind li supera: il pannello
+    // riflette lo stato REALE, non lo storico.
     let failed_jobs = sqlx::query(
         r#"
         SELECT id, kind, status, input, created_at
-        FROM jobs
-        WHERE project_id = $1 AND status NOT IN ('queued', 'running', 'completed', 'success', 'passed', 'ok', 'done')
+        FROM jobs j
+        WHERE j.project_id = $1
+          AND j.status NOT IN ('queued', 'running', 'completed', 'success', 'passed', 'ok', 'done')
+          AND NOT EXISTS (
+            SELECT 1 FROM jobs j2
+            WHERE j2.project_id = j.project_id
+              AND j2.kind = j.kind
+              AND j2.status IN ('completed', 'success', 'passed', 'ok', 'done')
+              AND j2.created_at > j.created_at
+          )
         ORDER BY created_at DESC
         LIMIT 50
         "#,
