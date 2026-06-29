@@ -1,6 +1,8 @@
 //! Test unitari del modulo orchestrator.
 
 use super::*;
+// Schema `ai_price_catalog` dal punto unico condiviso (regola L).
+use crate::test_support::create_ai_price_catalog_table;
 
 #[test]
 fn test_route_model_with_mode_file_ops_approfondita() {
@@ -172,23 +174,14 @@ fn intent_candidate_e_serializzabile_a_json() {
 // Test ADR 0023: provider_for_model (model_override da solo -> provider)
 // ─────────────────────────────────────────────────────────────────
 //
-// Usano un pool sqlx isolato (DB temporaneo per test). Creano una tabella
-// minima ai_price_catalog con solo le colonne usate dalla query. Idempotenti
+// Usano un pool sqlx isolato (DB temporaneo per test). La tabella
+// ai_price_catalog e' creata dal punto unico condiviso (regola L); la query
+// `provider_for_model` ne usa solo provider/model/is_enabled/costo. Idempotenti
 // e indipendenti dall'ordine: ogni test ha il proprio DB.
 
 #[sqlx::test]
 async fn provider_for_model_modello_noto_ritorna_provider(pool: sqlx::PgPool) {
-    sqlx::query(
-        "CREATE TABLE ai_price_catalog (
-            provider TEXT NOT NULL,
-            model TEXT NOT NULL,
-            is_enabled BOOLEAN NOT NULL DEFAULT true,
-            input_cost_per_million_tokens DOUBLE PRECISION
-        )",
-    )
-    .execute(&pool)
-    .await
-    .expect("create table");
+    create_ai_price_catalog_table(&pool).await;
 
     // Stesso modello su due provider: deve vincere il piu' economico (mistral).
     sqlx::query(
@@ -210,17 +203,7 @@ async fn provider_for_model_modello_noto_ritorna_provider(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn provider_for_model_modello_disabilitato_o_ignoto_ritorna_none(pool: sqlx::PgPool) {
-    sqlx::query(
-        "CREATE TABLE ai_price_catalog (
-            provider TEXT NOT NULL,
-            model TEXT NOT NULL,
-            is_enabled BOOLEAN NOT NULL DEFAULT true,
-            input_cost_per_million_tokens DOUBLE PRECISION
-        )",
-    )
-    .execute(&pool)
-    .await
-    .expect("create table");
+    create_ai_price_catalog_table(&pool).await;
 
     // Un modello presente ma disabilitato non deve essere risolto.
     sqlx::query(

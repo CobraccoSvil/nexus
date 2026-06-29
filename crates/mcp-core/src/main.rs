@@ -96,6 +96,8 @@ mod static_preview;
 mod sudo_manager;
 mod sudo_routes;
 mod task_watchdog;
+#[cfg(test)]
+mod test_support;
 mod tool_capability;
 mod tool_runner_server;
 mod trace_store;

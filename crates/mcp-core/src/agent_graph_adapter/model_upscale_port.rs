@@ -137,28 +137,11 @@ mod tests {
     use super::*;
 
     async fn create_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE ai_price_catalog ( \
-                 provider TEXT NOT NULL, \
-                 model TEXT NOT NULL, \
-                 is_enabled BOOLEAN NOT NULL DEFAULT true, \
-                 supports_tool_use BOOLEAN NOT NULL DEFAULT true, \
-                 supports_vision BOOLEAN NOT NULL DEFAULT false, \
-                 supports_image_gen BOOLEAN NOT NULL DEFAULT false, \
-                 supports_audio_in BOOLEAN NOT NULL DEFAULT false, \
-                 supports_audio_out BOOLEAN NOT NULL DEFAULT false, \
-                 supports_video_gen BOOLEAN NOT NULL DEFAULT false, \
-                 agentic_thinking_policy TEXT NOT NULL DEFAULT 'none', \
-                 performance_tier TEXT NOT NULL DEFAULT 'medium', \
-                 capabilities JSONB NOT NULL DEFAULT '[]', \
-                 context_window INTEGER NOT NULL DEFAULT 8192, \
-                 input_cost_per_million_tokens DOUBLE PRECISION NOT NULL DEFAULT 0, \
-                 is_featured BOOLEAN NOT NULL DEFAULT false \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create ai_price_catalog");
+        // Schema `ai_price_catalog` dal punto unico condiviso (regola L): una sola
+        // definizione per tutti i #[sqlx::test] del crate, allineata alle colonne
+        // lette da `select_models_tierchain`. Qui in piu' serve `settings` per i
+        // lookup `agent.upscale.*`.
+        crate::test_support::create_ai_price_catalog_table(pool).await;
         sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .execute(pool)
             .await

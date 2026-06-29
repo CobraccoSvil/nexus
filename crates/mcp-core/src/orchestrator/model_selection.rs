@@ -393,6 +393,8 @@ pub(crate) async fn shadow_compare_per_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Schema `ai_price_catalog` dal punto unico condiviso (regola L).
+    use crate::test_support::create_ai_price_catalog_table;
 
     async fn create_requirements_table(pool: &sqlx::PgPool) {
         sqlx::query(
@@ -450,34 +452,9 @@ mod tests {
         );
     }
 
-    async fn create_catalog_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE ai_price_catalog ( \
-                 provider TEXT NOT NULL, \
-                 model TEXT NOT NULL, \
-                 is_enabled BOOLEAN NOT NULL DEFAULT true, \
-                 supports_tool_use BOOLEAN NOT NULL DEFAULT true, \
-                 supports_vision BOOLEAN NOT NULL DEFAULT false, \
-                 supports_image_gen BOOLEAN NOT NULL DEFAULT false, \
-                 supports_audio_in BOOLEAN NOT NULL DEFAULT false, \
-                 supports_audio_out BOOLEAN NOT NULL DEFAULT false, \
-                 supports_video_gen BOOLEAN NOT NULL DEFAULT false, \
-                 agentic_thinking_policy TEXT NOT NULL DEFAULT 'none', \
-                 performance_tier TEXT NOT NULL DEFAULT 'medium', \
-                 capabilities JSONB NOT NULL DEFAULT '[]', \
-                 context_window INTEGER NOT NULL DEFAULT 8192, \
-                 input_cost_per_million_tokens DOUBLE PRECISION NOT NULL DEFAULT 0, \
-                 is_featured BOOLEAN NOT NULL DEFAULT false \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create ai_price_catalog");
-    }
-
     #[sqlx::test]
     async fn tierchain_agentico_sceglie_tool_capable_piu_economico(pool: sqlx::PgPool) {
-        create_catalog_table(&pool).await;
+        create_ai_price_catalog_table(&pool).await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
@@ -511,7 +488,7 @@ mod tests {
 
     #[sqlx::test]
     async fn tierchain_preferisce_policy_none_su_dual_mode(pool: sqlx::PgPool) {
-        create_catalog_table(&pool).await;
+        create_ai_price_catalog_table(&pool).await;
         // Stesso costo: il TIE-BREAKER (policy='none' DESC, ultimo criterio dopo
         // order_by) fa vincere il nativamente non-thinking A PARITA' di order_by.
         sqlx::query(
@@ -545,7 +522,7 @@ mod tests {
 
     #[sqlx::test]
     async fn tierchain_capacita_costo_vince_sul_tiebreaker_thinking(pool: sqlx::PgPool) {
-        create_catalog_table(&pool).await;
+        create_ai_price_catalog_table(&pool).await;
         // REGRESSIONE (fix routing agentico, regola H): con i modelli forti moderni
         // tutti dual-mode ('disable_for_tools') e i 'none' rimasti deboli/legacy, il
         // criterio PRIMARIO deve essere order_by (qui: costo), NON la policy thinking.
@@ -583,7 +560,7 @@ mod tests {
 
     #[sqlx::test]
     async fn tierchain_esclude_policy_exclude_quando_richiesto(pool: sqlx::PgPool) {
-        create_catalog_table(&pool).await;
+        create_ai_price_catalog_table(&pool).await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier) VALUES \
@@ -617,7 +594,7 @@ mod tests {
 
     #[sqlx::test]
     async fn tierchain_degrada_al_tier_successivo(pool: sqlx::PgPool) {
-        create_catalog_table(&pool).await;
+        create_ai_price_catalog_table(&pool).await;
         // Nessun heavy: la chain deve scendere a medium.
         sqlx::query(
             "INSERT INTO ai_price_catalog \
@@ -649,7 +626,7 @@ mod tests {
 
     #[sqlx::test]
     async fn tierchain_vision_via_supports_vision(pool: sqlx::PgPool) {
-        create_catalog_table(&pool).await;
+        create_ai_price_catalog_table(&pool).await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, supports_vision, performance_tier) VALUES \
@@ -682,7 +659,7 @@ mod tests {
 
     #[sqlx::test]
     async fn tierchain_capability_none_esclude_media(pool: sqlx::PgPool) {
-        create_catalog_table(&pool).await;
+        create_ai_price_catalog_table(&pool).await;
         // Un image-gen tool-capable (assurdo, ma testa che l'esclusione media
         // scatti a prescindere) NON deve entrare nel routing chat (capability=None).
         sqlx::query(
@@ -717,7 +694,7 @@ mod tests {
 
     #[sqlx::test]
     async fn tierchain_image_gen_via_supports_image_gen(pool: sqlx::PgPool) {
-        create_catalog_table(&pool).await;
+        create_ai_price_catalog_table(&pool).await;
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, supports_image_gen, performance_tier) VALUES \
