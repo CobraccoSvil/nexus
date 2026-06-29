@@ -595,6 +595,21 @@ pub fn detect_repeated_action_detailed(
     // soglia 2 e ABORTIVA un task GIA' risolto, con recap falso "File toccati: nessuno"
     // (incidente vite.config.ts: edit applicato, poi rilettura -> falso loop -> abort).
     let mut modified_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // RILETTURA-DOPO-PROGRESSO (regola H, generalizza l'esclusione rilettura-dopo-edit):
+    // una ripetizione di tool READ-ONLY NON e' uno stallo se tra l'occorrenza PRECEDENTE
+    // della STESSA signature e quella corrente c'e' stata almeno UN'AZIONE PRODUTTIVA (un
+    // tool NON read-only: write/edit/run_command/run_service/nexus_db_query/...). E' il
+    // pattern del DEBUGGING attivo: rileggi un file per VERIFICARE dopo aver agito, non a
+    // vuoto. Senza questa esclusione, due riletture sparse intervallate da ~12 azioni
+    // produttive scattavano repeated_action a soglia 2 e ABORTIVANO un agente che stava
+    // CONVERGENDO (incidente deepseek-v4-pro: HTTP 500 backend, utente gia' creato, due
+    // read_file di index.js a step 18 e 24 -> falso loop -> abort). Solo le read-only
+    // ripetute SENZA alcuna azione produttiva in mezzo (rilettura davvero a vuoto) restano
+    // stallo. `last_productive_idx` = indice del messaggio dell'ULTIMA azione produttiva
+    // vista finora; `read_first_idx` = per ogni signature read-only, l'indice della sua
+    // PRIMA occorrenza non ancora "scontata" dal progresso.
+    let mut last_productive_idx: Option<usize> = None;
+    let mut read_first_idx: Vec<(String, usize)> = Vec::new();
     let mut last_sig: Option<String> = None;
     for (idx, m) in recent.iter().enumerate() {
         for (name, input) in message_tool_uses(m) {
@@ -634,6 +649,28 @@ pub fn detect_repeated_action_detailed(
             // solo per la label leggibile e per le esclusioni sul bersaglio
             // (rilettura-dopo-edit, falso-doppione).
             let sig = build_signature(name, input);
+            // ESCLUSIONE rilettura-dopo-progresso (solo tool READ-ONLY). Per i tool
+            // PRODUTTIVI il comportamento resta invariato: aggiornano l'indice di
+            // progresso e contano sempre. Per i read-only: se la signature e' gia'
+            // comparsa e DOPO la sua prima occorrenza c'e' stata un'azione produttiva
+            // (last_productive_idx > prima_occorrenza), questa rilettura e' VERIFICA,
+            // non stallo -> non incrementa il conteggio; aggiorna la "prima occorrenza"
+            // a quella corrente cosi' una eventuale terza rilettura va misurata di
+            // nuovo rispetto al progresso piu' recente.
+            if is_read_only_repeatable_tool(name) {
+                if let Some((_, first_idx)) = read_first_idx.iter_mut().find(|(s, _)| *s == sig) {
+                    if last_productive_idx.is_some_and(|p| p > *first_idx) {
+                        *first_idx = idx;
+                        continue;
+                    }
+                } else {
+                    read_first_idx.push((sig.clone(), idx));
+                }
+            } else {
+                // Azione produttiva ESEGUITA: segna il progresso che "scusa" le
+                // successive riletture read-only delle signature gia' viste.
+                last_productive_idx = Some(idx);
+            }
             bump(&mut counts, &sig);
             let label_value: String = target.chars().take(120).collect();
             set_label(&mut labels, &sig, format!("{name}: {label_value}"));
@@ -1605,6 +1642,88 @@ mod tests {
             Some(2),
             "due read senza edit in mezzo restano stallo"
         );
+    }
+
+    #[test]
+    fn repeated_action_read_consecutive_senza_progresso_resta_stallo() {
+        // CASO 1 (anti-regressione): due read_file IDENTICHE CONSECUTIVE, senza alcuna
+        // azione in mezzo, restano stallo reale (count 2). L'esclusione rilettura-dopo-
+        // progresso NON deve indebolire l'anti-loop quando l'agente rilegge a vuoto.
+        let msgs = vec![
+            ai_tool_input("read_file", json!({"path": "backend/index.js"})),
+            human_tool_result(Some(0), false, "app.listen(...)"),
+            ai_tool_input("read_file", json!({"path": "backend/index.js"})),
+            human_tool_result(Some(0), false, "app.listen(...)"),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24)
+            .expect("due read consecutive senza progresso restano stallo");
+        assert_eq!(hit.count, 2);
+        assert_eq!(hit.tool_name, "read_file");
+    }
+
+    #[test]
+    fn repeated_action_read_dopo_azione_produttiva_non_stallo() {
+        // CASO 2 (fix): read_file A -> run_command (produttiva) -> read_file A identica.
+        // La produttiva in mezzo "scusa" la rilettura (verifica/debugging), quindi la
+        // signature read-only resta a count 1 -> sotto la soglia 2, nessuno stallo.
+        let msgs = vec![
+            ai_tool_input("read_file", json!({"path": "backend/index.js"})),
+            human_tool_result(Some(0), false, "app.listen(...)"),
+            ai_tool_input("run_command", json!({"command": "curl -s localhost:3000/health"})),
+            human_tool_result(Some(0), false, "500"),
+            ai_tool_input("read_file", json!({"path": "backend/index.js"})),
+            human_tool_result(Some(0), false, "app.listen(...)"),
+        ];
+        let count = detect_repeated_action_detailed(&msgs, 24)
+            .map(|h| h.count)
+            .unwrap_or(0);
+        assert!(
+            count < 2,
+            "read-dopo-azione-produttiva e' verifica, non stallo; count={count}"
+        );
+    }
+
+    #[test]
+    fn repeated_action_caso_reale_debugging_500_non_stallo() {
+        // CASO 3 (incidente deepseek-v4-pro ridotto): durante il debug di un HTTP 500
+        // l'agente legge il backend, esegue azioni produttive di diagnosi (curl, psql),
+        // poi RILEGGE lo stesso file per verificare. Due read_file identiche intervallate
+        // da azioni produttive NON sono uno stallo: l'agente sta CONVERGENDO.
+        let msgs = vec![
+            ai_tool_input("read_file", json!({"path": "backend/index.js"})),
+            human_tool_result(Some(0), false, "..."),
+            ai_tool_input("run_command", json!({"command": "curl -s localhost:3000/users"})),
+            human_tool_result(Some(0), false, "500 Internal Server Error"),
+            ai_tool_input("run_command", json!({"command": "psql -c 'select 1'"})),
+            human_tool_result(Some(0), false, "1 row"),
+            ai_tool_input("read_file", json!({"path": "backend/index.js"})),
+            human_tool_result(Some(0), false, "..."),
+        ];
+        let count = detect_repeated_action_detailed(&msgs, 24)
+            .map(|h| h.count)
+            .unwrap_or(0);
+        assert!(
+            count < 2,
+            "rilettura dopo azioni di diagnosi e' debugging, non stallo; count={count}"
+        );
+    }
+
+    #[test]
+    fn repeated_action_run_command_falliti_resta_stallo() {
+        // CASO 4 (anti-regressione tool produttivi): due run_command IDENTICI falliti
+        // restano stallo (count 2). I tool produttivi NON sono toccati dall'esclusione
+        // rilettura-dopo-progresso: contano sempre.
+        let msgs = vec![
+            ai_tool_input("run_command", json!({"command": "npm run build"})),
+            human_tool_result(None, true, "build failed"),
+            ai_tool_input("run_command", json!({"command": "npm run build"})),
+            human_tool_result(None, true, "build failed"),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24)
+            .expect("due run_command identici falliti restano stallo");
+        assert_eq!(hit.count, 2);
+        assert_eq!(hit.tool_name, "run_command");
+        assert!(hit.failed, "l'ultima occorrenza e' fallita");
     }
 
     #[test]
