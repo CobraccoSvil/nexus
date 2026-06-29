@@ -1001,15 +1001,15 @@ async fn errore_gateway_persiste_contatori() {
 
 #[tokio::test]
 async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
-    // FALLBACK cross-provider (regola H): il provider scelto e' in cooldown e il
+    // FAILOVER cross-provider (regola H + L): il provider scelto e' caduto e il
     // gateway ritorna in modo STRUTTURATO PortError::ProviderUnavailable. L'executor
-    // NON deve chiudere con StopReason::Error: deve ESCALARE al provider sano (cross-
-    // provider) riusando il punto unico pick_escalation_model -> sticky promosso +
+    // NON deve chiudere con StopReason::Error: deve RIPIEGARE sul provider sano
+    // delegando al punto unico del routing (failover_provider) -> sticky promosso +
     // StopReason::G1Escalated (il self-loop rientra col provider sano).
     let rc = Arc::new(StubRunControlStore::default());
-    // Solo candidato cross-provider disponibile (catena intra-provider vuota: il
-    // provider corrente e' in cooldown, Tier 1 saltato per costruzione).
-    let esc = Arc::new(StubEscalationPort::with_cross("mistral", "mistral-large-2411"));
+    // Esito di failover configurato (il routing avrebbe scelto questo provider sano
+    // escludendo quello caduto).
+    let esc = Arc::new(StubEscalationPort::with_failover("mistral", "mistral-large-2411"));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_provider_unavailable(
         "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> anthropic \
@@ -1026,7 +1026,7 @@ async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
     };
     let delta = n.run(&state, &ctx).await.expect("run NON deve abortire");
     let out = apply(state, delta);
-    // Escalation cross-provider, NON chiusura Error.
+    // Failover cross-provider, NON chiusura Error.
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(out.sticky_provider.as_deref(), Some("mistral"));
     assert_eq!(out.sticky_model.as_deref(), Some("mistral-large-2411"));
@@ -1035,14 +1035,21 @@ async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
     assert!(out.pending_tool_uses.unwrap().is_empty());
     // auto_escalations incrementato (0 -> 1): gate < 3 rispettato.
     assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    // failover_tried accumula sia il provider CADUTO sia quello SCELTO, cosi' un
+    // eventuale secondo salto li esclude entrambi (cascata).
+    let tried: Vec<String> = out
+        .extra
+        .get("failover_tried")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    assert_eq!(tried, vec!["anthropic".to_string(), "mistral".to_string()]);
     // UNA sola chiamata LLM (quella fallita): la ri-esecuzione avviene nel self-loop
     // successivo del grafo, non dentro questo turno.
     assert_eq!(llm.seen.lock().unwrap().len(), 1);
-    // La porta escalation e' stata interrogata col provider/model correnti.
-    let seen = esc.seen.lock().unwrap();
-    let last = seen.last().unwrap();
-    assert_eq!(last.1.as_deref(), Some("anthropic"));
-    assert_eq!(last.2.as_deref(), Some("claude-x"));
+    // failover_provider e' stato interrogato escludendo il provider caduto.
+    let seen = esc.failover_seen.lock().unwrap();
+    assert_eq!(seen.last().unwrap(), &vec!["anthropic".to_string()]);
 }
 
 #[tokio::test]
@@ -1073,6 +1080,61 @@ async fn provider_cooldown_senza_candidato_chiude_error() {
     assert!(out.sticky_provider.is_none());
     assert!(out.pending_tool_uses.unwrap().is_empty());
     assert_eq!(llm.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failover_cascata_accumula_provider_gia_provati() {
+    // CASCATA (regola L): un salto di failover precedente ha gia' registrato un
+    // provider in `failover_tried`. Al nuovo ProviderUnavailable l'executor deve
+    // escludere SIA i gia' provati SIA il provider corrente caduto, cosi' la
+    // selezione del routing sceglie sempre un provider DIVERSO (non insiste sullo
+    // stesso): e' cio' che il vecchio `loop_fallback_default` (candidato fisso) non
+    // faceva, costringendo l'utente a ri-lanciare.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_failover("google", "gemini-2.5-pro"));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_provider_unavailable(
+        "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> mistral\",\
+\"code\":\"PROVIDER_ERROR\"}",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut extra = serde_json::Map::new();
+    // Stato: un salto precedente ha gia' provato deepseek; auto_escalations=1 (< 3).
+    extra.insert("failover_tried".into(), json!(["deepseek"]));
+    extra.insert("auto_escalations".into(), json!(1));
+    // Il provider corrente del turno e' quello risolto da cfg_resolved()
+    // (routing_provider="anthropic"), NON state.provider_used: e' "anthropic" il
+    // provider che cade qui.
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("scrivi il file")],
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_provider.as_deref(), Some("google"));
+    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(2));
+    // failover_provider interrogato escludendo i gia' provati (deepseek) PIU' il
+    // provider corrente caduto (anthropic) — in quest'ordine.
+    let seen = esc.failover_seen.lock().unwrap();
+    assert_eq!(
+        seen.last().unwrap(),
+        &vec!["deepseek".to_string(), "anthropic".to_string()]
+    );
+    // failover_tried ora include anche google (lo scelto), per il prossimo giro.
+    let tried: Vec<String> = out
+        .extra
+        .get("failover_tried")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        tried,
+        vec!["deepseek".to_string(), "anthropic".to_string(), "google".to_string()]
+    );
 }
 
 #[tokio::test]

@@ -35,7 +35,7 @@ pub(crate) const KNOWN_INTENTS: [&str; 6] =
 
 mod core;
 mod intent;
-mod model_routing;
+pub(crate) mod model_routing;
 mod model_selection;
 mod neural_client;
 #[cfg(test)]

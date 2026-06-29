@@ -505,6 +505,13 @@ pub mod test_doubles {
         pub provider_in_cooldown: bool,
         /// Candidato cross-provider `(provider, model)`, o `None`.
         pub cross_provider: Option<(String, String)>,
+        /// Esito di `failover_provider` `(provider, model)`, o `None` (nessun
+        /// provider sano -> chiusura Error). Default `None`: i test che non
+        /// esercitano il failover su provider caduto non lo configurano.
+        pub failover: Option<(String, String)>,
+        /// `exclude` ricevuti dalle chiamate a `failover_provider` (per asserire
+        /// che la cascata accumula i provider gia' provati).
+        pub failover_seen: Mutex<Vec<Vec<String>>>,
         /// Se `true`, `escalation_inputs` ritorna un `PortError` (per i test del
         /// mapping fail-open dei chiamanti).
         pub fail: bool,
@@ -525,6 +532,15 @@ pub mod test_doubles {
         pub fn with_cross(provider: &str, model: &str) -> Self {
             Self {
                 cross_provider: Some((provider.to_string(), model.to_string())),
+                ..Default::default()
+            }
+        }
+
+        /// Stub con SOLO un esito di failover su provider caduto (catena vuota,
+        /// nessun cross): esercita il ramo `ProviderUnavailable` dell'executor.
+        pub fn with_failover(provider: &str, model: &str) -> Self {
+            Self {
+                failover: Some((provider.to_string(), model.to_string())),
                 ..Default::default()
             }
         }
@@ -563,6 +579,26 @@ pub mod test_doubles {
                         model: m.clone(),
                     }),
             })
+        }
+
+        async fn failover_provider(
+            &self,
+            exclude: &[String],
+        ) -> Result<Option<CrossProviderCandidate>, PortError> {
+            self.failover_seen
+                .lock()
+                .expect("lock failover_seen")
+                .push(exclude.to_vec());
+            if self.fail {
+                return Err(PortError::Llm("stub: failover_provider fail".to_string()));
+            }
+            Ok(self
+                .failover
+                .as_ref()
+                .map(|(p, m)| CrossProviderCandidate {
+                    provider: p.clone(),
+                    model: m.clone(),
+                }))
         }
     }
 

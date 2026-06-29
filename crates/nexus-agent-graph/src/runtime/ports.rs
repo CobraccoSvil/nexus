@@ -824,4 +824,24 @@ pub trait EscalationPort: Send + Sync {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<EscalationInputs, PortError>;
+
+    /// FAILOVER cross-provider su provider CADUTO (gateway 500 `PROVIDER_ERROR` /
+    /// cooldown runtime): ritorna il MIGLIOR modello agentico SANO escludendo i
+    /// provider gia' provati `exclude` (incluso quello appena caduto). A differenza
+    /// del candidato `loop_fallback_default` di [`escalation_inputs`] (UN solo
+    /// candidato statico, senza filtro cooldown, che non fa CASCATA), questo metodo
+    /// DELEGA al PUNTO UNICO del routing iniziale (`select_agentic_model`, regola L):
+    /// la STESSA selezione che il rilancio manuale del run usa — pavimento agentico,
+    /// gate cooldown (ADR 0020), tool-use, agentic_thinking_policy<>'exclude'.
+    /// Accumulando `exclude` ad ogni salto la cascata prova in sequenza tutti i
+    /// provider sani disponibili invece di insistere su uno solo.
+    ///
+    /// `None` SOLO quando nessun provider sano resta (rete davvero esaurita ->
+    /// chiusura `Error` onesta). FAIL-OPEN: un guasto di lettura -> `Ok(None)`
+    /// (nessun failover, il chiamante chiude come oggi), MAI un `PortError` nel
+    /// flusso normale. SOLA LETTURA: nessun gate `mode`.
+    async fn failover_provider(
+        &self,
+        exclude: &[String],
+    ) -> Result<Option<CrossProviderCandidate>, PortError>;
 }

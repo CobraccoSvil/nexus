@@ -887,7 +887,14 @@ impl Orchestrator {
                     ("medium".to_string(), "reasoning".to_string())
                 }
             };
-            if let Some(d) = route_model_from_catalog(db, &base_tier, &capability, "dinamico").await
+            // Turno agentico = intent diverso da "chat" (convenzione del progetto,
+            // model_routing.rs:772). Attiva il pavimento di tier agentico nel
+            // selettore dinamico (regola L: la decisione "agentico?" arriva dal
+            // chiamante che conosce l'intent, non re-implementata nel selettore).
+            let is_agentic_turn = intent != "chat";
+            if let Some(d) =
+                route_model_from_catalog(db, &base_tier, &capability, "dinamico", is_agentic_turn)
+                    .await
             {
                 let provider = d.provider;
                 if !is_provider_in_cooldown(&provider) {
@@ -1121,7 +1128,12 @@ impl Orchestrator {
             .behavior_mode
             == "dinamico"
         {
-            match route_model_from_catalog(db, &base_tier, &capability, "dinamico").await {
+            // Turno agentico = intent != "chat" (convenzione del progetto):
+            // attiva il pavimento di tier agentico nel selettore dinamico.
+            let is_agentic_turn = intent_str != "chat";
+            match route_model_from_catalog(db, &base_tier, &capability, "dinamico", is_agentic_turn)
+                .await
+            {
                 Some(dyn_decision) if !is_provider_in_cooldown(&dyn_decision.provider) => {
                     tracing::info!(
                         "Dynamic catalog routing: intent={} tokens~{} → {}/{}",

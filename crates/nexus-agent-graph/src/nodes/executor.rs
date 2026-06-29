@@ -1752,22 +1752,23 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         let mut resp = match ctx.llm.complete(req).await {
             Ok(r) => r,
             Err(err) => {
-                // FALLBACK cross-provider sul provider in cooldown/indisponibile
-                // (regola H, fix localizzato): se il gateway ha segnalato in modo
-                // STRUTTURATO che il provider scelto NON e' disponibile
-                // ([`PortError::ProviderUnavailable`], = 500 `PROVIDER_ERROR`: tutti
-                // i provider risolti per QUESTA richiesta in cooldown), NON chiudere
-                // il run con `StopReason::Error`: prova a RIPIEGARE su un provider
-                // SANO riusando lo STESSO meccanismo dell'escalation G1 (punto unico
-                // `escalation_inputs` + `pick_escalation_model`, regola L). Forziamo
-                // `provider_in_cooldown=true` per il provider corrente cosi' il Tier 1
-                // intra-provider viene SALTATO e si sceglie il cross-provider
-                // (`loop_fallback_default`). Se c'e' un candidato, promuoviamo lo
-                // sticky e usciamo con `G1Escalated`: il self-loop rientra
-                // nell'executor col provider sano (stesso pattern del ramo G1). Solo
-                // a escalation ESAURITA (nessun candidato) cadiamo nella chiusura
-                // `Error` sottostante. Gated `auto_escalations < 3` come gli altri
-                // rami di escalation (no escalation a raffica).
+                // FAILOVER cross-provider sul provider caduto/indisponibile (regola H
+                // + regola L): se il gateway ha segnalato in modo STRUTTURATO che il
+                // provider scelto NON e' disponibile ([`PortError::ProviderUnavailable`],
+                // = 500 `PROVIDER_ERROR`: tutti i provider risolti per QUESTA richiesta
+                // in cooldown), NON chiudere il run con `StopReason::Error`: RIPIEGA su
+                // un provider SANO delegando al PUNTO UNICO del routing iniziale
+                // ([`EscalationPort::failover_provider`] -> `select_agentic_model`), la
+                // STESSA selezione che il rilancio manuale userebbe. NON usa piu' il
+                // `loop_fallback_default` (un solo candidato statico, senza filtro
+                // cooldown, che non faceva cascata: o coincideva col corrente -> None,
+                // o puntava a un provider a crediti zero -> loop fino a Error). Se c'e'
+                // un provider sano, promuoviamo lo sticky e usciamo con `G1Escalated`:
+                // il self-loop rientra nell'executor col provider nuovo (stesso pattern
+                // del ramo G1). I provider gia' provati sono accumulati in
+                // `failover_tried` cosi' la cascata ne sceglie sempre uno diverso. Solo
+                // quando NESSUN provider sano resta cadiamo nella chiusura `Error`
+                // (onesta). Gated `auto_escalations < 3` (no escalation a raffica).
                 if matches!(err, crate::runtime::ports::PortError::ProviderUnavailable(_)) {
                     let cd_escal = state
                         .extra
@@ -1775,44 +1776,54 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
                     if cd_escal < 3 {
-                        // Provider/model correnti del turno (gia' risolti sopra). Il
-                        // provider corrente e' in cooldown -> `provider_in_cooldown=true`
-                        // forzato a prescindere dal gate ADR 0020 (il segnale e' gia'
-                        // il 500 del gateway, non serve ri-interrogare il cooldown set).
-                        let inputs = self
-                            .escalation
-                            .escalation_inputs(
-                                state.user_intent.as_deref(),
-                                Some(&provider),
-                                Some(&model),
-                            )
-                            .await
+                        // CASCATA cross-provider: accumuliamo i provider gia' provati
+                        // in questo run (incluso quello appena caduto) cosi' ogni salto
+                        // sceglie un provider SANO DIVERSO, invece di insistere su un
+                        // candidato fisso (era il difetto del vecchio
+                        // `loop_fallback_default`: un solo provider statico, senza
+                        // filtro cooldown -> o coincideva col corrente -> None, o
+                        // puntava a un provider a crediti zero -> loop fino a Error).
+                        let mut tried: Vec<String> = state
+                            .extra
+                            .get("failover_tried")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
                             .unwrap_or_default();
-                        if let Some(pick) = pick_escalation_model(
-                            &inputs.chain,
-                            Some(&provider),
-                            Some(&model),
-                            cd_escal,
-                            // FORZATO: il provider corrente e' in cooldown (segnale
-                            // strutturato del gateway), salta il Tier 1 intra-provider.
-                            true,
-                            inputs.cross_provider.as_ref(),
-                        ) {
+                        if !tried.iter().any(|p| p == &provider) {
+                            tried.push(provider.clone());
+                        }
+                        // Punto unico (regola L): il MIGLIOR provider agentico SANO
+                        // escludendo i gia' provati. DELEGA alla STESSA selezione del
+                        // routing iniziale (`select_agentic_model`, che esclude da se'
+                        // anche i cooldown) -> la rete scala IN-RUN, senza che l'utente
+                        // debba ri-lanciare. Fail-open: errore -> None -> chiusura Error.
+                        if let Ok(Some(pick)) =
+                            self.escalation.failover_provider(&tried).await
+                        {
                             tracing::warn!(
                                 target: "nexus_agent_graph::executor",
                                 from_provider = %provider,
                                 to_provider = %pick.provider,
                                 to_model = %pick.model,
-                                from_chain = pick.from_chain,
-                                "provider in cooldown -> FALLBACK cross-provider via escalation"
+                                tried = tried.len(),
+                                "provider caduto -> FAILOVER cross-provider via routing (cascata)"
                             );
                             let esc_nudge = human_msg(
                                 "Il provider precedente non e' disponibile (in cooldown). \
 Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito.",
                             );
+                            // Marca il provider scelto come provato: se cadesse anche
+                            // lui, il giro dopo lo esclude e ne sceglie un altro sano.
+                            tried.push(pick.provider.clone());
                             let mut extra_out = state.extra.clone();
                             extra_out
                                 .insert("auto_escalations".to_string(), json!(cd_escal + 1));
+                            extra_out
+                                .insert("failover_tried".to_string(), json!(tried));
                             return Ok(StateDelta {
                                 messages: Some(vec![esc_nudge]),
                                 sticky_provider: Some(Some(pick.provider)),
@@ -1832,7 +1843,7 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                         target: "nexus_agent_graph::executor",
                         provider = %provider,
                         auto_escalations = cd_escal,
-                        "provider in cooldown ma nessun candidato cross-provider: chiusura Error"
+                        "provider caduto ma nessun provider sano disponibile: chiusura Error"
                     );
                 }
                 // try/except onnicomprensivo Python: result="[Errore provider ...]",

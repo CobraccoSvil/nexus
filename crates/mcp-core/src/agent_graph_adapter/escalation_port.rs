@@ -260,6 +260,34 @@ impl EscalationPort for PgEscalationPort {
             cross_provider,
         })
     }
+
+    /// FAILOVER su provider caduto: DELEGA al punto unico del routing iniziale
+    /// ([`crate::orchestrator::model_routing::best_agentic_failover`], regola L),
+    /// che esclude i provider in cooldown (gate ADR 0020) E quelli gia' provati
+    /// (`exclude`). Niente `loop_fallback_default` (un solo candidato statico senza
+    /// filtro cooldown): qui si sceglie il MIGLIOR provider agentico SANO come
+    /// farebbe il rilancio manuale del run. FAIL-OPEN: errore di lettura -> `None`.
+    async fn failover_provider(
+        &self,
+        exclude: &[String],
+    ) -> Result<Option<CrossProviderCandidate>, PortError> {
+        let pick = crate::orchestrator::model_routing::best_agentic_failover(&self.db, exclude)
+            .await
+            .map(|d| CrossProviderCandidate {
+                provider: d.provider,
+                model: d.model,
+            });
+        if let Some(ref c) = pick {
+            tracing::info!(
+                target: "nexus_mcp_core::escalation_port",
+                failover_provider = %c.provider,
+                failover_model = %c.model,
+                excluded = exclude.len(),
+                "failover_provider: scelto provider sano via routing (esclusi i gia' provati)"
+            );
+        }
+        Ok(pick)
+    }
 }
 
 #[cfg(test)]

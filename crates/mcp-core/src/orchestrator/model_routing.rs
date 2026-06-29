@@ -153,20 +153,77 @@ pub(crate) async fn provider_for_model(db: &PgPool, model: &str) -> Option<Strin
     .flatten()
 }
 
+/// Chiave settings (regola G) del PAVIMENTO di tier per i turni AGENTICI.
+const AGENTIC_MIN_TIER_KEY: &str = "agent.routing.agentic_min_tier";
+
+/// Default del pavimento agentico se il setting e' assente. NON e' un nome
+/// modello (regola G non si applica): e' una soglia di policy locale, come
+/// `agent.enforce_port_allocation`='true' o `pending_steps_min_items`. Resta
+/// configurabile da DB; questo e' solo il valore quando la riga manca.
+const AGENTIC_MIN_TIER_DEFAULT: &str = "medium";
+
+/// Legge il pavimento di tier agentico dal DB (punto unico `get_setting`,
+/// cache 60s di nexus-auth). Valori validi: light/medium/heavy. Qualunque
+/// valore non riconosciuto o assenza del setting -> [`AGENTIC_MIN_TIER_DEFAULT`].
+/// Best-effort: un errore DB non fa fallire il routing, degrada al default.
+async fn agentic_min_tier(db: &PgPool) -> String {
+    let raw = crate::settings::get_setting(db, AGENTIC_MIN_TIER_KEY)
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_lowercase());
+    match raw.as_deref() {
+        Some("light") | Some("medium") | Some("heavy") => raw.unwrap(),
+        _ => AGENTIC_MIN_TIER_DEFAULT.to_string(),
+    }
+}
+
+/// Alza `required_tier` ad almeno `floor` quando il turno e' AGENTICO, usando il
+/// PUNTO UNICO dell'ordinamento tier ([`crate::routing_matrix_auto_promoter::tier_rank`]):
+/// light < medium < heavy. Funzione PURA (testabile senza DB). Per i turni NON
+/// agentici e' un no-op (ritorna `required_tier` invariato): la chat semplice
+/// resta libera di usare 'light'. Se `required_tier` e' gia' >= `floor` non lo
+/// abbassa MAI (es. un task heavy resta heavy anche con pavimento 'medium').
+fn floor_tier_for_agentic<'a>(
+    is_agentic_turn: bool,
+    required_tier: &'a str,
+    floor: &'a str,
+) -> &'a str {
+    if !is_agentic_turn {
+        return required_tier;
+    }
+    use crate::routing_matrix_auto_promoter::tier_rank;
+    if tier_rank(floor) > tier_rank(required_tier) {
+        floor
+    } else {
+        required_tier
+    }
+}
+
 /// Seleziona il modello ottimale dal catalogo DB per la modalità richiesta.
 /// La modalità "dinamico" sceglie il modello più adatto per capability+tier,
 /// privilegiando il costo più basso a parità di tier richiesto.
+///
+/// `is_agentic_turn` (regola L: deciso dal chiamante che conosce l'intent;
+/// convenzione del progetto `intent != "chat"`) attiva il PAVIMENTO di tier
+/// agentico: per i turni multi-step a tool il tier minimo viene alzato ad
+/// `agent.routing.agentic_min_tier` (default 'medium') PRIMA di costruire la
+/// tier-chain, cosi' il routing non parte da un modello LIGHT debole che
+/// diverge. La degradazione resta GRACEFUL: la tier-chain scende comunque verso
+/// il basso (es. heavy->medium->light) se nessun candidato del tier minimo e'
+/// disponibile (tutti in cooldown), senza mai fallire.
 pub(crate) async fn route_model_from_catalog(
     db: &PgPool,
     base_tier: &str,
     capability: &str,
     mode: &str,
+    is_agentic_turn: bool,
 ) -> Option<DynamicRoutingDecision> {
     // Promozione/declassamento del tier in base al behavior_mode.
     // "approfondita" scala in alto, "veloce"/"economica" scala in basso.
     // Il `base_tier` arriva gia' risolto dal chiamante via IntentCapabilityMap
     // (mig 0110), che applica le soglie di token threshold per l'intent.
-    let required_tier = match mode {
+    let mode_tier = match mode {
         "approfondita" => match base_tier {
             "light" => "medium",
             "medium" => "heavy",
@@ -178,6 +235,13 @@ pub(crate) async fn route_model_from_catalog(
         },
         _ => base_tier,
     };
+
+    // PAVIMENTO AGENTICO (regola L, punto unico della selezione dinamica/catalog):
+    // per i turni a tool il tier minimo e' alzato al pavimento DB-driven. La
+    // tier-chain sotto degrada comunque verso il basso (graceful), quindi se il
+    // tier minimo non ha candidati disponibili il run NON fallisce.
+    let floor = agentic_min_tier(db).await;
+    let required_tier = floor_tier_for_agentic(is_agentic_turn, mode_tier, &floor);
 
     // Query al catalogo: trova il modello più economico che soddisfa tier+capability.
     // Per "veloce" ordina per speed_tier, per "economica" per costo, per altri per featured.
@@ -191,15 +255,55 @@ pub(crate) async fn route_model_from_catalog(
     // Selezione tramite il PUNTO UNICO (regola L): l'eleggibilita' agentica
     // (tool_use, agentic_thinking_policy<>'exclude', consecutive_failures, cooldown)
     // e' definita una sola volta in select_agentic_model. Degradazione di tier
-    // controllata: heavy->medium, medium->light, ecc.
+    // GRACEFUL: il primo tier con un candidato eleggibile vince; se il tier
+    // minimo (incluso il pavimento agentico) e' tutto in cooldown, scende verso
+    // il basso fino a 'light' invece di fallire (heavy->medium->light).
     let tier_chain: Vec<&str> = match required_tier {
-        "heavy" => vec!["heavy", "medium"],
+        "heavy" => vec!["heavy", "medium", "light"],
         "medium" => vec!["medium", "light"],
         "light" => vec!["light", "medium"],
         other => vec![other],
     };
     // Branch: catalog dynamic routing (selettore agentico unico).
     select_agentic_model(db, &tier_chain, Some(capability), 0, &[], order_clause)
+        .await
+        .map(|(provider, model)| DynamicRoutingDecision { provider, model })
+}
+
+/// FAILOVER agentico cross-provider (regola L, punto unico): il MIGLIOR modello
+/// agentico SANO escludendo `exclude` (i provider gia' provati / caduti in questo
+/// run). Usato dall'auto-escalation runtime quando il gateway segnala che il
+/// provider corrente non e' disponibile (500 `PROVIDER_ERROR` / cooldown).
+///
+/// CONVERGENZA (regola L): NON re-implementa la selezione ne' usa il purpose
+/// `loop_fallback_default` (un solo candidato statico, senza filtro cooldown, che
+/// non fa cascata). Delega allo STESSO punto unico del routing iniziale —
+/// [`select_agentic_model`] — che applica il gate completo (supports_tool_use,
+/// `agentic_thinking_policy <> 'exclude'`, provider NON in cooldown, NON in
+/// `exclude_providers`). Cosi' il failover "in-run" sceglie esattamente come farebbe
+/// il rilancio manuale del run, senza che l'utente debba ri-lanciare.
+///
+/// Pavimento agentico (`agent.routing.agentic_min_tier`, default 'medium') +
+/// tier-chain GRACEFUL verso il basso: se il tier minimo e' tutto in cooldown
+/// scende fino a 'light' invece di fallire. `None` SOLO quando nessun provider
+/// sano resta (rete davvero esaurita -> il chiamante chiude `Error` onestamente).
+pub(crate) async fn best_agentic_failover(
+    db: &PgPool,
+    exclude: &[String],
+) -> Option<DynamicRoutingDecision> {
+    let floor = agentic_min_tier(db).await;
+    // Stessa degradazione graceful di route_model_from_catalog, partendo dal
+    // pavimento agentico (il failover e' sempre un turno agentico a tool).
+    let tier_chain: Vec<&str> = match floor.as_str() {
+        "heavy" => vec!["heavy", "medium", "light"],
+        "medium" => vec!["medium", "light"],
+        _ => vec!["light", "medium"],
+    };
+    // capability None: per il failover basta un modello agentico (tool-use) SANO
+    // di tier adeguato; non lo vincoliamo a una capability specifica del turno
+    // (il pavimento garantisce gia' la forza). Ordine: featured + piu' economico.
+    let order_clause = "is_featured DESC, input_cost_per_million_tokens ASC";
+    select_agentic_model(db, &tier_chain, None, 0, exclude, order_clause)
         .await
         .map(|(provider, model)| DynamicRoutingDecision { provider, model })
 }
@@ -1079,5 +1183,177 @@ mod intent_key_tests {
         // fix si sdoppia su complex_fix (default 3000).
         assert_eq!(intent_key_for("fix", 100, &t), "fix_semplice");
         assert_eq!(intent_key_for("fix", 5_000, &t), "fix_complesso");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Pavimento di tier per i turni AGENTICI (regola G DB-driven, regola L punto
+// unico). Verifica che un turno a tool non parta da un modello LIGHT debole, che
+// la chat semplice resti libera di usare LIGHT, e che la degradazione sia
+// GRACEFUL (se solo LIGHT e' disponibile, l'agentico ci scende senza panic).
+// ────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod agentic_tier_floor_tests {
+    use super::{floor_tier_for_agentic, route_model_from_catalog};
+
+    // ── Parte PURA: floor_tier_for_agentic (nessun DB) ──────────────────────
+
+    #[test]
+    fn floor_non_tocca_i_turni_non_agentici() {
+        // Chat semplice: il pavimento non si applica, 'light' resta 'light'.
+        assert_eq!(floor_tier_for_agentic(false, "light", "medium"), "light");
+        assert_eq!(floor_tier_for_agentic(false, "light", "heavy"), "light");
+    }
+
+    #[test]
+    fn floor_alza_il_tier_dei_turni_agentici() {
+        // Turno agentico con tier base 'light' e pavimento 'medium' -> 'medium'.
+        assert_eq!(floor_tier_for_agentic(true, "light", "medium"), "medium");
+        // Pavimento 'heavy' su base 'light' -> 'heavy'.
+        assert_eq!(floor_tier_for_agentic(true, "light", "heavy"), "heavy");
+    }
+
+    #[test]
+    fn floor_non_abbassa_mai_un_tier_gia_alto() {
+        // Un task heavy resta heavy anche col pavimento 'medium' (non declassa).
+        assert_eq!(floor_tier_for_agentic(true, "heavy", "medium"), "heavy");
+        // A parita' di rank resta invariato.
+        assert_eq!(floor_tier_for_agentic(true, "medium", "medium"), "medium");
+    }
+
+    // ── Parte DB: route_model_from_catalog (selettore reale sul catalog) ─────
+
+    async fn create_catalog_table(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE ai_price_catalog ( \
+                 provider TEXT NOT NULL, \
+                 model TEXT NOT NULL, \
+                 is_enabled BOOLEAN NOT NULL DEFAULT true, \
+                 supports_tool_use BOOLEAN NOT NULL DEFAULT true, \
+                 supports_vision BOOLEAN NOT NULL DEFAULT false, \
+                 supports_image_gen BOOLEAN NOT NULL DEFAULT false, \
+                 supports_audio_in BOOLEAN NOT NULL DEFAULT false, \
+                 supports_audio_out BOOLEAN NOT NULL DEFAULT false, \
+                 supports_video_gen BOOLEAN NOT NULL DEFAULT false, \
+                 agentic_thinking_policy TEXT NOT NULL DEFAULT 'none', \
+                 performance_tier TEXT NOT NULL DEFAULT 'medium', \
+                 capabilities JSONB NOT NULL DEFAULT '[]', \
+                 context_window INTEGER NOT NULL DEFAULT 8192, \
+                 input_cost_per_million_tokens DOUBLE PRECISION NOT NULL DEFAULT 0, \
+                 is_featured BOOLEAN NOT NULL DEFAULT false \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create ai_price_catalog");
+    }
+
+    async fn create_settings_table(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE settings ( \
+                 key TEXT PRIMARY KEY, \
+                 value TEXT NOT NULL \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create settings");
+    }
+
+    #[sqlx::test]
+    async fn turno_agentico_sceglie_almeno_medium(pool: sqlx::PgPool) {
+        create_catalog_table(&pool).await;
+        // Catalog misto light/medium/heavy, tutti tool-capable. Il piu' economico
+        // in assoluto e' il LIGHT (0.1): senza pavimento il selettore lo
+        // sceglierebbe. Col pavimento 'medium' (default, settings assente -> default
+        // visibile) il LIGHT e' ESCLUSO e vince il piu' economico >= medium.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, capabilities) VALUES \
+             ('flprov', 'light-economico', true, 'none', 'light', 0.1, '[\"code\"]'), \
+             ('mdprov', 'medium-mid', true, 'none', 'medium', 1.0, '[\"code\"]'), \
+             ('hvprov', 'heavy-caro', true, 'none', 'heavy', 5.0, '[\"code\"]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        // base_tier 'light' (come un intent fix_semplice a token bassi), turno
+        // agentico: il pavimento default 'medium' deve scartare il LIGHT.
+        let d = route_model_from_catalog(&pool, "light", "code", "dinamico", true)
+            .await
+            .expect("una decisione");
+        assert_eq!(d.provider, "mdprov");
+        assert_eq!(d.model, "medium-mid");
+    }
+
+    #[sqlx::test]
+    async fn turno_non_agentico_puo_scegliere_light(pool: sqlx::PgPool) {
+        create_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, capabilities) VALUES \
+             ('flprov2', 'light-economico', true, 'none', 'light', 0.1, '[\"chat\"]'), \
+             ('mdprov2', 'medium-mid', true, 'none', 'medium', 1.0, '[\"chat\"]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        // Chat semplice (is_agentic_turn=false): il pavimento NON si applica,
+        // base_tier 'light' resta 'light' -> sceglie il light economico.
+        let d = route_model_from_catalog(&pool, "light", "chat", "dinamico", false)
+            .await
+            .expect("una decisione");
+        assert_eq!(d.provider, "flprov2");
+        assert_eq!(d.model, "light-economico");
+    }
+
+    #[sqlx::test]
+    async fn turno_agentico_degrada_a_light_se_solo_light_disponibile(pool: sqlx::PgPool) {
+        create_catalog_table(&pool).await;
+        // Solo un modello LIGHT eleggibile (nessun medium/heavy): il pavimento
+        // 'medium' alza la richiesta a 'medium', ma la tier-chain medium->light
+        // degrada GRACEFUL al LIGHT invece di fallire (NON panic, NON None).
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, capabilities) VALUES \
+             ('onlyfl', 'unico-light', true, 'none', 'light', 0.1, '[\"code\"]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let d = route_model_from_catalog(&pool, "light", "code", "dinamico", true)
+            .await
+            .expect("degrado graceful al light, nessun fallimento");
+        assert_eq!(d.provider, "onlyfl");
+        assert_eq!(d.model, "unico-light");
+    }
+
+    #[sqlx::test]
+    async fn setting_db_driven_alza_il_pavimento_a_heavy(pool: sqlx::PgPool) {
+        create_catalog_table(&pool).await;
+        create_settings_table(&pool).await;
+        // Pavimento configurato a 'heavy' via DB (regola G): un turno agentico a
+        // base_tier 'light' deve salire fino a 'heavy', scartando light e medium.
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('agent.routing.agentic_min_tier', 'heavy')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert setting");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens, capabilities) VALUES \
+             ('flprov3', 'light-economico', true, 'none', 'light', 0.1, '[\"code\"]'), \
+             ('mdprov3', 'medium-mid', true, 'none', 'medium', 1.0, '[\"code\"]'), \
+             ('hvprov3', 'heavy-caro', true, 'none', 'heavy', 5.0, '[\"code\"]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert catalog");
+        let d = route_model_from_catalog(&pool, "light", "code", "dinamico", true)
+            .await
+            .expect("una decisione");
+        assert_eq!(d.provider, "hvprov3");
+        assert_eq!(d.model, "heavy-caro");
     }
 }
