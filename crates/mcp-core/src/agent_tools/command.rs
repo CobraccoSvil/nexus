@@ -198,10 +198,13 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     }
 
     // ── Livello 2: lista hardcoded di comandi noti ──
-    if looks_like_long_running_command(&command, &ctx.long_running_patterns) {
+    if looks_like_long_running_command(&command, &ctx.long_running_patterns)
+        || service::looks_like_web_service(&command)
+    {
         let routed = service::tool_run_service(ctx, input, "service").await;
         return format!(
-            "[Auto-routing] Comando long-running rilevato: avviato come servizio server-side.\n{}",
+            "[Auto-routing] Comando long-running/web-service rilevato: avviato come servizio \
+             server-side (PORT allocata nel bucket del progetto).\n{}",
             routed
         );
     }

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 ///
 /// In caso di dubbio (es. `make foo`), NON inietta PORT: l'agente puo' chiamare
 /// `request_port` esplicitamente e includere la porta nel comando.
-fn looks_like_web_service(command: &str) -> bool {
+pub(crate) fn looks_like_web_service(command: &str) -> bool {
     let lc = command.to_lowercase();
     // Lista di token che indicano "sto avviando un server web"
     const WEB_TOKENS: &[&str] = &[
@@ -777,7 +777,22 @@ pub(super) async fn tool_list_active_services(ctx: &AgentToolContext, _input: &V
 
 #[cfg(test)]
 mod tests {
-    use super::{existing_service_action, ExistingServiceAction};
+    use super::{existing_service_action, looks_like_web_service, ExistingServiceAction};
+
+    #[test]
+    fn web_service_riconosce_dev_server_diretti_e_indiretti() {
+        // Punto unico (regola L): looks_like_web_service governa SIA l'iniezione di
+        // PORT del bucket SIA il routing run_command -> run_service. Deve catturare i
+        // dev-server diretti e gli script npm/pnpm/yarn, altrimenti il server parte
+        // fuori bucket via run_command e il port_enforcer lo uccide (causa C).
+        assert!(looks_like_web_service("vite --port 35198 --host 0.0.0.0"));
+        assert!(looks_like_web_service("npm run dev"));
+        assert!(looks_like_web_service("pnpm dev"));
+        assert!(looks_like_web_service("next dev"));
+        assert!(!looks_like_web_service("ls -la"));
+        assert!(!looks_like_web_service("cargo build"));
+    }
+
 
     /// Regressione deadlock allocazione stantia: un servizio dello stesso scopo
     /// gia' ATTIVO va rifiutato (no duplicato), ma una allocazione SPENTA va
