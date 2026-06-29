@@ -592,6 +592,13 @@ pub fn detect_repeated_action_detailed(
     // sig -> esito dell'ULTIMA occorrenza (true = fallita).
     let mut last_failed: Vec<(String, bool)> = Vec::new();
     let mut succeeded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Target (file) con un edit_file/write_file RIUSCITO visto finora nella finestra:
+    // una rilettura read-only di uno di questi DOPO la modifica e' VERIFICA del
+    // risultato, NON uno stallo (regola H). Senza questa esclusione, il pattern sano
+    // "leggi -> modifica -> rileggi per verificare" faceva scattare repeated_action a
+    // soglia 2 e ABORTIVA un task GIA' risolto, con recap falso "File toccati: nessuno"
+    // (incidente vite.config.ts: edit applicato, poi rilettura -> falso loop -> abort).
+    let mut modified_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_sig: Option<String> = None;
     for (idx, m) in recent.iter().enumerate() {
         for (name, input) in message_tool_uses(m) {
@@ -612,6 +619,14 @@ pub fn detect_repeated_action_detailed(
             if target.is_empty() {
                 continue;
             }
+            // Esito strutturale dell'occorrenza corrente (primo tool_result dopo).
+            let outcome = tool_result_outcome_after(recent, idx, 3);
+            // Rilettura-di-verifica: un tool di SOLA LETTURA su un file gia' modificato
+            // (edit/write riuscito PRIMA, cronologicamente, nella finestra) non e' una
+            // ripetizione-stallo ma la verifica della modifica -> NON conta.
+            if is_read_only_repeatable_tool(name) && modified_targets.contains(&target) {
+                continue;
+            }
             // Discriminante di contenuto (solo per i tool di edit): rende la
             // signature sensibile al CONTENUTO. `run_command` & co. -> "".
             let content = repeated_action_content_key(name)
@@ -624,8 +639,12 @@ pub fn detect_repeated_action_detailed(
             set_label(&mut labels, &sig, format!("{name}: {label_value}"));
             set_label(&mut tool_names, &sig, name.to_string());
             last_sig = Some(sig.clone());
-            // Esito strutturale dell'occorrenza corrente (primo tool_result dopo).
-            let outcome = tool_result_outcome_after(recent, idx, 3);
+            // Un edit/write RIUSCITO (outcome == Some(false)) segna il target come
+            // modificato: le successive riletture read-only dello stesso file sono
+            // verifica e vengono escluse dal conteggio (sopra).
+            if outcome == Some(false) && matches!(name, "edit_file" | "write_file") {
+                modified_targets.insert(target.clone());
+            }
             // FALSO-DOPPIONE (solo tool PRODUTTIVI): la prima occorrenza RIUSCITA
             // esclude la signature (ridondanza innocua). Per i tool di SOLA LETTURA
             // la rilettura RIUSCITA ripetuta E' lo stallo (l'agente non avanza),
@@ -1546,6 +1565,42 @@ mod tests {
         ];
         let hit2 = detect_repeated_action_detailed(&diversi, 24);
         assert_eq!(hit2.map(|h| h.count), Some(1), "path diversi -> nessuno stallo");
+    }
+
+    #[test]
+    fn repeated_action_read_dopo_edit_e_verifica_non_stallo() {
+        // FIX (regola H, incidente vite.config.ts): leggi -> MODIFICA -> rileggi per
+        // verificare e' un pattern SANO, non uno stallo. La rilettura read-only DOPO
+        // un edit RIUSCITO sullo stesso file NON deve contare come repeated_action
+        // (prima faceva scattare l'ABORT a soglia 2 su un task GIA' risolto, con recap
+        // falso "File toccati: nessuno").
+        let msgs = vec![
+            ai_tool_input("read_file", json!({"path": "vite.config.ts"})),
+            human_tool_result(Some(0), false, "port: 35198"),
+            ai_tool_input("edit_file", json!({"path": "vite.config.ts", "old_string": "35198"})),
+            human_tool_result(Some(0), false, "applied"),
+            ai_tool_input("read_file", json!({"path": "vite.config.ts"})),
+            human_tool_result(Some(0), false, "port: process.env.PORT"),
+        ];
+        let count = detect_repeated_action_detailed(&msgs, 24)
+            .map(|h| h.count)
+            .unwrap_or(0);
+        assert!(
+            count < 2,
+            "read-dopo-edit e' verifica, non stallo; count={count}"
+        );
+        // Controprova: due read IDENTICHE senza edit in mezzo restano stallo.
+        let loop_msgs = vec![
+            ai_tool_input("read_file", json!({"path": "vite.config.ts"})),
+            human_tool_result(Some(0), false, "port: 35198"),
+            ai_tool_input("read_file", json!({"path": "vite.config.ts"})),
+            human_tool_result(Some(0), false, "port: 35198"),
+        ];
+        assert_eq!(
+            detect_repeated_action_detailed(&loop_msgs, 24).map(|h| h.count),
+            Some(2),
+            "due read senza edit in mezzo restano stallo"
+        );
     }
 
     #[test]
