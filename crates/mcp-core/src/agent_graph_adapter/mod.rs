@@ -24,9 +24,9 @@
 // STATO — FASE 3 (cablaggio reale): tutte le 14 impl concrete sono ora COSTRUITE
 // dal motore nativo ([`crate::native_engine::build_native_engine`]), che le inietta
 // nei nodi del grafo Rust. Gli `#[allow(dead_code)] // cablato in F3` per-file sono
-// stati rimossi: ciascun adapter ha ora un call site reale. Il path nativo NON e'
-// instradato in produzione (select_engine ritorna SEMPRE Python, regola G): e'
-// eseguibile/testato ma mai chiamato sul flusso reale -> regressione NULLA.
+// stati rimossi: ciascun adapter ha ora un call site reale. Il path nativo e' il
+// PRIMARIO instradato globalmente (select_engine ritorna 'rust' sulla riga jolly
+// '*'=rust, regola G): e' il flusso effettivamente eseguito per i nuovi run.
 
 // --- 8 impl FASE 2a (cablate da native_engine) ---
 pub mod agent_step_store;

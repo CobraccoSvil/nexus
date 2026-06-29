@@ -40,10 +40,12 @@
 //! final_gate) restano OFF (nessun comando -> nessun criterio, non blocca): un
 //! TODO esplicito li traccia, niente toppa.
 //!
-//! ## TODO Fase 5 (debiti di parita' da chiudere PRIMA dell'instradamento)
+//! ## DEBITI RESIDUI POST-CUTOVER (non bloccanti)
 //!
-//! Verifica adversariale 2026-06: latenti finche' `select_engine` resta python
-//! (regressione viva NULLA), ma da chiudere all'instradamento per parita' col brain:
+//! Verifica adversariale 2026-06: il motore nativo Rust e' il PRIMARIO ed e'
+//! instradato globalmente (`select_engine` ritorna `rust` sulla riga jolly
+//! `*`=rust). I punti seguenti sono debiti di parita' RESIDUI che non bloccano
+//! l'esecuzione primaria; restano da chiudere per parita' piena col brain legacy:
 //! 1. CHIUSO (F5a). `build_initial_state` valorizza `behavior_mode` con la STESSA
 //!    fonte del primario Python (`PRIMARY_BEHAVIOR_MODE`, costante riusata dal
 //!    client brain): lo shadow attraversa il grafo col mode IDENTICO. Conta dal
@@ -65,8 +67,8 @@
 //!    `confirm_native_run`). RESTA da portare il NODO che IMPOSTA
 //!    `awaiting_confirmation` (l'`interrupt_before=["executor"]` di graph.py):
 //!    finche' nessun nodo nativo valorizza il flag, un run `engine='rust'` non
-//!    raggiunge l'HITL e il resume nativo non viene esercitato in produzione. Il
-//!    resume dei run PYTHON legacy resta sul brain (`resume_run`).
+//!    raggiunge l'HITL e il resume nativo non viene ancora esercitato. Il resume
+//!    dei run PYTHON storici/rollback resta sul brain (`resume_run`).
 //! 5. CLASSIFIER LLM nel `RouterNode` (TODO `router.rs`, FIX A): la
 //!    classificazione intent via LLM (`AgenticIntentClassifier`) NON e' ancora
 //!    portata. Senza `intent_hint` il RouterNode cade nel fallback
@@ -74,16 +76,17 @@
 //!    primario (g1 sui run 0-tool, loop sui run con tool): mitigato derivando
 //!    `action_oriented`/`user_intent` dall'`intent_hint` in `build_initial_state`
 //!    (ramo Shadow, punto unico `decisions::action_oriented_for_intent`). Resta da
-//!    portare il classifier completo PRIMA del cutover: senza, i turni shadow
+//!    portare il classifier completo come debito residuo: senza, i turni shadow
 //!    SENZA `intent_hint` non hanno l'intent reale del primario.
 //!
-//! ## Stato (NON instradato in produzione)
+//! ## Stato (PRIMARIO, instradato globalmente)
 //!
-//! `select_engine` ritorna SEMPRE `python` (regola G, tabella
-//! `nexus_orchestrator_engine`). Quindi questo path e' COSTRUITO, COMPILA ed e'
-//! TESTATO end-to-end in-process, ma NON viene chiamato in produzione: la
-//! regressione e' NULLA. L'instradamento (Fase 5) e' un cambiamento di DATI nel
-//! DB, non di codice.
+//! `select_engine` ritorna `rust` sulla riga jolly `*`=rust (regola G, tabella
+//! `nexus_orchestrator_engine`): il motore nativo Rust e' il PRIMARIO in
+//! produzione e questo path e' quello effettivamente eseguito per i nuovi run.
+//! `Engine::Python` resta solo come default difensivo (riga DB assente / DB down /
+//! valore non riconosciuto), rollback per-sessione e valore storico dei run
+//! `agent_runs.engine='python'`. L'instradamento e' un dato nel DB, non codice.
 
 use std::sync::Arc;
 

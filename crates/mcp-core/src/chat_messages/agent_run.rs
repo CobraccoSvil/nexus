@@ -2197,7 +2197,8 @@ pub(crate) async fn spawn_agent_run(
     // Messaggio passato al classifier (con contesto recente) catturato per i rami
     // nativi: serve a ricostruire i dati COMPLETI del classifier del turno
     // (Tappa 1b punto B) via `resolve_classifier_fields`. Usato nei rami
-    // Engine::Shadow e Engine::Rust (entrambi non instradati globalmente).
+    // Engine::Rust (primario instradato globalmente) ed Engine::Shadow
+    // (attivabile solo per-sessione).
     let classifier_input_for_shadow: String = classifier_input.clone();
 
     // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
@@ -2331,15 +2332,14 @@ pub(crate) async fn spawn_agent_run(
         );
 
         let agent_body = std::panic::AssertUnwindSafe(async move {
-            // ── Confine di selezione del motore (strangler-fig, Fase 0) ──────────
+            // ── Confine di selezione del motore (strangler-fig) ──────────────────
             // Punto unico select_engine: legge nexus_orchestrator_engine (regola
-            // G). In Fase 0 ritorna SEMPRE Python -> si prosegue col flusso
-            // run_via_brain esistente, comportamento INVARIATO. Il record
+            // G). Cutover completo: ritorna 'rust' sulla riga jolly '*'=rust ->
+            // si esegue il PRIMARIO nativo (run_via_native). Il record
             // agent_runs.engine viene popolato per il recovery (sa su quale
-            // motore girava un run interrotto). Il ramo nativo e' uno stub
-            // (run_via_native) mai raggiunto finche' la tabella non abilita
-            // 'rust'/'shadow'; se per errore venisse selezionato, si logga e si
-            // cade in modo sicuro sul motore Python (nessun crash).
+            // motore girava un run interrotto). Il ramo Python legacy
+            // (run_via_brain) resta solo come rollback per-sessione / default
+            // difensivo (riga DB assente / DB down / valore non riconosciuto).
             let engine = select_engine(&db_clone, &session_id_cp.to_string()).await;
             let _ = sqlx::query("UPDATE agent_runs SET engine = $2 WHERE id = $1")
                 .bind(run_id)
@@ -2378,8 +2378,8 @@ pub(crate) async fn spawn_agent_run(
                 // ramo Primary deriva poi i flag fedeli (read->false: niente G1 spurio;
                 // azione->true: tool). Senza gateway o su fallback del classifier i
                 // campi restano neutri e build_initial_state lascia None (RouterNode
-                // decide, comportamento INVARIATO). Attivo SOLO per engine='rust'
-                // (per-sessione/cutover, non instradato): rischio vivo zero.
+                // decide, comportamento INVARIATO). Attivo per engine='rust', il
+                // motore primario instradato globalmente.
                 let primary_classifier = crate::native_engine::resolve_classifier_fields(
                     &db_clone,
                     state_for_finalize.orchestrator.nexus_gateway.as_ref(),
@@ -3668,8 +3668,9 @@ pub(crate) async fn spawn_agent_run(
             }
 
             // ── SHADOW (F4): ombra Rust AGGIUNTIVA dopo il primario Python ────────
-            // Solo per Engine::Shadow (NON instradato in produzione: select_engine
-            // ritorna SEMPRE Python, regola G). Il primario Python sopra e' gia'
+            // Solo per Engine::Shadow (non prodotto dal routing globale '*'=rust:
+            // attivabile solo per-sessione con engine='shadow', regola G). Il
+            // primario Python sopra e' gia'
             // concluso e i suoi agent_steps sono APPENA stati persistiti -> il
             // Replay puo' rileggerli. Lo shadow gira in un task tokio fire-and-forget
             // (NON aggiunge latenza all'utente: il primario ha gia' risposto) e su
@@ -3817,13 +3818,12 @@ pub(crate) async fn spawn_agent_run(
 }
 
 // ===========================================================================
-// Confine di selezione del motore di orchestrazione (strangler-fig, Fase 0).
+// Confine di selezione del motore di orchestrazione (strangler-fig).
 //
 // Punto UNICO (regola L) di decisione "quale motore esegue questo run":
-// `select_engine`. Il flusso esistente `run_via_brain` (motore Python) NON e'
-// toccato; si affianca solo il confine + lo stub `run_via_native`, mai
-// raggiunto in Fase 0 (la fonte DB ritorna sempre 'python'). Rischio di
-// regressione NULLO.
+// `select_engine`. Cutover completo: `run_via_native` (motore Rust) e' il path
+// PRIMARIO instradato globalmente (`*`=rust). Il flusso legacy `run_via_brain`
+// (motore Python) resta solo come rollback per-sessione / default difensivo.
 // ===========================================================================
 
 /// Motore di orchestrazione con cui un run viene eseguito.
@@ -3833,19 +3833,20 @@ pub(crate) async fn spawn_agent_run(
 /// il DB, niente env var ne' default hardcoded di emergenza).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Engine {
-    /// Motore corrente: orchestrazione nel brain Python/LangGraph (`run_via_brain`).
+    /// Motore legacy Python/LangGraph (`run_via_brain`), ora solo rollback /
+    /// default difensivo, non piu' il corrente.
     Python,
-    /// Motore nativo Rust (`nexus-agent-graph`). Non ancora raggiungibile in Fase 0.
+    /// Motore nativo PRIMARIO in produzione (`nexus-agent-graph`).
     Rust,
-    /// Doppia esecuzione di confronto (parita'): primario Python + ombra Rust
-    /// senza side-effect. Non ancora raggiungibile in Fase 0.
+    /// Doppia esecuzione di confronto (parita'): primario + ombra Rust senza
+    /// side-effect. Attivabile solo per-sessione (`engine='shadow'`).
     Shadow,
 }
 
 impl Engine {
     /// Parsing dal valore TEXT del DB. Sconosciuto -> `None` (il chiamante
-    /// decide: in Fase 0 cade sul default sicuro 'python' loggando un warn,
-    /// senza mascherare il dato malformato).
+    /// cade sul default difensivo 'python' loggando un warn, senza mascherare il
+    /// dato malformato).
     fn from_db(value: &str) -> Option<Engine> {
         match value.trim().to_ascii_lowercase().as_str() {
             "python" => Some(Engine::Python),
@@ -3873,13 +3874,13 @@ fn engine_cache() -> &'static nexus_cache::TtlCache<String, Engine> {
 /// Legge `nexus_orchestrator_engine` (mig 0451) con cache 60s PER-SCOPE. Lo
 /// `scope_key` e' il `session_id` testuale del run. Risoluzione (regola G):
 ///   1. riga con `scope_key = <scope>` (override per-sessione/progetto), se c'e';
-///   2. fallback alla riga jolly '*' (default globale, INVARIANTE 'python' in
-///      Fase 5: NON si instrada globalmente, si abilita solo il per-sessione).
+///   2. fallback alla riga jolly '*' (default globale = 'rust', instradato
+///      globalmente; l'override per-sessione resta comunque possibile).
 ///
-/// Cosi' `engine = 'shadow'`/'rust' si attiva PER-SESSIONE (riga dedicata) senza
-/// toccare il traffico globale: i run delle altre sessioni continuano a leggere
-/// la riga '*' = 'python'. Niente fallback hardcoded di emergenza: la
-/// configurazione vive nel DB.
+/// Cosi' un `engine = 'python'`/'shadow' per-sessione (riga dedicata) puo'
+/// deviare dal default globale 'rust' senza toccare il traffico delle altre
+/// sessioni, che continuano a leggere la riga '*' = 'rust'. Niente fallback
+/// hardcoded di emergenza: la configurazione vive nel DB.
 ///
 /// Cache: chiave = `scope_key` risolto. La riga specifica e la riga '*' hanno
 /// chiavi cache DISTINTE (lo scope concreto vs `ENGINE_GLOBAL_SCOPE`), quindi
@@ -3888,10 +3889,10 @@ fn engine_cache() -> &'static nexus_cache::TtlCache<String, Engine> {
 ///
 /// Comportamento difensivo coerente col resto del sistema: se il DB e'
 /// irraggiungibile o nessuna riga matcha (ne' specifica ne' '*'), ritorna
-/// `Engine::Python` (il motore stabile) loggando un warn. NON e' un "magic
-/// fallback" sul comportamento configurabile (il motore di default e' una
-/// decisione di safety): mantiene il sistema sull'unico motore validato finche'
-/// la tabella non abilita esplicitamente quello nativo.
+/// `Engine::Python` come default difensivo loggando un warn. NON e' un "magic
+/// fallback" sul comportamento configurabile (e' una decisione di safety): in
+/// assenza di configurazione leggibile ricade sul motore legacy noto invece di
+/// instradare alla cieca, mentre il default globale '*'=rust resta il primario.
 pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
     let cache = engine_cache();
     if let Some(hit) = cache.get(scope_key) {
@@ -4176,11 +4177,11 @@ async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps
 }
 
 /// Avvio del run SHADOW (Engine::Shadow): ri-esegue il grafo Rust in modalita'
-/// shadow (read-only) confrontando lo stato finale col primario Python gia'
+/// shadow (read-only) confrontando lo stato finale col primario gia'
 /// concluso (`primary_run_id`). Riusa il PUNTO UNICO `build_native_deps` +
-/// `native_engine::run_shadow` (regola L). NON instradato in produzione
-/// (select_engine ritorna SEMPRE Python). Lo shadow non impatta MAI il primario:
-/// su errore il chiamante logga WARN.
+/// `native_engine::run_shadow` (regola L). Non prodotto dal routing globale (che
+/// e' rust); attivabile solo per-sessione con `engine='shadow'`. Lo shadow non
+/// impatta MAI il primario: su errore il chiamante logga WARN.
 pub(crate) async fn run_shadow_for_state(
     state: &AppState,
     input: &crate::native_engine::NativeRunInput,
@@ -4230,7 +4231,11 @@ mod tests_select_engine {
         .expect("insert default");
 
         let engine = select_engine(&pool, "qualsiasi-scope").await;
-        assert_eq!(engine, Engine::Python, "il default globale Fase 0 e' python");
+        assert_eq!(
+            engine,
+            Engine::Python,
+            "il resolver legge il valore della riga jolly '*' (qui il fixture inserisce 'python')"
+        );
     }
 
     #[sqlx::test]
@@ -4278,9 +4283,9 @@ mod tests_select_engine {
     // logica testabile (costruzione initial_state dal prompt, mapping esito) e'
     // coperta dai test di `crate::native_engine`; il grafo end-to-end con gateway
     // scriptato e' coperto da `nexus_agent_graph::graph` (stessi tipi e builder).
-    // Qui resta la garanzia che il confine select_engine ritorna SEMPRE Python in
-    // Fase 0 (i due `select_engine_*` sopra), cosi' il path nativo non e'
-    // raggiungibile in produzione: regressione NULLA.
+    // I due `select_engine_*` sotto coprono il confine di routing: default
+    // difensivo 'python' a tabella vuota e scoping per-sessione (override sul
+    // default globale, che in produzione e' '*'=rust, il primario instradato).
 
     // ── DEBITO 3: mapping NativeRunOutcome -> AgentRunResult (finalize unico) ─────
 

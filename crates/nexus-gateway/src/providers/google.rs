@@ -70,6 +70,17 @@ const THINKING_BUDGET_FLOOR: u32 = 128;
 /// (es. pro -> 128) si interviene qui, non sparso nei call site (regola L).
 const THINKING_DISABLE_BUDGET: u32 = 0;
 
+/// Marker (case-insensitive) presente nel body d'errore HTTP 400 INVALID_ARGUMENT
+/// quando Gemini RIFIUTA `thinkingConfig.thinkingBudget=0`. Quirk per-modello: i
+/// modelli con thinking OBBLIGATORIO (es. gemini-2.5-pro, minimo documentato > 0)
+/// rispondono "The model does not support setting thinking_budget to 0."; i flash
+/// invece accettano 0 (disabilita). Anziche' mantenere una lista di modelli
+/// (fragile e in violazione della regola G), il provider RI-ESEGUE la richiesta
+/// una volta OMETTENDO il `thinkingConfig` (vedi
+/// [`GoogleProvider::send_with_thinking_retry`]). La sottostringa "thinking_budget"
+/// e' un campo dell'API (snake_case), non un nome modello hardcoded.
+const THINKING_BUDGET_ERROR_MARKER: &str = "thinking_budget";
+
 /// TTL della cache settings (60s, come gli altri provider).
 const SETTINGS_TTL: Duration = Duration::from_secs(60);
 
@@ -423,6 +434,70 @@ impl GoogleProvider {
         }
     }
 
+    /// Invia la richiesta a Gemini con RETRY-SU-400 per il quirk `thinking_budget`
+    /// (fix definitivo, regola H + L). Punto unico dell'invio condiviso da
+    /// [`complete`](LlmProvider::complete) e [`stream`](LlmProvider::stream): la
+    /// logica del retry vive QUI, i due call site delegano e non re-implementano.
+    ///
+    /// Flusso:
+    ///   1. costruisce il body con il `thinking` gia' risolto da
+    ///      [`resolve_thinking`] e lo invia via [`send_with_region_fallback`];
+    ///   2. se l'esito e' HTTP 400 e il body d'errore contiene
+    ///      [`THINKING_BUDGET_ERROR_MARKER`] (quirk: il modello rifiuta
+    ///      `thinkingBudget=0`, tipico di gemini-2.5-pro), RI-COSTRUISCE il body
+    ///      con [`GoogleThinking::Absent`] — cioe' SENZA alcun `thinkingConfig` —
+    ///      e RI-INVIA UNA sola volta. Omettendo il blocco, Gemini applica il suo
+    ///      default (thinking ON sui modelli con thinking obbligatorio, invariato
+    ///      altrove): evita il 400 senza sapere a priori quali modelli accettano 0;
+    ///   3. ogni altro status (incluso un 400 di natura diversa) NON innesca il
+    ///      retry: la risposta originale risale al chiamante invariata.
+    ///
+    /// Ritorna la `Response` FINALE (successo o errore non-retriabile). Il caller
+    /// e' responsabile di controllare `status().is_success()` come prima: questo
+    /// metodo non altera la gestione d'errore esistente, aggiunge solo il singolo
+    /// retry mirato. Il retry e' saltato del tutto se il body iniziale non aveva
+    /// `thinkingConfig` (niente da omettere -> il 400 e' di altra natura).
+    async fn send_with_thinking_retry(
+        &self,
+        backend: &GoogleBackend,
+        req: &LlmRequest,
+        thinking: GoogleThinking,
+        stream: bool,
+    ) -> anyhow::Result<reqwest::Response> {
+        let body = build_request_body(req, thinking);
+        let had_thinking_config = !matches!(thinking, GoogleThinking::Absent);
+        let resp = self
+            .send_with_region_fallback(backend, &req.model, stream, &body)
+            .await?;
+
+        // Retry mirato solo se: status 400 + avevamo davvero un thinkingConfig da
+        // omettere + il body d'errore parla di thinking_budget. Negli altri casi la
+        // risposta passa intatta (incluso 400 di natura diversa).
+        if resp.status().as_u16() != 400 || !had_thinking_config {
+            return Ok(resp);
+        }
+
+        // Consuma il body d'errore per ispezionarlo. Se NON e' il quirk
+        // thinking_budget dobbiamo restituire comunque l'errore al chiamante: ma la
+        // `Response` e' gia' consumata, quindi rifabbrichiamo un errore equivalente
+        // a quello che il call site avrebbe prodotto (`google HTTP 400: <body>`).
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !is_thinking_budget_error(&text) {
+            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+        }
+
+        // Quirk confermato: ri-eseguo OMETTENDO il thinkingConfig (GoogleThinking::
+        // Absent -> nessun blocco nel body). Non logghiamo il body (regola F).
+        tracing::warn!(
+            model = %req.model,
+            "gemini ha rifiutato thinkingBudget=0; ri-invio senza thinkingConfig (quirk thinking obbligatorio)"
+        );
+        let retry_body = build_request_body(req, GoogleThinking::Absent);
+        self.send_with_region_fallback(backend, &req.model, stream, &retry_body)
+            .await
+    }
+
     /// URL dell'azione per il modello richiesto. `stream=true` usa
     /// `streamGenerateContent?alt=sse`, altrimenti `generateContent`.
     fn endpoint(&self, model: &str, stream: bool) -> String {
@@ -465,13 +540,13 @@ impl LlmProvider for GoogleProvider {
         let backend = self.resolved_backend().await?;
         let configured = self.configured_thinking_budget().await;
         let thinking = resolve_thinking(req, configured);
-        let body = build_request_body(req, thinking);
         let start = Instant::now();
 
-        // Invio con fallback di region per Vertex (mig 0476): la prima region
-        // non-404 vince; per Gemini e' un singolo invio invariato.
+        // Invio con fallback di region per Vertex (mig 0476) e retry-su-400 per il
+        // quirk thinking_budget (punto unico send_with_thinking_retry): la prima
+        // region non-404 vince; per Gemini e' un singolo invio invariato.
         let resp = self
-            .send_with_region_fallback(&backend, &req.model, false, &body)
+            .send_with_thinking_retry(&backend, req, thinking, false)
             .await?;
 
         let status = resp.status();
@@ -491,14 +566,15 @@ impl LlmProvider for GoogleProvider {
         let backend = self.resolved_backend().await?;
         let configured = self.configured_thinking_budget().await;
         let thinking = resolve_thinking(req, configured);
-        let body = build_request_body(req, thinking);
 
         // Fallback di region risolto sullo STATUS HTTP iniziale (mig 0476): il 404
         // arriva prima di qualunque byte di stream, quindi scegliamo la region
-        // PRIMA di iniziare a consumare lo stream. Solo a risposta non-404 (e poi
-        // 2xx) si avvia il consumo dei bytes piu' sotto.
+        // PRIMA di iniziare a consumare lo stream. Il retry-su-400 thinking_budget
+        // (punto unico send_with_thinking_retry) avviene anch'esso prima del primo
+        // byte, perche' Gemini risponde 400 sullo status iniziale. Solo a risposta
+        // non-404 (e poi 2xx) si avvia il consumo dei bytes piu' sotto.
         let resp = self
-            .send_with_region_fallback(&backend, &req.model, true, &body)
+            .send_with_thinking_retry(&backend, req, thinking, true)
             .await?;
 
         let status = resp.status();
@@ -1014,6 +1090,16 @@ enum GoogleThinking {
     DisabledForTools,
     /// Thinking attivo con `budget` token riservati al reasoning.
     Enabled(u32),
+}
+
+/// Riconosce, dal body d'errore HTTP 400, il quirk Gemini "il modello non
+/// supporta thinkingBudget=0" (punto unico, funzione PURA testabile senza IO).
+/// Discrimina questo 400 specifico da tutti gli altri 400 (schema invalido,
+/// function-call mismatch, ecc.): solo per questo si fa il retry-senza-thinking.
+/// Match case-insensitive sul campo d'API [`THINKING_BUDGET_ERROR_MARKER`].
+fn is_thinking_budget_error(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains(THINKING_BUDGET_ERROR_MARKER)
 }
 
 /// Budget thinking effettivo per la richiesta (parita' col Python ~470-503).
@@ -3571,5 +3657,66 @@ mod tests {
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0].parts[0].text.as_deref(), Some("ciao"));
         assert_eq!(contents[1].parts[0].text.as_deref(), Some("salve"));
+    }
+
+    // --- Quirk thinking_budget=0 (retry-su-400) ----------------------------
+
+    #[test]
+    fn riconosce_errore_thinking_budget_e_ignora_gli_altri_400() {
+        // Il messaggio REALE di produzione (gemini-2.5-pro col gate tool) deve
+        // innescare il riconoscimento, anche con maiuscole/punteggiatura diverse.
+        assert!(is_thinking_budget_error(
+            "The model does not support setting thinking_budget to 0."
+        ));
+        assert!(is_thinking_budget_error(
+            r#"{"error":{"code":400,"message":"thinking_budget out of range","status":"INVALID_ARGUMENT"}}"#
+        ));
+        // Un 400 di NATURA DIVERSA (schema invalido, mismatch function-call) NON
+        // deve essere scambiato per il quirk: niente retry-senza-thinking li'.
+        assert!(!is_thinking_budget_error(
+            "Please ensure that the number of function response parts is equal to the number of function call parts"
+        ));
+        assert!(!is_thinking_budget_error(
+            r#"{"error":{"message":"Invalid JSON payload received."}}"#
+        ));
+        assert!(!is_thinking_budget_error(""));
+    }
+
+    #[test]
+    fn retry_ricostruisce_il_body_senza_thinking_config() {
+        // Cuore del retry-su-400: il body INIZIALE (gate tool -> DisabledForTools)
+        // porta un thinkingConfig esplicito con thinkingBudget=0 (cio' che
+        // gemini-2.5-pro rifiuta); il body del RETRY (GoogleThinking::Absent, cioe'
+        // thinkingConfig OMESSO) NON deve contenere alcun thinkingConfig, cosi'
+        // Gemini applica il suo default e il 400 sparisce. Questa e' la funzione
+        // pura di costruzione del body che send_with_thinking_retry riusa: testarla
+        // qui copre l'invariante senza bisogno di un mock HTTP.
+        let req = req_with_tools(vec![msg("user", "leggi x")], true);
+
+        // Replica la risoluzione del gate: con tool presenti -> DisabledForTools.
+        let initial = resolve_thinking(&req, 8192);
+        assert_eq!(initial, GoogleThinking::DisabledForTools);
+        let body_iniziale = serde_json::to_value(build_request_body(&req, initial)).unwrap();
+        assert_eq!(
+            body_iniziale["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0,
+            "il body iniziale deve portare il thinkingBudget=0 che pro rifiuta"
+        );
+
+        // Body del retry: ricostruito con Absent come fa send_with_thinking_retry.
+        let body_retry =
+            serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
+        assert!(
+            body_retry["generationConfig"]
+                .get("thinkingConfig")
+                .is_none(),
+            "il body del retry NON deve contenere thinkingConfig"
+        );
+        // I tool restano dichiarati nel retry: omettiamo SOLO il thinkingConfig,
+        // non i function-declarations (la richiesta resta una richiesta agentica).
+        assert_eq!(
+            body_retry["tools"][0]["functionDeclarations"][0]["name"],
+            "read_file"
+        );
     }
 }
