@@ -98,6 +98,7 @@ use uuid::Uuid;
 use nexus_agent_graph::nodes::{
     ExecutorConfig, ExecutorNode, VerifierConfig, VerifierNode,
 };
+use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
     LlmGateway, MetaStepStore, ModelUpscalePort, NextActionsDeriver, RunControlStore, TodoStore,
@@ -425,6 +426,26 @@ async fn setting_csv(db: &PgPool, key: &str, default: Vec<String>) -> Vec<String
     }
 }
 
+/// Legge un setting CSV di interi (es. "3,7,15,30") col fallback al `default`
+/// (lista). Degrada IN BLOCCO al default se la chiave manca, e' vuota o se UN
+/// QUALSIASI elemento non e' parsabile: niente liste parziali silenziose (le
+/// fasi di compressione vanno coerenti tra boundaries/keep_recent/max_chars).
+async fn setting_i64_csv(db: &PgPool, key: &str, default: Vec<i64>) -> Vec<i64> {
+    match nexus_auth::get_setting(db, key).await {
+        Some(raw) => {
+            let parsed: Option<Vec<i64>> = raw
+                .split(',')
+                .map(|s| s.trim().parse::<i64>().ok())
+                .collect();
+            match parsed {
+                Some(v) if !v.is_empty() => v,
+                _ => default,
+            }
+        }
+        None => default,
+    }
+}
+
 /// Legge un setting stringa dal DB col fallback al `default` se la chiave e'
 /// assente. NB: una stringa presente ma VUOTA viene restituita com'e' (stringa
 /// vuota), NON cade sul default: la semantica "vuoto = disabilitato" e'
@@ -557,13 +578,23 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
 /// Costruisce la [`ExecutorConfig`] DB-driven (regola G): provider/model sono
 /// RISOLTI A MONTE (passati come parametri, mai letti dal nodo); i flag/soglie
 /// anti-loop + smart-upscale + direttiva di verifica vengono letti dal DB col
-/// PUNTO UNICO `nexus_auth::get_setting` (helper `setting_*`). Gli ALTRI campi
-/// (context window, reminder, ctx_mgmt, capability risolte a monte) restano al
-/// `Default` (safe-default identico ai safe-default del brain: valgono SOLO se la
-/// chiave manca o il DB e' irraggiungibile, mai come magic fallback). Le chiavi
+/// PUNTO UNICO `nexus_auth::get_setting` (helper `setting_*`). Il `context_window`
+/// del modello del turno (gia' risolto a monte da `resolve_context_window`, regola G)
+/// arriva come PARAMETRO ed e' impostato qui: era il bug che lo lasciava a 0 (il
+/// valore finiva solo nel `ToolDispatchConfig`, mai nell'ExecutorConfig), rendendo
+/// INERTI tutte le difese gate da `if context_window > 0` (token_brake, forced_rag,
+/// smart-upscale). I parametri di context management (`agent.context.*`, mig 0199/0429)
+/// sono ora letti dal DB e popolano `ctx_mgmt` / `token_brake` / `forced_rag_*` invece
+/// di restare ai safe-default hardcoded del nodo (regola G: il DB e' l'unica fonte; i
+/// `Default` valgono SOLO se la chiave manca o il DB e' irraggiungibile). Le chiavi
 /// `agent.progress_controller_enabled` / `agent.repeated_action_force_diagnose_enabled`
 /// usano l'underscore: e' la chiave reale del setting nel DB.
-async fn load_executor_config(db: &PgPool, provider: &str, model: &str) -> ExecutorConfig {
+async fn load_executor_config(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    context_window: i64,
+) -> ExecutorConfig {
     let d = ExecutorConfig::default();
     ExecutorConfig {
         routing_provider: provider.to_string(),
@@ -585,6 +616,33 @@ async fn load_executor_config(db: &PgPool, provider: &str, model: &str) -> Execu
         tool_choice_forcing_enabled: setting_bool(db, "agent.tool_choice_forcing_enabled", d.tool_choice_forcing_enabled).await,
         tool_choice_forcing_max_iteration: setting_i64(db, "agent.tool_choice_forcing_max_iteration", d.tool_choice_forcing_max_iteration).await,
         tool_choice_style: crate::capability::resolve_tool_choice_style(db, provider, model).await,
+        // ── context management (mig 0199/0429): il bug + l'inerzia ────────────
+        // context_window (passato come parametro): senza questo era 0 -> token_brake
+        // / forced_rag / smart-upscale tutti no-op (gate `if context_window > 0`).
+        context_window,
+        // Fasi di compressione DB-driven: i valori AGGRESSIVI (mig 0429,
+        // compress_start_iter=3, boundaries [3,7,15,30], keep_recent [5,3,2,1],
+        // max_chars [1200,600,300,100]) erano IGNORATI perche' load_executor_config
+        // chiudeva con `..Default::default()` (safe-default permissivi). Ora dal DB.
+        ctx_mgmt: CtxMgmtConfig {
+            compress_start_iter: setting_i64(db, "agent.context.compress_start_iter", d.ctx_mgmt.compress_start_iter).await,
+            compress_phase_boundaries: setting_i64_csv(db, "agent.context.compress_phase_boundaries", d.ctx_mgmt.compress_phase_boundaries.clone()).await,
+            compress_phase_keep_recent: setting_i64_csv(db, "agent.context.compress_phase_keep_recent", d.ctx_mgmt.compress_phase_keep_recent.clone()).await,
+            compress_phase_max_chars: setting_i64_csv(db, "agent.context.compress_phase_max_chars", d.ctx_mgmt.compress_phase_max_chars.clone()).await,
+        },
+        // Freno token: la soglia hard (0.55 in DB vs 0.70 default) e i parametri
+        // aggressivi, ora dal DB.
+        token_brake: TokenBrakeConfig {
+            max_context_ratio: setting_f64(db, "agent.context.max_context_ratio", d.token_brake.max_context_ratio).await,
+            aggressive_keep_recent: setting_i64(db, "agent.context.aggressive_keep_recent", d.token_brake.aggressive_keep_recent as i64).await.max(0) as usize,
+            aggressive_max_chars: setting_i64(db, "agent.context.aggressive_max_chars", d.token_brake.aggressive_max_chars as i64).await.max(0) as usize,
+        },
+        // Forced-RAG reminder: ratio + testo dal DB (erano vuoti/0.0 -> reminder mai
+        // iniettato anche con offload attivo).
+        forced_rag_ratio: setting_f64(db, "agent.context.forced_rag_threshold_ratio", d.forced_rag_ratio).await,
+        forced_rag_reminder_text: setting_string(db, "agent.context.forced_rag_reminder_text", &d.forced_rag_reminder_text).await,
+        turn_focus_enabled: setting_bool(db, "agent.context.turn_focus_enabled", d.turn_focus_enabled).await,
+        discovery_max_injected: setting_i64(db, "agent.tools.discovery_max_injected", d.discovery_max_injected as i64).await.max(0) as usize,
         ..ExecutorConfig::default()
     }
 }
@@ -798,7 +856,7 @@ async fn build_native_engine(
     let final_gate_cfg = load_final_gate_config(&db).await;
     let verifier_cfg = load_verifier_config(&db).await;
 
-    let exec_cfg = load_executor_config(&db, &input.provider, &input.model).await;
+    let exec_cfg = load_executor_config(&db, &input.provider, &input.model, context_window).await;
 
     let tool_dispatch_cfg = ToolDispatchConfig {
         context_window,
@@ -2298,6 +2356,38 @@ mod tests {
             cfg.is_eligible(Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE), Some("code"), 1000),
             "planner eleggibile col behavior_mode del primario + intent + budget"
         );
+    }
+
+    #[sqlx::test]
+    async fn load_executor_config_aggancia_context_window_e_compress_settings(pool: sqlx::PgPool) {
+        // REGRESSIONE (gap porting context): context_window finiva SOLO nel
+        // ToolDispatchConfig, mai nell'ExecutorConfig -> restava 0 -> token_brake /
+        // forced_rag / smart-upscale INERTI (gate `if context_window > 0`). Inoltre i
+        // settings agent.context.* (mig 0429, valori aggressivi) erano IGNORATI perche'
+        // load_executor_config chiudeva con `..Default::default()`. Qui verifichiamo il
+        // wiring DB-driven (regola G): context_window agganciato + ctx_mgmt/token_brake
+        // dal DB; + degrado in blocco al default per un CSV malformato (max_chars).
+        create_settings_table(&pool).await;
+        set_setting(&pool, "agent.context.compress_start_iter", "3").await;
+        set_setting(&pool, "agent.context.compress_phase_boundaries", "3,7,15,30").await;
+        set_setting(&pool, "agent.context.compress_phase_keep_recent", "5,3,2,1").await;
+        // CSV malformato di proposito: deve degradare IN BLOCCO al default safe.
+        set_setting(&pool, "agent.context.compress_phase_max_chars", "1200,xxx,300,100").await;
+        set_setting(&pool, "agent.context.max_context_ratio", "0.55").await;
+        set_setting(&pool, "agent.context.forced_rag_threshold_ratio", "0.30").await;
+
+        let cfg = load_executor_config(&pool, "anthropic", "claude-x", 200_000).await;
+        // context_window agganciato (era il bug: restava 0).
+        assert_eq!(cfg.context_window, 200_000);
+        // ctx_mgmt dal DB (aggressivo), non il default permissivo [5,10,20,50].
+        assert_eq!(cfg.ctx_mgmt.compress_start_iter, 3);
+        assert_eq!(cfg.ctx_mgmt.compress_phase_boundaries, vec![3, 7, 15, 30]);
+        assert_eq!(cfg.ctx_mgmt.compress_phase_keep_recent, vec![5, 3, 2, 1]);
+        // CSV malformato -> degrado IN BLOCCO al default del nodo (non lista parziale).
+        assert_eq!(cfg.ctx_mgmt.compress_phase_max_chars, vec![2000, 1000, 500, 150]);
+        // token_brake dal DB (0.55 < 0.70 default).
+        assert!((cfg.token_brake.max_context_ratio - 0.55).abs() < 1e-9);
+        assert!((cfg.forced_rag_ratio - 0.30).abs() < 1e-9);
     }
 
     #[sqlx::test]
