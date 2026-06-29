@@ -1111,6 +1111,7 @@ mod tests {
                     Ok(o) => Ok(o),
                     Err(e) => Err(match e {
                         PortError::Llm(s) => PortError::Llm(s),
+                        PortError::ProviderUnavailable(s) => PortError::ProviderUnavailable(s),
                         PortError::Tool(s) => PortError::Tool(s),
                         PortError::ReplayMissing(s) => PortError::ReplayMissing(s),
                     }),
@@ -1120,6 +1121,9 @@ mod tests {
                 match q.first() {
                     Some(Ok(o)) => Ok(o.clone()),
                     Some(Err(PortError::Llm(s))) => Err(PortError::Llm(s.clone())),
+                    Some(Err(PortError::ProviderUnavailable(s))) => {
+                        Err(PortError::ProviderUnavailable(s.clone()))
+                    }
                     Some(Err(PortError::Tool(s))) => Err(PortError::Tool(s.clone())),
                     Some(Err(PortError::ReplayMissing(s))) => {
                         Err(PortError::ReplayMissing(s.clone()))

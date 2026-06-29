@@ -31,6 +31,16 @@ pub enum PortError {
     /// Il gateway LLM ha risposto con un errore (provider down, billing, 4xx).
     #[error("gateway LLM: {0}")]
     Llm(String),
+    /// Il gateway LLM ha risposto che il/i provider risolti per la richiesta NON
+    /// sono disponibili (cooldown billing/transient o `PROVIDER_ERROR` aggregato:
+    /// "tutti i provider hanno fallito"). E' un SEGNALE STRUTTURATO distinto da
+    /// [`PortError::Llm`] generico (regola L): il nodo executor lo matcha per
+    /// tentare il FALLBACK cross-provider (escalation) invece di chiudere il run
+    /// con `StopReason::Error`. Il discriminante e' il CODICE errore del gateway
+    /// (`PROVIDER_ERROR` nel body del 500), NON il testo lessicale "in cooldown"
+    /// (fragile): la mappatura vive nell'adapter concreto (`llm_gateway.rs`).
+    #[error("provider non disponibile: {0}")]
+    ProviderUnavailable(String),
     /// L'esecuzione di un tool e' fallita (ToolRunner down o errore applicativo).
     #[error("esecuzione tool: {0}")]
     Tool(String),

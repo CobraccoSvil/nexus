@@ -1745,6 +1745,89 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         let mut resp = match ctx.llm.complete(req).await {
             Ok(r) => r,
             Err(err) => {
+                // FALLBACK cross-provider sul provider in cooldown/indisponibile
+                // (regola H, fix localizzato): se il gateway ha segnalato in modo
+                // STRUTTURATO che il provider scelto NON e' disponibile
+                // ([`PortError::ProviderUnavailable`], = 500 `PROVIDER_ERROR`: tutti
+                // i provider risolti per QUESTA richiesta in cooldown), NON chiudere
+                // il run con `StopReason::Error`: prova a RIPIEGARE su un provider
+                // SANO riusando lo STESSO meccanismo dell'escalation G1 (punto unico
+                // `escalation_inputs` + `pick_escalation_model`, regola L). Forziamo
+                // `provider_in_cooldown=true` per il provider corrente cosi' il Tier 1
+                // intra-provider viene SALTATO e si sceglie il cross-provider
+                // (`loop_fallback_default`). Se c'e' un candidato, promuoviamo lo
+                // sticky e usciamo con `G1Escalated`: il self-loop rientra
+                // nell'executor col provider sano (stesso pattern del ramo G1). Solo
+                // a escalation ESAURITA (nessun candidato) cadiamo nella chiusura
+                // `Error` sottostante. Gated `auto_escalations < 3` come gli altri
+                // rami di escalation (no escalation a raffica).
+                if matches!(err, crate::runtime::ports::PortError::ProviderUnavailable(_)) {
+                    let cd_escal = state
+                        .extra
+                        .get("auto_escalations")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    if cd_escal < 3 {
+                        // Provider/model correnti del turno (gia' risolti sopra). Il
+                        // provider corrente e' in cooldown -> `provider_in_cooldown=true`
+                        // forzato a prescindere dal gate ADR 0020 (il segnale e' gia'
+                        // il 500 del gateway, non serve ri-interrogare il cooldown set).
+                        let inputs = self
+                            .escalation
+                            .escalation_inputs(
+                                state.user_intent.as_deref(),
+                                Some(&provider),
+                                Some(&model),
+                            )
+                            .await
+                            .unwrap_or_default();
+                        if let Some(pick) = pick_escalation_model(
+                            &inputs.chain,
+                            Some(&provider),
+                            Some(&model),
+                            cd_escal,
+                            // FORZATO: il provider corrente e' in cooldown (segnale
+                            // strutturato del gateway), salta il Tier 1 intra-provider.
+                            true,
+                            inputs.cross_provider.as_ref(),
+                        ) {
+                            tracing::warn!(
+                                target: "nexus_agent_graph::executor",
+                                from_provider = %provider,
+                                to_provider = %pick.provider,
+                                to_model = %pick.model,
+                                from_chain = pick.from_chain,
+                                "provider in cooldown -> FALLBACK cross-provider via escalation"
+                            );
+                            let esc_nudge = human_msg(
+                                "Il provider precedente non e' disponibile (in cooldown). \
+Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito.",
+                            );
+                            let mut extra_out = state.extra.clone();
+                            extra_out
+                                .insert("auto_escalations".to_string(), json!(cd_escal + 1));
+                            return Ok(StateDelta {
+                                messages: Some(vec![esc_nudge]),
+                                sticky_provider: Some(Some(pick.provider)),
+                                sticky_model: Some(Some(pick.model)),
+                                g1_reroute_count: Some(Some(0)),
+                                action_nudge_count: Some(Some(0)),
+                                pending_tool_uses: Some(Some(vec![])),
+                                stop_reason: Some(Some(StopReason::G1Escalated)),
+                                iterations: Some(Some(iters_in + 1)),
+                                extra: Some(extra_out),
+                                ..Default::default()
+                            }
+                            .into_opaque());
+                        }
+                    }
+                    tracing::warn!(
+                        target: "nexus_agent_graph::executor",
+                        provider = %provider,
+                        auto_escalations = cd_escal,
+                        "provider in cooldown ma nessun candidato cross-provider: chiusura Error"
+                    );
+                }
                 // try/except onnicomprensivo Python: result="[Errore provider ...]",
                 // stop_reason="error" (NON NodeError: il run prosegue al routing).
                 tracing::error!(

@@ -426,6 +426,7 @@ async fn happy_path_tool_use_produce_pending() {
     let llm = Arc::new(StubLlmGateway {
         canned,
         error: None,
+        error_provider_unavailable: false,
         seen: std::sync::Mutex::new(vec![]),
     });
     let ctx = ctx_with(llm.clone(), false);
@@ -493,6 +494,7 @@ async fn executor_emette_tool_use_su_pending() {
     let llm = Arc::new(StubLlmGateway {
         canned,
         error: None,
+        error_provider_unavailable: false,
         seen: std::sync::Mutex::new(vec![]),
     });
     let sink = Arc::new(RecordingEventSink::default());
@@ -993,6 +995,82 @@ async fn errore_gateway_persiste_contatori() {
     // auto_escalations emesso nel delta (FIX 3): invariato a 0 (escalation TODO).
     assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(0));
     // UNA sola chiamata LLM: nessun retry-senza-forcing sul ramo error gateway.
+    assert_eq!(llm.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
+    // FALLBACK cross-provider (regola H): il provider scelto e' in cooldown e il
+    // gateway ritorna in modo STRUTTURATO PortError::ProviderUnavailable. L'executor
+    // NON deve chiudere con StopReason::Error: deve ESCALARE al provider sano (cross-
+    // provider) riusando il punto unico pick_escalation_model -> sticky promosso +
+    // StopReason::G1Escalated (il self-loop rientra col provider sano).
+    let rc = Arc::new(StubRunControlStore::default());
+    // Solo candidato cross-provider disponibile (catena intra-provider vuota: il
+    // provider corrente e' in cooldown, Tier 1 saltato per costruzione).
+    let esc = Arc::new(StubEscalationPort::with_cross("mistral", "mistral-large-2411"));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_provider_unavailable(
+        "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> anthropic \
+(in cooldown, 42s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("scrivi il file")],
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-x".into()),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire");
+    let out = apply(state, delta);
+    // Escalation cross-provider, NON chiusura Error.
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_provider.as_deref(), Some("mistral"));
+    assert_eq!(out.sticky_model.as_deref(), Some("mistral-large-2411"));
+    assert_eq!(out.g1_reroute_count, Some(0));
+    assert_eq!(out.action_nudge_count, Some(0));
+    assert!(out.pending_tool_uses.unwrap().is_empty());
+    // auto_escalations incrementato (0 -> 1): gate < 3 rispettato.
+    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    // UNA sola chiamata LLM (quella fallita): la ri-esecuzione avviene nel self-loop
+    // successivo del grafo, non dentro questo turno.
+    assert_eq!(llm.seen.lock().unwrap().len(), 1);
+    // La porta escalation e' stata interrogata col provider/model correnti.
+    let seen = esc.seen.lock().unwrap();
+    let last = seen.last().unwrap();
+    assert_eq!(last.1.as_deref(), Some("anthropic"));
+    assert_eq!(last.2.as_deref(), Some("claude-x"));
+}
+
+#[tokio::test]
+async fn provider_cooldown_senza_candidato_chiude_error() {
+    // Contro-prova: provider in cooldown (ProviderUnavailable) ma NESSUN candidato
+    // cross-provider (porta vuota) -> nessun fallback possibile, l'executor chiude
+    // con StopReason::Error come prima (comportamento esistente preservato).
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota
+    let llm = Arc::new(StubLlmGateway::with_provider_unavailable(
+        "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> anthropic \
+(in cooldown, 42s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("scrivi il file")],
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-x".into()),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire");
+    let out = apply(state, delta);
+    // Nessun candidato -> chiusura Error (fallback graceful), sticky invariato.
+    assert_eq!(out.stop_reason, Some(StopReason::Error));
+    assert!(out.result.as_deref().unwrap().contains("[Errore provider"));
+    assert!(out.sticky_provider.is_none());
+    assert!(out.pending_tool_uses.unwrap().is_empty());
     assert_eq!(llm.seen.lock().unwrap().len(), 1);
 }
 

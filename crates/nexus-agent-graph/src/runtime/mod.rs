@@ -55,9 +55,14 @@ pub mod test_doubles {
     pub struct StubLlmGateway {
         /// Risposta fissa ritornata da ogni `complete`.
         pub canned: LlmResponse,
-        /// Se `Some`, `complete` ritorna `Err(PortError::Llm(_))` (provider down/
-        /// billing): esercita il ramo error del nodo (parita' con l'except Python).
+        /// Se `Some`, `complete` ritorna un `Err`: esercita il ramo error del nodo
+        /// (parita' con l'except Python). La VARIANTE e' decisa da
+        /// [`Self::error_provider_unavailable`].
         pub error: Option<String>,
+        /// Se `true` (e `error` e' `Some`), `complete` ritorna
+        /// `Err(PortError::ProviderUnavailable(_))` invece di `PortError::Llm(_)`:
+        /// esercita il ramo FALLBACK cross-provider del nodo (provider in cooldown).
+        pub error_provider_unavailable: bool,
         /// Richieste registrate (in ordine d'arrivo).
         pub seen: Mutex<Vec<LlmRequest>>,
     }
@@ -73,6 +78,7 @@ pub mod test_doubles {
                     ..Default::default()
                 },
                 error: None,
+                error_provider_unavailable: false,
                 seen: Mutex::new(vec![]),
             }
         }
@@ -93,6 +99,7 @@ pub mod test_doubles {
                     ..Default::default()
                 },
                 error: None,
+                error_provider_unavailable: false,
                 seen: Mutex::new(vec![]),
             }
         }
@@ -104,6 +111,20 @@ pub mod test_doubles {
             Self {
                 canned: LlmResponse::default(),
                 error: Some(message.to_string()),
+                error_provider_unavailable: false,
+                seen: Mutex::new(vec![]),
+            }
+        }
+
+        /// Crea uno stub il cui `complete` fallisce sempre con
+        /// `PortError::ProviderUnavailable` (provider scelto in cooldown): per il
+        /// ramo FALLBACK cross-provider del nodo (escalation invece di chiusura
+        /// `Error`).
+        pub fn with_provider_unavailable(message: &str) -> Self {
+            Self {
+                canned: LlmResponse::default(),
+                error: Some(message.to_string()),
+                error_provider_unavailable: true,
                 seen: Mutex::new(vec![]),
             }
         }
@@ -114,6 +135,9 @@ pub mod test_doubles {
         async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
             self.seen.lock().expect("lock seen").push(req);
             if let Some(msg) = &self.error {
+                if self.error_provider_unavailable {
+                    return Err(PortError::ProviderUnavailable(msg.clone()));
+                }
                 return Err(PortError::Llm(msg.clone()));
             }
             Ok(self.canned.clone())

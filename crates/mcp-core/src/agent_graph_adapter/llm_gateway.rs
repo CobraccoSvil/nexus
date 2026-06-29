@@ -83,8 +83,31 @@ impl LlmGateway for GatewayLlmAdapter {
             .gateway
             .complete(gw_req)
             .await
-            .map_err(|e| PortError::Llm(e.to_string()))?;
+            .map_err(|e| classify_gateway_error(&e.to_string()))?;
         Ok(map_gw_response(resp))
+    }
+}
+
+/// Classifica l'errore di stringa del gateway concreto nella variante di porta
+/// corretta. PUNTO UNICO (regola L) della traduzione errore-gateway -> [`PortError`]:
+/// e' l'unico confine fra il formato d'errore del `NexusGatewayClient`
+/// (`anyhow::Error` -> stringa `"Nexus Gateway {status}: {body}"`) e la porta.
+///
+/// SEGNALE STRUTTURATO (NON match sul testo lessicale "in cooldown", fragile):
+/// quando tutti i provider risolti per la richiesta sono indisponibili (cooldown
+/// billing/transient) il server `nexus-gateway` ritorna un **500** con body JSON
+/// `{ "error": "...", "code": "PROVIDER_ERROR" }` (vedi `routes.rs::run_fallback`
+/// + `PipelineError::provider`). Il discriminante stabile e' il CODICE
+/// `PROVIDER_ERROR` (contratto del gateway, invariante alla lingua del messaggio),
+/// che mappiamo su [`PortError::ProviderUnavailable`]: l'executor lo riconosce per
+/// tentare il FALLBACK cross-provider invece di chiudere il run con
+/// `StopReason::Error`. Ogni altro errore (4xx di richiesta, parse, HTTP) resta un
+/// [`PortError::Llm`] generico (chiusura come prima).
+fn classify_gateway_error(msg: &str) -> PortError {
+    if msg.contains("PROVIDER_ERROR") {
+        PortError::ProviderUnavailable(msg.to_string())
+    } else {
+        PortError::Llm(msg.to_string())
     }
 }
 
@@ -663,6 +686,42 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    // ── classify_gateway_error: segnale strutturato cooldown/provider ─────────
+
+    #[test]
+    fn classify_provider_error_code_diventa_provider_unavailable() {
+        // Il 500 aggregato del gateway porta code=PROVIDER_ERROR: e' il segnale
+        // strutturato che l'executor matcha per il fallback cross-provider.
+        let msg = "Nexus Gateway 500 Internal Server Error: {\"error\":\"tutti i provider \
+hanno fallito -> anthropic (in cooldown, 42s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}";
+        assert!(matches!(
+            classify_gateway_error(msg),
+            PortError::ProviderUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn classify_provider_error_indipendente_dal_testo_lessicale() {
+        // Discriminante = CODICE, non la frase "in cooldown" (puo' cambiare lingua):
+        // anche un messaggio billing senza la parola "cooldown" e' riconosciuto.
+        let msg = "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> \
+mistral (cooldown billing, 600s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}";
+        assert!(matches!(
+            classify_gateway_error(msg),
+            PortError::ProviderUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn classify_altri_errori_restano_llm_generico() {
+        // Un 400 di richiesta (BAD_REQUEST) o un errore HTTP non e' un cooldown:
+        // resta Llm generico -> l'executor chiude come prima (StopReason::Error).
+        let bad = "Nexus Gateway 400 Bad Request: {\"error\":\"model non valido\",\"code\":\"BAD_REQUEST\"}";
+        assert!(matches!(classify_gateway_error(bad), PortError::Llm(_)));
+        let http = "Nexus Gateway HTTP error: connection refused";
+        assert!(matches!(classify_gateway_error(http), PortError::Llm(_)));
     }
 
     // ── force_tool_choice end-to-end (BEFORE/AFTER) ───────────────────────────
