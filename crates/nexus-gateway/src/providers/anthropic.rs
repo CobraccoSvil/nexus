@@ -1229,6 +1229,7 @@ mod tests {
             tool_calls: None,
             name: None,
             thinking_signature: None,
+            reasoning: None,
         }
     }
 
@@ -1766,6 +1767,7 @@ mod tests {
             tool_calls: None,
             name: None,
             thinking_signature: None,
+            reasoning: None,
         }
     }
 

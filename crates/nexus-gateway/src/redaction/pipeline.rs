@@ -206,6 +206,10 @@ fn with_content(msg: &LlmMessage, text: String) -> LlmMessage {
         tool_calls: msg.tool_calls.clone(),
         name: msg.name.clone(),
         thinking_signature: msg.thinking_signature.clone(),
+        // Il reasoning_content DeepSeek di un turno assistant precedente viaggia
+        // intatto attraverso la redaction (non e' un payload testuale da
+        // redarre: e' il pensiero da ri-passare all'API, vincolo HTTP 400).
+        reasoning: msg.reasoning.clone(),
     }
 }
 
@@ -238,6 +242,7 @@ mod tests {
             tool_calls: None,
             name: None,
             thinking_signature: None,
+            reasoning: None,
         }
     }
 
@@ -361,6 +366,7 @@ mod tests {
             tool_calls: None,
             name: None,
             thinking_signature: None,
+            reasoning: None,
         };
         let req = request(vec![sys], "req-sys");
         let res = p.redact(&req).await.expect("redazione ok");

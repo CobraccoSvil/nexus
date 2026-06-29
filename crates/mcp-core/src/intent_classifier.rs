@@ -603,6 +603,7 @@ pub async fn classify(
             content: serde_json::Value::String(prompt),
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }],
         pin_provider: Some(provider.clone()),
         metadata: GwMetadata {

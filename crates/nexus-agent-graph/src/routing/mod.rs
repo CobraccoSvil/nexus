@@ -288,6 +288,7 @@ mod tests {
                 input: json!({"action": "set", "content": "fatto"}),
             }]),
             tool_calls: vec![],
+            reasoning: None,
         }
     }
 

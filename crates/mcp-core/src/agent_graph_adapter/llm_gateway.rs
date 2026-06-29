@@ -135,6 +135,7 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
                 content: Value::String(sys.clone()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             });
         }
     }
@@ -165,6 +166,11 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
             content: m.content.clone(),
             tool_calls,
             tool_call_id: m.tool_call_id.clone(),
+            // ROUND-TRIP reasoning (DeepSeek): il reasoning_content di un turno
+            // assistant in thinking mode VA ri-passato (vincolo HTTP 400). Il
+            // server lo inoltra SOLO al dialetto DeepSeek; per gli altri provider
+            // resta inerte. Speculare al thinking_signature Anthropic.
+            reasoning: m.reasoning.clone(),
         });
     }
 
@@ -989,12 +995,14 @@ mistral (cooldown billing, 600s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}";
                         input: json!({"path": "a.rs"}),
                     }]),
                     tool_call_id: None,
+                    reasoning: None,
                 },
                 LlmMessage {
                     role: "tool".to_string(),
                     content: json!("contenuto di a.rs"),
                     tool_calls: None,
                     tool_call_id: Some("call_X".to_string()),
+                    reasoning: None,
                 },
             ],
             ..Default::default()

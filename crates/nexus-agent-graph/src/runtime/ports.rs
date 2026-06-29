@@ -76,6 +76,13 @@ pub struct LlmMessage {
     /// Id della tool-call a cui un messaggio `tool` (risultato) risponde
     /// (round-trip). `None` su tutti gli altri ruoli.
     pub tool_call_id: Option<String>,
+    /// Reasoning (`reasoning_content`) di un turno `assistant` precedente generato
+    /// in thinking mode (DeepSeek), da RI-PASSARE all'API: vincolo HTTP 400
+    /// analogo al `thinking_signature` Anthropic. Il gateway concreto lo inoltra
+    /// SOLO al dialetto DeepSeek (vedi `nexus_gateway::GwMessage::reasoning` ->
+    /// wire `reasoning_content`). `None` su tutti gli altri ruoli/provider.
+    /// Additivo (`Default`): retrocompatibile coi call site esistenti.
+    pub reasoning: Option<String>,
 }
 
 /// Richiesta minimale al gateway LLM.

@@ -147,6 +147,7 @@ fn ai_tool(name: &str, input: Value) -> Message {
             input,
         }]),
         tool_calls: vec![],
+        reasoning: None,
     }
 }
 
@@ -1706,6 +1707,7 @@ async fn g1_resta_closure_first_non_conta_se_closure_fulfilled() {
                     "Inizio verificando il login e poi sistemo il resto.",
                 ),
                 tool_calls: vec![],
+                reasoning: None,
             },
         ],
         stop_reason: Some(StopReason::EndTurn),
@@ -2037,6 +2039,7 @@ mod golden_end_turn {
                         Some(Message::Ai {
                             content: MessageContent::Blocks(blocks),
                             tool_calls: vec![],
+                            reasoning: None,
                         })
                     })
                     .collect()
@@ -2204,6 +2207,7 @@ mod multi_turn_wire {
             Message::Ai {
                 content: MessageContent::text("risposta"),
                 tool_calls: vec![],
+                reasoning: None,
             },
         ];
         let hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();

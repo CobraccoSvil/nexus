@@ -1044,6 +1044,7 @@ mod tests {
             Message::Ai {
                 content: MessageContent::text("risposta ai"),
                 tool_calls: vec![],
+                reasoning: None,
             },
             human("ultimo utente"),
             Message::Tool {
@@ -1381,6 +1382,7 @@ mod golden {
                                         "assistant" | "ai" => Message::Ai {
                                             content: mc,
                                             tool_calls: vec![],
+                                            reasoning: None,
                                         },
                                         _ => Message::Tool {
                                             tool_call_id: "t".to_string(),

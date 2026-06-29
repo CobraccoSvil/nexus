@@ -45,6 +45,7 @@ fn ai_tool_use_names(messages: &[Message]) -> Vec<&str> {
         if let Message::Ai {
             content,
             tool_calls,
+            ..
         } = m
         {
             // Forma OpenAI-compat: tool_calls.
@@ -251,6 +252,7 @@ fn message_tool_uses(m: &Message) -> Vec<(&str, &Value)> {
     if let Message::Ai {
         content,
         tool_calls,
+        ..
     } = m
     {
         for tc in tool_calls {
@@ -1275,6 +1277,7 @@ mod tests {
                 name: name.into(),
                 input: json!({}),
             }],
+            reasoning: None,
         }
     }
 
@@ -1302,6 +1305,7 @@ mod tests {
                 input: json!({}),
             }]),
             tool_calls: vec![],
+            reasoning: None,
         }
     }
 
@@ -1336,6 +1340,7 @@ mod tests {
                 input,
             }]),
             tool_calls: vec![],
+            reasoning: None,
         }
     }
 
@@ -1365,6 +1370,7 @@ mod tests {
         assert!(!has_tool_calls_in_history(&[Message::Ai {
             content: MessageContent::text("solo testo"),
             tool_calls: vec![],
+            reasoning: None,
         }]));
     }
 
@@ -1857,10 +1863,12 @@ mod golden {
                         input: if input.is_null() { json!({}) } else { input.clone() },
                     }]),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
                 RawMsg::AiText { text } => Message::Ai {
                     content: MessageContent::text(text.clone()),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
                 RawMsg::Tool { text } => Message::Tool {
                     tool_call_id: "golden".into(),

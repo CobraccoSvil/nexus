@@ -251,6 +251,7 @@ impl NextActionsDeriverAdapter {
                 content: serde_json::Value::String(prompt),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             }],
             max_tokens: Some(1024),
             temperature: Some(0.0),

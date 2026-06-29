@@ -325,6 +325,7 @@ mod tests {
                 input,
             }]),
             tool_calls: vec![],
+            reasoning: None,
         }
     }
 

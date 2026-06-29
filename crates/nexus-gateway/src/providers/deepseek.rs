@@ -362,6 +362,7 @@ mod tests {
                 tool_calls: None,
                 name: None,
                 thinking_signature: None,
+                reasoning: None,
             }],
             temperature: None,
             max_tokens: Some(1024),

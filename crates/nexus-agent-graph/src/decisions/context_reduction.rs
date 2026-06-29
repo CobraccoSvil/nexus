@@ -114,6 +114,13 @@ pub struct HistoryMessage {
     /// compressione (`rebuilt_human`).
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Reasoning (`reasoning_content`) di un turno `assistant` in thinking mode
+    /// (DeepSeek), preservato attraverso la riduzione di contesto per poterlo
+    /// RI-PASSARE all'API (vincolo HTTP 400). `None` per i ruoli != assistant e
+    /// per i turni senza reasoning. La compressione (`rebuilt_human`) lo azzera:
+    /// un messaggio degradato a sintesi non porta piu' il pensiero originale.
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 impl HistoryMessage {
@@ -133,6 +140,9 @@ impl HistoryMessage {
             // inline, non c'e' piu' una coppia da referenziare). Coerente col Python.
             is_tool: false,
             tool_call_id: None,
+            // Il messaggio compresso e' un HumanMessage di sintesi: non porta piu'
+            // il reasoning originale (vincolo round-trip DeepSeek non applicabile).
+            reasoning: None,
         }
     }
 

@@ -35,7 +35,7 @@ pub struct NexusGatewayClient {
 /// SOLO da questi campi: senza di essi Anthropic risponde HTTP 400 (`tool_use ids
 /// without tool_result`). Campi `Option` additivi: omessi (`skip_serializing_if`)
 /// sui messaggi testuali, retrocompatibili coi call site esistenti.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 pub struct GwMessage {
     pub role: String,
     pub content: Value,
@@ -48,6 +48,14 @@ pub struct GwMessage {
     /// Omesso quando `None` (qualunque ruolo != tool).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Reasoning (`reasoning_content`) di un turno `assistant` precedente generato
+    /// in thinking mode (DeepSeek), da RI-PASSARE al gateway: il server lo inoltra
+    /// SOLO al dialetto DeepSeek (vincolo HTTP 400 "The reasoning_content in the
+    /// thinking mode must be passed back to the API"). Allineato a
+    /// `LlmMessage::reasoning` del server (`nexus-gateway::types`). Omesso quando
+    /// `None` (turno senza reasoning / altri ruoli o provider).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]

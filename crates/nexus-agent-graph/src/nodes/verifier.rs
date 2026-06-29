@@ -1017,6 +1017,7 @@ mod tests {
                 input: json!({"path": "src/main.tsx"}),
             }]),
             tool_calls: vec![],
+            reasoning: None,
         }
     }
 

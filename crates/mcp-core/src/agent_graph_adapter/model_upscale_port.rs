@@ -144,6 +144,10 @@ mod tests {
                  is_enabled BOOLEAN NOT NULL DEFAULT true, \
                  supports_tool_use BOOLEAN NOT NULL DEFAULT true, \
                  supports_vision BOOLEAN NOT NULL DEFAULT false, \
+                 supports_image_gen BOOLEAN NOT NULL DEFAULT false, \
+                 supports_audio_in BOOLEAN NOT NULL DEFAULT false, \
+                 supports_audio_out BOOLEAN NOT NULL DEFAULT false, \
+                 supports_video_gen BOOLEAN NOT NULL DEFAULT false, \
                  agentic_thinking_policy TEXT NOT NULL DEFAULT 'none', \
                  performance_tier TEXT NOT NULL DEFAULT 'medium', \
                  capabilities JSONB NOT NULL DEFAULT '[]', \

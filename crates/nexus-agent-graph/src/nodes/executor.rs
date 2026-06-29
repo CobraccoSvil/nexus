@@ -618,6 +618,7 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                 messages: Some(vec![Message::Ai {
                     content: MessageContent::text(cap_text.clone()),
                     tool_calls: vec![],
+                    reasoning: None,
                 }]),
                 result: Some(Some(cap_text)),
                 pending_tool_uses: Some(Some(vec![])),
@@ -805,6 +806,7 @@ la richiesta in modo piu' specifico.",
                 messages: Some(vec![Message::Ai {
                     content: MessageContent::text(cap_text.clone()),
                     tool_calls: vec![],
+                    reasoning: None,
                 }]),
                 result: Some(Some(cap_text)),
                 pending_tool_uses: Some(Some(vec![])),
@@ -870,6 +872,7 @@ la richiesta in modo piu' specifico.",
                     messages: Some(vec![Message::Ai {
                         content: MessageContent::text(ff_msg.clone()),
                         tool_calls: vec![],
+                        reasoning: None,
                     }]),
                     result: Some(Some(ff_msg)),
                     pending_tool_uses: Some(Some(vec![])),
@@ -1003,6 +1006,7 @@ Chiudo passando per la verifica del flusso."
                         messages: Some(vec![Message::Ai {
                             content: MessageContent::text(expl_text.clone()),
                             tool_calls: vec![],
+                            reasoning: None,
                         }]),
                         result: Some(Some(expl_text)),
                         pending_tool_uses: Some(Some(vec![])),
@@ -1034,6 +1038,7 @@ Riformula la richiesta in modo piu' specifico o usa un modello piu' capace."
                 messages: Some(vec![Message::Ai {
                     content: MessageContent::text(expl_text.clone()),
                     tool_calls: vec![],
+                    reasoning: None,
                 }]),
                 result: Some(Some(expl_text)),
                 pending_tool_uses: Some(Some(vec![])),
@@ -1241,6 +1246,7 @@ per confermare la correzione.",
                             messages: Some(vec![Message::Ai {
                                 content: MessageContent::text(ra_text.clone()),
                                 tool_calls: vec![],
+                                reasoning: None,
                             }]),
                             result: Some(Some(ra_text)),
                             pending_tool_uses: Some(Some(vec![])),
@@ -1363,6 +1369,7 @@ tool/le richieste a quella porta, senza allocarne di nuove."
                             messages: Some(vec![Message::Ai {
                                 content: MessageContent::text(rp_text.clone()),
                                 tool_calls: vec![],
+                                reasoning: None,
                             }]),
                             result: Some(Some(rp_text)),
                             pending_tool_uses: Some(Some(vec![])),
@@ -2063,6 +2070,7 @@ modo piu' specifico."
                 assistant_msg = Message::Ai {
                     content: MessageContent::text(loop_msg.clone()),
                     tool_calls: vec![],
+                    reasoning: None,
                 };
                 pending_tool_uses = vec![];
                 stop_reason_str_resp = Some("loop_detected".to_string());
@@ -2167,6 +2175,9 @@ modo piu' specifico."
                 assistant_msg = Message::Ai {
                     content: MessageContent::text(cleaned.clone()),
                     tool_calls: vec![],
+                    // Testo ripulito (rimozione <suggested_actions>): turno di chiusura
+                    // testuale, nessun reasoning da ri-passare.
+                    reasoning: None,
                 };
             }
             // Derivazione scelte sul testo ripulito (best-effort). Il meta_step si
@@ -2218,6 +2229,8 @@ modo piu' specifico."
                 assistant_msg = Message::Ai {
                     content: MessageContent::text(report),
                     tool_calls: vec![],
+                    // Resoconto onesto sostitutivo: turno testuale, nessun reasoning.
+                    reasoning: None,
                 };
             }
         }
@@ -2389,6 +2402,7 @@ impl ExecutorNode {
             messages: Some(vec![Message::Ai {
                 content: MessageContent::text(close_text.clone()),
                 tool_calls: vec![],
+                reasoning: None,
             }]),
             result: Some(Some(close_text)),
             pending_tool_uses: Some(Some(vec![])),
@@ -2509,12 +2523,16 @@ fn build_assistant_message(resp: &crate::runtime::ports::LlmResponse, result_tex
         return Message::Ai {
             content: MessageContent::Blocks(blocks),
             tool_calls: vec![],
+            // Reasoning del turno (DeepSeek thinking mode): preservato per il
+            // round-trip al gateway (vincolo HTTP 400). Vuoto -> None.
+            reasoning: resp.reasoning.as_ref().filter(|r| !r.is_empty()).cloned(),
         };
     }
     // Forma minimale: testo + tool_calls (OpenAI-compat).
     Message::Ai {
         content: MessageContent::text(result_text),
         tool_calls: resp.tool_calls.clone(),
+        reasoning: resp.reasoning.as_ref().filter(|r| !r.is_empty()).cloned(),
     }
 }
 
@@ -2524,7 +2542,7 @@ fn build_assistant_message(resp: &crate::runtime::ports::LlmResponse, result_tex
 fn message_to_history(m: &Message) -> HistoryMessage {
     match m {
         Message::Human { content } => history_from_content(content, true),
-        Message::Ai { content, tool_calls } => {
+        Message::Ai { content, tool_calls, reasoning } => {
             // Se l'AI porta tool_calls (forma OpenAI-compat) ma content testuale,
             // espandiamo i tool_use in anthropic_content per la dedup/compress.
             let mut hm = history_from_content(content, false);
@@ -2536,6 +2554,8 @@ fn message_to_history(m: &Message) -> HistoryMessage {
                         .collect(),
                 );
             }
+            // Reasoning DeepSeek del turno: preservato per il round-trip al gateway.
+            hm.reasoning = reasoning.clone();
             hm
         }
         // Il `ToolMessage` (risultato) preserva ruolo e id: `history_to_llm_messages`
@@ -2636,6 +2656,8 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
                         role: "assistant".to_string(),
                         content: flatten_history_blocks_text(&m.anthropic_content),
                         tool_calls: Some(tool_uses),
+                        // Round-trip reasoning DeepSeek del turno assistant.
+                        reasoning: m.reasoning.clone(),
                         ..Default::default()
                     });
                 }
@@ -2646,6 +2668,8 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
             return vec![LlmMessage {
                 role: role.to_string(),
                 content: m.anthropic_content.clone(),
+                // Round-trip reasoning DeepSeek: solo sugli assistant (mai sugli user).
+                reasoning: if m.is_human { None } else { m.reasoning.clone() },
                 ..Default::default()
             }];
         }
@@ -2656,6 +2680,8 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
     vec![LlmMessage {
         role: role.to_string(),
         content: m.content.clone(),
+        // Round-trip reasoning DeepSeek: solo sugli assistant (mai sugli user).
+        reasoning: if m.is_human { None } else { m.reasoning.clone() },
         ..Default::default()
     }]
 }

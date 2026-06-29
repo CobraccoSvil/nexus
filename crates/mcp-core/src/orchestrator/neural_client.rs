@@ -158,6 +158,7 @@ impl NeuralCoreClient {
                 content: json!(prompt),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             }],
             pin_provider: Some(provider.to_string()),
             metadata: GwMetadata {
@@ -225,6 +226,7 @@ impl NeuralCoreClient {
                 content: json!(system_text),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             });
         }
         all_messages.extend(messages);
@@ -515,11 +517,19 @@ fn gw_message_from_value(v: Value) -> GwMessage {
         .get("tool_call_id")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Round-trip reasoning DeepSeek: se la history porta il reasoning_content di
+    // un turno assistant precedente, lo ri-passiamo (vincolo HTTP 400). Il server
+    // lo inoltra solo al dialetto DeepSeek.
+    let reasoning = v
+        .get("reasoning")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     GwMessage {
         role,
         content,
         tool_calls,
         tool_call_id,
+        reasoning,
     }
 }
 

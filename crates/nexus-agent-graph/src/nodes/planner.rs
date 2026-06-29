@@ -1037,6 +1037,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         let assistant_msg = Message::Ai {
             content: MessageContent::text(""),
             tool_calls: vec![planner_tool_use],
+            // Assistant sintetico del planner (solo tool_use nexus_todo_write):
+            // nessun reasoning del modello da ri-passare.
+            reasoning: None,
         };
         let tool_result_msg = Message::Tool {
             tool_call_id: tool_use_id,
@@ -1884,6 +1887,7 @@ mod golden {
                     "assistant" | "ai" => Message::Ai {
                         content,
                         tool_calls: vec![],
+                        reasoning: None,
                     },
                     _ => Message::Human { content },
                 });

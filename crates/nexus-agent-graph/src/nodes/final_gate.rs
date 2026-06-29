@@ -735,6 +735,7 @@ mod tests {
                 input: json!({"path": "src/main.tsx"}),
             }]),
             tool_calls: vec![],
+            reasoning: None,
         }
     }
 
@@ -1181,6 +1182,7 @@ mod golden {
                     msgs.push(Message::Ai {
                         content: MessageContent::Blocks(blocks),
                         tool_calls: vec![],
+                        reasoning: None,
                     });
                 } else if role == "user" || role == "human" {
                     let c = m.get("content").and_then(Value::as_str).unwrap_or("");

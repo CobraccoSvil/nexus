@@ -597,7 +597,25 @@ fn build_request_body(
     stream: bool,
     reasoning: &ResolvedReasoning,
 ) -> ChatCompletionRequest {
-    let messages = req.messages.iter().map(to_wire_message).collect();
+    let mut messages: Vec<WireMessage> = req.messages.iter().map(to_wire_message).collect();
+
+    // ROUND-TRIP reasoning_content (DeepSeek): per gli assistant message generati
+    // in thinking mode l'API DeepSeek IMPONE che il `reasoning_content` venga
+    // ri-passato nelle richieste successive, altrimenti HTTP 400. Lo facciamo
+    // viaggiare SOLO verso DeepSeek: per ogni coppia (wire, sorgente) con
+    // role=="assistant" e `reasoning` non vuoto, copiamo il reasoning della
+    // history nel campo wire. Gli altri dialetti non vedono mai il campo (resta
+    // None -> omesso). Speculare al round-trip `thinking_signature` di Anthropic.
+    if reasoning.dialect == ReasoningDialect::DeepSeek {
+        for (wire, src) in messages.iter_mut().zip(req.messages.iter()) {
+            if wire.role == "assistant" {
+                if let Some(r) = src.reasoning.as_ref().filter(|r| !r.is_empty()) {
+                    wire.reasoning_content = Some(r.clone());
+                }
+            }
+        }
+    }
+
     let tools = req.tools.as_ref().map(|tools| {
         tools
             .iter()
@@ -761,6 +779,9 @@ fn to_wire_message(msg: &crate::types::LlmMessage) -> WireMessage {
         tool_call_id: msg.tool_call_id.clone(),
         tool_calls,
         name: msg.name.clone(),
+        // Popolato a valle in `build_request_body` SOLO per il dialetto DeepSeek
+        // (round-trip del reasoning_content): qui resta None, neutro per gli altri.
+        reasoning_content: None,
     }
 }
 
@@ -1050,6 +1071,14 @@ struct WireMessage {
     tool_calls: Option<Vec<WireToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    // Reasoning del turno assistant prodotto in thinking mode da DeepSeek, da
+    // RI-PASSARE all'API nelle richieste successive (vincolo HTTP 400: "The
+    // reasoning_content in the thinking mode must be passed back to the API").
+    // Valorizzato SOLO per il dialetto DeepSeek in `build_request_body`; per gli
+    // altri provider resta `None` (omesso) cosi' il campo non viaggia mai verso
+    // chi non lo conosce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 /// Content di un messaggio nel wire OpenAI: stringa (caso semplice) o array di
@@ -1225,6 +1254,7 @@ mod tests {
                 tool_calls: None,
                 name: None,
                 thinking_signature: None,
+                reasoning: None,
             }],
             temperature: Some(0.5),
             max_tokens: Some(256),
@@ -1296,6 +1326,64 @@ mod tests {
         assert!(json.get("max_completion_tokens").is_none());
         assert!(json.get("reasoning_effort").is_none());
         assert!(json.get("thinking").is_none());
+    }
+
+    /// Round-trip reasoning_content (DeepSeek): un assistant message con
+    /// `reasoning=Some(...)` DEVE comparire come `messages[i].reasoning_content`
+    /// nel body SOLO per il dialetto DeepSeek (vincolo HTTP 400). Per i dialetti
+    /// non-DeepSeek il campo NON deve viaggiare (assente).
+    #[test]
+    fn reasoning_content_round_trip_solo_deepseek() {
+        // Richiesta con un assistant in thinking mode (porta reasoning) seguito da
+        // un turno user: speculare a una history agentica multi-turno DeepSeek.
+        let mut req = sample_request();
+        req.messages = vec![
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("rispondo".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                reasoning: Some("ho ragionato cosi'".to_string()),
+            },
+            LlmMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("continua".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                // L'utente non porta reasoning: non deve mai comparire reasoning_content.
+                reasoning: Some("spurio-da-ignorare".to_string()),
+            },
+        ];
+
+        // Dialetto DeepSeek: il reasoning dell'assistant e' ri-passato.
+        let deepseek = ResolvedReasoning {
+            dialect: ReasoningDialect::DeepSeek,
+            enabled: true,
+            effort: None,
+        };
+        let body = build_request_body(&req, false, &deepseek);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["messages"][0]["reasoning_content"], "ho ragionato cosi'",
+            "l'assistant DeepSeek deve ri-passare il reasoning_content"
+        );
+        // Lo user NON deve portare reasoning_content (solo i ruoli assistant).
+        assert!(
+            json["messages"][1].get("reasoning_content").is_none(),
+            "lo user non deve mai esporre reasoning_content"
+        );
+
+        // Dialetto non-DeepSeek (base): il campo non viaggia mai.
+        let body_base = build_request_body(&req, false, &ResolvedReasoning::none());
+        let json_base = serde_json::to_value(&body_base).unwrap();
+        assert!(
+            json_base["messages"][0].get("reasoning_content").is_none(),
+            "fuori dal dialetto DeepSeek il reasoning_content non deve essere inviato"
+        );
     }
 
     fn edit_tool() -> crate::types::LlmToolDefinition {

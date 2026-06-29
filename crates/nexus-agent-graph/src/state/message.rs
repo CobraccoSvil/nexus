@@ -35,6 +35,18 @@ pub enum Message {
         /// Richieste di tool emesse dal modello. Vuoto se il turno e' testuale.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolUse>,
+        /// Reasoning (`reasoning_content`) emesso dal modello in thinking mode
+        /// (oggi DeepSeek). VA RI-PASSATO nelle richieste successive: l'API
+        /// DeepSeek lo IMPONE per gli assistant message generati in thinking mode
+        /// (altrimenti HTTP 400, "The reasoning_content in the thinking mode must
+        /// be passed back to the API"). Trasportato fino al wire via
+        /// `LlmMessage::reasoning` (porta) -> `GwMessage::reasoning` ->
+        /// `reasoning_content` (solo dialetto DeepSeek). `None` per i turni senza
+        /// reasoning / gli altri provider. Speculare al `thinking_signature`
+        /// Anthropic. Additivo (`serde(default)`): retrocompatibile col round-trip
+        /// dello stato persistito.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
     },
     /// Risultato dell'esecuzione di un tool, riferito alla richiesta via id.
     #[serde(rename = "tool")]

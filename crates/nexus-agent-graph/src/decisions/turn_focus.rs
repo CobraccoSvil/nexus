@@ -160,6 +160,7 @@ mod tests {
         Message::Ai {
             content: MessageContent::text(text),
             tool_calls: vec![],
+            reasoning: None,
         }
     }
 
@@ -304,6 +305,7 @@ mod golden {
                     "assistant" | "ai" => Message::Ai {
                         content,
                         tool_calls: vec![],
+                        reasoning: None,
                     },
                     "tool" => Message::Tool {
                         tool_call_id: "golden".to_string(),

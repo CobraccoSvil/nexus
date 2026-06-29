@@ -87,6 +87,18 @@ pub struct LlmMessage {
     /// HTTP 400). Retrocompatibile: assente/`None` per tutti gli altri provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_signature: Option<String>,
+    /// Testo del ragionamento (`reasoning_content`) di un turno assistant
+    /// precedente generato in thinking mode da DeepSeek. Vincolo analogo al
+    /// `thinking_signature` Anthropic: l'API DeepSeek IMPONE che, per gli
+    /// assistant message prodotti in thinking mode, il `reasoning_content` venga
+    /// RI-PASSATO nelle richieste successive, altrimenti HTTP 400 ("The
+    /// reasoning_content in the thinking mode must be passed back to the API").
+    /// Il chiamante lo rispedisce da [`LlmResponse::reasoning`] del turno
+    /// precedente; il provider OpenAI-compat lo re-include nel wire SOLO per il
+    /// dialetto DeepSeek (vedi `build_request_body`). Retrocompatibile:
+    /// assente/`None` per tutti gli altri provider, che non vedono il campo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Metadati di tracciamento e tenancy della richiesta (`RequestMetadata`).

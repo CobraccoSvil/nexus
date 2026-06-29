@@ -59,6 +59,7 @@ pub fn to_lc(message: &Message) -> Value {
         Message::Ai {
             content,
             tool_calls,
+            reasoning,
         } => {
             let mut kwargs = Map::new();
             kwargs.insert("content".to_string(), content_to_value(content));
@@ -75,6 +76,15 @@ pub fn to_lc(message: &Message) -> Value {
                 })
                 .collect();
             kwargs.insert("tool_calls".to_string(), Value::Array(lc_tool_calls));
+            // Reasoning DeepSeek (thinking mode) in `additional_kwargs.reasoning_content`,
+            // la chiave usata dal brain Python: cosi' sopravvive al round-trip gRPC e
+            // puo' essere ri-passato all'API (vincolo HTTP 400). Omesso se assente.
+            if let Some(r) = reasoning {
+                kwargs.insert(
+                    "additional_kwargs".to_string(),
+                    json!({ "reasoning_content": r }),
+                );
+            }
             kwargs.insert("type".to_string(), json!("ai"));
             constructor("AIMessage", kwargs)
         }
@@ -144,9 +154,21 @@ pub fn from_lc(value: &Value) -> Result<Message, LcSerdeError> {
         "AIMessage" | "AIMessageChunk" => {
             let content = value_to_content(kwargs.get("content"))?;
             let tool_calls = parse_lc_tool_calls(kwargs.get("tool_calls"))?;
+            // Reasoning DeepSeek: il brain Python lo mette in
+            // `additional_kwargs.reasoning_content`. Tollerante: accetta anche un
+            // `reasoning_content` top-level. Vuoto/assente -> None.
+            let reasoning = kwargs
+                .get("additional_kwargs")
+                .and_then(|v| v.as_object())
+                .and_then(|ak| ak.get("reasoning_content"))
+                .or_else(|| kwargs.get("reasoning_content"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             Ok(Message::Ai {
                 content,
                 tool_calls,
+                reasoning,
             })
         }
         "ToolMessage" => {
@@ -230,6 +252,7 @@ mod tests {
                 name: "read_file".to_string(),
                 input: json!({"path": "/tmp/x"}),
             }],
+            reasoning: None,
         };
         let tool = Message::Tool {
             tool_call_id: "call_1".to_string(),
@@ -254,6 +277,7 @@ mod tests {
                 name: "edit_file".to_string(),
                 input: json!({"a": 1}),
             }],
+            reasoning: None,
         };
         let lc = to_lc(&ai);
         assert_eq!(lc["lc"], json!(1));
@@ -315,6 +339,7 @@ mod tests {
             Message::Ai {
                 content,
                 tool_calls,
+                ..
             } => {
                 assert_eq!(*content, MessageContent::text("ok"));
                 assert_eq!(tool_calls.len(), 1);

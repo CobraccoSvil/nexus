@@ -1291,6 +1291,7 @@ impl Orchestrator {
                     content: serde_json::Value::String(composed_prompt.clone()),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning: None,
                 }],
                 max_tokens: Some(token_budget),
                 temperature: None,

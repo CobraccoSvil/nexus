@@ -896,6 +896,8 @@ fn history_entry_to_message(v: &serde_json::Value) -> Option<Message> {
         "assistant" | "ai" => Some(Message::Ai {
             content,
             tool_calls: Vec::new(),
+            // Ricostruzione da JSON minimale (role/content): nessun reasoning.
+            reasoning: None,
         }),
         "tool" => {
             let tool_call_id = obj
@@ -1359,7 +1361,7 @@ fn shadow_canonical(state: &AgentState, completed: bool) -> Value {
     };
 
     for m in &state.messages {
-        if let Message::Ai { content, tool_calls } = m {
+        if let Message::Ai { content, tool_calls, .. } = m {
             // Forma OpenAI-compat: tool_calls fuori dal contenuto.
             for tc in tool_calls {
                 note_tool(&tc.name);
@@ -2067,6 +2069,7 @@ mod tests {
                         name: "read_file".to_string(),
                         input: json!({}),
                     }],
+                    reasoning: None,
                 },
                 // Forma Anthropic: un edit_file inline (mutativo) -> produced_work.
                 Message::Ai {
@@ -2076,6 +2079,7 @@ mod tests {
                         input: json!({}),
                     }]),
                     tool_calls: vec![],
+                    reasoning: None,
                 },
             ],
             ..Default::default()
@@ -2095,6 +2099,7 @@ mod tests {
             messages: vec![Message::Ai {
                 content: nexus_agent_graph::state::MessageContent::text("risposta testuale"),
                 tool_calls: vec![],
+                reasoning: None,
             }],
             ..Default::default()
         };
@@ -2205,6 +2210,7 @@ mod tests {
                     name: "write_file".to_string(),
                     input: json!({}),
                 }],
+                reasoning: None,
             }],
             ..Default::default()
         };
