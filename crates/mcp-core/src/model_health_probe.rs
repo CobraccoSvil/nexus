@@ -186,6 +186,7 @@ pub(crate) async fn run_one_round(
                 stats.model_errors += 1;
                 stats.auto_disabled += 1;
             }
+            ProbeOutcome::Transient => stats.transient += 1,
         }
 
         sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
@@ -230,7 +231,7 @@ pub(crate) async fn run_one_round(
                     stats.tool_probe_failed += 1;
                     stats.tool_probe_disabled += 1;
                 }
-                ToolProbeOutcome::Skipped => {}
+                ToolProbeOutcome::Skipped | ToolProbeOutcome::Transient => {}
             }
             sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
         }
@@ -266,7 +267,9 @@ pub(crate) async fn run_one_round(
                         stats.reprobe_candidates += 1;
                         stats.reprobe_reenabled += 1;
                     }
-                    ReprobeResult::ProviderWide | ReprobeResult::StillBroken => {
+                    ReprobeResult::ProviderWide
+                    | ReprobeResult::StillBroken
+                    | ReprobeResult::Inconclusive => {
                         stats.reprobe_candidates += 1;
                     }
                 }
@@ -280,13 +283,14 @@ pub(crate) async fn run_one_round(
 
     tracing::info!(
         "model_health_probe: round completato — total={} healthy={} provider_errors={} \
-         model_errors={} auto_disabled={} skipped={} tool_probe_ok={} tool_probe_failed={} \
-         tool_probe_disabled={} reprobe_candidates={} reprobe_reenabled={}",
+         model_errors={} auto_disabled={} transient={} skipped={} tool_probe_ok={} \
+         tool_probe_failed={} tool_probe_disabled={} reprobe_candidates={} reprobe_reenabled={}",
         stats.total,
         stats.healthy,
         stats.provider_wide_errors,
         stats.model_errors,
         stats.auto_disabled,
+        stats.transient,
         stats.skipped_provider_cooldown,
         stats.tool_probe_ok,
         stats.tool_probe_failed,
@@ -304,6 +308,10 @@ pub struct ProbeRoundStats {
     pub provider_wide_errors: usize,
     pub model_errors: usize,
     pub auto_disabled: usize,
+    /// Esiti inconclusivi (errore opaco/transitorio): nessuna penalizzazione del
+    /// modello, ritentati al round successivo. Conteggiati a parte per non
+    /// inquinare `model_errors` (che governa la lettura "modelli rotti").
+    pub transient: usize,
     pub skipped_provider_cooldown: usize,
     /// FIX 1: modelli tool-capable che hanno superato il tool-probe.
     pub tool_probe_ok: usize,
@@ -324,6 +332,9 @@ enum ProbeOutcome {
     ProviderWide,
     ModelSpecificCounted,
     AutoDisabled,
+    /// Esito inconclusivo (errore opaco/transitorio): nessuna azione sui
+    /// contatori/is_enabled, conteggiato a parte per diagnostica.
+    Transient,
 }
 
 /// Esito del tool-probe (FIX 1). Non tocca mai `is_enabled`: solo
@@ -338,6 +349,9 @@ enum ToolProbeOutcome {
     /// Errore provider-wide (cooldown gia' applicato dal probe chat) -> nessuna
     /// azione tool-specific (non punisce il modello per colpa del provider).
     Skipped,
+    /// Esito inconclusivo (errore opaco/transitorio): nessuna azione su
+    /// supports_tool_use ne' sul contatore, ritentato al round successivo.
+    Transient,
 }
 
 /// Riga del catalog per il probe. `capability_source` e `auto_disabled_reason`
@@ -509,8 +523,13 @@ enum ReprobeResult {
     /// Errore provider-wide (billing/quota/rate): cooldown gia' applicato dal
     /// chat-probe, nessuna azione sul candidato (riprovato al prossimo giro).
     ProviderWide,
-    /// Ancora rotto (chat o tool falliti): timestamp di backoff aggiornato.
+    /// Ancora rotto (chat o tool falliti per causa model-specific): timestamp di
+    /// backoff aggiornato.
     StillBroken,
+    /// Esito inconclusivo (errore opaco/transitorio): NON tocca il backoff —
+    /// altrimenti ogni blip rinvierebbe il re-probe di un intero ciclo di
+    /// backoff (micro circolo vizioso). Riprovato gia' al prossimo giro.
+    Inconclusive,
 }
 
 /// Re-proba un singolo candidato disabilitato per quirk gateway. Riusa il
@@ -547,6 +566,15 @@ async fn reprobe_one_candidate(
             );
             return ReprobeResult::StillBroken;
         }
+        ProbeOnInsertResult::Transient(kind) => {
+            // INCONCLUSIVO: NON tocca il backoff (regola H: niente micro circolo
+            // vizioso che rinvia il re-probe ad ogni blip). Resta disabilitato,
+            // ma viene riprovato gia' al prossimo giro del worker.
+            tracing::debug!(
+                "model_health_probe[reprobe]: {provider}/{model} chat-probe inconclusivo ({kind}) -> backoff invariato, ritento al prossimo round"
+            );
+            return ReprobeResult::Inconclusive;
+        }
     }
 
     // 2. Tool-probe (no side-effect). Deve passare anch'esso: il quirk era
@@ -566,6 +594,13 @@ async fn reprobe_one_candidate(
                 "model_health_probe[reprobe]: {provider}/{model} tool-probe ancora rotto ({kind}) -> resta disabilitato"
             );
             return ReprobeResult::StillBroken;
+        }
+        ToolProbeVerdict::Transient(kind) => {
+            // INCONCLUSIVO: come il chat-probe sopra, NON tocca il backoff.
+            tracing::debug!(
+                "model_health_probe[reprobe]: {provider}/{model} tool-probe inconclusivo ({kind}) -> backoff invariato, ritento al prossimo round"
+            );
+            return ReprobeResult::Inconclusive;
         }
     }
 
@@ -686,18 +721,24 @@ async fn probe_one_model(
                 .await;
             classification_from_error_class(&ec)
         }
-        Err(_timeout_elapsed) => Classification::ModelSpecific(
+        // Timeout del probe: INCONCLUSIVO, non model-specific. Un modello sano
+        // dietro un provider lento (cold-start, coda) andava in auto-disable.
+        Err(_timeout_elapsed) => Classification::Transient(
             "timeout".to_string(),
             Some(format!("no response in {PROBE_TIMEOUT_S}s")),
         ),
     };
 
-    // Persist history (fire-and-forget, no impact se fail).
+    // Persist history (fire-and-forget, no impact se fail). Il Transient viene
+    // tracciato come unhealthy SOLO per diagnostica (storico append-only): non
+    // tocca contatori ne' is_enabled. error_kind prefissato 'transient:' lo
+    // distingue dai guasti reali nelle query dello storico.
     let (healthy, error_kind, error_message) = match &outcome {
         Classification::Ok => (true, None, None),
         Classification::ProviderWide(kind, msg) | Classification::ModelSpecific(kind, msg) => {
             (false, Some(kind.clone()), msg.clone())
         }
+        Classification::Transient(kind, msg) => (false, Some(format!("transient:{kind}")), msg.clone()),
     };
     let _ = sqlx::query(
         r#"INSERT INTO ai_model_health_history
@@ -790,6 +831,18 @@ async fn probe_one_model(
                 ProbeOutcome::ModelSpecificCounted
             }
         }
+        Classification::Transient(kind, _) => {
+            // INCONCLUSIVO: non e' colpa ne' del modello ne' (con certezza) del
+            // provider. Lo stato resta INVARIATO — niente incremento di
+            // consecutive_failures, niente is_enabled=false, niente cooldown.
+            // Si ritenta al round successivo. Questo e' il fix di radice
+            // (regola H): un cold-start auth Vertex / 5xx gateway / error_class
+            // generico non deve piu' marciare verso l'auto-disable.
+            tracing::debug!(
+                "model_health_probe: {provider}/{model} esito inconclusivo ({kind}) -> stato invariato, ritento al prossimo round"
+            );
+            ProbeOutcome::Transient
+        }
     }
 }
 
@@ -805,6 +858,11 @@ pub(crate) enum ToolProbeVerdict {
     /// Errore provider-wide (billing/quota/auth/rate_limit): non e' colpa del
     /// modello. Niente azione tool-specific.
     ProviderWide(String),
+    /// Esito INCONCLUSIVO: errore opaco/transitorio (error_class generico,
+    /// stop_reason='error' senza causa nota, timeout, 5xx gateway). NON degrada
+    /// supports_tool_use, NON incrementa consecutive_tool_failures, NON sposta
+    /// il backoff. Si ritenta al round successivo.
+    Transient(String),
 }
 
 /// Valuta la response JSON del brain (`GenerateAgentTurn`) per il tool-probe.
@@ -824,19 +882,26 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
         return match classification_from_error_class(ec) {
             Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
             Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
+            Classification::Transient(kind, _) => ToolProbeVerdict::Transient(kind),
             Classification::Ok => {
                 ToolProbeVerdict::ToolFailed("unexpected_ok_with_error_class".into())
             }
         };
     }
 
-    // 2. stop_reason=error senza error_class: trattalo come tool-failure.
+    // 2. stop_reason=error senza error_class: INCONCLUSIVO, non tool-failure.
+    //    Prima questo ramo marciava verso il degrado di supports_tool_use anche
+    //    quando l'errore era un blip generico al confine gateway/provider
+    //    (incidente Gemini: tool-probe e chat-probe accoppiati, entrambi
+    //    error_kind='error', NON dipendenti dai tool). Senza un error_class
+    //    model-specific riconosciuto non possiamo attribuire il guasto al
+    //    modello: Transient, stato invariato, ritento al round successivo.
     let stop_reason = response
         .get("stop_reason")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if stop_reason == "error" {
-        return ToolProbeVerdict::ToolFailed("stop_reason_error".into());
+        return ToolProbeVerdict::Transient("stop_reason_error".into());
     }
 
     // 3. Tool call valida verso nexus_probe_tool?
@@ -928,10 +993,13 @@ async fn run_tool_probe(
             match classification_from_error_class(&ec) {
                 Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
                 Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
+                Classification::Transient(kind, _) => ToolProbeVerdict::Transient(kind),
                 Classification::Ok => ToolProbeVerdict::ToolFailed("transport_ok_no_tool".into()),
             }
         }
-        Err(_timeout) => ToolProbeVerdict::ToolFailed("tool_probe_timeout".into()),
+        // Timeout del tool-probe: INCONCLUSIVO (cold-start / coda provider), non
+        // un guasto del tool-forcing del modello.
+        Err(_timeout) => ToolProbeVerdict::Transient("tool_probe_timeout".into()),
     };
     (verdict, latency_ms)
 }
@@ -951,6 +1019,7 @@ async fn tool_probe_one_model(
         ToolProbeVerdict::Success => (true, None),
         ToolProbeVerdict::ToolFailed(k) => (false, Some(format!("tool_probe:{k}"))),
         ToolProbeVerdict::ProviderWide(k) => (false, Some(format!("tool_probe_provider:{k}"))),
+        ToolProbeVerdict::Transient(k) => (false, Some(format!("tool_probe_transient:{k}"))),
     };
     let _ = sqlx::query(
         r#"INSERT INTO ai_model_health_history
@@ -972,6 +1041,15 @@ async fn tool_probe_one_model(
                 "model_health_probe[tool]: {provider}/{model} provider-wide '{kind}' -> nessuna azione tool-specific"
             );
             ToolProbeOutcome::Skipped
+        }
+        ToolProbeVerdict::Transient(kind) => {
+            // INCONCLUSIVO: niente degrado di supports_tool_use, niente
+            // incremento di consecutive_tool_failures. Stato invariato, si
+            // ritenta al round successivo (regola H).
+            tracing::debug!(
+                "model_health_probe[tool]: {provider}/{model} esito inconclusivo ({kind}) -> stato tool invariato"
+            );
+            ToolProbeOutcome::Transient
         }
         ToolProbeVerdict::Success => {
             // PUNTO UNICO (regola L): reset contatore + riabilitazione della
@@ -1100,6 +1178,19 @@ pub(crate) enum Classification {
     ProviderWide(String, Option<String>),
     /// Errore specifico del modello (incrementa il counter).
     ModelSpecific(String, Option<String>),
+    /// Esito INCONCLUSIVO: errore opaco/transitorio al confine gateway/provider
+    /// (cold-start auth Vertex, 5xx generico, timeout di rete, error_class
+    /// generico `error`/`unknown`/`provider_error`, stop_reason='error' senza
+    /// causa model-specific riconosciuta). NON e' una prova ne' che il modello
+    /// sia rotto ne' che il provider sia giu' in modo persistente: il verdetto
+    /// non incrementa alcun contatore, non scrive is_enabled=false, non degrada
+    /// supports_tool_use e non sposta il backoff del re-probe. Lo stato resta
+    /// invariato e si ritenta al round successivo. Replica esattamente il
+    /// pattern di `ProviderWide` (non punisce il modello), ma a differenza di
+    /// quello NON applica nemmeno un cooldown provider: l'errore e' troppo
+    /// generico per attribuirlo al provider con certezza (regola H: niente
+    /// auto-disable su sintomi opachi).
+    Transient(String, Option<String>),
 }
 
 /// Risultato sintetico del probe per uso in `catalog_sync::probe_on_insert`
@@ -1119,6 +1210,13 @@ pub(crate) enum ProbeOnInsertResult {
     /// Probe non eseguibile (timeout, exception client) — `is_enabled=false`
     /// conservativo, sara' rivalutato al prossimo round del worker probe.
     Inconclusive(String),
+    /// Esito INCONCLUSIVO da errore opaco/transitorio (error_class generico,
+    /// 5xx gateway, timeout di rete). Come `Inconclusive` per il catalog_sync
+    /// (modello appena scoperto: resta disabilitato in attesa del probe
+    /// periodico), ma nel RE-PROBE NON deve spostare il backoff: e' un blip,
+    /// non un guasto del modello. Distinto da `Inconclusive` proprio per
+    /// permettere ai chiamanti di trattarlo senza penalizzare il candidato.
+    Transient(String),
 }
 
 /// Probe sincrono di un singolo modello, usato da `catalog_sync` al momento
@@ -1160,6 +1258,7 @@ pub(crate) async fn probe_model_on_insert(
                     Classification::ModelSpecific(kind, _) => {
                         ProbeOnInsertResult::ModelBroken(kind)
                     }
+                    Classification::Transient(kind, _) => ProbeOnInsertResult::Transient(kind),
                 }
             } else {
                 ProbeOnInsertResult::Healthy
@@ -1174,6 +1273,7 @@ pub(crate) async fn probe_model_on_insert(
                 Classification::Ok => ProbeOnInsertResult::Healthy,
                 Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
                 Classification::ModelSpecific(kind, _) => ProbeOnInsertResult::ModelBroken(kind),
+                Classification::Transient(kind, _) => ProbeOnInsertResult::Transient(kind),
             }
         }
         Err(_timeout) => ProbeOnInsertResult::Inconclusive(format!("timeout {PROBE_TIMEOUT_S}s")),
@@ -1198,21 +1298,32 @@ pub(crate) fn classification_from_error_class(ec: &str) -> Classification {
         // disabilita/conteggia il singolo modello, non si spegne l'intero
         // provider con long cooldown 6h.
         "forbidden" => Classification::ModelSpecific("model_forbidden".into(), Some(ec.into())),
-        // Transienti -> short cooldown
+        // Transienti CHIARAMENTE provider-wide (segnale netto di provider giu' o
+        // throttling) -> short cooldown utile: il modello non viene punito.
         "rate_limit"
         | "overloaded"
         | "service_unavailable"
         | "bad_gateway"
-        | "provider_error"
         | "timeout"
         | "connection_error" => Classification::ProviderWide("rate_limit".into(), Some(ec.into())),
-        // Model-specific -> conteggio/auto-disable del modello
+        // Model-specific -> conteggio/auto-disable del modello. Sono le SOLE
+        // cause davvero attribuibili al modello: 404 (modello inesistente),
+        // contesto troppo lungo, richiesta invalida, capability non supportata.
         "not_found" => Classification::ModelSpecific("model_not_found".into(), Some(ec.into())),
         "context_too_long" | "invalid_request" | "unprocessable" | "unsupported" => {
             Classification::ModelSpecific(ec.into(), Some(ec.into()))
         }
         "" | "ok" => Classification::Ok,
-        other => Classification::ModelSpecific(other.into(), Some(other.into())),
+        // INCONCLUSIVO (regola H, causa-non-sintomo): `provider_error` (500
+        // generico), `error`/`unknown` (fallback del classificatore) e QUALUNQUE
+        // altro error_class non riconosciuto sono opachi. Trattarli come
+        // ModelSpecific (vecchio catch-all) auto-disabilitava modelli sani per
+        // cold-start auth Vertex / 5xx gateway / blip di rete. Diventano
+        // Transient: stato invariato, ritento al round successivo.
+        "provider_error" | "error" | "unknown" => {
+            Classification::Transient(ec.into(), Some(ec.into()))
+        }
+        other => Classification::Transient(other.into(), Some(other.into())),
     }
 }
 
@@ -1300,6 +1411,90 @@ mod tests {
         assert!(matches!(c, Classification::ProviderWide(ref k, _) if k == "rate_limit"));
     }
 
+    // --- TRANSIENT: errori opachi/transitori NON puniscono il modello --------
+
+    #[test]
+    fn classification_error_generico_e_transient() {
+        // error_class 'error' (fallback del classificatore) -> Transient.
+        // Regressione incidente Gemini: prima cadeva nel catch-all e diventava
+        // ModelSpecific -> consecutive_failures cresceva -> auto-disable a 3.
+        let c = classification_from_error_class("error");
+        assert!(matches!(c, Classification::Transient(ref k, _) if k == "error"));
+    }
+
+    #[test]
+    fn classification_unknown_e_provider_error_sono_transient() {
+        // 'unknown' e 'provider_error' (500 generico) sono opachi: inconclusivi,
+        // non attribuibili al modello.
+        assert!(matches!(
+            classification_from_error_class("unknown"),
+            Classification::Transient(ref k, _) if k == "unknown"
+        ));
+        assert!(matches!(
+            classification_from_error_class("provider_error"),
+            Classification::Transient(ref k, _) if k == "provider_error"
+        ));
+    }
+
+    #[test]
+    fn classification_catch_all_sconosciuto_e_transient() {
+        // Qualunque error_class non riconosciuto: Transient (mai ModelSpecific).
+        // Il catch-all NON deve piu' marciare verso l'auto-disable.
+        let c = classification_from_error_class("qualcosa_di_mai_visto");
+        assert!(matches!(c, Classification::Transient(ref k, _) if k == "qualcosa_di_mai_visto"));
+    }
+
+    #[test]
+    fn classification_model_specific_restano_punitive() {
+        // Le SOLE cause davvero model-specific continuano a degradare il modello:
+        // not_found, context_too_long, invalid_request, unprocessable, unsupported.
+        assert!(matches!(
+            classification_from_error_class("not_found"),
+            Classification::ModelSpecific(ref k, _) if k == "model_not_found"
+        ));
+        for ec in ["context_too_long", "invalid_request", "unprocessable", "unsupported"] {
+            assert!(
+                matches!(classification_from_error_class(ec), Classification::ModelSpecific(ref k, _) if k == ec),
+                "{ec} doveva restare ModelSpecific",
+            );
+        }
+    }
+
+    #[test]
+    fn tool_probe_transient_su_stop_reason_error() {
+        // stop_reason='error' senza error_class model-specific riconosciuto:
+        // INCONCLUSIVO, NON tool-failure. Prima era ToolFailed -> degradava
+        // supports_tool_use anche su un blip generico (incidente Gemini: il
+        // tool-probe e il chat-probe fallivano accoppiati con error_kind='error',
+        // a riprova che NON dipendeva dai tool).
+        let v = serde_json::json!({ "stop_reason": "error", "tool_use_blocks": [] });
+        assert!(matches!(
+            evaluate_tool_probe(&v),
+            ToolProbeVerdict::Transient(ref k) if k == "stop_reason_error"
+        ));
+    }
+
+    #[test]
+    fn tool_probe_transient_su_error_class_generico() {
+        // error_class 'error' nel tool-probe -> Transient (non ToolFailed):
+        // non degrada la tool-capability.
+        let v = serde_json::json!({ "error_class": "error", "tool_use_blocks": [] });
+        assert!(matches!(
+            evaluate_tool_probe(&v),
+            ToolProbeVerdict::Transient(ref k) if k == "error"
+        ));
+    }
+
+    #[test]
+    fn tool_probe_model_specific_restano_tool_failed() {
+        // not_found resta ToolFailed (degrada): solo i transient sono inconclusivi.
+        let v = serde_json::json!({ "error_class": "not_found", "tool_use_blocks": [] });
+        assert!(matches!(
+            evaluate_tool_probe(&v),
+            ToolProbeVerdict::ToolFailed(ref k) if k == "model_not_found"
+        ));
+    }
+
     #[test]
     fn extract_content_anthropic() {
         let v = serde_json::json!({"content": "Hello!"});
@@ -1378,14 +1573,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn tool_probe_fail_su_stop_reason_error() {
-        let v = serde_json::json!({ "stop_reason": "error", "tool_use_blocks": [] });
-        assert!(matches!(
-            evaluate_tool_probe(&v),
-            ToolProbeVerdict::ToolFailed(ref k) if k == "stop_reason_error"
-        ));
-    }
+    // NB: il caso stop_reason='error' e' ora coperto da
+    // `tool_probe_transient_su_stop_reason_error` (verdetto Transient, non
+    // ToolFailed): l'errore generico al confine gateway non degrada piu' il
+    // modello.
 
     // --- RE-PROBE candidati disabilitati per quirk gateway ------------------
 

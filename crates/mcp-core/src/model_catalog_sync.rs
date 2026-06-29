@@ -1239,6 +1239,17 @@ async fn sync_provider(
                                             provider, api_model, reason
                                         );
                                     }
+                                    ProbeOnInsertResult::Transient(kind) => {
+                                        // Errore opaco/transitorio al confine
+                                        // gateway/provider: il modello appena
+                                        // scoperto resta disabilitato (default),
+                                        // SENZA reason punitivo. Il model_health_probe
+                                        // periodico lo rivalutera' a provider stabile.
+                                        tracing::debug!(
+                                            "catalog_sync[{}]: probe transitorio su '{}': {} -> resta disabled (riprovato dal probe periodico)",
+                                            provider, api_model, kind
+                                        );
+                                    }
                                 }
                             }
                         }
