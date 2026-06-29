@@ -115,6 +115,36 @@ pub fn has_recent_productive_action(messages: &[Message], lookback: usize) -> bo
     has_productive_action_in_history(&messages[start..])
 }
 
+/// Elenca i file modificati con SUCCESSO (edit_file/write_file con tool_result NON
+/// errore) negli ultimi `lookback` messaggi, in ordine di prima apparizione, senza
+/// duplicati. Usata per un recap ONESTO: un ABORT non deve dichiarare "File toccati:
+/// nessuno" quando l'agente ha realmente applicato modifiche (regola H). Pura.
+pub fn modified_files_from_messages(messages: &[Message], lookback: usize) -> Vec<String> {
+    let recent = tail_messages(messages, lookback);
+    let mut out: Vec<String> = Vec::new();
+    for (idx, m) in recent.iter().enumerate() {
+        for (name, input) in message_tool_uses(m) {
+            if !matches!(name, "edit_file" | "write_file") {
+                continue;
+            }
+            let path = input
+                .get("path")
+                .or_else(|| input.get("file_path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(path) = path else { continue };
+            // Solo edit RIUSCITO (outcome == Some(false) = non errore).
+            if tool_result_outcome_after(recent, idx, 3) == Some(false)
+                && !out.iter().any(|p| p == path)
+            {
+                out.push(path.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Riepilogo conciso dei tool eseguiti nella history, per nome con conteggio:
 /// es. "5 azioni (write_file x3, run_command x2)". `None` se nessun tool_use.
 /// Punto unico (regola L) del riepilogo-lavoro: l'executor lo allega al messaggio

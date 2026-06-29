@@ -1200,17 +1200,43 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         tracing::warn!(target: "nexus_agent_graph::executor", "FORCE_DIAGNOSE repeated_action (force-action)");
                     }
                     Action::Abort => {
-                        // Recap M44 deterministico. modified_files_from_steps e' I/O
-                        // (agent_steps): TODO -> "nessuno" finche' non c'e' la porta.
-                        let ra_text = format!(
-                            "ESITO: non completato.\nMi sono bloccato ripetendo la stessa azione \
-({label}) {ra_count} volte senza che il risultato cambiasse; interrompo invece di \
+                        // Recap ONESTO (regola H): elenca i file REALMENTE modificati
+                        // (edit/write riusciti) invece dell'hardcoded "nessuno". Se
+                        // l'agente HA prodotto lavoro, NON dichiarare fallimento: chiudi
+                        // con EndTurn verso il final_gate, che valuta l'esito reale
+                        // (build/test); il messaggio falso "File toccati: nessuno" su un
+                        // task gia' risolto era la causa di "il sistema risolve ma dice
+                        // di aver fallito". Solo a 0 file modificati resta l'abort secco.
+                        let touched =
+                            crate::routing::signals::modified_files_from_messages(&messages, 40);
+                        let (ra_text, ra_stop) = if touched.is_empty() {
+                            (
+                                format!(
+                                    "ESITO: non completato.\nMi sono bloccato ripetendo la stessa \
+azione ({label}) {ra_count} volte senza che il risultato cambiasse; interrompo invece di \
 insistere a vuoto.\nFile toccati: nessuno.\nProssimo passo: identificare la causa radice \
 del fallimento di '{label}' dall'output/errore qui sopra e procedere con un approccio \
 diverso; se sei bloccato da una dipendenza/credenziale/permesso/servizio mancante, \
 indicalo esplicitamente."
+                                ),
+                                stop_reason_from_str(dec.stop_reason.as_deref()),
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "ESITO: modifiche applicate ai file: {}.\nMi sono fermato \
+perche' '{label}' si ripeteva senza ulteriore progresso; verifica i risultati (build/test) \
+per confermare la correzione.",
+                                    touched.join(", ")
+                                ),
+                                StopReason::EndTurn,
+                            )
+                        };
+                        tracing::warn!(
+                            target: "nexus_agent_graph::executor",
+                            touched = touched.len(),
+                            "ABORT/CLOSE repeated_action (recap onesto)"
                         );
-                        tracing::warn!(target: "nexus_agent_graph::executor", "ABORT repeated_action");
                         return Ok(StateDelta {
                             messages: Some(vec![Message::Ai {
                                 content: MessageContent::text(ra_text.clone()),
@@ -1218,7 +1244,7 @@ indicalo esplicitamente."
                             }]),
                             result: Some(Some(ra_text)),
                             pending_tool_uses: Some(Some(vec![])),
-                            stop_reason: Some(Some(stop_reason_from_str(dec.stop_reason.as_deref()))),
+                            stop_reason: Some(Some(ra_stop)),
                             iterations: Some(Some(iters_in + 1)),
                             progress_guided_axes: Some(Some(sorted(&progress_guided))),
                             progress_diagnosed_axes: Some(Some(sorted(&progress_diagnosed))),
