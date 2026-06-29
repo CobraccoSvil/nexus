@@ -43,6 +43,9 @@ pub mod context_offload;
 pub mod escalation_port;
 pub mod next_actions_deriver;
 
+// --- rolling-summary (intervento 3): SummaryStore (LLM economico) ---
+pub mod summary_store;
+
 // --- 3 impl FASE 2c: LlmGateway / ToolExecutor / CriteriaRunner ---
 pub mod criteria_runner;
 pub mod llm_gateway;

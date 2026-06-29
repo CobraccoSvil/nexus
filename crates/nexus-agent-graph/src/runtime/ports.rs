@@ -673,6 +673,39 @@ pub trait ContextOffload: Send + Sync {
     async fn offload_to_rag(&self, payload: Value, mode: ExecMode) -> Result<String, PortError>;
 }
 
+/// Rolling-summary della history conversazionale: RIASSUME (non tronca) i
+/// messaggi vecchi chiamando un modello economico, per ridurre i token sui run
+/// lunghi.
+///
+/// CONFINE (regola L): la logica PURA (DECIDERE il cutoff, serializzare il
+/// prefisso, applicare il riassunto sostituendo il prefisso con un solo
+/// messaggio) NON vive qui — sta nel modulo `context_reduction`
+/// ([`crate::decisions::context_reduction::select_rolling_summary_cutoff`],
+/// `serialize_prefix_for_summary`, `apply_rolling_summary`). Questo trait espone
+/// SOLO l'I/O: la chiamata LLM al summarizer (modello da
+/// `agent.context.rolling_summary_model`, regola G).
+///
+/// Best-effort con DEGRADO A HISTORY INVARIATA: se la chiamata fallisce (gateway
+/// down, provider in cooldown, modello non risolto) l'impl ritorna `PortError` e
+/// il nodo executor degrada lasciando la history invariata (a valle compress e
+/// token_brake fanno comunque il loro lavoro). Il guasto del summarizer NON deve
+/// MAI rompere il run.
+///
+/// Gata `Real` (PUNTO UNICO gate shadow, regola L; uniforme con
+/// [`ContextOffload`]/[`MetaStepStore`]): la chiamata LLM e' un side-effect che
+/// COSTA e che, in shadow, divergerebbe dal replay; quindi `summarize` riceve
+/// `mode` e in [`ExecMode::Replay`] e' un NO-OP che ritorna `PortError` (il nodo
+/// degrada = salta il summary, non riassume in replay).
+#[async_trait]
+pub trait SummaryStore: Send + Sync {
+    /// Riassume `text` (il prefisso della history gia' serializzato dal punto
+    /// unico puro) chiamando il modello economico, e ritorna il testo del
+    /// riassunto. Gata `Real`: in [`ExecMode::Replay`] e' un no-op che ritorna
+    /// `PortError` (il run shadow non riassume). Su guasto LLM (anche in Real)
+    /// ritorna `PortError` (il nodo degrada a history invariata). Best-effort.
+    async fn summarize(&self, text: String, mode: ExecMode) -> Result<String, PortError>;
+}
+
 /// Dati di INPUT dell'auto-escalation gia' risolti dall'impl (catena DB + gate
 /// cooldown + router cross-provider): tutto cio' che serve a
 /// [`crate::decisions::escalation::pick_escalation_model`] per DECIDERE in modo

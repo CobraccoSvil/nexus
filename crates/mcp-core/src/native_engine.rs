@@ -101,8 +101,8 @@ use nexus_agent_graph::nodes::{
 use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
-    LlmGateway, MetaStepStore, ModelUpscalePort, NextActionsDeriver, RunControlStore, TodoStore,
-    ToolExecutor, VerifierRunStore,
+    LlmGateway, MetaStepStore, ModelUpscalePort, NextActionsDeriver, RunControlStore, SummaryStore,
+    TodoStore, ToolExecutor, VerifierRunStore,
 };
 use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
@@ -122,8 +122,8 @@ use crate::agent_graph_adapter::{
     llm_gateway::{GatewayLlmAdapter, ReplayLlmGateway},
     meta_step_store::PgMetaStepStore, model_upscale_port::CatalogModelUpscalePort,
     next_actions_deriver::NextActionsDeriverAdapter, run_control_store::PgRunControlStore,
-    todo_store::PgTodoStore, tool_executor::ToolRunnerExecutorAdapter,
-    verifier_run_store::PgVerifierRunStore,
+    summary_store::PgSummaryStore, todo_store::PgTodoStore,
+    tool_executor::ToolRunnerExecutorAdapter, verifier_run_store::PgVerifierRunStore,
 };
 use crate::agent_types::AgentStepEvent;
 use crate::nexus_gateway::NexusGatewayClient;
@@ -643,6 +643,11 @@ async fn load_executor_config(
         forced_rag_reminder_text: setting_string(db, "agent.context.forced_rag_reminder_text", &d.forced_rag_reminder_text).await,
         turn_focus_enabled: setting_bool(db, "agent.context.turn_focus_enabled", d.turn_focus_enabled).await,
         discovery_max_injected: setting_i64(db, "agent.tools.discovery_max_injected", d.discovery_max_injected as i64).await.max(0) as usize,
+        // ── rolling-summary (intervento 3): RIASSUME i vecchi via LLM economico ─
+        // Flag + keep_recent dal DB (regola G). Il MODELLO economico vive nell'impl
+        // della porta PgSummaryStore (agent.context.rolling_summary_model).
+        rolling_summary_enabled: setting_bool(db, "agent.context.rolling_summary_enabled", d.rolling_summary_enabled).await,
+        rolling_keep_recent: setting_i64(db, "agent.context.rolling_keep_recent_turns", d.rolling_keep_recent).await,
         ..ExecutorConfig::default()
     }
 }
@@ -838,6 +843,9 @@ async fn build_native_engine(
         Arc::new(CooldownBillingPort::new())
     };
     let upscale: Arc<dyn ModelUpscalePort> = Arc::new(CatalogModelUpscalePort::new(db.clone()));
+    // Rolling-summary (intervento 3): riassume i vecchi via LLM economico (modello
+    // da `agent.context.rolling_summary_model`, regola G). Gata Real (no-op shadow).
+    let summary_store: Arc<dyn SummaryStore> = Arc::new(PgSummaryStore::new(db.clone()));
 
     // Motore criteri del final_gate / verifier: delega al tool_executor (punto
     // unico, regola L) per i criteri run_command/list_files + DB per outputs_exist.
@@ -897,6 +905,7 @@ async fn build_native_engine(
             next_actions.clone(),
             billing.clone(),
             upscale.clone(),
+            summary_store.clone(),
         )),
         tool_dispatch: Arc::new(ToolDispatchNode::new(
             tool_dispatch_cfg,

@@ -317,3 +317,148 @@ fn forced_rag_reminder_condizioni() {
     assert_eq!(inject_forced_rag_reminder(&msgs, "SYS", 80, 100, 0.5, "").0.len(), 1);
     assert_eq!(inject_forced_rag_reminder(&msgs, "SYS", 80, 0, 0.5, "x").0.len(), 1);
 }
+
+// ── 9) ROLLING SUMMARY (cutoff + serialize + apply) ───────────────────────────
+
+/// Messaggio assistant testuale.
+fn ai_text(text: &str) -> HistoryMessage {
+    HistoryMessage {
+        is_human: false,
+        content: Value::String(text.to_string()),
+        anthropic_content: Value::Null,
+        ..Default::default()
+    }
+}
+
+/// Messaggio `Message::Tool` (role=tool): is_tool=true + tool_call_id.
+fn tool_msg(id: &str, body: &str) -> HistoryMessage {
+    HistoryMessage {
+        is_human: false,
+        content: Value::String(body.to_string()),
+        anthropic_content: Value::Null,
+        is_tool: true,
+        tool_call_id: Some(id.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn rolling_cutoff_caso_normale() {
+    // 5 messaggi, keep_recent=2 -> cutoff base = 3. Il msg[3] e' assistant (non
+    // tool_result), quindi nessun aggiustamento: cutoff = 3.
+    let hist = vec![
+        human_text("domanda 1"),
+        ai_text("risposta 1"),
+        human_text("domanda 2"),
+        ai_text("risposta 2"),
+        human_text("domanda 3"),
+    ];
+    assert_eq!(select_rolling_summary_cutoff(&hist, 2), Some(3));
+}
+
+#[test]
+fn rolling_cutoff_aggiusta_per_non_lasciare_tool_result_orfano() {
+    // Sequenza: human, ai(tool_use), tool_result, ai, human (5 msg). keep_recent=2
+    // -> cutoff base = 3, ma hist[3] e' assistant; controllo il caso in cui il
+    // suffisso INIZIEREBBE con un tool_result orfano.
+    // hist: [human, ai(tool_use), TOOL_RESULT, TOOL_RESULT, ai, human] (6 msg).
+    // keep_recent=3 -> base = 3 -> hist[3] e' un tool_result orfano -> avanza a 4
+    // (hist[4]=ai, non tool). cutoff = 4: i due tool_result finiscono nel prefisso.
+    let hist = vec![
+        human_text("domanda"),
+        ai_text("uso un tool"),
+        tool_msg("t1", "risultato tool 1"),
+        tool_msg("t2", "risultato tool 2"),
+        ai_text("ecco la risposta"),
+        human_text("ok grazie"),
+    ];
+    let cut = select_rolling_summary_cutoff(&hist, 3).expect("cutoff Some");
+    assert_eq!(cut, 4, "cutoff aggiustato per assorbire i tool_result nel prefisso");
+    // Il primo messaggio del suffisso NON e' un tool_result.
+    assert!(!hist[cut].is_tool, "suffisso non parte con un tool_result orfano");
+}
+
+#[test]
+fn rolling_cutoff_none_history_corta() {
+    // 2 messaggi, keep_recent=2 -> base = 0 -> None.
+    let hist = vec![human_text("ciao"), ai_text("salve")];
+    assert_eq!(select_rolling_summary_cutoff(&hist, 2), None);
+    // 3 messaggi, keep_recent=2 -> base = 1 -> prefisso < MIN (2) -> None.
+    let hist3 = vec![human_text("a"), ai_text("b"), human_text("c")];
+    assert_eq!(select_rolling_summary_cutoff(&hist3, 2), None);
+}
+
+#[test]
+fn rolling_cutoff_none_prefisso_tutto_summary() {
+    // Prefisso gia' tutto messaggi summary -> niente di nuovo da riassumere.
+    let mut s1 = human_text("[RIASSUNTO conversazione precedente]\nfatti");
+    s1.rolling_summary = true;
+    let mut s2 = human_text("[RIASSUNTO conversazione precedente]\naltri fatti");
+    s2.rolling_summary = true;
+    let hist = vec![s1, s2, human_text("nuova domanda"), ai_text("risposta")];
+    // keep_recent=2 -> base = 2; hist[..2] e' tutto summary -> None.
+    assert_eq!(select_rolling_summary_cutoff(&hist, 2), None);
+}
+
+#[test]
+fn rolling_cutoff_none_se_tutto_suffisso_tool_result() {
+    // Se dopo l'aggiustamento il cutoff supera la fine (tutto tool_result in coda)
+    // -> None (nessun suffisso pulito residuo).
+    let hist = vec![
+        human_text("domanda"),
+        ai_text("uso tool"),
+        tool_msg("t1", "r1"),
+        tool_msg("t2", "r2"),
+    ];
+    // keep_recent=2 -> base = 2 -> hist[2],hist[3] sono tool_result -> avanza a 4
+    // = len -> None.
+    assert_eq!(select_rolling_summary_cutoff(&hist, 2), None);
+}
+
+#[test]
+fn rolling_serialize_prefix_testo_leggibile() {
+    let hist = vec![
+        human_text("come va il progetto?"),
+        msg_blocks(json!([
+            {"type": "text", "text": "controllo"},
+            {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "a.rs"}}
+        ])),
+        tool_msg("t1", "contenuto del file"),
+    ];
+    let text = serialize_prefix_for_summary(&hist, 3);
+    assert!(text.contains("[human]: come va il progetto?"));
+    assert!(text.contains("[assistant]:"));
+    assert!(text.contains("controllo"));
+    assert!(text.contains("<tool read_file("));
+    assert!(text.contains("[tool]: contenuto del file"));
+    // Non e' JSON: niente parentesi graffe top-level di serializzazione messaggio.
+    assert!(!text.trim_start().starts_with('{'));
+}
+
+#[test]
+fn rolling_apply_collassa_e_preserva_suffisso() {
+    let hist = vec![
+        human_text("domanda 1"),
+        ai_text("risposta 1"),
+        human_text("domanda 2"),
+        ai_text("risposta 2"),
+        human_text("domanda 3"),
+    ];
+    let out = apply_rolling_summary(&hist, 3, "L'utente ha chiesto X, deciso Y.");
+    // 3 collassati in 1 + 2 invariati = 3 messaggi.
+    assert_eq!(out.len(), 3);
+    // Primo messaggio: human di sintesi con marker e flag rolling_summary.
+    assert!(out[0].is_human, "il primo messaggio resta human");
+    assert!(out[0].rolling_summary, "flag rolling_summary attivo");
+    assert!(!out[0].is_tool);
+    assert!(out[0].tool_call_id.is_none());
+    assert!(out[0].reasoning.is_none());
+    let content = out[0].content.as_str().expect("content stringa");
+    assert!(content.starts_with("[RIASSUNTO conversazione precedente]"));
+    assert!(content.contains("deciso Y"));
+    // Il riassunto e' riconosciuto come summary (preservato dalle riduzioni dopo).
+    assert!(out[0].is_summary());
+    // Suffisso invariato (gli stessi due messaggi originali).
+    assert_eq!(out[1], hist[3]);
+    assert_eq!(out[2], hist[4]);
+}

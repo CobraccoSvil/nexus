@@ -1176,6 +1176,229 @@ pub fn inject_forced_rag_reminder(
     (out, system_text.to_string())
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+//  9) ROLLING SUMMARY (parte PURA): cutoff + serializzazione + applicazione
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Il SUMMARIZER vero (chiamata LLM al modello economico) e' I/O e vive dietro il
+// trait [`crate::runtime::ports::SummaryStore`]. Qui restano le tre primitive
+// PURE (regola L): DECIDERE dove tagliare la history (`select_rolling_summary_cutoff`),
+// SERIALIZZARE il prefisso da riassumere (`serialize_prefix_for_summary`) e
+// APPLICARE il riassunto sostituendo il prefisso con un solo messaggio
+// (`apply_rolling_summary`). Il nodo executor (call site) le orchestra: cutoff ->
+// serialize -> SummaryStore.summarize (I/O) -> apply. Su guasto LLM il nodo
+// degrada lasciando la history invariata (compress/token_brake fanno il resto).
+
+/// Soglia minima di messaggi nel prefisso sotto la quale NON vale la pena
+/// chiamare l'LLM summarizer (il costo della chiamata supera il risparmio). Un
+/// prefisso con < 2 messaggi da riassumere fa ritornare `None` al cutoff.
+pub const ROLLING_SUMMARY_MIN_PREFIX: usize = 2;
+
+/// `true` se il messaggio aprirebbe il suffisso con un `tool_result` ORFANO,
+/// cioe' un risultato di tool il cui `tool_use` corrispondente finirebbe nel
+/// prefisso riassunto (rompendo il pairing tool_use/tool_result -> HTTP 400).
+///
+/// Due forme di tool_result nella history (vedi `message_to_history`):
+///   - `Message::Tool` -> `is_tool = true` (role=tool wire, id in `tool_call_id`);
+///   - un `HumanMessage` che porta blocchi `tool_result` in `anthropic_content`
+///     (forma Anthropic inline) il cui PRIMO blocco e' un `tool_result`.
+fn opens_with_tool_result(m: &HistoryMessage) -> bool {
+    if m.is_tool {
+        return true;
+    }
+    // Forma inline: anthropic_content che inizia con un blocco tool_result e NON
+    // contiene un tool_use proprio (un turno misto user+nuovo tool_use non e'
+    // orfano). Conservativo: se il PRIMO blocco e' tool_result, lo trattiamo come
+    // apertura orfana (il suo tool_use sta in un assistant precedente).
+    match m.anthropic_blocks().and_then(|b| b.first()) {
+        Some(first) => {
+            first
+                .as_object()
+                .and_then(|o| o.get("type"))
+                .and_then(Value::as_str)
+                == Some("tool_result")
+        }
+        None => false,
+    }
+}
+
+/// DECIDE il punto di taglio (cutoff) per il rolling summary: i messaggi
+/// `hist[0..cutoff]` vengono riassunti, `hist[cutoff..]` restano intatti.
+///
+/// - Cutoff base = `len - keep_recent`. Se `<= 0` -> `None` (niente da riassumere).
+/// - PAIRING tool_use/tool_result (vincolo non negoziabile): se `hist[cutoff]`
+///   aprirebbe il suffisso con un `tool_result` orfano (il cui `tool_use` finisce
+///   nel prefisso), INCREMENTA il cutoff finche' il primo messaggio del suffisso
+///   non e' piu' un tool_result. Cosi' i tool_result iniziali del suffisso vengono
+///   ASSORBITI nel prefisso riassunto e il suffisso parte da un messaggio "pulito".
+/// - Se dopo l'aggiustamento `cutoff >= len` -> `None` (nessun suffisso residuo).
+/// - Se il prefisso `hist[0..cutoff]` e' GIA' tutto messaggi summary -> `None`
+///   (niente di nuovo da riassumere, evita di riassumere un riassunto).
+/// - Se il prefisso ha meno di [`ROLLING_SUMMARY_MIN_PREFIX`] messaggi -> `None`.
+///
+/// PURA: nessuna chiamata LLM/DB. `keep_recent` arriva dal call site (config DB).
+pub fn select_rolling_summary_cutoff(hist: &[HistoryMessage], keep_recent: i64) -> Option<usize> {
+    let len = hist.len();
+    let base = len as i64 - keep_recent;
+    if base <= 0 {
+        return None;
+    }
+    let mut cutoff = base as usize;
+    // Aggiusta in avanti finche' il suffisso non parte con un tool_result orfano.
+    while cutoff < len && opens_with_tool_result(&hist[cutoff]) {
+        cutoff += 1;
+    }
+    if cutoff >= len {
+        return None;
+    }
+    if cutoff < ROLLING_SUMMARY_MIN_PREFIX {
+        return None;
+    }
+    // Niente da riassumere se il prefisso e' gia' tutto sintesi.
+    if hist[..cutoff].iter().all(HistoryMessage::is_summary) {
+        return None;
+    }
+    Some(cutoff)
+}
+
+/// SERIALIZZA il prefisso `hist[0..cutoff]` in TESTO leggibile per il summarizer
+/// LLM (non JSON): una riga `[ruolo]: contenuto` per messaggio. Il ruolo deriva
+/// dai flag (`is_human` -> human, `is_tool` -> tool, altrimenti assistant). Il
+/// contenuto estrae il testo da `content` (stringa o blocchi `text`) e annota i
+/// `tool_use` (`<tool nome(args)>`) e i `tool_result` (`<tool_result: ...>`) in
+/// forma sintetica, cosi' il modello vede sia il dialogo sia le azioni.
+///
+/// PURA: nessun I/O. Robusta su content opaco (fallback a stringa JSON compatta).
+pub fn serialize_prefix_for_summary(hist: &[HistoryMessage], cutoff: usize) -> String {
+    let upper = cutoff.min(hist.len());
+    let mut out = String::new();
+    for m in &hist[..upper] {
+        let role = if m.is_human {
+            "human"
+        } else if m.is_tool {
+            "tool"
+        } else {
+            "assistant"
+        };
+        let body = serialize_message_body(m);
+        if body.trim().is_empty() {
+            continue;
+        }
+        out.push('[');
+        out.push_str(role);
+        out.push_str("]: ");
+        out.push_str(body.trim());
+        out.push('\n');
+    }
+    out
+}
+
+/// Estrae il corpo testuale di un messaggio per [`serialize_prefix_for_summary`]:
+/// testo da `content`, piu' annotazioni sintetiche dei blocchi `tool_use`/
+/// `tool_result` (sia in `content` se lista, sia in `anthropic_content`).
+fn serialize_message_body(m: &HistoryMessage) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // 1) Testo del content.
+    match &m.content {
+        Value::String(s) => {
+            if !s.trim().is_empty() {
+                parts.push(s.clone());
+            }
+        }
+        Value::Array(blocks) => parts.extend(serialize_blocks(blocks)),
+        Value::Null => {}
+        other => parts.push(compact_json(other)),
+    }
+
+    // 2) Blocchi anthropic_content (tool_use/tool_result/text).
+    if let Some(blocks) = m.anthropic_blocks() {
+        parts.extend(serialize_blocks(blocks));
+    }
+
+    parts.join(" ")
+}
+
+/// Annota i blocchi Anthropic-style in forma testuale sintetica.
+fn serialize_blocks(blocks: &[Value]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for b in blocks {
+        let Some(obj) = b.as_object() else { continue };
+        match obj.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = obj.get("text").and_then(Value::as_str) {
+                    if !t.trim().is_empty() {
+                        out.push(t.to_string());
+                    }
+                }
+            }
+            Some("tool_use") => {
+                let name = obj.get("name").and_then(Value::as_str).unwrap_or("?");
+                let args = obj
+                    .get("input")
+                    .map(compact_json)
+                    .unwrap_or_default();
+                out.push(format!("<tool {name}({args})>"));
+            }
+            Some("tool_result") => {
+                let content = obj
+                    .get("content")
+                    .map(|c| match c {
+                        Value::String(s) => s.clone(),
+                        other => compact_json(other),
+                    })
+                    .unwrap_or_default();
+                out.push(format!("<tool_result: {content}>"));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Serializzazione JSON compatta best-effort (fallback su content opaco). Mai
+/// panica: su errore ritorna stringa vuota.
+fn compact_json(v: &Value) -> String {
+    serde_json::to_string(v).unwrap_or_default()
+}
+
+/// APPLICA il rolling summary: sostituisce `hist[0..cutoff]` con UN SOLO
+/// `HumanMessage` di sintesi e mantiene `hist[cutoff..]` INVARIATO.
+///
+/// Il messaggio di sintesi:
+///   - `content = "[RIASSUNTO conversazione precedente]\n{summary_text}"`;
+///   - `is_human = true` (cosi' il primo messaggio della history resta human);
+///   - `rolling_summary = true` (riconosciuto da [`HistoryMessage::is_summary`],
+///     preservato dalle riduzioni successive);
+///   - tutti gli altri campi al default (no tool, no reasoning).
+///
+/// Il primo messaggio risultante e' human e il suffisso e' intatto: il pairing
+/// tool_use/tool_result del suffisso resta valido (il cutoff lo garantisce via
+/// [`select_rolling_summary_cutoff`]). PURA: nessun I/O.
+pub fn apply_rolling_summary(
+    hist: &[HistoryMessage],
+    cutoff: usize,
+    summary_text: &str,
+) -> Vec<HistoryMessage> {
+    let upper = cutoff.min(hist.len());
+    let summary = HistoryMessage {
+        is_human: true,
+        content: Value::String(format!(
+            "[RIASSUNTO conversazione precedente]\n{summary_text}"
+        )),
+        anthropic_content: Value::Null,
+        nexus_summary: false,
+        rolling_summary: true,
+        is_tool: false,
+        tool_call_id: None,
+        reasoning: None,
+    };
+    let mut out: Vec<HistoryMessage> = Vec::with_capacity(hist.len() - upper + 1);
+    out.push(summary);
+    out.extend_from_slice(&hist[upper..]);
+    out
+}
+
 #[cfg(test)]
 mod tests;
 

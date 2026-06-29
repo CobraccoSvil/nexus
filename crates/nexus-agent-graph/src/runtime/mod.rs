@@ -13,8 +13,8 @@ pub use ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
     CriterionSpec, EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway, LlmMessage,
     LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort, NextActionChoice,
-    NextActionsDeriver, PlanRow, PortError, RunControlStore, SseEvent, TodoStore, ToolCall,
-    ToolExecutor, ToolOutcome, UpscalePick, VerifierRunRecord, VerifierRunStore,
+    NextActionsDeriver, PlanRow, PortError, RunControlStore, SseEvent, SummaryStore, TodoStore,
+    ToolCall, ToolExecutor, ToolOutcome, UpscalePick, VerifierRunRecord, VerifierRunStore,
 };
 
 /// Sink eventi NO-OP: scarta ogni evento, nessun output verso l'utente.
@@ -44,8 +44,8 @@ pub mod test_doubles {
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
         CriterionSpec, EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway,
         LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort, NextActionChoice,
-        NextActionsDeriver, PlanRow, PortError, RunControlStore, SseEvent, ToolCall, ToolExecutor,
-        ToolOutcome, TodoStore, UpscalePick, VerifierRunRecord, VerifierRunStore,
+        NextActionsDeriver, PlanRow, PortError, RunControlStore, SseEvent, SummaryStore, ToolCall,
+        ToolExecutor, ToolOutcome, TodoStore, UpscalePick, VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
     use crate::decisions::escalation::{ChainEntry, CrossProviderCandidate};
@@ -490,6 +490,51 @@ pub mod test_doubles {
             g.push(payload);
             // Pointer fittizio deterministico (indice progressivo).
             Ok(format!("stub-rag-pointer-{}", g.len() - 1))
+        }
+    }
+
+    /// Summarizer di test: NON chiama alcun LLM. Se `summary` e' `Some`, ritorna
+    /// quel testo (in Real) e registra l'input ricevuto in `summarize_seen` (per
+    /// asserire CHE COSA viene serializzato e passato al modello). Se `summary` e'
+    /// `None` (DEFAULT) ritorna `PortError`: cosi' i test che NON configurano il
+    /// summary esercitano il DEGRADO best-effort (history invariata) senza dover
+    /// impostare nulla.
+    ///
+    /// Gata `Real` come l'impl concreta: in `Replay` e' NO-OP (`PortError`, niente
+    /// in `summarize_seen`).
+    #[derive(Default)]
+    pub struct StubSummaryStore {
+        /// Riassunto fisso ritornato in Real. `None` (default) -> `PortError`
+        /// (degrado best-effort: la history resta invariata).
+        pub summary: Option<String>,
+        /// Testi ricevuti da `summarize`, in ordine (per asserire l'input). Vuoto
+        /// in shadow (gate `Real`).
+        pub summarize_seen: Mutex<Vec<String>>,
+    }
+
+    impl StubSummaryStore {
+        /// Costruttore comodo: stub che ritorna `summary` in Real.
+        pub fn with_summary(summary: impl Into<String>) -> Self {
+            StubSummaryStore {
+                summary: Some(summary.into()),
+                summarize_seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SummaryStore for StubSummaryStore {
+        async fn summarize(&self, text: String, mode: ExecMode) -> Result<String, PortError> {
+            // Gate shadow: in Replay NON si riassume (no-op), come l'impl concreta.
+            if mode != ExecMode::Real {
+                return Err(PortError::Llm("shadow: summarize no-op".to_string()));
+            }
+            self.summarize_seen.lock().expect("lock summarize_seen").push(text);
+            match &self.summary {
+                Some(s) => Ok(s.clone()),
+                // Nessun riassunto configurato: degrado best-effort (history invariata).
+                None => Err(PortError::Llm("stub: nessun summary configurato".to_string())),
+            }
         }
     }
 

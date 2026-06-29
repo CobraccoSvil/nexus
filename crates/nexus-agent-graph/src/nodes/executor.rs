@@ -178,7 +178,7 @@ use crate::routing::signals::{
 };
 use crate::runtime::ports::{
     AgentStepStore, BillingCooldownPort, EscalationPort, LlmMessage, LlmRequest, MetaStepStore,
-    ModelUpscalePort, NextActionsDeriver, RunControlStore, SseEvent,
+    ModelUpscalePort, NextActionsDeriver, RunControlStore, SseEvent, SummaryStore,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
@@ -276,6 +276,15 @@ pub struct ExecutorConfig {
     /// (`agent.upscale.target_overhead_ratio`, default 1.2): `required =
     /// est_tokens * ratio`. Il tier e la query catalog vivono nell'impl della porta.
     pub upscale_overhead_ratio: f64,
+    /// `true` se il rolling-summary e' attivo (`agent.context.rolling_summary_enabled`):
+    /// al cambio-fase RIASSUME (non solo tronca) i messaggi vecchi chiamando il
+    /// modello economico via [`SummaryStore`]. Il modello e i turni di finestra
+    /// vivono nell'impl della porta (regola G). Default safe-DB-down: OFF.
+    pub rolling_summary_enabled: bool,
+    /// `keep_recent` (numero di messaggi recenti da preservare) per il rolling
+    /// summary, da `agent.context.rolling_keep_recent_turns`. I messaggi
+    /// `hist[..len-keep_recent]` (aggiustati per il pairing) vengono riassunti.
+    pub rolling_keep_recent: i64,
 }
 
 impl Default for ExecutorConfig {
@@ -323,6 +332,12 @@ impl Default for ExecutorConfig {
             // non scatta (parita' col Python quando enabled=false).
             upscale_enabled: false,
             upscale_overhead_ratio: 1.2,
+            // Default safe-DB-down: rolling-summary OFF (il wiring mcp-core passa
+            // `agent.context.rolling_summary_enabled`). Con questo default il
+            // summarizer non scatta: la riduzione resta deterministica (compress).
+            rolling_summary_enabled: false,
+            // Default coerente con `agent.context.rolling_keep_recent_turns` (2).
+            rolling_keep_recent: 2,
         }
     }
 }
@@ -360,6 +375,11 @@ pub struct ExecutorNode {
     /// La DECISIONE (`should_upscale` + `required`) e' del modulo puro (regola L).
     /// Best-effort: errore -> nessun upscale.
     upscale: Arc<dyn ModelUpscalePort>,
+    /// Porta I/O del rolling-summary (chiamata LLM al modello economico). La
+    /// DECISIONE (`select_rolling_summary_cutoff` + serializzazione + applicazione)
+    /// e' del modulo puro [`crate::decisions::context_reduction`] (regola L).
+    /// Best-effort: errore -> history invariata (degrado). Gata Real.
+    summary_store: Arc<dyn SummaryStore>,
 }
 
 impl ExecutorNode {
@@ -374,6 +394,7 @@ impl ExecutorNode {
         next_actions: Arc<dyn NextActionsDeriver>,
         billing: Arc<dyn BillingCooldownPort>,
         upscale: Arc<dyn ModelUpscalePort>,
+        summary_store: Arc<dyn SummaryStore>,
     ) -> Self {
         Self {
             cfg,
@@ -384,6 +405,7 @@ impl ExecutorNode {
             next_actions,
             billing,
             upscale,
+            summary_store,
         }
     }
 }
@@ -1573,8 +1595,9 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         let _ = self.run_control.heartbeat(&run_id, mode).await;
 
         // ── CONTEXT REDUCTION (parte PURA, punti unici PR-D) ──────────────────
-        // I/O (summarizer / continuity-trim / rolling-summary / smart-upscale /
-        // system-offload) NON portati: TODO trait dedicati. Qui solo la parte pura.
+        // I/O (continuity-trim / system-offload) NON portati: TODO trait dedicati.
+        // Il ROLLING-SUMMARY (riassume i vecchi via LLM economico) e' agganciato al
+        // cambio-fase qui sotto via la porta [`SummaryStore`] (best-effort, gata Real).
         let mut hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();
         let compress_iter = iters_in;
 
@@ -1588,9 +1611,55 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         let mut gen_cutoff_index: Option<i64> = None;
         let mut gen_cutoff_phase: Option<i64> = None;
         if phase_now > prev_phase {
-            // CAMBIO FASE: dedup + drop base64 (rolling = I/O, TODO).
+            // CAMBIO FASE: dedup + drop base64.
             hist = ctxr::dedup_tool_results_history(&hist);
             hist = ctxr::drop_unused_base64_payloads(&hist, ctxr_drop_age(), 2);
+
+            // ROLLING-SUMMARY (intervento 3): RIASSUME il prefisso vecchio invece di
+            // limitarsi a comprimere/troncare. DECISIONE pura (punto unico, regola L):
+            // cutoff -> serialize -> SummaryStore.summarize (I/O, gata Real) -> apply.
+            // BEST-EFFORT: su guasto (LLM down, cooldown, Replay no-op) la history
+            // resta INVARIATA e si prosegue (compress/token_brake fanno il resto).
+            if self.cfg.rolling_summary_enabled {
+                if let Some(cut) =
+                    ctxr::select_rolling_summary_cutoff(&hist, self.cfg.rolling_keep_recent)
+                {
+                    let prefix_text = ctxr::serialize_prefix_for_summary(&hist, cut);
+                    match self.summary_store.summarize(prefix_text, mode).await {
+                        Ok(summary) if !summary.trim().is_empty() => {
+                            let before = hist.len();
+                            hist = ctxr::apply_rolling_summary(&hist, cut, &summary);
+                            tracing::info!(
+                                target: "nexus_agent_graph::executor",
+                                run_id = %run_id,
+                                phase = phase_now,
+                                msgs_before = before,
+                                msgs_after = hist.len(),
+                                cutoff = cut,
+                                "rolling summary: prefisso conversazione riassunto"
+                            );
+                        }
+                        Ok(_) => {
+                            // Summary vuoto: degrada (history invariata).
+                            tracing::warn!(
+                                target: "nexus_agent_graph::executor",
+                                run_id = %run_id,
+                                "rolling summary: risposta vuota, degrado a history invariata"
+                            );
+                        }
+                        Err(e) => {
+                            // Guasto LLM / Replay no-op: degrado best-effort.
+                            tracing::warn!(
+                                target: "nexus_agent_graph::executor",
+                                run_id = %run_id,
+                                error = %e,
+                                "rolling summary non disponibile, degrado a history invariata"
+                            );
+                        }
+                    }
+                }
+            }
+
             cutoff_idx = std::cmp::max(0, hist.len() as i64 - params.keep_recent);
             gen_cutoff_index = Some(cutoff_idx);
             gen_cutoff_phase = Some(phase_now);

@@ -312,13 +312,14 @@ mod tests {
     use crate::runtime::ports::{
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
         EscalationPort, ExecMode, LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore,
-        ModelUpscalePort, NextActionsDeriver, PortError, RunControlStore, TodoStore, ToolCall,
-        ToolExecutor, ToolOutcome, VerifierRunStore,
+        ModelUpscalePort, NextActionsDeriver, PortError, RunControlStore, SummaryStore, TodoStore,
+        ToolCall, ToolExecutor, ToolOutcome, VerifierRunStore,
     };
     use crate::runtime::test_doubles::{
         NullEventSink, StubAgentStepStore, StubBillingCooldownPort, StubContextOffload,
         StubCriteriaRunner, StubEscalationPort, StubMetaStepStore, StubModelUpscalePort,
-        StubNextActionsDeriver, StubRunControlStore, StubTodoStore, StubVerifierRunStore,
+        StubNextActionsDeriver, StubRunControlStore, StubSummaryStore, StubTodoStore,
+        StubVerifierRunStore,
     };
     use crate::state::{Message, MessageContent, StopReason, ToolUse};
 
@@ -509,6 +510,7 @@ mod tests {
             Arc::new(StubNextActionsDeriver::default());
         let billing: Arc<dyn BillingCooldownPort> = Arc::new(StubBillingCooldownPort::default());
         let upscale: Arc<dyn ModelUpscalePort> = Arc::new(StubModelUpscalePort::default());
+        let summary_store: Arc<dyn SummaryStore> = Arc::new(StubSummaryStore::default());
 
         let exec_cfg = ExecutorConfig {
             routing_provider: "stub-provider".to_string(),
@@ -542,6 +544,7 @@ mod tests {
                 next_actions.clone(),
                 billing.clone(),
                 upscale.clone(),
+                summary_store.clone(),
             )),
             tool_dispatch: Arc::new(ToolDispatchNode::new(
                 ToolDispatchConfig::default(),

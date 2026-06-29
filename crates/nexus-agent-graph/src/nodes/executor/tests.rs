@@ -18,7 +18,7 @@ use crate::runtime::ports::{LlmResponse, LlmUsage, SseEvent};
 use crate::runtime::test_doubles::{
     NullEventSink, RecordingEventSink, StubAgentStepStore, StubBillingCooldownPort,
     StubEscalationPort, StubLlmGateway, StubMetaStepStore, StubModelUpscalePort,
-    StubNextActionsDeriver, StubRunControlStore, StubToolExecutor,
+    StubNextActionsDeriver, StubRunControlStore, StubSummaryStore, StubToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{ContentBlock, MessageContent, ToolUse};
@@ -105,8 +105,32 @@ fn node_esc(
         Arc::new(StubNextActionsDeriver::default()),
         Arc::new(StubBillingCooldownPort::default()),
         Arc::new(StubModelUpscalePort::default()),
+        // Summarizer di default: nessun summary -> degrado (history invariata).
+        Arc::new(StubSummaryStore::default()),
     );
     (n, meta, steps)
+}
+
+/// Nodo con un [`StubSummaryStore`] CONFIGURABILE (rolling-summary). Ritorna anche
+/// lo stub per asserire l'input serializzato passato al summarizer.
+fn node_summary(
+    cfg: ExecutorConfig,
+    rc: Arc<StubRunControlStore>,
+    summary: Arc<StubSummaryStore>,
+) -> ExecutorNode {
+    let meta = Arc::new(StubMetaStepStore::default());
+    let steps = Arc::new(StubAgentStepStore::default());
+    ExecutorNode::new(
+        cfg,
+        rc,
+        meta,
+        steps,
+        Arc::new(StubEscalationPort::default()),
+        Arc::new(StubNextActionsDeriver::default()),
+        Arc::new(StubBillingCooldownPort::default()),
+        Arc::new(StubModelUpscalePort::default()),
+        summary,
+    )
 }
 
 /// Nodo con le porte POST/billing/upscale CONFIGURABILI (per i 4 rami PR-J2).
@@ -129,6 +153,7 @@ fn node_ports(
         next_actions,
         billing,
         upscale,
+        Arc::new(StubSummaryStore::default()),
     );
     (n, meta)
 }
@@ -1861,6 +1886,103 @@ async fn smart_upscale_sotto_soglia_non_promuove() {
     assert_eq!(req.model, "claude-x");
     // select_upscale_model NON chiamata (gate should_upscale falso).
     assert!(upscale.selected.lock().unwrap().is_empty());
+}
+
+// ── rolling-summary (intervento 3): aggancio al cambio-fase ───────────────────
+
+/// Messaggio assistant testuale (helper locale per i test rolling-summary).
+fn ai(text: &str) -> Message {
+    Message::Ai {
+        content: MessageContent::text(text),
+        tool_calls: vec![],
+        reasoning: None,
+    }
+}
+
+/// Config che attiva il rolling-summary con keep_recent=2 (provider/model risolti).
+fn cfg_rolling() -> ExecutorConfig {
+    ExecutorConfig {
+        rolling_summary_enabled: true,
+        rolling_keep_recent: 2,
+        ..cfg_resolved()
+    }
+}
+
+/// Stato a 6 messaggi testuali, iter=5 (cambio-fase 0->1 coi boundaries default
+/// [5,10,20,50]). Risposta testuale dal gateway (nessun gate di testa scatta).
+fn state_cambio_fase() -> AgentState {
+    AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![
+            human("domanda 1"),
+            ai("risposta 1"),
+            human("domanda 2"),
+            ai("risposta 2"),
+            human("domanda 3"),
+            ai("risposta 3"),
+        ],
+        iterations: Some(5),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    }
+}
+
+/// Al cambio-fase con un `StubSummaryStore::with_summary(...)` la history viene
+/// COLLASSATA: il summarizer riceve il prefisso serializzato e la richiesta LLM
+/// del turno porta MENO messaggi (1 summary + keep_recent) rispetto agli originali.
+#[tokio::test]
+async fn rolling_summary_collassa_la_history_al_cambio_fase() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let summary = Arc::new(StubSummaryStore::with_summary(
+        "L'utente ha posto 3 domande, tutte gia' risposte.",
+    ));
+    let n = node_summary(cfg_rolling(), rc, summary.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_cambio_fase();
+    let _ = n.run(&state, &ctx).await.expect("run");
+
+    // Il summarizer e' stato chiamato col prefisso serializzato (6-2=4 messaggi).
+    let seen = summary.summarize_seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "summarize chiamato una volta al cambio-fase");
+    assert!(seen[0].contains("[human]: domanda 1"));
+    drop(seen);
+
+    // La richiesta LLM porta la history COLLASSATA: 1 summary + 2 recenti = 3
+    // (contro i 6 originali).
+    let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
+    assert_eq!(
+        req.messages.len(),
+        3,
+        "history collassata a 1 summary + keep_recent (2)"
+    );
+    // Il primo messaggio wire e' il riassunto (ruolo user con marker RIASSUNTO).
+    assert_eq!(req.messages[0].role, "user");
+    let first = req.messages[0].content.as_str().unwrap_or_default();
+    assert!(first.contains("[RIASSUNTO conversazione precedente]"));
+}
+
+/// Con lo stub di DEFAULT (`StubSummaryStore::default()`, nessun summary -> il
+/// summarize ritorna `PortError`) la history NON cambia numero di messaggi: il
+/// nodo degrada best-effort (un guasto del summarizer non riduce ne' rompe nulla).
+#[tokio::test]
+async fn rolling_summary_degrado_best_effort_history_invariata() {
+    let rc = Arc::new(StubRunControlStore::default());
+    // node_summary col default: summarize -> PortError (degrado).
+    let n = node_summary(cfg_rolling(), rc, Arc::new(StubSummaryStore::default()));
+    let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_cambio_fase();
+    let _ = n.run(&state, &ctx).await.expect("run");
+
+    // Nessun collasso: i 6 messaggi originali restano (compress non riduce il
+    // NUMERO di messaggi, solo i contenuti dei tool_result; qui sono testuali).
+    let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
+    assert_eq!(
+        req.messages.len(),
+        6,
+        "degrado best-effort: history invariata quando il summarizer fallisce"
+    );
 }
 
 /// Golden di parita' 1:1 vs Python per la LOGICA DETERMINISTICA del singolo turno
