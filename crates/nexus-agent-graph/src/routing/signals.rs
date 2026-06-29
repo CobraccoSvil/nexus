@@ -19,8 +19,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::Value;
-use sha1::{Digest, Sha1};
 
+use crate::decisions::loop_signatures::build_signature;
 use crate::state::{AgentState, ContentBlock, Message, MessageContent};
 
 use super::config::RoutingConfig;
@@ -504,9 +504,10 @@ pub fn detect_repeated_failed_command(
 /// Tool tracciati da `detect_repeated_action` -> chiavi argomento che ne
 /// definiscono il BERSAGLIO (path/comando/pattern).
 ///
-/// PUNTO UNICO (regola L): qualunque call site che debba decidere "questa azione
-/// e' la stessa di prima?" passa da qui. Il bersaglio da solo NON basta a definire
-/// l'identita' per i tool di edit (vedi [`repeated_action_content_key`]).
+/// Il bersaglio NON e' l'identita' dell'azione (quella e' l'INPUT COMPLETO, via
+/// [`build_signature`]): qui si estrae solo il bersaglio per la label leggibile e
+/// per le esclusioni basate sul file (rilettura-dopo-edit, falso-doppione).
+/// PUNTO UNICO (regola L): l'estrazione del bersaglio passa tutta da qui.
 ///
 /// Oltre ai tool PRODUTTIVI (scrittura/comando) sono inclusi i tool di SOLA
 /// LETTURA con bersaglio (read_file/list_files/grep & co.): la ripetizione
@@ -538,46 +539,6 @@ fn is_read_only_repeatable_tool(name: &str) -> bool {
     )
 }
 
-/// Chiave dell'argomento di CONTENUTO che, insieme al bersaglio, definisce
-/// l'identita' COMPLETA di un'azione di scrittura.
-///
-/// Causa radice del falso-stallo (regola H): due `edit_file` sullo stesso path
-/// con `old_string` DIVERSI sono tentativi DISTINTI (uno e' la CORREZIONE
-/// dell'altro), non una ripetizione a vuoto. Senza il contenuto nella signature
-/// collassavano sulla stessa chiave -> count=2 -> stallo -> ABORT con "0 file
-/// modificati". Includendo l'hash del contenuto la soglia 2 conta solo gli edit
-/// DAVVERO identici (stesso path + stesso old_string), lasciando passare la
-/// correzione iterativa dell'old_string.
-///
-/// PUNTO UNICO (regola L): unico posto dove si decide quale argomento porta il
-/// "contenuto" di una scrittura. `run_command` & co. NON hanno contenuto separato
-/// (il comando E' gia' il bersaglio) -> `None`, signature = solo bersaglio.
-fn repeated_action_content_key(name: &str) -> Option<&'static str> {
-    match name {
-        "edit_file" => Some("old_string"),
-        "write_file" => Some("content"),
-        _ => None,
-    }
-}
-
-/// Discriminante stabile e compatto di un valore di contenuto: `sha1_hex12` dei
-/// byte del valore (stesso schema di [`crate::decisions::loop_signatures`]).
-/// Stringa vuota (o contenuto assente) -> `""`, cosi' due edit "senza contenuto"
-/// collassano sulla stessa signature (retro-compatibilita' del path-only).
-fn content_discriminant(value: &str) -> String {
-    if value.is_empty() {
-        return String::new();
-    }
-    let mut hasher = Sha1::new();
-    hasher.update(value.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex12 = String::with_capacity(12);
-    for byte in digest.iter().take(6) {
-        hex12.push_str(&format!("{byte:02x}"));
-    }
-    hex12
-}
-
 /// Esito ricco di [`detect_repeated_action_detailed`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepeatedActionHit {
@@ -598,11 +559,14 @@ pub struct RepeatedActionHit {
 /// a prescindere dall'esito. Versione RICCA: ritorna [`RepeatedActionHit`] con
 /// label, conteggio, nome tool ed esito dell'ultima occorrenza.
 ///
-/// IDENTITA' dell'azione (regola L, punto unico): bersaglio
-/// ([`repeated_action_keys`]) + discriminante di contenuto
-/// ([`repeated_action_content_key`] -> [`content_discriminant`]). Cosi' per i tool
-/// di edit due chiamate sullo stesso file con `old_string` diversi sono azioni
-/// DISTINTE (count 1 ciascuna): solo l'edit DAVVERO identico fa count>=2.
+/// IDENTITA' dell'azione (regola L, punto unico UNIVERSALE): [`build_signature`]
+/// `(name, input)` = name + hash dell'INPUT COMPLETO. Lo stesso punto del detector
+/// dell'engine ([`crate::decisions::loop_signatures`]): vale per OGNI tool e OGNI
+/// argomento, senza whitelist da mantenere. Cosi' due chiamate dello stesso tool
+/// che differiscono in QUALSIASI argomento (l'`old_string` di un edit, il range di
+/// un read_file, il path di un grep) sono azioni DISTINTE (count 1 ciascuna): solo
+/// la chiamata DAVVERO identica fa count>=2. Il bersaglio ([`repeated_action_keys`])
+/// serve solo per label/esclusioni, non per l'identita'.
 ///
 /// FALSO-DOPPIONE: le signature la cui PRIMA occorrenza e' RIUSCITA
 /// (`tool_result_outcome_after == Some(false)`) sono ESCLUSE dal conteggio
@@ -657,13 +621,17 @@ pub fn detect_repeated_action_detailed(
             if is_read_only_repeatable_tool(name) && modified_targets.contains(&target) {
                 continue;
             }
-            // Discriminante di contenuto (solo per i tool di edit): rende la
-            // signature sensibile al CONTENUTO. `run_command` & co. -> "".
-            let content = repeated_action_content_key(name)
-                .and_then(|ck| input.get(ck).and_then(Value::as_str))
-                .map(content_discriminant)
-                .unwrap_or_default();
-            let sig = format!("{name}|{target}|{content}");
+            // IDENTITA' UNIVERSALE (regola L): la firma e' l'UNICA definizione di
+            // "stessa azione", data da build_signature(name, input) = name + hash
+            // dell'INPUT COMPLETO (ordine chiavi irrilevante). E' lo STESSO punto
+            // usato dal detector dell'engine (loop_signatures): nessun tool puo'
+            // sfuggire, perche' OGNI argomento entra per costruzione (il range di
+            // read_file, l'old_string di edit_file, il pattern+path di grep, ...).
+            // Niente whitelist di chiavi da mantenere a mano -> niente piu' falsi
+            // loop quando si aggiunge un tool/argomento. Il `target` qui sopra resta
+            // solo per la label leggibile e per le esclusioni sul bersaglio
+            // (rilettura-dopo-edit, falso-doppione).
+            let sig = build_signature(name, input);
             bump(&mut counts, &sig);
             let label_value: String = target.chars().take(120).collect();
             set_label(&mut labels, &sig, format!("{name}: {label_value}"));
@@ -1645,6 +1613,102 @@ mod tests {
         let hit = detect_repeated_action_detailed(&msgs, 24).expect("stallo grep atteso");
         assert_eq!(hit.tool_name, "grep");
         assert_eq!(hit.count, 2);
+    }
+
+    #[test]
+    fn repeated_action_read_file_porzioni_diverse_non_stallo() {
+        // Causa radice del falso-stallo "crea utente" (regola H): leggere PORZIONI
+        // diverse dello stesso file (zoom progressivo limit:50 -> 30-330 -> 314-320)
+        // e' esplorazione LEGITTIMA, non un loop. Con la signature sensibile al range
+        // le tre letture sono azioni DISTINTE (count 1 ciascuna), sotto la soglia 2.
+        let progressivo = vec![
+            ai_tool_input("read_file", json!({"path": "src/big.ts", "limit": 50})),
+            human_tool_result(Some(0), false, "..."),
+            ai_tool_input(
+                "read_file",
+                json!({"path": "src/big.ts", "start_line": 30, "end_line": 330}),
+            ),
+            human_tool_result(Some(0), false, "..."),
+            ai_tool_input(
+                "read_file",
+                json!({"path": "src/big.ts", "start_line": 314, "end_line": 320}),
+            ),
+            human_tool_result(Some(0), false, "..."),
+        ];
+        assert_eq!(
+            detect_repeated_action_detailed(&progressivo, 24).map(|h| h.count),
+            Some(1),
+            "porzioni diverse dello stesso file -> nessuno stallo"
+        );
+        // Controprova: la STESSA porzione (range identico) ripetuta resta stallo reale.
+        let identico = vec![
+            ai_tool_input(
+                "read_file",
+                json!({"path": "src/big.ts", "start_line": 314, "end_line": 320}),
+            ),
+            human_tool_result(Some(0), false, "..."),
+            ai_tool_input(
+                "read_file",
+                json!({"path": "src/big.ts", "start_line": 314, "end_line": 320}),
+            ),
+            human_tool_result(Some(0), false, "..."),
+        ];
+        let hit = detect_repeated_action_detailed(&identico, 24)
+            .expect("stallo atteso su range identico");
+        assert_eq!(hit.count, 2);
+        assert_eq!(hit.tool_name, "read_file");
+    }
+
+    #[test]
+    fn repeated_action_identita_universale_per_ogni_tool() {
+        // CONTROLLO UNIVERSALE (regola L): per OGNI tool tracciato, due chiamate che
+        // differiscono anche in UN SOLO argomento sono azioni DISTINTE (no falso
+        // loop), mentre due chiamate IDENTICHE sono un loop. L'identita' deriva
+        // dall'input COMPLETO (build_signature), quindi la proprieta' vale per
+        // qualunque tool e argomento SENZA whitelist da mantenere. Questo test e' il
+        // guard contro la reintroduzione di firme parziali (causa storica dei falsi
+        // loop su read_file/range ed edit_file/old_string). Esito fallito ovunque
+        // per neutralizzare l'esclusione "falso-doppione" dei tool produttivi.
+        let cases: &[(&str, Value, Value)] = &[
+            ("read_file", json!({"path": "a.ts"}), json!({"path": "a.ts", "start_line": 50})),
+            (
+                "read_file_lines",
+                json!({"path": "a.ts", "start_line": 1, "end_line": 50}),
+                json!({"path": "a.ts", "start_line": 51, "end_line": 100}),
+            ),
+            ("list_files", json!({"dir": "src"}), json!({"dir": "src/app"})),
+            ("grep", json!({"pattern": "TODO", "path": "src"}), json!({"pattern": "TODO", "path": "lib"})),
+            ("search_in_files", json!({"query": "auth", "path": "a"}), json!({"query": "auth", "path": "b"})),
+            ("edit_file", json!({"path": "a.ts", "old_string": "x"}), json!({"path": "a.ts", "old_string": "y"})),
+            ("write_file", json!({"path": "a.ts", "content": "x"}), json!({"path": "a.ts", "content": "y"})),
+            ("run_command", json!({"command": "ls"}), json!({"command": "pwd"})),
+        ];
+        for (tool, base, variato) in cases {
+            // Un argomento diverso -> azioni distinte -> nessuna signature a soglia 2.
+            let diversi = vec![
+                ai_tool_input(tool, base.clone()),
+                human_tool_result(None, true, "..."),
+                ai_tool_input(tool, variato.clone()),
+                human_tool_result(None, true, "..."),
+            ];
+            let count_diversi = detect_repeated_action_detailed(&diversi, 24)
+                .map(|h| h.count)
+                .unwrap_or(0);
+            assert!(
+                count_diversi < 2,
+                "{tool}: input diverso NON deve contare come loop (count {count_diversi})"
+            );
+            // Input IDENTICO ripetuto -> loop reale (count 2).
+            let identici = vec![
+                ai_tool_input(tool, base.clone()),
+                human_tool_result(None, true, "..."),
+                ai_tool_input(tool, base.clone()),
+                human_tool_result(None, true, "..."),
+            ];
+            let hit = detect_repeated_action_detailed(&identici, 24)
+                .unwrap_or_else(|| panic!("{tool}: input identico DEVE essere loop"));
+            assert_eq!(hit.count, 2, "{tool}: input identico -> count 2");
+        }
     }
 
     #[test]

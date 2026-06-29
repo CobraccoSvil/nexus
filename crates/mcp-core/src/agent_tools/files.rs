@@ -143,10 +143,15 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
         return content;
     }
 
-    // File grande: anteponiamo una mappa strutturale per orientare l'agente,
-    // MA restituiamo SEMPRE il contenuto INTEGRALE subito dopo (politica "mai
-    // troncare-e-buttare": nessuna riga viene persa, nessun rimando obbligato a
-    // read_file_lines).
+    // File grande: anteponiamo una mappa strutturale per orientare l'agente.
+    // Per i file medio-grandi restituiamo il contenuto INTEGRALE subito dopo
+    // (politica "mai troncare-e-buttare": nessuna riga persa). MA oltre una soglia
+    // di RIGHE il contenuto integrale satura il contesto e, se l'agente rilegge
+    // identicamente read_file (non avendo trovato subito la sezione), innesca un
+    // loop REALE: incidente bookingService.ts 1711 righe -> 3 read_file identiche
+    // -> loop_detected -> abort, senza che il file venisse mai usato. Oltre la
+    // soglia si rimanda a read_file_lines guidati dalla mappa, come gia' fa il
+    // cap-byte sopra. Soglia DB-driven (regola G); 0/assente = sempre integrale.
     let structure = extract_file_structure(&content);
     let structure_map: String = if structure.is_empty() {
         "  (nessuna struttura rilevata automaticamente)".to_string()
@@ -157,6 +162,30 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
             .collect::<Vec<_>>()
             .join("\n")
     };
+
+    let read_full_max_lines: usize =
+        crate::settings::get_setting(&ctx.db, "agent.fs.read_full_max_lines")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1200);
+    if read_full_max_lines > 0 && total_lines > read_full_max_lines {
+        return format!(
+            "[FILE GRANDE — {total_lines} righe — troppo lungo per la lettura integrale]\n\
+            NON rileggere read_file su questo path: otterresti lo stesso output. Per procedere:\n\
+            → leggi una sezione specifica con read_file_lines(\"{path_str}\", start_line, end_line) \
+            usando le righe indicate dalla mappa qui sotto;\n\
+            → oppure search_file_semantic(\"{path_str}\", \"cosa stai cercando\") per individuarla.\n\
+            \n\
+            === STRUTTURA DEL FILE ({struct_count} definizioni trovate) ===\n\
+            {structure_map}",
+            total_lines = total_lines,
+            path_str = path_str,
+            struct_count = structure.len(),
+            structure_map = structure_map,
+        );
+    }
 
     format!(
         "[FILE GRANDE — {total_lines} righe totali — contenuto integrale incluso sotto]\n\
