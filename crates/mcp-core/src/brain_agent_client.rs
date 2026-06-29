@@ -1506,6 +1506,9 @@ pub async fn run_via_brain(
         } else {
             Some(accumulated_reasoning)
         },
+        // Il path Python persiste la history per altra via: nessun messages_json
+        // dal result (campo specifico del finalizzatore nativo).
+        messages_json: None,
     }
 }
 
@@ -1646,6 +1649,8 @@ fn fail_result(run_id: &str, provider: &str, model: &str, msg: String) -> AgentR
         hollow_completion_kind: String::new(),
         // Fallimento infrastrutturale: nessun reasoning prodotto (FIX D4).
         reasoning: None,
+        // Fallimento infrastrutturale: nessuna conversazione da persistere.
+        messages_json: None,
     }
 }
 

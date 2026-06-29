@@ -282,6 +282,14 @@ pub struct AgentRunResult {
     /// `None` se il modello non ha prodotto thinking. Mai loggato in chiaro (regola F).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Conversazione finale del run nativo serializzata `[{role, content, ...}]`
+    /// (campo `messages` dello stato del grafo). PERSISTITA in
+    /// `agent_runs.messages_json` dal finalizzatore: serve al resume
+    /// (`status='interrupted'` con `messages_json IS NOT NULL`) e al trace panel.
+    /// `None` sul path Python (che persiste la history per altra via) o quando la
+    /// conversazione e' vuota. Non serializzata se assente.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_json: Option<String>,
 }
 
 /// Evento di trace LLM: mostra i messaggi inviati al provider e la risposta ricevuta.

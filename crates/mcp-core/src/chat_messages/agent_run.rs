@@ -1235,6 +1235,9 @@ async fn native_outcome_to_run_result(
         hollow_completion_kind: String::new(),
         // FIX D4: reasoning accumulato dal grafo nativo (reasoning_acc dello stato).
         reasoning: outcome.reasoning,
+        // Conversazione finale del grafo per agent_runs.messages_json (resume +
+        // trace panel): prima il run nativo lasciava la colonna NULL.
+        messages_json: outcome.messages_json,
     }
 }
 
@@ -1397,6 +1400,8 @@ fn native_engine_failure_result(
         hollow_completion_kind: String::new(),
         // Fallimento del motore nativo: nessun reasoning utile (FIX D4).
         reasoning: None,
+        // Fallimento prima di produrre una conversazione: nessun messages_json.
+        messages_json: None,
     }
 }
 
@@ -3423,11 +3428,15 @@ pub(crate) async fn spawn_agent_run(
             // su billing_error), che il blocco context-aware pre-loop non vede.
             // L'header, leggendo agentRun dopo getAgentRun(), mostra il modello
             // reale dell'esecuzione, non quello registrato a spawn.
+            // messages_json: conversazione finale del grafo nativo (None sul path
+            // Python). Persistito solo se valorizzato (COALESCE: non azzera un
+            // valore eventualmente scritto a monte), cosi' resume e trace panel
+            // la trovano (prima il run nativo lasciava la colonna NULL/vuota).
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
              prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
              nexus_override_applied=$9, nexus_agent_type=$10, nexus_task_type=$11, \
-             provider=$12, model=$13, \
+             provider=$12, model=$13, messages_json=COALESCE($14, messages_json), \
              completed_at=NOW() WHERE id=$1",
             )
             .bind(run_id)
@@ -3443,6 +3452,7 @@ pub(crate) async fn spawn_agent_run(
             .bind(result.nexus_task_type.as_deref())
             .bind(&result.provider)
             .bind(&result.model)
+            .bind(result.messages_json.as_deref())
             .execute(&db_clone)
             .await;
 
@@ -4075,10 +4085,14 @@ pub(crate) async fn confirm_native_run(
             let ledger_totals = fetch_ledger_totals(&state.db, run_id).await;
             let _ = reconcile_run_cost_from_ledger(&mut result, &ledger_totals);
             let status_str = result.status.as_str();
+            // messages_json: conversazione finale del resume nativo (COALESCE: non
+            // azzera la history del run originale se il resume non ne produce una
+            // nuova). Resume e trace panel la trovano valorizzata.
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
                  prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
-                 nexus_task_type=$9, provider=$10, model=$11, completed_at=NOW() \
+                 nexus_task_type=$9, provider=$10, model=$11, \
+                 messages_json=COALESCE($12, messages_json), completed_at=NOW() \
                  WHERE id=$1",
             )
             .bind(run_id)
@@ -4092,6 +4106,7 @@ pub(crate) async fn confirm_native_run(
             .bind(result.nexus_task_type.as_deref())
             .bind(&result.provider)
             .bind(&result.model)
+            .bind(result.messages_json.as_deref())
             .execute(&state.db)
             .await;
             result.status
@@ -4309,6 +4324,7 @@ mod tests_select_engine {
             total_cost: 0.0,
             user_intent: Some("code".to_string()),
             reasoning: None,
+            messages_json: Some(r#"[{"role":"user","content":"ciao"}]"#.to_string()),
         }
     }
 
@@ -4352,6 +4368,11 @@ mod tests_select_engine {
         assert_eq!(r.steps[0].status, AgentStepStatus::Completed);
         assert_eq!(r.steps[1].tool_name, "write_file");
         assert_eq!(r.steps[1].status, AgentStepStatus::Failed);
+        // La conversazione finale del grafo e' propagata per agent_runs.messages_json.
+        assert_eq!(
+            r.messages_json.as_deref(),
+            Some(r#"[{"role":"user","content":"ciao"}]"#)
+        );
     }
 
     #[sqlx::test]
@@ -4535,6 +4556,7 @@ mod tests_finalize_turn {
             hollow_no_tools: false,
             hollow_completion_kind: hollow_kind.into(),
             reasoning: None,
+            messages_json: None,
         }
     }
 

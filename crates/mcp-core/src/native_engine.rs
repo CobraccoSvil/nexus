@@ -323,6 +323,14 @@ pub struct NativeRunOutcome {
     /// il blocco "Ragionamento" sopravvive al refresh (FIX D4). `None` se il
     /// modello non ha prodotto thinking.
     pub reasoning: Option<String>,
+    /// Conversazione finale del grafo (campo `messages` dello stato), serializzata
+    /// nel formato `[{role, content, ...}]` (la forma `Message` del canale interno,
+    /// la stessa attesa dal resume e da `generate_agent_turn`). PERSISTITA in
+    /// `agent_runs.messages_json` cosi' il resume (`status='interrupted'` filtra
+    /// `messages_json IS NOT NULL`) e il trace panel la trovano valorizzata (prima
+    /// il run nativo non scriveva mai questa colonna -> NULL). `None` se la
+    /// serializzazione fallisce o la conversazione e' vuota.
+    pub messages_json: Option<String>,
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -731,7 +739,17 @@ async fn build_native_engine(
     let emit: Arc<dyn EventSink> = if role.is_shadow() {
         Arc::new(NullEventSink)
     } else {
-        Arc::new(SseEventSinkAdapter::new(input.step_tx.clone(), input.run_id))
+        // Primario: oltre a emettere gli eventi LIVE, l'adapter ricostruisce e
+        // PERSISTE le tracce gateway (`AITraceEvent`) su `nexus_agent_traces` cosi'
+        // il trace panel sopravvive al refresh (FIX persistenza tracing nativo:
+        // prima il ramo nativo non scriveva mai questa tabella). Best-effort,
+        // punto unico `trace_store::persist_trace` (regola L).
+        Arc::new(SseEventSinkAdapter::with_persistence(
+            input.step_tx.clone(),
+            input.run_id,
+            input.session_id,
+            db.clone(),
+        ))
     };
 
     // Store DB + porte ausiliarie.
@@ -1216,6 +1234,16 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             .reasoning_acc
             .clone()
             .filter(|s| !s.trim().is_empty()),
+        // Conversazione finale serializzata per agent_runs.messages_json (resume +
+        // trace panel). `Message` serializza in `{role, content, [tool_calls|
+        // tool_call_id]}`, la forma attesa dal resume. Conversazione vuota o
+        // serializzazione fallita -> None (la colonna resta NULL, nessun valore
+        // spurio).
+        messages_json: if state.messages.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&state.messages).ok()
+        },
     }
 }
 
