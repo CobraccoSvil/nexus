@@ -549,3 +549,45 @@ async fn resolve_meta_db_url(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty()))
 }
+
+/// Cache TTL (30s) del flag globale di separazione DB, per non interrogare i
+/// settings a ogni call-site dei domini migrati (regola L: lettura centralizzata).
+static PROJECT_SEPARATION_FLAG: once_cell::sync::Lazy<nexus_cache::TtlCache<(), bool>> =
+    once_cell::sync::Lazy::new(|| nexus_cache::TtlCache::new(std::time::Duration::from_secs(30)));
+
+/// `true` se la separazione DB per-progetto e' abilitata (setting
+/// `db.project_separation.enabled`, mig 0495). Cachato 30s.
+async fn project_separation_enabled(meta_db: &sqlx::PgPool) -> bool {
+    if let Some(v) = PROJECT_SEPARATION_FLAG.get(&()) {
+        return v;
+    }
+    let v = nexus_auth::get_setting(meta_db, "db.project_separation.enabled")
+        .await
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    PROJECT_SEPARATION_FLAG.insert((), v);
+    v
+}
+
+/// Punto unico (regola L) per il pool DOVE risiedono i dati per-progetto di un
+/// dominio gia' migrato: il DB metadati del progetto (`<slug>_nexus`) se la
+/// separazione e' abilitata, altrimenti il meta-DB centrale (comportamento
+/// storico). I call-site dei domini migrati usano QUESTO, mai `state.db` diretto.
+/// Fallback sicuro al meta-DB se il pool del progetto non si apre (es. DB non
+/// ancora provisionato): l'app non si rompe, legge dalla copia centrale.
+pub async fn project_data_pool(state: &AppState, project_id: Uuid) -> sqlx::PgPool {
+    if !project_separation_enabled(&state.db).await {
+        return state.db.clone();
+    }
+    match project_meta_pool(state, project_id).await {
+        Ok(pool) => (*pool).clone(),
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "project_data_pool: apertura DB metadati progetto fallita, fallback al meta-DB"
+            );
+            state.db.clone()
+        }
+    }
+}
