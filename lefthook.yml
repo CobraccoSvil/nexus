@@ -45,11 +45,10 @@ pre-commit:
 commit-msg:
   commands:
     no-emoji:
-      run: |
-        if grep -P "[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}]" "{1}" >/dev/null; then
-          echo "Commit message contiene emoji: rimuovile - direttiva editoriale" >&2
-          exit 1
-        fi
+      # Logica in scripts/check-no-emoji.sh (regola L): forma single-line +
+      # LC_ALL=C.UTF-8, portabile su git-bash Windows dove il blocco `run: |`
+      # multi-line e `grep -P` con locale non-UTF-8 fallivano.
+      run: bash scripts/check-no-emoji.sh "{1}"
 
 # Post-commit: notifica mcp-core per aggiornare il meta-vault.
 # Fail-soft: se mcp-core non e' raggiungibile (dev offline), il commit passa
