@@ -734,7 +734,7 @@ pub async fn send_chat_message(
                             .bind(&answer)
                             .bind(meta)
                             .bind(msg_id_r)
-                            .execute(&db_clone2)
+                            .execute(&crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await)
                             .await;
                         }
 

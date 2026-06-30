@@ -3359,7 +3359,7 @@ pub(crate) async fn spawn_agent_run(
             .bind(&effective_answer)
             .bind(meta)
             .bind(user_message_id)
-            .execute(&db_clone)
+            .execute(&crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await)
             .await;
 
                 spawn_embed_conversation_turn(
@@ -3805,7 +3805,7 @@ pub(crate) async fn spawn_agent_run(
             ))
             .bind(json!({"errorClass": "internal_panic", "agentRunId": panic_run_id.to_string()}))
             .bind(panic_user_msg_id)
-            .execute(&panic_db)
+            .execute(&crate::project_db_routes::project_data_pool_from(&panic_db, panic_project_id).await)
             .await;
         }
     });
