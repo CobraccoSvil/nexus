@@ -115,7 +115,7 @@ pub(crate) async fn run_turn(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let row = load_message_by_id(&state.db, assistant_id).await?;
+    let row = load_message_by_id(&state.db, project_id, assistant_id).await?;
     let view = to_message_view(&row)?;
     Ok((view, orchestrator_output))
 }

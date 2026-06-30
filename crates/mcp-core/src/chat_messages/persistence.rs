@@ -245,6 +245,10 @@ pub(crate) async fn insert_message(
     request_message_id: Option<Uuid>,
 ) -> Result<Uuid, ApiError> {
     let message_id = Uuid::new_v4();
+    // Cutover separazione DB (route-at-helper): il messaggio si scrive nel DB del
+    // progetto via registry globale. `db` e' il pool meta-DB per la risoluzione;
+    // flag off -> ritorna il meta-DB (comportamento storico).
+    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     sqlx::query(
         r#"
         INSERT INTO chat_messages (
@@ -260,7 +264,7 @@ pub(crate) async fn insert_message(
     .bind(content)
     .bind(metadata)
     .bind(request_message_id)
-    .execute(db)
+    .execute(&pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -268,8 +272,11 @@ pub(crate) async fn insert_message(
 }
 pub(crate) async fn load_message_by_id(
     db: &PgPool,
+    project_id: Uuid,
     message_id: Uuid,
 ) -> Result<sqlx::postgres::PgRow, ApiError> {
+    // Legge dal DB del progetto dove il messaggio e' stato scritto (route-at-helper).
+    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     sqlx::query(
         r#"
         SELECT
@@ -287,7 +294,7 @@ pub(crate) async fn load_message_by_id(
         "#,
     )
     .bind(message_id)
-    .fetch_one(db)
+    .fetch_one(&pool)
     .await
     .map_err(|_| api_error(StatusCode::NOT_FOUND, "Messaggio non trovato"))
 }

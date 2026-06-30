@@ -49,13 +49,13 @@ pub use migrations::{
     apply_project_migrations, list_project_migrations, request_ddl_override,
     rollback_project_migration,
 };
-pub use provision::{provision_internal_core, provision_project_db, DbRole};
-// `project_data_pool` (punto unico flag-gated) e `project_meta_pool` instradano i
-// dati per-progetto verso `<slug>_nexus` (Fase 0-2 separazione DB). Esportati come
-// fondazione; finche' nessun call-site di dominio e' instradato non hanno ancora
-// chiamanti interni al binario.
+pub use provision::{
+    init_global_pools, project_data_pool, project_data_pool_by_session, project_data_pool_from,
+    provision_internal_core, provision_project_db, DbRole,
+};
+// Esportati come fondazione; non ancora richiamati da call-site interni.
 #[allow(unused_imports)]
-pub use provision::{project_data_pool, project_data_pool_by_session, project_meta_pool};
+pub use provision::{project_data_pool_by_session_from, project_meta_pool};
 pub use query::{
     discover_schema_candidates, execute_project_db_query, import_project_db_schema,
     read_schema_file,

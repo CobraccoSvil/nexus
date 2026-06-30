@@ -474,24 +474,25 @@ pub async fn provision_internal_core(
     }))
 }
 
-/// Punto unico (regola L, Fase 0 separazione DB) per ottenere il pool del DB
-/// metadati Nexus del progetto (`<slug>_nexus`). Risolve la connessione da
-/// `project_database_config` (connection_role='nexus_metadata'); se assente,
-/// provisiona il DB e rilegge. Il pool e' cachato in `state.project_meta_pools`
-/// (TtlCache, invalidazione su re-provisioning / scadenza TTL). Tutti i call-site
-/// che accedono ai dati per-progetto passano da qui, mai aprendo pool a mano.
-pub async fn project_meta_pool(
-    state: &AppState,
+/// Core (regola L) del resolver del pool DB metadati per-progetto: opera su
+/// `meta` (pool meta-DB) e `cache` espliciti, cosi' lo stesso codice serve sia i
+/// call-site con `&AppState` sia gli helper che usano il registry globale.
+/// Risolve da `project_database_config` (connection_role='nexus_metadata'); se
+/// assente provisiona `<slug>_nexus`, ne applica lo schema (db/migrations/project)
+/// e cacha il pool. Tutti i percorsi passano da qui, mai aprendo pool a mano.
+async fn project_meta_pool_core(
+    meta: &sqlx::PgPool,
+    cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     project_id: Uuid,
 ) -> Result<std::sync::Arc<sqlx::PgPool>, String> {
-    if let Some(pool) = state.project_meta_pools.get(&project_id) {
+    if let Some(pool) = cache.get(&project_id) {
         return Ok(pool);
     }
-    let url = match resolve_meta_db_url(&state.db, project_id).await? {
+    let url = match resolve_meta_db_url(meta, project_id).await? {
         Some(u) => u,
         None => {
             provision_internal_core(
-                &state.db,
+                meta,
                 project_id,
                 "nexus_metadata",
                 Some("postgres"),
@@ -499,7 +500,7 @@ pub async fn project_meta_pool(
                 DbRole::NexusMetadata,
             )
             .await?;
-            resolve_meta_db_url(&state.db, project_id)
+            resolve_meta_db_url(meta, project_id)
                 .await?
                 .ok_or_else(|| "DB metadati non risolvibile dopo il provisioning".to_string())?
         }
@@ -511,18 +512,23 @@ pub async fn project_meta_pool(
         .await
         .map_err(|e| format!("apertura pool DB metadati (progetto {project_id}) fallita: {e}"))?;
     let arc = std::sync::Arc::new(pool);
-    // Applica lo schema per-progetto (db/migrations/project/) al DB metadati.
-    // Idempotente: sqlx salta le migrazioni gia' applicate (tracciate in
-    // _sqlx_migrations del DB-progetto). Path relativo alla root del repo, come
-    // db.rs (cwd del servizio = D:\IDEAI via workingdirectory WinSW).
+    // Schema per-progetto idempotente (db/migrations/project, _sqlx_migrations nel DB-progetto).
     sqlx::migrate::Migrator::new(std::path::Path::new("db/migrations/project"))
         .await
         .map_err(|e| format!("caricamento migrazioni per-progetto fallito: {e}"))?
         .run(arc.as_ref())
         .await
         .map_err(|e| format!("migrazioni schema per-progetto (progetto {project_id}) fallite: {e}"))?;
-    state.project_meta_pools.insert(project_id, arc.clone());
+    cache.insert(project_id, arc.clone());
     Ok(arc)
+}
+
+/// Wrapper con `&AppState` (Fase 0). Delega a [`project_meta_pool_core`].
+pub async fn project_meta_pool(
+    state: &AppState,
+    project_id: Uuid,
+) -> Result<std::sync::Arc<sqlx::PgPool>, String> {
+    project_meta_pool_core(&state.db, &state.project_meta_pools, project_id).await
 }
 
 /// Risolve la URL del DB metadati Nexus del progetto dal registry
@@ -575,11 +581,15 @@ async fn project_separation_enabled(meta_db: &sqlx::PgPool) -> bool {
 /// storico). I call-site dei domini migrati usano QUESTO, mai `state.db` diretto.
 /// Fallback sicuro al meta-DB se il pool del progetto non si apre (es. DB non
 /// ancora provisionato): l'app non si rompe, legge dalla copia centrale.
-pub async fn project_data_pool(state: &AppState, project_id: Uuid) -> sqlx::PgPool {
-    if !project_separation_enabled(&state.db).await {
-        return state.db.clone();
+async fn project_data_pool_core(
+    meta: &sqlx::PgPool,
+    cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
+    project_id: Uuid,
+) -> sqlx::PgPool {
+    if !project_separation_enabled(meta).await {
+        return meta.clone();
     }
-    match project_meta_pool(state, project_id).await {
+    match project_meta_pool_core(meta, cache, project_id).await {
         Ok(pool) => (*pool).clone(),
         Err(e) => {
             tracing::warn!(
@@ -587,9 +597,13 @@ pub async fn project_data_pool(state: &AppState, project_id: Uuid) -> sqlx::PgPo
                 error = %e,
                 "project_data_pool: apertura DB metadati progetto fallita, fallback al meta-DB"
             );
-            state.db.clone()
+            meta.clone()
         }
     }
+}
+
+pub async fn project_data_pool(state: &AppState, project_id: Uuid) -> sqlx::PgPool {
+    project_data_pool_core(&state.db, &state.project_meta_pools, project_id).await
 }
 
 /// Risolve il `project_id` di una sessione chat dalla directory di routing
@@ -610,18 +624,65 @@ async fn resolve_project_for_session(meta_db: &sqlx::PgPool, session_id: Uuid) -
 /// `project_id` a portata di mano): risolve il progetto dalla directory di
 /// routing e delega. Flag off o sessione non mappata -> meta-DB (comportamento
 /// storico, sicuro). Punto unico per il routing per-sessione (regola L).
-pub async fn project_data_pool_by_session(state: &AppState, session_id: Uuid) -> sqlx::PgPool {
-    if !project_separation_enabled(&state.db).await {
-        return state.db.clone();
+async fn project_data_pool_by_session_core(
+    meta: &sqlx::PgPool,
+    cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
+    session_id: Uuid,
+) -> sqlx::PgPool {
+    if !project_separation_enabled(meta).await {
+        return meta.clone();
     }
-    match resolve_project_for_session(&state.db, session_id).await {
-        Some(project_id) => project_data_pool(state, project_id).await,
+    match resolve_project_for_session(meta, session_id).await {
+        Some(project_id) => project_data_pool_core(meta, cache, project_id).await,
         None => {
             tracing::warn!(
                 session_id = %session_id,
                 "routing directory: sessione non mappata, fallback al meta-DB"
             );
-            state.db.clone()
+            meta.clone()
         }
+    }
+}
+
+pub async fn project_data_pool_by_session(state: &AppState, session_id: Uuid) -> sqlx::PgPool {
+    project_data_pool_by_session_core(&state.db, &state.project_meta_pools, session_id).await
+}
+
+// ── Registry globale del pool per-progetto (route-at-helper) ──────────────────
+// Permette agli helper centrali (insert_message, load_message_by_id,
+// persist_message_attachments, ...) di instradare i dati per-progetto SENZA
+// ricevere &AppState: hanno gia' il pool meta-DB e il project_id, e la cache dei
+// pool vive qui. La cache CONDIVIDE lo store con AppState.project_meta_pools
+// (TtlCache::clone condivide l'Arc<DashMap>) -> nessun pool aperto due volte.
+
+/// Cache globale dei pool metadati per-progetto. Inizializzata una volta all'avvio.
+static GLOBAL_PROJECT_POOL_CACHE: once_cell::sync::OnceCell<
+    nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
+> = once_cell::sync::OnceCell::new();
+
+/// Inizializza il registry globale con la cache di `AppState` (chiamato in main.rs).
+pub fn init_global_pools(cache: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>) {
+    let _ = GLOBAL_PROJECT_POOL_CACHE.set(cache);
+}
+
+/// Pool dove risiedono i dati per-progetto, per gli helper che hanno il pool
+/// meta-DB (`meta`) e il `project_id` ma non `&AppState`. Usa la cache globale;
+/// se il registry non e' inizializzato ricade su `meta` (sicuro).
+pub async fn project_data_pool_from(meta: &sqlx::PgPool, project_id: Uuid) -> sqlx::PgPool {
+    match GLOBAL_PROJECT_POOL_CACHE.get() {
+        Some(cache) => project_data_pool_core(meta, cache, project_id).await,
+        None => meta.clone(),
+    }
+}
+
+/// Come [`project_data_pool_from`] ma a partire da `session_id` (risolto via la
+/// directory di routing). Per gli helper che hanno solo il session_id.
+pub async fn project_data_pool_by_session_from(
+    meta: &sqlx::PgPool,
+    session_id: Uuid,
+) -> sqlx::PgPool {
+    match GLOBAL_PROJECT_POOL_CACHE.get() {
+        Some(cache) => project_data_pool_by_session_core(meta, cache, session_id).await,
+        None => meta.clone(),
     }
 }

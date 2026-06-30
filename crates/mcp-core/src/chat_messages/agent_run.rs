@@ -1573,7 +1573,7 @@ pub(crate) async fn spawn_agent_run(
         );
         // Rimuoviamo il canale broadcast: non avviamo l'agent run.
         state.agent_channels.remove(&run_id);
-        let view = match load_message_by_id(&state.db, msg_id).await {
+        let view = match load_message_by_id(&state.db, params.project_id, msg_id).await {
             Ok(row) => match to_message_view(&row) {
                 Ok(v) => match serde_json::to_value(v) {
                     Ok(json_view) => json_view,

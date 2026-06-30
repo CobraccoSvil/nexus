@@ -619,6 +619,10 @@ async fn main() -> anyhow::Result<()> {
     };
     // Singleton globale per emit da contesti senza &ProjectChannels (NexusToolHandler).
     nexus_events::dispatcher::init_global(state.project_channels.clone());
+    // Registry globale dei pool per-progetto (separazione DB): condivide lo store
+    // con state.project_meta_pools, cosi' gli helper che instradano i dati
+    // per-progetto (insert_message, ...) non aprono pool doppi.
+    project_db_routes::init_global_pools(state.project_meta_pools.clone());
 
     chat_learning::spawn_vector_compaction_scheduler(state.clone());
     nexus_builtin::seed_tools_and_server(&state.db).await;

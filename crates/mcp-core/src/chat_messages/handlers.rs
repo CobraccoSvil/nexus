@@ -216,7 +216,7 @@ pub async fn send_chat_message(
         None,
     )
     .await?;
-    let user_row = load_message_by_id(&state.db, user_message_id).await?;
+    let user_row = load_message_by_id(&state.db, context.project_id, user_message_id).await?;
     let user_message = to_message_view(&user_row)?;
 
     // ── Persistenza allegati su filesystem + DB ──────────────────────────────
@@ -299,7 +299,7 @@ pub async fn send_chat_message(
                 Some(user_message_id),
             )
             .await?;
-            let ack_row = load_message_by_id(&state.db, ack_id).await?;
+            let ack_row = load_message_by_id(&state.db, context.project_id, ack_id).await?;
             let ack_message = to_message_view(&ack_row)?;
             return Ok(Json(json!({
                 "sessionId": context.session_id.to_string(),
@@ -351,7 +351,7 @@ pub async fn send_chat_message(
                 Some(user_message_id),
             )
             .await?;
-            let ack_row = load_message_by_id(&state.db, ack_id).await?;
+            let ack_row = load_message_by_id(&state.db, context.project_id, ack_id).await?;
             let ack_message = to_message_view(&ack_row)?;
 
             return Ok(Json(json!({
@@ -837,7 +837,7 @@ pub async fn send_chat_message(
                     .await
                     .ok();
                     if let Some(err_msg_id) = err_id {
-                        if let Ok(err_row) = load_message_by_id(&state.db, err_msg_id).await {
+                        if let Ok(err_row) = load_message_by_id(&state.db, context.project_id, err_msg_id).await {
                             if let Ok(err_msg) = to_message_view(&err_row) {
                                 return Ok(Json(json!({
                                     "sessionId": context.session_id.to_string(),
@@ -1181,7 +1181,7 @@ pub async fn resend_chat_message(
         None,
     )
     .await?;
-    let resent_user_row = load_message_by_id(&state.db, resent_user_message_id).await?;
+    let resent_user_row = load_message_by_id(&state.db, project_id, resent_user_message_id).await?;
     let resent_user_message = to_message_view(&resent_user_row)?;
 
     // ── Agent mode per resend (usa la stessa funzione condivisa di send) ──
@@ -1395,7 +1395,7 @@ async fn fallback_assistant_after_run_turn_error(
         Some(user_message_id),
     )
     .await?;
-    let row = load_message_by_id(&state.db, assistant_id).await?;
+    let row = load_message_by_id(&state.db, project_id, assistant_id).await?;
     let assistant = to_message_view(&row)?;
     serde_json::to_value(assistant)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
