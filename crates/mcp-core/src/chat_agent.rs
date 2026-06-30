@@ -415,7 +415,7 @@ pub async fn get_session_worklog(
     let user_id = parse_user_id(&claims)?;
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
-    let context = crate::chat_sessions::load_session_context(&state.db, session_id, user_id).await?;
+    let context = crate::chat_sessions::load_session_context(&state, session_id, user_id).await?;
     let block = crate::session_worklog::fetch_rendered_block(&state.db, context.session_id)
         .await
         .unwrap_or_default();

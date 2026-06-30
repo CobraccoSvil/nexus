@@ -5,7 +5,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
@@ -50,10 +50,13 @@ struct SessionSummary {
 }
 
 pub(crate) async fn load_session_context(
-    db: &PgPool,
+    state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
 ) -> Result<SessionContext, ApiError> {
+    // La sessione chat vive nel DB del progetto (risolto da session_id via la
+    // directory di routing); ensure_project_access resta sul meta-DB (globale).
+    let chat_pool = crate::project_db_routes::project_data_pool_by_session(state, session_id).await;
     let row = sqlx::query(
         r#"
         SELECT id, project_id, user_id
@@ -62,7 +65,7 @@ pub(crate) async fn load_session_context(
         "#,
     )
     .bind(session_id)
-    .fetch_optional(db)
+    .fetch_optional(&chat_pool)
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -84,7 +87,7 @@ pub(crate) async fn load_session_context(
     let project_id: Uuid = row
         .try_get("project_id")
         .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    ensure_project_access(db, user_id, project_id).await?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
 
     Ok(SessionContext {
         session_id,
@@ -293,7 +296,7 @@ pub async fn rename_chat_session(
     let session_id = Uuid::parse_str(&session_id_str)
         .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "session id non valido"))?;
 
-    let ctx = load_session_context(&state.db, session_id, user_id).await?;
+    let ctx = load_session_context(&state, session_id, user_id).await?;
 
     let title = body.title.trim().to_string();
     if title.is_empty() {
@@ -303,10 +306,11 @@ pub async fn rename_chat_session(
         ));
     }
 
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, ctx.project_id).await;
     sqlx::query("UPDATE chat_sessions SET title = $1, updated_at = NOW() WHERE id = $2")
         .bind(&title)
         .bind(ctx.session_id)
-        .execute(&state.db)
+        .execute(&chat_pool)
         .await
         .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -322,21 +326,22 @@ pub async fn delete_chat_session(
     let session_id = Uuid::parse_str(&session_id_str)
         .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "session id non valido"))?;
 
-    let ctx = load_session_context(&state.db, session_id, user_id).await?;
+    let ctx = load_session_context(&state, session_id, user_id).await?;
 
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, ctx.project_id).await;
     // Soft-delete messages
     sqlx::query(
         "UPDATE chat_messages SET deleted_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
     )
     .bind(ctx.session_id)
-    .execute(&state.db)
+    .execute(&chat_pool)
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Hard-delete session
     sqlx::query("DELETE FROM chat_sessions WHERE id = $1")
         .bind(ctx.session_id)
-        .execute(&state.db)
+        .execute(&chat_pool)
         .await
         .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -799,7 +804,7 @@ pub async fn compact_chat_session(
     let session_id = Uuid::parse_str(&session_id_str)
         .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "session id non valido"))?;
 
-    let ctx = load_session_context(&state.db, session_id, user_id).await?;
+    let ctx = load_session_context(&state, session_id, user_id).await?;
 
     let outcome = compact_session_core(&state, ctx.session_id, ctx.project_id)
         .await

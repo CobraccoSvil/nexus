@@ -8,7 +8,7 @@ pub async fn list_chat_messages(
     let user_id = parse_user_id(&claims)?;
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
-    let context = load_session_context(&state.db, session_id, user_id).await?;
+    let context = load_session_context(&state, session_id, user_id).await?;
 
     let rows = sqlx::query(
         r#"
@@ -116,7 +116,7 @@ pub async fn send_chat_message(
     let user_id = parse_user_id(&claims)?;
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
-    let context = load_session_context(&state.db, session_id, user_id).await?;
+    let context = load_session_context(&state, session_id, user_id).await?;
 
     let content = body.content.trim();
     if content.is_empty() {
