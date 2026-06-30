@@ -414,7 +414,9 @@ impl CompactError {
 /// duplicata sugli stessi tool mutativi. `None` se il worklog e' vuoto o
 /// disabilitato (il riassunto procede senza la sezione strutturale).
 async fn structured_work_state(db: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
-    let block = crate::session_worklog::fetch_rendered_block(db, session_id).await?;
+    // Worklog di sessione nel DB del progetto (risolto da session_id via routing).
+    let pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
+    let block = crate::session_worklog::fetch_rendered_block(&pool, session_id).await?;
     Some(format!(
         "\n\n## Stato lavori (worklog di sessione, punto unico — non perdere questi fatti)\n{block}"
     ))
@@ -430,6 +432,10 @@ pub(crate) async fn compact_session_core(
     // Necessario perche' dopo una compattazione l'utente continua a chattare
     // accumulando nuovi token che devono poter essere a loro volta compattati.
 
+    // Cutover separazione DB: i dati chat della compattazione vivono nel DB del
+    // progetto (flag off -> meta-DB). project_id e' in scope.
+    let chat_pool = crate::project_db_routes::project_data_pool(state, project_id).await;
+
     // Load non-deleted messages
     let rows = sqlx::query(
         r#"
@@ -439,7 +445,7 @@ pub(crate) async fn compact_session_core(
         "#,
     )
     .bind(session_id)
-    .fetch_all(&state.db)
+    .fetch_all(&chat_pool)
     .await
     .map_err(|e| CompactError::internal(e.to_string()))?;
 
@@ -672,7 +678,7 @@ pub(crate) async fn compact_session_core(
     .bind(&summary_text)
     .bind(format!("session:{}", session_id))
     .bind(&point_id)
-    .execute(&state.db)
+    .execute(&chat_pool)
     .await
     .map_err(|e| CompactError::internal(e.to_string()))?;
 
@@ -687,7 +693,7 @@ pub(crate) async fn compact_session_core(
            AND role IN ('user', 'assistant')",
     )
     .bind(session_id)
-    .execute(&state.db)
+    .execute(&chat_pool)
     .await
     .map_err(|e| CompactError::internal(e.to_string()))?;
 
@@ -718,14 +724,14 @@ pub(crate) async fn compact_session_core(
     .bind(project_id)
     .bind(&summary_content)
     .bind(&summary_metadata)
-    .execute(&state.db)
+    .execute(&chat_pool)
     .await
     .map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Mark session as compacted
     sqlx::query("UPDATE chat_sessions SET status = 'compacted', updated_at = NOW() WHERE id = $1")
         .bind(session_id)
-        .execute(&state.db)
+        .execute(&chat_pool)
         .await
         .map_err(|e| CompactError::internal(e.to_string()))?;
 
