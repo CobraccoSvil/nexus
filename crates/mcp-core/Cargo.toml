@@ -89,5 +89,10 @@ onnx = ["nexus-orchestrator/onnx"]
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# windows-sys: liveness di processo cross-platform in process_util.rs
+# (OpenProcess/WaitForSingleObject). Su Linux la liveness usa /proc, qui no dep.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [lints]
 workspace = true

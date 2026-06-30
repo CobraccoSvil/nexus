@@ -72,6 +72,7 @@ pub mod playwright_live;
 mod plugins;
 mod port_registry;
 mod process_resume;
+mod process_util;
 mod profiles;
 // Estratto in crate workspace (split 7.4): re-export per mantenere
 // validi i path crate::project_db:: dei moduli esistenti.

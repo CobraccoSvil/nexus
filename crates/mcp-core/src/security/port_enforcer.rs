@@ -20,6 +20,7 @@ use crate::project_workspace::services::{
     detect_all_port_bindings, port_allocated_to_project, project_bucket_start,
     PROJECT_PORT_BUCKET_SIZE,
 };
+use crate::process_util::process_alive;
 use crate::security::{record_audit, AuditEntry};
 
 /// Intervallo di scansione: 5s bilancia reattivita' (finestra di violazione breve)
@@ -266,27 +267,9 @@ async fn kill_process(pid: u32, sig: Signal) {
     }
 }
 
-/// Controlla se il processo e' ancora vivo via /proc/{pid}.
-fn process_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{}", pid)).exists()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_process_alive_current() {
-        // Il processo corrente deve risultare vivo
-        let pid = std::process::id();
-        assert!(process_alive(pid));
-    }
-
-    #[test]
-    fn test_process_alive_nonexistent() {
-        // PID assurdo non deve risultare vivo
-        assert!(!process_alive(u32::MAX));
-    }
 
     #[test]
     fn test_signal_variants() {
