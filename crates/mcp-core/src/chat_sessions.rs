@@ -224,6 +224,10 @@ pub async fn create_chat_session(
     let project_id = parse_project_id(&body.project_id)?;
     ensure_project_access(&state.db, user_id, project_id).await?;
 
+    // Cutover separazione DB: la sessione chat si scrive nel DB del progetto
+    // (flag off -> meta-DB). project_id in scope dal body.
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, project_id).await;
+
     let session_id = Uuid::new_v4();
     let title = body
         .title
@@ -243,7 +247,7 @@ pub async fn create_chat_session(
     .bind(project_id)
     .bind(user_id)
     .bind(&title)
-    .execute(&state.db)
+    .execute(&chat_pool)
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
