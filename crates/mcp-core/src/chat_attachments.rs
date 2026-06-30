@@ -434,7 +434,7 @@ pub async fn persist_message_attachments(
         .bind(&kind)
         .bind(&content_hash)
         .bind(created_at)
-        .execute(db)
+        .execute(&crate::project_db_routes::project_data_pool_from(db, project_id).await)
         .await;
 
         if let Err(e) = insert {
