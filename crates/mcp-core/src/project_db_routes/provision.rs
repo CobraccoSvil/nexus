@@ -21,6 +21,34 @@ use super::connection::{test_project_db_connection, TestConnectionBody};
 use super::shared::{api_err, pg_physical_target, ApiResult};
 use crate::{auth::Claims, AppState};
 
+/// Ruolo di una connessione registrata in `project_database_config` (Fase 0
+/// separazione DB, regola L): distingue il DB applicativo dell'utente da quello
+/// dei metadati Nexus per-progetto. Determina suffisso del nome e visibilita'.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DbRole {
+    /// DB applicativo dell'utente (`<slug>_app`), visibile nel pannello SQL.
+    App,
+    /// DB interno Nexus per-progetto (`<slug>_nexus`): chat/run/costi, mai esposto.
+    NexusMetadata,
+}
+
+impl DbRole {
+    /// Suffisso del nome fisico del database per questo ruolo.
+    fn suffix(self) -> &'static str {
+        match self {
+            DbRole::App => "_app",
+            DbRole::NexusMetadata => "_nexus",
+        }
+    }
+    /// Valore della colonna `connection_role`.
+    fn as_db_value(self) -> &'static str {
+        match self {
+            DbRole::App => "app",
+            DbRole::NexusMetadata => "nexus_metadata",
+        }
+    }
+}
+
 /// Corpo richiesta per `POST /api/projects/:id/db/provision`.
 ///
 /// Provisiona davvero un database per il progetto:
@@ -70,10 +98,10 @@ fn sanitize_db_ident(input: &str) -> String {
         .collect()
 }
 
-/// Deriva il nome fisico del database dallo slug del progetto (sanitizzato),
-/// stessa logica di ensure_project_db_url per riconoscere idempotentemente un
-/// DB gia creato dall agente.
-fn derive_app_db_name(slug: Option<&str>, project_id: Uuid) -> String {
+/// Deriva il nome fisico del database dallo slug del progetto (sanitizzato) e
+/// dal `suffix` del ruolo (`_app` o `_nexus`). Stessa logica idempotente di
+/// `ensure_project_db_url` per riconoscere un DB gia' creato.
+fn derive_project_db_name(slug: Option<&str>, project_id: Uuid, suffix: &str) -> String {
     let base = slug
         .map(|s| s.to_string())
         .unwrap_or_else(|| project_id.simple().to_string());
@@ -88,10 +116,12 @@ fn derive_app_db_name(slug: Option<&str>, project_id: Uuid) -> String {
     {
         sanitized.insert(0, 'p');
     }
-    if sanitized.len() > 56 {
-        sanitized.truncate(56);
+    // Tronca lasciando spazio al suffisso, cosi' il nome totale resta valido.
+    let max_base = 56_usize.saturating_sub(suffix.len());
+    if sanitized.len() > max_base {
+        sanitized.truncate(max_base);
     }
-    format!("{sanitized}_app")
+    format!("{sanitized}{suffix}")
 }
 
 pub async fn provision_project_db(
@@ -224,7 +254,9 @@ async fn provision_internal(
     engine_in: Option<&str>,
     db_name_in: Option<&str>,
 ) -> ApiResult {
-    match provision_internal_core(&state.db, project_id, name, engine_in, db_name_in).await {
+    match provision_internal_core(&state.db, project_id, name, engine_in, db_name_in, DbRole::App)
+        .await
+    {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
@@ -241,6 +273,7 @@ pub async fn provision_internal_core(
     name: &str,
     engine_in: Option<&str>,
     db_name_in: Option<&str>,
+    role: DbRole,
 ) -> Result<Value, String> {
     let engine = engine_in.unwrap_or("postgres").trim().to_lowercase();
     if engine != "postgres" {
@@ -258,12 +291,12 @@ pub async fn provision_internal_core(
         Some(explicit) => {
             let cleaned = sanitize_db_ident(explicit);
             if cleaned.is_empty() {
-                derive_app_db_name(slug.as_deref(), project_id)
+                derive_project_db_name(slug.as_deref(), project_id, role.suffix())
             } else {
                 cleaned
             }
         }
-        None => derive_app_db_name(slug.as_deref(), project_id),
+        None => derive_project_db_name(slug.as_deref(), project_id, role.suffix()),
     };
 
     let host = load_app_db_setting(db, "nexus_app_db_host", "localhost").await;
@@ -352,17 +385,20 @@ pub async fn provision_internal_core(
 
     // Una connessione che gia' esiste e viene riusata non e' una "prima"
     // connessione; la primary viene garantita dopo (vedi sotto).
-    let is_first = existing_count == 0;
+    // Il DB metadati (NexusMetadata) NON e' mai primary: la primary e' sempre il
+    // DB applicativo dell'utente. Solo il ruolo App puo' essere primario.
+    let is_first = role == DbRole::App && existing_count == 0;
 
     let detection_meta = serde_json::json!({ "source": "panel_provision_internal" });
     sqlx::query(
-        "INSERT INTO project_database_config (project_id, name, engine, hosting_mode, connection_secret, is_primary, allow_ddl_override, detection_metadata) VALUES ($1, $2, 'postgres', 'internal', $3::bytea, $4, false, $5) ON CONFLICT (project_id, LOWER(name)) DO UPDATE SET engine = EXCLUDED.engine, hosting_mode = EXCLUDED.hosting_mode, connection_secret = EXCLUDED.connection_secret, updated_at = NOW()",
+        "INSERT INTO project_database_config (project_id, name, engine, hosting_mode, connection_secret, is_primary, allow_ddl_override, detection_metadata, connection_role) VALUES ($1, $2, 'postgres', 'internal', $3::bytea, $4, false, $5, $6) ON CONFLICT (project_id, LOWER(name)) DO UPDATE SET engine = EXCLUDED.engine, hosting_mode = EXCLUDED.hosting_mode, connection_secret = EXCLUDED.connection_secret, connection_role = EXCLUDED.connection_role, updated_at = NOW()",
     )
     .bind(project_id)
     .bind(&effective_name)
     .bind(url.as_bytes())
     .bind(is_first)
     .bind(&detection_meta)
+    .bind(role.as_db_value())
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
@@ -378,7 +414,9 @@ pub async fn provision_internal_core(
     .await
     .map_err(|e| e.to_string())?;
 
-    if !has_primary {
+    // Solo il ruolo App puo' diventare primary: un DB metadati non promuove mai
+    // se stesso (la primary resta il DB applicativo dell'utente).
+    if !has_primary && role == DbRole::App {
         sqlx::query("UPDATE project_database_config SET is_primary = false WHERE project_id = $1")
             .bind(project_id)
             .execute(&mut *tx)
@@ -434,4 +472,70 @@ pub async fn provision_internal_core(
         "reused": reused,
         "is_primary": is_primary,
     }))
+}
+
+/// Punto unico (regola L, Fase 0 separazione DB) per ottenere il pool del DB
+/// metadati Nexus del progetto (`<slug>_nexus`). Risolve la connessione da
+/// `project_database_config` (connection_role='nexus_metadata'); se assente,
+/// provisiona il DB e rilegge. Il pool e' cachato in `state.project_meta_pools`
+/// (TtlCache, invalidazione su re-provisioning / scadenza TTL). Tutti i call-site
+/// che accedono ai dati per-progetto passano da qui, mai aprendo pool a mano.
+pub async fn project_meta_pool(
+    state: &AppState,
+    project_id: Uuid,
+) -> Result<std::sync::Arc<sqlx::PgPool>, String> {
+    if let Some(pool) = state.project_meta_pools.get(&project_id) {
+        return Ok(pool);
+    }
+    let url = match resolve_meta_db_url(&state.db, project_id).await? {
+        Some(u) => u,
+        None => {
+            provision_internal_core(
+                &state.db,
+                project_id,
+                "nexus_metadata",
+                Some("postgres"),
+                None,
+                DbRole::NexusMetadata,
+            )
+            .await?;
+            resolve_meta_db_url(&state.db, project_id)
+                .await?
+                .ok_or_else(|| "DB metadati non risolvibile dopo il provisioning".to_string())?
+        }
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&url)
+        .await
+        .map_err(|e| format!("apertura pool DB metadati (progetto {project_id}) fallita: {e}"))?;
+    let arc = std::sync::Arc::new(pool);
+    state.project_meta_pools.insert(project_id, arc.clone());
+    Ok(arc)
+}
+
+/// Risolve la URL del DB metadati Nexus del progetto dal registry
+/// `project_database_config` (connection_role='nexus_metadata'). `None` se non
+/// ancora provisionato. La URL e' salvata in chiaro nel `connection_secret`
+/// (vedi nota sicurezza in cleanup.rs); la lettura e' coerente con
+/// `resolve_project_conn`.
+async fn resolve_meta_db_url(
+    meta_db: &sqlx::PgPool,
+    project_id: Uuid,
+) -> Result<Option<String>, String> {
+    let secret: Option<Vec<u8>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(
+        "SELECT connection_secret FROM project_database_config \
+         WHERE project_id = $1 AND connection_role = 'nexus_metadata' \
+         ORDER BY updated_at DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .fetch_optional(meta_db)
+    .await
+    .map_err(|e| e.to_string())?
+    .flatten();
+    Ok(secret
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
 }

@@ -1785,7 +1785,7 @@ async fn handle_db_provision(db: &PgPool, project_id: Uuid, arguments: &Value) -
         "internal" => {
             let db_name = arguments.get("db_name").and_then(Value::as_str);
             let engine = arguments.get("engine").and_then(Value::as_str);
-            match crate::project_db_routes::provision_internal_core(db, project_id, name, engine, db_name).await {
+            match crate::project_db_routes::provision_internal_core(db, project_id, name, engine, db_name, crate::project_db_routes::DbRole::App).await {
                 Ok(v) => v.to_string(),
                 Err(e) => json!({ "ok": false, "error": e }).to_string(),
             }

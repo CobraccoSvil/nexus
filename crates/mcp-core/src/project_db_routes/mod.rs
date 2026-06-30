@@ -49,7 +49,12 @@ pub use migrations::{
     apply_project_migrations, list_project_migrations, request_ddl_override,
     rollback_project_migration,
 };
-pub use provision::{provision_internal_core, provision_project_db};
+pub use provision::{provision_internal_core, provision_project_db, DbRole};
+// `project_meta_pool` e' il punto unico (Fase 0 separazione DB) che instrada i
+// dati per-progetto verso `<slug>_nexus`. Esportato ora come fondazione; finche'
+// nessun dominio e' migrato (fasi 2+) non ha ancora chiamanti interni al binario.
+#[allow(unused_imports)]
+pub use provision::project_meta_pool;
 pub use query::{
     discover_schema_candidates, execute_project_db_query, import_project_db_schema,
     read_schema_file,

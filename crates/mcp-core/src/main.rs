@@ -182,6 +182,11 @@ struct AppState {
             std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>,
         >,
     >,
+    /// Pool-cache dei DB metadati Nexus per-progetto (Fase 0 separazione DB,
+    /// regola L). Popolata/letta SOLO da `project_db_routes::project_meta_pool`,
+    /// il punto unico che risolve/provisiona `<slug>_nexus` e instrada i dati
+    /// per-progetto. Invalidazione su re-provisioning / scadenza TTL.
+    pub(crate) project_meta_pools: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
 }
 
 #[tokio::main(worker_threads = 32)]
@@ -610,6 +615,7 @@ async fn main() -> anyhow::Result<()> {
         watching_projects: Arc::new(DashSet::new()),
         project_channels: nexus_events::dispatcher::new_registry(),
         monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        project_meta_pools: nexus_cache::TtlCache::new(std::time::Duration::from_secs(600)),
     };
     // Singleton globale per emit da contesti senza &ProjectChannels (NexusToolHandler).
     nexus_events::dispatcher::init_global(state.project_channels.clone());
