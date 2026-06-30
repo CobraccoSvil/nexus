@@ -193,87 +193,92 @@ async fn scan_and_ingest(state: &WikiDeps, settings: &ChatNoteSettings) -> Resul
         }
     };
 
-    // Selezioniamo solo messaggi user con project_id valorizzato (gia' NOT NULL
-    // post-mig 0008 — ma controlliamo l'esistenza del progetto via JOIN per
-    // robustezza dopo eventuali ON DELETE SET NULL futuri).
-    //
-    // Limit = max_per_minute, cosi' il cap di sicurezza e' rispettato per
-    // iterazione (vediamo `interval_secs` >= 5, in pratica al massimo
-    // max_per_minute * (60/interval) inserzioni reali al minuto, vicino al cap).
-    let rows = sqlx::query(
-        r#"
-        SELECT cm.id, cm.project_id, cm.session_id, cm.content, cm.created_at
-        FROM chat_messages cm
-        JOIN projects p ON p.id = cm.project_id
-        WHERE cm.role = 'user'
-          AND cm.kb_ingested IS NULL
-          AND cm.deleted_at IS NULL
-        ORDER BY cm.created_at ASC
-        LIMIT $1
-        "#,
-    )
-    .bind(settings.max_per_minute as i64)
-    .fetch_all(&state.db)
-    .await
-    .context("SELECT chat_messages pending kb_ingest")?;
-
-    if rows.is_empty() {
-        return Ok(0);
-    }
-
+    // Separazione DB per-progetto: i messaggi chat vivono nel DB del progetto (a
+    // flag OFF ancora nel meta). Iteriamo i progetti e instradiamo scansione +
+    // mark_processed sul pool di ciascuno; `wiki_docs`/Qdrant restano sul meta
+    // (dominio KB non ancora migrato). `max_per_minute` resta un cap GLOBALE per
+    // batch tramite il budget `remaining` decrementato a ogni messaggio trattato.
     let mut ingested = 0usize;
-    for row in rows {
-        let message_id: Uuid = match row.try_get("id") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let project_id: Uuid = match row.try_get("project_id") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let session_id: Uuid = match row.try_get("session_id") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let content: String = row.try_get("content").unwrap_or_default();
-        let created_at: chrono::DateTime<chrono::Utc> = row
-            .try_get("created_at")
-            .unwrap_or_else(|_| chrono::Utc::now());
-
-        // Filtro 1: lunghezza minima.
-        if content.trim().chars().count() < settings.min_body_chars {
-            mark_processed(&state.db, message_id).await;
-            continue;
+    let mut remaining = settings.max_per_minute;
+    for project_id in state.list_project_ids().await {
+        if remaining == 0 {
+            break;
         }
-        // Filtro 2: pattern banale.
-        if let Some(re) = &skip_re {
-            if re.is_match(content.trim()) {
-                mark_processed(&state.db, message_id).await;
+        let run_pool = state.run_pool(project_id).await;
+        // Messaggi user pending per QUESTO progetto (no JOIN projects: il
+        // project_id viene dall'iterazione, e a flag ON il pool ha solo i suoi).
+        let rows = sqlx::query(
+            r#"
+            SELECT cm.id, cm.session_id, cm.content, cm.created_at
+            FROM chat_messages cm
+            WHERE cm.project_id = $1
+              AND cm.role = 'user'
+              AND cm.kb_ingested IS NULL
+              AND cm.deleted_at IS NULL
+            ORDER BY cm.created_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(project_id)
+        .bind(remaining as i64)
+        .fetch_all(&run_pool)
+        .await
+        .context("SELECT chat_messages pending kb_ingest")?;
+
+        for row in rows {
+            if remaining == 0 {
+                break;
+            }
+            let message_id: Uuid = match row.try_get("id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let session_id: Uuid = match row.try_get("session_id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let content: String = row.try_get("content").unwrap_or_default();
+            let created_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("created_at")
+                .unwrap_or_else(|_| chrono::Utc::now());
+
+            remaining = remaining.saturating_sub(1);
+
+            // Filtro 1: lunghezza minima.
+            if content.trim().chars().count() < settings.min_body_chars {
+                mark_processed(&run_pool, message_id).await;
                 continue;
             }
-        }
+            // Filtro 2: pattern banale.
+            if let Some(re) = &skip_re {
+                if re.is_match(content.trim()) {
+                    mark_processed(&run_pool, message_id).await;
+                    continue;
+                }
+            }
 
-        match ingest_message(
-            state, message_id, project_id, session_id, &content, created_at,
-        )
-        .await
-        {
-            Ok(true) => {
-                ingested += 1;
-                mark_processed(&state.db, message_id).await;
-            }
-            Ok(false) => {
-                // Skip esplicito (es. ingest_message ha deciso di non creare doc).
-                mark_processed(&state.db, message_id).await;
-            }
-            Err(e) => {
-                // Non marcare: il prossimo giro riprovera'. Se l'errore e' persistente
-                // resta in coda — ammesso, e' un'eccezione rara.
-                tracing::warn!(
-                    message_id = %message_id,
-                    error = %e,
-                    "wiki.chat_note: ingest_message fallito (retry al prossimo giro)"
-                );
+            match ingest_message(
+                state, message_id, project_id, session_id, &content, created_at,
+            )
+            .await
+            {
+                Ok(true) => {
+                    ingested += 1;
+                    mark_processed(&run_pool, message_id).await;
+                }
+                Ok(false) => {
+                    // Skip esplicito (es. ingest_message ha deciso di non creare doc).
+                    mark_processed(&run_pool, message_id).await;
+                }
+                Err(e) => {
+                    // Non marcare: il prossimo giro riprovera'. Se l'errore e' persistente
+                    // resta in coda — ammesso, e' un'eccezione rara.
+                    tracing::warn!(
+                        message_id = %message_id,
+                        error = %e,
+                        "wiki.chat_note: ingest_message fallito (retry al prossimo giro)"
+                    );
+                }
             }
         }
     }

@@ -25,4 +25,4 @@ pub mod triple_extractor;
 pub mod vault;
 pub mod watcher;
 
-pub use deps::{WikiAiServices, WikiDeps};
+pub use deps::{ProjectPoolResolver, WikiAiServices, WikiDeps};

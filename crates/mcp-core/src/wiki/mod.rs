@@ -90,6 +90,31 @@ impl WikiAiServices for AppStateWikiAi {
     }
 }
 
+/// Impl mcp-core del risolutore pool per-progetto per i worker wiki
+/// (separazione DB). Delega al registry globale `project_data_pool_from` (punto
+/// unico, regola L): a flag OFF ritorna il meta-DB, a flag ON il pool di
+/// `<slug>_nexus`. Tiene solo il meta pool (i worker girano in background, senza
+/// AppState vivo).
+#[derive(Clone)]
+pub(crate) struct AppStateProjectPool {
+    meta: sqlx::PgPool,
+}
+
+impl std::fmt::Debug for AppStateProjectPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AppStateProjectPool")
+    }
+}
+
+impl nexus_wiki::ProjectPoolResolver for AppStateProjectPool {
+    fn project_pool(&self, project_id: uuid::Uuid) -> BoxFuture<'_, sqlx::PgPool> {
+        let meta = self.meta.clone();
+        Box::pin(async move {
+            crate::project_db_routes::project_data_pool_from(&meta, project_id).await
+        })
+    }
+}
+
 impl crate::AppState {
     /// Costruisce il contesto `WikiDeps` per le funzioni del crate nexus-wiki.
     pub(crate) fn wiki_deps(&self) -> WikiDeps {
@@ -99,6 +124,9 @@ impl crate::AppState {
             ai: Arc::new(AppStateWikiAi {
                 state: self.clone(),
             }),
+            project_pool: Some(Arc::new(AppStateProjectPool {
+                meta: self.db.clone(),
+            })),
         }
     }
 }

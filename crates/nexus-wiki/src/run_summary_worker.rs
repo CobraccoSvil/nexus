@@ -155,79 +155,89 @@ pub fn start_run_summary_worker(state: Arc<WikiDeps>) {
 }
 
 async fn scan_and_ingest(state: &WikiDeps, settings: &RunSummarySettings) -> Result<usize> {
-    let rows = sqlx::query(
-        r#"
-        SELECT ar.id, ar.project_id, ar.session_id, ar.status, ar.provider, ar.model,
-               ar.iteration_count, ar.final_answer, ar.created_at, ar.completed_at
-        FROM agent_runs ar
-        JOIN projects p ON p.id = ar.project_id
-        WHERE ar.kb_ingested IS NULL
-          AND ar.status IN ('completed', 'failed', 'aborted')
-          AND ar.completed_at IS NOT NULL
-        ORDER BY ar.completed_at ASC
-        LIMIT $1
-        "#,
-    )
-    .bind(settings.max_per_minute as i64)
-    .fetch_all(&state.db)
-    .await
-    .context("SELECT agent_runs pending kb_ingest")?;
-
-    if rows.is_empty() {
-        return Ok(0);
-    }
-
+    // Separazione DB per-progetto: i run vivono nel DB del progetto (a flag OFF
+    // ancora nel meta). Iteriamo i progetti e instradiamo la scansione + il
+    // mark_processed sul pool di ciascuno; `wiki_docs`/Qdrant restano sul meta
+    // (dominio KB non ancora migrato). `max_per_minute` resta un cap GLOBALE per
+    // batch tramite il budget `remaining` decrementato a ogni run trattato.
     let mut ingested = 0usize;
-    for row in rows {
-        let run_id: Uuid = match row.try_get("id") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let project_id: Uuid = match row.try_get("project_id") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let session_id: Uuid = match row.try_get("session_id") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let status: String = row.try_get("status").unwrap_or_default();
-        let provider: Option<String> = row.try_get("provider").ok();
-        let model: Option<String> = row.try_get("model").ok();
-        let iteration_count: i32 = row.try_get("iteration_count").unwrap_or(0);
-        let final_answer: Option<String> = row.try_get("final_answer").ok();
-        let created_at: chrono::DateTime<chrono::Utc> = row
-            .try_get("created_at")
-            .unwrap_or_else(|_| chrono::Utc::now());
-        let completed_at: chrono::DateTime<chrono::Utc> = row
-            .try_get("completed_at")
-            .unwrap_or_else(|_| chrono::Utc::now());
-
-        match ingest_run(
-            state,
-            run_id,
-            project_id,
-            session_id,
-            &status,
-            provider.as_deref(),
-            model.as_deref(),
-            iteration_count,
-            final_answer.as_deref(),
-            created_at,
-            completed_at,
+    let mut remaining = settings.max_per_minute;
+    for project_id in state.list_project_ids().await {
+        if remaining == 0 {
+            break;
+        }
+        let run_pool = state.run_pool(project_id).await;
+        let rows = sqlx::query(
+            r#"
+            SELECT ar.id, ar.session_id, ar.status, ar.provider, ar.model,
+                   ar.iteration_count, ar.final_answer, ar.created_at, ar.completed_at
+            FROM agent_runs ar
+            WHERE ar.project_id = $1
+              AND ar.kb_ingested IS NULL
+              AND ar.status IN ('completed', 'failed', 'aborted')
+              AND ar.completed_at IS NOT NULL
+            ORDER BY ar.completed_at ASC
+            LIMIT $2
+            "#,
         )
+        .bind(project_id)
+        .bind(remaining as i64)
+        .fetch_all(&run_pool)
         .await
-        {
-            Ok(_) => {
-                ingested += 1;
-                mark_processed(&state.db, run_id).await;
+        .context("SELECT agent_runs pending kb_ingest")?;
+
+        for row in rows {
+            if remaining == 0 {
+                break;
             }
-            Err(e) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    error = %e,
-                    "wiki.run_summary: ingest_run fallito (retry al prossimo giro)"
-                );
+            let run_id: Uuid = match row.try_get("id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let session_id: Uuid = match row.try_get("session_id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let status: String = row.try_get("status").unwrap_or_default();
+            let provider: Option<String> = row.try_get("provider").ok();
+            let model: Option<String> = row.try_get("model").ok();
+            let iteration_count: i32 = row.try_get("iteration_count").unwrap_or(0);
+            let final_answer: Option<String> = row.try_get("final_answer").ok();
+            let created_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("created_at")
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let completed_at: chrono::DateTime<chrono::Utc> = row
+                .try_get("completed_at")
+                .unwrap_or_else(|_| chrono::Utc::now());
+
+            remaining = remaining.saturating_sub(1);
+            match ingest_run(
+                state,
+                &run_pool,
+                run_id,
+                project_id,
+                session_id,
+                &status,
+                provider.as_deref(),
+                model.as_deref(),
+                iteration_count,
+                final_answer.as_deref(),
+                created_at,
+                completed_at,
+            )
+            .await
+            {
+                Ok(_) => {
+                    ingested += 1;
+                    mark_processed(&run_pool, run_id).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "wiki.run_summary: ingest_run fallito (retry al prossimo giro)"
+                    );
+                }
             }
         }
     }
@@ -237,6 +247,7 @@ async fn scan_and_ingest(state: &WikiDeps, settings: &RunSummarySettings) -> Res
 #[allow(clippy::too_many_arguments)]
 async fn ingest_run(
     state: &WikiDeps,
+    run_pool: &PgPool,
     run_id: Uuid,
     project_id: Uuid,
     session_id: Uuid,
@@ -254,7 +265,7 @@ async fn ingest_run(
         "SELECT tool_name, status FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
     )
     .bind(run_id)
-    .fetch_all(&state.db)
+    .fetch_all(run_pool)
     .await
     .context("SELECT agent_steps per run_summary")?;
 

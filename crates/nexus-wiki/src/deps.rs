@@ -37,12 +37,50 @@ pub trait WikiAiServices: std::fmt::Debug + Send + Sync {
     ) -> BoxFuture<'_, Result<(String, String), String>>;
 }
 
+/// Risolutore del pool DB per-progetto (separazione DB per-progetto). Iniettato
+/// da mcp-core, che possiede il registry globale (`project_data_pool_from`):
+/// nexus-wiki non vede quel registry (la dipendenza e' invertita, mcp-core ->
+/// nexus-wiki), quindi riceve solo questo contratto. I worker cross-progetto lo
+/// usano per instradare le letture del dominio run/chat sul DB del singolo
+/// progetto. A flag separazione OFF l'impl delega comunque a
+/// `project_data_pool_from`, che ritorna il meta-DB -> comportamento invariato.
+pub trait ProjectPoolResolver: std::fmt::Debug + Send + Sync {
+    /// Pool del DB del dominio run/chat per `project_id`. A flag OFF ritorna il
+    /// meta-DB; a flag ON il pool di `<slug>_nexus`.
+    fn project_pool(&self, project_id: uuid::Uuid) -> BoxFuture<'_, PgPool>;
+}
+
 /// Contesto dei servizi usati dal wiki (sottoinsieme di AppState).
 #[derive(Debug, Clone)]
 pub struct WikiDeps {
     pub db: PgPool,
     pub template_cache: TemplateCache,
     pub ai: Arc<dyn WikiAiServices>,
+    /// Risolutore pool per-progetto (separazione DB). `None` -> i worker
+    /// cross-progetto ricadono sul meta-DB (`db`), comportamento storico.
+    pub project_pool: Option<Arc<dyn ProjectPoolResolver>>,
+}
+
+impl WikiDeps {
+    /// Pool del dominio run/chat per `project_id`: via il risolutore iniettato
+    /// (separazione DB) oppure, se assente, il meta-DB. Punto unico (regola L)
+    /// di routing per i worker cross-progetto.
+    pub async fn run_pool(&self, project_id: uuid::Uuid) -> PgPool {
+        match &self.project_pool {
+            Some(r) => r.project_pool(project_id).await,
+            None => self.db.clone(),
+        }
+    }
+
+    /// Elenco dei `project_id` (tabella globale `projects`, sempre sul meta-DB).
+    /// I worker cross-progetto iterano questo elenco e instradano le letture del
+    /// dominio run/chat sul pool di ciascun progetto via [`Self::run_pool`].
+    pub async fn list_project_ids(&self) -> Vec<uuid::Uuid> {
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM projects")
+            .fetch_all(&self.db)
+            .await
+            .unwrap_or_default()
+    }
 }
 
 /// Estrae `(input_tokens, output_tokens)` dal payload di `generate_completion`,
