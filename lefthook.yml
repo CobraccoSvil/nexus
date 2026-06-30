@@ -9,6 +9,13 @@
 
 # Emergenza: LEFTHOOK=0
 
+# NB Windows: lefthook word-splitta il campo 'run' ignorando le virgolette, quindi
+# 'bash -lc "comando con spazi"' veniva eseguito come 'bash -lc comando con spazi'
+# (bash riceveva come command string solo il primo token -> falso-verde). Per i
+# comandi non banali si invoca SEMPRE uno script dedicato in scripts/ con due soli
+# token ('bash scripts/<nome>.sh'); cosi' nessuna interpolazione li corrompe.
+# Pattern di riferimento: commit-msg no-emoji -> scripts/check-no-emoji.sh.
+
 pre-commit:
   parallel: false
   commands:
@@ -19,16 +26,19 @@ pre-commit:
         - "*.js"
         - "*.jsx"
         - "*.json"
-      run: bash -lc "pnpm exec turbo run typecheck lint --continue"
+      run: bash scripts/precommit-turbo.sh
       fail_text: "pre-commit turbo fallito: correggi typecheck/lint."
 
+    # Solo sorgenti Rust e manifest cargo: nessun file *.yaml/*.yml e' input di
+    # 'cargo check' (verificato: niente include_str! di yaml, build.rs leggono solo
+    # .proto). Il glob yaml/yml ereditato dallo scaffold iniziale faceva girare un
+    # cargo check dell'intero workspace a ogni commit di config (es. questo stesso
+    # lefthook.yml): 10+ minuti inutili che spingono verso --no-verify (vietato, C).
     cargo_check_quick:
       glob:
         - "*.rs"
         - "*.toml"
-        - "*.yaml"
-        - "*.yml"
-      run: bash -lc "cargo check --workspace"
+      run: bash scripts/precommit-cargo-check.sh
       fail_text: "pre-commit cargo fallito: correggi cargo check."
 
     # Guard dei punti unici (regola L / ADR 0026): grep istantaneo, blocca nuove
@@ -39,7 +49,7 @@ pre-commit:
         - "*.rs"
         - "*.ts"
         - "*.tsx"
-      run: bash -lc "bash scripts/check-single-source.sh"
+      run: bash scripts/check-single-source.sh
       fail_text: "pre-commit: regressione su un punto unico (regola L / ADR 0026)."
 
 commit-msg:
@@ -57,13 +67,5 @@ post-commit:
   parallel: false
   commands:
     meta_docs_ingest:
-      run: |
-        COMMIT=$(git rev-parse HEAD)
-        if curl -sf -m 3 -X POST http://localhost:4000/api/meta-docs/ingest-commit \
-             -H "Content-Type: application/json" \
-             -d "{\"commit\":\"$COMMIT\"}" > /dev/null; then
-          echo "[meta-docs] commit $COMMIT registrato"
-        else
-          echo "[meta-docs] mcp-core non raggiungibile (commit registrato, worker recuperera')"
-        fi
+      run: bash scripts/postcommit-meta-docs.sh
       fail_text: ""
