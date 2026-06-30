@@ -243,7 +243,10 @@ mod tests {
             exe.to_string_lossy().to_string(),
         ];
         let pos = args.iter().position(|a| a == "--executable-path").unwrap();
-        assert!(args[pos + 1].ends_with("chromium-1228/chrome-linux64/chrome"));
+        // Normalizza i separatori: su Windows Path::join produce '\', il suffisso
+        // atteso usa '/'. Confronto indipendente dall'OS.
+        let resolved = args[pos + 1].replace('\\', "/");
+        assert!(resolved.ends_with("chromium-1228/chrome-linux64/chrome"));
         assert!(args.contains(&"--headless".to_string()));
         assert!(args.contains(&"--no-sandbox".to_string()));
 

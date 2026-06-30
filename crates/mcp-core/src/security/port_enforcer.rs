@@ -242,33 +242,68 @@ enum Signal {
     Kill,
 }
 
-/// Invia un segnale al processo. Best-effort: errori loggati ma non propagati.
+/// Invia un segnale di terminazione al processo. Best-effort: errori loggati ma
+/// non propagati. Comando nativo per OS (niente `kill` su Windows): Unix usa
+/// `kill -TERM/-KILL`, Windows `taskkill` (/F = forzato, ~ KILL; senza /F richiede
+/// la chiusura, ~ TERM). Stesso pattern cfg-gated di agent_processes (stop) e
+/// services_watchdog (restart).
 async fn kill_process(pid: u32, sig: Signal) {
-    let sig_str = match sig {
-        Signal::Term => "-TERM",
-        Signal::Kill => "-KILL",
+    #[cfg(unix)]
+    let (program, args, label): (&str, Vec<String>, &str) = {
+        let sig_str = match sig {
+            Signal::Term => "-TERM",
+            Signal::Kill => "-KILL",
+        };
+        ("kill", vec![sig_str.to_string(), pid.to_string()], sig_str)
     };
-    let result = tokio::process::Command::new("kill")
-        .args([sig_str, &pid.to_string()])
+    #[cfg(windows)]
+    let (program, args, label): (&str, Vec<String>, &str) = match sig {
+        Signal::Term => ("taskkill", vec!["/PID".to_string(), pid.to_string()], "taskkill"),
+        Signal::Kill => (
+            "taskkill",
+            vec!["/F".to_string(), "/PID".to_string(), pid.to_string()],
+            "taskkill /F",
+        ),
+    };
+
+    let result = tokio::process::Command::new(program)
+        .args(&args)
         .output()
         .await;
     match result {
         Ok(out) if out.status.success() => {
-            tracing::debug!(pid, signal = sig_str, "port_enforcer: segnale inviato");
+            tracing::debug!(pid, signal = label, "port_enforcer: segnale inviato");
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            tracing::warn!(pid, signal = sig_str, stderr = %stderr, "port_enforcer: kill fallito");
+            tracing::warn!(pid, signal = label, stderr = %stderr, "port_enforcer: kill fallito");
         }
         Err(e) => {
-            tracing::warn!(pid, signal = sig_str, error = %e, "port_enforcer: kill errore");
+            tracing::warn!(pid, signal = label, error = %e, "port_enforcer: kill errore");
         }
     }
 }
 
-/// Controlla se il processo e' ancora vivo via /proc/{pid}.
+/// Controlla se il processo e' ancora vivo. Cfg-gated come kill_process: i due OS
+/// espongono meccanismi diversi (un solo punto decide "e' vivo?", due rami nativi).
+#[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+/// Variante Windows: niente /proc. `tasklist` filtrato per PID (header soppresso
+/// con /NH, output CSV); una riga che contiene il PID quotato = processo vivo.
+/// Quando non trova nulla tasklist stampa "INFO: No tasks...", privo del PID
+/// quotato -> false. Sincrona: il chiamante la wrappa gia' in spawn_blocking.
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    match std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
