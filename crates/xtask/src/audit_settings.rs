@@ -4,7 +4,7 @@
 //! Punto unico (regola L) per l'audit "ogni setting esposta in admin e' davvero
 //! letta dal codice". Quattro collettori:
 //!
-//!   A1. DB live          — SELECT key, category FROM settings (docker exec psql)
+//!   A1. DB live          — SELECT key, category FROM settings (sqlx via DATABASE_URL)
 //!   A2. Migrazioni       — parser di INSERT/DELETE su db/migrations/*.sql
 //!   B.  Lettori codice   — regex sulle API punto-unico (nexus-auth / settings_db)
 //!                          + SQL diretto + pattern dinamici whitelistati
@@ -26,7 +26,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -107,44 +106,61 @@ fn repo_root() -> PathBuf {
 /// lo script Python itera `db_live.items()` di un dict che conserva l'ordine
 /// d'inserimento, e popola le classi in quell'ordine -> il JSON delle classi
 /// riflette la collation Postgres, non l'ordinamento lessicografico Rust.
-fn collect_db_live() -> Option<Vec<(String, String)>> {
-    let out = Command::new("docker")
-        .args([
-            "exec",
-            "ideai-postgres-nexus-1",
-            "psql",
-            "-U",
-            "nexus",
-            "-d",
-            "nexus",
-            "-t",
-            "-A",
-            "-F",
-            "|",
-            "-c",
-            "SELECT key, category FROM settings ORDER BY key",
-        ])
-        .output()
+/// Esegue la SELECT su `settings` via sqlx contro DATABASE_URL e ritorna le
+/// righe `(key, category-nullable)` nell'ordine `ORDER BY key`, o None se il DB
+/// non e' raggiungibile (-> il chiamante degrada a --no-db).
+///
+/// Connection string canonica dal .env (regola G: unica fonte di verita', niente
+/// docker exec hardcoded). Su Windows nativo il meta-DB e' un Postgres su
+/// localhost:5433, la stessa DATABASE_URL che usa mcp-core (main.rs:197). Se .env
+/// manca o DATABASE_URL non e' definita -> None (rete di sicurezza preservata).
+fn query_settings_live() -> Option<Vec<(String, Option<String>)>> {
+    dotenvy::dotenv().ok();
+    let database_url = std::env::var("DATABASE_URL").ok()?;
+
+    // sqlx e' async: runtime current-thread effimero (questo collettore gira una
+    // sola volta per invocazione, niente pool da tenere vivo). Qualunque errore
+    // di costruzione/connessione/query collassa a None -> degrado a --no-db.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // SELECT identica al vecchio `psql -c`: key + category, ORDER BY key (la
+    // collation del DB definisce l'ordine, vedi doc sopra). `category` puo' essere
+    // NULL -> Option, mappata a "" dal chiamante come psql in modalita' -t -A.
+    rt.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&database_url)
+            .await
+            .ok()?;
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT key, category FROM settings ORDER BY key",
+        )
+        .fetch_all(&pool)
+        .await
+        .ok();
+        pool.close().await;
+        rows
+    })
+}
+
+fn collect_db_live() -> Option<Vec<(String, String)>> {
+    let raw = query_settings_live()?;
     // Python: rows[key] = cat su un dict -> ultima categoria vince ma la
     // posizione e' quella della prima occorrenza della chiave. Con ORDER BY key
     // le chiavi sono uniche, ma replichiamo comunque la semantica del dict.
     let mut rows: Vec<(String, String)> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
-    for line in stdout.lines() {
-        if let Some(idx) = line.find('|') {
-            let key = line[..idx].trim().to_string();
-            let cat = line[idx + 1..].trim().to_string();
-            if let Some(&pos) = seen.get(&key) {
-                rows[pos].1 = cat;
-            } else {
-                seen.insert(key.clone(), rows.len());
-                rows.push((key, cat));
-            }
+    for (key, cat) in raw {
+        let cat = cat.unwrap_or_default();
+        if let Some(&pos) = seen.get(&key) {
+            rows[pos].1 = cat;
+        } else {
+            seen.insert(key.clone(), rows.len());
+            rows.push((key, cat));
         }
     }
     if rows.is_empty() { None } else { Some(rows) }

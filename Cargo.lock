@@ -5705,10 +5705,13 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dotenvy",
  "mcp-quality",
  "regex",
  "serde",
  "serde_json",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
