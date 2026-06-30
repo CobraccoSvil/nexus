@@ -251,6 +251,20 @@ pub async fn create_chat_session(
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Directory di routing (sempre sul meta-DB, mig 0496): session -> project,
+    // cosi' gli handler con solo session_id risolvono il pool del progetto anche
+    // a flag on. Ausiliario: un errore non deve far fallire la creazione.
+    if let Err(e) = sqlx::query(
+        "INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id) VALUES ('session', $1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(session_id)
+    .bind(project_id)
+    .execute(&state.db)
+    .await
+    {
+        tracing::warn!(error = %e, "routing directory: insert sessione fallito");
+    }
+
     update_user_active_project(&state, user_id, project_id).await;
 
     Ok(Json(json!({

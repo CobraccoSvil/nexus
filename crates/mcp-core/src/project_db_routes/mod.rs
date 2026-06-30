@@ -55,7 +55,7 @@ pub use provision::{provision_internal_core, provision_project_db, DbRole};
 // fondazione; finche' nessun call-site di dominio e' instradato non hanno ancora
 // chiamanti interni al binario.
 #[allow(unused_imports)]
-pub use provision::{project_data_pool, project_meta_pool};
+pub use provision::{project_data_pool, project_data_pool_by_session, project_meta_pool};
 pub use query::{
     discover_schema_candidates, execute_project_db_query, import_project_db_schema,
     read_schema_file,

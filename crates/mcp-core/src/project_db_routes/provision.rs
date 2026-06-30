@@ -591,3 +591,37 @@ pub async fn project_data_pool(state: &AppState, project_id: Uuid) -> sqlx::PgPo
         }
     }
 }
+
+/// Risolve il `project_id` di una sessione chat dalla directory di routing
+/// (`nexus_data_routing` nel meta-DB, mig 0496). Serve agli handler che hanno
+/// solo `session_id` (rename/delete sessione, ecc.). `None` se non mappata.
+async fn resolve_project_for_session(meta_db: &sqlx::PgPool, session_id: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT project_id FROM nexus_data_routing WHERE entity_kind = 'session' AND entity_id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(meta_db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Come [`project_data_pool`] ma a partire da un `session_id` (handler senza
+/// `project_id` a portata di mano): risolve il progetto dalla directory di
+/// routing e delega. Flag off o sessione non mappata -> meta-DB (comportamento
+/// storico, sicuro). Punto unico per il routing per-sessione (regola L).
+pub async fn project_data_pool_by_session(state: &AppState, session_id: Uuid) -> sqlx::PgPool {
+    if !project_separation_enabled(&state.db).await {
+        return state.db.clone();
+    }
+    match resolve_project_for_session(&state.db, session_id).await {
+        Some(project_id) => project_data_pool(state, project_id).await,
+        None => {
+            tracing::warn!(
+                session_id = %session_id,
+                "routing directory: sessione non mappata, fallback al meta-DB"
+            );
+            state.db.clone()
+        }
+    }
+}
