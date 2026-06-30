@@ -19,7 +19,10 @@ pre-commit:
         - "*.js"
         - "*.jsx"
         - "*.json"
-      run: bash -lc "pnpm exec turbo run typecheck lint --continue"
+      # Niente wrapper `bash -lc "..."`: su git-bash Windows lefthook non
+      # preserva la stringa quotata (esegue solo il primo token). Lasciare il
+      # comando nudo: lefthook lo passa al suo shell (sh -c) integro.
+      run: pnpm exec turbo run typecheck lint --continue
       fail_text: "pre-commit turbo fallito: correggi typecheck/lint."
 
     cargo_check_quick:
@@ -28,7 +31,7 @@ pre-commit:
         - "*.toml"
         - "*.yaml"
         - "*.yml"
-      run: bash -lc "cargo check --workspace"
+      run: cargo check --workspace
       fail_text: "pre-commit cargo fallito: correggi cargo check."
 
     # Guard dei punti unici (regola L / ADR 0026): grep istantaneo, blocca nuove
@@ -39,7 +42,7 @@ pre-commit:
         - "*.rs"
         - "*.ts"
         - "*.tsx"
-      run: bash -lc "bash scripts/check-single-source.sh"
+      run: bash scripts/check-single-source.sh
       fail_text: "pre-commit: regressione su un punto unico (regola L / ADR 0026)."
 
 commit-msg:
@@ -57,13 +60,7 @@ post-commit:
   parallel: false
   commands:
     meta_docs_ingest:
-      run: |
-        COMMIT=$(git rev-parse HEAD)
-        if curl -sf -m 3 -X POST http://localhost:4000/api/meta-docs/ingest-commit \
-             -H "Content-Type: application/json" \
-             -d "{\"commit\":\"$COMMIT\"}" > /dev/null; then
-          echo "[meta-docs] commit $COMMIT registrato"
-        else
-          echo "[meta-docs] mcp-core non raggiungibile (commit registrato, worker recuperera')"
-        fi
+      # Logica in scripts/meta-docs-ingest.sh (regola L): il blocco `run: |`
+      # multi-line non sopravvive a lefthook su git-bash Windows.
+      run: bash scripts/meta-docs-ingest.sh
       fail_text: ""
