@@ -44,12 +44,11 @@ pre-commit:
 
 commit-msg:
   commands:
+    # Check estratto in scripts/check-no-emoji.sh: la regex \x{...} inline veniva
+    # corrotta dall'interpolazione dei template lefthook su Windows e grep -P non e'
+    # supportato da Git Bash. Lo script usa node (match Unicode indipendente dal locale).
     no-emoji:
-      run: |
-        if grep -P "[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}]" "{1}" >/dev/null; then
-          echo "Commit message contiene emoji: rimuovile - direttiva editoriale" >&2
-          exit 1
-        fi
+      run: bash scripts/check-no-emoji.sh "{1}"
 
 # Post-commit: notifica mcp-core per aggiornare il meta-vault.
 # Fail-soft: se mcp-core non e' raggiungibile (dev offline), il commit passa
