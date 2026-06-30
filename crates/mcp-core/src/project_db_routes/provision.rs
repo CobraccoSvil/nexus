@@ -511,6 +511,16 @@ pub async fn project_meta_pool(
         .await
         .map_err(|e| format!("apertura pool DB metadati (progetto {project_id}) fallita: {e}"))?;
     let arc = std::sync::Arc::new(pool);
+    // Applica lo schema per-progetto (db/migrations/project/) al DB metadati.
+    // Idempotente: sqlx salta le migrazioni gia' applicate (tracciate in
+    // _sqlx_migrations del DB-progetto). Path relativo alla root del repo, come
+    // db.rs (cwd del servizio = D:\IDEAI via workingdirectory WinSW).
+    sqlx::migrate::Migrator::new(std::path::Path::new("db/migrations/project"))
+        .await
+        .map_err(|e| format!("caricamento migrazioni per-progetto fallito: {e}"))?
+        .run(arc.as_ref())
+        .await
+        .map_err(|e| format!("migrazioni schema per-progetto (progetto {project_id}) fallite: {e}"))?;
     state.project_meta_pools.insert(project_id, arc.clone());
     Ok(arc)
 }
