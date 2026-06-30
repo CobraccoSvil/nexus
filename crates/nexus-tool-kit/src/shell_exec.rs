@@ -1,4 +1,4 @@
-use super::exec::run_cmd;
+use super::exec::run_cmd_owned;
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -19,8 +19,11 @@ impl NexusToolHandler for ShellExecTool {
             .and_then(Value::as_u64)
             .unwrap_or(300); // default 5 min: sufficiente per docker build / npm install
 
-        let out = run_cmd(
-            "sh",
+        // Punto unico (regola L): crate::sandbox::agent_shell -> bash su Unix,
+        // Git Bash su Windows (tail/grep/&&/| nativi). Eseguito con "-c".
+        let shell = crate::sandbox::agent_shell();
+        let out = run_cmd_owned(
+            &shell,
             &["-c", command.as_str()],
             &ctx.project_root,
             timeout_secs,

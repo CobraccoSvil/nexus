@@ -207,11 +207,36 @@ fn should_skip_path(path: &str) -> bool {
     false
 }
 
+/// Porte di servizi-infrastruttura ben note a cui i progetti si CONNETTONO come
+/// client (DB, cache, code, search), NON che bindano. Una `port: N` / `DB_PORT=N`
+/// verso queste e' una connessione legittima, non un binding hardcoded da
+/// governare: lo scanner non distingue `app.listen(N)` (binding) da `port: N`
+/// dentro un client di connessione, e il regex generico `port:` (PORT_REGEXES)
+/// catturava `port: 5433` di `new Pool({...})` (DB Nexus) -> rifiuto deterministico
+/// di edit_file -> l'agente ripete identico -> loop force-close. Include l'infra
+/// Nexus (5433 postgres-nexus, 6379 redis, 6333/6334 qdrant, regola E) + i DB/cache
+/// di terze parti piu' comuni. Falso-negativo accettabile: un progetto che bindasse
+/// davvero una di queste e' raro (Nexus provisiona i DB, i servizi usano il bucket).
+const WELL_KNOWN_SERVICE_PORTS: &[u32] = &[
+    5432, 5433, // PostgreSQL (5433 = ideai-postgres-nexus)
+    3306, // MySQL / MariaDB
+    27017, // MongoDB
+    6379, // Redis
+    6333, 6334, // Qdrant (REST / gRPC)
+    1433, // SQL Server
+    5672, // RabbitMQ (amqp)
+    9200, // Elasticsearch
+    11211, // Memcached
+];
+
 fn port_is_violating(port: u32) -> bool {
     if (NEXUS_PORT_MIN..NEXUS_PORT_MAX).contains(&port) {
         return false;
     }
     if port < 1024 {
+        return false;
+    }
+    if WELL_KNOWN_SERVICE_PORTS.contains(&port) {
         return false;
     }
     true
@@ -629,6 +654,27 @@ mod tests {
     }
 
     #[test]
+    fn allow_db_connection_port() {
+        // Regressione: `port: 5433` in una config di CONNESSIONE al DB (new Pool)
+        // NON e' un binding hardcoded -> non deve essere rifiutato (prima mandava
+        // l'agente in loop su edit_file di server.js). Vedi WELL_KNOWN_SERVICE_PORTS.
+        let res = scan_content(
+            "backend/server.js",
+            "const pool = new Pool({\n  host: 'localhost',\n  port: 5433,\n  database: 'app',\n});\n",
+        );
+        assert!(
+            matches!(res, PortScanOutcome::Allowed),
+            "porta DB di connessione (5433) non deve essere rifiutata"
+        );
+        // Un vero binding fuori bucket resta rifiutato.
+        let res2 = scan_content("backend/server.js", "app.listen(5000)\n");
+        assert!(
+            matches!(res2, PortScanOutcome::Reject(_)),
+            "binding fuori bucket (5000) deve restare rifiutato"
+        );
+    }
+
+    #[test]
     fn detect_cli_port_flag_in_script() {
         // Fix A1: porta hardcoded via `--port` negli script package.json
         // (Vite/Next/Astro). Prima sfuggiva: nessun regex copriva la sintassi CLI
@@ -896,12 +942,19 @@ mod tests {
 
     #[test]
     fn detect_db_port_var() {
+        // Una porta DB ben nota (5432 Postgres) e' una CONNESSIONE legittima, non un
+        // binding -> consentita (WELL_KNOWN_SERVICE_PORTS). Prima era un falso
+        // positivo che faceva rifiutare la config DB e loopare l'agente.
         let res = scan_content("dev.sh", "DB_PORT=5432\n");
-        match res {
-            PortScanOutcome::Reject(f) => {
-                assert!(f.iter().any(|x| x.port == 5432));
-            }
-            _ => panic!("DB_PORT=5432 deve essere rifiutato"),
+        assert!(
+            matches!(res, PortScanOutcome::Allowed),
+            "DB_PORT verso una porta DB ben nota e' una connessione, va consentita"
+        );
+        // Una porta NON ben nota fuori bucket resta rilevata dal regex DB_PORT.
+        let res2 = scan_content("dev.sh", "DB_PORT=5000\n");
+        match res2 {
+            PortScanOutcome::Reject(f) => assert!(f.iter().any(|x| x.port == 5000)),
+            _ => panic!("DB_PORT=5000 (porta non nota) deve essere rifiutato"),
         }
     }
 

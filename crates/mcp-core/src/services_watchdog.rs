@@ -203,9 +203,17 @@ async fn resolve_port(db: &PgPool, port_setting_key: &str) -> Option<u16> {
         .and_then(|v| v.trim().parse::<u16>().ok())
 }
 
-/// Riavvia un servizio invocando `deploy-local.sh --service <name> --debug` in
-/// modo detached. Best-effort: l'esito reale si verifica al ciclo successivo via
-/// probe. Ritorna true se lo spawn dello script e' partito senza errori.
+/// Riavvia un servizio caduto. Best-effort: l'esito reale si verifica al ciclo
+/// successivo via probe. Ritorna true se lo spawn del riavvio e' partito senza
+/// errori. Il meccanismo e' platform-specifico (regola L: un solo punto decide
+/// "come riavviare", ma con due implementazioni cfg-gated perche' i due OS hanno
+/// supervisori diversi):
+/// - Unix/WSL: `deploy-local.sh --service <name> --debug` detached (setsid nohup);
+///   lo script conosce env/porte/build di ogni kind di servizio.
+/// - Windows: i microservizi sono Windows Services `nexus-<name>` (WinSW) gestiti
+///   dall'SCM, quindi si invoca `Restart-Service` (la shell Unix e lo script .sh
+///   non esistono nativamente su Windows).
+#[cfg(unix)]
 async fn restart_service(name: &str) -> bool {
     let root = std::env::var("NEXUS_REPO_ROOT")
         .unwrap_or_else(|_| "/home/administrator/ideai".to_string());
@@ -239,6 +247,38 @@ async fn restart_service(name: &str) -> bool {
         }
         Err(e) => {
             tracing::warn!("services_watchdog: exec deploy-local.sh per {name} fallito: {e}");
+            false
+        }
+    }
+}
+
+/// Variante Windows: riavvio via SCM (`Restart-Service nexus-<name>`). I nomi
+/// `WatchedService.name` (gateway, admin, chat, ...) mappano sui servizi WinSW
+/// `nexus-<name>` definiti in deploy-local.ps1.
+#[cfg(windows)]
+async fn restart_service(name: &str) -> bool {
+    let svc = format!("nexus-{name}");
+    match tokio::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("Restart-Service -Name '{svc}' -Force -ErrorAction Stop"),
+        ])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            tracing::warn!(
+                "services_watchdog: Restart-Service {svc} fallito ({}): {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("services_watchdog: exec Restart-Service per {svc} fallito: {e}");
             false
         }
     }

@@ -25,7 +25,6 @@ use crate::orchestrator::NeuralCoreClient;
 
 // ── Costanti ─────────────────────────────────────────────────────────────────
 
-const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_COLLECTION: &str = "mcp_tools";
 const VECTOR_SIZE: u64 = 384;
 const DEFAULT_MIN_SCORE: f64 = 0.35;
@@ -62,10 +61,8 @@ const SEARCH_STOPWORDS: &[&str] = &[
 use nexus_auth::get_setting;
 
 async fn qdrant_url(db: &PgPool) -> String {
-    get_setting(db, "qdrant_url")
-        .await
-        .or_else(|| std::env::var("QDRANT_URL").ok())
-        .unwrap_or_else(|| DEFAULT_QDRANT_URL.to_string())
+    // Delega al punto unico (regola L) condiviso col health probe del watchdog.
+    crate::settings::resolve_qdrant_url(db).await
 }
 
 async fn collection_name(db: &PgPool) -> String {

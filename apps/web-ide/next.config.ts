@@ -1,11 +1,15 @@
 import type { NextConfig } from "next";
+import path from "node:path";
 
 const isDev = process.env.NODE_ENV !== "production";
 
 const nextConfig: NextConfig = {
   // Imposta la root del workspace per evitare warning su lockfile multipli
-  // (il progetto redemptor ha un package-lock.json separato non rilevante)
-  outputFileTracingRoot: "/home/administrator/ideai",
+  // (il progetto redemptor ha un package-lock.json separato non rilevante).
+  // Derivata dalla cwd (la build gira sempre da apps/web-ide): risale due
+  // livelli alla root del monorepo. Niente path assoluto hardcoded, cosi'
+  // funziona sia su Windows (D:/IDEAI) sia su WSL (/home/administrator/ideai).
+  outputFileTracingRoot: path.join(process.cwd(), "..", ".."),
   typedRoutes: true,
   // Build ID univoco per invalidare la cache del browser ad ogni deploy
   generateBuildId: async () => `build-${Date.now()}`,

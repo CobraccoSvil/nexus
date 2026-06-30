@@ -145,13 +145,22 @@ pub async fn spawn_agent_process(
 
         #[cfg(not(unix))]
         {
-            Command::new("cmd")
-                .args(["/C", command])
+            // Windows: esegui via agent_shell (Git Bash) cosi' i comandi in sintassi
+            // Unix (`a && b`, `... | tail`, `grep`) funzionano. NIENTE env_clear su
+            // Windows: il processo eredita PATH/SystemRoot/TEMP necessari; sopra
+            // aggiungiamo solo le override del progetto (es. PORT) non bloccate.
+            let shell = sandbox::agent_shell();
+            let mut sh = Command::new(&shell);
+            sh.args(["-c", command])
                 .current_dir(working_dir)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Spawn error: {e}"))?
+                .stderr(std::process::Stdio::piped());
+            for (k, v) in &env_vars {
+                if !sandbox::is_blocked_env(k) {
+                    sh.env(k, v);
+                }
+            }
+            sh.spawn().map_err(|e| format!("Spawn error: {e}"))?
         }
     };
 
@@ -380,15 +389,28 @@ pub async fn stop_process(db: &PgPool, process_id: Uuid) -> Result<String, Strin
     // 2. Kill del process group (docker CLI o processo diretto)
     let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
     if let Some(pid) = pid {
-        let _ = tokio::process::Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
-            .output()
-            .await;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let _ = tokio::process::Command::new("kill")
-            .args(["-9", &format!("-{pid}")])
-            .output()
-            .await;
+        #[cfg(unix)]
+        {
+            // kill dell'intero process group (-{pid}): graceful (TERM) poi forzato (9).
+            let _ = tokio::process::Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .output()
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let _ = tokio::process::Command::new("kill")
+                .args(["-9", &format!("-{pid}")])
+                .output()
+                .await;
+        }
+        #[cfg(windows)]
+        {
+            // taskkill /T termina l'intero albero processi (equivalente del process
+            // group Unix), /F forzato. Niente `kill` su Windows.
+            let _ = tokio::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output()
+                .await;
+        }
     }
 
     Ok("Process stopped".to_string())

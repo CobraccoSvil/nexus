@@ -488,73 +488,104 @@ pub async fn fix_environment(
         }))),
 
         "restart_frontend" => {
-            // Kill processo sulla porta 3000
-            let _ = Command::new("sh")
-                .args(["-c", "kill $(ss -tlnp | grep ':3000' | grep -oP 'pid=\\K[0-9]+' | head -1) 2>/dev/null || true"])
-                .output()
-                .await;
+            #[cfg(unix)]
+            {
+                // Kill processo sulla porta 3000
+                let _ = Command::new("sh")
+                    .args(["-c", "kill $(ss -tlnp | grep ':3000' | grep -oP 'pid=\\K[0-9]+' | head -1) 2>/dev/null || true"])
+                    .output()
+                    .await;
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
 
-            // Cerca la directory del frontend
-            let nexus_root = std::env::var("NEXUS_ROOT")
-                .unwrap_or_else(|_| "/var/lib/postgresql/wal/nexus".to_string());
-            let frontend_dir = format!("{nexus_root}/apps/web-ide");
+                // Cerca la directory del frontend
+                let nexus_root = std::env::var("NEXUS_ROOT")
+                    .unwrap_or_else(|_| "/var/lib/postgresql/wal/nexus".to_string());
+                let frontend_dir = format!("{nexus_root}/apps/web-ide");
 
-            let result = Command::new("sh")
-                .args([
-                    "-c",
-                    &format!("cd {frontend_dir} && nohup pnpm start > /tmp/web-ide.log 2>&1 &"),
-                ])
-                .output()
-                .await;
+                let result = Command::new("sh")
+                    .args([
+                        "-c",
+                        &format!("cd {frontend_dir} && nohup pnpm start > /tmp/web-ide.log 2>&1 &"),
+                    ])
+                    .output()
+                    .await;
 
-            match result {
-                Ok(_) => Ok(Json(
-                    json!({ "ok": true, "output": "Frontend restart initiated. Check port 3000 in a few seconds." }),
-                )),
-                Err(e) => Ok(Json(
-                    json!({ "ok": false, "output": format!("Error: {e}") }),
-                )),
+                match result {
+                    Ok(_) => Ok(Json(
+                        json!({ "ok": true, "output": "Frontend restart initiated. Check port 3000 in a few seconds." }),
+                    )),
+                    Err(e) => Ok(Json(
+                        json!({ "ok": false, "output": format!("Error: {e}") }),
+                    )),
+                }
+            }
+            #[cfg(windows)]
+            {
+                // Su Windows il web-ide gira come servizio WinSW (nexus-web-ide):
+                // il restart e' gestito dal service manager, non da qui. No-op.
+                tracing::warn!(
+                    "restart frontend: su Windows il web-ide e' gestito da WinSW (nexus-web-ide), no-op"
+                );
+                Ok(Json(json!({
+                    "ok": true,
+                    "output": "Su Windows il web-ide e' gestito da WinSW (nexus-web-ide): usa il service manager. No-op."
+                })))
             }
         }
 
         "install_system_deps" => {
-            let sudo_password = body.sudo_password.as_deref().unwrap_or("");
-            if sudo_password.is_empty() {
-                return Err(api_error(StatusCode::BAD_REQUEST, "sudo_password required"));
-            }
-
-            let packages = "libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 libglib2.0-0 libdbus-1-3 libxshmfence1 libxext6";
-
-            let cmd = format!(
-                "echo '{}' | sudo -S apt-get install -y {} 2>&1",
-                sudo_password, packages
-            );
-
-            let result = tokio::time::timeout(
-                Duration::from_secs(120),
-                tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&cmd)
-                    .output(),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(output)) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    let combined = format!("{}\n{}", stdout, stderr)
-                        .lines()
-                        .filter(|l| !l.contains("[sudo] password") && !l.contains("password for"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let ok = output.status.success();
-                    Ok(Json(json!({ "ok": ok, "output": combined })))
+            #[cfg(unix)]
+            {
+                let sudo_password = body.sudo_password.as_deref().unwrap_or("");
+                if sudo_password.is_empty() {
+                    return Err(api_error(StatusCode::BAD_REQUEST, "sudo_password required"));
                 }
-                Ok(Err(e)) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-                Err(_) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "Timeout")),
+
+                let packages = "libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 libglib2.0-0 libdbus-1-3 libxshmfence1 libxext6";
+
+                let cmd = format!(
+                    "echo '{}' | sudo -S apt-get install -y {} 2>&1",
+                    sudo_password, packages
+                );
+
+                let result = tokio::time::timeout(
+                    Duration::from_secs(120),
+                    tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&cmd)
+                        .output(),
+                )
+                .await;
+
+                match result {
+                    Ok(Ok(output)) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        let combined = format!("{}\n{}", stdout, stderr)
+                            .lines()
+                            .filter(|l| !l.contains("[sudo] password") && !l.contains("password for"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let ok = output.status.success();
+                        Ok(Json(json!({ "ok": ok, "output": combined })))
+                    }
+                    Ok(Err(e)) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+                    Err(_) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "Timeout")),
+                }
+            }
+            #[cfg(windows)]
+            {
+                // Niente apt-get/sudo su Windows: l'installazione delle dipendenze
+                // di sistema (librerie native per Playwright/Chromium ecc.) non e'
+                // automatizzabile qui. Segnala chiaramente all'utente.
+                tracing::warn!(
+                    "install_system_deps: non supportato su Windows, installazione manuale richiesta"
+                );
+                Ok(Json(json!({
+                    "ok": false,
+                    "output": "installazione dipendenze di sistema non supportata su Windows: installale manualmente"
+                })))
             }
         }
 

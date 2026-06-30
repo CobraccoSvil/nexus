@@ -624,7 +624,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     tracing::info!(command = %command_str, root = %root.display(), "run_playwright_tests: avvio comando");
 
     // ── 7. Esegui con env BASE_URL ────────────────────────────────────────────
-    let mut child_builder = tokio::process::Command::new("/bin/sh");
+    let mut child_builder = tokio::process::Command::new(crate::sandbox::agent_shell());
     child_builder
         .arg("-c")
         .arg(&command_str)
@@ -1320,7 +1320,7 @@ async fn run_test_command(
 ) -> String {
     use tokio::io::AsyncReadExt;
 
-    let mut child = match tokio::process::Command::new("/bin/sh")
+    let mut child = match tokio::process::Command::new(crate::sandbox::agent_shell())
         .arg("-c")
         .arg(command)
         .current_dir(work_dir)

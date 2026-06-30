@@ -8,6 +8,25 @@
 /* ---------- 1. Reset / base ---------- */
 body {
   margin: 0;
+  /* Font base dell'IDE — PUNTO UNICO (regola L). Tutto eredita famiglia E
+     dimensione, inclusi i contenuti via portal (dialog/menu/toast) e i testi
+     non stilizzati (es. gli stati vuoti dei pannelli). Senza family cadrebbero
+     sul serif del browser (Times New Roman); senza size sui 16px di default
+     (oversize rispetto ai 12-13px dell'UI). */
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 13px;
+}
+
+/* I controlli nativi (button/input/select/textarea) NON ereditano font-family
+   dal parent per default del browser: senza questo reset rendono col font di
+   sistema (Arial su Windows) mentre il resto dell'IDE e' monospace, creando la
+   disomogeneita' visibile (es. select/bottoni del pannello Source Control). */
+button,
+input,
+select,
+textarea,
+optgroup {
+  font-family: inherit;
 }
 
 ::selection {

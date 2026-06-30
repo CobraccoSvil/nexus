@@ -5,6 +5,27 @@ use super::*;
 /// Durata del "probe" per rilevare comandi long-running non noti.
 /// Se il processo non termina entro questo tempo, viene killato e ri-lanciato nel terminale.
 const RUN_COMMAND_PROBE_SECS: u64 = 10;
+/// Comandi one-shot LUNGHI (install/build/compile/test/migrate) NON sono server:
+/// vanno attesi in sincrono a lungo, NON instradati a run_service (semantica
+/// errata + su Windows il wizard setsid/nohup e' rotto -> il processo "service"
+/// muore subito). Timeout sincrono generoso.
+const LONG_ONESHOT_PROBE_SECS: u64 = 300;
+
+/// True se il comando e' un one-shot LUNGO che TERMINA (install/build/compile/
+/// test/migrate) — da attendere in sincrono, non da instradare a run_service.
+fn is_long_oneshot(command: &str) -> bool {
+    let c = command.to_lowercase();
+    c.contains("install")
+        || c.contains("npm ci")
+        || c.contains(" build")
+        || c.contains("tsc")
+        || c.contains("cargo build")
+        || c.contains("cargo check")
+        || c.contains("cargo test")
+        || c.contains("compile")
+        || c.contains("migrate")
+        || c.contains("prisma generate")
+}
 
 const RUN_TESTS_DEFAULT_TIMEOUT: u64 = 120;
 const RUN_TESTS_MAX_TIMEOUT: u64 = 300;
@@ -231,16 +252,12 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // Idempotente: CREATE DATABASE solo se non esiste.
     let (project_db_url, project_db_name) = ensure_project_db_url(ctx).await;
 
-    // Bash invece di /bin/sh per garantire brace-expansion (mkdir -p a/{b,c})
-    // e altre feature attese dagli agenti che generano comandi shell ricchi.
-    // Fallback a /bin/sh se bash non esiste.
-    let shell_path = if std::path::Path::new("/bin/bash").exists() {
-        "/bin/bash"
-    } else {
-        "/bin/sh"
-    };
+    // Shell cross-platform (punto unico crate::sandbox::agent_shell): bash su Unix,
+    // Git Bash su Windows. Gli agenti generano comandi in sintassi bash (brace
+    // expansion, &&, pipe, pnpm/npm); su Windows /bin/bash non esiste -> os error 3.
+    let shell_path = crate::sandbox::agent_shell();
 
-    let child = crate::sandbox::isolated_command(shell_path)
+    let child = crate::sandbox::isolated_command(&shell_path)
         .arg("-c")
         .arg(&command)
         .current_dir(&work_dir)
@@ -259,9 +276,16 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // Drain stdout/stderr IN PARALLELO con child.wait() (evita deadlock pipe ~64KB).
     let (stdout_task, stderr_task) = spawn_output_drainers(&mut child);
 
-    // Probe: aspetta 10 secondi. Se finisce, ritorna output. Se no, killa e re-route.
+    // Probe: per gli one-shot LUNGHI (install/build) attesa sincrona lunga; per gli
+    // altri 10s, poi re-route a run_service (server long-running tipo dev/serve).
+    let is_oneshot = is_long_oneshot(&command);
+    let probe_secs = if is_oneshot {
+        LONG_ONESHOT_PROBE_SECS
+    } else {
+        RUN_COMMAND_PROBE_SECS
+    };
     let probe = tokio::time::timeout(
-        std::time::Duration::from_secs(RUN_COMMAND_PROBE_SECS),
+        std::time::Duration::from_secs(probe_secs),
         child.wait(),
     )
     .await;
@@ -277,7 +301,12 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
             // Hint semantici: per exit != 0 classifica l'errore con suggerimento diagnostico
             let hint = if exit_code != 0 {
                 let diag = classify_command_error(exit_code, &stderr, &stdout);
-                format!("\n\n❌ Comando fallito (exit {exit_code}). {diag}.")
+                // Su Windows aggiunge la guida POSIX se il comando usava sintassi
+                // cmd/PowerShell (evita il loop repeated_action -> force-close).
+                let win = super::helpers::windows_shell_hint(&command)
+                    .map(|h| format!(" {h}"))
+                    .unwrap_or_default();
+                format!("\n\n❌ Comando fallito (exit {exit_code}). {diag}.{win}")
             } else if exit_code == 0 && stdout.trim().is_empty() && stderr.trim().is_empty() {
                 "\n[NESSUN RISULTATO: il comando è completato con successo ma non ha prodotto output. \
                  Per grep/sed questo significa che il pattern non è stato trovato o il file è vuoto. \
@@ -313,15 +342,29 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
             format!("[Errore attesa comando '{}': {}]", command, e)
         }
         Err(_) => {
-            // Probe timeout: il processo non è terminato in 10s → è long-running
-            // Killa il processo server-side e ri-lancia nel terminale
+            // Probe timeout.
             let _ = child.kill().await;
-            let routed = service::tool_run_service(ctx, input, "service").await;
-            format!(
-                "[Auto-probe] Il comando non è terminato in {}s — rilevato come long-running.\n\
-                 Processo server-side terminato e ri-lanciato come servizio.\n{}",
-                RUN_COMMAND_PROBE_SECS, routed
-            )
+            if is_oneshot {
+                // One-shot (install/build) che non finisce nemmeno in probe_secs:
+                // NON è un server long-running -> NON instradare a run_service
+                // (semantica errata + su Windows il wizard setsid/nohup è rotto).
+                // Segnala il timeout così l'agente può spezzare il comando.
+                format!(
+                    "{}[Timeout] Il comando '{}' non è terminato in {}s ed è stato interrotto. \
+                     Se è un build/install legittimo molto lungo, eseguilo per passi.",
+                    hints_prefix,
+                    command.chars().take(120).collect::<String>(),
+                    probe_secs
+                )
+            } else {
+                // Long-running non-one-shot (dev server, watcher) → run_service.
+                let routed = service::tool_run_service(ctx, input, "service").await;
+                format!(
+                    "[Auto-probe] Il comando non è terminato in {}s — rilevato come long-running.\n\
+                     Processo server-side terminato e ri-lanciato come servizio.\n{}",
+                    probe_secs, routed
+                )
+            }
         }
     }
 }
@@ -379,7 +422,7 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> Str
         .min(RUN_TESTS_MAX_TIMEOUT);
 
     // 4. Esecuzione sincrona — NESSUN auto-routing a background
-    let child = crate::sandbox::isolated_command("/bin/sh")
+    let child = crate::sandbox::isolated_command(&crate::sandbox::agent_shell())
         .arg("-c")
         .arg(&command)
         .current_dir(&work_dir)

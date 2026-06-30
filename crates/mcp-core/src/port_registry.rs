@@ -518,12 +518,6 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     released
 }
 
-/// Radice dei progetti utente sotto cui un dev-server e' considerato candidato.
-const USER_PROJECTS_ROOT: &str = "/home/administrator/projects/";
-/// Radice del meta-progetto Nexus: i processi con cwd qui sono infrastruttura e
-/// NON vanno mai terminati (regola E di CLAUDE.md).
-const NEXUS_ROOT: &str = "/home/administrator/ideai";
-
 /// True se la command line (token NUL-separati di /proc/{pid}/cmdline) appartiene
 /// a un dev-server di un'app utente (Vite, Next, `pnpm dev`, ecc.). Esclude
 /// esplicitamente build/install e i processi di Nexus stesso.
@@ -670,6 +664,33 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
         Ok(e) => e,
         Err(_) => return 0,
     };
+
+    // Radici risolte a runtime (regola G: nessun path hardcoded; regola L: la
+    // radice progetti utente arriva dal punto unico `load_projects_base_root`,
+    // che legge la setting `projects_base_root`). Cosi' il dedup segue
+    // `D:/IDEAI-projects` su Windows e `/home/administrator/projects` su WSL,
+    // senza costanti compilate. Trailing slash per evitare match parziali
+    // (`/.../projects` non deve combaciare con `/.../projects-altro`).
+    let user_projects_root = match crate::projects::load_projects_base_root(db).await {
+        Ok(p) => {
+            let mut s = p.to_string_lossy().replace('\\', "/");
+            if !s.ends_with('/') {
+                s.push('/');
+            }
+            s
+        }
+        Err(_) => {
+            warn!("cleanup_duplicate_dev_servers: projects_base_root non risolvibile — skip");
+            return 0;
+        }
+    };
+    // Radice del meta-progetto Nexus (regola E): i processi con cwd qui sono
+    // infrastruttura e NON vanno mai terminati. Stessa fonte (`NEXUS_REPO_ROOT`)
+    // usata da claude_agents.rs / services_watchdog.rs.
+    let nexus_root = std::env::var("NEXUS_REPO_ROOT")
+        .unwrap_or_else(|_| "/home/administrator/ideai".to_string())
+        .replace('\\', "/");
+
     for entry in entries.flatten() {
         let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
             Some(p) => p,
@@ -699,7 +720,9 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
             Err(_) => continue,
         };
         let cwd_str = cwd.to_string_lossy().to_string();
-        if cwd_str.starts_with(NEXUS_ROOT) || !cwd_str.starts_with(USER_PROJECTS_ROOT) {
+        if cwd_str.starts_with(nexus_root.as_str())
+            || !cwd_str.starts_with(user_projects_root.as_str())
+        {
             continue;
         }
 

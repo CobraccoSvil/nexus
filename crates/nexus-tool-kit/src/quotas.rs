@@ -173,7 +173,7 @@ pub async fn check_can_start_container(db: &PgPool, project_id: Uuid) -> Result<
     Ok(())
 }
 
-/// Cache dell'uso disco per progetto (il `du` ricorsivo e' costoso): TTL piu'
+/// Cache dell'uso disco per progetto (la somma ricorsiva e' costosa): TTL piu'
 /// lungo della quota perche' lo spazio cambia lentamente.
 static DISK_USAGE_CACHE: OnceLock<RwLock<HashMap<Uuid, (i64, Instant)>>> = OnceLock::new();
 const DISK_USAGE_TTL: Duration = Duration::from_secs(300);
@@ -182,9 +182,39 @@ fn disk_cache() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
     DISK_USAGE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Uso disco stimato della project_root in MB (cache 5 min). `du` in
+/// Dimensione totale (in byte) di una directory, ricorsiva, in puro Rust
+/// (cross-platform, sostituisce `du`). Stack iterativo per evitare ricorsione
+/// profonda; non segue i symlink (usa `symlink_metadata`) per evitare loop e
+/// doppio conteggio. Best-effort: ogni errore per-entry e' ignorato.
+fn dir_size_bytes(root: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        // symlink_metadata non segue i link simbolici.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            // Non seguiamo i symlink: contiamo il link stesso, non il target.
+            total = total.saturating_add(meta.len());
+        } else if file_type.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    stack.push(entry.path());
+                }
+            }
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Uso disco stimato della project_root in MB (cache 5 min). Somma ricorsiva in
 /// spawn_blocking per non bloccare il runtime tokio. Best-effort: su errore
-/// ritorna 0 (non blocchiamo le scritture per un `du` fallito).
+/// ritorna 0 (non blocchiamo le scritture per un calcolo fallito).
 async fn project_disk_usage_mb(project_id: Uuid, root_path: &str) -> i64 {
     {
         let guard = disk_cache().read().await;
@@ -196,22 +226,11 @@ async fn project_disk_usage_mb(project_id: Uuid, root_path: &str) -> i64 {
     }
     let root = root_path.to_string();
     let mb = tokio::task::spawn_blocking(move || {
-        // `du -sm` ritorna i MB della directory (esclusi i filesystem montati).
-        std::process::Command::new("du")
-            .args(["-sm", "--", &root])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8_lossy(&o.stdout)
-                        .split_whitespace()
-                        .next()
-                        .and_then(|s| s.parse::<i64>().ok())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0)
+        // Somma ricorsiva cross-platform in puro Rust (sostituisce `du -sm`,
+        // che non esiste su Windows). Best-effort: errori per-entry ignorati.
+        // Conversione byte -> MiB (1 MiB = 1.048.576 byte), coerente con `du -m`.
+        let bytes = dir_size_bytes(std::path::Path::new(&root));
+        (bytes / (1024 * 1024)) as i64
     })
     .await
     .unwrap_or(0);

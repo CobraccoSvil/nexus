@@ -289,12 +289,52 @@ pub(super) async fn list_services_fallback(
     services
 }
 
+/// Windows: elenca i servizi di progetto come processi gestiti (agent_processes
+/// kind='service'), nella STESSA shape di list_services_fallback. Su Windows non
+/// esistono unit systemd: l'install (install_service_windows) registra i servizi
+/// qui. Dedup per label tenendo lo stato piu' recente.
+#[cfg(windows)]
+pub(super) async fn list_services_windows(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    slug: &str,
+) -> Vec<serde_json::Value> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT label, status FROM agent_processes \
+         WHERE project_id = $1 AND kind = 'service' \
+         ORDER BY label, created_at DESC",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut services: Vec<serde_json::Value> = Vec::new();
+    for (label, status) in rows {
+        if !seen.insert(label.clone()) {
+            continue;
+        }
+        let running = matches!(status.as_str(), "running" | "starting");
+        services.push(json!({
+            "unit":       format!("{slug}-{label}.service"),
+            "short":      label,
+            "state":      if running { "active" } else { "inactive" },
+            "sub":        if running { "running" } else { "dead" },
+            "managed_by": "windows",
+        }));
+    }
+    services.sort_by(|a, b| a["short"].as_str().cmp(&b["short"].as_str()));
+    services
+}
+
 // ── POST /api/projects/:id/services/:service/:action ─────────────────────────
 // service: "backend" | "brain" | "frontend"
 // action:  "start" | "stop" | "restart"
 
 /// Elenca tutti i servizi systemd --user il cui nome inizia con `{slug}-`.
 /// Nessun hardcoding: il progetto può avere quanti servizi vuole.
+/// Su Windows (niente systemd) usa il ramo dedicato (list_services_windows).
+#[cfg_attr(windows, allow(unreachable_code))]
 pub async fn get_project_services_status(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -305,6 +345,21 @@ pub async fn get_project_services_status(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let context = load_project_context(&state.db, project_id, user_id).await?;
     let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
+
+    // Su Windows non c'e' systemd: i servizi sono processi gestiti registrati in
+    // agent_processes (install_service_windows). Elencali da li' invece di
+    // invocare systemctl (che non esiste -> hang/500 -> pannello "Caricamento...").
+    #[cfg(windows)]
+    {
+        let services = list_services_windows(&state.db, project_id, &slug).await;
+        return Ok(Json(json!({
+            "services": services,
+            "slug": slug,
+            "manager_unavailable": true,
+            "manager_mode": "windows",
+            "manager_hint": "Su Windows i servizi di progetto sono processi gestiti (niente systemd).",
+        })));
+    }
 
     // `systemctl --user list-units --type=service --all --no-legend --no-pager`
     // restituisce righe: "  UNIT  LOAD  ACTIVE  SUB  DESCRIPTION"
@@ -460,6 +515,129 @@ pub async fn control_project_service(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     axum::extract::Path((id, service, action)): axum::extract::Path<(String, String, String)>,
+) -> ApiResult {
+    // Dispatch per piattaforma (regola L): su Windows i servizi sono processi gestiti
+    // in agent_processes -> start = ri-spawn, stop = taskkill, restart = stop+start.
+    #[cfg(windows)]
+    {
+        control_project_service_windows(state, claims, id, service, action).await
+    }
+    #[cfg(not(windows))]
+    {
+        control_project_service_systemd(state, claims, id, service, action).await
+    }
+}
+
+/// Windows: start/stop/restart di un servizio di progetto (processo in agent_processes).
+#[cfg(windows)]
+async fn control_project_service_windows(
+    state: AppState,
+    claims: Claims,
+    id: String,
+    service: String,
+    action: String,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
+
+    if service.contains('/') || service.contains("..") {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+    }
+    if !matches!(action.as_str(), "start" | "stop" | "restart") {
+        return Err(api_error(StatusCode::BAD_REQUEST, format!("Azione non valida: {action}")));
+    }
+    // nome corto: rimuovi prefisso "{slug}-" e suffisso ".service" se presenti.
+    let short = service
+        .strip_prefix(&format!("{slug}-"))
+        .unwrap_or(&service)
+        .strip_suffix(".service")
+        .unwrap_or(&service)
+        .to_string();
+
+    // STOP (anche prima parte di RESTART): taskkill dei processi running del servizio.
+    if action == "stop" || action == "restart" {
+        let running: Vec<(Option<i32>,)> = sqlx::query_as(
+            "SELECT pid FROM agent_processes \
+             WHERE project_id = $1 AND label = $2 AND kind = 'service' AND status = 'running'",
+        )
+        .bind(project_id)
+        .bind(&short)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        for (pid,) in running {
+            if let Some(p) = pid {
+                let _ = tokio::process::Command::new("taskkill")
+                    .args(["/PID", &p.to_string(), "/T", "/F"])
+                    .output()
+                    .await;
+            }
+        }
+        let _ = sqlx::query(
+            "UPDATE agent_processes SET status = 'stopped', stopped_at = now() \
+             WHERE project_id = $1 AND label = $2 AND kind = 'service' AND status = 'running'",
+        )
+        .bind(project_id)
+        .bind(&short)
+        .execute(&state.db)
+        .await;
+    }
+
+    // START (anche seconda parte di RESTART): ri-spawn dalla definizione piu' recente.
+    if action == "start" || action == "restart" {
+        let def: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT command, working_dir FROM agent_processes \
+             WHERE project_id = $1 AND label = $2 AND kind = 'service' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(&short)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        let (command, working_dir) = def.ok_or_else(|| {
+            api_error(StatusCode::NOT_FOUND, format!("Servizio '{short}' non trovato"))
+        })?;
+        let cwd = working_dir
+            .filter(|w| !w.trim().is_empty())
+            .unwrap_or_else(|| context.root_path.to_string_lossy().to_string());
+
+        crate::agent_processes::spawn_agent_process(
+            &state.db,
+            project_id,
+            None,
+            &short,
+            &command,
+            &cwd,
+            Some(context.root_path.clone()),
+            None,  // env non persistito in agent_processes; la porta e' tipicamente inline nel comando
+            false, // niente sandbox Docker su Windows
+            "service",
+            None,
+        )
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Avvio fallito: {e}")))?;
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "service": short,
+        "action": action,
+        "manager_mode": "windows-process",
+    })))
+}
+
+#[cfg(not(windows))]
+async fn control_project_service_systemd(
+    state: AppState,
+    claims: Claims,
+    id: String,
+    service: String,
+    action: String,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
     let project_id = Uuid::parse_str(&id)

@@ -223,7 +223,17 @@ pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value)
     let mut notes = String::from(
         "Code-snapshot React/TS estratto dal .make e scritto su disco: NON e' \
          incluso nel contesto (solo metadati qui). Leggi i file con read_file \
-         quando ti servono. Genera package.json da detected_dependencies.",
+         quando ti servono. Genera package.json da detected_dependencies. \
+         IMPORTANTE: gli export Figma hanno bug noti di scaffolding (import dei \
+         simboli router da 'react-router' v7 mentre in deps c'e' 'react-router-dom' \
+         v6; main.tsx che avvolge in <BrowserRouter> un'App che usa <RouterProvider> \
+         -> doppio router: l'app NON monta e resta a SCHERMO BIANCO anche se `npm \
+         run build` passa senza errori; wrapper UI mancanti come \
+         components/ui/sonner). PRIMA di build/avvio chiama \
+         nexus_verify_scaffold(target_dir=\"<root del progetto>\"): il tool RILEVA e \
+         APPLICA da se' i fix deterministici (write_file/edit_file, idempotenti) e \
+         ritorna il campo 'applied'. NON riapplicarli a mano: controlla solo \
+         'apply_errors' e le eventuali azioni manuali residue (run_command/blocker).",
     );
     if rejected_paths {
         notes.push_str(

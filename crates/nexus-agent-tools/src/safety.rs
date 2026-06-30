@@ -237,6 +237,88 @@ static FORBIDDEN_SET: Lazy<RegexSet> = Lazy::new(|| {
         .expect("FORBIDDEN_PATTERNS contiene regex non valida — fix in safety.rs")
 });
 
+// ── Layer dinamico: root protetta parametrica + comandi Windows/PowerShell ────
+//
+// I pattern statici sopra hardcodano i path Linux (`/home/administrator/ideai`)
+// e i comandi unix (`rm`, `cat`). Su Windows nativo la root del repo Nexus e'
+// `D:/IDEAI` (da `NEXUS_REPO_ROOT`) e i vettori distruttivi sono cmdlet
+// PowerShell (`Remove-Item`, `Get-Content`, `Stop-Service`). Questo layer
+// AGGIUNTIVO (regola L: la root protetta ha UNA sola fonte, l'env, invece di
+// essere hardcoded; regola G: niente path compilato) copre quei vettori senza
+// toccare i pattern statici (e quindi senza regredire i test esistenti).
+
+/// Frammento regex delle root del repo Nexus da proteggere, con boundary finale.
+/// Legge `NEXUS_REPO_ROOT` (slash-normalizzato) e include sempre il path storico
+/// `/home/administrator/ideai` e il riferimento `$IDEAI_ROOT`.
+fn nexus_root_regex_alt() -> String {
+    nexus_root_regex_alt_for(std::env::var("NEXUS_REPO_ROOT").ok().as_deref().unwrap_or(""))
+}
+
+/// Variante pura (testabile) di [`nexus_root_regex_alt`]. Il boundary CONSUMANTE
+/// `(?:[/\s"']|$)` (il crate `regex` non ha lookahead) impedisce che la root
+/// faccia match su un path che la contiene solo come PREFISSO: cosi'
+/// `D:/IDEAI-projects` (dir dei progetti utente) NON viene protetta/bloccata,
+/// mentre `D:/IDEAI` e `D:/IDEAI/...` si'.
+fn nexus_root_regex_alt_for(repo_root: &str) -> String {
+    let mut roots = vec!["/home/administrator/ideai".to_string()];
+    let normalized = repo_root.trim().replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    if !normalized.is_empty() {
+        roots.push(normalized.to_string());
+    }
+    roots.sort();
+    roots.dedup();
+    let mut alts: Vec<String> = roots.iter().map(|r| regex::escape(r)).collect();
+    alts.push(r"\$IDEAI_ROOT".to_string());
+    format!(r#"(?:{})(?:[/\s"']|$)"#, alts.join("|"))
+}
+
+/// Costruisce i pattern dinamici dato il frammento root. Funzione PURA (niente
+/// env/Lazy) per essere testabile in isolamento.
+fn dynamic_patterns_for(root_alt: &str) -> Vec<(&'static str, String, &'static str, &'static str)> {
+    vec![
+        // Scrittura/cancellazione del filesystem Nexus — verbi unix + PowerShell.
+        (
+            "fs_write_nexus_root",
+            format!(
+                r"(?i)(?:\brm\b|\bcp\b|\bmv\b|\bchmod\b|\bchown\b|\bsed\s+-i\b|\btee\b|\bremove-item\b|\bdel\b|\berase\b|\brmdir\b|\bset-content\b|\bout-file\b|\badd-content\b)[^|;&]*{}",
+                root_alt
+            ),
+            "Modifica/cancellazione del filesystem del repo Nexus vietata",
+            "Resta dentro la project_root del task corrente. La root del repo Nexus e' off-limits.",
+        ),
+        // Lettura dei .env (secrets) sotto la root Nexus — unix + PowerShell.
+        (
+            "cat_env_nexus_root",
+            format!(
+                r"(?i)(?:\bcat\b|\bhead\b|\btail\b|\bless\b|\bmore\b|\bgrep\b|\bget-content\b|\bselect-string\b|\btype\b)[^|;&]*{}[^|;&]*\.env",
+                root_alt
+            ),
+            "Lettura dei file .env del repo Nexus vietata",
+            "I .env del workspace Nexus contengono secrets: off-limits.",
+        ),
+        // Stop/modifica dei Windows Services Nexus (nexus-*): equivale a killare
+        // l'infrastruttura (regola E). Indipendente dalla root.
+        (
+            "stop_service_nexus",
+            r"(?i)(?:\bstop-service\b|\bsuspend-service\b|\bset-service\b|\bremove-service\b|\bsc(?:\.exe)?\s+(?:stop|delete|config|pause)\b)[^|;&]*\bnexus-\S+".to_string(),
+            "Stop/modifica dei Windows Services Nexus (nexus-*) vietato",
+            "I servizi nexus-* sono infrastruttura Nexus. Gestisci solo i servizi del TUO progetto.",
+        ),
+    ]
+}
+
+/// RegexSet dinamico + metadati, compilati una sola volta (la root da env e'
+/// stabile per la vita del processo). safety: pattern validi per costruzione.
+#[allow(clippy::type_complexity)]
+static DYNAMIC: Lazy<(RegexSet, Vec<(&'static str, String, &'static str, &'static str)>)> =
+    Lazy::new(|| {
+        let pats = dynamic_patterns_for(&nexus_root_regex_alt());
+        let set = RegexSet::new(pats.iter().map(|(_, re, _, _)| re.as_str()))
+            .expect("DYNAMIC safety regex non valida — fix in safety.rs");
+        (set, pats)
+    });
+
 /// Verifica un comando shell contro la blacklist.
 /// Ritorna `Some(BlockReason)` se va bloccato, `None` se OK.
 /// True se il comando contiene almeno un `systemctl` di SISTEMA (cioe' NON
@@ -281,17 +363,29 @@ pub fn check_command(cmd: &str) -> Option<BlockReason> {
             remediation: "Per i servizi del progetto usa `systemctl --user <slug>-<servizio>.service`. `systemctl` di sistema e' sysadmin, fuori scope progetto.",
         });
     }
-    let matches: Vec<usize> = FORBIDDEN_SET.matches(normalized).into_iter().collect();
-    if matches.is_empty() {
-        return None;
+    // Layer statico (path unix storici): comportamento invariato.
+    if let Some(idx) = FORBIDDEN_SET.matches(normalized).into_iter().next() {
+        let (category, _re, message, remediation) = FORBIDDEN_PATTERNS[idx];
+        return Some(BlockReason {
+            category,
+            message,
+            remediation,
+        });
     }
-    let idx = matches[0];
-    let (category, _re, message, remediation) = FORBIDDEN_PATTERNS[idx];
-    Some(BlockReason {
-        category,
-        message,
-        remediation,
-    })
+    // Layer dinamico: root protetta parametrica (NEXUS_REPO_ROOT) + comandi
+    // PowerShell/Windows. Match sul comando con i separatori normalizzati a '/',
+    // cosi' `D:\IDEAI` e `D:/IDEAI` combaciano entrambi.
+    let slash = normalized.replace('\\', "/");
+    let (dyn_set, dyn_pats) = &*DYNAMIC;
+    if let Some(idx) = dyn_set.matches(&slash).into_iter().next() {
+        let p = &dyn_pats[idx];
+        return Some(BlockReason {
+            category: p.0,
+            message: p.2,
+            remediation: p.3,
+        });
+    }
+    None
 }
 
 /// Formatta il messaggio di blocco per il tool_result (visibile all'agente).
@@ -351,6 +445,70 @@ mod tests {
                 .category,
             "iptables_route"
         );
+    }
+
+    // ── Layer dinamico (root parametrica + comandi Windows/PowerShell) ─────────
+
+    /// Helper: RegexSet dinamico per una repo-root data (no env/Lazy globale).
+    fn dyn_set_for(repo_root: &str) -> RegexSet {
+        let pats = dynamic_patterns_for(&nexus_root_regex_alt_for(repo_root));
+        RegexSet::new(pats.iter().map(|(_, r, _, _)| r.as_str())).unwrap()
+    }
+
+    #[test]
+    fn dynamic_blocca_powershell_su_root_nexus() {
+        let set = dyn_set_for("D:/IDEAI");
+        // check_command normalizza i backslash a '/': replico la stessa trasformazione.
+        let rm = "Remove-Item -Recurse -Force D:\\IDEAI\\.env".replace('\\', "/");
+        assert!(set.is_match(&rm), "Remove-Item sulla root Nexus deve essere bloccato");
+        assert!(
+            set.is_match("Get-Content D:/IDEAI/.env"),
+            "Get-Content del .env Nexus deve essere bloccato"
+        );
+        assert!(
+            set.is_match("del D:/IDEAI"),
+            "del sulla root Nexus (boundary di fine stringa) deve essere bloccato"
+        );
+    }
+
+    #[test]
+    fn dynamic_non_blocca_projects_che_ha_root_come_prefisso() {
+        // D:/IDEAI-projects contiene la repo-root come PREFISSO ma e' la dir dei
+        // progetti utente: il boundary deve evitare il falso positivo.
+        let set = dyn_set_for("D:/IDEAI");
+        assert!(
+            !set.is_match("Remove-Item -Recurse D:/IDEAI-projects/Beauty-Book/dist"),
+            "i path dei progetti utente NON vanno bloccati"
+        );
+        assert!(!set.is_match("Get-Content D:/IDEAI-projects/Foo/.env"));
+    }
+
+    #[test]
+    fn dynamic_blocca_stop_service_nexus() {
+        // Pattern indipendente dalla root: testabile via check_command reale.
+        assert_eq!(
+            check_command("Stop-Service nexus-mcp-core -Force")
+                .unwrap()
+                .category,
+            "stop_service_nexus"
+        );
+        assert!(check_command("sc stop nexus-gateway").is_some());
+    }
+
+    #[test]
+    fn dynamic_permette_comandi_legittimi() {
+        // Path non-Nexus e servizi non-nexus devono passare.
+        assert!(check_command("Remove-Item -Recurse D:/IDEAI-projects/app/node_modules").is_none());
+        assert!(check_command("Get-Content ./.env").is_none());
+        assert!(check_command("Stop-Service my-app-frontend").is_none());
+    }
+
+    #[test]
+    fn dynamic_root_alt_baseline_ha_boundary_e_path_linux() {
+        // Senza env, la baseline contiene il path Linux storico + il boundary.
+        let alt = nexus_root_regex_alt_for("");
+        assert!(alt.contains("/home/administrator/ideai"));
+        assert!(alt.contains(r#"(?:[/\s"']|$)"#));
     }
 
     #[test]

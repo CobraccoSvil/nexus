@@ -635,10 +635,92 @@ pub fn safe_env_for_direct_spawn() -> HashMap<String, String> {
 /// di `kill_process_tree`: invece di sperare che il killer riconosca mcp-core,
 /// rendiamo strutturalmente impossibile che il padre finisca nel gruppo killato.
 pub fn isolated_command(program: &str) -> tokio::process::Command {
+    // `mut` serve solo su Unix, dove `process_group` prende `&mut self`. Su
+    // Windows (MSVC) il binding resta immutato: sopprimiamo il warning solo li'
+    // invece di rimuovere `mut` (che romperebbe la build Unix/WSL).
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut cmd = tokio::process::Command::new(program);
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW (0x08000000): il figlio non apre/condivide una console
+        // (niente finestre cmd lampeggianti per i comandi agente). NB: da solo NON
+        // impedisce l'eredita' del socket :4000 (bInheritHandles resta TRUE per gli
+        // stdio) -> per quello c'e' make_socket_non_inheritable sul listener.
+        // creation_flags e' inerente a tokio::process::Command su Windows: nessun
+        // import di std::os::windows::process::CommandExt necessario.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd
+}
+
+/// Windows: marca un socket listener come NON ereditabile dai processi figli.
+/// PUNTO UNICO (regola L) contro il difetto per cui i figli spawnati da mcp-core
+/// (dev server avviati dall'agente) ereditano l'handle del socket di ascolto (es.
+/// :4000): un figlio orfano lo tiene dopo un crash/restart -> il nuovo mcp-core
+/// fallisce il bind con WSAEADDRINUSE (os error 10048) -> crash loop WinSW.
+/// `SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0)` azzera il flag di
+/// ereditarieta' a prescindere da bInheritHandles del CreateProcess. Da chiamare
+/// UNA volta subito dopo il bind, su `std::net::TcpListener`. Dichiarazione
+/// kernel32 inline per non aggiungere la dipendenza windows-sys.
+#[cfg(windows)]
+pub fn make_socket_non_inheritable(listener: &std::net::TcpListener) {
+    use std::os::windows::io::AsRawSocket;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    #[link(name = "kernel32")]
+    extern "system" {
+        // HANDLE e' pointer-sized: usize e' ABI-compatibile e evita il cast a *mut.
+        fn SetHandleInformation(h_object: usize, dw_mask: u32, dw_flags: u32) -> i32;
+    }
+    let handle = listener.as_raw_socket() as usize;
+    // Best-effort: in caso di fallimento resta il comportamento attuale.
+    unsafe {
+        let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+    }
+}
+
+/// Shell con cui eseguire i comandi shell dell'agente (`run_command`, `run_tests`,
+/// `execute_command`). PUNTO UNICO cross-platform (regola L). Gli agenti generano
+/// comandi in sintassi bash (`mkdir -p a/{b,c}`, `pnpm install && pnpm build`,
+/// pipe, `&&`), quindi su Windows usiamo **Git Bash** (non `cmd`/`powershell`, che
+/// romperebbero quella sintassi). Senza questo, su Windows `/bin/bash` non esiste
+/// e ogni comando agente fallisce con `os error 3` (path not found). Override
+/// esplicito via env `NEXUS_SHELL`.
+pub fn agent_shell() -> String {
+    if let Ok(s) = std::env::var("NEXUS_SHELL") {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    shell_default()
+}
+
+#[cfg(unix)]
+fn shell_default() -> String {
+    // Bash (brace-expansion ecc.); fallback a sh.
+    if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash".to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
+}
+
+#[cfg(windows)]
+fn shell_default() -> String {
+    // Git Bash nei path d'installazione standard; fallback a `bash` via PATH.
+    for p in [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ] {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+    "bash".to_string()
 }
 
 // ─── Validation override env passate dall'agente ──────────────────────────────

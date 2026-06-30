@@ -1,3 +1,10 @@
+// Su Windows molti sottosistemi sono Linux-only (systemd/wizard, sudo-runner,
+// docker-compose, /proc, run-mode) e il loro codice e' cfg-gated out o non
+// raggiunto: e' dead-code LECITO del porting. allow(dead_code) SOLO su Windows;
+// su Linux questo codice e' tutto usato, quindi il CI Linux continua a catturare
+// il dead-code GENUINO. Punto unico (regola L) invece di allow sparsi per-modulo.
+#![cfg_attr(windows, allow(dead_code))]
+
 mod admin;
 mod agent_graph_adapter;
 mod agent_processes;
@@ -1231,6 +1238,12 @@ async fn main() -> anyhow::Result<()> {
     // intermittenza (route vecchie vs nuove). Difesa indipendente dal deploy.
     // Il File viene "dimenticato" cosi' il lock resta tenuto per tutta la vita
     // del processo; il kernel lo rilascia automaticamente alla terminazione.
+    //
+    // Adattamento Windows (ri-applicato dopo recupero della base da WSL):
+    // flock/libc/raw-fd non esistono su Windows e il single-instance e' gia'
+    // garantito dal Service Manager (WinSW/SCM avvia UNA sola istanza di
+    // nexus-mcp-core), quindi questo guard e' compilato solo su Unix.
+    #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         let lock_path = std::env::var("NEXUS_MCP_CORE_LOCK")
@@ -1266,13 +1279,26 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], mcp_http_port));
     tracing::info!("mcp-core listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Bind via std::net per marcare il socket NON ereditabile su Windows PRIMA che
+    // l'agente spawni figli (dev server): altrimenti un figlio eredita l'handle di
+    // :4000 e, orfano dopo un crash/restart, blocca il re-bind (WSAEADDRINUSE,
+    // os error 10048 -> crash loop WinSW). Punto unico: sandbox::make_socket_non_inheritable.
+    let listener = {
+        let std_listener = std::net::TcpListener::bind(addr)?;
+        std_listener.set_nonblocking(true)?;
+        #[cfg(windows)]
+        crate::sandbox::make_socket_non_inheritable(&std_listener);
+        tokio::net::TcpListener::from_std(std_listener)?
+    };
 
     // Diagnostica: al SIGTERM raccoglie indizi sul possibile MITTENTE. tokio non
     // espone il si_pid del segnale, quindi facciamo best-effort scansionando /proc
     // per i processi che tipicamente inviano SIGTERM a mcp-core (deploy, pkill/kill,
     // un secondo mcp-core in single-instance). Serve a capire in 10s chi ha ucciso
     // il backend, invece di doverlo ricostruire a ritroso (incidente 2026-06-07).
+    // Solo Unix: legge /proc ed e' invocata unicamente nel ramo SIGTERM cfg(unix)
+    // (su Windows sarebbe codice morto -> warning con clippy -D warnings).
+    #[cfg(unix)]
     fn diagnose_signal_origin() -> String {
         let own = std::process::id();
         let ppid = std::fs::read_to_string("/proc/self/stat")
@@ -1421,38 +1447,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
         .unwrap_or(false)
     };
 
-    // Verifica TCP connect rapido al Brain REST (porta 8001): gli agent run
-    // usano POST /agent/run/stream su questa porta. neural_core (gRPC 50051)
-    // puo' essere online mentre il server REST e' giu'.
-    // Indirizzo: env var (override) > DB (canonico) > hardcoded.
-    let brain_rest_ok = {
-        let db_url = settings::get_setting(&state.db, "brain_rest_url")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| {
-                // Estrae host:port da URL come "http://127.0.0.1:8001"
-                v.trim()
-                    .trim_start_matches("http://")
-                    .trim_start_matches("https://")
-                    .split('/')
-                    .next()
-                    .map(|s| s.to_string())
-            });
-        let addr = std::env::var("BRAIN_REST_ADDR")
-            .ok()
-            .or(db_url)
-            .unwrap_or_else(|| "127.0.0.1:8001".into());
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
-    };
-
-    let status = if db_ok && redis_ok && tools_grpc_ok && brain_rest_ok {
+    // NB: il vecchio probe `brain_rest` (TCP :8001) e' stato rimosso. Il brain
+    // Python e' stato eliminato e i suoi endpoint vivono ora in mcp-core (coperti
+    // da neural_core); sondare la 8001 dava sempre False, degradando l'health a
+    // vita. Anche la UI (status-bar / ide-shell) ha gia' rimosso quel LED.
+    let status = if db_ok && redis_ok && tools_grpc_ok {
         "ok"
     } else {
         "degraded"
@@ -1477,7 +1476,6 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
                 .dependency_status
                 .embedder
                 .load(std::sync::atomic::Ordering::Relaxed),
-            brain_rest: brain_rest_ok,
         },
     })
 }

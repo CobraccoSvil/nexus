@@ -371,11 +371,29 @@ pub async fn spawn_tool_runner_server(
             let tool_runner_svc = ToolRunnerServer::new(svc.clone())
                 .max_decoding_message_size(MAX_MSG)
                 .max_encoding_message_size(MAX_MSG);
-            match Server::builder()
-                .add_service(tool_runner_svc)
-                .serve(addr)
-                .await
-            {
+            // Bind via std::net per marcare il socket NON ereditabile su Windows: i
+            // figli spawnati dall'agente non devono ereditare la porta gRPC, altrimenti
+            // un orfano dopo un crash blocca il re-bind (come per :4000). Bind+serve in
+            // un blocco unico: un errore di bind (es. TIME_WAIT) confluisce nel retry.
+            let serve_result: Result<(), String> = async {
+                let std_listener =
+                    std::net::TcpListener::bind(addr).map_err(|e| format!("bind: {e}"))?;
+                std_listener
+                    .set_nonblocking(true)
+                    .map_err(|e| format!("set_nonblocking: {e}"))?;
+                #[cfg(windows)]
+                crate::sandbox::make_socket_non_inheritable(&std_listener);
+                let listener = tokio::net::TcpListener::from_std(std_listener)
+                    .map_err(|e| format!("from_std: {e}"))?;
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                Server::builder()
+                    .add_service(tool_runner_svc)
+                    .serve_with_incoming(incoming)
+                    .await
+                    .map_err(|e| format!("serve: {e}"))
+            }
+            .await;
+            match serve_result {
                 Ok(_) => {
                     tracing::info!("ToolRunner server terminato regolarmente");
                     return;

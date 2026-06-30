@@ -80,13 +80,25 @@ pub async fn run_cmd(
     timeout_secs: u64,
 ) -> Result<CmdOutput, NexusToolError> {
     ensure_binary(bin).await?;
+    run_cmd_owned(bin, args, cwd, timeout_secs).await
+}
 
+/// Come [`run_cmd`] ma con `bin` DINAMICO (non `&'static`): per quando il binario/shell
+/// e' risolto a runtime — es. `sandbox::agent_shell()` ritorna Git Bash su Windows.
+/// Non esegue il pre-check `ensure_binary` (che richiede `&'static` per la diagnostica
+/// `BinaryMissing`): un binario assente emerge come errore IO dallo spawn.
+pub async fn run_cmd_owned(
+    bin: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout_secs: u64,
+) -> Result<CmdOutput, NexusToolError> {
     debug!(
         bin = bin,
         args = ?args,
         cwd = ?cwd,
         timeout = timeout_secs,
-        "nexus_tools: spawning subprocess"
+        "nexus_tools: spawning subprocess (owned bin)"
     );
 
     let start = std::time::Instant::now();
@@ -124,11 +136,6 @@ pub async fn run_cmd(
                 timeout = timeout_secs,
                 "nexus_tools: subprocess timed out, child was already moved into wait_with_output"
             );
-            // wait_with_output ha already mosso il child: non possiamo killare
-            // esplicitamente qui. Il drop della future dovrebbe far uscire il
-            // child; tokio rimuove il file descriptor e il kernel consegna
-            // SIGPIPE alla prima write. Per i tool stateless (cargo/git) è
-            // sufficiente — il processo termina naturalmente entro 1-2s.
             Err(NexusToolError::Timeout(timeout_secs))
         }
     }

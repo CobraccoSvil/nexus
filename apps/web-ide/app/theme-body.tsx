@@ -43,7 +43,9 @@ function ThemedBody({ children }: { children: ReactNode }) {
         style={{
           background: mounted ? t.bg : "transparent",
           color: mounted ? t.text : "transparent",
-          fontFamily: "JetBrains Mono, Fira Code, monospace",
+          // Font base: PUNTO UNICO in globals.css (`body`), cosi' lo ereditano
+          // anche i portal (dialog/menu/toast) che renderizzano fuori da questo
+          // wrapper. Qui non va piu' ridichiarato (regola L).
           visibility: mounted ? "visible" : "hidden",
           minHeight: "100vh",
         }}

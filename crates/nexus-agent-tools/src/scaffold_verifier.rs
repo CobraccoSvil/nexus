@@ -195,6 +195,90 @@ pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) ->
         }
     }
 
+    // ── 3.5 Router consistency (causa #1 del build-loop sugli export Figma) ──
+    // L'export Figma spesso importa i simboli router da "react-router" (v7) o
+    // avvolge App in <BrowserRouter> (v6) mentre App usa <RouterProvider>
+    // (data-router v6.4): import non risolto (build fallisce con "createBrowserRouter
+    // is not exported by react-router") oppure doppio router (App NON monta ->
+    // schermo bianco). Si scansionano TUTTI i .tsx sotto src/, non solo main.tsx:
+    // l'export sparge i bug del router in App.tsx/routes.tsx.
+    let has_rr_dom = all_deps.contains("react-router-dom");
+    let has_rr = all_deps.contains("react-router");
+    let src_dir = target.join("src");
+    let source_files = collect_source_files(&src_dir).await;
+    let mut app_uses_router_provider = false;
+    for f in &source_files {
+        let content = match fs::read_to_string(f).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let rel = f
+            .strip_prefix(&target)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| f.to_string_lossy().to_string());
+        if content.contains("RouterProvider") {
+            app_uses_router_provider = true;
+        }
+        // Import dei simboli router dal pacchetto "react-router" (esatto, non -dom):
+        // se NON e' in dependencies ma react-router-dom si', normalizza a v6.
+        if (content.contains("from \"react-router\"") || content.contains("from 'react-router'"))
+            && !has_rr
+            && has_rr_dom
+        {
+            result.inconsistent_imports.push(InconsistentImport {
+                file: rel.clone(),
+                import_path: "react-router".into(),
+                reason: "import da 'react-router' (v7) non presente in dependencies; usa 'react-router-dom' (v6 installato), che esporta createBrowserRouter/RouterProvider".into(),
+                suggested_path: Some("react-router-dom".into()),
+            });
+        }
+        // Wrapper UI 'sonner' importato ma assente -> genera lo stub (re-export).
+        for cap in import_regex().captures_iter(&content) {
+            let path = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let is_sonner = (path.starts_with("./") || path.starts_with("../"))
+                && (path.ends_with("/ui/sonner") || path.ends_with("/sonner"));
+            if is_sonner && resolve_relative_import(f, &path, &target).await.is_none() {
+                if let Some(parent) = f.parent() {
+                    if let Ok(stub_rel) = parent
+                        .join(format!("{}.tsx", path))
+                        .strip_prefix(&target)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    {
+                        result.missing_files.push(MissingFile {
+                            path: stub_rel.clone(),
+                            purpose: "wrapper Toaster (re-export da 'sonner')".into(),
+                            template_id: None,
+                        });
+                        result.suggested_fixes.push(json!({
+                            "type": "write_file",
+                            "path": format!("{}/{}", target_rel.trim_end_matches('/'), stub_rel),
+                            "content": "// Stub generato da nexus_verify_scaffold: re-export Toaster da 'sonner'.\nexport { Toaster } from \"sonner\";\n",
+                            "note": format!("'{}' e' importato ma il file non esiste -> genera lo stub (re-export del Toaster di sonner).", path),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    // main.tsx avvolge App in <BrowserRouter> mentre l'app usa <RouterProvider> ->
+    // doppio router: l'app non monta. Sostituisci main.tsx col template canonico
+    // (rende solo <App />, il routing lo gestisce RouterProvider dentro App).
+    if main_tsx.exists() && app_uses_router_provider {
+        if let Ok(main_content) = fs::read_to_string(&main_tsx).await {
+            if main_content.contains("BrowserRouter") {
+                result.package_json_issues.push(
+                    "main.tsx avvolge App in <BrowserRouter> (v6) mentre l'app usa <RouterProvider> (data-router): doppio router -> App NON monta (schermo bianco)".into(),
+                );
+                result.suggested_fixes.push(json!({
+                    "type": "write_file",
+                    "path": format!("{}/src/main.tsx", target_rel.trim_end_matches('/')),
+                    "content": VITE_MAIN_TSX,
+                    "note": "Sostituisci main.tsx col template canonico che rende solo <App /> SENZA <BrowserRouter>: il routing e' gia' gestito da <RouterProvider> dentro App. Cosi' l'app monta invece di restare bianca.",
+                }));
+            }
+        }
+    }
+
     // ── 4. Costruisci suggested_fixes finali ────────────────────────────────
     for mf in &result.missing_files {
         if let Some(tmpl) = mf.template_id {
@@ -243,6 +327,32 @@ pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) ->
         && result.inconsistent_imports.is_empty()
         && result.package_json_issues.is_empty();
 
+    // ── 4.5 Auto-apply dei fix deterministici (regola H) ────────────────────
+    // Il verifier non si limita a SUGGERIRE: APPLICA i fix sicuri e idempotenti
+    // (write_file di template/stub, edit_file di normalizzazione import router).
+    // Motivo: il bug del doppio router NON rompe il build (vite compila lo
+    // stesso), quindi l'agente vede "build OK" e conclude il turno lasciando
+    // l'app a schermo bianco. Applicare lato verifier toglie la dipendenza dalla
+    // convergenza dell'agente nel loop diagnose->fix. run_command/blocker/
+    // manual_review NON sono auto-applicati (richiedono comandi o giudizio).
+    // Disattivabile con apply=false per sola ispezione.
+    let apply = input.get("apply").and_then(Value::as_bool).unwrap_or(true);
+    let (applied, apply_errors) = if apply {
+        apply_fixes(&ctx.root_path, &target, &result.suggested_fixes).await
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let manual_remaining = result
+        .suggested_fixes
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.get("type").and_then(Value::as_str).unwrap_or(""),
+                "run_command" | "blocker" | "manual_review" | "edit_package_json"
+            )
+        })
+        .count();
+
     json!({
         "ok": ok,
         "project_kind": result.project_kind,
@@ -256,13 +366,83 @@ pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) ->
         })).collect::<Vec<_>>(),
         "package_json_issues": result.package_json_issues,
         "suggested_fixes": result.suggested_fixes,
-        "next_step_hint": if ok {
+        "applied": applied,
+        "apply_errors": apply_errors,
+        "next_step_hint": if !apply {
+            "apply=false: sola ispezione. Applica i suggested_fixes (write_file/edit_file/run_command), poi ri-chiama."
+        } else if !apply_errors.is_empty() {
+            "Alcuni fix automatici sono FALLITI (vedi apply_errors): risolvili a mano, poi build."
+        } else if manual_remaining > 0 {
+            "Fix deterministici applicati automaticamente. Restano azioni manuali (run_command/blocker) in suggested_fixes: eseguile, poi build."
+        } else if !applied.is_empty() {
+            "Fix applicati automaticamente: scaffold riparato (router/import/template). Avvia/build: niente schermo bianco da doppio router."
+        } else if ok {
             "Scaffolding consistente. Puoi avviare con npm run dev/start senza errori noti."
         } else {
-            "Applica i suggested_fixes in ordine (write_file/edit_file/run_command), poi ri-chiama questo tool per verifica residui."
+            "Nessun fix auto-applicabile rilevato; vedi suggested_fixes."
         }
     })
     .to_string()
+}
+
+/// Applica i fix deterministici e idempotenti prodotti dalla verifica:
+/// `write_file` (template/stub) e `edit_file` (normalizzazione import). NON
+/// applica `run_command`/`blocker`/`manual_review`/`edit_package_json`, che
+/// richiedono esecuzione comandi o giudizio. Idempotente: ri-applicare e' sicuro
+/// (write_file riscrive identico; edit_file salta se il pattern `from` non e'
+/// piu' presente). Estratto come punto unico testabile (regola L).
+async fn apply_fixes(
+    root_path: &Path,
+    target: &Path,
+    fixes: &[Value],
+) -> (Vec<Value>, Vec<String>) {
+    let mut applied: Vec<Value> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for fix in fixes {
+        match fix.get("type").and_then(Value::as_str).unwrap_or("") {
+            "write_file" => {
+                let path = fix.get("path").and_then(Value::as_str).unwrap_or("");
+                let content = fix.get("content").and_then(Value::as_str).unwrap_or("");
+                match nexus_types::workspace_paths::normalize_into_root(
+                    root_path,
+                    path.trim_start_matches("./"),
+                ) {
+                    Ok(clean) => {
+                        let abs = root_path.join(&clean);
+                        if let Some(parent) = abs.parent() {
+                            let _ = fs::create_dir_all(parent).await;
+                        }
+                        match fs::write(&abs, content).await {
+                            Ok(_) => applied.push(json!({"type": "write_file", "path": path})),
+                            Err(e) => errors.push(format!("write_file {}: {}", path, e)),
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("write_file {} path invalido: {}", path, e.message()))
+                    }
+                }
+            }
+            "edit_file" => {
+                let file = fix.get("file").and_then(Value::as_str).unwrap_or("");
+                let from = fix.get("from").and_then(Value::as_str).unwrap_or("");
+                let to = fix.get("to").and_then(Value::as_str).unwrap_or("");
+                let abs = target.join(file);
+                match fs::read_to_string(&abs).await {
+                    Ok(c) if c.contains(from) => {
+                        match fs::write(&abs, c.replace(from, to)).await {
+                            Ok(_) => applied.push(json!({"type": "edit_file", "file": file})),
+                            Err(e) => errors.push(format!("edit_file {}: {}", file, e)),
+                        }
+                    }
+                    // `from` assente: gia' applicato (idempotente), non un errore.
+                    Ok(_) => {}
+                    Err(e) => errors.push(format!("edit_file read {}: {}", file, e)),
+                }
+            }
+            _ => {}
+        }
+    }
+    (applied, errors)
 }
 
 /// Regex per estrarre import: `import X from "Y"` / `import "Y"`.
@@ -317,6 +497,37 @@ async fn resolve_relative_import(
     None
 }
 
+/// Raccoglie ricorsivamente i file .tsx/.ts sotto `dir`, saltando node_modules e
+/// le cartelle nascoste. Usato per verificare gli import in TUTTI i sorgenti, non
+/// solo main.tsx: l'export Figma sparge i bug del router (react-router v7,
+/// BrowserRouter+RouterProvider) e gli import UI mancanti in App.tsx/routes.tsx.
+async fn collect_source_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let mut rd = match fs::read_dir(&d).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_string();
+            if name == "node_modules" || name.starts_with('.') {
+                continue;
+            }
+            let p = entry.path();
+            match entry.file_type().await {
+                Ok(ft) if ft.is_dir() => stack.push(p),
+                Ok(ft) if ft.is_file() && (name.ends_with(".tsx") || name.ends_with(".ts")) => {
+                    out.push(p)
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// Template per file mancanti (Vite+React+TS standard).
 fn template_content(id: &str) -> Option<&'static str> {
     match id {
@@ -366,3 +577,73 @@ createRoot(container).render(
   </React.StrictMode>,
 );
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn apply_fixes_ripara_router_e_main_tsx() {
+        // Replica il bug Beauty-Book: App.tsx importa da "react-router" (v7, non
+        // in deps) e usa RouterProvider; main.tsx avvolge App in <BrowserRouter>
+        // (doppio router -> schermo bianco). I fix: edit_file import + write_file
+        // main.tsx canonico. run_command NON deve essere auto-applicato.
+        let root =
+            std::env::temp_dir().join(format!("scaffold_apply_{}", uuid::Uuid::new_v4()));
+        let app_dir = root.join("src/app");
+        fs::create_dir_all(&app_dir).await.unwrap();
+        let app_tsx = app_dir.join("App.tsx");
+        fs::write(
+            &app_tsx,
+            "import { RouterProvider } from \"react-router\";\nexport default function App() { return <RouterProvider router={router} />; }\n",
+        )
+        .await
+        .unwrap();
+        let main_tsx = root.join("src/main.tsx");
+        fs::write(
+            &main_tsx,
+            "import { BrowserRouter } from 'react-router-dom';\n// vecchio main con doppio router\n",
+        )
+        .await
+        .unwrap();
+
+        let fixes = vec![
+            json!({
+                "type": "edit_file",
+                "file": "src/app/App.tsx",
+                "from": "from \"react-router\"",
+                "to": "from \"react-router-dom\"",
+            }),
+            json!({
+                "type": "write_file",
+                "path": "./src/main.tsx",
+                "content": VITE_MAIN_TSX,
+            }),
+            json!({"type": "run_command", "command": "npm install foo"}),
+        ];
+
+        let (applied, errors) = apply_fixes(&root, &root, &fixes).await;
+        assert!(errors.is_empty(), "errori inattesi: {:?}", errors);
+        assert_eq!(applied.len(), 2, "solo write_file + edit_file auto-applicati");
+
+        let app_after = fs::read_to_string(&app_tsx).await.unwrap();
+        assert!(
+            app_after.contains("from \"react-router-dom\""),
+            "import non normalizzato: {app_after}"
+        );
+        let main_after = fs::read_to_string(&main_tsx).await.unwrap();
+        assert_eq!(main_after, VITE_MAIN_TSX, "main.tsx non sostituito col canonico");
+        assert!(
+            !main_after.contains("BrowserRouter"),
+            "BrowserRouter ancora presente in main.tsx"
+        );
+
+        // Idempotenza: al 2o giro edit_file salta (pattern assente), write_file
+        // riscrive identico -> nessun errore, un solo applied.
+        let (applied2, errors2) = apply_fixes(&root, &root, &fixes).await;
+        assert!(errors2.is_empty(), "errori al secondo apply: {:?}", errors2);
+        assert_eq!(applied2.len(), 1, "al 2o giro solo write_file (edit_file gia' fatto)");
+
+        let _ = fs::remove_dir_all(&root).await;
+    }
+}

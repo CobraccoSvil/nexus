@@ -135,7 +135,7 @@ async fn run_cycle(
     let was_embedder_ok = status.embedder.load(Ordering::Relaxed);
     let was_gateway_ok = status.gateway.load(Ordering::Relaxed);
 
-    let qdrant_result = probe_qdrant().await;
+    let qdrant_result = probe_qdrant(db).await;
     let embedder_result = probe_embedder(orchestrator).await;
     let gateway_result = probe_gateway().await;
 
@@ -437,9 +437,11 @@ struct ProbeResult {
 }
 
 /// Probe Qdrant via HTTP GET /healthz (pattern da environment.rs:394).
-async fn probe_qdrant() -> ProbeResult {
-    let qdrant_url =
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
+async fn probe_qdrant(db: &PgPool) -> ProbeResult {
+    // Stessa fonte URL dei client (regola L): setting DB `qdrant_url` -> env ->
+    // default REST 6333. Prima leggeva solo l'env, divergendo dai client e
+    // dando falsi negativi se l'env puntava alla porta gRPC 6334.
+    let qdrant_url = crate::settings::resolve_qdrant_url(db).await;
     let health_url = format!("{}/healthz", qdrant_url.trim_end_matches('/'));
 
     let client = match reqwest::Client::builder()

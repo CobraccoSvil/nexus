@@ -396,3 +396,19 @@ pub async fn get_raw_value(
 /// Lettura setting: punto unico in nexus-auth (regola L / ADR 0026).
 /// Re-export con la firma storica (Result, valore raw, propaga l'errore DB).
 pub use nexus_auth::get_setting_checked as get_setting;
+
+/// Punto unico (regola L) per risolvere l'URL REST di Qdrant.
+///
+/// Ordine: setting DB `qdrant_url` -> env `QDRANT_URL` -> default REST
+/// `http://localhost:6333`. La 6333 e' la porta REST usata da TUTTI i client
+/// Nexus (RAG, doc-service, health probe); la 6334 e' gRPC (protocollo diverso).
+/// Prima il watchdog leggeva solo l'env mentre i client leggevano il DB: due
+/// fonti divergenti per la stessa decisione (un env errato a 6334 dava
+/// `qdrant=False` pur con il setting DB corretto a 6333). Ora c'e' una sola
+/// risoluzione condivisa.
+pub async fn resolve_qdrant_url(db: &sqlx::PgPool) -> String {
+    nexus_auth::get_setting(db, "qdrant_url")
+        .await
+        .or_else(|| std::env::var("QDRANT_URL").ok())
+        .unwrap_or_else(|| "http://localhost:6333".to_string())
+}

@@ -942,13 +942,132 @@ pub(crate) fn derive_frontend_sibling_env(
     }
 }
 
-/// Installa un servizio come unit file systemd --user e lo abilita.
-/// Body JSON: { short, command, args, cwd, env, description }
+/// Endpoint "installa servizio". Su Linux crea e abilita una unit systemd --user;
+/// su Windows (niente systemd) esegue il servizio come processo gestito, lo stesso
+/// meccanismo di run_service (cmd /C, che trova i binari via PATH macchina). Punto
+/// unico di dispatch per piattaforma (regola L).
 pub async fn wizard_install_service(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<serde_json::Value>,
+) -> ApiResult {
+    #[cfg(windows)]
+    {
+        install_service_windows(state, claims, id, body).await
+    }
+    #[cfg(not(windows))]
+    {
+        install_service_systemd(state, claims, id, body).await
+    }
+}
+
+/// Windows: "installa servizio" esegue il comando come processo background gestito
+/// (registrato in agent_processes, output catturato), invece di una unit systemd
+/// inapplicabile. Il binario (es. npm) viene risolto da cmd /C col PATH macchina,
+/// quindi NON serve la risoluzione bash/login-PATH del ramo systemd.
+#[cfg(windows)]
+async fn install_service_windows(
+    state: AppState,
+    claims: Claims,
+    id: String,
+    body: serde_json::Value,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+
+    let short = body["short"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'short' obbligatorio"))?;
+    let command = body["command"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'command' obbligatorio"))?;
+    if short.contains('/') || short.contains("..") {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+    }
+    if command.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il comando del servizio non può essere vuoto",
+        ));
+    }
+    let root_str = context.root_path.to_string_lossy().to_string();
+    let cwd = body["cwd"].as_str().unwrap_or(&root_str).to_string();
+    if tokio::fs::metadata(&cwd).await.is_err() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("La directory di lavoro '{}' non esiste o non è accessibile", cwd),
+        ));
+    }
+
+    // command + args (il body puo' separarli, come per il ramo systemd).
+    let args: Vec<String> = body["args"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let full_command = if args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {}", command, args.join(" "))
+    };
+
+    // env: stringa "K=V" per riga, oppure oggetto JSON.
+    let mut env_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(env_str) = body["env"].as_str() {
+        for line in env_str.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                if !k.is_empty() {
+                    env_map.insert(k.to_string(), v.trim().to_string());
+                }
+            }
+        }
+    } else if let Some(env_obj) = body["env"].as_object() {
+        for (k, v) in env_obj {
+            if let Some(vs) = v.as_str() {
+                env_map.insert(k.clone(), vs.to_string());
+            }
+        }
+    }
+
+    let process_id = crate::agent_processes::spawn_agent_process(
+        &state.db,
+        project_id,
+        None,
+        short,
+        &full_command,
+        &cwd,
+        Some(context.root_path.clone()),
+        Some(env_map),
+        false, // niente sandbox Docker su Windows
+        "service",
+        None,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Avvio servizio fallito: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "windows_native": true,
+        "process_id": process_id,
+        "service": short,
+        "message": format!(
+            "Servizio '{}' avviato come processo gestito (su Windows non si usano unit systemd).",
+            short
+        ),
+    })))
+}
+
+/// Installa un servizio come unit file systemd --user e lo abilita.
+/// Body JSON: { short, command, args, cwd, env, description }
+#[cfg(not(windows))]
+async fn install_service_systemd(
+    state: AppState,
+    claims: Claims,
+    id: String,
+    body: serde_json::Value,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
     let project_id = Uuid::parse_str(&id)

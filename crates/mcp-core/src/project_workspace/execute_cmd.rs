@@ -66,7 +66,7 @@ pub async fn execute_command(
     // Esegui il comando nella root del progetto via bash
     let result = tokio::time::timeout(
         timeout,
-        crate::sandbox::isolated_command("bash")
+        crate::sandbox::isolated_command(&crate::sandbox::agent_shell())
             .args(["-c", &command])
             .current_dir(&context.root_path)
             .env("HOME", std::env::var("HOME").unwrap_or_default())

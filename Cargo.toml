@@ -38,9 +38,9 @@ authors = ["Cobracco S.r.l."]
 # numero di riga). Genera e LINKA molto meno DWARF -> link incrementale piu'
 # rapido. I debugger step-by-step perdono qualcosa, raro nel dev-loop di Nexus.
 debug = "line-tables-only"
-# DWARF fuori dagli oggetti .o: il linker non deve copiarlo dentro il binario
-# (su Linux/WSL e' il default piu' rapido per ricompilazioni frequenti).
-split-debuginfo = "unpacked"
+# NB: split-debuginfo="unpacked" RIMOSSO nel porting a Windows nativo: su MSVC
+# non e' un valore supportato (solo "packed"/"off") e causava errore di build.
+# Il default per piattaforma va bene: su Windows MSVC genera un .pdb separato.
 
 # Le dipendenze esterne in dev: compilarle con un minimo di ottimizzazione le
 # rende piu' veloci a runtime (es. sqlx/regex/serde) senza rallentare il
@@ -88,7 +88,7 @@ base64 = "0.22"
 dashmap = "5"
 nexus-http = { path = "crates/nexus-http" }
 futures = "0.3"
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
 notify = { version = "6", features = ["serde"] }
 # PTY cross-platform per il WebSocket del terminale IDE (mcp-core). Apre una
 # shell reale (openpty) con resize/cwd/env; API SINCRONA, usata da un thread

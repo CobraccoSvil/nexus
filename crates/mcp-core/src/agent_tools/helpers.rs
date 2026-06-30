@@ -324,6 +324,50 @@ pub(crate) fn classify_command_error(exit_code: i32, stderr: &str, stdout: &str)
     "errore generico — leggi stderr per la causa specifica, poi usa un approccio alternativo o un comando diverso"
 }
 
+/// Hint platform-aware per i comandi agente che falliscono perche' usano sintassi
+/// cmd/PowerShell (Windows-native) mentre `run_command` gira in Git Bash (POSIX).
+/// Senza, l'agente ripete lo stesso comando -> repeated_action -> force-close
+/// ("non completato") anche dopo aver gia' creato il progetto. Solo su Windows
+/// (su Unix la shell e' bash nativa e questi comandi non sono attesi).
+#[cfg(windows)]
+pub(crate) fn windows_shell_hint(command: &str) -> Option<&'static str> {
+    let c = command.trim_start().to_lowercase();
+    // Comandi cmd/PowerShell che NON esistono in Git Bash.
+    let posix_violation = c.starts_with("dir ")
+        || c == "dir"
+        || c.starts_with("dir/")
+        || c.starts_with("dir\\")
+        || c.contains("get-childitem")
+        || c.contains("select-object")
+        || c.contains("where-object")
+        || c.contains("-recurse")
+        || c.starts_with("ss ")
+        || c == "ss"
+        || c.starts_with("ss -")
+        || c.contains("findstr");
+    // taskkill con singolo slash: Git Bash (MSYS) converte '/F' in un path ->
+    // argomento invalido. Serve il doppio slash '//F //PID'.
+    let bad_taskkill = c.contains("taskkill")
+        && (c.contains(" /f") || c.contains(" /pid") || c.contains(" /im"))
+        && !c.contains("//");
+    if posix_violation || bad_taskkill {
+        return Some(
+            "Su Windows run_command esegue in Git Bash (POSIX), NON cmd/PowerShell. \
+             Usa comandi POSIX: 'ls'/'find' invece di 'dir'/'Get-ChildItem', 'grep' \
+             invece di 'findstr', 'netstat -ano' invece di 'ss'. Per terminare un \
+             processo: 'taskkill //F //PID <pid>' (DOPPIO slash: Git Bash interpreta \
+             '/F' come percorso) oppure 'kill <pid>'. Riprova con la sintassi POSIX, \
+             non ripetere il comando in stile Windows.",
+        );
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn windows_shell_hint(_command: &str) -> Option<&'static str> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

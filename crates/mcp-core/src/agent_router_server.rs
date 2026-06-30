@@ -272,11 +272,28 @@ pub async fn spawn_agent_router_server(addr: SocketAddr) -> anyhow::Result<()> {
     let svc = AgentRouterService::new();
     tracing::info!("AgentRouter gRPC server in ascolto su {addr}");
     tokio::spawn(async move {
-        if let Err(e) = Server::builder()
-            .add_service(AgentRouterServer::new(svc))
-            .serve(addr)
-            .await
-        {
+        // Bind via std::net per marcare il socket NON ereditabile su Windows (i figli
+        // dell'agente non ereditano la porta gRPC -> niente blocco al re-bind dopo un
+        // crash, come per :4000), poi serve_with_incoming.
+        let serve_result: Result<(), String> = async {
+            let std_listener =
+                std::net::TcpListener::bind(addr).map_err(|e| format!("bind: {e}"))?;
+            std_listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("set_nonblocking: {e}"))?;
+            #[cfg(windows)]
+            crate::sandbox::make_socket_non_inheritable(&std_listener);
+            let listener = tokio::net::TcpListener::from_std(std_listener)
+                .map_err(|e| format!("from_std: {e}"))?;
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            Server::builder()
+                .add_service(AgentRouterServer::new(svc))
+                .serve_with_incoming(incoming)
+                .await
+                .map_err(|e| format!("serve: {e}"))
+        }
+        .await;
+        if let Err(e) = serve_result {
             tracing::error!("AgentRouter server terminato con errore: {e}");
         }
     });
