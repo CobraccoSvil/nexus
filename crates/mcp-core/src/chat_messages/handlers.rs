@@ -9,6 +9,10 @@ pub async fn list_chat_messages(
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
     let context = load_session_context(&state, session_id, user_id).await?;
+    // Cutover separazione DB: messaggi + agent_runs ora nel DB del progetto (il
+    // JOIN funziona perche' entrambi sono in <slug>_nexus). project_data_pool e' il
+    // punto unico (flag off -> meta-DB, comportamento storico).
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, context.project_id).await;
 
     let rows = sqlx::query(
         r#"
@@ -22,7 +26,7 @@ pub async fn list_chat_messages(
         "#,
     )
     .bind(context.session_id)
-    .fetch_all(&state.db)
+    .fetch_all(&chat_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -47,7 +51,7 @@ pub async fn list_chat_messages(
         "#,
     )
     .bind(context.session_id)
-    .fetch_all(&state.db)
+    .fetch_all(&chat_pool)
     .await
     .unwrap_or_default();
 
