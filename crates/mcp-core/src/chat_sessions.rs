@@ -127,6 +127,12 @@ pub async fn list_chat_sessions(
     let project_id = parse_project_id(project_id_raw)?;
     ensure_project_access(&state.db, user_id, project_id).await?;
 
+    // Cutover separazione DB (regola L): i dati chat vivono nel DB del progetto
+    // quando il flag e' on; project_data_pool e' il punto unico (flag off ->
+    // ritorna il meta-DB, comportamento storico). ensure_project_access sopra
+    // resta sul meta-DB (membership globale).
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, project_id).await;
+
     let rows = sqlx::query(
         r#"
         SELECT
@@ -176,7 +182,7 @@ pub async fn list_chat_sessions(
     )
     .bind(project_id)
     .bind(user_id)
-    .fetch_all(&state.db)
+    .fetch_all(&chat_pool)
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
