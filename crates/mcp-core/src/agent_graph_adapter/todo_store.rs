@@ -17,14 +17,19 @@ use nexus_agent_graph::runtime::ports::{ExecMode, PlanRow, PortError, TodoStore}
 
 /// Adapter [`TodoStore`] -> `nexus_agent_todos` via `sqlx`.
 pub struct PgTodoStore {
-    /// Pool Postgres su cui girano le query/UPDATE dei todo.
+    /// Pool del dominio run (todos/plans del progetto): `<slug>_nexus` a flag
+    /// separazione ON, meta a flag OFF.
     db: PgPool,
+    /// Pool meta-DB per le letture di `settings` (config GLOBALE, regola G: non
+    /// per-progetto). A flag OFF coincide con `db`.
+    meta: PgPool,
 }
 
 impl PgTodoStore {
-    /// Costruisce lo store sul pool Postgres condiviso.
-    pub fn new(db: PgPool) -> Self {
-        Self { db }
+    /// Costruisce lo store: `db` = pool del dominio run (todos/plans), `meta` =
+    /// pool meta-DB per la config globale (`settings`).
+    pub fn new(db: PgPool, meta: PgPool) -> Self {
+        Self { db, meta }
     }
 }
 
@@ -189,7 +194,7 @@ impl TodoStore for PgTodoStore {
     /// inline ASCII, niente emoji). SOLA LETTURA: nessun gate `mode`. Le soglie sono
     /// DB-driven (regola G), niente hardcode nella logica di business.
     async fn build_reminder_text(&self, run_id: &str) -> Result<Option<String>, PortError> {
-        let plan_enabled = crate::settings::get_setting(&self.db, "orchestrator.plan_phase_enabled")
+        let plan_enabled = crate::settings::get_setting(&self.meta, "orchestrator.plan_phase_enabled")
             .await
             .ok()
             .flatten()
@@ -202,7 +207,7 @@ impl TodoStore for PgTodoStore {
         if todos.is_empty() {
             return Ok(None);
         }
-        let min_todos: i64 = crate::settings::get_setting(&self.db, "orchestrator.todo_reminder_min_todos")
+        let min_todos: i64 = crate::settings::get_setting(&self.meta, "orchestrator.todo_reminder_min_todos")
             .await
             .ok()
             .flatten()
@@ -352,7 +357,7 @@ mod tests {
         let _c = insert_todo(&pool, run_id, 3, "terzo", "pending", &[]).await;
         let _b = insert_todo(&pool, run_id, 2, "secondo", "pending", &[a]).await;
 
-        let store = PgTodoStore::new(pool.clone());
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
         let todos = store.list_todos(&run_id.to_string()).await.expect("ok");
         // ORDER BY seq ASC: primo, secondo, terzo.
         assert_eq!(todos.len(), 3);
@@ -371,7 +376,7 @@ mod tests {
         insert_todo(&pool, run_id, 1, "a", "completed", &[]).await;
         insert_todo(&pool, run_id, 2, "b", "pending", &[]).await;
         let ip = insert_todo(&pool, run_id, 3, "c", "in_progress", &[]).await;
-        let store = PgTodoStore::new(pool.clone());
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
         let active = store.active_todo(&run_id.to_string()).await.expect("ok");
         assert_eq!(active.expect("attivo").id, ip.to_string());
     }
@@ -381,7 +386,7 @@ mod tests {
         create_schema(&pool).await;
         let run_id = Uuid::new_v4();
         let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
-        let store = PgTodoStore::new(pool.clone());
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
             .mark_status(&t.to_string(), TodoStatus::Blocked, ExecMode::Real)
             .await
@@ -401,7 +406,7 @@ mod tests {
         create_schema(&pool).await;
         let run_id = Uuid::new_v4();
         let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
-        let store = PgTodoStore::new(pool.clone());
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
             .mark_status(&t.to_string(), TodoStatus::Completed, ExecMode::Replay)
             .await
@@ -421,7 +426,7 @@ mod tests {
         let run_id = Uuid::new_v4();
         let p = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
         let c = insert_todo(&pool, run_id, 2, "b", "completed", &[]).await;
-        let store = PgTodoStore::new(pool.clone());
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
             .increment_iteration_seen(&run_id.to_string(), ExecMode::Real)
             .await
@@ -455,7 +460,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert plan");
-        let store = PgTodoStore::new(pool.clone());
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
         let plan = store.fetch_plan(&run_id.to_string()).await.expect("ok");
         let plan = plan.expect("piano presente");
         assert_eq!(plan.user_intent.as_deref(), Some("fix"));
@@ -470,7 +475,7 @@ mod tests {
             insert_todo(&pool, run_id, i, "x", "pending", &[]).await;
         }
         // settings vuoto -> plan_phase_enabled default false.
-        let store = PgTodoStore::new(pool.clone());
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
         let r = store.build_reminder_text(&run_id.to_string()).await.expect("ok");
         assert!(r.is_none(), "feature OFF -> nessun reminder");
     }
@@ -491,7 +496,7 @@ mod tests {
         insert_todo(&pool, run_id, 2, "in corso", "in_progress", &[]).await;
         insert_todo(&pool, run_id, 3, "da fare", "pending", &[]).await;
         insert_todo(&pool, run_id, 4, "altro", "pending", &[]).await;
-        let store = PgTodoStore::new(pool.clone());
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
         let r = store
             .build_reminder_text(&run_id.to_string())
             .await

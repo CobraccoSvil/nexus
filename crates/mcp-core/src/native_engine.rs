@@ -742,6 +742,17 @@ async fn build_native_engine(
     let (fallback_provider, fallback_model) = resolve_purpose(&db, "planner_fallback").await;
     let (reflection_provider, reflection_model) = resolve_purpose(&db, "reflection").await;
 
+    // ── Pool del dominio run (separazione DB per-progetto, punto unico regola L) ─
+    // Tutte le porte che PERSISTONO dati per-progetto del run (agent_runs,
+    // agent_steps, nexus_agent_*, nexus_graph_checkpoints, nexus_agent_traces,
+    // todos/plans) girano su QUESTO pool: il DB del progetto (`<slug>_nexus`) a
+    // flag separazione ON, il meta-DB a flag OFF / sessione non mappata
+    // (comportamento storico). Risolto UNA volta dal session_id via la directory
+    // di routing. Le porte che leggono SOLO config/catalogo GLOBALI (settings,
+    // ai_price_catalog, nexus_prompt_templates, routing matrix) restano su `db`.
+    let run_db = crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id)
+        .await;
+
     // ── Porte I/O concrete (14 impl FASE 2) ──────────────────────────────────
     // Gateway LLM: dipende dal ruolo (regola L, punto unico, stesso switch del
     // `tools` sotto).
@@ -760,7 +771,7 @@ async fn build_native_engine(
                 "SELECT project_id, user_id FROM chat_sessions WHERE id = $1",
             )
             .bind(input.session_id)
-            .fetch_optional(&db)
+            .fetch_optional(&run_db)
             .await
             .ok()
             .flatten()
@@ -778,7 +789,7 @@ async fn build_native_engine(
             ))
         }
         RunRole::Shadow { primary_run_id } => {
-            Arc::new(ReplayLlmGateway::new(db.clone(), primary_run_id))
+            Arc::new(ReplayLlmGateway::new(run_db.clone(), primary_run_id))
         }
     };
 
@@ -794,7 +805,7 @@ async fn build_native_engine(
             None,
         )),
         RunRole::Shadow { primary_run_id } => Arc::new(
-            ToolRunnerExecutorAdapter::from_db_for_replay(db.clone(), Some(primary_run_id)),
+            ToolRunnerExecutorAdapter::from_db_for_replay(run_db.clone(), Some(primary_run_id)),
         ),
     };
 
@@ -814,17 +825,24 @@ async fn build_native_engine(
             input.step_tx.clone(),
             input.run_id,
             input.session_id,
-            db.clone(),
+            run_db.clone(),
         ))
     };
 
-    // Store DB + porte ausiliarie.
-    let run_control: Arc<dyn RunControlStore> = Arc::new(PgRunControlStore::new(db.clone()));
-    let steps: Arc<dyn AgentStepStore> = Arc::new(PgAgentStepStore::new(db.clone()));
+    // Store DB + porte ausiliarie. Le store del dominio run (agent_runs,
+    // agent_steps, nexus_agent_meta_steps, nexus_agent_todos/plans,
+    // nexus_agent_verifier_runs) persistono su `run_db` (DB del progetto a flag
+    // ON, meta a flag OFF). `todos` riceve ANCHE `db` (meta) per le letture di
+    // `settings` (config globale, non per-progetto: regola G). `offload`/
+    // `escalation`/`next_actions` leggono solo config/template/catalogo GLOBALI
+    // (settings, nexus_prompt_templates, ai_price_catalog) -> restano su `db`.
+    let run_control: Arc<dyn RunControlStore> = Arc::new(PgRunControlStore::new(run_db.clone()));
+    let steps: Arc<dyn AgentStepStore> = Arc::new(PgAgentStepStore::new(run_db.clone()));
     let meta_steps: Arc<dyn MetaStepStore> =
-        Arc::new(PgMetaStepStore::new(db.clone(), input.run_id));
-    let todos: Arc<dyn TodoStore> = Arc::new(PgTodoStore::new(db.clone()));
-    let verifier_runs: Arc<dyn VerifierRunStore> = Arc::new(PgVerifierRunStore::new(db.clone()));
+        Arc::new(PgMetaStepStore::new(run_db.clone(), input.run_id));
+    let todos: Arc<dyn TodoStore> = Arc::new(PgTodoStore::new(run_db.clone(), db.clone()));
+    let verifier_runs: Arc<dyn VerifierRunStore> =
+        Arc::new(PgVerifierRunStore::new(run_db.clone()));
     let offload: Arc<dyn ContextOffload> = Arc::new(RagContextOffloadAdapter::new(db.clone()));
     let escalation: Arc<dyn EscalationPort> = Arc::new(PgEscalationPort::new(db.clone()));
     let next_actions: Arc<dyn NextActionsDeriver> =
@@ -850,7 +868,7 @@ async fn build_native_engine(
     // Motore criteri del final_gate / verifier: delega al tool_executor (punto
     // unico, regola L) per i criteri run_command/list_files + DB per outputs_exist.
     let criteria: Arc<dyn CriteriaRunner> =
-        Arc::new(FinalGateCriteriaRunnerAdapter::new(tools.clone(), db.clone()));
+        Arc::new(FinalGateCriteriaRunnerAdapter::new(tools.clone(), run_db.clone()));
 
     // ── Config dei nodi (DB-driven, regola G piena) ──────────────────────────
     // DEBITO 2 chiuso (TODO Fase 5): le config dei nodi che il brain Python legge
@@ -942,7 +960,7 @@ async fn build_native_engine(
         if role.is_shadow() {
             Arc::new(nexus_graph::MemoryCheckpointer::<AgentState>::new())
         } else {
-            Arc::new(nexus_agent_graph::PgCheckpointer::new(db.clone()))
+            Arc::new(nexus_agent_graph::PgCheckpointer::new(run_db.clone()))
         };
 
     let engine = build_agent_graph(nodes, routing_cfg.clone(), planner_cfg, checkpointer);
