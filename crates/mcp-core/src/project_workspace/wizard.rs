@@ -1315,6 +1315,441 @@ fn rewrite_port_flags(command: &str, target_port: u16) -> String {
     forza_flag_port(&out, &p)
 }
 
+/// Helper di `install_service_systemd`: risolve il path assoluto del `command`.
+/// Se e' gia' assoluto/relativo esplicito lo lascia invariato; altrimenti tenta
+/// `bash -lc 'command -v X'` e poi una lista di prefissi tipici. Errore esplicito
+/// (400) se non trovato. Estratto per tenere la host sotto soglia; logica invariata.
+#[cfg(not(windows))]
+async fn risolvi_command_path(command: &str) -> Result<String, ApiError> {
+    if command.starts_with('/') || command.starts_with("./") {
+        // Path gia' assoluto/relativo esplicito
+        return Ok(command.to_string());
+    }
+    // 1. Tentativo via login shell (rispetta config personalizzate dell'utente).
+    if let Some(p) = probe_command_via_login_shell(command).await {
+        return Ok(p);
+    }
+    // 2. Fallback su prefissi tipici per binary "user-installed": necessario
+    //    perche' `.bashrc` di alcuni utenti non e' caricato da shell
+    //    non-interactive, oppure punta a path errati.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let candidates = vec![
+        format!("{}/.dotnet/{}", home, command),
+        format!("{}/.cargo/bin/{}", home, command),
+        format!("{}/.local/bin/{}", home, command),
+        format!("/usr/local/bin/{}", command),
+        format!("/usr/bin/{}", command),
+        format!("/bin/{}", command),
+    ];
+    for cand in &candidates {
+        if tokio::fs::metadata(cand).await.is_ok() {
+            return Ok(cand.clone());
+        }
+    }
+    // 3. Non trovato: errore esplicito.
+    Err(api_error(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "Binary '{}' non trovato. Cercato in: bash login PATH + {}. \
+             Installa il tool o specifica il path assoluto nel comando.",
+            command,
+            candidates.join(", ")
+        ),
+    ))
+}
+
+/// Helper di `risolvi_command_path`: prova a risolvere `command` via
+/// `bash -lc 'command -v X'`. `None` se il comando non e' nel PATH di login.
+#[cfg(not(windows))]
+async fn probe_command_via_login_shell(command: &str) -> Option<String> {
+    let r = tokio::process::Command::new("/bin/bash")
+        .args(["-lc", &format!("command -v {}", command)])
+        .output()
+        .await;
+    match r {
+        Ok(out) if out.status.success() => {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if p.is_empty() {
+                None
+            } else {
+                Some(p)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Helper di `alloca_porta_servizio`: sceglie la porta concreta. Se `existing`
+/// e' un PORT esplicito valido (non riservato, disponibile, bindabile) lo
+/// rispetta; altrimenti auto-alloca dal bucket via find_or_allocate (PUNTO UNICO,
+/// regola L: riusa la porta persistita per (project_id, short) o ne alloca una
+/// deterministica e la PERSISTE — A3: niente swap frontend<->backend), con
+/// fallback find_free se la query fallisce. Query invariate.
+#[cfg(not(windows))]
+async fn scegli_porta_bucket(
+    state: &AppState,
+    project_id: &Uuid,
+    short: &str,
+    existing: Option<u16>,
+    reserved: &std::collections::HashSet<u16>,
+) -> u16 {
+    if let Some(p) = existing {
+        let ok = !reserved.contains(&p)
+            && state.port_registry.is_port_available(p).await
+            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", p))
+                .await
+                .is_ok();
+        if ok {
+            return p;
+        }
+        return services::find_free_project_port(project_id, &state.port_registry).await;
+    }
+    match super::allocate_port::find_or_allocate(
+        &state.db,
+        &state.port_registry,
+        *project_id,
+        short,
+    )
+    .await
+    {
+        Ok(a) => a.port,
+        Err(e) => {
+            tracing::warn!(
+                "wizard: find_or_allocate fallita per {} ({}), fallback find_free",
+                short,
+                e
+            );
+            services::find_free_project_port(project_id, &state.port_registry).await
+        }
+    }
+}
+
+/// Helper di `install_service_systemd`: se il servizio vuole una porta, la sceglie
+/// (rispettando un PORT esplicito valido, altrimenti auto-alloca dal bucket) e la
+/// scrive in `env_map` (+ ASPNETCORE_URLS per .NET). Ritorna la porta scelta.
+/// Estratto per tenere la host sotto soglia; logica e query invariate.
+#[cfg(not(windows))]
+async fn alloca_porta_servizio(
+    state: &AppState,
+    project_id: &Uuid,
+    short: &str,
+    kind: &str,
+    wants_port: bool,
+    reserved: &std::collections::HashSet<u16>,
+    env_map: &mut std::collections::HashMap<String, String>,
+) -> Option<u16> {
+    if !wants_port {
+        return None;
+    }
+    let existing_port = env_map.get("PORT").and_then(|v| parse_port_token(v));
+    let actual = scegli_porta_bucket(state, project_id, short, existing_port, reserved).await;
+    env_map.insert("PORT".to_string(), actual.to_string());
+    // .NET: usa ASPNETCORE_URLS per forzare la porta (PORT da solo non basta).
+    if kind == "dotnet" && !env_map.contains_key("ASPNETCORE_URLS") {
+        env_map.insert(
+            "ASPNETCORE_URLS".to_string(),
+            format!("http://0.0.0.0:{}", actual),
+        );
+    }
+    Some(actual)
+}
+
+/// Helper di `install_service_systemd`: riscrive l'ExecStart per la porta `p`,
+/// gestendo gli script alias (npm/pnpm/yarn run dev) che avvolgono tool vite-like
+/// (Vite/Astro/Nuxt/Svelte) che ignorano $PORT e richiedono `--port` sulla CLI.
+/// Estratto per tenere la host sotto soglia; logica invariata.
+#[cfg(not(windows))]
+fn costruisci_exec_start_con_porta(cwd: &str, exec_start: &str, p: u16) -> String {
+    // Per script alias (npm/pnpm/yarn run dev) prova a risolvere il tool
+    // reale dal package.json. Necessario per Vite/Astro/Nuxt che ignorano
+    // $PORT env e richiedono --port sulla CLI del tool, non del wrapper.
+    let lower_exec = exec_start.to_lowercase();
+    let is_script_runner = (lower_exec.contains("npm")
+        || lower_exec.contains("pnpm")
+        || lower_exec.contains("yarn"))
+        && (lower_exec.contains(" run ")
+            || lower_exec.ends_with(" dev")
+            || lower_exec.ends_with(" start"));
+    if !is_script_runner {
+        return rewrite_port_flags(exec_start, p);
+    }
+    let Some(resolved) = resolve_script_command(cwd, exec_start) else {
+        return rewrite_port_flags(exec_start, p);
+    };
+    let resolved_lower = resolved.to_lowercase();
+    let uses_vite_like = resolved_lower.contains("vite")
+        || resolved_lower.contains("astro")
+        || resolved_lower.contains("nuxt")
+        || resolved_lower.contains("svelte");
+    if !uses_vite_like {
+        return rewrite_port_flags(exec_start, p);
+    }
+    // Estrai il package manager (npm/pnpm/yarn) per usare `<pm> exec`.
+    let pm = if lower_exec.contains("pnpm") {
+        "pnpm exec"
+    } else if lower_exec.contains("yarn") {
+        "yarn"
+    } else {
+        "npx"
+    };
+    // Aggiungi --host solo se lo script risolto non lo ha gia',
+    // altrimenti l'ExecStart finisce con `--host 0.0.0.0` duplicato.
+    let needs_host = (resolved_lower.contains("vite") || resolved_lower.contains("svelte"))
+        && !resolved_lower.contains("--host");
+    let host_flag = if needs_host { " --host 0.0.0.0" } else { "" };
+    // resolved e' qualcosa come "vite" o "vite --some-flag" — manteniamo i suoi flag
+    // ma aggiungiamo --port se manca.
+    let resolved_rewritten = rewrite_port_flags(&resolved, p);
+    let needs_port_append = !resolved_rewritten.to_lowercase().contains("--port")
+        && !resolved_rewritten.to_lowercase().contains(" -p ");
+    let port_flag = if needs_port_append {
+        format!(" --port {}", p)
+    } else {
+        String::new()
+    };
+    format!("{} {}{}{}", pm, resolved_rewritten, port_flag, host_flag)
+}
+
+/// Helper di `install_service_systemd`: deriva le env var frontend dai servizi
+/// sibling gia' allocati al progetto (punto unico, regola L). Query as-is su
+/// `state.db` (meta). Estratto per tenere la host sotto soglia.
+#[cfg(not(windows))]
+async fn deriva_sibling_env(
+    state: &AppState,
+    project_id: &Uuid,
+    short: &str,
+    kind: &str,
+    exec_start: &str,
+    env_map: &mut std::collections::HashMap<String, String>,
+) {
+    #[derive(sqlx::FromRow)]
+    struct PortLabel {
+        port: i32,
+        label: String,
+    }
+    let sibling_rows: Vec<PortLabel> = sqlx::query_as(
+        "SELECT port, label FROM nexus_port_allocations \
+         WHERE project_id = $1 AND label != $2 ORDER BY port ASC",
+    )
+    .bind(project_id)
+    .bind(short)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let sibling_ports: Vec<(i32, String)> = sibling_rows
+        .into_iter()
+        .map(|r| (r.port, r.label))
+        .collect();
+
+    // Derivazione env frontend dai sibling (punto unico, regola L): vedi
+    // derive_frontend_sibling_env. exec_start qui e' ancora l'originale (il
+    // rebind per l'override docker avviene piu' sotto).
+    derive_frontend_sibling_env(env_map, &sibling_ports, exec_start, kind);
+}
+
+/// Helper di `install_service_systemd`: rifiuta con 409 se il progetto ha gia' una
+/// unit in una modalita' di avvio diversa (nativo vs container), che si
+/// ucciderebbero a vicenda. Fail-open se la dir non e' leggibile. Estratto per
+/// tenere la host sotto soglia; comportamento invariato.
+#[cfg(not(windows))]
+async fn verifica_coerenza_run_mode(
+    svc_dir: &str,
+    slug: &str,
+    unit_name: &str,
+    exec_start: &str,
+) -> Result<(), ApiError> {
+    use super::run_mode::{exec_start_of_unit, run_mode_of};
+    let candidate_mode = run_mode_of(exec_start);
+    if let Ok(mut rd) = tokio::fs::read_dir(svc_dir).await {
+        let prefix = format!("{}-", slug);
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            let fname = ent.file_name().to_string_lossy().to_string();
+            if fname == unit_name || !fname.starts_with(&prefix) || !fname.ends_with(".service") {
+                continue;
+            }
+            let Ok(content) = tokio::fs::read_to_string(ent.path()).await else {
+                continue;
+            };
+            if let Some(es) = exec_start_of_unit(&content) {
+                let other_mode = run_mode_of(&es);
+                if other_mode != candidate_mode {
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "Conflitto di modalita' di avvio: il progetto ha gia' il servizio \
+                             '{}' in modalita' {}, mentre '{}' sarebbe {}. Avvio nativo e \
+                             container per lo stesso progetto si uccidono a vicenda (SIGTERM) e \
+                             il sito non parte. Disinstalla i servizi dell'altra modalita' \
+                             prima di installare questo, oppure usa la stessa modalita'.",
+                            fname,
+                            other_mode.label(),
+                            unit_name,
+                            candidate_mode.label()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Helper di `pulisci_servizi_orfani`: stop + disable + rimozione file della
+/// unit orfana `old_unit`. Errori ignorati (best-effort), come nel codice originale.
+#[cfg(not(windows))]
+async fn stop_disable_remove_unit(svc_dir: &str, old_unit: &str) {
+    let old_path = format!("{}/{}", svc_dir, old_unit);
+    let _ = systemctl_user()
+        .args(["--user", "stop", old_unit])
+        .output()
+        .await;
+    let _ = systemctl_user()
+        .args(["--user", "disable", old_unit])
+        .output()
+        .await;
+    let _ = tokio::fs::remove_file(&old_path).await;
+}
+
+/// Helper di `install_service_systemd`: rimuove le unit disabled dello stesso
+/// progetto con nome corto sovrapponibile al nuovo (prefisso reciproco). Ritorna
+/// l'elenco delle unit ripulite. Estratto per tenere la host sotto soglia.
+#[cfg(not(windows))]
+async fn pulisci_servizi_orfani(
+    svc_dir: &str,
+    slug: &str,
+    unit_name: &str,
+    short: &str,
+) -> Vec<String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    let slug_prefix = format!("{}-", slug);
+    if let Ok(list_out) = systemctl_user()
+        .args([
+            "--user",
+            "list-unit-files",
+            "--type=service",
+            "--no-legend",
+            "--no-pager",
+        ])
+        .output()
+        .await
+    {
+        for line in String::from_utf8_lossy(&list_out.stdout).lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let old_unit = cols.first().copied().unwrap_or("");
+            let old_state = cols.get(1).copied().unwrap_or("");
+            if old_state != "disabled" {
+                continue;
+            }
+            if !old_unit.starts_with(&slug_prefix) || !old_unit.ends_with(".service") {
+                continue;
+            }
+            if old_unit == unit_name {
+                continue;
+            }
+            let old_short = old_unit
+                .strip_prefix(&slug_prefix)
+                .unwrap_or(old_unit)
+                .strip_suffix(".service")
+                .unwrap_or(old_unit);
+            if short.starts_with(old_short) || old_short.starts_with(short) {
+                stop_disable_remove_unit(svc_dir, old_unit).await;
+                cleaned.push(old_unit.to_string());
+                tracing::info!(
+                    "Rimosso servizio orfano {} (sostituito da {})",
+                    old_unit,
+                    unit_name
+                );
+            }
+        }
+    }
+    cleaned
+}
+
+/// Helper di `registra_porte_unit`: valorizza `service_unit` sulla riga della porta
+/// principale gia' persistita (UPDATE idempotente su `state.db`). Query as-is.
+#[cfg(not(windows))]
+async fn aggiorna_service_unit_porta_principale(
+    state: &AppState,
+    project_id: &Uuid,
+    short: &str,
+    unit_name: &str,
+    fp: u16,
+) {
+    if let Err(e) = sqlx::query(
+        "UPDATE nexus_port_allocations SET service_unit = $1, updated_at = NOW() \
+         WHERE project_id = $2 AND label = $3",
+    )
+    .bind(unit_name)
+    .bind(project_id)
+    .bind(short)
+    .execute(&state.db)
+    .await
+    {
+        tracing::warn!(
+            "wizard: update service_unit per {} (porta {}) fallito: {}",
+            unit_name,
+            fp,
+            e
+        );
+    }
+}
+
+/// Helper di `registra_porte_unit`: registra le porte SECONDARIE estratte dalla
+/// unit (salta `final_port`, gia' persistita, per non collidere su
+/// uq_port_alloc_project_label). Errori di registrazione ignorati (non bloccanti).
+#[cfg(not(windows))]
+async fn registra_porte_secondarie(
+    state: &AppState,
+    project_id: &Uuid,
+    short: &str,
+    unit_name: &str,
+    unit_content: &str,
+    final_port: Option<u16>,
+) {
+    let detected_ports = services::extract_ports_from_unit(unit_content);
+    for p in &detected_ports {
+        if Some(*p) == final_port {
+            continue; // gia' persistita da find_or_allocate + service_unit sopra
+        }
+        // Ignora errori di registrazione (es. porta gia' allocata) — non blocca l'install
+        if let Err(e) = state
+            .port_registry
+            .allocate(*project_id, *p, short, "auto", None, Some(unit_name))
+            .await
+        {
+            tracing::warn!(
+                "port_registry: registrazione porta {} per {} fallita: {}",
+                p,
+                unit_name,
+                e
+            );
+        }
+    }
+}
+
+/// Helper di `install_service_systemd`: valorizza `service_unit` sulla porta
+/// principale gia' persistita (UPDATE idempotente) e registra le porte SECONDARIE
+/// estratte dalla unit. Query as-is su `state.db`. Estratto per tenere la host
+/// sotto soglia.
+#[cfg(not(windows))]
+async fn registra_porte_unit(
+    state: &AppState,
+    project_id: &Uuid,
+    short: &str,
+    unit_name: &str,
+    unit_content: &str,
+    final_port: Option<u16>,
+) {
+    // A3: la porta PRINCIPALE (final_port) e' gia' stata scelta e PERSISTITA da
+    // find_or_allocate sopra, sulla riga (project_id, short). Qui basta valorizzarne
+    // il service_unit (find_or_allocate lo lascia NULL) con un UPDATE idempotente, e
+    // registrare le eventuali porte SECONDARIE estratte dalla unit (raro).
+    if let Some(fp) = final_port {
+        aggiorna_service_unit_porta_principale(state, project_id, short, unit_name, fp).await;
+    }
+    registra_porte_secondarie(state, project_id, short, unit_name, unit_content, final_port).await;
+}
+
 /// Installa un servizio come unit file systemd --user e lo abilita.
 /// Body JSON: { short, command, args, cwd, env, description }
 #[cfg(not(windows))]
@@ -1409,75 +1844,7 @@ async fn install_service_systemd(
         })
         .unwrap_or_default();
 
-    let resolved_command: String = if command.starts_with('/') || command.starts_with("./") {
-        // Path gia' assoluto/relativo esplicito
-        command.to_string()
-    } else {
-        // Binary nudo: risolvi al path assoluto in 2 step.
-        //
-        // 1. Tentativo via login shell `bash -lc 'command -v X'` (rispetta
-        //    eventuali config personalizzate dell'utente).
-        // 2. Fallback su lista di prefissi tipici per binary "user-installed":
-        //    ~/.dotnet, ~/.cargo/bin, ~/.local/bin, /usr/local/bin, ecc.
-        //    Necessario perche' `.bashrc` di alcuni utenti non viene caricato
-        //    da shell non-interactive, oppure punta a path errati.
-        // 3. Se neanche cosi' troviamo, errore esplicito.
-        let probed: Option<String> = {
-            let r = tokio::process::Command::new("/bin/bash")
-                .args(["-lc", &format!("command -v {}", command)])
-                .output()
-                .await;
-            match r {
-                Ok(out) if out.status.success() => {
-                    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if p.is_empty() {
-                        None
-                    } else {
-                        Some(p)
-                    }
-                }
-                _ => None,
-            }
-        };
-
-        let resolved = match probed {
-            Some(p) => p,
-            None => {
-                // Fallback su path tipici. HOME e' rilasciato qui (gia' usato sopra)
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                let candidates = vec![
-                    format!("{}/.dotnet/{}", home, command),
-                    format!("{}/.cargo/bin/{}", home, command),
-                    format!("{}/.local/bin/{}", home, command),
-                    format!("/usr/local/bin/{}", command),
-                    format!("/usr/bin/{}", command),
-                    format!("/bin/{}", command),
-                ];
-                let mut found: Option<String> = None;
-                for cand in &candidates {
-                    if tokio::fs::metadata(cand).await.is_ok() {
-                        found = Some(cand.clone());
-                        break;
-                    }
-                }
-                match found {
-                    Some(p) => p,
-                    None => {
-                        return Err(api_error(
-                            StatusCode::BAD_REQUEST,
-                            format!(
-                                "Binary '{}' non trovato. Cercato in: bash login PATH + {}. \
-                                 Installa il tool o specifica il path assoluto nel comando.",
-                                command,
-                                candidates.join(", ")
-                            ),
-                        ));
-                    }
-                }
-            }
-        };
-        resolved
-    };
+    let resolved_command: String = risolvi_command_path(command).await?;
 
     let exec_start = if args.is_empty() {
         resolved_command
@@ -1499,119 +1866,13 @@ async fn install_service_systemd(
     let kind = body["kind"].as_str().unwrap_or("");
     let wants_port = matches!(kind, "npm" | "pnpm" | "dotnet" | "static")
         || looks_like_web_server_command(&exec_start);
-    let existing_port = env_map.get("PORT").and_then(|v| parse_port_token(v));
-    let final_port = if wants_port {
-        let actual = match existing_port {
-            // Il client/utente ha forzato PORT: rispettalo, ma validalo e ripiega su
-            // una porta libera del bucket se occupata/riservata.
-            Some(p) => {
-                let ok = !reserved.contains(&p)
-                    && state.port_registry.is_port_available(p).await
-                    && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", p))
-                        .await
-                        .is_ok();
-                if ok {
-                    p
-                } else {
-                    services::find_free_project_port(&project_id, &state.port_registry).await
-                }
-            }
-            // Auto-allocazione: PUNTO UNICO (regola L). find_or_allocate riusa la
-            // porta gia' persistita in nexus_port_allocations per (project_id, short)
-            // se esiste, altrimenti ne alloca una deterministica nel bucket e la
-            // PERSISTE. Cosi' un re-install/riavvio riprende SEMPRE la stessa porta
-            // (A3: niente swap frontend<->backend) e l'allocazione non resta 0-righe
-            // (causa radice login Beauty-Book: A2 non aveva una riga backend da cui
-            // derivare VITE_API_URL). Niente piu' calcolo hash order-dependent qui.
-            None => {
-                match super::allocate_port::find_or_allocate(
-                    &state.db,
-                    &state.port_registry,
-                    project_id,
-                    short,
-                )
-                .await
-                {
-                    Ok(a) => a.port,
-                    Err(e) => {
-                        tracing::warn!(
-                            "wizard: find_or_allocate fallita per {} ({}), fallback find_free",
-                            short,
-                            e
-                        );
-                        services::find_free_project_port(&project_id, &state.port_registry).await
-                    }
-                }
-            }
-        };
-        env_map.insert("PORT".to_string(), actual.to_string());
-        // .NET: usa ASPNETCORE_URLS per forzare la porta (PORT da solo non basta).
-        if kind == "dotnet" && !env_map.contains_key("ASPNETCORE_URLS") {
-            env_map.insert(
-                "ASPNETCORE_URLS".to_string(),
-                format!("http://0.0.0.0:{}", actual),
-            );
-        }
-        Some(actual)
-    } else {
-        None
-    };
+    let final_port =
+        alloca_porta_servizio(&state, &project_id, short, kind, wants_port, &reserved, &mut env_map)
+            .await;
 
-    let exec_start = if let Some(p) = final_port {
-        // Per script alias (npm/pnpm/yarn run dev) prova a risolvere il tool
-        // reale dal package.json. Necessario per Vite/Astro/Nuxt che ignorano
-        // $PORT env e richiedono --port sulla CLI del tool, non del wrapper.
-        let lower_exec = exec_start.to_lowercase();
-        let is_script_runner = (lower_exec.contains("npm")
-            || lower_exec.contains("pnpm")
-            || lower_exec.contains("yarn"))
-            && (lower_exec.contains(" run ")
-                || lower_exec.ends_with(" dev")
-                || lower_exec.ends_with(" start"));
-        if is_script_runner {
-            if let Some(resolved) = resolve_script_command(cwd, &exec_start) {
-                let resolved_lower = resolved.to_lowercase();
-                let uses_vite_like = resolved_lower.contains("vite")
-                    || resolved_lower.contains("astro")
-                    || resolved_lower.contains("nuxt")
-                    || resolved_lower.contains("svelte");
-                if uses_vite_like {
-                    // Estrai il package manager (npm/pnpm/yarn) per usare `<pm> exec`.
-                    let pm = if lower_exec.contains("pnpm") {
-                        "pnpm exec"
-                    } else if lower_exec.contains("yarn") {
-                        "yarn"
-                    } else {
-                        "npx"
-                    };
-                    // Aggiungi --host solo se lo script risolto non lo ha gia',
-                    // altrimenti l'ExecStart finisce con `--host 0.0.0.0` duplicato.
-                    let needs_host = (resolved_lower.contains("vite")
-                        || resolved_lower.contains("svelte"))
-                        && !resolved_lower.contains("--host");
-                    let host_flag = if needs_host { " --host 0.0.0.0" } else { "" };
-                    // resolved e' qualcosa come "vite" o "vite --some-flag" — manteniamo i suoi flag
-                    // ma aggiungiamo --port se manca.
-                    let resolved_rewritten = rewrite_port_flags(&resolved, p);
-                    let needs_port_append = !resolved_rewritten.to_lowercase().contains("--port")
-                        && !resolved_rewritten.to_lowercase().contains(" -p ");
-                    let port_flag = if needs_port_append {
-                        format!(" --port {}", p)
-                    } else {
-                        String::new()
-                    };
-                    format!("{} {}{}{}", pm, resolved_rewritten, port_flag, host_flag)
-                } else {
-                    rewrite_port_flags(&exec_start, p)
-                }
-            } else {
-                rewrite_port_flags(&exec_start, p)
-            }
-        } else {
-            rewrite_port_flags(&exec_start, p)
-        }
-    } else {
-        exec_start
+    let exec_start = match final_port {
+        Some(p) => costruisci_exec_start_con_porta(cwd, &exec_start, p),
+        None => exec_start,
     };
 
     // Inietta la porta allocata da Nexus al posto del placeholder dei servizi
@@ -1629,31 +1890,7 @@ async fn install_service_systemd(
     // già allocati al progetto. Evita porte hardcoded nei file .service.
     // Si esegue dopo l'assegnazione di PORT/ASPNETCORE_URLS per includere la
     // porta appena allocata nelle ricerche sibling.
-    {
-        #[derive(sqlx::FromRow)]
-        struct PortLabel {
-            port: i32,
-            label: String,
-        }
-        let sibling_rows: Vec<PortLabel> = sqlx::query_as(
-            "SELECT port, label FROM nexus_port_allocations \
-             WHERE project_id = $1 AND label != $2 ORDER BY port ASC",
-        )
-        .bind(project_id)
-        .bind(short)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-        let sibling_ports: Vec<(i32, String)> = sibling_rows
-            .into_iter()
-            .map(|r| (r.port, r.label))
-            .collect();
-
-        // Derivazione env frontend dai sibling (punto unico, regola L): vedi
-        // derive_frontend_sibling_env. exec_start qui e' ancora l'originale (il
-        // rebind per l'override docker avviene piu' sotto).
-        derive_frontend_sibling_env(&mut env_map, &sibling_ports, &exec_start, kind);
-    }
+    deriva_sibling_env(&state, &project_id, short, kind, &exec_start, &mut env_map).await;
 
     // Funzione unica (regola L): per i servizi docker-compose, Nexus genera un
     // OVERRIDE deterministico (docker-compose.nexus.yml) con il mapping coerente
@@ -1691,49 +1928,7 @@ async fn install_service_systemd(
     let svc_path = format!("{}/{}", svc_dir, unit_name);
 
     // ── Coerenza modalita' di avvio del progetto (regola L, run_mode) ─────────
-    // Un progetto usa UNA sola modalita': NATIVO (npm/dotnet/...) oppure CONTAINER
-    // (docker compose). Installare un servizio nell'altra modalita' crea unit che
-    // si uccidono a vicenda (SIGTERM) -> il sito non parte (incidente beauty-book:
-    // backend.service npm + docker-compose insieme). Difesa autoritativa nel punto
-    // unico di creazione unit: si rifiuta il mix con 409, indicando come switchare.
-    // Fail-open: se la dir non e' leggibile o non si classifica, si procede come
-    // prima (nessuna regressione sul flusso esistente).
-    {
-        use super::run_mode::{exec_start_of_unit, run_mode_of};
-        let candidate_mode = run_mode_of(&exec_start);
-        if let Ok(mut rd) = tokio::fs::read_dir(&svc_dir).await {
-            let prefix = format!("{}-", slug);
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let fname = ent.file_name().to_string_lossy().to_string();
-                if fname == unit_name || !fname.starts_with(&prefix) || !fname.ends_with(".service")
-                {
-                    continue;
-                }
-                let Ok(content) = tokio::fs::read_to_string(ent.path()).await else {
-                    continue;
-                };
-                if let Some(es) = exec_start_of_unit(&content) {
-                    let other_mode = run_mode_of(&es);
-                    if other_mode != candidate_mode {
-                        return Err(api_error(
-                            StatusCode::CONFLICT,
-                            format!(
-                                "Conflitto di modalita' di avvio: il progetto ha gia' il servizio \
-                                 '{}' in modalita' {}, mentre '{}' sarebbe {}. Avvio nativo e \
-                                 container per lo stesso progetto si uccidono a vicenda (SIGTERM) e \
-                                 il sito non parte. Disinstalla i servizi dell'altra modalita' \
-                                 prima di installare questo, oppure usa la stessa modalita'.",
-                                fname,
-                                other_mode.label(),
-                                unit_name,
-                                candidate_mode.label()
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
+    verifica_coerenza_run_mode(&svc_dir, &slug, &unit_name, &exec_start).await?;
 
     tokio::fs::create_dir_all(&svc_dir)
         .await
@@ -1743,107 +1938,18 @@ async fn install_service_systemd(
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {}", e)))?;
 
     // Cleanup: rimuove servizi disabled dello stesso progetto con ruolo sovrapponibile.
-    // Es. se stiamo installando "backend-FreeLance.Api", rimuove "backend" (disabled)
-    // perche' il nome corto del vecchio servizio e' un prefisso del nuovo.
-    let mut cleaned: Vec<String> = Vec::new();
-    let slug_prefix = format!("{}-", slug);
-    if let Ok(list_out) = systemctl_user()
-        .args([
-            "--user",
-            "list-unit-files",
-            "--type=service",
-            "--no-legend",
-            "--no-pager",
-        ])
-        .output()
-        .await
-    {
-        for line in String::from_utf8_lossy(&list_out.stdout).lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            let old_unit = cols.first().copied().unwrap_or("");
-            let old_state = cols.get(1).copied().unwrap_or("");
-            if old_state != "disabled" {
-                continue;
-            }
-            if !old_unit.starts_with(&slug_prefix) || !old_unit.ends_with(".service") {
-                continue;
-            }
-            if old_unit == unit_name {
-                continue;
-            }
-            let old_short = old_unit
-                .strip_prefix(&slug_prefix)
-                .unwrap_or(old_unit)
-                .strip_suffix(".service")
-                .unwrap_or(old_unit);
-            if short.starts_with(old_short) || old_short.starts_with(short) {
-                let old_path = format!("{}/{}", svc_dir, old_unit);
-                let _ = systemctl_user()
-                    .args(["--user", "stop", old_unit])
-                    .output()
-                    .await;
-                let _ = systemctl_user()
-                    .args(["--user", "disable", old_unit])
-                    .output()
-                    .await;
-                let _ = tokio::fs::remove_file(&old_path).await;
-                cleaned.push(old_unit.to_string());
-                tracing::info!(
-                    "Rimosso servizio orfano {} (sostituito da {})",
-                    old_unit,
-                    unit_name
-                );
-            }
-        }
-    }
+    let cleaned = pulisci_servizi_orfani(&svc_dir, &slug, &unit_name, short).await;
 
     // Registra le porte del servizio nel port_registry (mig 0114).
-    // Estrae le porte dal contenuto unit appena scritto e le registra come "auto".
-    // Indipendente dalla strategia di avvio (systemd o detached).
-    //
-    // A3: la porta PRINCIPALE (final_port) e' gia' stata scelta e PERSISTITA da
-    // find_or_allocate sopra, sulla riga (project_id, short). Qui basta valorizzarne
-    // il service_unit (find_or_allocate lo lascia NULL) con un UPDATE idempotente, e
-    // registrare le eventuali porte SECONDARIE estratte dalla unit (raro). Saltiamo
-    // final_port nel loop per non collidere su uq_port_alloc_project_label.
-    if let Some(fp) = final_port {
-        if let Err(e) = sqlx::query(
-            "UPDATE nexus_port_allocations SET service_unit = $1, updated_at = NOW() \
-             WHERE project_id = $2 AND label = $3",
-        )
-        .bind(&unit_name)
-        .bind(project_id)
-        .bind(short)
-        .execute(&state.db)
-        .await
-        {
-            tracing::warn!(
-                "wizard: update service_unit per {} (porta {}) fallito: {}",
-                unit_name,
-                fp,
-                e
-            );
-        }
-    }
-    let detected_ports = services::extract_ports_from_unit(&unit_content);
-    for p in &detected_ports {
-        if Some(*p) == final_port {
-            continue; // gia' persistita da find_or_allocate + service_unit sopra
-        }
-        // Ignora errori di registrazione (es. porta gia' allocata) — non blocca l'install
-        if let Err(e) = state
-            .port_registry
-            .allocate(project_id, *p, short, "auto", None, Some(&unit_name))
-            .await
-        {
-            tracing::warn!(
-                "port_registry: registrazione porta {} per {} fallita: {}",
-                p,
-                unit_name,
-                e
-            );
-        }
-    }
+    registra_porte_unit(
+        &state,
+        &project_id,
+        short,
+        &unit_name,
+        &unit_content,
+        final_port,
+    )
+    .await;
 
     // Fix sistemico: per i servizi docker-compose scrivi/aggiorna il .env nella
     // dir del compose con le porte allocate. Cosi' anche un `docker compose up`
