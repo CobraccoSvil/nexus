@@ -126,11 +126,41 @@ pub(crate) async fn run_one_round(
         ..Default::default()
     };
 
-    // FIX 1: config DB-driven del tool-probe (regola G, niente hardcode).
-    // - `agent.model_tool_probe.enabled` (default true): abilita il tool-probe.
-    // - `agent.model_tool_failure_threshold` (default 3, mig 0269): soglia oltre
-    //   la quale un modello che fallisce il tool-forcing viene marcato
-    //   supports_tool_use=false (NON is_enabled=false).
+    let tool_cfg = load_tool_probe_config(db).await;
+
+    for pm in models {
+        probe_model_round(orchestrator, db, pm, failure_threshold, &tool_cfg, &mut stats).await;
+    }
+
+    run_reprobe_phase(orchestrator, db, &mut stats).await;
+
+    tracing::info!(
+        "model_health_probe: round completato — total={} healthy={} provider_errors={} \
+         model_errors={} auto_disabled={} transient={} skipped={} tool_probe_ok={} \
+         tool_probe_failed={} tool_probe_disabled={} reprobe_candidates={} reprobe_reenabled={}",
+        stats.total,
+        stats.healthy,
+        stats.provider_wide_errors,
+        stats.model_errors,
+        stats.auto_disabled,
+        stats.transient,
+        stats.skipped_provider_cooldown,
+        stats.tool_probe_ok,
+        stats.tool_probe_failed,
+        stats.tool_probe_disabled,
+        stats.reprobe_candidates,
+        stats.reprobe_reenabled,
+    );
+    stats
+}
+
+/// Config DB-driven del tool-probe (FIX 1, regola G: niente hardcode).
+/// Ritorna `(tool_probe_enabled, tool_failure_threshold)`.
+/// - `agent.model_tool_probe.enabled` (default true): abilita il tool-probe.
+/// - `agent.model_tool_failure_threshold` (default 3, mig 0269): soglia oltre
+///   la quale un modello che fallisce il tool-forcing viene marcato
+///   supports_tool_use=false (NON is_enabled=false).
+async fn load_tool_probe_config(db: &PgPool) -> (bool, i32) {
     let tool_probe_enabled = crate::settings::get_setting(db, "agent.model_tool_probe.enabled")
         .await
         .ok()
@@ -150,102 +180,111 @@ pub(crate) async fn run_one_round(
             .and_then(|v| v.trim().parse::<i32>().ok())
             .filter(|t| *t > 0)
             .unwrap_or(3);
+    (tool_probe_enabled, tool_failure_threshold)
+}
 
-    for pm in models {
-        let ProbeModel {
-            provider,
-            model,
-            consecutive_failures,
-            supports_tool_use,
-            capability_source,
-            auto_disabled_reason,
-            consecutive_tool_failures,
-        } = pm;
-        // Salta se il provider e' in cooldown lungo: faremmo solo rumore
-        // (tutte le probe ritornerebbero errore di quota/billing che e'
-        // gia' noto al sistema).
-        if is_provider_in_cooldown(&provider) {
-            stats.skipped_provider_cooldown += 1;
-            continue;
-        }
+/// Esegue il chat-probe e (quando eleggibile) il tool-probe di UN modello del
+/// giro principale, aggiornando i contatori in `stats`. Estratta da
+/// `run_one_round` per contenerne la lunghezza; nessun cambio di comportamento.
+async fn probe_model_round(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    pm: ProbeModel,
+    failure_threshold: i32,
+    tool_cfg: &(bool, i32),
+    stats: &mut ProbeRoundStats,
+) {
+    // Salta se il provider e' in cooldown lungo: faremmo solo rumore
+    // (tutte le probe ritornerebbero errore di quota/billing che e'
+    // gia' noto al sistema).
+    if is_provider_in_cooldown(&pm.provider) {
+        stats.skipped_provider_cooldown += 1;
+        return;
+    }
 
-        match probe_one_model(
+    let outcome = probe_one_model(
+        orchestrator,
+        db,
+        &pm.provider,
+        &pm.model,
+        pm.consecutive_failures,
+        failure_threshold,
+    )
+    .await;
+    stats.record_chat_probe(&outcome);
+
+    sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
+
+    maybe_tool_probe_round(orchestrator, db, &pm, tool_cfg, stats).await;
+}
+
+/// Esegue (se eleggibile) il tool-probe di un modello del giro principale e
+/// aggiorna i contatori tool in `stats`. Estratta da `probe_model_round`.
+///
+/// Il tool-probe gira sui candidati agentici (supports_tool_use=true) E
+/// sui modelli AUTO-DEGRADATI da un writer automatico (supports_tool_use=
+/// false con reason 'tool_probe_failed:%' dal probe O 'malformed_tool_calls'
+/// dal runtime, solo capability_source='auto'). Senza questo secondo caso
+/// il re-enable promesso era IRRAGGIUNGIBILE: un modello marcato
+/// non-tool-capable non veniva mai piu' ri-testato (catch-22) e restava
+/// degradato anche dopo che il provider tornava sano (es. i magistral; e
+/// il degrado runtime era riabilitabile SOLO se la routing matrix
+/// continuava a scegliere il modello — caso deepseek-v4-pro). I modelli
+/// pure-chat (mai tool-capable) e le curature manual
+/// (capability_source='manual') NON vengono toccati. Provider in cooldown
+/// gia' saltato dal chiamante.
+/// PUNTO UNICO (regola L): il criterio di riaggancio vive in
+/// tool_capability::was_auto_degraded e copre ANCHE le righe ORFANE
+/// (reason NULL con counter > 0): un re-enable esterno (catalog_sync
+/// "ricomparso API", ciclo billing cooldown) puo' azzerare il reason
+/// senza ripristinare il flag — senza questo ramo il degrado restava
+/// permanente (incidente magistral-small-2509, 2026-06-10).
+async fn maybe_tool_probe_round(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    pm: &ProbeModel,
+    tool_cfg: &(bool, i32),
+    stats: &mut ProbeRoundStats,
+) {
+    let (tool_probe_enabled, tool_failure_threshold) = *tool_cfg;
+    let tool_probe_was_auto_degraded = crate::tool_capability::was_auto_degraded(
+        pm.supports_tool_use,
+        &pm.capability_source,
+        pm.auto_disabled_reason.as_deref(),
+        pm.consecutive_tool_failures,
+    );
+    if tool_probe_enabled && (pm.supports_tool_use || tool_probe_was_auto_degraded) {
+        match tool_probe_one_model(
             orchestrator,
             db,
-            &provider,
-            &model,
-            consecutive_failures,
-            failure_threshold,
+            &pm.provider,
+            &pm.model,
+            tool_failure_threshold,
         )
         .await
         {
-            ProbeOutcome::Ok => stats.healthy += 1,
-            ProbeOutcome::ProviderWide => stats.provider_wide_errors += 1,
-            ProbeOutcome::ModelSpecificCounted => stats.model_errors += 1,
-            ProbeOutcome::AutoDisabled => {
-                stats.model_errors += 1;
-                stats.auto_disabled += 1;
+            ToolProbeOutcome::Ok => stats.tool_probe_ok += 1,
+            ToolProbeOutcome::FailedCounted => stats.tool_probe_failed += 1,
+            ToolProbeOutcome::MarkedNonToolCapable => {
+                stats.tool_probe_failed += 1;
+                stats.tool_probe_disabled += 1;
             }
-            ProbeOutcome::Transient => stats.transient += 1,
+            ToolProbeOutcome::Skipped | ToolProbeOutcome::Transient => {}
         }
-
         sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
-
-        // Il tool-probe gira sui candidati agentici (supports_tool_use=true) E
-        // sui modelli AUTO-DEGRADATI da un writer automatico (supports_tool_use=
-        // false con reason 'tool_probe_failed:%' dal probe O 'malformed_tool_calls'
-        // dal runtime, solo capability_source='auto'). Senza questo secondo caso
-        // il re-enable promesso era IRRAGGIUNGIBILE: un modello marcato
-        // non-tool-capable non veniva mai piu' ri-testato (catch-22) e restava
-        // degradato anche dopo che il provider tornava sano (es. i magistral; e
-        // il degrado runtime era riabilitabile SOLO se la routing matrix
-        // continuava a scegliere il modello — caso deepseek-v4-pro). I modelli
-        // pure-chat (mai tool-capable) e le curature manual
-        // (capability_source='manual') NON vengono toccati. Provider in cooldown
-        // gia' saltato sopra.
-        // PUNTO UNICO (regola L): il criterio di riaggancio vive in
-        // tool_capability::was_auto_degraded e copre ANCHE le righe ORFANE
-        // (reason NULL con counter > 0): un re-enable esterno (catalog_sync
-        // "ricomparso API", ciclo billing cooldown) puo' azzerare il reason
-        // senza ripristinare il flag — senza questo ramo il degrado restava
-        // permanente (incidente magistral-small-2509, 2026-06-10).
-        let tool_probe_was_auto_degraded = crate::tool_capability::was_auto_degraded(
-            supports_tool_use,
-            &capability_source,
-            auto_disabled_reason.as_deref(),
-            consecutive_tool_failures,
-        );
-        if tool_probe_enabled && (supports_tool_use || tool_probe_was_auto_degraded) {
-            match tool_probe_one_model(
-                orchestrator,
-                db,
-                &provider,
-                &model,
-                tool_failure_threshold,
-            )
-            .await
-            {
-                ToolProbeOutcome::Ok => stats.tool_probe_ok += 1,
-                ToolProbeOutcome::FailedCounted => stats.tool_probe_failed += 1,
-                ToolProbeOutcome::MarkedNonToolCapable => {
-                    stats.tool_probe_failed += 1;
-                    stats.tool_probe_disabled += 1;
-                }
-                ToolProbeOutcome::Skipped | ToolProbeOutcome::Transient => {}
-            }
-            sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
-        }
     }
+}
 
-    // ── RE-PROBE candidati disabilitati per QUIRK GATEWAY ───────────────────
-    // FIX nodo strutturale (regola H): i modelli auto-disabilitati per un quirk
-    // del gateway (tool-probe fallito / malformed tool calls) NON venivano piu'
-    // caricati da load_enabled_models (WHERE is_enabled=true) -> mai ri-probati
-    // -> restavano disabilitati per sempre anche dopo che il quirk era corretto
-    // in produzione (es. mistral/google a 0 modelli abilitati). Qui ricarichiamo
-    // ESPLICITAMENTE quei candidati e, con backoff DB-driven, li ri-probiamo
-    // (chat-probe + tool-probe via le stesse funzioni del giro principale,
-    // regola L). Se entrambi passano, li riabilitiamo da soli.
+/// Fase di RE-PROBE dei candidati disabilitati per QUIRK GATEWAY.
+/// FIX nodo strutturale (regola H): i modelli auto-disabilitati per un quirk
+/// del gateway (tool-probe fallito / malformed tool calls) NON venivano piu'
+/// caricati da load_enabled_models (WHERE is_enabled=true) -> mai ri-probati
+/// -> restavano disabilitati per sempre anche dopo che il quirk era corretto
+/// in produzione (es. mistral/google a 0 modelli abilitati). Qui ricarichiamo
+/// ESPLICITAMENTE quei candidati e, con backoff DB-driven, li ri-probiamo
+/// (chat-probe + tool-probe via le stesse funzioni del giro principale,
+/// regola L). Se entrambi passano, li riabilitiamo da soli.
+async fn run_reprobe_phase(orchestrator: &Orchestrator, db: &PgPool, stats: &mut ProbeRoundStats) {
     let backoff_min = crate::settings::get_setting(db, "agent.model_reprobe.backoff_minutes")
         .await
         .ok()
@@ -280,25 +319,6 @@ pub(crate) async fn run_one_round(
             tracing::warn!("model_health_probe: impossibile leggere candidati re-probe: {e}");
         }
     }
-
-    tracing::info!(
-        "model_health_probe: round completato — total={} healthy={} provider_errors={} \
-         model_errors={} auto_disabled={} transient={} skipped={} tool_probe_ok={} \
-         tool_probe_failed={} tool_probe_disabled={} reprobe_candidates={} reprobe_reenabled={}",
-        stats.total,
-        stats.healthy,
-        stats.provider_wide_errors,
-        stats.model_errors,
-        stats.auto_disabled,
-        stats.transient,
-        stats.skipped_provider_cooldown,
-        stats.tool_probe_ok,
-        stats.tool_probe_failed,
-        stats.tool_probe_disabled,
-        stats.reprobe_candidates,
-        stats.reprobe_reenabled,
-    );
-    stats
 }
 
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
@@ -325,6 +345,22 @@ pub struct ProbeRoundStats {
     /// RE-PROBE: candidati riabilitati (is_enabled=true) perche' chat-probe +
     /// tool-probe sono ora entrambi OK (quirk gateway risolto).
     pub reprobe_reenabled: usize,
+}
+
+impl ProbeRoundStats {
+    /// Aggrega l'esito di un chat-probe nei contatori del round.
+    fn record_chat_probe(&mut self, outcome: &ProbeOutcome) {
+        match outcome {
+            ProbeOutcome::Ok => self.healthy += 1,
+            ProbeOutcome::ProviderWide => self.provider_wide_errors += 1,
+            ProbeOutcome::ModelSpecificCounted => self.model_errors += 1,
+            ProbeOutcome::AutoDisabled => {
+                self.model_errors += 1;
+                self.auto_disabled += 1;
+            }
+            ProbeOutcome::Transient => self.transient += 1,
+        }
+    }
 }
 
 enum ProbeOutcome {
@@ -549,62 +585,98 @@ async fn reprobe_one_candidate(
     let provider = cand.provider.as_str();
     let model = cand.model.as_str();
 
-    // 1. Chat-probe (no side-effect). Se provider-wide -> cooldown gia' gestito
-    //    altrove, niente azione qui.
+    // 1. Chat-probe (no side-effect). Se fallisce, il verdetto e' gia' definitivo.
+    if let Some(early) = reprobe_chat_step(orchestrator, db, provider, model).await {
+        return early;
+    }
+
+    // 2. Tool-probe (no side-effect). Deve passare anch'esso: il quirk era
+    //    proprio sul tool-forcing.
+    if let Some(early) = reprobe_tool_step(orchestrator, db, provider, model).await {
+        return early;
+    }
+
+    // 3. Entrambi OK: riabilita.
+    reenable_candidate(db, cand, provider, model).await;
+    ReprobeResult::Reenabled
+}
+
+/// Esegue lo step chat-probe del re-probe: ritorna `Some(risultato)` se il
+/// verdetto e' gia' definitivo (rimanda/resta rotto/inconclusivo), `None` se il
+/// chat-probe e' passato e si puo' procedere al tool-probe. Il ProviderWide non
+/// tocca il backoff (cooldown gia' gestito altrove); ModelBroken/Inconclusive lo
+/// aggiornano; il Transient NON lo tocca (regola H: niente micro circolo vizioso).
+async fn reprobe_chat_step(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> Option<ReprobeResult> {
     match probe_model_on_insert(orchestrator, provider, model).await {
-        ProbeOnInsertResult::Healthy => {}
+        ProbeOnInsertResult::Healthy => None,
         ProbeOnInsertResult::ProviderDown(kind) => {
             tracing::debug!(
                 "model_health_probe[reprobe]: {provider}/{model} chat-probe provider-wide '{kind}' -> rimando"
             );
-            return ReprobeResult::ProviderWide;
+            Some(ReprobeResult::ProviderWide)
         }
         ProbeOnInsertResult::ModelBroken(kind) | ProbeOnInsertResult::Inconclusive(kind) => {
             touch_reprobe_backoff(db, provider, model).await;
             tracing::debug!(
                 "model_health_probe[reprobe]: {provider}/{model} chat-probe ancora rotto ({kind}) -> resta disabilitato"
             );
-            return ReprobeResult::StillBroken;
+            Some(ReprobeResult::StillBroken)
         }
         ProbeOnInsertResult::Transient(kind) => {
-            // INCONCLUSIVO: NON tocca il backoff (regola H: niente micro circolo
-            // vizioso che rinvia il re-probe ad ogni blip). Resta disabilitato,
+            // INCONCLUSIVO: NON tocca il backoff (regola H). Resta disabilitato,
             // ma viene riprovato gia' al prossimo giro del worker.
             tracing::debug!(
                 "model_health_probe[reprobe]: {provider}/{model} chat-probe inconclusivo ({kind}) -> backoff invariato, ritento al prossimo round"
             );
-            return ReprobeResult::Inconclusive;
+            Some(ReprobeResult::Inconclusive)
         }
     }
+}
 
-    // 2. Tool-probe (no side-effect). Deve passare anch'esso: il quirk era
-    //    proprio sul tool-forcing.
+/// Esegue lo step tool-probe del re-probe: stessa semantica di `reprobe_chat_step`
+/// (`Some` = verdetto definitivo, `None` = passato). Il quirk gateway era proprio
+/// sul tool-forcing, quindi il tool-probe deve passare per riabilitare.
+async fn reprobe_tool_step(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> Option<ReprobeResult> {
     let (verdict, _latency) = run_tool_probe(orchestrator, provider, model).await;
     match verdict {
-        ToolProbeVerdict::Success => {}
+        ToolProbeVerdict::Success => None,
         ToolProbeVerdict::ProviderWide(kind) => {
             tracing::debug!(
                 "model_health_probe[reprobe]: {provider}/{model} tool-probe provider-wide '{kind}' -> rimando"
             );
-            return ReprobeResult::ProviderWide;
+            Some(ReprobeResult::ProviderWide)
         }
         ToolProbeVerdict::ToolFailed(kind) => {
             touch_reprobe_backoff(db, provider, model).await;
             tracing::debug!(
                 "model_health_probe[reprobe]: {provider}/{model} tool-probe ancora rotto ({kind}) -> resta disabilitato"
             );
-            return ReprobeResult::StillBroken;
+            Some(ReprobeResult::StillBroken)
         }
         ToolProbeVerdict::Transient(kind) => {
-            // INCONCLUSIVO: come il chat-probe sopra, NON tocca il backoff.
+            // INCONCLUSIVO: come il chat-probe, NON tocca il backoff.
             tracing::debug!(
                 "model_health_probe[reprobe]: {provider}/{model} tool-probe inconclusivo ({kind}) -> backoff invariato, ritento al prossimo round"
             );
-            return ReprobeResult::Inconclusive;
+            Some(ReprobeResult::Inconclusive)
         }
     }
+}
 
-    // 3. Entrambi OK: riabilita. Ripristina supports_tool_use se era degradato.
+/// Riabilita un candidato che ha superato chat-probe + tool-probe: is_enabled=true,
+/// reason/timestamp azzerati, contatori a 0, e ripristino di supports_tool_use se
+/// era stato degradato. Non tocca le righe manual (guard nella WHERE).
+async fn reenable_candidate(db: &PgPool, cand: &ReprobeCandidate, provider: &str, model: &str) {
     let restore_tool = !cand.supports_tool_use;
     let _ = sqlx::query(
         "UPDATE ai_price_catalog \
@@ -629,7 +701,6 @@ async fn reprobe_one_candidate(
         "model_health_probe[reprobe]: RE-ENABLE {provider}/{model} (era disabilitato per '{}', quirk gateway risolto: chat-probe + tool-probe OK)",
         cand.reason
     );
-    ReprobeResult::Reenabled
 }
 
 /// Aggiorna il timestamp di backoff (`auto_disabled_at`) a NOW() per un
@@ -666,53 +737,7 @@ async fn probe_one_model(
     let latency_ms = started.elapsed().as_millis() as i32;
 
     let outcome = match result {
-        Ok(Ok(response)) => {
-            // PRIMA dell'analisi del content: il brain riformatta gli errori
-            // provider in un messaggio umano (multilingua) che NON inizia con
-            // "[Error:", mascherando il fallimento. Ma ritorna anche il campo
-            // strutturato `error_class`: lo usiamo come fonte autorevole
-            // (language-agnostic). Mappa error_class -> Classification.
-            let ec = response
-                .get("error_class")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    response
-                        .get("metadata")
-                        .and_then(|m| m.get("error_class"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-                .unwrap_or("");
-            // error_class CANONICO prodotto dal brain (unico classificatore):
-            // mappiamo valore->azione, senza ri-classificare il testo.
-            if !ec.is_empty() {
-                classification_from_error_class(ec)
-            } else {
-                // Fallback: analisi del content (hollow_completion / "[Error:" / OK).
-                let content_text = extract_content_text(&response);
-                let trimmed = content_text.trim();
-                if trimmed.is_empty() {
-                    Classification::ModelSpecific(
-                        "hollow_completion".to_string(),
-                        Some("response had 0 chars of content".to_string()),
-                    )
-                } else if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
-                    // Errore ingoiato dal brain. Estrai messaggio e classifica.
-                    let inner = trimmed
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .trim_start_matches("Error:")
-                        .trim_start_matches("error:")
-                        .trim();
-                    // Classificazione via il punto UNICO (brain gRPC).
-                    let ec = orchestrator.neural.classify_error(inner, provider).await;
-                    classification_from_error_class(&ec)
-                } else {
-                    Classification::Ok
-                }
-            }
-        }
+        Ok(Ok(response)) => classify_probe_response(orchestrator, provider, &response).await,
         Ok(Err(e)) => {
             // Errore di trasporto/gRPC: classificazione via il punto UNICO.
             let ec = orchestrator
@@ -729,16 +754,86 @@ async fn probe_one_model(
         ),
     };
 
-    // Persist history (fire-and-forget, no impact se fail). Il Transient viene
-    // tracciato come unhealthy SOLO per diagnostica (storico append-only): non
-    // tocca contatori ne' is_enabled. error_kind prefissato 'transient:' lo
-    // distingue dai guasti reali nelle query dello storico.
-    let (healthy, error_kind, error_message) = match &outcome {
+    persist_probe_history(db, provider, model, &outcome, latency_ms).await;
+
+    apply_probe_outcome(db, provider, model, outcome, prior_failures, failure_threshold).await
+}
+
+/// Classifica una response del brain andata a buon fine sul trasporto (chat-probe).
+/// Estratta da `probe_one_model`: prima legge l'`error_class` canonico (fonte
+/// autorevole, language-agnostic), poi ricade sull'analisi del content
+/// (hollow_completion / "[Error:" ingoiato / OK).
+async fn classify_probe_response(
+    orchestrator: &Orchestrator,
+    provider: &str,
+    response: &serde_json::Value,
+) -> Classification {
+    // PRIMA dell'analisi del content: il brain riformatta gli errori
+    // provider in un messaggio umano (multilingua) che NON inizia con
+    // "[Error:", mascherando il fallimento. Ma ritorna anche il campo
+    // strutturato `error_class`: lo usiamo come fonte autorevole
+    // (language-agnostic). Mappa error_class -> Classification.
+    let ec = response
+        .get("error_class")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            response
+                .get("metadata")
+                .and_then(|m| m.get("error_class"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("");
+    // error_class CANONICO prodotto dal brain (unico classificatore):
+    // mappiamo valore->azione, senza ri-classificare il testo.
+    if !ec.is_empty() {
+        return classification_from_error_class(ec);
+    }
+    // Fallback: analisi del content (hollow_completion / "[Error:" / OK).
+    let content_text = extract_content_text(response);
+    let trimmed = content_text.trim();
+    if trimmed.is_empty() {
+        Classification::ModelSpecific(
+            "hollow_completion".to_string(),
+            Some("response had 0 chars of content".to_string()),
+        )
+    } else if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
+        // Errore ingoiato dal brain. Estrai messaggio e classifica.
+        let inner = trimmed
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_start_matches("Error:")
+            .trim_start_matches("error:")
+            .trim();
+        // Classificazione via il punto UNICO (brain gRPC).
+        let ec = orchestrator.neural.classify_error(inner, provider).await;
+        classification_from_error_class(&ec)
+    } else {
+        Classification::Ok
+    }
+}
+
+/// Persiste l'esito del chat-probe in `ai_model_health_history` (fire-and-forget,
+/// nessun impatto se fallisce). Il Transient viene tracciato come unhealthy SOLO
+/// per diagnostica (storico append-only): non tocca contatori ne' is_enabled.
+/// error_kind prefissato 'transient:' lo distingue dai guasti reali nelle query
+/// dello storico.
+async fn persist_probe_history(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    outcome: &Classification,
+    latency_ms: i32,
+) {
+    let (healthy, error_kind, error_message) = match outcome {
         Classification::Ok => (true, None, None),
         Classification::ProviderWide(kind, msg) | Classification::ModelSpecific(kind, msg) => {
             (false, Some(kind.clone()), msg.clone())
         }
-        Classification::Transient(kind, msg) => (false, Some(format!("transient:{kind}")), msg.clone()),
+        Classification::Transient(kind, msg) => {
+            (false, Some(format!("transient:{kind}")), msg.clone())
+        }
     };
     let _ = sqlx::query(
         r#"INSERT INTO ai_model_health_history
@@ -753,83 +848,41 @@ async fn probe_one_model(
     .bind(error_message.as_deref().map(|s| truncate(s, 500)))
     .execute(db)
     .await;
+}
 
-    // Applica logica counter / auto-disable / auto-reenable.
+/// Applica la logica counter / auto-disable / auto-reenable in base alla
+/// classificazione dell'esito del chat-probe. Estratta da `probe_one_model`.
+async fn apply_probe_outcome(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    outcome: Classification,
+    prior_failures: i32,
+    failure_threshold: i32,
+) -> ProbeOutcome {
     match outcome {
-        Classification::Ok => {
-            // Il probe usa prompt "ping" (1-2 token output) — un account
-            // con budget quasi vuoto puo' passare il probe ma fallire sui
-            // workload reali (es. anthropic con credit basso risponde
-            // a "hi" ma fallisce su 5000+ token). Quindi il probe-OK NON
-            // resetta il counter di consecutive_failures: solo i run REALI
-            // (in chat_messages.rs::2117+) possono resettarlo, perche'
-            // solo loro testano workload reale.
-            // Il probe puo' SOLO segnalare success per logging.
-            if prior_failures > 0 {
-                tracing::debug!(
-                    "model_health_probe: {provider}/{model} probe-OK ma prior_failures={} (non reset, attende run reale)",
-                    prior_failures
-                );
-            }
-            ProbeOutcome::Ok
-        }
+        Classification::Ok => handle_probe_ok(provider, model, prior_failures),
         Classification::ProviderWide(kind, _) => {
             // Errore di provider, non del modello: counter del modello invariato.
-            //
-            // Bug architetturale corretto qui: prima il branch ritornava
-            // soltanto `ProbeOutcome::ProviderWide` per il conteggio statistico
-            // ma NON propagava il problema al modulo `provider_cooldown`. In
-            // produzione cio' significava che, ad es. con OpenAI in
-            // `insufficient_quota` (HTTP 429), il probe classificava ogni
-            // singolo modello del catalog come "provider-wide error" senza
-            // mai mettere il provider in cooldown — risultato: i prossimi
-            // round del probe (e i chiamanti runtime) continuavano a tentare
-            // tutti i modelli OpenAI uno per uno, ognuno con 429.
-            //
-            // Fix definitivo: mappare il `kind` rilevato dal classifier
-            // direttamente sul cooldown di provider piu' appropriato.
+            // Oltre al conteggio statistico, propaga il problema a
+            // `provider_cooldown` mappando il `kind` sul cooldown appropriato: se
+            // no, con un provider in quota/billing ogni modello del catalog
+            // classificava "provider-wide error" senza mai mettere il provider in
+            // cooldown, e ogni round ritentava tutti i suoi modelli con lo stesso
+            // 429 (bug architetturale corretto qui).
             apply_provider_wide_cooldown(provider, model, &kind).await;
             ProbeOutcome::ProviderWide
         }
         Classification::ModelSpecific(kind, _msg) => {
-            let new_count = prior_failures + 1;
-            let should_disable = new_count >= failure_threshold;
-            if should_disable {
-                let _ = sqlx::query(
-                    "UPDATE ai_price_catalog
-                        SET is_enabled = false,
-                            consecutive_failures = $3,
-                            auto_disabled_at = NOW(),
-                            auto_disabled_reason = $4,
-                            updated_at = NOW()
-                      WHERE provider = $1 AND model = $2",
-                )
-                .bind(provider)
-                .bind(model)
-                .bind(new_count)
-                .bind(&kind)
-                .execute(db)
-                .await;
-                tracing::warn!(
-                    "model_health_probe: AUTO-DISABLE {provider}/{model} (failures={new_count}, reason={kind})"
-                );
-                ProbeOutcome::AutoDisabled
-            } else {
-                let _ = sqlx::query(
-                    "UPDATE ai_price_catalog
-                        SET consecutive_failures = $3, updated_at = NOW()
-                      WHERE provider = $1 AND model = $2",
-                )
-                .bind(provider)
-                .bind(model)
-                .bind(new_count)
-                .execute(db)
-                .await;
-                tracing::debug!(
-                    "model_health_probe: {provider}/{model} fail #{new_count}/{failure_threshold} ({kind})"
-                );
-                ProbeOutcome::ModelSpecificCounted
-            }
+            record_model_specific_failure(
+                db,
+                provider,
+                model,
+                &kind,
+                prior_failures,
+                failure_threshold,
+            )
+            .await
         }
         Classification::Transient(kind, _) => {
             // INCONCLUSIVO: non e' colpa ne' del modello ne' (con certezza) del
@@ -843,6 +896,75 @@ async fn probe_one_model(
             );
             ProbeOutcome::Transient
         }
+    }
+}
+
+/// Gestisce l'esito OK del chat-probe (solo logging, nessuna scrittura DB).
+///
+/// Il probe usa prompt "ping" (1-2 token output) — un account con budget quasi
+/// vuoto puo' passare il probe ma fallire sui workload reali (es. anthropic con
+/// credit basso risponde a "hi" ma fallisce su 5000+ token). Quindi il probe-OK
+/// NON resetta il counter di consecutive_failures: solo i run REALI (in
+/// chat_messages.rs::2117+) possono resettarlo, perche' solo loro testano
+/// workload reale. Il probe puo' SOLO segnalare success per logging.
+fn handle_probe_ok(provider: &str, model: &str, prior_failures: i32) -> ProbeOutcome {
+    if prior_failures > 0 {
+        tracing::debug!(
+            "model_health_probe: {provider}/{model} probe-OK ma prior_failures={} (non reset, attende run reale)",
+            prior_failures
+        );
+    }
+    ProbeOutcome::Ok
+}
+
+/// Registra un fallimento model-specific: incrementa `consecutive_failures` e,
+/// a soglia, auto-disabilita il modello (is_enabled=false + reason). Estratta
+/// dal ramo ModelSpecific di `apply_probe_outcome`.
+async fn record_model_specific_failure(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    kind: &str,
+    prior_failures: i32,
+    failure_threshold: i32,
+) -> ProbeOutcome {
+    let new_count = prior_failures + 1;
+    let should_disable = new_count >= failure_threshold;
+    if should_disable {
+        let _ = sqlx::query(
+            "UPDATE ai_price_catalog
+                SET is_enabled = false,
+                    consecutive_failures = $3,
+                    auto_disabled_at = NOW(),
+                    auto_disabled_reason = $4,
+                    updated_at = NOW()
+              WHERE provider = $1 AND model = $2",
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(new_count)
+        .bind(kind)
+        .execute(db)
+        .await;
+        tracing::warn!(
+            "model_health_probe: AUTO-DISABLE {provider}/{model} (failures={new_count}, reason={kind})"
+        );
+        ProbeOutcome::AutoDisabled
+    } else {
+        let _ = sqlx::query(
+            "UPDATE ai_price_catalog
+                SET consecutive_failures = $3, updated_at = NOW()
+              WHERE provider = $1 AND model = $2",
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(new_count)
+        .execute(db)
+        .await;
+        tracing::debug!(
+            "model_health_probe: {provider}/{model} fail #{new_count}/{failure_threshold} ({kind})"
+        );
+        ProbeOutcome::ModelSpecificCounted
     }
 }
 
@@ -865,6 +987,18 @@ pub(crate) enum ToolProbeVerdict {
     Transient(String),
 }
 
+/// Mappa un error_class canonico sul verdetto del tool-probe (punto unico del
+/// mapping Classification -> ToolProbeVerdict, regola L). `ok_fallback` e' il
+/// `kind` usato per il caso — non atteso — di error_class classificato Ok.
+fn verdict_from_error_class(ec: &str, ok_fallback: &str) -> ToolProbeVerdict {
+    match classification_from_error_class(ec) {
+        Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
+        Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
+        Classification::Transient(kind, _) => ToolProbeVerdict::Transient(kind),
+        Classification::Ok => ToolProbeVerdict::ToolFailed(ok_fallback.into()),
+    }
+}
+
 /// Valuta la response JSON del brain (`GenerateAgentTurn`) per il tool-probe.
 /// Logica:
 /// - error_class provider-wide -> ProviderWide (non punire il modello).
@@ -879,14 +1013,7 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
         .filter(|s| !s.is_empty())
         .unwrap_or("");
     if !ec.is_empty() {
-        return match classification_from_error_class(ec) {
-            Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
-            Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
-            Classification::Transient(kind, _) => ToolProbeVerdict::Transient(kind),
-            Classification::Ok => {
-                ToolProbeVerdict::ToolFailed("unexpected_ok_with_error_class".into())
-            }
-        };
+        return verdict_from_error_class(ec, "unexpected_ok_with_error_class");
     }
 
     // 2. stop_reason=error senza error_class: INCONCLUSIVO, non tool-failure.
@@ -927,25 +1054,11 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
     })
 }
 
-/// FIX 1: esegue il tool-probe su un singolo modello tool-capable, sul PATH
-/// AGENTE (`generate_agent_turn`), forzando una tool call su un tool fittizio.
-/// Applica la stessa semantica del runtime (`tool_failure_action`): a soglia
-/// marca `supports_tool_use=false` SENZA toccare `is_enabled`.
-/// Esegue il tool-probe (chiamata `generate_agent_turn` con tool-forcing) e
-/// ritorna SOLO il verdetto, SENZA side-effect su DB/contatori. Punto unico
-/// (regola L) della costruzione della richiesta di tool-probe e della latenza:
-/// sia `tool_probe_one_model` (che applica counter/degrado) sia il re-probe dei
-/// candidati disabilitati (che riabilita is_enabled) lo riusano, senza
-/// duplicare tools_json / messages_json / mapping errore->verdetto.
-async fn run_tool_probe(
-    orchestrator: &Orchestrator,
-    provider: &str,
-    model: &str,
-) -> (ToolProbeVerdict, i32) {
-    // Tool fittizio minimale + tool_choice forzato. Mettiamo il tool_choice
-    // nel JSON dei tools cosi' il brain lo inoltra al provider (lo schema
-    // generate_agent_turn non ha un campo tool_choice dedicato: i provider
-    // OpenAI-compatible accettano la forzatura via messaggio + presenza tool).
+/// Costruisce la richiesta di tool-probe: ritorna `(tools_json, messages_json,
+/// system_text)`. Tool fittizio minimale + tool_choice forzato via messaggio: lo
+/// schema generate_agent_turn non ha un campo tool_choice dedicato, ma i provider
+/// OpenAI-compatible accettano la forzatura via messaggio + presenza tool.
+fn build_tool_probe_request() -> (String, String, String) {
     let tools_json = serde_json::json!([
         {
             "name": TOOL_PROBE_TOOL_NAME,
@@ -967,6 +1080,25 @@ async fn run_tool_probe(
     .to_string();
     let system_text =
         format!("Devi rispondere ESCLUSIVAMENTE chiamando il tool {TOOL_PROBE_TOOL_NAME}.");
+    (tools_json, messages_json, system_text)
+}
+
+/// FIX 1: esegue il tool-probe su un singolo modello tool-capable, sul PATH
+/// AGENTE (`generate_agent_turn`), forzando una tool call su un tool fittizio.
+/// Applica la stessa semantica del runtime (`tool_failure_action`): a soglia
+/// marca `supports_tool_use=false` SENZA toccare `is_enabled`.
+/// Esegue il tool-probe (chiamata `generate_agent_turn` con tool-forcing) e
+/// ritorna SOLO il verdetto, SENZA side-effect su DB/contatori. Punto unico
+/// (regola L) della costruzione della richiesta di tool-probe e della latenza:
+/// sia `tool_probe_one_model` (che applica counter/degrado) sia il re-probe dei
+/// candidati disabilitati (che riabilita is_enabled) lo riusano, senza
+/// duplicare tools_json / messages_json / mapping errore->verdetto.
+async fn run_tool_probe(
+    orchestrator: &Orchestrator,
+    provider: &str,
+    model: &str,
+) -> (ToolProbeVerdict, i32) {
+    let (tools_json, messages_json, system_text) = build_tool_probe_request();
 
     let started = Instant::now();
     let result = tokio::time::timeout(
@@ -990,12 +1122,7 @@ async fn run_tool_probe(
                 .neural
                 .classify_error(&e.to_string(), provider)
                 .await;
-            match classification_from_error_class(&ec) {
-                Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
-                Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
-                Classification::Transient(kind, _) => ToolProbeVerdict::Transient(kind),
-                Classification::Ok => ToolProbeVerdict::ToolFailed("transport_ok_no_tool".into()),
-            }
+            verdict_from_error_class(&ec, "transport_ok_no_tool")
         }
         // Timeout del tool-probe: INCONCLUSIVO (cold-start / coda provider), non
         // un guasto del tool-forcing del modello.
@@ -1013,27 +1140,7 @@ async fn tool_probe_one_model(
 ) -> ToolProbeOutcome {
     let (verdict, latency_ms) = run_tool_probe(orchestrator, provider, model).await;
 
-    // Persisti l'esito nello storico (diagnosticabile). error_kind prefissato
-    // 'tool_probe:' per distinguerlo dal probe chat.
-    let (healthy, error_kind) = match &verdict {
-        ToolProbeVerdict::Success => (true, None),
-        ToolProbeVerdict::ToolFailed(k) => (false, Some(format!("tool_probe:{k}"))),
-        ToolProbeVerdict::ProviderWide(k) => (false, Some(format!("tool_probe_provider:{k}"))),
-        ToolProbeVerdict::Transient(k) => (false, Some(format!("tool_probe_transient:{k}"))),
-    };
-    let _ = sqlx::query(
-        r#"INSERT INTO ai_model_health_history
-           (provider, model, healthy, latency_ms, error_kind, error_message)
-           VALUES ($1, $2, $3, $4, $5, $6)"#,
-    )
-    .bind(provider)
-    .bind(model)
-    .bind(healthy)
-    .bind(latency_ms)
-    .bind(error_kind.as_deref())
-    .bind(error_kind.as_deref())
-    .execute(db)
-    .await;
+    persist_tool_probe_history(db, provider, model, &verdict, latency_ms).await;
 
     match verdict {
         ToolProbeVerdict::ProviderWide(kind) => {
@@ -1062,31 +1169,69 @@ async fn tool_probe_one_model(
             ToolProbeOutcome::Ok
         }
         ToolProbeVerdict::ToolFailed(kind) => {
-            // PUNTO UNICO (regola L): counter + degrado a soglia con guard
-            // capability_source='auto' vivono in tool_capability — l'enforcement
-            // del 'manual' e' davvero unico in tutto il sistema (probe E runtime).
-            let reason = format!("{}{kind}", crate::tool_capability::REASON_TOOL_PROBE_PREFIX);
-            match crate::tool_capability::record_tool_failure(
-                db, provider, model, threshold, &reason,
-            )
-            .await
-            {
-                crate::tool_capability::ToolFailureRecord::MarkedNonToolCapable { .. } => {
-                    ToolProbeOutcome::MarkedNonToolCapable
-                }
-                crate::tool_capability::ToolFailureRecord::Counted { failures } => {
-                    tracing::debug!(
-                        "model_health_probe[tool]: {provider}/{model} tool-fail #{failures}/{threshold} ({kind})"
-                    );
-                    ToolProbeOutcome::FailedCounted
-                }
-                crate::tool_capability::ToolFailureRecord::Protected => {
-                    tracing::debug!(
-                        "model_health_probe[tool]: {provider}/{model} riga manual — degrado non applicato ({kind})"
-                    );
-                    ToolProbeOutcome::FailedCounted
-                }
-            }
+            record_tool_probe_failure(db, provider, model, threshold, &kind).await
+        }
+    }
+}
+
+/// Persiste l'esito del tool-probe nello storico (diagnosticabile). error_kind
+/// prefissato per distinguerlo dal probe chat ('tool_probe:' fallimento,
+/// 'tool_probe_provider:' provider-wide, 'tool_probe_transient:' inconclusivo).
+async fn persist_tool_probe_history(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    verdict: &ToolProbeVerdict,
+    latency_ms: i32,
+) {
+    let (healthy, error_kind) = match verdict {
+        ToolProbeVerdict::Success => (true, None),
+        ToolProbeVerdict::ToolFailed(k) => (false, Some(format!("tool_probe:{k}"))),
+        ToolProbeVerdict::ProviderWide(k) => (false, Some(format!("tool_probe_provider:{k}"))),
+        ToolProbeVerdict::Transient(k) => (false, Some(format!("tool_probe_transient:{k}"))),
+    };
+    let _ = sqlx::query(
+        r#"INSERT INTO ai_model_health_history
+           (provider, model, healthy, latency_ms, error_kind, error_message)
+           VALUES ($1, $2, $3, $4, $5, $6)"#,
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(healthy)
+    .bind(latency_ms)
+    .bind(error_kind.as_deref())
+    .bind(error_kind.as_deref())
+    .execute(db)
+    .await;
+}
+
+/// Registra un fallimento del tool-probe delegando a `tool_capability` (PUNTO
+/// UNICO, regola L): counter + degrado a soglia con guard capability_source=
+/// 'auto', enforcement del 'manual' unico in tutto il sistema (probe E runtime).
+async fn record_tool_probe_failure(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    threshold: i32,
+    kind: &str,
+) -> ToolProbeOutcome {
+    let reason = format!("{}{kind}", crate::tool_capability::REASON_TOOL_PROBE_PREFIX);
+    match crate::tool_capability::record_tool_failure(db, provider, model, threshold, &reason).await
+    {
+        crate::tool_capability::ToolFailureRecord::MarkedNonToolCapable { .. } => {
+            ToolProbeOutcome::MarkedNonToolCapable
+        }
+        crate::tool_capability::ToolFailureRecord::Counted { failures } => {
+            tracing::debug!(
+                "model_health_probe[tool]: {provider}/{model} tool-fail #{failures}/{threshold} ({kind})"
+            );
+            ToolProbeOutcome::FailedCounted
+        }
+        crate::tool_capability::ToolFailureRecord::Protected => {
+            tracing::debug!(
+                "model_health_probe[tool]: {provider}/{model} riga manual — degrado non applicato ({kind})"
+            );
+            ToolProbeOutcome::FailedCounted
         }
     }
 }
@@ -1119,56 +1264,41 @@ async fn apply_provider_wide_cooldown(provider: &str, model: &str, kind: &str) {
     // provider (probe-then-reenable) e azzera il TTL quando il credito torna.
     // I transienti (rate_limit/connection) restano solo in-memory: tornano da
     // soli in pochi secondi.
-    match kind {
-        "quota_exceeded" => {
-            tracing::info!(
-                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
-            );
-            put_provider_in_long_cooldown(provider, "Quota provider esaurita (HTTP 429)");
-        }
-        "credit_balance_too_low" => {
-            tracing::info!(
-                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
-            );
-            put_provider_in_long_cooldown(provider, "Credito provider insufficiente");
-        }
-        "billing_required" => {
-            tracing::info!(
-                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
-            );
-            put_provider_in_long_cooldown(provider, "Billing provider non configurato");
-        }
-        "auth_error" => {
-            tracing::info!(
-                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
-            );
-            put_provider_in_long_cooldown(provider, "API key non valida");
-        }
-        "rate_limit" => {
-            tracing::info!(
-                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
-            );
-            put_provider_in_short_cooldown(
-                provider,
-                "Rate limit raggiunto",
-                crate::provider_cooldown::provider_health_timings().slow_cooldown_s,
-            );
-        }
-        "connection_error" => {
-            tracing::info!(
-                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
-            );
-            put_provider_in_short_cooldown(
-                provider,
-                "Provider non raggiungibile",
-                crate::provider_cooldown::provider_health_timings().cooldown_default_s,
-            );
-        }
-        _ => {
-            tracing::debug!(
-                "model_health_probe: provider {provider} errore provider-wide '{kind}' senza cooldown automatico (rilevato in probe model {model})"
-            );
-        }
+    // Log identico per tutti i kind con cooldown automatico: emesso una volta
+    // qui, ogni arm calcola solo l'azione (long/short cooldown). Il kind ignoto
+    // (nessun cooldown) e' l'unico caso a parte, con log debug.
+    // Errori persistenti -> long cooldown (differiscono solo per il messaggio).
+    let long_msg = match kind {
+        "quota_exceeded" => Some("Quota provider esaurita (HTTP 429)"),
+        "credit_balance_too_low" => Some("Credito provider insufficiente"),
+        "billing_required" => Some("Billing provider non configurato"),
+        "auth_error" => Some("API key non valida"),
+        _ => None,
+    };
+    // Transienti -> short cooldown (messaggio + timing dedicati).
+    let timings = crate::provider_cooldown::provider_health_timings();
+    let short = match kind {
+        "rate_limit" => Some(("Rate limit raggiunto", timings.slow_cooldown_s)),
+        "connection_error" => Some(("Provider non raggiungibile", timings.cooldown_default_s)),
+        _ => None,
+    };
+    let known = if let Some(msg) = long_msg {
+        put_provider_in_long_cooldown(provider, msg);
+        true
+    } else if let Some((msg, secs)) = short {
+        put_provider_in_short_cooldown(provider, msg, secs);
+        true
+    } else {
+        false
+    };
+    if known {
+        tracing::info!(
+            "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
+        );
+    } else {
+        tracing::debug!(
+            "model_health_probe: provider {provider} errore provider-wide '{kind}' senza cooldown automatico (rilevato in probe model {model})"
+        );
     }
 }
 
@@ -1248,18 +1378,8 @@ pub(crate) async fn probe_model_on_insert(
                     .trim_start_matches("Error:")
                     .trim_start_matches("error:")
                     .trim();
-                match classification_from_error_class(
-                    &orchestrator.neural.classify_error(inner, provider).await,
-                ) {
-                    Classification::Ok => ProbeOnInsertResult::Healthy,
-                    Classification::ProviderWide(kind, _) => {
-                        ProbeOnInsertResult::ProviderDown(kind)
-                    }
-                    Classification::ModelSpecific(kind, _) => {
-                        ProbeOnInsertResult::ModelBroken(kind)
-                    }
-                    Classification::Transient(kind, _) => ProbeOnInsertResult::Transient(kind),
-                }
+                let ec = orchestrator.neural.classify_error(inner, provider).await;
+                on_insert_from_classification(classification_from_error_class(&ec))
             } else {
                 ProbeOnInsertResult::Healthy
             }
@@ -1269,14 +1389,20 @@ pub(crate) async fn probe_model_on_insert(
                 .neural
                 .classify_error(&e.to_string(), provider)
                 .await;
-            match classification_from_error_class(&ec) {
-                Classification::Ok => ProbeOnInsertResult::Healthy,
-                Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
-                Classification::ModelSpecific(kind, _) => ProbeOnInsertResult::ModelBroken(kind),
-                Classification::Transient(kind, _) => ProbeOnInsertResult::Transient(kind),
-            }
+            on_insert_from_classification(classification_from_error_class(&ec))
         }
         Err(_timeout) => ProbeOnInsertResult::Inconclusive(format!("timeout {PROBE_TIMEOUT_S}s")),
+    }
+}
+
+/// Mappa una `Classification` sul risultato del probe-on-insert (punto unico del
+/// mapping, regola L): riusato dal ramo response-`[Error:` e dal ramo trasporto.
+fn on_insert_from_classification(c: Classification) -> ProbeOnInsertResult {
+    match c {
+        Classification::Ok => ProbeOnInsertResult::Healthy,
+        Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
+        Classification::ModelSpecific(kind, _) => ProbeOnInsertResult::ModelBroken(kind),
+        Classification::Transient(kind, _) => ProbeOnInsertResult::Transient(kind),
     }
 }
 
