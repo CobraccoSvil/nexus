@@ -1102,6 +1102,36 @@ fn check_repeated_literals(lines: &[&str], file_path: &str) -> Vec<QualityFindin
     findings
 }
 
+/// Bilancio netto di parentesi tonde IGNORANDO quelle dentro stringhe letterali
+/// (`'...'`, `"..."`, `` `...` ``). Serve a capire se una chiamata `db.query(...)`
+/// resta aperta su piu' righe: le parentesi dentro la stringa SQL argomento (es. la
+/// lista colonne di un `INSERT`) non devono contare come apertura/chiusura di chiamata.
+fn net_parens_outside_strings(s: &str) -> i32 {
+    let mut depth = 0i32;
+    let mut string_quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in s.chars() {
+        match string_quote {
+            Some(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    string_quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' | '`' => string_quote = Some(ch),
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            },
+        }
+    }
+    depth
+}
+
 /// Rileva query SQL eseguite dentro loop — pattern N+1 esteso a tutti i linguaggi.
 /// Regola: il DB deve fornire il dato già filtrato, ordinato e limitato. Non elaborare in codice.
 fn check_db_queries_in_loops(lines: &[&str], file_path: &str, overrides: &RuleOverrides) -> Vec<QualityFinding> {
@@ -1157,6 +1187,9 @@ fn check_db_queries_in_loops(lines: &[&str], file_path: &str, overrides: &RuleOv
     let mut loop_start_line = 0usize;
     let mut brace_depth = 0i32;
     let mut loop_brace_depth = 0i32;
+    // Parentesi ancora aperte della chiamata query gia' contata: finche' > 0 siamo
+    // sulle righe di continuazione della STESSA query e non dobbiamo ri-emettere.
+    let mut open_query_parens = 0i32;
 
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
@@ -1183,8 +1216,17 @@ fn check_db_queries_in_loops(lines: &[&str], file_path: &str, overrides: &RuleOv
             loop_brace_depth = brace_depth - 1;
         }
 
-        // Dentro un loop: cerca query DB
-        if loop_depth > 0 && query_re.is_match(t) {
+        // Dentro un loop: cerca query DB. Una singola chiamata `db.query(...)` puo'
+        // estendersi su piu' righe (metodo su una riga, stringa SQL argomento sulla
+        // successiva) e `RE_QUERY_BACKEND` matcha entrambe: senza deduplica la stessa
+        // query genererebbe due finding su righe adiacenti. La query va contata UNA
+        // volta sopprimendo i match che cadono dentro le parentesi ancora aperte della
+        // chiamata gia' registrata; due query DISTINTE restano invece due finding.
+        let paren_delta = net_parens_outside_strings(t);
+        if open_query_parens > 0 {
+            // Riga di continuazione della chiamata gia' contata: non ri-emettere.
+            open_query_parens = (open_query_parens + paren_delta).max(0);
+        } else if loop_depth > 0 && query_re.is_match(t) {
             findings.push(QualityFinding {
                 category: "reliability".into(),
                 severity: "high".into(),
@@ -1200,6 +1242,14 @@ fn check_db_queries_in_loops(lines: &[&str], file_path: &str, overrides: &RuleOv
                     "// REFACTOR: spostare la query fuori dal loop, usare JOIN o WHERE IN per caricare tutti i dati in una sola chiamata".into()
                 ),
             });
+            // Se la chiamata resta aperta (parentesi non chiuse su questa riga),
+            // sopprimi i match sulle righe di continuazione della stessa query.
+            open_query_parens = paren_delta.max(0);
+        }
+        // Fuori da ogni loop lo stato di continuazione non ha piu' senso: azzera per
+        // non trascinare parentesi non bilanciate su codice successivo.
+        if loop_depth == 0 {
+            open_query_parens = 0;
         }
 
         // Cerca sort/filter su dati che potrebbero venire dal DB
@@ -1333,6 +1383,73 @@ fn foo() {
 "#;
         let report = analyze_source("test.rs", source);
         assert!(report.findings.iter().any(|f| f.title.contains("unwrap")));
+    }
+
+    #[test]
+    fn test_n_plus_one_query_multilinea_conta_una_volta() {
+        // Regressione: una singola `pool.query(...)` distribuita su piu' righe dentro
+        // un loop deve produrre UN solo finding N+1, non uno per riga che matcha il
+        // pattern (riga del metodo `.query(` + riga della stringa SQL `INSERT ...`).
+        // Riproduce il caso reale Beaty-Book/backend/server.js:374-379.
+        let source = r#"
+async function seed() {
+    for (let d = 1; d <= 6; d++) {
+        await pool.query(
+            'INSERT INTO opening_hours (location_id, day_of_week) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+            [lid, d]
+        );
+    }
+}
+"#;
+        let report = analyze_source("server.js", source);
+        let n_plus_one = report
+            .findings
+            .iter()
+            .filter(|f| f.title.contains("N+1"))
+            .count();
+        assert_eq!(
+            n_plus_one, 1,
+            "una query multilinea deve dare un solo finding N+1, trovati {n_plus_one}"
+        );
+    }
+
+    #[test]
+    fn test_n_plus_one_query_distinte_restano_separate() {
+        // Due chiamate DB DISTINTE nello stesso loop restano due finding: la deduplica
+        // sopprime solo le righe di continuazione della stessa chiamata, non query diverse.
+        let source = r#"
+async function run(users) {
+    for (const u of users) {
+        await db.query('SELECT * FROM orders WHERE user_id = $1', [u.id]);
+        await db.query('UPDATE users SET seen = true WHERE id = $1', [u.id]);
+    }
+}
+"#;
+        let report = analyze_source("service.js", source);
+        let n_plus_one = report
+            .findings
+            .iter()
+            .filter(|f| f.title.contains("N+1"))
+            .count();
+        assert_eq!(
+            n_plus_one, 2,
+            "due query distinte devono dare due finding N+1, trovati {n_plus_one}"
+        );
+    }
+
+    #[test]
+    fn test_net_parens_outside_strings_ignora_stringhe() {
+        // Le parentesi dentro la stringa SQL non contano; solo quella della call.
+        assert_eq!(net_parens_outside_strings("await pool.query("), 1);
+        assert_eq!(
+            net_parens_outside_strings("'INSERT INTO t (a, b) VALUES ($1, $2)',"),
+            0
+        );
+        assert_eq!(net_parens_outside_strings(");"), -1);
+        assert_eq!(
+            net_parens_outside_strings("await db.query('SELECT (1)', [x]);"),
+            0
+        );
     }
 
     #[test]
