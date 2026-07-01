@@ -167,10 +167,43 @@ async fn check_tool_runner(db: &sqlx::PgPool) -> EnvironmentCheck {
     }
 }
 
+/// Probe TCP portabile: `true` se `127.0.0.1:{port}` accetta una connessione
+/// entro 1s. Un connect riuscito implica porta in ascolto, indipendentemente
+/// dall'OS (regola H: niente `ss`/`netstat` POSIX-only). Punto unico riusato da
+/// tutti i check di porta di questo modulo (regola L).
+async fn tcp_port_open(port: u16) -> bool {
+    timeout(
+        Duration::from_secs(1),
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
+}
+
+/// Sonda in parallelo i microservizi e restituisce `(nome, in_ascolto)` nello
+/// stesso ordine della lista in ingresso.
+async fn probe_microservices(services: &[(&'static str, u16)]) -> Vec<(&'static str, bool)> {
+    let handles: Vec<_> = services
+        .iter()
+        .map(|(name, port)| {
+            let p = *port;
+            (*name, tokio::spawn(async move { tcp_port_open(p).await }))
+        })
+        .collect();
+
+    let mut results: Vec<(&str, bool)> = Vec::with_capacity(handles.len());
+    for (name, handle) in handles {
+        results.push((name, handle.await.unwrap_or(false)));
+    }
+    results
+}
+
 /// Controlla i microservizi Rust ausiliari (admin, doc, billing, plugin).
 /// Li verifica in parallelo con TCP connect (1s timeout); restituisce un check
 /// aggregato con il dettaglio per ciascun servizio.
 async fn check_microservices() -> EnvironmentCheck {
+    const LABEL: &str = "Microservizi (admin/chat/doc/billing/plugin)";
     let services = [
         ("admin-service", 4010u16),
         ("doc-service", 4030),
@@ -178,32 +211,7 @@ async fn check_microservices() -> EnvironmentCheck {
         ("plugin-service", 4050),
     ];
 
-    let mut results: Vec<(&str, bool)> = Vec::with_capacity(services.len());
-    let handles: Vec<_> = services
-        .iter()
-        .map(|(name, port)| {
-            let _addr = format!("127.0.0.1:{port}");
-            let p = *port;
-            (
-                *name,
-                tokio::spawn(async move {
-                    timeout(
-                        Duration::from_secs(1),
-                        tokio::net::TcpStream::connect(format!("127.0.0.1:{p}")),
-                    )
-                    .await
-                    .map(|r| r.is_ok())
-                    .unwrap_or(false)
-                }),
-            )
-        })
-        .collect();
-
-    for (name, handle) in handles {
-        let ok = handle.await.unwrap_or(false);
-        results.push((name, ok));
-    }
-
+    let results = probe_microservices(&services).await;
     let ok_count = results.iter().filter(|(_, ok)| *ok).count();
     let total = results.len();
     let detail = results
@@ -213,23 +221,15 @@ async fn check_microservices() -> EnvironmentCheck {
         .join(", ");
 
     if ok_count == total {
-        EnvironmentCheck::ok(
-            "microservices",
-            "Microservizi (admin/chat/doc/billing/plugin)",
-            format!("{ok_count}/{total} operativi"),
-        )
+        EnvironmentCheck::ok("microservices", LABEL, format!("{ok_count}/{total} operativi"))
     } else if ok_count > 0 {
         EnvironmentCheck::warn(
             "microservices",
-            "Microservizi (admin/chat/doc/billing/plugin)",
+            LABEL,
             format!("{ok_count}/{total} operativi — {detail}"),
         )
     } else {
-        EnvironmentCheck::error(
-            "microservices",
-            "Microservizi (admin/chat/doc/billing/plugin)",
-            format!("0/{total} operativi — {detail}"),
-        )
+        EnvironmentCheck::error("microservices", LABEL, format!("0/{total} operativi — {detail}"))
     }
 }
 
@@ -239,81 +239,75 @@ fn check_backend_process() -> EnvironmentCheck {
 }
 
 async fn check_frontend_process() -> EnvironmentCheck {
-    // Probe TCP portabile (regola H): un connect riuscito su 127.0.0.1:3000
-    // implica che la porta e' in ascolto, indipendentemente dall'OS. Elimina la
-    // dipendenza da `ss` (POSIX-only, falso allarme "down" su Windows). Non piu'
-    // disponibili pid/program del listener: si riporta solo lo stato in-ascolto.
+    // Probe TCP portabile (regola H+L): riusa `tcp_port_open`. Un connect
+    // riuscito su 127.0.0.1:3000 implica porta in ascolto, indipendentemente
+    // dall'OS. Elimina la dipendenza da `ss` (POSIX-only, falso allarme "down"
+    // su Windows). Non piu' disponibili pid/program: solo lo stato in-ascolto.
     const FRONTEND_PORT: u16 = 3000;
-    let connect = timeout(
-        Duration::from_millis(1000),
-        tokio::net::TcpStream::connect(format!("127.0.0.1:{FRONTEND_PORT}")),
-    )
-    .await;
-    match connect {
-        Ok(Ok(_)) => EnvironmentCheck::ok(
+    if tcp_port_open(FRONTEND_PORT).await {
+        EnvironmentCheck::ok(
             "frontend_process",
             "Frontend web-ide",
             format!("Port {FRONTEND_PORT} listening"),
-        ),
-        Ok(Err(_)) | Err(_) => EnvironmentCheck::error(
+        )
+    } else {
+        EnvironmentCheck::error(
             "frontend_process",
             "Frontend web-ide",
             format!("Port {FRONTEND_PORT} not listening"),
-        ),
+        )
+    }
+}
+
+/// Check `warn` standard quando sqlx-cli non e' installato/trovato.
+fn migrations_sqlx_missing() -> EnvironmentCheck {
+    EnvironmentCheck::warn(
+        "migrations_sqlx_missing",
+        "DB Migrations",
+        "sqlx-cli non installato",
+    )
+}
+
+/// Risolve il path di sqlx-cli in modo cross-platform.
+/// - Unix: path esplicito noto, poi `which` sul PATH.
+/// - Windows: `where` (where.exe) sul PATH; niente path esplicito
+///   (l'installazione cargo mette sqlx.exe in %USERPROFILE%\.cargo\bin, gia'
+///   nel PATH). `which` non esiste su Windows: usarlo darebbe un falso
+///   "sqlx-cli non installato".
+/// Ritorna `Err(check)` con il warn gia' pronto se non risolvibile.
+#[cfg(unix)]
+async fn resolve_sqlx_path() -> Result<String, EnvironmentCheck> {
+    if std::path::Path::new("/home/administrator/.cargo/bin/sqlx").exists() {
+        return Ok("/home/administrator/.cargo/bin/sqlx".to_string());
+    }
+    let which_out = Command::new("which").arg("sqlx").output().await;
+    match which_out {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        _ => Err(migrations_sqlx_missing()),
+    }
+}
+
+/// Vedi doc di `resolve_sqlx_path` (variante Windows).
+#[cfg(windows)]
+async fn resolve_sqlx_path() -> Result<String, EnvironmentCheck> {
+    let where_out = Command::new("where").arg("sqlx").output().await;
+    match where_out {
+        // `where` puo' stampare piu' righe (path multipli): prende la prima.
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            match stdout.lines().next().map(|l| l.trim().to_string()) {
+                Some(p) if !p.is_empty() => Ok(p),
+                _ => Err(migrations_sqlx_missing()),
+            }
+        }
+        _ => Err(migrations_sqlx_missing()),
     }
 }
 
 async fn check_migrations(db_url: &str) -> EnvironmentCheck {
-    // Risolve il path di sqlx-cli in modo cross-platform.
-    // - Unix: path esplicito noto, poi `which` sul PATH.
-    // - Windows: `where` (where.exe) sul PATH; niente path esplicito
-    //   (l'installazione cargo mette sqlx.exe in %USERPROFILE%\.cargo\bin, gia'
-    //   nel PATH). `which` non esiste su Windows: usarlo darebbe un falso
-    //   "sqlx-cli non installato".
-    #[cfg(unix)]
-    let sqlx_path = if std::path::Path::new("/home/administrator/.cargo/bin/sqlx").exists() {
-        "/home/administrator/.cargo/bin/sqlx".to_string()
-    } else {
-        let which_out = Command::new("which").arg("sqlx").output().await;
-        match which_out {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            _ => {
-                // sqlx-cli non installato: id dedicato per mostrare il pulsante di installazione
-                return EnvironmentCheck::warn(
-                    "migrations_sqlx_missing",
-                    "DB Migrations",
-                    "sqlx-cli non installato",
-                );
-            }
-        }
-    };
-
-    #[cfg(windows)]
-    let sqlx_path = {
-        let where_out = Command::new("where").arg("sqlx").output().await;
-        match where_out {
-            // `where` puo' stampare piu' righe (path multipli): prende la prima.
-            Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                match stdout.lines().next().map(|l| l.trim().to_string()) {
-                    Some(p) if !p.is_empty() => p,
-                    _ => {
-                        return EnvironmentCheck::warn(
-                            "migrations_sqlx_missing",
-                            "DB Migrations",
-                            "sqlx-cli non installato",
-                        );
-                    }
-                }
-            }
-            _ => {
-                return EnvironmentCheck::warn(
-                    "migrations_sqlx_missing",
-                    "DB Migrations",
-                    "sqlx-cli non installato",
-                );
-            }
-        }
+    let sqlx_path = match resolve_sqlx_path().await {
+        Ok(p) => p,
+        Err(check) => return check,
     };
 
     let result = timeout(
@@ -461,217 +455,204 @@ pub struct FixRequest {
     pub sudo_password: Option<String>,
 }
 
+/// Serializza in JSON l'esito di un `Command`: `stdout`+`stderr` concatenati e
+/// `ok` dallo status. `timeout_msg`/`spawn_prefix` personalizzano i messaggi di
+/// errore per riprodurre esattamente le stringhe originali di ogni azione.
+fn command_result_json(
+    result: Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
+    spawn_prefix: &str,
+    timeout_msg: &str,
+) -> ApiResult {
+    match result {
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let output = format!("{stdout}{stderr}");
+            Ok(Json(
+                json!({ "ok": out.status.success(), "output": output }),
+            ))
+        }
+        Ok(Err(e)) => Ok(Json(
+            json!({ "ok": false, "output": format!("{spawn_prefix}{e}") }),
+        )),
+        Err(_) => Ok(Json(json!({ "ok": false, "output": timeout_msg }))),
+    }
+}
+
+async fn action_install_playwright_browsers() -> ApiResult {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let result = timeout(
+        Duration::from_secs(120),
+        Command::new("npx")
+            .args(["playwright", "install", "chromium"])
+            .current_dir(&home)
+            .output(),
+    )
+    .await;
+    command_result_json(result, "Error: ", "Timeout after 120s")
+}
+
+async fn action_run_migrations() -> ApiResult {
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://nexus:nexus@localhost:5433/nexus".to_string());
+    let result = timeout(
+        Duration::from_secs(60),
+        Command::new("/home/administrator/.cargo/bin/sqlx")
+            .args(["migrate", "run", "--database-url", &db_url])
+            .output(),
+    )
+    .await;
+    command_result_json(result, "Error: ", "Timeout after 60s")
+}
+
+async fn action_restart_frontend() -> ApiResult {
+    #[cfg(unix)]
+    {
+        // Kill processo sulla porta 3000
+        let _ = Command::new("sh")
+            .args(["-c", "kill $(ss -tlnp | grep ':3000' | grep -oP 'pid=\\K[0-9]+' | head -1) 2>/dev/null || true"])
+            .output()
+            .await;
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Cerca la directory del frontend
+        let nexus_root = std::env::var("NEXUS_ROOT")
+            .unwrap_or_else(|_| "/var/lib/postgresql/wal/nexus".to_string());
+        let frontend_dir = format!("{nexus_root}/apps/web-ide");
+
+        let result = Command::new("sh")
+            .args([
+                "-c",
+                &format!("cd {frontend_dir} && nohup pnpm start > /tmp/web-ide.log 2>&1 &"),
+            ])
+            .output()
+            .await;
+
+        match result {
+            Ok(_) => Ok(Json(
+                json!({ "ok": true, "output": "Frontend restart initiated. Check port 3000 in a few seconds." }),
+            )),
+            Err(e) => Ok(Json(
+                json!({ "ok": false, "output": format!("Error: {e}") }),
+            )),
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Su Windows il web-ide gira come servizio WinSW (nexus-web-ide):
+        // il restart e' gestito dal service manager, non da qui. No-op.
+        tracing::warn!(
+            "restart frontend: su Windows il web-ide e' gestito da WinSW (nexus-web-ide), no-op"
+        );
+        Ok(Json(json!({
+            "ok": true,
+            "output": "Su Windows il web-ide e' gestito da WinSW (nexus-web-ide): usa il service manager. No-op."
+        })))
+    }
+}
+
+#[cfg(unix)]
+async fn install_system_deps_unix(sudo_password: &str) -> ApiResult {
+    if sudo_password.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "sudo_password required"));
+    }
+
+    let packages = "libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 libglib2.0-0 libdbus-1-3 libxshmfence1 libxext6";
+
+    let cmd = format!(
+        "echo '{}' | sudo -S apt-get install -y {} 2>&1",
+        sudo_password, packages
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let combined = format!("{}\n{}", stdout, stderr)
+                .lines()
+                .filter(|l| !l.contains("[sudo] password") && !l.contains("password for"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let ok = output.status.success();
+            Ok(Json(json!({ "ok": ok, "output": combined })))
+        }
+        Ok(Err(e)) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(_) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "Timeout")),
+    }
+}
+
+async fn action_install_system_deps(_sudo_password: Option<&str>) -> ApiResult {
+    #[cfg(unix)]
+    {
+        install_system_deps_unix(_sudo_password.unwrap_or("")).await
+    }
+    #[cfg(windows)]
+    {
+        // Niente apt-get/sudo su Windows: l'installazione delle dipendenze
+        // di sistema (librerie native per Playwright/Chromium ecc.) non e'
+        // automatizzabile qui. Segnala chiaramente all'utente.
+        tracing::warn!(
+            "install_system_deps: non supportato su Windows, installazione manuale richiesta"
+        );
+        Ok(Json(json!({
+            "ok": false,
+            "output": "installazione dipendenze di sistema non supportata su Windows: installale manualmente"
+        })))
+    }
+}
+
+async fn action_install_sqlx_cli() -> ApiResult {
+    // Installa sqlx-cli con supporto solo postgres (più veloce, ~2-3 min).
+    // Usa il cargo del sistema (PATH ereditato da mcp-core) oppure il path
+    // esplicito ~/.cargo/bin/cargo come fallback.
+    let cargo_bin = if std::path::Path::new("/home/administrator/.cargo/bin/cargo").exists() {
+        "/home/administrator/.cargo/bin/cargo".to_string()
+    } else {
+        "cargo".to_string()
+    };
+
+    let result = timeout(
+        Duration::from_secs(300), // 5 minuti: compilazione da sorgente
+        Command::new(&cargo_bin)
+            .args([
+                "install",
+                "sqlx-cli",
+                "--no-default-features",
+                "--features",
+                "native-tls,postgres",
+                "--locked",
+            ])
+            .envs(std::env::vars()) // propaga PATH, CARGO_HOME, ecc.
+            .output(),
+    )
+    .await;
+    command_result_json(result, "Errore avvio cargo: ", "Timeout dopo 300s. Riprova.")
+}
+
 pub async fn fix_environment(
     State(_state): State<AppState>,
     Json(body): Json<FixRequest>,
 ) -> ApiResult {
     match body.action.as_str() {
-        "install_playwright_browsers" => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            let result = timeout(
-                Duration::from_secs(120),
-                Command::new("npx")
-                    .args(["playwright", "install", "chromium"])
-                    .current_dir(&home)
-                    .output(),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(out)) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let output = format!("{stdout}{stderr}");
-                    Ok(Json(
-                        json!({ "ok": out.status.success(), "output": output }),
-                    ))
-                }
-                Ok(Err(e)) => Ok(Json(
-                    json!({ "ok": false, "output": format!("Error: {e}") }),
-                )),
-                Err(_) => Ok(Json(json!({ "ok": false, "output": "Timeout after 120s" }))),
-            }
-        }
-
-        "run_migrations" => {
-            let db_url = std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://nexus:nexus@localhost:5433/nexus".to_string());
-            let result = timeout(
-                Duration::from_secs(60),
-                Command::new("/home/administrator/.cargo/bin/sqlx")
-                    .args(["migrate", "run", "--database-url", &db_url])
-                    .output(),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(out)) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let output = format!("{stdout}{stderr}");
-                    Ok(Json(
-                        json!({ "ok": out.status.success(), "output": output }),
-                    ))
-                }
-                Ok(Err(e)) => Ok(Json(
-                    json!({ "ok": false, "output": format!("Error: {e}") }),
-                )),
-                Err(_) => Ok(Json(json!({ "ok": false, "output": "Timeout after 60s" }))),
-            }
-        }
-
+        "install_playwright_browsers" => action_install_playwright_browsers().await,
+        "run_migrations" => action_run_migrations().await,
         "get_system_deps_command" => Ok(Json(json!({
             "ok": true,
             "output": "sudo apt-get install -y libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 libglib2.0-0"
         }))),
-
-        "restart_frontend" => {
-            #[cfg(unix)]
-            {
-                // Kill processo sulla porta 3000
-                let _ = Command::new("sh")
-                    .args(["-c", "kill $(ss -tlnp | grep ':3000' | grep -oP 'pid=\\K[0-9]+' | head -1) 2>/dev/null || true"])
-                    .output()
-                    .await;
-
-                tokio::time::sleep(Duration::from_secs(1)).await;
-
-                // Cerca la directory del frontend
-                let nexus_root = std::env::var("NEXUS_ROOT")
-                    .unwrap_or_else(|_| "/var/lib/postgresql/wal/nexus".to_string());
-                let frontend_dir = format!("{nexus_root}/apps/web-ide");
-
-                let result = Command::new("sh")
-                    .args([
-                        "-c",
-                        &format!("cd {frontend_dir} && nohup pnpm start > /tmp/web-ide.log 2>&1 &"),
-                    ])
-                    .output()
-                    .await;
-
-                match result {
-                    Ok(_) => Ok(Json(
-                        json!({ "ok": true, "output": "Frontend restart initiated. Check port 3000 in a few seconds." }),
-                    )),
-                    Err(e) => Ok(Json(
-                        json!({ "ok": false, "output": format!("Error: {e}") }),
-                    )),
-                }
-            }
-            #[cfg(windows)]
-            {
-                // Su Windows il web-ide gira come servizio WinSW (nexus-web-ide):
-                // il restart e' gestito dal service manager, non da qui. No-op.
-                tracing::warn!(
-                    "restart frontend: su Windows il web-ide e' gestito da WinSW (nexus-web-ide), no-op"
-                );
-                Ok(Json(json!({
-                    "ok": true,
-                    "output": "Su Windows il web-ide e' gestito da WinSW (nexus-web-ide): usa il service manager. No-op."
-                })))
-            }
-        }
-
-        "install_system_deps" => {
-            #[cfg(unix)]
-            {
-                let sudo_password = body.sudo_password.as_deref().unwrap_or("");
-                if sudo_password.is_empty() {
-                    return Err(api_error(StatusCode::BAD_REQUEST, "sudo_password required"));
-                }
-
-                let packages = "libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 libglib2.0-0 libdbus-1-3 libxshmfence1 libxext6";
-
-                let cmd = format!(
-                    "echo '{}' | sudo -S apt-get install -y {} 2>&1",
-                    sudo_password, packages
-                );
-
-                let result = tokio::time::timeout(
-                    Duration::from_secs(120),
-                    tokio::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&cmd)
-                        .output(),
-                )
-                .await;
-
-                match result {
-                    Ok(Ok(output)) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                        let combined = format!("{}\n{}", stdout, stderr)
-                            .lines()
-                            .filter(|l| !l.contains("[sudo] password") && !l.contains("password for"))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let ok = output.status.success();
-                        Ok(Json(json!({ "ok": ok, "output": combined })))
-                    }
-                    Ok(Err(e)) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-                    Err(_) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "Timeout")),
-                }
-            }
-            #[cfg(windows)]
-            {
-                // Niente apt-get/sudo su Windows: l'installazione delle dipendenze
-                // di sistema (librerie native per Playwright/Chromium ecc.) non e'
-                // automatizzabile qui. Segnala chiaramente all'utente.
-                tracing::warn!(
-                    "install_system_deps: non supportato su Windows, installazione manuale richiesta"
-                );
-                Ok(Json(json!({
-                    "ok": false,
-                    "output": "installazione dipendenze di sistema non supportata su Windows: installale manualmente"
-                })))
-            }
-        }
-
-        "install_sqlx_cli" => {
-            // Installa sqlx-cli con supporto solo postgres (più veloce, ~2-3 min).
-            // Usa il cargo del sistema (PATH ereditato da mcp-core) oppure il path
-            // esplicito ~/.cargo/bin/cargo come fallback.
-            let cargo_bin = if std::path::Path::new("/home/administrator/.cargo/bin/cargo").exists()
-            {
-                "/home/administrator/.cargo/bin/cargo".to_string()
-            } else {
-                "cargo".to_string()
-            };
-
-            let result = timeout(
-                Duration::from_secs(300), // 5 minuti: compilazione da sorgente
-                Command::new(&cargo_bin)
-                    .args([
-                        "install",
-                        "sqlx-cli",
-                        "--no-default-features",
-                        "--features",
-                        "native-tls,postgres",
-                        "--locked",
-                    ])
-                    .envs(std::env::vars()) // propaga PATH, CARGO_HOME, ecc.
-                    .output(),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(out)) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                    let output = format!("{stdout}{stderr}");
-                    Ok(Json(
-                        json!({ "ok": out.status.success(), "output": output }),
-                    ))
-                }
-                Ok(Err(e)) => Ok(Json(
-                    json!({ "ok": false, "output": format!("Errore avvio cargo: {e}") }),
-                )),
-                Err(_) => Ok(Json(
-                    json!({ "ok": false, "output": "Timeout dopo 300s. Riprova." }),
-                )),
-            }
-        }
-
+        "restart_frontend" => action_restart_frontend().await,
+        "install_system_deps" => action_install_system_deps(body.sudo_password.as_deref()).await,
+        "install_sqlx_cli" => action_install_sqlx_cli().await,
         _ => Err(api_error(
             StatusCode::BAD_REQUEST,
             format!("Unknown action: {}", body.action),
@@ -750,79 +731,80 @@ async fn resolve_gateway_url(
     }
 }
 
-pub async fn gateway_providers_handler(
-    axum::extract::State(state): axum::extract::State<crate::AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let gw_url = resolve_gateway_url(&state.db).await?;
-    let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| "dev-internal-token".to_string());
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+/// Lista canonica dei provider noti (regola L: unica definizione riusata dagli
+/// handler di stato provider di questo modulo).
+const KNOWN_PROVIDERS: [&str; 5] = ["anthropic", "openai", "google", "deepseek", "mistral"];
 
-    // Snapshot dei provider in cooldown (in-memory) per riportarli come unhealthy
-    // anche se il gateway li riporta come "configurati".
-    let cooldown_map: std::collections::HashMap<String, (u64, Option<String>)> =
-        crate::provider_cooldown::cooldown_snapshot()
-            .into_iter()
-            .map(|(name, secs, reason)| (name, (secs, reason)))
-            .collect();
+/// Ultimo health check per provider (popolato dal worker `provider_health_probe`).
+/// Punto unico riusato da `gateway_providers_handler` e `providers_status_internal`.
+#[derive(sqlx::FromRow)]
+struct ProviderHealthRow {
+    provider: String,
+    healthy: bool,
+    latency_ms: Option<i32>,
+    error_kind: Option<String>,
+    checked_at: chrono::DateTime<chrono::Utc>,
+}
 
-    // Ultimo health check per provider (popolato dal worker provider_health_probe).
-    // Permette al frontend di mostrare timestamp ultimo ping + ultima latency,
-    // anche prima che il primo errore reale dell'utente arrivi.
-    // DISTINCT ON e' un'estensione PostgreSQL: prende per ogni provider la riga
-    // piu' recente in O(N log N) sull'indice (provider, checked_at DESC).
-    #[derive(sqlx::FromRow)]
-    struct HealthRow {
-        provider: String,
-        healthy: bool,
-        latency_ms: Option<i32>,
-        error_kind: Option<String>,
-        checked_at: chrono::DateTime<chrono::Utc>,
-    }
-    let health_rows: Vec<HealthRow> = sqlx::query_as::<_, HealthRow>(
+/// Carica l'ultimo health check per provider come mappa `provider -> riga`.
+/// DISTINCT ON e' un'estensione PostgreSQL: prende per ogni provider la riga
+/// piu' recente in O(N log N) sull'indice (provider, checked_at DESC).
+async fn fetch_provider_health_map(
+    db: &sqlx::PgPool,
+) -> std::collections::HashMap<String, ProviderHealthRow> {
+    let rows: Vec<ProviderHealthRow> = sqlx::query_as::<_, ProviderHealthRow>(
         r#"SELECT DISTINCT ON (provider)
                   provider, healthy, latency_ms, error_kind, checked_at
            FROM nexus_provider_health_history
            ORDER BY provider, checked_at DESC"#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
     .unwrap_or_default();
-    let health_map: std::collections::HashMap<String, HealthRow> = health_rows
-        .into_iter()
-        .map(|r| (r.provider.clone(), r))
-        .collect();
+    rows.into_iter().map(|r| (r.provider.clone(), r)).collect()
+}
 
-    // Query presenza API key per provider (usata nel fallback se gateway offline).
-    // Mappa: "anthropic" -> true se anthropic_api_key non è vuoto.
+/// Mappa `provider -> API key configurata` (chiave `*_api_key` non vuota in
+/// `settings`, categoria providers).
+async fn fetch_api_key_configured(db: &sqlx::PgPool) -> std::collections::HashMap<String, bool> {
     #[derive(sqlx::FromRow)]
     struct SettingsRow {
         key: String,
         value: String,
     }
-    let settings_rows: Vec<SettingsRow> = sqlx::query_as::<_, SettingsRow>(
+    let rows: Vec<SettingsRow> = sqlx::query_as::<_, SettingsRow>(
         "SELECT key, value FROM settings WHERE category = 'providers' AND key LIKE '%_api_key'",
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
     .unwrap_or_default();
-    let api_key_configured: std::collections::HashMap<String, bool> = settings_rows
-        .into_iter()
+    rows.into_iter()
         .map(|r| {
-            let provider = r.key.trim_end_matches("_api_key").to_string();
-            (provider, !r.value.trim().is_empty())
+            (
+                r.key.trim_end_matches("_api_key").to_string(),
+                !r.value.trim().is_empty(),
+            )
         })
-        .collect();
+        .collect()
+}
 
-    // Lista fallback costruita da health_map + api_key_configured + cooldown_map.
-    // Usata quando il gateway TypeScript (4060) non è raggiungibile, così i LED
-    // mostrano l'ultimo stato noto invece di essere tutti grigi.
-    const KNOWN_PROVIDERS_LIST: [&str; 5] =
-        ["anthropic", "openai", "google", "deepseek", "mistral"];
-    let providers_fallback: Vec<serde_json::Value> = KNOWN_PROVIDERS_LIST
+/// Snapshot dei provider in cooldown come mappa `provider -> (secondi, motivo)`.
+fn fetch_cooldown_map() -> std::collections::HashMap<String, (u64, Option<String>)> {
+    crate::provider_cooldown::cooldown_snapshot()
+        .into_iter()
+        .map(|(name, secs, reason)| (name, (secs, reason)))
+        .collect()
+}
+
+/// Costruisce la lista fallback dei provider da health/api-key/cooldown map.
+/// Usata quando il gateway TypeScript (4060) non e' raggiungibile, cosi' i LED
+/// mostrano l'ultimo stato noto invece di essere tutti grigi.
+fn build_providers_fallback(
+    health_map: &std::collections::HashMap<String, ProviderHealthRow>,
+    api_key_configured: &std::collections::HashMap<String, bool>,
+    cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
+) -> Vec<serde_json::Value> {
+    KNOWN_PROVIDERS
         .iter()
         .map(|&name| {
             let configured = api_key_configured.get(name).copied().unwrap_or(false);
@@ -851,7 +833,160 @@ pub async fn gateway_providers_handler(
             }
             p
         })
+        .collect()
+}
+
+/// Applica al provider JSON i dati dell'ultimo health probe canonico.
+/// Il probe mcp-core (provider_health_probe.rs) e' la fonte di verita' canonica
+/// per lo stato dei provider: scrive in DB, gira ogni 5 min, ha auto-recovery
+/// cooldown e outage detection. Il gateway TypeScript ha un suo in-memory cache
+/// che puo' restare stale (es. se loadApiKeysFromDb fallisce al boot per
+/// ECONNRESET, marca tutti unhealthy senza retry). Quindi:
+///   - se il probe dice healthy=true E recente (<10 min) → sovrascrive il
+///     gateway: e' la verita' attuale.
+///   - se il probe dice unhealthy → mantiene unhealthy (ribadiamo anche se
+///     cooldown e' stato perso).
+fn apply_health_probe(p: &mut serde_json::Value, h: &ProviderHealthRow) {
+    p["last_health_check_at"] = json!(h.checked_at.to_rfc3339());
+    if let Some(lat) = h.latency_ms {
+        p["last_health_latency_ms"] = json!(lat);
+    }
+    if let Some(kind) = &h.error_kind {
+        p["last_known_error_kind"] = json!(kind);
+    }
+    p["last_known_healthy"] = json!(h.healthy);
+    let probe_recent = chrono::Utc::now()
+        .signed_duration_since(h.checked_at)
+        .num_seconds()
+        < 600;
+    if h.healthy && probe_recent {
+        // Probe recente positivo: forza healthy=true anche se il gateway dice
+        // il contrario (cache stale). Pulisce eventuale "error" stale.
+        p["healthy"] = json!(true);
+        if p.get("error").is_some() {
+            p["error"] = json!(null);
+        }
+    } else if !h.healthy {
+        p["healthy"] = json!(false);
+    }
+}
+
+/// Applica cooldown attivo o billing error (mutuamente esclusivi) al provider
+/// JSON. Raccoglie in `new_billing` i nuovi billing error da persistere.
+fn apply_cooldown_or_billing(
+    p: &mut serde_json::Value,
+    name: &str,
+    cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
+    new_billing: &mut Vec<(String, String)>,
+) {
+    if let Some((secs, reason)) = cooldown_map.get(name) {
+        p["healthy"] = json!(false);
+        p["cooldown_seconds_remaining"] = json!(secs);
+        p["error"] = json!(reason.clone().unwrap_or_else(|| format!(
+            "In cooldown ({}s rimanenti) — l'AI userà un altro provider",
+            secs
+        )));
+    } else if let Some(billing_msg) = p.get("billing_error").and_then(|v| v.as_str()) {
+        // Il gateway TypeScript ha rilevato un errore di billing:
+        // imposta cooldown lungo e raccogliamo per la persistenza Redis.
+        let billing_msg = billing_msg.to_string();
+        if !crate::provider_cooldown::is_provider_in_cooldown(name) {
+            crate::provider_cooldown::put_provider_in_long_cooldown(name, &billing_msg);
+            tracing::warn!(
+                "Provider '{}' in cooldown lungo da billing_error gateway TS: {}",
+                name,
+                billing_msg
+            );
+            new_billing.push((name.to_string(), billing_msg.clone()));
+        }
+        // Aggiorna il JSON di risposta per coerenza immediata
+        let cooldown_duration_secs: u64 = 6 * 3600;
+        p["healthy"] = json!(false);
+        p["cooldown_seconds_remaining"] = json!(cooldown_duration_secs);
+        p["error"] = json!(billing_msg);
+    }
+}
+
+/// Arricchisce un singolo provider JSON restituito dal gateway con i dati del
+/// probe canonico + cooldown, e raccoglie eventuali nuovi billing error da
+/// persistere. Vedi doc dei due helper per la logica di precedenza.
+fn patch_gateway_provider(
+    mut p: serde_json::Value,
+    health_map: &std::collections::HashMap<String, ProviderHealthRow>,
+    cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
+    new_billing: &mut Vec<(String, String)>,
+) -> serde_json::Value {
+    let name = p["name"].as_str().unwrap_or("").to_lowercase();
+    if let Some(h) = health_map.get(&name) {
+        apply_health_probe(&mut p, h);
+    }
+    apply_cooldown_or_billing(&mut p, &name, cooldown_map, new_billing);
+    p
+}
+
+/// Persiste su Redis i nuovi billing cooldown (chiave con TTL 6h + 60s).
+async fn persist_billing_cooldowns(
+    redis: &redis::aio::MultiplexedConnection,
+    new_billing: &[(String, String)],
+) {
+    if new_billing.is_empty() {
+        return;
+    }
+    let mut conn = redis.clone();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for (pname, pmsg) in new_billing {
+        let redis_key = format!("nexus:billing_cooldown:{}", pname);
+        let until_ts = now_ts.saturating_add(6 * 3600);
+        let redis_value = format!("{}|{}", until_ts, pmsg);
+        let _ = redis::cmd("SET")
+            .arg(&redis_key)
+            .arg(&redis_value)
+            .arg("EX")
+            .arg(6u64 * 3600 + 60)
+            .query_async::<()>(&mut conn)
+            .await;
+    }
+}
+
+/// Arricchisce la lista provider del gateway (prima passata, sync) e persiste i
+/// nuovi billing cooldown su Redis (seconda passata, async).
+async fn build_patched_providers(
+    state: &crate::AppState,
+    body: &serde_json::Value,
+    health_map: &std::collections::HashMap<String, ProviderHealthRow>,
+    cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
+) -> Vec<serde_json::Value> {
+    let mut new_billing: Vec<(String, String)> = Vec::new();
+    let providers_patched: Vec<serde_json::Value> = body["providers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| patch_gateway_provider(p, health_map, cooldown_map, &mut new_billing))
         .collect();
+    persist_billing_cooldowns(&state.redis, &new_billing).await;
+    providers_patched
+}
+
+pub async fn gateway_providers_handler(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let gw_url = resolve_gateway_url(&state.db).await?;
+    let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
+        .unwrap_or_else(|_| "dev-internal-token".to_string());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let cooldown_map = fetch_cooldown_map();
+    let health_map = fetch_provider_health_map(&state.db).await;
+    let api_key_configured = fetch_api_key_configured(&state.db).await;
+    let providers_fallback =
+        build_providers_fallback(&health_map, &api_key_configured, &cooldown_map);
 
     match client
         .get(format!("{}/providers", gw_url.trim_end_matches('/')))
@@ -861,105 +996,8 @@ pub async fn gateway_providers_handler(
     {
         Ok(r) if r.status().is_success() => {
             let body: serde_json::Value = r.json().await.unwrap_or(json!({"providers": []}));
-            // Prima passata: raccogli i nuovi billing errors (non async, dentro closure).
-            let mut new_billing: Vec<(String, String)> = Vec::new();
-            let providers_patched: Vec<serde_json::Value> = body["providers"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|mut p| {
-                    let name = p["name"].as_str().unwrap_or("").to_lowercase();
-                    // Arricchimento con dati health probe (se disponibili).
-                    // Il probe mcp-core (provider_health_probe.rs) e' la fonte di
-                    // verita' canonica per lo stato dei provider: scrive in DB,
-                    // gira ogni 5 min, ha auto-recovery cooldown e outage detection.
-                    // Il gateway TypeScript ha un suo in-memory cache che puo'
-                    // restare stale (es. se loadApiKeysFromDb fallisce al boot
-                    // per ECONNRESET, marca tutti unhealthy senza retry). Quindi:
-                    //   - se il probe dice healthy=true E recente (<10 min) →
-                    //     sovrascrive il gateway: e' la verita' attuale.
-                    //   - se il probe dice unhealthy → mantiene unhealthy
-                    //     (ribadiamo anche se cooldown e' stato perso).
-                    if let Some(h) = health_map.get(&name) {
-                        p["last_health_check_at"] = json!(h.checked_at.to_rfc3339());
-                        if let Some(lat) = h.latency_ms {
-                            p["last_health_latency_ms"] = json!(lat);
-                        }
-                        if let Some(kind) = &h.error_kind {
-                            p["last_known_error_kind"] = json!(kind);
-                        }
-                        p["last_known_healthy"] = json!(h.healthy);
-                        let probe_recent = chrono::Utc::now()
-                            .signed_duration_since(h.checked_at)
-                            .num_seconds()
-                            < 600;
-                        if h.healthy && probe_recent {
-                            // Probe recente positivo: forza healthy=true
-                            // anche se il gateway dice il contrario (cache stale).
-                            p["healthy"] = json!(true);
-                            // Pulisce eventuale "error" stale dal gateway.
-                            if p.get("error").is_some() {
-                                p["error"] = json!(null);
-                            }
-                        } else if !h.healthy {
-                            p["healthy"] = json!(false);
-                        }
-                    }
-                    if let Some((secs, reason)) = cooldown_map.get(&name) {
-                        p["healthy"] = json!(false);
-                        p["cooldown_seconds_remaining"] = json!(secs);
-                        p["error"] = json!(reason.clone().unwrap_or_else(|| format!(
-                            "In cooldown ({}s rimanenti) — l'AI userà un altro provider",
-                            secs
-                        )));
-                    } else if let Some(billing_msg) =
-                        p.get("billing_error").and_then(|v| v.as_str())
-                    {
-                        // Il gateway TypeScript ha rilevato un errore di billing:
-                        // imposta cooldown lungo e raccogliamo per la persistenza Redis.
-                        let billing_msg = billing_msg.to_string();
-                        if !crate::provider_cooldown::is_provider_in_cooldown(&name) {
-                            crate::provider_cooldown::put_provider_in_long_cooldown(
-                                &name,
-                                &billing_msg,
-                            );
-                            tracing::warn!(
-                                "Provider '{}' in cooldown lungo da billing_error gateway TS: {}",
-                                name,
-                                billing_msg
-                            );
-                            new_billing.push((name.clone(), billing_msg.clone()));
-                        }
-                        // Aggiorna il JSON di risposta per coerenza immediata
-                        let cooldown_duration_secs: u64 = 6 * 3600;
-                        p["healthy"] = json!(false);
-                        p["cooldown_seconds_remaining"] = json!(cooldown_duration_secs);
-                        p["error"] = json!(billing_msg);
-                    }
-                    p
-                })
-                .collect();
-            // Seconda passata (async): persisti i nuovi billing errors su Redis.
-            if !new_billing.is_empty() {
-                let mut conn = state.redis.clone();
-                let now_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                for (pname, pmsg) in &new_billing {
-                    let redis_key = format!("nexus:billing_cooldown:{}", pname);
-                    let until_ts = now_ts.saturating_add(6 * 3600);
-                    let redis_value = format!("{}|{}", until_ts, pmsg);
-                    let _ = redis::cmd("SET")
-                        .arg(&redis_key)
-                        .arg(&redis_value)
-                        .arg("EX")
-                        .arg(6u64 * 3600 + 60)
-                        .query_async::<()>(&mut conn)
-                        .await;
-                }
-            }
+            let providers_patched =
+                build_patched_providers(&state, &body, &health_map, &cooldown_map).await;
             Ok(Json(json!({
                 "gateway_url": gw_url,
                 "providers": providers_patched,
@@ -1090,6 +1128,9 @@ async fn probe_embedding_dimensions(_model: &str) -> Result<u64, ApiError> {
     let vector = tokio::task::spawn_blocking(move || bridge.embed_one(&probe))
         .await
         .map_err(|e| {
+            // Falso positivo del detector SQL: "join" qui e' il join del task
+            // tokio (spawn_blocking), non una JOIN SQL. Nessuna query in questa
+            // funzione. Lasciato invariato per non alterare il messaggio d'errore.
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("embed probe join: {e}"),
@@ -1119,6 +1160,44 @@ pub async fn embeddings_validate_handler(
     ))
 }
 
+/// Reset (drop + create) della collection Qdrant dedicata con la dimensione
+/// vettoriale corretta. La delete ignora gli errori (404 se assente); la create
+/// propaga un `502` se Qdrant non e' raggiungibile o rifiuta la richiesta.
+async fn reindex_qdrant_collection(collection: &str, dim: u64) -> Result<(), ApiError> {
+    let qdrant_url =
+        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    let base = qdrant_url.trim_end_matches('/');
+    let delete_url = format!("{}/collections/{}", base, urlencoding::encode(collection));
+    let _ = client.delete(&delete_url).send().await; // ignore errors (404 etc.)
+
+    let create_url = format!("{}/collections/{}", base, urlencoding::encode(collection));
+    let create_body = json!({ "vectors": { "size": dim, "distance": "Cosine" } });
+    let resp = client
+        .put(&create_url)
+        .json(&create_body)
+        .send()
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Qdrant non raggiungibile: {e}"),
+            )
+        })?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Qdrant create collection fallito (HTTP {status}): {text}"),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn embeddings_apply_handler(
     State(state): State<AppState>,
     Json(body): Json<ApplyEmbeddingModelRequest>,
@@ -1134,37 +1213,7 @@ pub async fn embeddings_apply_handler(
 
     // Reindex = reset della collection dedicata (drop/create) con dimensione corretta.
     if body.reindex {
-        let qdrant_url =
-            std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
-        let base = qdrant_url.trim_end_matches('/');
-        let delete_url = format!("{}/collections/{}", base, urlencoding::encode(&collection));
-        let _ = client.delete(&delete_url).send().await; // ignore errors (404 etc.)
-
-        let create_url = format!("{}/collections/{}", base, urlencoding::encode(&collection));
-        let create_body = json!({ "vectors": { "size": dim, "distance": "Cosine" } });
-        let resp = client
-            .put(&create_url)
-            .json(&create_body)
-            .send()
-            .await
-            .map_err(|e| {
-                api_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("Qdrant non raggiungibile: {e}"),
-                )
-            })?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Qdrant create collection fallito (HTTP {status}): {text}"),
-            ));
-        }
+        reindex_qdrant_collection(&collection, dim).await?;
     }
 
     upsert_setting_value(
@@ -1214,65 +1263,14 @@ pub async fn embeddings_apply_handler(
 pub async fn providers_status_internal(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Json<Value> {
-    const KNOWN_PROVIDERS: [&str; 5] = ["anthropic", "openai", "google", "deepseek", "mistral"];
-
-    // Ultimo health check per provider.
-    #[derive(sqlx::FromRow)]
-    struct HealthRow {
-        provider: String,
-        healthy: bool,
-        latency_ms: Option<i32>,
-        error_kind: Option<String>,
-        checked_at: chrono::DateTime<chrono::Utc>,
-    }
-    let health_rows: Vec<HealthRow> = sqlx::query_as::<_, HealthRow>(
-        r#"SELECT DISTINCT ON (provider)
-                  provider, healthy, latency_ms, error_kind, checked_at
-           FROM nexus_provider_health_history
-           ORDER BY provider, checked_at DESC"#,
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let health_map: std::collections::HashMap<String, HealthRow> = health_rows
-        .into_iter()
-        .map(|r| (r.provider.clone(), r))
-        .collect();
-
-    // API key presenti in settings.
-    #[derive(sqlx::FromRow)]
-    struct SettingsRow {
-        key: String,
-        value: String,
-    }
-    let settings_rows: Vec<SettingsRow> = sqlx::query_as::<_, SettingsRow>(
-        "SELECT key, value FROM settings WHERE category = 'providers' AND key LIKE '%_api_key'",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let api_key_configured: std::collections::HashMap<String, bool> = settings_rows
-        .into_iter()
-        .map(|r| {
-            (
-                r.key.trim_end_matches("_api_key").to_string(),
-                !r.value.trim().is_empty(),
-            )
-        })
-        .collect();
-
-    // Cooldown snapshot — fonte unica locale (regola L): `provider_cooldown.rs`,
-    // lo stato canonico dei cooldown applicati da mcp-core (es. da
-    // brain_agent_client.rs quando rileva stop_reason=error + classify
-    // provider_error riconosce billing/rate_limit/overloaded). Lo stesso dato e'
-    // esposto da `/api/neural/providers/billing-cooldown`. Il vecchio merge col
-    // brain REST Python e' stato rimosso col brain stesso: ora la rilevazione
-    // billing/rate-limit vive interamente in-process in mcp-core.
-    let cooldown_map: std::collections::HashMap<String, (u64, Option<String>)> =
-        crate::provider_cooldown::cooldown_snapshot()
-            .into_iter()
-            .map(|(name, secs, reason)| (name, (secs, reason)))
-            .collect();
+    // Fonti canoniche riusate (regola L): health probe DB, API key in settings,
+    // cooldown snapshot in-process (`provider_cooldown.rs`, stato applicato da
+    // mcp-core quando classify provider_error riconosce billing/rate_limit/
+    // overloaded). Lo stesso dato e' esposto da
+    // `/api/neural/providers/billing-cooldown`.
+    let health_map = fetch_provider_health_map(&state.db).await;
+    let api_key_configured = fetch_api_key_configured(&state.db).await;
+    let cooldown_map = fetch_cooldown_map();
 
     let providers: Vec<Value> = KNOWN_PROVIDERS
         .iter()
