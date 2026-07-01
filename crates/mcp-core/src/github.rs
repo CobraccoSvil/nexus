@@ -569,42 +569,26 @@ async fn load_github_connection_record(
         anyhow::bail!("GitHub account owner not found");
     };
 
-    Ok(GitHubConnectionRecord {
-        github_username: row
-            .try_get::<Option<String>, _>("github_username")
-            .ok()
-            .flatten()
-            .or_else(|| {
-                row.try_get::<Option<String>, _>("user_github_username")
-                    .ok()
-                    .flatten()
-            }),
-        avatar_url: row
-            .try_get::<Option<String>, _>("avatar_url")
-            .ok()
-            .flatten(),
-        connection_status: row
-            .try_get::<Option<String>, _>("connection_status")
-            .ok()
-            .flatten(),
-        access_token: row
-            .try_get::<Option<String>, _>("access_token")
-            .ok()
-            .flatten(),
-        refresh_token: row
-            .try_get::<Option<String>, _>("refresh_token")
-            .ok()
-            .flatten(),
-        token_scope: row
-            .try_get::<Option<String>, _>("token_scope")
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
+    Ok(connection_record_from_row(&row))
+}
+
+/// Mappa una riga della join users/github_connections nel record applicativo,
+/// tollerando colonne mancanti o NULL (accessi via `try_get`).
+fn connection_record_from_row(row: &sqlx::postgres::PgRow) -> GitHubConnectionRecord {
+    let opt_str = |column: &str| row.try_get::<Option<String>, _>(column).ok().flatten();
+
+    GitHubConnectionRecord {
+        github_username: opt_str("github_username").or_else(|| opt_str("user_github_username")),
+        avatar_url: opt_str("avatar_url"),
+        connection_status: opt_str("connection_status"),
+        access_token: opt_str("access_token"),
+        refresh_token: opt_str("refresh_token"),
+        token_scope: opt_str("token_scope").unwrap_or_default(),
         access_token_expires_at: row
             .try_get::<Option<DateTime<Utc>>, _>("access_token_expires_at")
             .ok()
             .flatten(),
-    })
+    }
 }
 
 fn is_expired(expires_at: Option<DateTime<Utc>>) -> bool {
@@ -691,6 +675,27 @@ pub(crate) async fn ensure_github_authorized_user(
     }))
 }
 
+/// Costruisce un summary in stato non-connesso/degradato riutilizzando i campi
+/// comuni del record (avatar, expires_at, username fallback). `connected` e'
+/// sempre falso per questi stati.
+fn degraded_account_summary(
+    record: &GitHubConnectionRecord,
+    username: Option<String>,
+    status: &str,
+    scopes: Vec<String>,
+) -> GitHubAccountSummary {
+    GitHubAccountSummary {
+        username,
+        avatar_url: record.avatar_url.clone(),
+        status: status.to_string(),
+        connected: false,
+        scopes,
+        expires_at: record
+            .access_token_expires_at
+            .map(|value| value.to_rfc3339()),
+    }
+}
+
 pub(crate) async fn github_account_summary(
     db: &PgPool,
     user_id: Uuid,
@@ -711,33 +716,26 @@ pub(crate) async fn github_account_summary(
     }
 
     if record.connection_status.is_none() || record.access_token.is_none() {
-        return Ok(GitHubAccountSummary {
-            username: fallback_username.clone(),
-            avatar_url: record.avatar_url,
-            status: if fallback_username.is_some() {
-                "upgrade_required".to_string()
-            } else {
-                "not_connected".to_string()
-            },
-            connected: false,
+        let status = if fallback_username.is_some() {
+            "upgrade_required"
+        } else {
+            "not_connected"
+        };
+        return Ok(degraded_account_summary(
+            &record,
+            fallback_username,
+            status,
             scopes,
-            expires_at: record
-                .access_token_expires_at
-                .map(|value| value.to_rfc3339()),
-        });
+        ));
     }
 
     if !has_required_scopes(&scopes) {
-        return Ok(GitHubAccountSummary {
-            username: fallback_username,
-            avatar_url: record.avatar_url,
-            status: "upgrade_required".to_string(),
-            connected: false,
+        return Ok(degraded_account_summary(
+            &record,
+            fallback_username,
+            "upgrade_required",
             scopes,
-            expires_at: record
-                .access_token_expires_at
-                .map(|value| value.to_rfc3339()),
-        });
+        ));
     }
 
     match ensure_github_authorized_user(db, user_id).await {
@@ -749,29 +747,39 @@ pub(crate) async fn github_account_summary(
             scopes: authorized.scopes,
             expires_at: authorized.expires_at.map(|value| value.to_rfc3339()),
         }),
-        Ok(None) => Ok(GitHubAccountSummary {
-            username: fallback_username,
-            avatar_url: record.avatar_url,
-            status: "reconnect_required".to_string(),
-            connected: false,
+        Ok(None) => Ok(degraded_account_summary(
+            &record,
+            fallback_username,
+            "reconnect_required",
             scopes,
-            expires_at: record
-                .access_token_expires_at
-                .map(|value| value.to_rfc3339()),
-        }),
+        )),
         Err(error) => {
             tracing::warn!("GitHub connection refresh failed for {user_id}: {error}");
-            Ok(GitHubAccountSummary {
-                username: fallback_username,
-                avatar_url: record.avatar_url,
-                status: "reconnect_required".to_string(),
-                connected: false,
+            Ok(degraded_account_summary(
+                &record,
+                fallback_username,
+                "reconnect_required",
                 scopes,
-                expires_at: record
-                    .access_token_expires_at
-                    .map(|value| value.to_rfc3339()),
-            })
+            ))
         }
+    }
+}
+
+/// Costruisce la risoluzione SSH da un path `owner/repo` estratto dopo il prefisso
+/// git@ / ssh://; il `repo` viene ripulito dal suffisso `.git`.
+fn ssh_remote_resolution(
+    remote_name: &str,
+    remote_url: &str,
+    path: &str,
+) -> GitHubRemoteResolution {
+    let parts = path.split('/').collect::<Vec<_>>();
+    GitHubRemoteResolution::GitHubSsh {
+        remote_name: remote_name.to_string(),
+        remote_url: remote_url.to_string(),
+        owner: parts.first().map(|value| (*value).to_string()),
+        repo: parts
+            .get(1)
+            .map(|value| value.trim_end_matches(".git").to_string()),
     }
 }
 
@@ -784,23 +792,11 @@ fn parse_github_remote_url(remote_name: &str, remote_url: &str) -> GitHubRemoteR
     let normalize_repo = |raw: &str| raw.trim_end_matches(".git").to_string();
 
     if let Some(path) = trimmed.strip_prefix("git@github.com:") {
-        let parts = path.split('/').collect::<Vec<_>>();
-        return GitHubRemoteResolution::GitHubSsh {
-            remote_name: remote_name.to_string(),
-            remote_url: trimmed.to_string(),
-            owner: parts.first().map(|value| (*value).to_string()),
-            repo: parts.get(1).map(|value| normalize_repo(value)),
-        };
+        return ssh_remote_resolution(remote_name, trimmed, path);
     }
 
     if let Some(path) = trimmed.strip_prefix("ssh://git@github.com/") {
-        let parts = path.split('/').collect::<Vec<_>>();
-        return GitHubRemoteResolution::GitHubSsh {
-            remote_name: remote_name.to_string(),
-            remote_url: trimmed.to_string(),
-            owner: parts.first().map(|value| (*value).to_string()),
-            repo: parts.get(1).map(|value| normalize_repo(value)),
-        };
+        return ssh_remote_resolution(remote_name, trimmed, path);
     }
 
     match reqwest::Url::parse(trimmed) {
@@ -945,32 +941,114 @@ async fn read_last_commit_title(root: &std::path::Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Costruisce un response in stato "non pubblicabile su GitHub" (available=false)
+/// popolando i campi comuni da `branch_status`/`last_commit_title`. I campi
+/// specifici del remote (reason, nome/url, owner/repo) sono passati esplicitamente.
+fn unavailable_remote_status(
+    reason: &str,
+    remote_name: Option<String>,
+    remote_url: Option<String>,
+    owner: Option<String>,
+    repo: Option<String>,
+    branch_status: BranchRemoteStatus,
+    last_commit_title: Option<String>,
+) -> GitHubRemoteStatusResponse {
+    let repo_full_name = owner
+        .as_ref()
+        .zip(repo.as_ref())
+        .map(|(left, right)| format!("{left}/{right}"));
+    let published = branch_status.upstream.is_some();
+    GitHubRemoteStatusResponse {
+        available: false,
+        reason: reason.to_string(),
+        remote_name,
+        remote_url,
+        owner,
+        repo,
+        repo_full_name,
+        branch: branch_status.branch,
+        upstream: branch_status.upstream,
+        ahead: branch_status.ahead,
+        behind: branch_status.behind,
+        published,
+        default_branch: None,
+        can_push_pull: false,
+        suggested_pr_title: last_commit_title.clone(),
+        last_commit_title,
+        pull_request: None,
+        api_error: None,
+    }
+}
+
+/// Arricchisce il response di un remote GitHub HTTPS con i dati che richiedono
+/// il token utente: `default_branch` del repo e l'eventuale PR aperta per il
+/// branch corrente. Gli errori API sono catturati in `api_error`.
+async fn enrich_https_remote_status(
+    db: &PgPool,
+    user_id: Uuid,
+    remote: &GitHubHttpsRemote,
+    branch: Option<&str>,
+    response: &mut GitHubRemoteStatusResponse,
+) -> anyhow::Result<()> {
+    let Some(authorized) = ensure_github_authorized_user(db, user_id).await? else {
+        return Ok(());
+    };
+    response.can_push_pull = true;
+    let repo_url = format!(
+        "https://api.github.com/repos/{}/{}",
+        remote.owner, remote.repo
+    );
+    match github_api_get::<GitHubRepoResponse>(&authorized.access_token, &repo_url).await {
+        Ok(repo_info) => response.default_branch = Some(repo_info.default_branch),
+        Err(error) => response.api_error = Some(error.to_string()),
+    }
+
+    if response.api_error.is_some() {
+        return Ok(());
+    }
+    let Some(branch) = branch.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let pulls_url = format!(
+        "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=open&per_page=1",
+        remote.owner, remote.repo, remote.owner, branch
+    );
+    match github_api_get::<Vec<GitHubPullRequestResponse>>(&authorized.access_token, &pulls_url)
+        .await
+    {
+        Ok(mut pulls) => {
+            if let Some(pr) = pulls.drain(..).next() {
+                response.pull_request = Some(GitHubPullRequestSummary {
+                    number: pr.number,
+                    html_url: pr.html_url,
+                    title: pr.title,
+                    state: pr.state,
+                });
+            }
+        }
+        Err(error) => response.api_error = Some(error.to_string()),
+    }
+    Ok(())
+}
+
 async fn build_remote_status(
     db: &PgPool,
     user_id: Uuid,
     context: &ProjectContext,
 ) -> anyhow::Result<GitHubRemoteStatusResponse> {
     if !context.is_git_repo {
-        return Ok(GitHubRemoteStatusResponse {
-            available: false,
-            reason: "not_git_repo".to_string(),
-            remote_name: None,
-            remote_url: None,
-            owner: None,
-            repo: None,
-            repo_full_name: None,
-            branch: context.current_branch.clone(),
-            upstream: None,
-            ahead: 0,
-            behind: 0,
-            published: false,
-            default_branch: None,
-            can_push_pull: false,
-            suggested_pr_title: None,
-            last_commit_title: None,
-            pull_request: None,
-            api_error: None,
-        });
+        return Ok(unavailable_remote_status(
+            "not_git_repo",
+            None,
+            None,
+            None,
+            None,
+            BranchRemoteStatus {
+                branch: context.current_branch.clone(),
+                ..BranchRemoteStatus::default()
+            },
+            None,
+        ));
     }
 
     let (status_stdout, _) = run_git_command(
@@ -982,81 +1060,43 @@ async fn build_remote_status(
     let last_commit_title = read_last_commit_title(&context.repository_root_path).await;
 
     match load_origin_remote(&context.repository_root_path).await {
-        GitHubRemoteResolution::Missing => Ok(GitHubRemoteStatusResponse {
-            available: false,
-            reason: "missing_origin_remote".to_string(),
-            remote_name: Some("origin".to_string()),
-            remote_url: None,
-            owner: None,
-            repo: None,
-            repo_full_name: None,
-            branch: branch_status.branch,
-            upstream: branch_status.upstream,
-            ahead: branch_status.ahead,
-            behind: branch_status.behind,
-            published: false,
-            default_branch: None,
-            can_push_pull: false,
-            suggested_pr_title: last_commit_title.clone(),
+        GitHubRemoteResolution::Missing => Ok(unavailable_remote_status(
+            "missing_origin_remote",
+            Some("origin".to_string()),
+            None,
+            None,
+            None,
+            branch_status,
             last_commit_title,
-            pull_request: None,
-            api_error: None,
-        }),
+        )),
         GitHubRemoteResolution::Other {
             remote_name,
             remote_url,
-        } => Ok(GitHubRemoteStatusResponse {
-            available: false,
-            reason: "non_github_remote".to_string(),
-            remote_name: Some(remote_name),
-            remote_url: Some(remote_url),
-            owner: None,
-            repo: None,
-            repo_full_name: None,
-            branch: branch_status.branch,
-            upstream: branch_status.upstream,
-            ahead: branch_status.ahead,
-            behind: branch_status.behind,
-            published: false,
-            default_branch: None,
-            can_push_pull: false,
-            suggested_pr_title: last_commit_title.clone(),
+        } => Ok(unavailable_remote_status(
+            "non_github_remote",
+            Some(remote_name),
+            Some(remote_url),
+            None,
+            None,
+            branch_status,
             last_commit_title,
-            pull_request: None,
-            api_error: None,
-        }),
+        )),
         GitHubRemoteResolution::GitHubSsh {
             remote_name,
             remote_url,
             owner,
             repo,
-        } => {
-            let published = branch_status.upstream.is_some();
-            Ok(GitHubRemoteStatusResponse {
-                available: false,
-                reason: "ssh_remote_unsupported".to_string(),
-                remote_name: Some(remote_name),
-                remote_url: Some(remote_url),
-                repo_full_name: owner
-                    .as_ref()
-                    .zip(repo.as_ref())
-                    .map(|(left, right)| format!("{left}/{right}")),
-                owner,
-                repo,
-                branch: branch_status.branch,
-                upstream: branch_status.upstream,
-                ahead: branch_status.ahead,
-                behind: branch_status.behind,
-                published,
-                default_branch: None,
-                can_push_pull: false,
-                suggested_pr_title: last_commit_title.clone(),
-                last_commit_title,
-                pull_request: None,
-                api_error: None,
-            })
-        }
+        } => Ok(unavailable_remote_status(
+            "ssh_remote_unsupported",
+            Some(remote_name),
+            Some(remote_url),
+            owner,
+            repo,
+            branch_status,
+            last_commit_title,
+        )),
         GitHubRemoteResolution::GitHubHttps(remote) => {
+            let branch = branch_status.branch.clone();
             let mut response = GitHubRemoteStatusResponse {
                 available: true,
                 reason: "github_https".to_string(),
@@ -1080,60 +1120,8 @@ async fn build_remote_status(
                 api_error: None,
             };
 
-            if let Some(authorized) = ensure_github_authorized_user(db, user_id).await? {
-                response.can_push_pull = true;
-                let repo_url = format!(
-                    "https://api.github.com/repos/{}/{}",
-                    remote.owner, remote.repo
-                );
-                match github_api_get::<GitHubRepoResponse>(&authorized.access_token, &repo_url)
-                    .await
-                {
-                    Ok(repo_info) => {
-                        response.default_branch = Some(repo_info.default_branch);
-                    }
-                    Err(error) => {
-                        response.api_error = Some(error.to_string());
-                    }
-                }
-
-                if response.api_error.is_none() {
-                    if let Some(branch) = branch_status
-                        .branch
-                        .as_deref()
-                        .filter(|value| !value.is_empty())
-                    {
-                        let pulls_url = format!(
-                            "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=open&per_page=1",
-                            remote.owner,
-                            remote.repo,
-                            remote.owner,
-                            branch
-                        );
-                        match github_api_get::<Vec<GitHubPullRequestResponse>>(
-                            &authorized.access_token,
-                            &pulls_url,
-                        )
-                        .await
-                        {
-                            Ok(mut pulls) => {
-                                if let Some(pr) = pulls.drain(..).next() {
-                                    response.pull_request = Some(GitHubPullRequestSummary {
-                                        number: pr.number,
-                                        html_url: pr.html_url,
-                                        title: pr.title,
-                                        state: pr.state,
-                                    });
-                                }
-                            }
-                            Err(error) => {
-                                response.api_error = Some(error.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-
+            enrich_https_remote_status(db, user_id, &remote, branch.as_deref(), &mut response)
+                .await?;
             Ok(response)
         }
     }
@@ -1191,10 +1179,24 @@ fn github_auth_git_options(access_token: &str) -> GitCommandOptions {
     }
 }
 
-async fn list_github_repositories(
+/// Costruisce un URL della API repos con i query pair `type=owner` comuni ai
+/// due fallback (per-utente autenticato e endpoint pubblico per username).
+fn owner_repos_url(base: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base)?;
+    url.query_pairs_mut()
+        .append_pair("type", "owner")
+        .append_pair("sort", "updated")
+        .append_pair("per_page", "100");
+    Ok(url)
+}
+
+/// Recupera i repository dell'utente provando in cascata: query principale
+/// (visibility=all), fallback owner sull'endpoint autenticato, fallback pubblico
+/// per username. In caso di triplo fallimento aggrega i tre errori.
+async fn fetch_user_repos(
     access_token: &str,
     username: &str,
-) -> anyhow::Result<Vec<GitHubRepositorySummary>> {
+) -> anyhow::Result<Vec<GitHubUserRepoResponse>> {
     let mut primary_url = reqwest::Url::parse("https://api.github.com/user/repos")?;
     primary_url
         .query_pairs_mut()
@@ -1203,49 +1205,44 @@ async fn list_github_repositories(
         .append_pair("sort", "updated")
         .append_pair("per_page", "100");
 
-    let repos_response = match github_api_get::<Vec<GitHubUserRepoResponse>>(
+    let primary_error = match github_api_get::<Vec<GitHubUserRepoResponse>>(
         access_token,
         primary_url.as_str(),
     )
     .await
     {
-        Ok(value) => value,
-        Err(primary_error) => {
-            let mut fallback_url = reqwest::Url::parse("https://api.github.com/user/repos")?;
-            fallback_url
-                .query_pairs_mut()
-                .append_pair("type", "owner")
-                .append_pair("sort", "updated")
-                .append_pair("per_page", "100");
-
-            match github_api_get::<Vec<GitHubUserRepoResponse>>(access_token, fallback_url.as_str())
-                .await
-            {
-                Ok(value) => value,
-                Err(fallback_error) => {
-                    let mut public_fallback = reqwest::Url::parse(&format!(
-                        "https://api.github.com/users/{username}/repos"
-                    ))?;
-                    public_fallback
-                        .query_pairs_mut()
-                        .append_pair("type", "owner")
-                        .append_pair("sort", "updated")
-                        .append_pair("per_page", "100");
-
-                    github_api_get::<Vec<GitHubUserRepoResponse>>(access_token, public_fallback.as_str())
-                        .await
-                        .map_err(|public_fallback_error| {
-                            anyhow::anyhow!(
-                                "Impossibile caricare i repository GitHub (query principale: {:#}; fallback owner: {:#}; fallback users: {:#})",
-                                primary_error,
-                                fallback_error,
-                                public_fallback_error
-                            )
-                        })?
-                }
-            }
-        }
+        Ok(value) => return Ok(value),
+        Err(error) => error,
     };
+
+    let fallback_url = owner_repos_url("https://api.github.com/user/repos")?;
+    let fallback_error =
+        match github_api_get::<Vec<GitHubUserRepoResponse>>(access_token, fallback_url.as_str())
+            .await
+        {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+
+    let public_fallback =
+        owner_repos_url(&format!("https://api.github.com/users/{username}/repos"))?;
+    github_api_get::<Vec<GitHubUserRepoResponse>>(access_token, public_fallback.as_str())
+        .await
+        .map_err(|public_fallback_error| {
+            anyhow::anyhow!(
+                "Impossibile caricare i repository GitHub (query principale: {:#}; fallback owner: {:#}; fallback users: {:#})",
+                primary_error,
+                fallback_error,
+                public_fallback_error
+            )
+        })
+}
+
+async fn list_github_repositories(
+    access_token: &str,
+    username: &str,
+) -> anyhow::Result<Vec<GitHubRepositorySummary>> {
+    let repos_response = fetch_user_repos(access_token, username).await?;
 
     let mut repos = repos_response
         .into_iter()
@@ -1332,12 +1329,7 @@ pub async fn github_clone_repository(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let context = load_project_context(&state.db, project_id, user_id).await?;
 
-    if !context.access.can_manage_git {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "Non hai permessi Git su questo progetto",
-        ));
-    }
+    require_git_management(&context)?;
     if context.is_git_repo {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1361,10 +1353,6 @@ pub async fn github_clone_repository(
             ))
         }
     };
-    let remote_owner = remote.owner.clone();
-    let remote_repo = remote.repo.clone();
-    let remote_clone_url = remote.remote_url.clone();
-
     let authorized = ensure_github_authorized_user(&state.db, user_id)
         .await
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
@@ -1383,52 +1371,91 @@ pub async fn github_clone_repository(
     };
 
     if !is_empty {
-        // Derive a clean directory name from the repo name
-        let dir_name = remote_repo
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-            .collect::<String>();
-        let dir_name = if dir_name.is_empty() {
-            "repo".to_string()
-        } else {
-            dir_name
-        };
-
-        let base_root = crate::projects::load_projects_base_root(&state.db).await?;
-        let dest = base_root.join(&dir_name);
-
-        if !tokio::fs::try_exists(&dest).await.unwrap_or(false) {
-            tokio::fs::create_dir_all(&dest)
-                .await
-                .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        }
-
-        let git_options = github_auth_git_options(&authorized.access_token);
-        let clone_result = run_git_command_with_options(
-            &dest,
-            &["clone", remote_clone_url.as_str(), "."],
-            &git_options,
-        )
-        .await;
-
-        if let Err(error) = clone_result {
-            return Err(api_error(StatusCode::BAD_REQUEST, error.to_string()));
-        }
-
-        // Register the new project and return it
-        let register_body = crate::projects::RegisterProjectRequest {
-            absolute_path: dest.to_string_lossy().to_string(),
-            name: Some(remote_repo.clone()),
-        };
-        return crate::projects::register_project(
-            State(state),
-            Extension(claims),
-            axum::Json(register_body),
-        )
-        .await;
+        return clone_into_new_project(state, claims, &authorized.access_token, &remote).await;
     }
 
-    let git_options = github_auth_git_options(&authorized.access_token);
+    clone_in_place(
+        &state,
+        user_id,
+        project_id,
+        context,
+        &authorized.access_token,
+        &remote,
+    )
+    .await
+}
+
+/// Percorso "directory non vuota": clona il repository in una nuova sottocartella
+/// dentro `projects_base_root` (nome derivato dal repo, ripulito) e lo registra
+/// come progetto separato, ritornando il progetto appena creato.
+async fn clone_into_new_project(
+    state: AppState,
+    claims: Claims,
+    access_token: &str,
+    remote: &GitHubHttpsRemote,
+) -> ApiResult {
+    // Derive a clean directory name from the repo name
+    let dir_name = remote
+        .repo
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .collect::<String>();
+    let dir_name = if dir_name.is_empty() {
+        "repo".to_string()
+    } else {
+        dir_name
+    };
+
+    let base_root = crate::projects::load_projects_base_root(&state.db).await?;
+    let dest = base_root.join(&dir_name);
+
+    if !tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+        tokio::fs::create_dir_all(&dest)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    let git_options = github_auth_git_options(access_token);
+    let clone_result = run_git_command_with_options(
+        &dest,
+        &["clone", remote.remote_url.as_str(), "."],
+        &git_options,
+    )
+    .await;
+
+    if let Err(error) = clone_result {
+        return Err(api_error(StatusCode::BAD_REQUEST, error.to_string()));
+    }
+
+    // Register the new project and return it
+    let register_body = crate::projects::RegisterProjectRequest {
+        absolute_path: dest.to_string_lossy().to_string(),
+        name: Some(remote.repo.clone()),
+    };
+    crate::projects::register_project(
+        State(state),
+        Extension(claims),
+        axum::Json(register_body),
+    )
+    .await
+}
+
+/// Percorso "directory vuota": clona il repository nella root del progetto,
+/// aggiorna la riga `repositories`, registra l'operazione git e ritorna lo
+/// snapshot aggiornato. Su fallita clonazione registra l'errore e ritorna 400.
+async fn clone_in_place(
+    state: &AppState,
+    user_id: Uuid,
+    project_id: Uuid,
+    context: ProjectContext,
+    access_token: &str,
+    remote: &GitHubHttpsRemote,
+) -> ApiResult {
+    let remote_owner = &remote.owner;
+    let remote_repo = &remote.repo;
+    let remote_clone_url = &remote.remote_url;
+
+    let git_options = github_auth_git_options(access_token);
     let clone_result = run_git_command_with_options(
         &context.repository_root_path,
         &["clone", remote_clone_url.as_str(), "."],
@@ -1569,6 +1596,35 @@ pub async fn github_project_status(
     Ok(Json(json!({ "github": status })))
 }
 
+/// Verifica che il chiamante possa gestire git sul progetto (403 altrimenti).
+fn require_git_management(context: &ProjectContext) -> Result<(), ApiError> {
+    if context.access.can_manage_git {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Non hai permessi Git su questo progetto",
+        ))
+    }
+}
+
+/// Calcola lo stato del remote e verifica che sia un remote GitHub HTTPS
+/// (`reason == "github_https"`); altrimenti ritorna 400 con `unsupported_msg`.
+async fn github_https_status_or_error(
+    db: &PgPool,
+    user_id: Uuid,
+    context: &ProjectContext,
+    unsupported_msg: &'static str,
+) -> Result<GitHubRemoteStatusResponse, ApiError> {
+    let status = build_remote_status(db, user_id, context)
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if status.reason != "github_https" {
+        return Err(api_error(StatusCode::BAD_REQUEST, unsupported_msg));
+    }
+    Ok(status)
+}
+
 pub async fn github_publish_branch(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -1579,12 +1635,7 @@ pub async fn github_publish_branch(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let context = load_project_context(&state.db, project_id, user_id).await?;
 
-    if !context.access.can_manage_git {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "Non hai permessi Git su questo progetto",
-        ));
-    }
+    require_git_management(&context)?;
     if !context.is_git_repo {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1592,15 +1643,13 @@ pub async fn github_publish_branch(
         ));
     }
 
-    let status = build_remote_status(&state.db, user_id, &context)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
-    if status.reason != "github_https" {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Publish branch supporta solo remote https://github.com",
-        ));
-    }
+    let status = github_https_status_or_error(
+        &state.db,
+        user_id,
+        &context,
+        "Publish branch supporta solo remote https://github.com",
+    )
+    .await?;
     let branch = status
         .branch
         .clone()
@@ -1666,16 +1715,28 @@ pub async fn github_create_pull_request(
             )
         })?;
 
-    let status = build_remote_status(&state.db, user_id, &context)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
-    if status.reason != "github_https" {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Create PR supporta solo remote https://github.com",
-        ));
+    let status = github_https_status_or_error(
+        &state.db,
+        user_id,
+        &context,
+        "Create PR supporta solo remote https://github.com",
+    )
+    .await?;
+
+    if let Some(existing) = &status.pull_request {
+        return Ok(Json(json!({ "created": false, "pullRequest": existing })));
     }
 
+    submit_pull_request(&authorized.access_token, &status, body).await
+}
+
+/// Deriva i parametri della pull request dallo stato del remote e dal body
+/// (owner/repo/head/base/title, con default sensati) e la apre via API GitHub.
+async fn submit_pull_request(
+    access_token: &str,
+    status: &GitHubRemoteStatusResponse,
+    body: GitHubCreatePullRequestRequest,
+) -> ApiResult {
     let owner = status
         .owner
         .clone()
@@ -1689,10 +1750,6 @@ pub async fn github_create_pull_request(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Branch corrente non disponibile"))?;
-
-    if let Some(existing) = status.pull_request {
-        return Ok(Json(json!({ "created": false, "pullRequest": existing })));
-    }
 
     let base_branch = body
         .base_branch
@@ -1711,7 +1768,7 @@ pub async fn github_create_pull_request(
     };
 
     let pr = github_api_post::<GitHubPullRequestResponse>(
-        &authorized.access_token,
+        access_token,
         &format!("https://api.github.com/repos/{owner}/{repo}/pulls"),
         json!({
             "title": title,
@@ -1734,6 +1791,81 @@ pub async fn github_create_pull_request(
     })))
 }
 
+/// Valida il nome repository: solo alfanumerico e i separatori ammessi da GitHub
+/// (`-`, `_`, `.`). Ritorna 400 se contiene caratteri non consentiti.
+fn validate_repo_name(name: &str) -> Result<(), ApiError> {
+    if name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome repository non valido (solo alfanumerico, '-', '_', '.')",
+        ))
+    }
+}
+
+/// Estrae un campo stringa dalla risposta GitHub, con default se assente/non stringa.
+fn github_repo_field(body: &serde_json::Value, key: &str, default: &str) -> String {
+    body.get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(default)
+        .to_string()
+}
+
+/// Costruisce l'errore standard "GitHub API <status> — <message>" dal corpo di risposta.
+fn github_repo_api_error(status: reqwest::StatusCode, body: &serde_json::Value) -> ApiError {
+    let msg = body
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("errore sconosciuto");
+    api_error(
+        StatusCode::BAD_REQUEST,
+        format!("GitHub API {} — {}", status, msg),
+    )
+}
+
+/// Esegue `POST /user/repos` col token utente e ritorna status e corpo JSON grezzo.
+/// La gestione degli status non-success e' lasciata al chiamante (create vs publish
+/// hanno semantiche diverse sul conflitto 422).
+async fn create_repo_via_api(
+    access_token: &str,
+    name: &str,
+    private: bool,
+    description: &str,
+    auto_init: bool,
+) -> Result<(reqwest::StatusCode, serde_json::Value), ApiError> {
+    let client = Client::builder()
+        .user_agent("nexus-mcp-core")
+        .build()
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("http client: {}", e),
+            )
+        })?;
+
+    let resp = client
+        .post("https://api.github.com/user/repos")
+        .bearer_auth(access_token)
+        .header("Accept", "application/vnd.github+json")
+        .json(&json!({
+            "name": name,
+            "private": private,
+            "description": description,
+            "auto_init": auto_init,
+        }))
+        .send()
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("GitHub API call: {}", e)))?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    Ok((status, resp_body))
+}
+
 /// Fix M15: POST /api/projects/:id/github/create-repo
 /// Crea un nuovo repository GitHub per l'utente connesso e configura origin remote
 /// nel progetto target. Risolve il flow E2E "create new project on GitHub" che oggi
@@ -1752,12 +1884,7 @@ pub async fn github_create_repo(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let context = load_project_context(&state.db, project_id, user_id).await?;
 
-    if !context.access.can_manage_git {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "Non hai permessi Git su questo progetto",
-        ));
-    }
+    require_git_management(&context)?;
 
     let authorized = ensure_github_authorized_user(&state.db, user_id)
         .await
@@ -1776,16 +1903,7 @@ pub async fn github_create_repo(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?;
 
-    // Validazione name: solo alfanumerico/dash/underscore/punto (GitHub allow)
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Nome repository non valido (solo alfanumerico, '-', '_', '.')",
-        ));
-    }
+    validate_repo_name(name)?;
 
     let private = body
         .get("private")
@@ -1801,64 +1919,18 @@ pub async fn github_create_repo(
         .unwrap_or(false);
 
     // ── Chiamata GitHub API: POST /user/repos ────────────────────────────
-    let client = Client::builder()
-        .user_agent("nexus-mcp-core")
-        .build()
-        .map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("http client: {}", e),
-            )
-        })?;
-
-    let resp = client
-        .post("https://api.github.com/user/repos")
-        .bearer_auth(&authorized.access_token)
-        .header("Accept", "application/vnd.github+json")
-        .json(&json!({
-            "name": name,
-            "private": private,
-            "description": description,
-            "auto_init": auto_init,
-        }))
-        .send()
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("GitHub API call: {}", e)))?;
-
-    let status = resp.status();
-    let resp_body: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    let (status, resp_body) =
+        create_repo_via_api(&authorized.access_token, name, private, description, auto_init)
+            .await?;
 
     if !status.is_success() {
-        let msg = resp_body
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("errore sconosciuto");
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            format!("GitHub API {} — {}", status, msg),
-        ));
+        return Err(github_repo_api_error(status, &resp_body));
     }
 
-    let clone_url = resp_body
-        .get("clone_url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let html_url = resp_body
-        .get("html_url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let full_name = resp_body
-        .get("full_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let default_branch = resp_body
-        .get("default_branch")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("main")
-        .to_string();
+    let clone_url = github_repo_field(&resp_body, "clone_url", "");
+    let html_url = github_repo_field(&resp_body, "html_url", "");
+    let full_name = github_repo_field(&resp_body, "full_name", "");
+    let default_branch = github_repo_field(&resp_body, "default_branch", "main");
 
     // ── Configura origin remote sul progetto (idempotente) ──────────────
     let mut origin_configured = false;
@@ -1887,6 +1959,118 @@ pub async fn github_create_repo(
     })))
 }
 
+/// Prepara il repository git locale prima della pubblicazione: init con branch
+/// `main` se manca, `.gitignore` di default se assente, config user idempotente,
+/// quindi `add -A` + `commit` (il commit e' no-op se non ci sono modifiche).
+async fn prepare_local_git_repo(
+    root: &std::path::Path,
+    commit_message: &str,
+) -> Result<(), ApiError> {
+    // ── 1. Init git locale se manca ──────────────────────────────────────
+    let dot_git = root.join(".git");
+    if !tokio::fs::try_exists(&dot_git).await.unwrap_or(false) {
+        run_git_command(root, &["init", "-b", "main"])
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("git init: {e}")))?;
+    }
+
+    // .gitignore di default se manca
+    let gitignore_path = root.join(".gitignore");
+    if !tokio::fs::try_exists(&gitignore_path).await.unwrap_or(false) {
+        let default_gitignore = "# Dependencies\nnode_modules/\n.pnpm-store/\n\n# Build output\ndist/\nbuild/\n.next/\n.turbo/\nout/\ntarget/\n\n# Environment\n.env\n.env.local\n.env.*.local\n!.env.example\n\n# Logs\n*.log\nnpm-debug.log*\npnpm-debug.log*\n\n# Editor\n.vscode/\n.idea/\n*.swp\n*.swo\n.DS_Store\n\n# Test artifacts\nplaywright-report/\ntest-results/\ncoverage/\n\n# OS\nThumbs.db\n";
+        let _ = tokio::fs::write(&gitignore_path, default_gitignore).await;
+    }
+
+    // Configura user.email/name locali (idempotente) per consentire git commit
+    let _ = run_git_command(root, &["config", "user.email", "nexus@local"]).await;
+    let _ = run_git_command(root, &["config", "user.name", "Nexus"]).await;
+
+    // ── 2. add + commit (no-op se nulla da committare) ───────────────────
+    let _ = run_git_command(root, &["add", "-A"]).await;
+    // git commit ritorna errore se nulla da committare: ignoriamo (e' lecito ripubblicare)
+    let _ = run_git_command(root, &["commit", "-m", commit_message]).await;
+    Ok(())
+}
+
+/// Crea il repository su GitHub, oppure riusa quello esistente se GitHub risponde
+/// 422 "already exists" (via GET /repos/:owner/:repo). Ritorna il corpo JSON del
+/// repository (creato o riusato). Propaga 400 se il repo esiste ma non e' accessibile.
+async fn create_or_reuse_github_repo(
+    access_token: &str,
+    username: &str,
+    name: &str,
+    private: bool,
+    description: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let (status, resp_body) =
+        create_repo_via_api(access_token, name, private, description, false).await?;
+
+    // Idempotenza: se il repo esiste gia' (422 "name already exists on this
+    // account"), riusiamo quello esistente facendo GET /repos/:owner/:repo,
+    // cosi' il flusso "Pubblica su GitHub" funziona anche per
+    // ripubblicazioni e progetti gia' creati ma senza origin/push.
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        let already_exists = resp_body
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .map(|errs| {
+                errs.iter().any(|e| {
+                    e.get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|m| m.contains("already exists"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if already_exists {
+            return lookup_existing_repo(access_token, username, name).await;
+        }
+    }
+
+    if !status.is_success() {
+        return Err(github_repo_api_error(status, &resp_body));
+    }
+    Ok(resp_body)
+}
+
+/// Recupera il repository esistente `owner/name` via GET /repos. Ritorna 400 se
+/// il token non ha accesso (404/403), altrimenti il corpo JSON del repository.
+async fn lookup_existing_repo(
+    access_token: &str,
+    owner: &str,
+    name: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let client = Client::builder()
+        .user_agent("nexus-mcp-core")
+        .build()
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("http client: {}", e),
+            )
+        })?;
+    let lookup = client
+        .get(format!("https://api.github.com/repos/{}/{}", owner, name))
+        .bearer_auth(access_token)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("GitHub lookup: {}", e)))?;
+    if !lookup.status().is_success() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Il repository {}/{} esiste su GitHub ma non e' accessibile col tuo token (404/403). Verifica i permessi del token.",
+                owner, name
+            ),
+        ));
+    }
+    Ok(lookup
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|_| json!({})))
+}
+
 /// POST /api/projects/:id/github/publish
 ///
 /// Orchestrazione completa "pubblica progetto su GitHub":
@@ -1909,12 +2093,7 @@ pub async fn github_publish_project(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let context = load_project_context(&state.db, project_id, user_id).await?;
 
-    if !context.access.can_manage_git {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "Non hai permessi Git su questo progetto",
-        ));
-    }
+    require_git_management(&context)?;
 
     let authorized = ensure_github_authorized_user(&state.db, user_id)
         .await
@@ -1934,15 +2113,7 @@ pub async fn github_publish_project(
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?
         .to_string();
 
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Nome repository non valido (solo alfanumerico, '-', '_', '.')",
-        ));
-    }
+    validate_repo_name(&name)?;
 
     let private = body
         .get("private")
@@ -1962,144 +2133,23 @@ pub async fn github_publish_project(
 
     let root = context.root_path.clone();
 
-    // ── 1. Init git locale se manca ──────────────────────────────────────
-    let dot_git = root.join(".git");
-    if !tokio::fs::try_exists(&dot_git).await.unwrap_or(false) {
-        run_git_command(&root, &["init", "-b", "main"])
-            .await
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("git init: {e}")))?;
-    }
+    // ── 1-2. Prepara repo git locale (init, .gitignore, config, add+commit) ─
+    prepare_local_git_repo(&root, &commit_message).await?;
 
-    // .gitignore di default se manca
-    let gitignore_path = root.join(".gitignore");
-    if !tokio::fs::try_exists(&gitignore_path)
-        .await
-        .unwrap_or(false)
-    {
-        let default_gitignore = "# Dependencies\nnode_modules/\n.pnpm-store/\n\n# Build output\ndist/\nbuild/\n.next/\n.turbo/\nout/\ntarget/\n\n# Environment\n.env\n.env.local\n.env.*.local\n!.env.example\n\n# Logs\n*.log\nnpm-debug.log*\npnpm-debug.log*\n\n# Editor\n.vscode/\n.idea/\n*.swp\n*.swo\n.DS_Store\n\n# Test artifacts\nplaywright-report/\ntest-results/\ncoverage/\n\n# OS\nThumbs.db\n";
-        let _ = tokio::fs::write(&gitignore_path, default_gitignore).await;
-    }
+    // ── 3. Crea repo su GitHub (o riusa quello esistente su 422) ─────────
+    let resp_body = create_or_reuse_github_repo(
+        &authorized.access_token,
+        &authorized.username,
+        &name,
+        private,
+        &description,
+    )
+    .await?;
 
-    // Configura user.email/name locali (idempotente) per consentire git commit
-    let _ = run_git_command(&root, &["config", "user.email", "nexus@local"]).await;
-    let _ = run_git_command(&root, &["config", "user.name", "Nexus"]).await;
-
-    // ── 2. add + commit (no-op se nulla da committare) ───────────────────
-    let _ = run_git_command(&root, &["add", "-A"]).await;
-    // git commit ritorna errore se nulla da committare: ignoriamo (e' lecito ripubblicare)
-    let _ = run_git_command(&root, &["commit", "-m", &commit_message]).await;
-
-    // ── 3. Crea repo su GitHub ───────────────────────────────────────────
-    let client = Client::builder()
-        .user_agent("nexus-mcp-core")
-        .build()
-        .map_err(|e| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("http client: {}", e),
-            )
-        })?;
-
-    let resp = client
-        .post("https://api.github.com/user/repos")
-        .bearer_auth(&authorized.access_token)
-        .header("Accept", "application/vnd.github+json")
-        .json(&json!({
-            "name": &name,
-            "private": private,
-            "description": &description,
-            "auto_init": false,
-        }))
-        .send()
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("GitHub API call: {}", e)))?;
-
-    let status = resp.status();
-    let resp_body: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
-
-    // Idempotenza: se il repo esiste gia' (422 "name already exists on this
-    // account"), riusiamo quello esistente facendo GET /repos/:owner/:repo,
-    // cosi' il flusso "Pubblica su GitHub" funziona anche per
-    // ripubblicazioni e progetti gia' creati ma senza origin/push.
-    let reused = if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-        let already_exists = resp_body
-            .get("errors")
-            .and_then(serde_json::Value::as_array)
-            .map(|errs| {
-                errs.iter().any(|e| {
-                    e.get("message")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|m| m.contains("already exists"))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
-        if already_exists {
-            let owner = &authorized.username;
-            let lookup = client
-                .get(format!("https://api.github.com/repos/{}/{}", owner, name))
-                .bearer_auth(&authorized.access_token)
-                .header("Accept", "application/vnd.github+json")
-                .send()
-                .await
-                .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("GitHub lookup: {}", e)))?;
-            if !lookup.status().is_success() {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "Il repository {}/{} esiste su GitHub ma non e' accessibile col tuo token (404/403). Verifica i permessi del token.",
-                        owner, name
-                    ),
-                ));
-            }
-            Some(
-                lookup
-                    .json::<serde_json::Value>()
-                    .await
-                    .unwrap_or_else(|_| json!({})),
-            )
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let resp_body = if let Some(reused_body) = reused {
-        reused_body
-    } else if !status.is_success() {
-        let msg = resp_body
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("errore sconosciuto");
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            format!("GitHub API {} — {}", status, msg),
-        ));
-    } else {
-        resp_body
-    };
-
-    let clone_url = resp_body
-        .get("clone_url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let html_url = resp_body
-        .get("html_url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let full_name = resp_body
-        .get("full_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let default_branch = resp_body
-        .get("default_branch")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("main")
-        .to_string();
+    let clone_url = github_repo_field(&resp_body, "clone_url", "");
+    let html_url = github_repo_field(&resp_body, "html_url", "");
+    let full_name = github_repo_field(&resp_body, "full_name", "");
+    let default_branch = github_repo_field(&resp_body, "default_branch", "main");
 
     // ── 4. Configura origin (idempotente) ────────────────────────────────
     if !clone_url.is_empty() {
