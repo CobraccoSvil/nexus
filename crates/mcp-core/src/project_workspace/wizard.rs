@@ -2254,25 +2254,33 @@ async fn uninstall_project_service_systemd(
 
 /// Cerca ricorsivamente (BFS iterativo) file con un dato nome fino a max_depth livelli.
 /// Salta le directory irrilevanti per velocizzare la ricerca.
+/// Directory sempre da saltare in `find_files_named`: non contengono sorgenti
+/// propri del progetto.
+const FIND_FILES_SKIP: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".next",
+    ".turbo",
+    ".cache",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    "obj",
+    "bin", // .NET build output
+    ".terraform",
+    ".gradle", // build tools
+    "vendor",  // Go/PHP vendor
+];
+
+/// Helper di `find_files_named`: true se `path` sembra una build dir Rust (ha una
+/// sottodirectory `debug` o `release`), da saltare durante la ricerca.
+async fn is_rust_target(path: &std::path::Path) -> bool {
+    tokio::fs::metadata(path.join("debug")).await.is_ok()
+        || tokio::fs::metadata(path.join("release")).await.is_ok()
+}
+
 pub(super) async fn find_files_named(root: &str, filename: &str, max_depth: usize) -> Vec<String> {
-    // Directory sempre da saltare: non contengono sorgenti propri del progetto
-    const SKIP: &[&str] = &[
-        ".git",
-        "node_modules",
-        ".next",
-        ".turbo",
-        ".cache",
-        "__pycache__",
-        ".venv",
-        "venv",
-        "env",
-        "obj",
-        "bin", // .NET build output
-        ".terraform",
-        ".gradle", // build tools
-        "vendor",  // Go/PHP vendor
-    ];
-    // Salta "target" solo se contiene a sua volta "debug" o "release" (indice di build Rust)
     let mut results = Vec::new();
     let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> =
         std::collections::VecDeque::new();
@@ -2285,16 +2293,12 @@ pub(super) async fn find_files_named(root: &str, filename: &str, max_depth: usiz
         while let Ok(Some(entry)) = rd.next_entry().await {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if SKIP.contains(&name) {
+            if FIND_FILES_SKIP.contains(&name) {
                 continue;
             }
             // Salta "target/" solo se sembra una build Rust (ha "debug" o "release" al suo interno)
-            if name == "target" && path.is_dir() {
-                let is_rust_target = tokio::fs::metadata(path.join("debug")).await.is_ok()
-                    || tokio::fs::metadata(path.join("release")).await.is_ok();
-                if is_rust_target {
-                    continue;
-                }
+            if name == "target" && path.is_dir() && is_rust_target(&path).await {
+                continue;
             }
             if name == filename {
                 results.push(path.to_string_lossy().to_string());
@@ -2502,42 +2506,7 @@ pub(super) fn classify_role(
     }
 
     if kind == "npm" {
-        if let Some(pkg) = pkg {
-            let deps = pkg.get("dependencies").and_then(|v| v.as_object());
-            let dev_deps = pkg.get("devDependencies").and_then(|v| v.as_object());
-            let has_dep = |key: &str| -> bool {
-                deps.is_some_and(|d| d.contains_key(key))
-                    || dev_deps.is_some_and(|d| d.contains_key(key))
-            };
-            if has_dep("next")
-                || has_dep("react")
-                || has_dep("vite")
-                || has_dep("vue")
-                || has_dep("svelte")
-                || has_dep("astro")
-                || has_dep("@angular/core")
-            {
-                return "frontend";
-            }
-            if let Some(pkg_name) = pkg.get("name").and_then(|v| v.as_str()) {
-                let low = pkg_name.to_lowercase();
-                if low.contains("api")
-                    || low.contains("server")
-                    || low.contains("backend")
-                    || low.contains("gateway")
-                    || low.contains("service")
-                    || low.contains("worker")
-                    || low.contains("brain")
-                    || low.contains("mcp")
-                {
-                    return "backend";
-                }
-            }
-        }
-        if matches!(lname.as_str(), "dev" | "start" | "serve" | "preview") {
-            return "frontend";
-        }
-        return "tool";
+        return classify_npm_role(&lname, pkg);
     }
 
     if kind == "cargo" || kind == "python" {
@@ -2547,6 +2516,47 @@ pub(super) fn classify_role(
         return "backend";
     }
 
+    "tool"
+}
+
+/// Helper di `classify_role` per il caso `kind == "npm"`: deriva il ruolo dalle
+/// dipendenze (frontend), dal nome pacchetto (backend) e infine dallo script.
+fn classify_npm_role(lname: &str, pkg: Option<&serde_json::Value>) -> &'static str {
+    if let Some(pkg) = pkg {
+        let deps = pkg.get("dependencies").and_then(|v| v.as_object());
+        let dev_deps = pkg.get("devDependencies").and_then(|v| v.as_object());
+        let has_dep = |key: &str| -> bool {
+            deps.is_some_and(|d| d.contains_key(key))
+                || dev_deps.is_some_and(|d| d.contains_key(key))
+        };
+        if has_dep("next")
+            || has_dep("react")
+            || has_dep("vite")
+            || has_dep("vue")
+            || has_dep("svelte")
+            || has_dep("astro")
+            || has_dep("@angular/core")
+        {
+            return "frontend";
+        }
+        if let Some(pkg_name) = pkg.get("name").and_then(|v| v.as_str()) {
+            let low = pkg_name.to_lowercase();
+            if low.contains("api")
+                || low.contains("server")
+                || low.contains("backend")
+                || low.contains("gateway")
+                || low.contains("service")
+                || low.contains("worker")
+                || low.contains("brain")
+                || low.contains("mcp")
+            {
+                return "backend";
+            }
+        }
+    }
+    if matches!(lname, "dev" | "start" | "serve" | "preview") {
+        return "frontend";
+    }
     "tool"
 }
 
@@ -2679,13 +2689,10 @@ pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::P
     dirs
 }
 
-/// Estrae i member paths di un Cargo workspace dal Cargo.toml root (supporta glob `crates/*`).
-pub(super) fn collect_cargo_workspace_members(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+/// Helper di `collect_cargo_workspace_members`: estrae i pattern grezzi di
+/// `members` dalla sezione `[workspace]` del Cargo.toml (inline o multi-riga).
+fn parse_workspace_members(content: &str) -> Vec<String> {
     let mut raw: Vec<String> = Vec::new();
-    let content = match std::fs::read_to_string(root.join("Cargo.toml")) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
     let mut in_workspace = false;
     let mut in_members = false;
     for line in content.lines() {
@@ -2727,7 +2734,12 @@ pub(super) fn collect_cargo_workspace_members(root: &std::path::Path) -> Vec<std
             }
         }
     }
+    raw
+}
 
+/// Helper di `collect_cargo_workspace_members`: espande i pattern `raw` (con glob
+/// `crates/*`) in directory che contengono un `Cargo.toml`.
+fn espandi_membri_glob(root: &std::path::Path, raw: Vec<String>) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for m in raw {
         if let Some(prefix) = m.strip_suffix("/*") {
@@ -2748,6 +2760,16 @@ pub(super) fn collect_cargo_workspace_members(root: &std::path::Path) -> Vec<std
         }
     }
     out
+}
+
+/// Estrae i member paths di un Cargo workspace dal Cargo.toml root (supporta glob `crates/*`).
+pub(super) fn collect_cargo_workspace_members(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let content = match std::fs::read_to_string(root.join("Cargo.toml")) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let raw = parse_workspace_members(&content);
+    espandi_membri_glob(root, raw)
 }
 
 /// Parser minimale di docker-compose: estrae i nomi dei service al primo livello di indentazione.
