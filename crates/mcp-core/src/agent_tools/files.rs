@@ -71,18 +71,7 @@ async fn run_build_graph_preflight(ctx: &AgentToolContext, path_str: &str) -> Bu
             ))
         }
         crate::build_graph::BuildGraphMembership::OutOfGraph { reason } => {
-            // Recupera info per messaggio diagnostico.
-            let info_msg = match crate::build_graph::BuildGraphCache::global() {
-                Some(cache) => match cache.get_or_compute(ctx.project_id).await {
-                    Ok(info) => format!(
-                        " Build graph derivato da: {}. Include patterns: {}.",
-                        info.sources.join(", "),
-                        info.include_globs.join(", ")
-                    ),
-                    Err(_) => String::new(),
-                },
-                None => String::new(),
-            };
+            let info_msg = build_graph_out_of_graph_info(ctx.project_id).await;
             BuildGraphPreflight::Warn(format!(
                 "ATTENZIONE: '{}' NON e' nel build graph del progetto ({}). I file fuori dal build graph non vengono compilati ne eseguiti.{} Se il tuo obiettivo e' modificare codice di produzione, usa `nexus_build_graph_info` per verificare quale path e' nel build graph.",
                 path_str, reason, info_msg
@@ -91,6 +80,24 @@ async fn run_build_graph_preflight(ctx: &AgentToolContext, path_str: &str) -> Bu
         crate::build_graph::BuildGraphMembership::Unknown { .. }
         | crate::build_graph::BuildGraphMembership::InGraph { .. }
         | crate::build_graph::BuildGraphMembership::Entrypoint { .. } => BuildGraphPreflight::Allow,
+    }
+}
+
+/// Suffisso diagnostico per il warning "fuori dal build graph": sorgenti e
+/// include-pattern da cui il grafo e' derivato. Stringa vuota se la cache non
+/// e' disponibile o il calcolo fallisce (best-effort). Estratto da
+/// `run_build_graph_preflight` per brevita'.
+async fn build_graph_out_of_graph_info(project_id: uuid::Uuid) -> String {
+    match crate::build_graph::BuildGraphCache::global() {
+        Some(cache) => match cache.get_or_compute(project_id).await {
+            Ok(info) => format!(
+                " Build graph derivato da: {}. Include patterns: {}.",
+                info.sources.join(", "),
+                info.include_globs.join(", ")
+            ),
+            Err(_) => String::new(),
+        },
+        None => String::new(),
     }
 }
 
@@ -111,25 +118,8 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
     // Cap-byte difensivo (governance fs/read_max_bytes): un file enorme
     // (bundle, dump, lock) caricato integralmente satura il contesto e la
     // memoria. Soglia DB-driven (regola G); 0/assente = nessun cap.
-    let read_max_bytes: u64 = crate::settings::get_setting(&ctx.db, "agent.fs.read_max_bytes")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(2_097_152);
-    if read_max_bytes > 0 {
-        if let Ok(meta) = tokio::fs::metadata(&target).await {
-            if meta.len() > read_max_bytes {
-                return format!(
-                    "[Errore lettura '{}': file troppo grande ({} byte > limite {} byte). \
-                     Usa read_file_lines(path, start_line, end_line) per leggere una porzione, \
-                     o search_file_semantic per trovare le sezioni rilevanti.]",
-                    path_str,
-                    meta.len(),
-                    read_max_bytes
-                );
-            }
-        }
+    if let Some(err) = read_max_bytes_guard(ctx, &target, path_str).await {
+        return err;
     }
 
     let content = match tokio::fs::read_to_string(&target).await {
@@ -143,26 +133,6 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
         return content;
     }
 
-    // File grande: anteponiamo una mappa strutturale per orientare l'agente.
-    // Per i file medio-grandi restituiamo il contenuto INTEGRALE subito dopo
-    // (politica "mai troncare-e-buttare": nessuna riga persa). MA oltre una soglia
-    // di RIGHE il contenuto integrale satura il contesto e, se l'agente rilegge
-    // identicamente read_file (non avendo trovato subito la sezione), innesca un
-    // loop REALE: incidente bookingService.ts 1711 righe -> 3 read_file identiche
-    // -> loop_detected -> abort, senza che il file venisse mai usato. Oltre la
-    // soglia si rimanda a read_file_lines guidati dalla mappa, come gia' fa il
-    // cap-byte sopra. Soglia DB-driven (regola G); 0/assente = sempre integrale.
-    let structure = extract_file_structure(&content);
-    let structure_map: String = if structure.is_empty() {
-        "  (nessuna struttura rilevata automaticamente)".to_string()
-    } else {
-        structure
-            .iter()
-            .map(|(ln, desc)| format!("  riga {:>4} — {}", ln, desc))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
     let read_full_max_lines: usize =
         crate::settings::get_setting(&ctx.db, "agent.fs.read_full_max_lines")
             .await
@@ -170,6 +140,73 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
             .flatten()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(1200);
+    render_large_file_response(&content, total_lines, path_str, read_full_max_lines)
+}
+
+/// Cap-byte difensivo sulla lettura integrale: se il file supera la soglia
+/// `agent.fs.read_max_bytes` (DB-driven, regola G; 0/assente = nessun cap)
+/// ritorna `Some(messaggio_errore)` che invita a `read_file_lines`. Estratto da
+/// `tool_read_file`.
+async fn read_max_bytes_guard(
+    ctx: &AgentToolContext,
+    target: &Path,
+    path_str: &str,
+) -> Option<String> {
+    let read_max_bytes: u64 = crate::settings::get_setting(&ctx.db, "agent.fs.read_max_bytes")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2_097_152);
+    if read_max_bytes == 0 {
+        return None;
+    }
+    let meta = tokio::fs::metadata(target).await.ok()?;
+    if meta.len() > read_max_bytes {
+        return Some(format!(
+            "[Errore lettura '{}': file troppo grande ({} byte > limite {} byte). \
+             Usa read_file_lines(path, start_line, end_line) per leggere una porzione, \
+             o search_file_semantic per trovare le sezioni rilevanti.]",
+            path_str,
+            meta.len(),
+            read_max_bytes
+        ));
+    }
+    None
+}
+
+/// Compone la risposta per un file "grande" (oltre `READ_FILE_STRUCTURE_HINT_LINES`
+/// righe): antepone una mappa strutturale per orientare l'agente. Per i file
+/// medio-grandi restituisce il contenuto INTEGRALE subito dopo (politica "mai
+/// troncare-e-buttare": nessuna riga persa). MA oltre `read_full_max_lines` il
+/// contenuto integrale satura il contesto e, se l'agente rilegge identicamente
+/// read_file (non avendo trovato subito la sezione), innesca un loop REALE:
+/// incidente bookingService.ts 1711 righe -> 3 read_file identiche ->
+/// loop_detected -> abort. Oltre la soglia si rimanda a read_file_lines guidati
+/// dalla mappa (0/assente = sempre integrale). Estratto da `tool_read_file`.
+/// Formatta la mappa strutturale (righe "  riga NNNN — descrizione") a partire
+/// dalle definizioni estratte da `extract_file_structure`; placeholder se vuota.
+/// Estratto da `render_large_file_response`.
+fn format_structure_map(structure: &[(usize, String)]) -> String {
+    if structure.is_empty() {
+        return "  (nessuna struttura rilevata automaticamente)".to_string();
+    }
+    structure
+        .iter()
+        .map(|(ln, desc)| format!("  riga {:>4} — {}", ln, desc))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_large_file_response(
+    content: &str,
+    total_lines: usize,
+    path_str: &str,
+    read_full_max_lines: usize,
+) -> String {
+    let structure = extract_file_structure(content);
+    let structure_map = format_structure_map(&structure);
+
     if read_full_max_lines > 0 && total_lines > read_full_max_lines {
         return format!(
             "[FILE GRANDE — {total_lines} righe — troppo lungo per la lettura integrale]\n\
@@ -205,44 +242,57 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
     )
 }
 
-pub(super) async fn tool_read_file_lines(ctx: &AgentToolContext, input: &Value) -> String {
-    let path_str = match input.get("path").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "[Errore: parametro 'path' mancante]".to_string(),
-    };
-
-    // Accetta sia start_line/end_line (parametri corretti) sia offset/limit (alias
-    // usati erroneamente da alcune istruzioni del supervisor — mappati automaticamente
-    // per evitare che errori nei prompt causino loop di re-lettura).
+/// Estrae `(start_line, end_line)` (1-based, inclusi) dai parametri di
+/// `read_file_lines`. Accetta sia `start_line`/`end_line` (parametri corretti)
+/// sia `offset`/`limit` (alias usati erroneamente da alcune istruzioni del
+/// supervisor — mappati automaticamente per evitare loop di re-lettura). Applica
+/// il cap `READ_FILE_LINES_MAX` sul range. Estratto da `tool_read_file_lines`.
+fn parse_line_range(input: &Value) -> Result<(usize, usize), String> {
     let start_line: usize = if let Some(n) = input.get("start_line").and_then(Value::as_u64) {
         if n < 1 {
-            return "[Errore: 'start_line' deve essere un intero >= 1]".to_string();
+            return Err("[Errore: 'start_line' deve essere un intero >= 1]".to_string());
         }
         n as usize
     } else if let Some(n) = input.get("offset").and_then(Value::as_u64) {
         if n < 1 {
-            return "[Errore: 'offset' deve essere un intero >= 1]".to_string();
+            return Err("[Errore: 'offset' deve essere un intero >= 1]".to_string());
         }
         n as usize
     } else {
-        return "[Errore: parametro 'start_line' mancante (oppure 'offset' come alias)]"
-            .to_string();
+        return Err(
+            "[Errore: parametro 'start_line' mancante (oppure 'offset' come alias)]".to_string(),
+        );
     };
 
     let end_line: usize = if let Some(n) = input.get("end_line").and_then(Value::as_u64) {
         if n < start_line as u64 {
-            return "[Errore: 'end_line' deve essere >= start_line]".to_string();
+            return Err("[Errore: 'end_line' deve essere >= start_line]".to_string());
         }
         n as usize
     } else if let Some(limit) = input.get("limit").and_then(Value::as_u64) {
         // offset + limit - 1 → end_line inclusa
         (start_line as u64).saturating_add(limit).saturating_sub(1) as usize
     } else {
-        return "[Errore: parametro 'end_line' mancante (oppure 'limit' come alias)]".to_string();
+        return Err(
+            "[Errore: parametro 'end_line' mancante (oppure 'limit' come alias)]".to_string(),
+        );
     };
 
     // Limita il range massimo per evitare di caricare troppe righe
     let end_line = end_line.min(start_line + READ_FILE_LINES_MAX - 1);
+    Ok((start_line, end_line))
+}
+
+pub(super) async fn tool_read_file_lines(ctx: &AgentToolContext, input: &Value) -> String {
+    let path_str = match input.get("path").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return "[Errore: parametro 'path' mancante]".to_string(),
+    };
+
+    let (start_line, end_line) = match parse_line_range(input) {
+        Ok(range) => range,
+        Err(msg) => return msg,
+    };
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
@@ -258,6 +308,14 @@ pub(super) async fn tool_read_file_lines(ctx: &AgentToolContext, input: &Value) 
         Err(e) => return format!("[Errore lettura '{}': {}]", path_str, e),
     };
 
+    render_line_range(&content, path_str, start_line, end_line)
+}
+
+/// Rende la porzione `[start_line, end_line]` (1-based, inclusi) del contenuto
+/// con prefisso numerato "NNNN | testo" e un hint di continuazione se restano
+/// righe. Errore esplicito se `start_line` supera il totale. Estratto da
+/// `tool_read_file_lines`.
+fn render_line_range(content: &str, path_str: &str, start_line: usize, end_line: usize) -> String {
     let total_lines = content.lines().count();
     if start_line > total_lines {
         return format!(
@@ -294,22 +352,80 @@ pub(super) async fn tool_read_file_lines(ctx: &AgentToolContext, input: &Value) 
     )
 }
 
-pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> String {
-    if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
-    }
-    let path_str = match input.get("path").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "[Errore: parametro 'path' mancante]".to_string(),
-    };
-    if !ctx.is_nexus_operator {
-        if let Some(pattern) = is_protected_path(path_str) {
-            return format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente. Modifica manualmente se necessario.]", path_str, pattern);
+/// Prepara la scrittura di `target`: crea le directory intermedie e registra il
+/// tracking ripristinabile (mig 0349) leggendo lo stato PRIMA della scrittura,
+/// cosi' un revert riporta il file allo stato attuale. Il record e' best-effort
+/// (warn ma non blocca: l'agente non puo' restare bloccato per un bug della
+/// tabella di audit). Ritorna se il file esisteva gia'. Estratto da
+/// `tool_write_file`.
+async fn prepare_write_and_track(
+    ctx: &AgentToolContext,
+    target: &Path,
+    path_str: &str,
+    content: &str,
+) -> Result<bool, String> {
+    // Crea directory intermedie se necessario
+    if let Some(parent) = target.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err(format!("[Errore creazione directory: {}]", e));
         }
     }
-    let content = match input.get("content").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "[Errore: parametro 'content' mancante]".to_string(),
+    let existed_before = target.exists();
+    let before_for_track: Option<String> = if existed_before {
+        tokio::fs::read_to_string(target).await.ok()
+    } else {
+        None
+    };
+    if let Err(e) = crate::file_mutations::record_mutation(
+        &ctx.db,
+        ctx.project_id,
+        ctx.session_id,
+        Some(ctx.user_id),
+        path_str,
+        "write_file",
+        before_for_track.as_deref(),
+        Some(content),
+    )
+    .await
+    {
+        tracing::warn!(
+            project_id = %ctx.project_id, path = %path_str,
+            "file_mutations::record_mutation fallita (write_file): {e}"
+        );
+    }
+    Ok(existed_before)
+}
+
+/// Preambolo di `write_file`: permesso di scrittura, path presente e non
+/// protetto, parametro `content` presente. Ritorna `(path_str, content)` o il
+/// messaggio d'errore. Estratto da `tool_write_file`.
+fn read_write_params<'a>(
+    ctx: &AgentToolContext,
+    input: &'a Value,
+) -> Result<(&'a str, &'a str), String> {
+    if !ctx.can_write {
+        return Err("[Errore: permesso di scrittura non concesso su questo progetto]".to_string());
+    }
+    let path_str = input
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "[Errore: parametro 'path' mancante]".to_string())?;
+    if !ctx.is_nexus_operator {
+        if let Some(pattern) = is_protected_path(path_str) {
+            return Err(format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente. Modifica manualmente se necessario.]", path_str, pattern));
+        }
+    }
+    let content = input
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "[Errore: parametro 'content' mancante]".to_string())?;
+    Ok((path_str, content))
+}
+
+pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> String {
+    let (path_str, content) = match read_write_params(ctx, input) {
+        Ok(pair) => pair,
+        Err(msg) => return msg,
     };
 
     // Governance risorse in scrittura (porte ADR 0010 + URL interni), punto
@@ -341,139 +457,130 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         Err(e) => return format!("[Errore: {e}]"),
     };
 
-    // Crea directory intermedie se necessario
-    if let Some(parent) = target.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return format!("[Errore creazione directory: {}]", e);
-        }
-    }
-    let existed_before = target.exists();
-    // Tracking ripristinabile (mig 0349): legge lo stato corrente PRIMA della
-    // scrittura e registra (project_id, session_id, file_path, before, after)
-    // in `file_mutations`. Cosi' un revert successivo riporta il file allo
-    // stato attuale. Best-effort: se la registrazione fallisce loggiamo ma non
-    // blocchiamo la scrittura (l'agente non puo' restare bloccato per un bug
-    // della tabella di audit).
-    let before_for_track: Option<String> = if existed_before {
-        tokio::fs::read_to_string(&target).await.ok()
-    } else {
-        None
+    let existed_before = match prepare_write_and_track(ctx, &target, path_str, content).await {
+        Ok(existed) => existed,
+        Err(msg) => return msg,
     };
-    if let Err(e) = crate::file_mutations::record_mutation(
-        &ctx.db,
-        ctx.project_id,
-        ctx.session_id,
-        Some(ctx.user_id),
-        path_str,
-        "write_file",
-        before_for_track.as_deref(),
-        Some(content),
-    )
-    .await
-    {
-        tracing::warn!(
-            project_id = %ctx.project_id, path = %path_str,
-            "file_mutations::record_mutation fallita (write_file): {e}"
-        );
-    }
-    let autocommit_op = if existed_before { "modify" } else { "create" };
     match tokio::fs::write(&target, content).await {
-        Ok(()) => {
-            // Dispatcher: notifica Explorer/Editor in tempo reale
-            nexus_events::dispatcher::emit(
-                &ctx.project_channels,
-                ctx.project_id,
-                nexus_events::event::ProjectEvent::FileChanged {
-                    path: path_str.to_string(),
-                    op: if existed_before {
-                        "modified".to_string()
-                    } else {
-                        "created".to_string()
-                    },
-                },
-            );
-
-            // Auto-commit per sessione su branch dedicato: rete di sicurezza
-            // sopra file_mutations. Se non e' un git repo / setting disabilitato
-            // / session_id assente, il modulo fa no-op silenzioso (vedi modulo).
-            let ac_db = ctx.db.clone();
-            let ac_root = ctx.root_path.clone();
-            let ac_is_git = ctx.is_git_repo;
-            let ac_sid = ctx.session_id;
-            let ac_path = path_str.to_string();
-            let ac_op = autocommit_op.to_string();
-            tokio::spawn(async move {
-                crate::session_autocommit::snapshot_after_mutation(
-                    &ac_db, &ac_root, ac_is_git, ac_sid, &ac_op, &ac_path,
-                )
-                .await;
-            });
-
-            // Re-indicizza il file nel code index + eventuale auto-scan qualità (in background)
-            let db_bg = ctx.db.clone();
-            let neural_bg = ctx.neural.clone();
-            let project_id_bg = ctx.project_id;
-            let root_bg = ctx.root_path.clone();
-            let target_bg = target.clone();
-            let path_str_bg = path_str.to_string();
-            let content_bg = content.to_string();
-            tokio::spawn(async move {
-                let _ = crate::projects::reindex_single_file(
-                    &db_bg,
-                    &neural_bg,
-                    project_id_bg,
-                    &root_bg,
-                    &target_bg,
-                )
-                .await;
-                crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
-                // Ri-valuta le violazioni di governance risorse sul file appena scritto:
-                // se l'edit ha rimosso la porta/URL hardcoded, la diagnosi policy_violation
-                // viene chiusa e sparisce dal pannello Problemi (regola H: niente residui).
-                crate::security::resource_linter::revalidate_file_violations(
-                    &db_bg,
-                    project_id_bg,
-                    &root_bg.to_string_lossy(),
-                    &target_bg,
-                )
-                .await;
-                // Hook M2: se il file e' un .md di documentazione, registra in project_documents
-                let _ = upsert_project_document_if_doc(
-                    &db_bg,
-                    project_id_bg,
-                    &path_str_bg,
-                    &content_bg,
-                )
-                .await;
-            });
-            let base = format!(
-                "File '{}' scritto con successo ({} byte)",
-                path_str,
-                content.len()
-            );
-            let mut msg = base;
-            if let Some(w) = bg_warning {
-                msg = format!("{}\n\n{}", msg, w);
-            }
-            // B2: se e' una config critica (.env, vite.config, package.json, ...),
-            // SEGNALA (non prescrive, mig 0438) che i servizi gia' in ascolto non
-            // applicheranno le modifiche finche' non vengono riavviati. Evita il
-            // caso (incidente Beauty-Book) in cui l'agente cambia il .env del proxy
-            // ma non riavvia il frontend, e la verifica gira sulla vecchia config.
-            if is_critical_config(path_str) {
-                msg = format!(
-                    "{}\n\nNota: questo e' un file di CONFIGURAZIONE. Un servizio gia' \
-                     in esecuzione non applichera' le modifiche finche' non viene \
-                     riavviato (es. Vite/Next leggono .env e config solo all'avvio). \
-                     Se un servizio del progetto e' attivo, riavvialo prima di \
-                     verificarne il comportamento.",
-                    msg
-                );
-            }
-            msg
-        }
+        Ok(()) => on_write_success(ctx, &target, path_str, content, existed_before, bg_warning),
         Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
     }
+}
+
+/// Post-scrittura riuscita di `write_file`: emette l'evento FileChanged
+/// (created/modified), avvia i task di background (auto-commit + reindex/scan/
+/// lint/doc) e compone il messaggio di successo. Estratto da `tool_write_file`.
+fn on_write_success(
+    ctx: &AgentToolContext,
+    target: &Path,
+    path_str: &str,
+    content: &str,
+    existed_before: bool,
+    bg_warning: Option<String>,
+) -> String {
+    // Dispatcher: notifica Explorer/Editor in tempo reale
+    nexus_events::dispatcher::emit(
+        &ctx.project_channels,
+        ctx.project_id,
+        nexus_events::event::ProjectEvent::FileChanged {
+            path: path_str.to_string(),
+            op: if existed_before {
+                "modified".to_string()
+            } else {
+                "created".to_string()
+            },
+        },
+    );
+
+    let autocommit_op = if existed_before { "modify" } else { "create" };
+    spawn_autocommit_snapshot(ctx, autocommit_op, path_str);
+    spawn_write_reindex(ctx, target, path_str, content);
+    build_write_success_message(path_str, content.len(), bg_warning)
+}
+
+/// Avvia in background lo snapshot di auto-commit per sessione su branch
+/// dedicato (rete di sicurezza sopra `file_mutations`). Se non e' un git repo /
+/// setting disabilitato / session_id assente, il modulo fa no-op silenzioso.
+/// Punto unico (regola L) condiviso da `tool_write_file` e `tool_edit_file`.
+fn spawn_autocommit_snapshot(ctx: &AgentToolContext, op: &str, path_str: &str) {
+    let ac_db = ctx.db.clone();
+    let ac_root = ctx.root_path.clone();
+    let ac_is_git = ctx.is_git_repo;
+    let ac_sid = ctx.session_id;
+    let ac_path = path_str.to_string();
+    let ac_op = op.to_string();
+    tokio::spawn(async move {
+        crate::session_autocommit::snapshot_after_mutation(
+            &ac_db, &ac_root, ac_is_git, ac_sid, &ac_op, &ac_path,
+        )
+        .await;
+    });
+}
+
+/// Avvia in background la re-indicizzazione del file nel code index, l'eventuale
+/// auto-scan qualita', la ri-validazione delle violazioni di governance risorse
+/// (regola H: niente residui nel pannello Problemi) e l'hook M2 di registrazione
+/// documentazione (`upsert_project_document_if_doc`). Estratto da
+/// `tool_write_file`.
+fn spawn_write_reindex(ctx: &AgentToolContext, target: &Path, path_str: &str, content: &str) {
+    let db_bg = ctx.db.clone();
+    let neural_bg = ctx.neural.clone();
+    let project_id_bg = ctx.project_id;
+    let root_bg = ctx.root_path.clone();
+    let target_bg = target.to_path_buf();
+    let path_str_bg = path_str.to_string();
+    let content_bg = content.to_string();
+    tokio::spawn(async move {
+        let _ = crate::projects::reindex_single_file(
+            &db_bg,
+            &neural_bg,
+            project_id_bg,
+            &root_bg,
+            &target_bg,
+        )
+        .await;
+        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
+        // Ri-valuta le violazioni di governance risorse sul file appena scritto:
+        // se l'edit ha rimosso la porta/URL hardcoded, la diagnosi policy_violation
+        // viene chiusa e sparisce dal pannello Problemi (regola H: niente residui).
+        crate::security::resource_linter::revalidate_file_violations(
+            &db_bg,
+            project_id_bg,
+            &root_bg.to_string_lossy(),
+            &target_bg,
+        )
+        .await;
+        // Hook M2: se il file e' un .md di documentazione, registra in project_documents
+        let _ =
+            upsert_project_document_if_doc(&db_bg, project_id_bg, &path_str_bg, &content_bg).await;
+    });
+}
+
+/// Compone il messaggio di successo di `write_file`: riga base + eventuale
+/// warning build-graph + nota B2 sulle config critiche (che richiedono il
+/// riavvio dei servizi per avere effetto, mig 0438). Estratto da
+/// `tool_write_file`.
+fn build_write_success_message(path_str: &str, byte_len: usize, bg_warning: Option<String>) -> String {
+    let mut msg = format!("File '{}' scritto con successo ({} byte)", path_str, byte_len);
+    if let Some(w) = bg_warning {
+        msg = format!("{}\n\n{}", msg, w);
+    }
+    // B2: se e' una config critica (.env, vite.config, package.json, ...),
+    // SEGNALA (non prescrive, mig 0438) che i servizi gia' in ascolto non
+    // applicheranno le modifiche finche' non vengono riavviati. Evita il
+    // caso (incidente Beauty-Book) in cui l'agente cambia il .env del proxy
+    // ma non riavvia il frontend, e la verifica gira sulla vecchia config.
+    if is_critical_config(path_str) {
+        msg = format!(
+            "{}\n\nNota: questo e' un file di CONFIGURAZIONE. Un servizio gia' \
+             in esecuzione non applichera' le modifiche finche' non viene \
+             riavviato (es. Vite/Next leggono .env e config solo all'avvio). \
+             Se un servizio del progetto e' attivo, riavvialo prima di \
+             verificarne il comportamento.",
+            msg
+        );
+    }
+    msg
 }
 
 /// Vero se `path` e' un file di CONFIGURAZIONE critica le cui modifiche
@@ -506,50 +613,46 @@ pub(crate) fn is_critical_config(path: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// Hook M2: rileva se un file appena scritto e' documentazione del progetto e lo registra in `project_documents`.
-/// Tipi rilevati: PRD, README, ARCHITECTURE, CHANGELOG, CONTRIBUTING, SPEC, generic markdown sotto specs/ o docs/.
-/// Idempotente: se esiste gia una riga con stesso (project_id, file_path), aggiorna updated_at e version increment patch.
-async fn upsert_project_document_if_doc(
-    db: &sqlx::PgPool,
-    project_id: uuid::Uuid,
-    rel_path: &str,
-    content: &str,
-) -> Result<(), sqlx::Error> {
-    let lower = rel_path.to_lowercase();
-    if !lower.ends_with(".md") && !lower.ends_with(".markdown") {
-        return Ok(());
-    }
-    // Mappa al check constraint del DB (project_documents_doc_type_check):
-    //   functional_analysis, technical_analysis, er_diagram, project_management, release_notes
-    let doc_type = if lower.contains("prd")
+/// Classifica un path `.md` (gia' lowercased) in uno dei `doc_type` ammessi dal
+/// check constraint `project_documents_doc_type_check` (functional_analysis,
+/// technical_analysis, er_diagram, project_management, release_notes). `None` se
+/// il file non e' documentazione riconosciuta. Estratto da
+/// `upsert_project_document_if_doc`.
+fn classify_project_doc_type(lower: &str) -> Option<&'static str> {
+    if lower.contains("prd")
         || lower.starts_with("specs/")
         || lower.contains("/specs/")
         || lower.contains("functional")
     {
-        "functional_analysis"
+        Some("functional_analysis")
     } else if lower.ends_with("readme.md")
         || lower.contains("architecture")
         || lower.starts_with("docs/")
         || lower.contains("/docs/")
         || lower.contains("technical")
     {
-        "technical_analysis"
+        Some("technical_analysis")
     } else if lower.contains("erd")
         || lower.contains("schema_diagram")
         || lower.contains("er_diagram")
     {
-        "er_diagram"
+        Some("er_diagram")
     } else if lower.contains("changelog") || lower.contains("release_notes") {
-        "release_notes"
+        Some("release_notes")
     } else if lower.contains("contributing")
         || lower.contains("project_management")
         || lower.contains("roadmap")
     {
-        "project_management"
+        Some("project_management")
     } else {
-        return Ok(());
-    };
-    // Titolo: prima riga "# ..." oppure nome file senza estensione
+        None
+    }
+}
+
+/// Titolo del documento: prima riga "# ..." del contenuto, oppure il nome file
+/// senza estensione. Troncato a 255 caratteri. Estratto da
+/// `upsert_project_document_if_doc`.
+fn extract_doc_title(content: &str, rel_path: &str) -> String {
     let title = content
         .lines()
         .find_map(|l| {
@@ -563,7 +666,27 @@ async fn upsert_project_document_if_doc(
                 .unwrap_or(rel_path)
                 .to_string()
         });
-    let title = title.chars().take(255).collect::<String>();
+    title.chars().take(255).collect::<String>()
+}
+
+/// Hook M2: rileva se un file appena scritto e' documentazione del progetto e lo registra in `project_documents`.
+/// Tipi rilevati: PRD, README, ARCHITECTURE, CHANGELOG, CONTRIBUTING, SPEC, generic markdown sotto specs/ o docs/.
+/// Idempotente: se esiste gia una riga con stesso (project_id, file_path), aggiorna updated_at e version increment patch.
+async fn upsert_project_document_if_doc(
+    db: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    rel_path: &str,
+    content: &str,
+) -> Result<(), sqlx::Error> {
+    let lower = rel_path.to_lowercase();
+    if !lower.ends_with(".md") && !lower.ends_with(".markdown") {
+        return Ok(());
+    }
+    let doc_type = match classify_project_doc_type(&lower) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let title = extract_doc_title(content, rel_path);
 
     sqlx::query(
         r#"
@@ -649,35 +772,44 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
         ctx.root_path.clone()
     };
 
+    let stdout = match run_grep_or_fallback(pattern, &search_path).await {
+        Ok(s) => s,
+        Err(msg) => return msg,
+    };
+
+    format_search_output(ctx, pattern, &stdout)
+}
+
+/// Esegue `grep -rn --include=* --max-count=50 -I` su `search_path` e ne
+/// ritorna lo stdout (formato "path:lineno:contenuto"). Se lo spawn fallisce
+/// (grep assente, tipico Windows nativo) ripiega su [`search_in_files_rust`],
+/// che produce lo STESSO formato cosi' il post-processing a valle resta unico
+/// (regola L). `Err(msg)` solo quando grep gira ma emette un errore reale
+/// (stdout vuoto + stderr non vuoto), da propagare al chiamante.
+async fn run_grep_or_fallback(pattern: &str, search_path: &Path) -> Result<String, String> {
     let output = Command::new("grep")
         .arg("-rn")
         .arg("--include=*")
         .arg("--max-count=50")
         .arg("-I") // ignora file binari
         .arg(pattern)
-        .arg(&search_path)
+        .arg(search_path)
         .output()
         .await;
 
-    // stdout in formato grep `-rn` ("path:lineno:contenuto"). Su Windows `grep`
-    // non e' garantito: se lo spawn fallisce (Err, non exit-code != 0), si passa
-    // al fallback in Rust puro, cross-platform, che produce lo STESSO formato
-    // cosi' il post-processing (relativizzazione path + troncamento) resta unico.
-    let stdout: String = match output {
+    match output {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             // grep esce con 1 e stdout vuoto quando non trova nulla: non e' un errore.
             if stdout.is_empty() && !stderr.is_empty() {
-                return format!("[grep error: {}]", stderr.trim());
+                return Err(format!("[grep error: {}]", stderr.trim()));
             }
-            stdout
+            Ok(stdout)
         }
         // grep assente (tipico Windows nativo): ricerca in-process, best-effort.
-        Err(_) => search_in_files_rust(&search_path, pattern),
-    };
-
-    format_search_output(ctx, pattern, &stdout)
+        Err(_) => Ok(search_in_files_rust(search_path, pattern)),
+    }
 }
 
 /// Formatta l'output della ricerca (comune a grep e al fallback Rust): rende i
@@ -722,6 +854,20 @@ fn format_search_output(ctx: &AgentToolContext, pattern: &str, stdout: &str) -> 
     result
 }
 
+/// Compila il predicato di match di riga per il fallback Rust: grep di default
+/// interpreta il pattern come espressione regolare (BRE); `regex` usa ERE/PCRE-
+/// like, che per i pattern comuni (letterali, classi, alternanze) coincide. Se
+/// la compilazione fallisce si degrada a ricerca letterale (substring), sempre
+/// case-sensitive. Estratto da `search_in_files_rust`.
+fn compile_line_matcher(pattern: &str) -> impl Fn(&str) -> bool {
+    let re = regex::Regex::new(pattern).ok();
+    let literal = pattern.to_string();
+    move |line: &str| match &re {
+        Some(r) => r.is_match(line),
+        None => line.contains(&literal),
+    }
+}
+
 /// Ricerca ricorsiva in Rust puro, fallback cross-platform quando `grep` non e'
 /// disponibile (Windows nativo). Riproduce il comportamento essenziale di
 /// `grep -rn --max-count=50 -I`:
@@ -734,24 +880,12 @@ fn format_search_output(ctx: &AgentToolContext, pattern: &str, stdout: &str) -> 
 ///
 /// Formato riga identico a `grep -rn`: "<path_assoluto>:<lineno>:<contenuto>".
 fn search_in_files_rust(root: &std::path::Path, pattern: &str) -> String {
-    // grep di default interpreta il pattern come espressione regolare (BRE).
-    // `regex` usa la sintassi ERE/PCRE-like: per i pattern comuni (letterali,
-    // classi, alternanze) il comportamento coincide; se la compilazione fallisce
-    // si degrada a ricerca letterale (substring), sempre case-sensitive.
-    let re = regex::Regex::new(pattern).ok();
-    let matches = |line: &str| -> bool {
-        match &re {
-            Some(r) => r.is_match(line),
-            None => line.contains(pattern),
-        }
-    };
+    let matches = compile_line_matcher(pattern);
 
     // Budget difensivo per non camminare all'infinito su alberi enormi: ben oltre
     // il troncamento a valle (2000 righe / 500 KB), quindi non altera il risultato.
     const MAX_FILES_VISITED: usize = 50_000;
     const MAX_TOTAL_MATCHES: usize = 5_000;
-    const MAX_MATCHES_PER_FILE: usize = 50;
-    const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
     let mut out = String::new();
     let mut total_matches = 0usize;
@@ -786,30 +920,48 @@ fn search_in_files_rust(root: &std::path::Path, pattern: &str) -> String {
             if files_visited > MAX_FILES_VISITED || total_matches >= MAX_TOTAL_MATCHES {
                 return out;
             }
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            // Euristica `-I`: file binario se contiene un NUL nell'intestazione.
-            if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            let path_str = path.to_string_lossy();
-            let mut per_file = 0usize;
-            for (idx, line) in text.lines().enumerate() {
-                if matches(line) {
-                    out.push_str(&format!("{}:{}:{}\n", path_str, idx + 1, line));
-                    per_file += 1;
-                    total_matches += 1;
-                    if per_file >= MAX_MATCHES_PER_FILE || total_matches >= MAX_TOTAL_MATCHES {
-                        break;
-                    }
-                }
-            }
+            let remaining = MAX_TOTAL_MATCHES - total_matches;
+            total_matches += append_file_matches(&path, &matches, remaining, &mut out);
         }
     }
     out
+}
+
+/// Cerca `matches` nel file `path` e appende in `out` le righe corrispondenti in
+/// formato `grep -rn` ("path:lineno:contenuto"). Salta i binari (euristica `-I`:
+/// byte NUL nei primi 8 KB) e i file illeggibili. Limita a min(50, `remaining`)
+/// match. Ritorna il numero di match appesi. Estratto da `search_in_files_rust`.
+fn append_file_matches(
+    path: &Path,
+    matches: &impl Fn(&str) -> bool,
+    remaining: usize,
+    out: &mut String,
+) -> usize {
+    const MAX_MATCHES_PER_FILE: usize = 50;
+    const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    // Euristica `-I`: file binario se contiene un NUL nell'intestazione.
+    if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+        return 0;
+    }
+    let cap = MAX_MATCHES_PER_FILE.min(remaining);
+    let text = String::from_utf8_lossy(&bytes);
+    let path_str = path.to_string_lossy();
+    let mut per_file = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        if matches(line) {
+            out.push_str(&format!("{}:{}:{}\n", path_str, idx + 1, line));
+            per_file += 1;
+            if per_file >= cap {
+                break;
+            }
+        }
+    }
+    per_file
 }
 
 pub(super) async fn tool_delete_file(ctx: &AgentToolContext, input: &Value) -> String {
@@ -836,37 +988,43 @@ pub(super) async fn tool_delete_file(ctx: &AgentToolContext, input: &Value) -> S
     };
 
     if target.is_dir() {
-        if recursive {
-            match tokio::fs::remove_dir_all(&target).await {
-                Ok(()) => format!(
-                    "Directory '{}' eliminata ricorsivamente con successo",
-                    path_str
-                ),
-                Err(e) => format!("[Errore eliminazione directory '{}': {}]", path_str, e),
-            }
-        } else {
-            match tokio::fs::remove_dir(&target).await {
-                Ok(()) => format!("Directory '{}' eliminata con successo", path_str),
-                Err(e) => format!(
-                    "[Errore eliminazione directory '{}': {} (se non e' vuota usa recursive:true)]",
-                    path_str, e
-                ),
-            }
+        return delete_directory(&target, path_str, recursive).await;
+    }
+    match tokio::fs::remove_file(&target).await {
+        Ok(()) => {
+            nexus_events::dispatcher::emit(
+                &ctx.project_channels,
+                ctx.project_id,
+                nexus_events::event::ProjectEvent::FileChanged {
+                    path: path_str.to_string(),
+                    op: "deleted".to_string(),
+                },
+            );
+            format!("File '{}' eliminato con successo", path_str)
+        }
+        Err(e) => format!("[Errore eliminazione '{}': {}]", path_str, e),
+    }
+}
+
+/// Elimina una directory, ricorsivamente se `recursive`. Estratto da
+/// `tool_delete_file`: il ramo non-ricorsivo suggerisce `recursive:true` se la
+/// directory non e' vuota.
+async fn delete_directory(target: &Path, path_str: &str, recursive: bool) -> String {
+    if recursive {
+        match tokio::fs::remove_dir_all(target).await {
+            Ok(()) => format!(
+                "Directory '{}' eliminata ricorsivamente con successo",
+                path_str
+            ),
+            Err(e) => format!("[Errore eliminazione directory '{}': {}]", path_str, e),
         }
     } else {
-        match tokio::fs::remove_file(&target).await {
-            Ok(()) => {
-                nexus_events::dispatcher::emit(
-                    &ctx.project_channels,
-                    ctx.project_id,
-                    nexus_events::event::ProjectEvent::FileChanged {
-                        path: path_str.to_string(),
-                        op: "deleted".to_string(),
-                    },
-                );
-                format!("File '{}' eliminato con successo", path_str)
-            }
-            Err(e) => format!("[Errore eliminazione '{}': {}]", path_str, e),
+        match tokio::fs::remove_dir(target).await {
+            Ok(()) => format!("Directory '{}' eliminata con successo", path_str),
+            Err(e) => format!(
+                "[Errore eliminazione directory '{}': {} (se non e' vuota usa recursive:true)]",
+                path_str, e
+            ),
         }
     }
 }
@@ -1005,6 +1163,32 @@ fn occurrence_start_lines(content: &str, needle: &str, max_hits: usize) -> Vec<u
     hits
 }
 
+/// Rende i blocchi "Occorrenza N (~riga M):" con l'estratto numerato attorno a
+/// ciascuna hit (finestra +3/-6 righe, cap 900 byte per blocco). Estratto da
+/// `build_old_string_ambiguous_message`; il valore ritornato e' gia' trimmato
+/// dei newline finali. Riusa il punto unico [`render_numbered_window`].
+fn render_occurrence_blocks(lines: &[&str], hit_lines: &[usize]) -> String {
+    const WINDOW_BEFORE: usize = 3;
+    const WINDOW_AFTER: usize = 6;
+    const MAX_BYTES_PER_HIT: usize = 900;
+
+    let total_lines = lines.len();
+    let mut blocks = String::new();
+    for (n, &hit) in hit_lines.iter().enumerate() {
+        let start = hit.saturating_sub(WINDOW_BEFORE);
+        let end = (hit + WINDOW_AFTER + 1).min(total_lines);
+        let (excerpt, _) = render_numbered_window(lines, start, end, MAX_BYTES_PER_HIT);
+        blocks.push_str(&format!(
+            "Occorrenza {} (~riga {}):\n{}\n\n",
+            n + 1,
+            hit + 1,
+            excerpt
+        ));
+    }
+    // Rimuove i due newline finali per pulizia.
+    blocks.trim_end().to_string()
+}
+
 /// Costruisce il messaggio di errore quando `edit_file` trova `old_string` PIU'
 /// volte (deve essere univoco). Ramo reso actionable come il "non trovato":
 /// mostra l'ESTRATTO NUMERATO attorno alle prime occorrenze, cosi' l'agente puo'
@@ -1017,13 +1201,9 @@ fn build_old_string_ambiguous_message(
     path_str: &str,
     count: usize,
 ) -> String {
-    const WINDOW_BEFORE: usize = 3;
-    const WINDOW_AFTER: usize = 6;
     const MAX_HITS_SHOWN: usize = 3;
-    const MAX_BYTES_PER_HIT: usize = 900;
 
     let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
     let hit_lines = occurrence_start_lines(content, old_string_lf, MAX_HITS_SHOWN);
 
     // Fallback difensivo: se per qualche motivo non localizziamo le occorrenze
@@ -1036,18 +1216,7 @@ fn build_old_string_ambiguous_message(
         );
     }
 
-    let mut blocks = String::new();
-    for (n, &hit) in hit_lines.iter().enumerate() {
-        let start = hit.saturating_sub(WINDOW_BEFORE);
-        let end = (hit + WINDOW_AFTER + 1).min(total_lines);
-        let (excerpt, _) = render_numbered_window(&lines, start, end, MAX_BYTES_PER_HIT);
-        blocks.push_str(&format!(
-            "Occorrenza {} (~riga {}):\n{}\n\n",
-            n + 1,
-            hit + 1,
-            excerpt
-        ));
-    }
+    let blocks = render_occurrence_blocks(&lines, &hit_lines);
     let more = if count > hit_lines.len() {
         format!(
             " (mostrate le prime {} di {} occorrenze)",
@@ -1057,8 +1226,6 @@ fn build_old_string_ambiguous_message(
     } else {
         String::new()
     };
-    // Rimuove i due newline finali per pulizia.
-    let blocks = blocks.trim_end().to_string();
 
     format!(
         "[Errore: old_string trovato {count} volte in '{path}' \u{2014} deve essere UNICO.{more}\n\
@@ -1180,26 +1347,41 @@ fn build_old_string_not_found_message(content: &str, old_string_lf: &str, path_s
     )
 }
 
-pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> String {
+/// Preambolo di `edit_file`: permesso di scrittura, path presente e non
+/// protetto, parametri `old_string`/`new_string` presenti. Ritorna la tripla
+/// `(path_str, old_string, new_string)` o il messaggio d'errore. Estratto da
+/// `tool_edit_file`.
+fn read_edit_params<'a>(
+    ctx: &AgentToolContext,
+    input: &'a Value,
+) -> Result<(&'a str, &'a str, &'a str), String> {
     if !ctx.can_write {
-        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+        return Err("[Errore: permesso di scrittura non concesso su questo progetto]".to_string());
     }
-    let path_str = match input.get("path").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "[Errore: parametro 'path' mancante]".to_string(),
-    };
+    let path_str = input
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "[Errore: parametro 'path' mancante]".to_string())?;
     if !ctx.is_nexus_operator {
         if let Some(pattern) = is_protected_path(path_str) {
-            return format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente.]", path_str, pattern);
+            return Err(format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente.]", path_str, pattern));
         }
     }
-    let old_string = match input.get("old_string").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "[Errore: parametro 'old_string' mancante]".to_string(),
-    };
-    let new_string = match input.get("new_string").and_then(Value::as_str) {
-        Some(s) => s,
-        None => return "[Errore: parametro 'new_string' mancante]".to_string(),
+    let old_string = input
+        .get("old_string")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "[Errore: parametro 'old_string' mancante]".to_string())?;
+    let new_string = input
+        .get("new_string")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "[Errore: parametro 'new_string' mancante]".to_string())?;
+    Ok((path_str, old_string, new_string))
+}
+
+pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> String {
+    let (path_str, old_string, new_string) = match read_edit_params(ctx, input) {
+        Ok(triple) => triple,
+        Err(msg) => return msg,
     };
 
     // Governance risorse in scrittura (porte + URL interni), punto unico con
@@ -1232,7 +1414,22 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
         }
     };
 
-    let raw_content = match tokio::fs::read_to_string(&target).await {
+    edit_matched_content(ctx, &target, path_str, old_string, new_string, bg_warning).await
+}
+
+/// Legge il file, normalizza CRLF -> LF per un matching consistente e, in base al
+/// numero di occorrenze di `old_string`, ritorna il messaggio di errore
+/// (0 = non trovato, N>1 = ambiguo) o applica la sostituzione univoca. Estratto
+/// da `tool_edit_file`.
+async fn edit_matched_content(
+    ctx: &AgentToolContext,
+    target: &Path,
+    path_str: &str,
+    old_string: &str,
+    new_string: &str,
+    bg_warning: Option<String>,
+) -> String {
+    let raw_content = match tokio::fs::read_to_string(target).await {
         Ok(c) => c,
         Err(e) => return format!("[Errore lettura '{}': {}]", path_str, e),
     };
@@ -1254,94 +1451,149 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
             build_old_string_ambiguous_message(&content, &old_string_lf, path_str, n)
         }
         _ => {
-            let new_content_lf = content.replacen(old_string_lf.as_str(), new_string_lf.as_str(), 1);
-            // Ripristina gli EOL originali del file (CRLF se l'originale era CRLF).
-            // Senza questo, ogni edit di un file Windows convertirebbe l'intero file
-            // in LF generando un diff git rumoroso (bug 14).
-            let new_content = if was_crlf {
-                new_content_lf.replace('\n', "\r\n")
-            } else {
-                new_content_lf
-            };
-            // Tracking ripristinabile (mig 0349): registra before/after PRIMA
-            // della scrittura. raw_content e' il contenuto preesistente
-            // (gia' letto sopra). best-effort: warn ma non blocca.
-            if let Err(e) = crate::file_mutations::record_mutation(
-                &ctx.db,
-                ctx.project_id,
-                ctx.session_id,
-                Some(ctx.user_id),
+            apply_edit_and_persist(
+                ctx,
+                target,
                 path_str,
-                "edit_file",
-                Some(&raw_content),
-                Some(&new_content),
+                EditApply {
+                    content_lf: &content,
+                    old_string_lf: &old_string_lf,
+                    new_string_lf: &new_string_lf,
+                    raw_content: &raw_content,
+                    was_crlf,
+                    bg_warning,
+                },
             )
             .await
-            {
-                tracing::warn!(
-                    project_id = %ctx.project_id, path = %path_str,
-                    "file_mutations::record_mutation fallita (edit_file): {e}"
-                );
-            }
-            match tokio::fs::write(&target, &new_content).await {
-                Ok(()) => {
-                    nexus_events::dispatcher::emit(
-                        &ctx.project_channels,
-                        ctx.project_id,
-                        nexus_events::event::ProjectEvent::FileChanged {
-                            path: path_str.to_string(),
-                            op: "modified".to_string(),
-                        },
-                    );
-                    // Auto-commit per sessione (vedi tool_write_file).
-                    let ac_db = ctx.db.clone();
-                    let ac_root = ctx.root_path.clone();
-                    let ac_is_git = ctx.is_git_repo;
-                    let ac_sid = ctx.session_id;
-                    let ac_path = path_str.to_string();
-                    tokio::spawn(async move {
-                        crate::session_autocommit::snapshot_after_mutation(
-                            &ac_db, &ac_root, ac_is_git, ac_sid, "modify", &ac_path,
-                        )
-                        .await;
-                    });
-
-                    // Re-indicizza il file nel code index + eventuale auto-scan qualità (in background)
-                    let db_bg = ctx.db.clone();
-                    let neural_bg = ctx.neural.clone();
-                    let project_id_bg = ctx.project_id;
-                    let root_bg = ctx.root_path.clone();
-                    let target_bg = target.clone();
-                    tokio::spawn(async move {
-                        let _ = crate::projects::reindex_single_file(&db_bg, &neural_bg, project_id_bg, &root_bg, &target_bg).await;
-                        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
-                        // Ri-valuta le violazioni di governance risorse sul file appena
-                        // modificato: chiude (e fa sparire dal pannello Problemi) le diagnosi
-                        // policy_violation risolte dall'edit (regola H: niente residui).
-                        crate::security::resource_linter::revalidate_file_violations(
-                            &db_bg,
-                            project_id_bg,
-                            &root_bg.to_string_lossy(),
-                            &target_bg,
-                        )
-                        .await;
-                    });
-                    let base = format!(
-                        "File '{}' modificato con successo ({} byte → {} byte)",
-                        path_str,
-                        content.len(),
-                        new_content.len()
-                    );
-                    if let Some(w) = bg_warning {
-                        format!("{}\n\n{}", base, w)
-                    } else {
-                        base
-                    }
-                }
-                Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
-            }
         }
     }
+}
+
+/// Parametri della sostituzione da persistere in [`apply_edit_and_persist`].
+/// Raggruppati per evitare una firma con troppi argomenti (clippy).
+struct EditApply<'a> {
+    /// Contenuto attuale LF-normalizzato del file.
+    content_lf: &'a str,
+    /// `old_string` LF-normalizzato (gia' verificato univoco dal chiamante).
+    old_string_lf: &'a str,
+    /// `new_string` LF-normalizzato che sostituisce l'occorrenza.
+    new_string_lf: &'a str,
+    /// Contenuto preesistente grezzo (EOL originali), per il tracking mutazioni.
+    raw_content: &'a str,
+    /// Vero se il file originale usava CRLF: gli EOL vengono ripristinati.
+    was_crlf: bool,
+    /// Warning build-graph da accodare al messaggio di successo.
+    bg_warning: Option<String>,
+}
+
+/// Tracking ripristinabile (mig 0349) per un `edit_file`: registra before/after
+/// PRIMA della scrittura (`before` e' il contenuto preesistente gia' letto dal
+/// chiamante). Best-effort: warn ma non blocca. Estratto da
+/// `apply_edit_and_persist`.
+async fn record_edit_mutation(
+    ctx: &AgentToolContext,
+    path_str: &str,
+    before: &str,
+    after: &str,
+) {
+    if let Err(e) = crate::file_mutations::record_mutation(
+        &ctx.db,
+        ctx.project_id,
+        ctx.session_id,
+        Some(ctx.user_id),
+        path_str,
+        "edit_file",
+        Some(before),
+        Some(after),
+    )
+    .await
+    {
+        tracing::warn!(
+            project_id = %ctx.project_id, path = %path_str,
+            "file_mutations::record_mutation fallita (edit_file): {e}"
+        );
+    }
+}
+
+/// Applica la sostituzione univoca (gia' validata dal chiamante), ripristina gli
+/// EOL originali, registra il tracking mutazioni, scrive il file e avvia i task
+/// di background (auto-commit + reindex/scan/lint). Ritorna il messaggio finale.
+/// Estratto dal ramo di successo di `tool_edit_file`.
+async fn apply_edit_and_persist(
+    ctx: &AgentToolContext,
+    target: &Path,
+    path_str: &str,
+    apply: EditApply<'_>,
+) -> String {
+    let new_content_lf = apply
+        .content_lf
+        .replacen(apply.old_string_lf, apply.new_string_lf, 1);
+    // Ripristina gli EOL originali del file (CRLF se l'originale era CRLF).
+    // Senza questo, ogni edit di un file Windows convertirebbe l'intero file
+    // in LF generando un diff git rumoroso (bug 14).
+    let new_content = if apply.was_crlf {
+        new_content_lf.replace('\n', "\r\n")
+    } else {
+        new_content_lf
+    };
+    record_edit_mutation(ctx, path_str, apply.raw_content, &new_content).await;
+    match tokio::fs::write(target, &new_content).await {
+        Ok(()) => {
+            nexus_events::dispatcher::emit(
+                &ctx.project_channels,
+                ctx.project_id,
+                nexus_events::event::ProjectEvent::FileChanged {
+                    path: path_str.to_string(),
+                    op: "modified".to_string(),
+                },
+            );
+            // Auto-commit per sessione (vedi tool_write_file).
+            spawn_autocommit_snapshot(ctx, "modify", path_str);
+            spawn_edit_reindex(ctx, target);
+            let base = format!(
+                "File '{}' modificato con successo ({} byte → {} byte)",
+                path_str,
+                apply.content_lf.len(),
+                new_content.len()
+            );
+            match apply.bg_warning {
+                Some(w) => format!("{}\n\n{}", base, w),
+                None => base,
+            }
+        }
+        Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
+    }
+}
+
+/// Avvia in background la re-indicizzazione del file dopo un `edit_file`:
+/// reindex nel code index, eventuale auto-scan qualita' e ri-validazione delle
+/// violazioni di governance risorse risolte dall'edit (regola H: niente residui
+/// nel pannello Problemi). Variante di `spawn_write_reindex` senza l'hook M2 sui
+/// documenti (edit non ricrea il .md da zero). Estratto da `tool_edit_file`.
+fn spawn_edit_reindex(ctx: &AgentToolContext, target: &Path) {
+    let db_bg = ctx.db.clone();
+    let neural_bg = ctx.neural.clone();
+    let project_id_bg = ctx.project_id;
+    let root_bg = ctx.root_path.clone();
+    let target_bg = target.to_path_buf();
+    tokio::spawn(async move {
+        let _ = crate::projects::reindex_single_file(
+            &db_bg,
+            &neural_bg,
+            project_id_bg,
+            &root_bg,
+            &target_bg,
+        )
+        .await;
+        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
+        crate::security::resource_linter::revalidate_file_violations(
+            &db_bg,
+            project_id_bg,
+            &root_bg.to_string_lossy(),
+            &target_bg,
+        )
+        .await;
+    });
 }
 
 /// Crea una directory con semantica `-p` (idempotente, crea genitori).
@@ -1389,23 +1641,9 @@ pub(super) async fn tool_fs_copy(ctx: &AgentToolContext, input: &Value) -> Strin
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let from = match resolve_relative_path(&ctx.root_path, from_str) {
-        Ok(p) => p,
-        Err(e) => {
-            return format!(
-                "[Errore percorso sorgente: {}]",
-                e.1["error"].as_str().unwrap_or("path error")
-            )
-        }
-    };
-    let to = match resolve_relative_path(&ctx.root_path, to_str) {
-        Ok(p) => p,
-        Err(e) => {
-            return format!(
-                "[Errore percorso destinazione: {}]",
-                e.1["error"].as_str().unwrap_or("path error")
-            )
-        }
+    let (from, to) = match resolve_from_to(&ctx.root_path, from_str, to_str) {
+        Ok(pair) => pair,
+        Err(msg) => return msg,
     };
 
     if !from.exists() {
@@ -1419,6 +1657,12 @@ pub(super) async fn tool_fs_copy(ctx: &AgentToolContext, input: &Value) -> Strin
         );
     }
 
+    copy_from_to(&from, &to, from_str, to_str).await
+}
+
+/// Esegue la copia risolta: file singolo (creando le directory genitore) o
+/// directory ricorsiva. Estratto da `tool_fs_copy` per coesione e brevita'.
+async fn copy_from_to(from: &Path, to: &Path, from_str: &str, to_str: &str) -> String {
     if from.is_file() {
         // Crea directory genitore se non esiste
         if let Some(parent) = to.parent() {
@@ -1426,7 +1670,7 @@ pub(super) async fn tool_fs_copy(ctx: &AgentToolContext, input: &Value) -> Strin
                 return format!("[Errore creazione directory destinazione: {}]", e);
             }
         }
-        match tokio::fs::copy(&from, &to).await {
+        match tokio::fs::copy(from, to).await {
             Ok(bytes) => format!(
                 "File copiato '{}' -> '{}' ({} byte)",
                 from_str, to_str, bytes
@@ -1434,7 +1678,7 @@ pub(super) async fn tool_fs_copy(ctx: &AgentToolContext, input: &Value) -> Strin
             Err(e) => format!("[Errore copia file: {}]", e),
         }
     } else if from.is_dir() {
-        match copy_dir_recursive(&from, &to).await {
+        match copy_dir_recursive(from, to).await {
             Ok(count) => format!(
                 "Directory copiata '{}' -> '{}' ({} file)",
                 from_str, to_str, count
@@ -1472,6 +1716,29 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
+/// Risolve una coppia di path relativi (`from`/`to`) confinandoli alla root,
+/// con messaggi d'errore distinti "sorgente"/"destinazione". Punto unico
+/// (regola L) del pattern condiviso da `tool_fs_move`/`tool_fs_copy`.
+fn resolve_from_to(
+    root: &Path,
+    from_str: &str,
+    to_str: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let from = resolve_relative_path(root, from_str).map_err(|e| {
+        format!(
+            "[Errore percorso sorgente: {}]",
+            e.1["error"].as_str().unwrap_or("path error")
+        )
+    })?;
+    let to = resolve_relative_path(root, to_str).map_err(|e| {
+        format!(
+            "[Errore percorso destinazione: {}]",
+            e.1["error"].as_str().unwrap_or("path error")
+        )
+    })?;
+    Ok((from, to))
+}
+
 /// Sposta (rinomina) un file o una directory. Atomico se sullo stesso filesystem.
 pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> String {
     if !ctx.can_write {
@@ -1486,23 +1753,9 @@ pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> Strin
         None => return "[Errore: parametro 'to' mancante]".to_string(),
     };
 
-    let from = match resolve_relative_path(&ctx.root_path, from_str) {
-        Ok(p) => p,
-        Err(e) => {
-            return format!(
-                "[Errore percorso sorgente: {}]",
-                e.1["error"].as_str().unwrap_or("path error")
-            )
-        }
-    };
-    let to = match resolve_relative_path(&ctx.root_path, to_str) {
-        Ok(p) => p,
-        Err(e) => {
-            return format!(
-                "[Errore percorso destinazione: {}]",
-                e.1["error"].as_str().unwrap_or("path error")
-            )
-        }
+    let (from, to) = match resolve_from_to(&ctx.root_path, from_str, to_str) {
+        Ok(pair) => pair,
+        Err(msg) => return msg,
     };
 
     if !from.exists() {
