@@ -1085,10 +1085,116 @@ pub async fn wizard_install_service(
     }
 }
 
+/// Helper di `install_service_windows`: interpreta il campo `env` del body come
+/// stringa "K=V" per riga OPPURE come oggetto JSON, restituendo la mappa env.
+/// (Semantica del solo ramo Windows: il ramo systemd accetta solo l'oggetto JSON.)
+#[cfg(windows)]
+fn parse_env_body(body: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    let mut env_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(env_str) = body["env"].as_str() {
+        for line in env_str.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                if !k.is_empty() {
+                    env_map.insert(k.to_string(), v.trim().to_string());
+                }
+            }
+        }
+    } else if let Some(env_obj) = body["env"].as_object() {
+        for (k, v) in env_obj {
+            if let Some(vs) = v.as_str() {
+                env_map.insert(k.clone(), vs.to_string());
+            }
+        }
+    }
+    env_map
+}
+
 /// Windows: "installa servizio" esegue il comando come processo background gestito
 /// (registrato in agent_processes, output catturato), invece di una unit systemd
 /// inapplicabile. Il binario (es. npm) viene risolto da cmd /C col PATH macchina,
 /// quindi NON serve la risoluzione bash/login-PATH del ramo systemd.
+#[cfg(windows)]
+/// Helper di `install_service_windows`: valida `short` (niente `/` o `..`) e
+/// `command` (non vuoto). Errore 400 esplicito in caso contrario.
+#[cfg(windows)]
+fn valida_short_command_windows(short: &str, command: &str) -> Result<(), ApiError> {
+    if short.contains('/') || short.contains("..") {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+    }
+    if command.trim().is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il comando del servizio non può essere vuoto",
+        ));
+    }
+    Ok(())
+}
+
+/// Helper di `install_service_windows`: verifica che la working directory esista
+/// e sia accessibile. Errore 400 esplicito altrimenti.
+#[cfg(windows)]
+async fn valida_cwd_windows(cwd: &str) -> Result<(), ApiError> {
+    if tokio::fs::metadata(cwd).await.is_err() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("La directory di lavoro '{}' non esiste o non è accessibile", cwd),
+        ));
+    }
+    Ok(())
+}
+
+/// Helper di `install_service_windows`: unisce `command` e gli `args` del body in
+/// un'unica riga di comando (il body puo' separarli, come nel ramo systemd).
+#[cfg(windows)]
+fn costruisci_full_command(command: &str, body: &serde_json::Value) -> String {
+    let args: Vec<String> = body["args"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if args.is_empty() {
+        command.to_string()
+    } else {
+        let args_str = args.join(" ");
+        format!("{} {}", command, args_str)
+    }
+}
+
+/// Helper di `install_service_windows`: avvia il comando come processo gestito
+/// (agent_processes) senza sandbox Docker e ritorna l'id del processo. Errore 500
+/// esplicito se lo spawn fallisce.
+#[cfg(windows)]
+async fn spawn_service_windows(
+    state: &AppState,
+    project_id: Uuid,
+    project_root: &std::path::Path,
+    short: &str,
+    full_command: &str,
+    cwd: &str,
+    env_map: std::collections::HashMap<String, String>,
+) -> Result<Uuid, ApiError> {
+    crate::agent_processes::spawn_agent_process(
+        &state.db,
+        project_id,
+        None,
+        short,
+        full_command,
+        cwd,
+        Some(project_root.to_path_buf()),
+        Some(env_map),
+        false, // niente sandbox Docker su Windows
+        "service",
+        None,
+    )
+    .await
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Avvio servizio fallito: {e}"),
+        )
+    })
+}
+
 #[cfg(windows)]
 async fn install_service_windows(
     state: AppState,
@@ -1107,70 +1213,25 @@ async fn install_service_windows(
     let command = body["command"]
         .as_str()
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'command' obbligatorio"))?;
-    if short.contains('/') || short.contains("..") {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
-    }
-    if command.trim().is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il comando del servizio non può essere vuoto",
-        ));
-    }
+    valida_short_command_windows(short, command)?;
     let root_str = context.root_path.to_string_lossy().to_string();
     let cwd = body["cwd"].as_str().unwrap_or(&root_str).to_string();
-    if tokio::fs::metadata(&cwd).await.is_err() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            format!("La directory di lavoro '{}' non esiste o non è accessibile", cwd),
-        ));
-    }
+    valida_cwd_windows(&cwd).await?;
 
-    // command + args (il body puo' separarli, come per il ramo systemd).
-    let args: Vec<String> = body["args"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    let full_command = if args.is_empty() {
-        command.to_string()
-    } else {
-        let args_str = args.join(" ");
-        format!("{} {}", command, args_str)
-    };
-
+    let full_command = costruisci_full_command(command, &body);
     // env: stringa "K=V" per riga, oppure oggetto JSON.
-    let mut env_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    if let Some(env_str) = body["env"].as_str() {
-        for line in env_str.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                let k = k.trim();
-                if !k.is_empty() {
-                    env_map.insert(k.to_string(), v.trim().to_string());
-                }
-            }
-        }
-    } else if let Some(env_obj) = body["env"].as_object() {
-        for (k, v) in env_obj {
-            if let Some(vs) = v.as_str() {
-                env_map.insert(k.clone(), vs.to_string());
-            }
-        }
-    }
+    let env_map = parse_env_body(&body);
 
-    let process_id = crate::agent_processes::spawn_agent_process(
-        &state.db,
+    let process_id = spawn_service_windows(
+        &state,
         project_id,
-        None,
+        &context.root_path,
         short,
         &full_command,
         &cwd,
-        Some(context.root_path.clone()),
-        Some(env_map),
-        false, // niente sandbox Docker su Windows
-        "service",
-        None,
+        env_map,
     )
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Avvio servizio fallito: {e}")))?;
+    .await?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -2092,6 +2153,66 @@ pub async fn uninstall_project_service(
 /// `~/.config/systemd/user/` inesistente -> rispondeva `ok:true, removed:false`
 /// ma il servizio ricompariva al primo refresh ("la cancellazione non funziona").
 #[cfg(windows)]
+/// Helper di `uninstall_project_service_windows`: normalizza il nome corto del
+/// servizio rimuovendo il prefisso `{slug}-` e il suffisso `.service` se presenti
+/// (stessa normalizzazione di control_project_service_windows / list_services_windows).
+#[cfg(windows)]
+fn normalizza_short_servizio_windows(service: &str, slug: &str) -> String {
+    service
+        .strip_prefix(&format!("{slug}-"))
+        .unwrap_or(service)
+        .strip_suffix(".service")
+        .unwrap_or(service)
+        .to_string()
+}
+
+/// Helper di `uninstall_project_service_windows`: taskkill dei processi ancora
+/// vivi (running|starting) del servizio. Query su `proj_pool` (per-progetto),
+/// dove risiede `agent_processes`. Distinzione pool mantenuta as-is.
+#[cfg(windows)]
+async fn kill_service_processes(proj_pool: &sqlx::PgPool, project_id: Uuid, short: &str) {
+    let running: Vec<(Option<i32>,)> = sqlx::query_as(
+        "SELECT pid FROM agent_processes \
+         WHERE project_id = $1 AND label = $2 AND kind = 'service' \
+           AND status IN ('running', 'starting')",
+    )
+    .bind(project_id)
+    .bind(short)
+    .fetch_all(proj_pool)
+    .await
+    .unwrap_or_default();
+    for (pid,) in running {
+        if let Some(p) = pid {
+            let _ = tokio::process::Command::new("taskkill")
+                .args(["/PID", &p.to_string(), "/T", "/F"])
+                .output()
+                .await;
+        }
+    }
+}
+
+/// Helper di `uninstall_project_service_windows`: rilascia le porte allocate a
+/// nome del servizio (best-effort). Su Windows non c'e' unit file: usa
+/// `nexus_port_allocations` (label=short) su `state.db` (META), non sul pool
+/// per-progetto. Distinzione pool mantenuta as-is.
+#[cfg(windows)]
+async fn rilascia_porte_label(state: &AppState, project_id: Uuid, short: &str) {
+    let alloc_ports: Vec<(i32,)> = sqlx::query_as(
+        "SELECT port FROM nexus_port_allocations WHERE project_id = $1 AND label = $2",
+    )
+    .bind(project_id)
+    .bind(short)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    for (port,) in alloc_ports {
+        if let Err(e) = state.port_registry.release(port as u16).await {
+            tracing::debug!(port, service = %short, "port_registry: rilascio ignorato: {e}");
+        }
+    }
+}
+
+#[cfg(windows)]
 async fn uninstall_project_service_windows(
     state: AppState,
     claims: Claims,
@@ -2109,53 +2230,17 @@ async fn uninstall_project_service_windows(
     }
     // nome corto: rimuovi prefisso "{slug}-" e suffisso ".service" se presenti
     // (stessa normalizzazione di control_project_service_windows / list_services_windows).
-    let short = service
-        .strip_prefix(&format!("{slug}-"))
-        .unwrap_or(&service)
-        .strip_suffix(".service")
-        .unwrap_or(&service)
-        .to_string();
+    let short = normalizza_short_servizio_windows(&service, &slug);
 
     // Separazione DB per-progetto: agent_processes e' migrata, instrada sul pool
     // del progetto (flag OFF -> meta-pool, behavior-preserving).
     let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
 
     // 1. taskkill dei processi ancora vivi del servizio (running | starting).
-    let running: Vec<(Option<i32>,)> = sqlx::query_as(
-        "SELECT pid FROM agent_processes \
-         WHERE project_id = $1 AND label = $2 AND kind = 'service' \
-           AND status IN ('running', 'starting')",
-    )
-    .bind(project_id)
-    .bind(&short)
-    .fetch_all(&proj_pool)
-    .await
-    .unwrap_or_default();
-    for (pid,) in running {
-        if let Some(p) = pid {
-            let _ = tokio::process::Command::new("taskkill")
-                .args(["/PID", &p.to_string(), "/T", "/F"])
-                .output()
-                .await;
-        }
-    }
+    kill_service_processes(&proj_pool, project_id, &short).await;
 
-    // 2. Rilascia le porte allocate a nome del servizio (best-effort). Su Windows
-    // non c'e' unit file da cui estrarle: usa nexus_port_allocations (label=short),
-    // stessa fonte del pannello Porte. Rilascio via punto unico port_registry.release.
-    let alloc_ports: Vec<(i32,)> = sqlx::query_as(
-        "SELECT port FROM nexus_port_allocations WHERE project_id = $1 AND label = $2",
-    )
-    .bind(project_id)
-    .bind(&short)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    for (port,) in alloc_ports {
-        if let Err(e) = state.port_registry.release(port as u16).await {
-            tracing::debug!(port, service = %short, "port_registry: rilascio ignorato: {e}");
-        }
-    }
+    // 2. Rilascia le porte allocate a nome del servizio (best-effort).
+    rilascia_porte_label(&state, project_id, &short).await;
 
     // 3. Cancella le righe del servizio: e' l'unico modo per rimuoverlo dalla lista.
     let deleted = sqlx::query(
