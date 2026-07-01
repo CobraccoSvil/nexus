@@ -35,9 +35,41 @@ const CHECKPOINT_SCHEMA = {
   properties: { passed: { type: 'boolean' }, detail: { type: 'string' } },
 }
 
-// RIEMPIRE con i path (forward-slash) della work-list residua, in ordine di priorita.
+// Work-list residua (forward-slash), ordinata per impatto realmente riducibile
+// (long_functions*10 + complexity_high*8 + security). Generata da xtask
+// quality-scan --export il 2026-07-01. chat_learning.rs escluso: bonificato a
+// mano per sbloccare il gate. Primo giro: 30 file top-impatto.
 const FILES = [
-  // 'crates/mcp-core/src/playwright_env.rs',
+  'crates/mcp-core/src/project_workspace/wizard.rs',
+  'crates/mcp-core/src/project_workspace/services.rs',
+  'crates/mcp-core/src/agent_tools/files.rs',
+  'crates/mcp-core/src/chat_messages/agent_run.rs',
+  'crates/mcp-core/src/model_catalog_sync.rs',
+  'crates/mcp-core/src/projects/quality.rs',
+  'crates/mcp-core/src/github.rs',
+  'crates/mcp-core/src/orchestrator/core.rs',
+  'crates/mcp-core/src/project_workspace/logs.rs',
+  'crates/mcp-core/src/wiki/routes.rs',
+  'crates/nexus-gateway/src/providers/google.rs',
+  'crates/mcp-core/src/chat_messages/handlers.rs',
+  'crates/mcp-core/src/projects/indexing.rs',
+  'crates/mcp-core/src/agent_tools/knowledge.rs',
+  'crates/nexus-project-db/src/exec.rs',
+  'crates/plugin-service/src/plugins.rs',
+  'crates/mcp-quality/src/lib.rs',
+  'crates/mcp-core/src/agent_tools/testing.rs',
+  'crates/mcp-core/src/model_health_probe.rs',
+  'crates/mcp-core/src/nexus_bridge.rs',
+  'crates/mcp-core/src/project_db_routes/connection.rs',
+  'crates/mcp-core/src/prompt_templates.rs',
+  'crates/mcp-core/src/vector_memory.rs',
+  'crates/xtask/src/audit_settings.rs',
+  'crates/mcp-core/src/agent_tools/service.rs',
+  'crates/nexus-agent-graph/src/nodes/tool_dispatch.rs',
+  'crates/mcp-core/src/project_workspace/run_configs.rs',
+  'crates/mcp-core/src/environment.rs',
+  'crates/mcp-core/src/projects/deep_analyze.rs',
+  'crates/mcp-core/src/projects/mod.rs',
 ]
 
 const CHECKPOINT_EVERY = 25

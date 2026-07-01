@@ -60,14 +60,10 @@ commit-msg:
 post-commit:
   parallel: false
   commands:
+    # NB Windows: comando estratto in script (path singolo, senza quote annidate
+    # ne' continuazioni multilinea) perche' Git Bash corrompe il corpo JSON del
+    # curl inline -> "syntax error: unexpected end of file" con exit 2 (falso
+    # fallimento). Stesso motivo di hook-turbo-quick.sh / hook-cargo-check.sh.
     meta_docs_ingest:
-      run: |
-        COMMIT=$(git rev-parse HEAD)
-        if curl -sf -m 3 -X POST http://localhost:4000/api/meta-docs/ingest-commit \
-             -H "Content-Type: application/json" \
-             -d "{\"commit\":\"$COMMIT\"}" > /dev/null; then
-          echo "[meta-docs] commit $COMMIT registrato"
-        else
-          echo "[meta-docs] mcp-core non raggiungibile (commit registrato, worker recuperera')"
-        fi
+      run: bash scripts/hook-meta-docs-ingest.sh
       fail_text: ""

@@ -738,17 +738,30 @@ pub(crate) async fn github_account_summary(
         ));
     }
 
+    finalize_connected_summary(db, user_id, &record, fallback_username, scopes).await
+}
+
+/// Ultimo passo del summary quando il record risulta connesso con scope validi:
+/// verifica/refresh del token e mappa l'esito su "connected" o "reconnect_required"
+/// (quest'ultimo anche in caso di errore di refresh, loggato come warning).
+async fn finalize_connected_summary(
+    db: &PgPool,
+    user_id: Uuid,
+    record: &GitHubConnectionRecord,
+    fallback_username: Option<String>,
+    scopes: Vec<String>,
+) -> anyhow::Result<GitHubAccountSummary> {
     match ensure_github_authorized_user(db, user_id).await {
         Ok(Some(authorized)) => Ok(GitHubAccountSummary {
             username: Some(authorized.username),
-            avatar_url: record.avatar_url,
+            avatar_url: record.avatar_url.clone(),
             status: "connected".to_string(),
             connected: true,
             scopes: authorized.scopes,
             expires_at: authorized.expires_at.map(|value| value.to_rfc3339()),
         }),
         Ok(None) => Ok(degraded_account_summary(
-            &record,
+            record,
             fallback_username,
             "reconnect_required",
             scopes,
@@ -756,7 +769,7 @@ pub(crate) async fn github_account_summary(
         Err(error) => {
             tracing::warn!("GitHub connection refresh failed for {user_id}: {error}");
             Ok(degraded_account_summary(
-                &record,
+                record,
                 fallback_username,
                 "reconnect_required",
                 scopes,
@@ -1096,35 +1109,46 @@ async fn build_remote_status(
             last_commit_title,
         )),
         GitHubRemoteResolution::GitHubHttps(remote) => {
-            let branch = branch_status.branch.clone();
-            let mut response = GitHubRemoteStatusResponse {
-                available: true,
-                reason: "github_https".to_string(),
-                remote_name: Some(remote.remote_name.clone()),
-                remote_url: Some(remote.remote_url.clone()),
-                owner: Some(remote.owner.clone()),
-                repo: Some(remote.repo.clone()),
-                repo_full_name: Some(format!("{}/{}", remote.owner, remote.repo)),
-                branch: branch_status.branch.clone(),
-                upstream: branch_status.upstream.clone(),
-                ahead: branch_status.ahead,
-                behind: branch_status.behind,
-                published: branch_status.upstream.is_some(),
-                default_branch: None,
-                can_push_pull: false,
-                suggested_pr_title: last_commit_title
-                    .clone()
-                    .or_else(|| branch_status.branch.clone()),
-                last_commit_title,
-                pull_request: None,
-                api_error: None,
-            };
-
-            enrich_https_remote_status(db, user_id, &remote, branch.as_deref(), &mut response)
-                .await?;
-            Ok(response)
+            build_https_remote_status(db, user_id, remote, branch_status, last_commit_title).await
         }
     }
+}
+
+/// Costruisce il response per un remote GitHub HTTPS (available=true) e lo
+/// arricchisce con i dati che richiedono il token utente (default_branch, PR aperta).
+async fn build_https_remote_status(
+    db: &PgPool,
+    user_id: Uuid,
+    remote: GitHubHttpsRemote,
+    branch_status: BranchRemoteStatus,
+    last_commit_title: Option<String>,
+) -> anyhow::Result<GitHubRemoteStatusResponse> {
+    let branch = branch_status.branch.clone();
+    let mut response = GitHubRemoteStatusResponse {
+        available: true,
+        reason: "github_https".to_string(),
+        remote_name: Some(remote.remote_name.clone()),
+        remote_url: Some(remote.remote_url.clone()),
+        owner: Some(remote.owner.clone()),
+        repo: Some(remote.repo.clone()),
+        repo_full_name: Some(format!("{}/{}", remote.owner, remote.repo)),
+        branch: branch_status.branch.clone(),
+        upstream: branch_status.upstream.clone(),
+        ahead: branch_status.ahead,
+        behind: branch_status.behind,
+        published: branch_status.upstream.is_some(),
+        default_branch: None,
+        can_push_pull: false,
+        suggested_pr_title: last_commit_title
+            .clone()
+            .or_else(|| branch_status.branch.clone()),
+        last_commit_title,
+        pull_request: None,
+        api_error: None,
+    };
+
+    enrich_https_remote_status(db, user_id, &remote, branch.as_deref(), &mut response).await?;
+    Ok(response)
 }
 
 pub(crate) async fn resolve_github_git_command_options(
@@ -1270,15 +1294,12 @@ pub async fn github_list_user_repositories(
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
 
-    let authorized = ensure_github_authorized_user(&state.db, user_id)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "Collega GitHub a Nexus per visualizzare i repository",
-            )
-        })?;
+    let authorized = require_github_authorized(
+        &state.db,
+        user_id,
+        "Collega GitHub a Nexus per visualizzare i repository",
+    )
+    .await?;
 
     let repositories = list_github_repositories(&authorized.access_token, &authorized.username)
         .await
@@ -1299,15 +1320,12 @@ pub async fn github_list_repositories(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
-    let authorized = ensure_github_authorized_user(&state.db, user_id)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "Collega GitHub a Nexus per visualizzare i repository",
-            )
-        })?;
+    let authorized = require_github_authorized(
+        &state.db,
+        user_id,
+        "Collega GitHub a Nexus per visualizzare i repository",
+    )
+    .await?;
 
     let repositories = list_github_repositories(&authorized.access_token, &authorized.username)
         .await
@@ -1316,6 +1334,25 @@ pub async fn github_list_repositories(
     Ok(Json(json!({
         "repositories": repositories,
     })))
+}
+
+/// Valida l'URL di clone: non vuoto e riconducibile a un remote GitHub HTTPS.
+/// Ritorna il remote risolto oppure 400 con il messaggio appropriato.
+fn parse_clone_target(clone_url: &str) -> Result<GitHubHttpsRemote, ApiError> {
+    let clone_url = clone_url.trim();
+    if clone_url.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "L'URL clone del repository e' obbligatorio",
+        ));
+    }
+    match parse_github_remote_url("origin", clone_url) {
+        GitHubRemoteResolution::GitHubHttps(remote) => Ok(remote),
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Sono supportati solo repository GitHub HTTPS",
+        )),
+    }
 }
 
 pub async fn github_clone_repository(
@@ -1337,31 +1374,13 @@ pub async fn github_clone_repository(
         ));
     }
 
-    let clone_url = body.clone_url.trim();
-    if clone_url.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "L'URL clone del repository e' obbligatorio",
-        ));
-    }
-    let remote = match parse_github_remote_url("origin", clone_url) {
-        GitHubRemoteResolution::GitHubHttps(remote) => remote,
-        _ => {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "Sono supportati solo repository GitHub HTTPS",
-            ))
-        }
-    };
-    let authorized = ensure_github_authorized_user(&state.db, user_id)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "Collega GitHub a Nexus per clonare repository privati o protetti",
-            )
-        })?;
+    let remote = parse_clone_target(&body.clone_url)?;
+    let authorized = require_github_authorized(
+        &state.db,
+        user_id,
+        "Collega GitHub a Nexus per clonare repository privati o protetti",
+    )
+    .await?;
 
     // If the current project directory is not empty, clone into a new subdirectory
     // inside projects_base_root and register it as a separate project.
@@ -1385,6 +1404,20 @@ pub async fn github_clone_repository(
     .await
 }
 
+/// Ricava un nome di cartella sicuro dal nome repo (solo alfanumerico e `-_.`),
+/// con fallback `repo` se il risultato e' vuoto.
+fn sanitize_repo_dir_name(repo: &str) -> String {
+    let dir_name = repo
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .collect::<String>();
+    if dir_name.is_empty() {
+        "repo".to_string()
+    } else {
+        dir_name
+    }
+}
+
 /// Percorso "directory non vuota": clona il repository in una nuova sottocartella
 /// dentro `projects_base_root` (nome derivato dal repo, ripulito) e lo registra
 /// come progetto separato, ritornando il progetto appena creato.
@@ -1394,18 +1427,7 @@ async fn clone_into_new_project(
     access_token: &str,
     remote: &GitHubHttpsRemote,
 ) -> ApiResult {
-    // Derive a clean directory name from the repo name
-    let dir_name = remote
-        .repo
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-        .collect::<String>();
-    let dir_name = if dir_name.is_empty() {
-        "repo".to_string()
-    } else {
-        dir_name
-    };
-
+    let dir_name = sanitize_repo_dir_name(&remote.repo);
     let base_root = crate::projects::load_projects_base_root(&state.db).await?;
     let dest = base_root.join(&dir_name);
 
@@ -1440,9 +1462,85 @@ async fn clone_into_new_project(
     .await
 }
 
+/// Ricava il branch corrente del repository appena clonato via `rev-parse`,
+/// con fallback `main` se il comando fallisce o restituisce vuoto.
+async fn resolve_cloned_branch(root: &std::path::Path) -> String {
+    run_git_command(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .ok()
+        .map(|(out, _)| out.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "main".to_string())
+}
+
+/// Aggiorna la riga `repositories` del progetto marcandola come repo git con la
+/// root e il branch correnti dopo una clonazione in-place.
+async fn persist_cloned_repo(
+    db: &PgPool,
+    project_id: Uuid,
+    root: &std::path::Path,
+    branch: &str,
+) -> Result<(), ApiError> {
+    let repository_root = root.to_string_lossy().to_string();
+    sqlx::query(
+        r#"
+        UPDATE repositories
+        SET is_git_repo = TRUE,
+            root_path = $2,
+            current_branch = $3
+        WHERE project_id = $1
+        "#,
+    )
+    .bind(project_id)
+    .bind(&repository_root)
+    .bind(branch)
+    .execute(db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(())
+}
+
 /// Percorso "directory vuota": clona il repository nella root del progetto,
 /// aggiorna la riga `repositories`, registra l'operazione git e ritorna lo
 /// snapshot aggiornato. Su fallita clonazione registra l'errore e ritorna 400.
+async fn run_authenticated_clone(
+    state: &AppState,
+    user_id: Uuid,
+    context: &ProjectContext,
+    access_token: &str,
+    remote: &GitHubHttpsRemote,
+) -> Result<(String, String), ApiError> {
+    let git_options = github_auth_git_options(access_token);
+    let clone_result = run_git_command_with_options(
+        &context.repository_root_path,
+        &["clone", remote.remote_url.as_str(), "."],
+        &git_options,
+    )
+    .await;
+
+    match clone_result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            crate::projects::record_git_operation(
+                &state.db,
+                user_id,
+                context,
+                "clone",
+                "error",
+                "",
+                &error.to_string(),
+                json!({
+                    "cloneUrl": remote.remote_url,
+                    "owner": remote.owner,
+                    "repo": remote.repo,
+                }),
+            )
+            .await;
+            Err(api_error(StatusCode::BAD_REQUEST, error.to_string()))
+        }
+    }
+}
+
 async fn clone_in_place(
     state: &AppState,
     user_id: Uuid,
@@ -1455,62 +1553,11 @@ async fn clone_in_place(
     let remote_repo = &remote.repo;
     let remote_clone_url = &remote.remote_url;
 
-    let git_options = github_auth_git_options(access_token);
-    let clone_result = run_git_command_with_options(
-        &context.repository_root_path,
-        &["clone", remote_clone_url.as_str(), "."],
-        &git_options,
-    )
-    .await;
+    let (stdout, stderr) =
+        run_authenticated_clone(state, user_id, &context, access_token, remote).await?;
 
-    let (stdout, stderr) = match clone_result {
-        Ok(value) => value,
-        Err(error) => {
-            crate::projects::record_git_operation(
-                &state.db,
-                user_id,
-                &context,
-                "clone",
-                "error",
-                "",
-                &error.to_string(),
-                json!({
-                    "cloneUrl": remote_clone_url,
-                    "owner": remote_owner,
-                    "repo": remote_repo,
-                }),
-            )
-            .await;
-            return Err(api_error(StatusCode::BAD_REQUEST, error.to_string()));
-        }
-    };
-
-    let branch = run_git_command(
-        &context.repository_root_path,
-        &["rev-parse", "--abbrev-ref", "HEAD"],
-    )
-    .await
-    .ok()
-    .map(|(out, _)| out.trim().to_string())
-    .filter(|value| !value.is_empty())
-    .unwrap_or_else(|| "main".to_string());
-
-    let repository_root = context.repository_root_path.to_string_lossy().to_string();
-    sqlx::query(
-        r#"
-        UPDATE repositories
-        SET is_git_repo = TRUE,
-            root_path = $2,
-            current_branch = $3
-        WHERE project_id = $1
-        "#,
-    )
-    .bind(project_id)
-    .bind(&repository_root)
-    .bind(&branch)
-    .execute(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let branch = resolve_cloned_branch(&context.repository_root_path).await;
+    persist_cloned_repo(&state.db, project_id, &context.repository_root_path, &branch).await?;
 
     let refreshed_context = load_project_context(&state.db, project_id, user_id).await?;
     crate::projects::record_git_operation(
@@ -1659,22 +1706,29 @@ pub async fn github_publish_branch(
         .remote_name
         .clone()
         .unwrap_or_else(|| "origin".to_string());
+    push_branch_and_record(&state, user_id, &context, &branch, &remote_name).await
+}
+
+/// Esegue `git push --set-upstream <remote> <branch>` con le credenziali GitHub,
+/// registra l'operazione e ritorna lo snapshot git aggiornato.
+async fn push_branch_and_record(
+    state: &AppState,
+    user_id: Uuid,
+    context: &ProjectContext,
+    branch: &str,
+    remote_name: &str,
+) -> ApiResult {
     let git_options = resolve_github_git_command_options(
         &state.db,
         user_id,
         &context.repository_root_path,
-        Some(remote_name.as_str()),
+        Some(remote_name),
     )
     .await?;
 
     let (stdout, stderr) = run_git_command_with_options(
         &context.repository_root_path,
-        &[
-            "push",
-            "--set-upstream",
-            remote_name.as_str(),
-            branch.as_str(),
-        ],
+        &["push", "--set-upstream", remote_name, branch],
         &git_options,
     )
     .await
@@ -1683,7 +1737,7 @@ pub async fn github_publish_branch(
     crate::projects::record_git_operation(
         &state.db,
         user_id,
-        &context,
+        context,
         "publish_branch",
         "success",
         &stdout,
@@ -1691,7 +1745,7 @@ pub async fn github_publish_branch(
         json!({ "branch": branch, "remote": remote_name }),
     )
     .await;
-    let git_state = refresh_git_snapshot(&state.db, &context).await?;
+    let git_state = refresh_git_snapshot(&state.db, context).await?;
     Ok(Json(json!({ "ok": true, "git": git_state })))
 }
 
@@ -1705,15 +1759,12 @@ pub async fn github_create_pull_request(
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let context = load_project_context(&state.db, project_id, user_id).await?;
-    let authorized = ensure_github_authorized_user(&state.db, user_id)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "Collega GitHub a Nexus prima di creare una pull request",
-            )
-        })?;
+    let authorized = require_github_authorized(
+        &state.db,
+        user_id,
+        "Collega GitHub a Nexus prima di creare una pull request",
+    )
+    .await?;
 
     let status = github_https_status_or_error(
         &state.db,
@@ -1730,13 +1781,11 @@ pub async fn github_create_pull_request(
     submit_pull_request(&authorized.access_token, &status, body).await
 }
 
-/// Deriva i parametri della pull request dallo stato del remote e dal body
-/// (owner/repo/head/base/title, con default sensati) e la apre via API GitHub.
-async fn submit_pull_request(
-    access_token: &str,
+/// Estrae owner/repo/head branch dallo stato del remote; ognuno e' obbligatorio
+/// (400 se assente o, per il branch, vuoto).
+fn pr_head_target(
     status: &GitHubRemoteStatusResponse,
-    body: GitHubCreatePullRequestRequest,
-) -> ApiResult {
+) -> Result<(String, String, String), ApiError> {
     let owner = status
         .owner
         .clone()
@@ -1750,6 +1799,17 @@ async fn submit_pull_request(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Branch corrente non disponibile"))?;
+    Ok((owner, repo, head_branch))
+}
+
+/// Deriva i parametri della pull request dallo stato del remote e dal body
+/// (owner/repo/head/base/title, con default sensati) e la apre via API GitHub.
+async fn submit_pull_request(
+    access_token: &str,
+    status: &GitHubRemoteStatusResponse,
+    body: GitHubCreatePullRequestRequest,
+) -> ApiResult {
+    let (owner, repo, head_branch) = pr_head_target(status)?;
 
     let base_branch = body
         .base_branch
@@ -1866,6 +1926,54 @@ async fn create_repo_via_api(
     Ok((status, resp_body))
 }
 
+/// Crea il repository via API e valida lo status: ritorna il corpo JSON su 2xx,
+/// altrimenti l'errore standard "GitHub API <status> — <message>".
+async fn create_repo_checked(
+    access_token: &str,
+    name: &str,
+    private: bool,
+    description: &str,
+    auto_init: bool,
+) -> Result<serde_json::Value, ApiError> {
+    let (status, resp_body) =
+        create_repo_via_api(access_token, name, private, description, auto_init).await?;
+    if !status.is_success() {
+        return Err(github_repo_api_error(status, &resp_body));
+    }
+    Ok(resp_body)
+}
+
+/// Verifica che l'utente abbia una connessione GitHub valida, ritornando l'utente
+/// autorizzato; altrimenti 400 con `missing_msg` (accodato al pattern std di errore).
+async fn require_github_authorized(
+    db: &PgPool,
+    user_id: Uuid,
+    missing_msg: &'static str,
+) -> Result<GitHubAuthorizedUser, ApiError> {
+    ensure_github_authorized_user(db, user_id)
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, missing_msg))
+}
+
+/// Configura (idempotente) l'origin remote sul progetto verso `clone_url`,
+/// rimuovendo l'eventuale origin pre-esistente. Ritorna true se l'add e' riuscito.
+/// Un fallimento dell'add e' loggato come warning e ritorna false (non fatale).
+async fn configure_project_origin(root: &std::path::Path, clone_url: &str) -> bool {
+    // Rimuovi eventuale origin pre-esistente
+    let _ = run_git_command(root, &["remote", "remove", "origin"]).await;
+    match run_git_command(root, &["remote", "add", "origin", clone_url]).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                "configure_project_origin: remote add fallito (repo creato ma origin non configurato): {}",
+                e
+            );
+            false
+        }
+    }
+}
+
 /// Fix M15: POST /api/projects/:id/github/create-repo
 /// Crea un nuovo repository GitHub per l'utente connesso e configura origin remote
 /// nel progetto target. Risolve il flow E2E "create new project on GitHub" che oggi
@@ -1886,15 +1994,12 @@ pub async fn github_create_repo(
 
     require_git_management(&context)?;
 
-    let authorized = ensure_github_authorized_user(&state.db, user_id)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "Collega GitHub a Nexus prima di creare un repository",
-            )
-        })?;
+    let authorized = require_github_authorized(
+        &state.db,
+        user_id,
+        "Collega GitHub a Nexus prima di creare un repository",
+    )
+    .await?;
 
     let name = body
         .get("name")
@@ -1918,14 +2023,14 @@ pub async fn github_create_repo(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    // ── Chiamata GitHub API: POST /user/repos ────────────────────────────
-    let (status, resp_body) =
-        create_repo_via_api(&authorized.access_token, name, private, description, auto_init)
-            .await?;
-
-    if !status.is_success() {
-        return Err(github_repo_api_error(status, &resp_body));
-    }
+    let resp_body = create_repo_checked(
+        &authorized.access_token,
+        name,
+        private,
+        description,
+        auto_init,
+    )
+    .await?;
 
     let clone_url = github_repo_field(&resp_body, "clone_url", "");
     let html_url = github_repo_field(&resp_body, "html_url", "");
@@ -1933,20 +2038,11 @@ pub async fn github_create_repo(
     let default_branch = github_repo_field(&resp_body, "default_branch", "main");
 
     // ── Configura origin remote sul progetto (idempotente) ──────────────
-    let mut origin_configured = false;
-    if context.is_git_repo && !clone_url.is_empty() {
-        // Rimuovi eventuale origin pre-esistente
-        let _ = run_git_command(&context.root_path, &["remote", "remove", "origin"]).await;
-        match run_git_command(&context.root_path, &["remote", "add", "origin", &clone_url]).await {
-            Ok(_) => origin_configured = true,
-            Err(e) => {
-                tracing::warn!(
-                    "github_create_repo: remote add fallito (repo creato ma origin non configurato): {}",
-                    e
-                );
-            }
-        }
-    }
+    let origin_configured = if context.is_git_repo && !clone_url.is_empty() {
+        configure_project_origin(&context.root_path, &clone_url).await
+    } else {
+        false
+    };
 
     Ok(Json(json!({
         "ok": true,
@@ -2071,6 +2167,72 @@ async fn lookup_existing_repo(
         .unwrap_or_else(|_| json!({})))
 }
 
+/// Estrae e valida i campi del body di publish: `name` (obbligatorio, validato),
+/// `private` (default true), `description` (default vuoto), `commit_message`
+/// (default "Initial commit (Nexus)").
+fn parse_publish_body(
+    body: &serde_json::Value,
+) -> Result<(String, bool, String, String), ApiError> {
+    let name = body
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?
+        .to_string();
+    validate_repo_name(&name)?;
+
+    let private = body
+        .get("private")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let description = body
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let commit_message = body
+        .get("commit_message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Initial commit (Nexus)")
+        .to_string();
+    Ok((name, private, description, commit_message))
+}
+
+/// Configura l'origin remote verso `clone_url` rimuovendo l'eventuale origin
+/// pre-esistente. A differenza di [`configure_project_origin`], qui il fallimento
+/// dell'add e' fatale (500), come richiesto dal flusso di publish.
+async fn set_origin_remote_required(
+    root: &std::path::Path,
+    clone_url: &str,
+) -> Result<(), ApiError> {
+    let _ = run_git_command(root, &["remote", "remove", "origin"]).await;
+    run_git_command(root, &["remote", "add", "origin", clone_url])
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("remote add: {e}"),
+            )
+        })?;
+    Ok(())
+}
+
+/// Esegue `git push -u origin <branch>` con le credenziali GitHub. Un fallimento
+/// non e' fatale: viene loggato come warning e ritorna false.
+async fn push_to_origin(access_token: &str, root: &std::path::Path, branch: &str) -> bool {
+    let git_options = github_auth_git_options(access_token);
+    match run_git_command_with_options(root, &["push", "-u", "origin", branch], &git_options).await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("github_publish_project: push fallito: {e}");
+            false
+        }
+    }
+}
+
 /// POST /api/projects/:id/github/publish
 ///
 /// Orchestrazione completa "pubblica progetto su GitHub":
@@ -2095,41 +2257,14 @@ pub async fn github_publish_project(
 
     require_git_management(&context)?;
 
-    let authorized = ensure_github_authorized_user(&state.db, user_id)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                "Collega GitHub a Nexus prima di pubblicare",
-            )
-        })?;
+    let authorized = require_github_authorized(
+        &state.db,
+        user_id,
+        "Collega GitHub a Nexus prima di pubblicare",
+    )
+    .await?;
 
-    let name = body
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?
-        .to_string();
-
-    validate_repo_name(&name)?;
-
-    let private = body
-        .get("private")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let description = body
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let commit_message = body
-        .get("commit_message")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("Initial commit (Nexus)")
-        .to_string();
+    let (name, private, description, commit_message) = parse_publish_body(&body)?;
 
     let root = context.root_path.clone();
 
@@ -2151,34 +2286,13 @@ pub async fn github_publish_project(
     let full_name = github_repo_field(&resp_body, "full_name", "");
     let default_branch = github_repo_field(&resp_body, "default_branch", "main");
 
-    // ── 4. Configura origin (idempotente) ────────────────────────────────
+    // ── 4. Configura origin (idempotente, fatale in publish) ─────────────
     if !clone_url.is_empty() {
-        let _ = run_git_command(&root, &["remote", "remove", "origin"]).await;
-        run_git_command(&root, &["remote", "add", "origin", &clone_url])
-            .await
-            .map_err(|e| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("remote add: {e}"),
-                )
-            })?;
+        set_origin_remote_required(&root, &clone_url).await?;
     }
 
     // ── 5. Push con token iniettato ──────────────────────────────────────
-    let git_options = github_auth_git_options(&authorized.access_token);
-    let pushed = match run_git_command_with_options(
-        &root,
-        &["push", "-u", "origin", &default_branch],
-        &git_options,
-    )
-    .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!("github_publish_project: push fallito: {e}");
-            false
-        }
-    };
+    let pushed = push_to_origin(&authorized.access_token, &root, &default_branch).await;
 
     Ok(Json(json!({
         "ok": true,
