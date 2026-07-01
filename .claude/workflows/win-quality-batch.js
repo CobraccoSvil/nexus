@@ -35,41 +35,31 @@ const CHECKPOINT_SCHEMA = {
   properties: { passed: { type: 'boolean' }, detail: { type: 'string' } },
 }
 
-// Work-list residua (forward-slash), ordinata per impatto realmente riducibile
-// (long_functions*10 + complexity_high*8 + security). Generata da xtask
-// quality-scan --export il 2026-07-01. chat_learning.rs escluso: bonificato a
-// mano per sbloccare il gate. Primo giro: 30 file top-impatto.
+// Work-list giro-3 (ripresa post-riavvio 2026-07-01): i 18 file RESTANTI del
+// giro-2 (i primi 9 gia committati, HEAD ...audit_settings.rs 22349ac).
+// Rigenerata da xtask quality-scan --export sui finding ATTUALI (post GO-LIVE
+// cutover DB), ordinata per RISCHIO crescente (complexity_high asc, long_functions desc).
+// Esclusi come sempre i 2 super-hotspot agent_run.rs + wizard.rs (intervento dedicato).
+// Prerequisito: pre-scaldare la cache con `cargo clippy --workspace --all-targets`.
 const FILES = [
-  'crates/mcp-core/src/project_workspace/wizard.rs',
-  'crates/mcp-core/src/project_workspace/services.rs',
-  'crates/mcp-core/src/agent_tools/files.rs',
-  'crates/mcp-core/src/chat_messages/agent_run.rs',
-  'crates/mcp-core/src/model_catalog_sync.rs',
-  'crates/mcp-core/src/projects/quality.rs',
-  'crates/mcp-core/src/github.rs',
-  'crates/mcp-core/src/orchestrator/core.rs',
-  'crates/mcp-core/src/project_workspace/logs.rs',
-  'crates/mcp-core/src/wiki/routes.rs',
-  'crates/nexus-gateway/src/providers/google.rs',
-  'crates/mcp-core/src/chat_messages/handlers.rs',
-  'crates/mcp-core/src/projects/indexing.rs',
-  'crates/mcp-core/src/agent_tools/knowledge.rs',
-  'crates/nexus-project-db/src/exec.rs',
-  'crates/plugin-service/src/plugins.rs',
-  'crates/mcp-quality/src/lib.rs',
-  'crates/mcp-core/src/agent_tools/testing.rs',
-  'crates/mcp-core/src/model_health_probe.rs',
-  'crates/mcp-core/src/nexus_bridge.rs',
-  'crates/mcp-core/src/project_db_routes/connection.rs',
-  'crates/mcp-core/src/prompt_templates.rs',
-  'crates/mcp-core/src/vector_memory.rs',
-  'crates/xtask/src/audit_settings.rs',
-  'crates/mcp-core/src/agent_tools/service.rs',
-  'crates/nexus-agent-graph/src/nodes/tool_dispatch.rs',
-  'crates/mcp-core/src/project_workspace/run_configs.rs',
   'crates/mcp-core/src/environment.rs',
   'crates/mcp-core/src/projects/deep_analyze.rs',
   'crates/mcp-core/src/projects/mod.rs',
+  'crates/mcp-core/src/model_catalog_sync.rs',
+  'crates/mcp-core/src/projects/quality.rs',
+  'crates/mcp-core/src/chat_messages/handlers.rs',
+  'crates/mcp-core/src/agent_tools/knowledge.rs',
+  'crates/nexus-project-db/src/exec.rs',
+  'crates/plugin-service/src/plugins.rs',
+  'crates/mcp-core/src/agent_tools/testing.rs',
+  'crates/mcp-core/src/project_db_routes/connection.rs',
+  'crates/mcp-core/src/prompt_templates.rs',
+  'crates/mcp-core/src/agent_tools/service.rs',
+  'crates/nexus-agent-graph/src/nodes/tool_dispatch.rs',
+  'crates/mcp-core/src/orchestrator/core.rs',
+  'crates/mcp-core/src/project_workspace/run_configs.rs',
+  'crates/mcp-core/src/project_workspace/services.rs',
+  'crates/mcp-core/src/projects/indexing.rs',
 ]
 
 const CHECKPOINT_EVERY = 25

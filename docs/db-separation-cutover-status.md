@@ -205,29 +205,45 @@ nessun admin richiesto, niente lock `.exe` da servizio elevato durante il rebuil
 
 ## Sicurezza / stato attuale
 Flag **true** — **GO-LIVE ATTIVO**. `beaty_book_nexus` e' la fonte viva dei dati
-per-progetto (chat/run); il meta conserva le copie pre-flip (dual-presenza) come rete
-di rollback. Rollback in un comando: `UPDATE settings SET value='false'` -> torna a
-leggere/scrivere dal meta entro ~30s (i dati scritti in beaty a flag ON restano li',
-da ri-sincronizzare se si vuole tornare stabilmente su meta).
+per-progetto (chat/run). Le copie pre-flip nel meta sono state **RIMOSSE** (cleanup
+dual-presence eseguito, vedi sotto): la rete di rollback ora e' il **backup su disco**
+(`backups/postgres/nexus_pre_cleanup_main_*.dump` + `nexus_checkpoints_*.dump`).
+Rollback del flag (richiede il bypass del guard, vedi mig 0499):
+`BEGIN; SET LOCAL app.allow_protected_write='on'; UPDATE settings SET value='false' WHERE key='db.project_separation.enabled'; COMMIT;`
+NB dopo il cleanup un rollback a flag OFF troverebbe il meta SENZA i dati di beaty ->
+per tornare stabilmente su meta serve ripristinare dal backup o ri-copiare da beaty.
 
-Verifica E2E del go-live (2026-07-01, ~15:18): inviato un messaggio da UI su beaty-book
--> `beaty_book_nexus.chat_messages` 68 -> 70 (user + assistant), `nexus.chat_messages`
-FERMO a 68 (nessuno split-brain), `nexus_data_routing` auto-aggiornato. Migrator salta
-pulito (fix PROVISION_LOCKS nel binario rebuiltato), 2 connessioni nexus_app attive su
-beaty, health ok.
+Verifica E2E del go-live (2026-07-01, ~15:18): messaggio da UI su beaty-book ->
+`beaty_book_nexus.chat_messages` 68 -> 70, `nexus.chat_messages` FERMO a 68 (nessuno
+split-brain), routing auto-aggiornato, migrator pulito, health ok.
 
-### Cleanup dual-presence (prossimo passo, opzionale)
-Le copie meta pre-flip (chat/run di beaty) sono ora ridondanti. CONSIGLIO: attendere
-qualche giorno di go-live stabile prima di rimuoverle (restano la rete di rollback).
-Poi `scripts/db-cleanup-dual-presence.sh 98138624-... --apply` + `VACUUM (ANALYZE)`.
+## Follow-up post-go-live (sessione 2026-07-01)
+- **Cleanup dual-presence: FATTO.** 2808 righe di beaty rimosse dal meta (transazione
+  unica, safety-check beaty>=meta) + VACUUM FULL (nexus_graph_checkpoints 295MB->24kB).
+  Backup pre-cleanup su disco. `scripts/db-cleanup-dual-presence.sh`.
+- **Guard flip accidentale: FATTO** (mig 0499, commit a69663f). Colonna
+  `settings.is_protected` + trigger `trg_settings_guard_protected` -> il value dei
+  setting protetti non e' modificabile dagli endpoint generici senza bypass di sessione.
+  `db.project_separation.enabled` marcato protetto. Punto unico DB (copre admin-service
+  + mcp-core). Verificato.
+- **Boot-recovery per-progetto: FATTO** (commit f47936b). agent_processes riconciliati
+  al boot anche nei DB progetto (mark-only). RICHIEDE REBUILD per attivarsi.
+- **Diagnosi provider AI**: anthropic+openai in cooldown billing (`credit_balance_too_low`,
+  fino ~21:21 UTC), unici attivi in routing -> la chat non ottiene risposta. NON e' un
+  bug del cutover: credito esaurito sugli account. Fix = ricaricare credito, oppure
+  attivare in `nexus_routing_matrix` un provider con credito (google/deepseek/mistral
+  hanno API key ma sono is_active=false). Decisione operativa.
+- **RISCHIO read-path non instradati (aperto)**: dopo il cleanup il meta non ha piu' i
+  dati di beaty, quindi ogni read-path che legge una tabella MIGRATA dal meta a flag ON
+  ora mostra VUOTO (prima vedeva le copie stale). Trovato+corretto
+  `monitor_seed.rs::recent_active_projects` (pannello Monitor). DA FARE: audit esaustivo
+  degli altri call-site read che usano `state.db`/meta su tabelle migrate invece del
+  pool per-progetto, poi rebuild.
 
-### Nota: rischio flip accidentale (ora mitigato)
-Il flag e' scrivibile dalla UI admin generica (`admin-service/src/settings.rs`,
-`PUT /setting/:key`, nessuna whitelist). Con beaty ora POPOLATO il rischio del flip
-accidentale e' neutralizzato (un flip off->on->off non nasconde piu' la cronologia).
-Resta valido come hardening futuro: whitelist/guard sui setting critici.
+### Nota: rischio flip accidentale — RISOLTO
+Vedi guard mig 0499 sopra. Sostituisce la vecchia mitigazione (beaty popolato).
 
 ## Migrazioni introdotte
 `0494` connection_role, `0495` seed flag, `0496` nexus_data_routing,
-`0497` drop tabelle morte, `0498` seed retention,
+`0497` drop tabelle morte, `0498` seed retention, `0499` settings protetti (guard flip),
 `db/migrations/project/0001_chat.sql`, `0002_run.sql`, `0003` drop dead.
