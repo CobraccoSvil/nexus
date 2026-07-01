@@ -25,7 +25,7 @@ docker logs nexus-gateway --tail=100 | grep "ProviderError"
 ```
 
 ### Rimedi
-1. **Fallback automatico**: il `FallbackChain` già tenta il provider secondario. Verifica che il secondario sia healthy.
+1. **Fallback automatico**: il fallback multi-provider (`run_fallback`) già tenta il provider secondario. Verifica che il secondario sia healthy.
 2. **Forzatura manuale del provider** (aggiornando la policy):
    ```yaml
    # config/policies/default.yaml — commenta il provider down

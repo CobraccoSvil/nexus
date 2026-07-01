@@ -455,8 +455,9 @@ pub async fn complete(
 
 /// `POST /v1/stream`: completion in streaming SSE (auth richiesta).
 ///
-/// Differenza dal Node: la `FallbackChain` non espone uno stream multi-provider,
-/// quindi lo streaming usa il PRIMO provider risolto non in cooldown (parita'
+/// Differenza dal Node: il fallback multi-provider (`run_fallback`) non espone
+/// uno stream, quindi lo streaming usa il PRIMO provider risolto non in cooldown
+/// (parita'
 /// ragionevole: il caso comune e' un solo primario sano). Su errore di apertura
 /// dello stream emette un evento `error` e termina, come il `catch` del server.ts.
 pub async fn stream(
