@@ -400,6 +400,383 @@ static RE_COMPOSE_PORT_VAR: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
     regex::Regex::new(r"\$\{(PORT[A-Z0-9_]*)(?::-\d+)?\}").unwrap()
 });
 
+/// Porta deterministica per suggerimenti web: evita conflitti già in fase di
+/// analisi. Punto unico su `deterministic_project_port_for_key`.
+async fn suggest_port(state: &AppState, project_id: &Uuid, key: &str) -> u16 {
+    super::services::deterministic_project_port_for_key(project_id, key, &state.port_registry).await
+}
+
+/// Helper di `detect_node_suggestions`: dato un `package.json` gia' parsato, emette
+/// AL PIU' un suggerimento (primo script tra dev/start/serve/preview presente).
+/// Helper di `emit_node_pkg_sugg`: dal path del `package.json` deriva `(cwd, rel,
+/// pkg_manager, needs_install)`. `needs_install` = manca `node_modules`.
+async fn node_pkg_context(root: &str, pkg_path: &str) -> (String, String, &'static str, bool) {
+    let cwd = std::path::Path::new(pkg_path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.to_string());
+    let rel = cwd
+        .strip_prefix(root)
+        .unwrap_or("")
+        .trim_start_matches('/')
+        .to_string();
+    let pkg_manager = if tokio::fs::metadata(format!("{}/pnpm-lock.yaml", cwd))
+        .await
+        .is_ok()
+    {
+        "pnpm"
+    } else {
+        "npm"
+    };
+    // Controlla se node_modules esiste. Il flag `needs_install`
+    // viene usato dalla UI per mostrare uno step "Setup ambiente";
+    // il wizard install eseguirà automaticamente il setup.
+    let needs_install = tokio::fs::metadata(format!("{}/node_modules", &cwd))
+        .await
+        .is_err();
+    (cwd, rel, pkg_manager, needs_install)
+}
+
+async fn emit_node_pkg_sugg(
+    state: &AppState,
+    project_id: &Uuid,
+    root: &str,
+    slug: &str,
+    pkg_path: &str,
+    pkg: &serde_json::Value,
+    out: &mut Vec<serde_json::Value>,
+) {
+    let scripts = pkg.get("scripts").and_then(|s| s.as_object());
+    let (cwd, rel, pkg_manager, needs_install) = node_pkg_context(root, pkg_path).await;
+    for script_name in ["dev", "start", "serve", "preview"] {
+        if scripts
+            .map(|s| s.contains_key(script_name))
+            .unwrap_or(false)
+        {
+            let svc_short = if rel.is_empty() {
+                script_name.to_string()
+            } else {
+                format!("{}-{}", rel.replace('/', "-"), script_name)
+            };
+            out.push(json!({
+                "short":         svc_short,
+                "unit":          format!("{}-{}.service", slug, svc_short),
+                "label":         format!("{} {} ({})", pkg_manager, script_name, if rel.is_empty() { "root" } else { rel.as_str() }),
+                "kind":          if pkg_manager == "pnpm" { "pnpm" } else { "npm" },
+                "command":       pkg_manager,
+                "args":          ["run", script_name],
+                "cwd":           cwd,
+                "env":           { "PORT": suggest_port(state, project_id, &svc_short).await.to_string() },
+                "existing":      false,
+                "needs_install": needs_install,
+                "pkg_manager":   pkg_manager,
+            }));
+            break; // un solo script per package.json
+        }
+    }
+}
+
+/// Blocco 1 di `wizard_detect_services`: suggerimenti da `package.json`/pnpm.
+async fn detect_node_suggestions(
+    state: &AppState,
+    project_id: &Uuid,
+    root: &str,
+    slug: &str,
+) -> Vec<serde_json::Value> {
+    let mut suggestions: Vec<serde_json::Value> = Vec::new();
+    let pkg_paths = find_files_named(root, "package.json", 6).await;
+    for pkg_path in &pkg_paths {
+        if let Ok(content) = tokio::fs::read_to_string(pkg_path).await {
+            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
+                emit_node_pkg_sugg(
+                    state,
+                    project_id,
+                    root,
+                    slug,
+                    pkg_path,
+                    &pkg,
+                    &mut suggestions,
+                )
+                .await;
+            }
+        }
+    }
+    suggestions
+}
+
+/// Blocco 2 di `wizard_detect_services`: suggerimenti .NET da launchSettings.json.
+async fn detect_dotnet_launch_suggestions(
+    state: &AppState,
+    project_id: &Uuid,
+    root: &str,
+    slug: &str,
+) -> Vec<serde_json::Value> {
+    let mut suggestions: Vec<serde_json::Value> = Vec::new();
+    let launch_paths = find_files_named(root, "launchSettings.json", 8).await;
+    for lp in &launch_paths {
+        let cwd = std::path::Path::new(lp)
+            .parent()
+            .and_then(|p| p.parent()) // Properties/ → project dir
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| root.to_string());
+        let csproj = find_csproj_in(&cwd).await;
+        let proj_arg = csproj.as_deref().unwrap_or(".");
+        let rel = cwd
+            .strip_prefix(root)
+            .unwrap_or("")
+            .trim_start_matches('/');
+        let svc_short = if rel.is_empty() {
+            "dotnet".to_string()
+        } else {
+            rel.replace('/', "-")
+        };
+        // needs_install: manca la directory bin/ → dotnet restore necessario
+        let needs_install = tokio::fs::metadata(format!("{}/bin", cwd)).await.is_err();
+        suggestions.push(json!({
+            "short":         svc_short,
+            "unit":          format!("{}-{}.service", slug, svc_short),
+            "label":         format!("dotnet run ({})", if rel.is_empty() { "root" } else { rel }),
+            "kind":          "dotnet",
+            "command":       "dotnet",
+            "args":          ["run", "--project", proj_arg],
+            "cwd":           cwd,
+            "env":           { "PORT": suggest_port(state, project_id, &svc_short).await.to_string() },
+            "existing":      false,
+            "needs_install": needs_install,
+            "pkg_manager":   "dotnet restore",
+        }));
+    }
+    suggestions
+}
+
+/// Blocco 3 di `wizard_detect_services`: suggerimenti Cargo `[[bin]]`.
+async fn detect_cargo_bin_suggestions(root: &str, slug: &str) -> Vec<serde_json::Value> {
+    let mut suggestions: Vec<serde_json::Value> = Vec::new();
+    let cargo_paths = find_files_named(root, "Cargo.toml", 6).await;
+    for cp in &cargo_paths {
+        if let Ok(content) = tokio::fs::read_to_string(cp).await {
+            // Cerca [[bin]] entries
+            let bin_names: Vec<String> = content
+                .lines()
+                .filter_map(|l| {
+                    let t = l.trim();
+                    if t.starts_with("name") && content.contains("[[bin]]") {
+                        t.split_once('=').map(|x| x.1)
+                            .map(|v| v.trim().trim_matches('"').to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let cwd = std::path::Path::new(cp)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.to_string());
+            let rel = cwd
+                .strip_prefix(root)
+                .unwrap_or("")
+                .trim_start_matches('/');
+            for bin in &bin_names {
+                let svc_short = format!("cargo-{}", bin);
+                suggestions.push(json!({
+                    "short":    svc_short,
+                    "unit":     format!("{}-{}.service", slug, svc_short),
+                    "label":    format!("cargo run --bin {} ({})", bin, if rel.is_empty() { "root" } else { rel }),
+                    "kind":     "cargo",
+                    "command":  "cargo",
+                    "args":     ["run", "--bin", bin],
+                    "cwd":      cwd,
+                    "existing": false,
+                }));
+            }
+        }
+    }
+    suggestions
+}
+
+/// Helper di `detect_compose_suggestions`: legge il file compose e alloca una
+/// porta gestita per ciascuna variabile ${PORT*} distinta, costruendo l'oggetto
+/// env dei suggerimenti. docker-compose espone tipicamente PIU' porte via
+/// variabili (es. ${PORT_FRONTEND:-20001}, ${PORT_BACKEND:-20002}): usiamo le
+/// porte del bucket di progetto (regola I / ADR 0010) invece di lasciare il
+/// placeholder fuorviante.
+async fn costruisci_compose_env(
+    state: &AppState,
+    project_id: &Uuid,
+    dc_path: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut env_obj = serde_json::Map::new();
+    if let Ok(compose) = tokio::fs::read_to_string(dc_path).await {
+        let mut seen = std::collections::HashSet::new();
+        for cap in RE_COMPOSE_PORT_VAR.captures_iter(&compose) {
+            if let Some(m) = cap.get(1) {
+                let var = m.as_str().to_string();
+                if seen.insert(var.clone()) {
+                    let key = format!("docker-{}", var.to_lowercase());
+                    let p = suggest_port(state, project_id, &key).await;
+                    env_obj.insert(var, serde_json::Value::String(p.to_string()));
+                }
+            }
+        }
+    }
+    env_obj
+}
+
+/// Blocco 4 di `wizard_detect_services`: suggerimento docker-compose (primo file
+/// trovato). Alloca una porta gestita per ciascuna variabile ${PORT*} del compose.
+async fn detect_compose_suggestions(
+    state: &AppState,
+    project_id: &Uuid,
+    root: &str,
+    slug: &str,
+) -> Vec<serde_json::Value> {
+    let mut suggestions: Vec<serde_json::Value> = Vec::new();
+    for dc_name in &[
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.dev.yml",
+        "docker-compose.dev.yaml",
+    ] {
+        let dc_path = format!("{}/{}", root, dc_name);
+        if tokio::fs::metadata(&dc_path).await.is_ok() {
+            let env_obj = costruisci_compose_env(state, project_id, &dc_path).await;
+            suggestions.push(json!({
+                "short":    "docker",
+                "unit":     format!("{}-docker.service", slug),
+                "label":    format!("docker compose up ({})", dc_name),
+                "kind":     "shell",
+                "command":  "docker",
+                "args":     ["compose", "-f", dc_name, "up"],
+                "cwd":      root,
+                "existing": false,
+                "env":      serde_json::Value::Object(env_obj),
+            }));
+            break;
+        }
+    }
+    suggestions
+}
+
+/// Helper di `detect_python_suggestions`: rileva il package manager Python della
+/// `root` e se l'ambiente e' gia' pronto. Ritorna `(pkg_manager, needs_install)`.
+async fn rileva_python_pkg_manager(root: &str) -> (&'static str, bool) {
+    let venv_ok = tokio::fs::metadata(format!("{}/.venv", root)).await.is_ok()
+        || tokio::fs::metadata(format!("{}/venv", root)).await.is_ok();
+    let pm = if tokio::fs::metadata(format!("{}/uv.lock", root))
+        .await
+        .is_ok()
+    {
+        "uv sync"
+    } else if tokio::fs::metadata(format!("{}/poetry.lock", root))
+        .await
+        .is_ok()
+    {
+        "poetry install"
+    } else if tokio::fs::metadata(format!("{}/Pipfile", root))
+        .await
+        .is_ok()
+    {
+        "pipenv install"
+    } else if tokio::fs::metadata(format!("{}/requirements.txt", root))
+        .await
+        .is_ok()
+    {
+        "pip install -r requirements.txt"
+    } else {
+        ""
+    };
+    (pm, !venv_ok && !pm.is_empty())
+}
+
+/// Blocco 5 di `wizard_detect_services`: suggerimenti Python (entry point comuni).
+async fn detect_python_suggestions(root: &str, slug: &str) -> Vec<serde_json::Value> {
+    let mut suggestions: Vec<serde_json::Value> = Vec::new();
+    for py_entry in &["main.py", "app.py", "server.py", "run.py", "manage.py"] {
+        let py_path = format!("{}/{}", root, py_entry);
+        if tokio::fs::metadata(&py_path).await.is_ok() {
+            let svc_short = py_entry.strip_suffix(".py").unwrap_or(py_entry);
+            let (py_pkg_manager, needs_install) = rileva_python_pkg_manager(root).await;
+            suggestions.push(json!({
+                "short":         svc_short,
+                "unit":          format!("{}-{}.service", slug, svc_short),
+                "label":         format!("python {} (root)", py_entry),
+                "kind":          "python",
+                "command":       "python3",
+                "args":          [py_entry],
+                "cwd":           root,
+                "existing":      false,
+                "needs_install": needs_install,
+                "pkg_manager":   py_pkg_manager,
+            }));
+        }
+    }
+    suggestions
+}
+
+/// Blocco 6 di `wizard_detect_services`: sito HTML statico senza framework.
+/// Punto unico (regola L): stessa rilevazione del server integrato
+/// (static_preview::detect_static_entry). Proposto SOLO se nessun framework
+/// serve gia' il sito (package.json/Cargo.toml/launchSettings/python entry).
+/// Il server e' un python http.server su una PORTA ALLOCATA DA NEXUS
+/// (kind="static" -> wants_port nell'install): mai porte riservate (la 8080
+/// e' in NEXUS_RESERVED_PORTS) ne' hardcoded. La porta concreta e' iniettata
+/// dall'install al posto del placeholder __PORT__.
+async fn detect_static_site_suggestion(root: &str, slug: &str) -> Vec<serde_json::Value> {
+    let mut suggestions: Vec<serde_json::Value> = Vec::new();
+    let mut has_framework = tokio::fs::metadata(format!("{}/package.json", root))
+        .await
+        .is_ok()
+        || tokio::fs::metadata(format!("{}/Cargo.toml", root))
+            .await
+            .is_ok()
+        || tokio::fs::metadata(format!("{}/launchSettings.json", root))
+            .await
+            .is_ok();
+    if !has_framework {
+        for f in &["main.py", "app.py", "server.py", "run.py", "manage.py"] {
+            if tokio::fs::metadata(format!("{}/{}", root, f)).await.is_ok() {
+                has_framework = true;
+                break;
+            }
+        }
+    }
+    if !has_framework {
+        if let Some(entry) = crate::static_preview::detect_static_entry(root).await {
+            suggestions.push(json!({
+                "short":         "static",
+                "unit":          format!("{}-static.service", slug),
+                "label":         format!("Server statico HTML ({entry})"),
+                "kind":          "static",
+                "command":       "python3",
+                "args":          ["-m", "http.server", "__PORT__", "--bind", "127.0.0.1"],
+                "cwd":           root,
+                "existing":      false,
+                "needs_install": false,
+            }));
+        }
+    }
+    suggestions
+}
+
+/// Euristica testuale (rete di sicurezza di `wizard_detect_services`): concatena i
+/// blocchi di detection NELLO STESSO ORDINE (package.json, .NET, Cargo,
+/// docker-compose, python, static) per preservare l'ordine dei suggerimenti.
+async fn detect_services_heuristic(
+    state: &AppState,
+    project_id: &Uuid,
+    root: &str,
+    slug: &str,
+) -> Vec<serde_json::Value> {
+    let mut suggestions: Vec<serde_json::Value> = Vec::new();
+    suggestions.extend(detect_node_suggestions(state, project_id, root, slug).await);
+    suggestions.extend(detect_dotnet_launch_suggestions(state, project_id, root, slug).await);
+    suggestions.extend(detect_cargo_bin_suggestions(root, slug).await);
+    suggestions.extend(detect_compose_suggestions(state, project_id, root, slug).await);
+    suggestions.extend(detect_python_suggestions(root, slug).await);
+    suggestions.extend(detect_static_site_suggestion(root, slug).await);
+    suggestions
+}
+
 pub async fn wizard_detect_services(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -411,14 +788,6 @@ pub async fn wizard_detect_services(
     let context = load_project_context(&state.db, project_id, user_id).await?;
     let root = context.root_path.to_string_lossy().to_string();
     let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
-
-    let mut suggestions: Vec<serde_json::Value> = Vec::new();
-
-    // Porta deterministica per suggerimenti web: evita conflitti già in fase di analisi.
-    async fn suggest_port(state: &AppState, project_id: &Uuid, key: &str) -> u16 {
-        super::services::deterministic_project_port_for_key(project_id, key, &state.port_registry)
-            .await
-    }
 
     // ── Rilevamento agentico PRIMARIO (agent-first) ────────────────────────
     // Se l'agent identifica servizi validi, li usa e ritorna subito; altrimenti
@@ -441,277 +810,7 @@ pub async fn wizard_detect_services(
         }
     }
 
-    // ── 1. package.json / pnpm ─────────────────────────────────────────────
-    let pkg_paths = find_files_named(&root, "package.json", 6).await;
-    for pkg_path in &pkg_paths {
-        if let Ok(content) = tokio::fs::read_to_string(pkg_path).await {
-            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
-                let scripts = pkg.get("scripts").and_then(|s| s.as_object());
-                let cwd = std::path::Path::new(pkg_path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| root.clone());
-                let rel = cwd
-                    .strip_prefix(&root)
-                    .unwrap_or("")
-                    .trim_start_matches('/');
-                let pkg_manager = if tokio::fs::metadata(format!("{}/pnpm-lock.yaml", cwd))
-                    .await
-                    .is_ok()
-                {
-                    "pnpm"
-                } else {
-                    "npm"
-                };
-                // Controlla se node_modules esiste. Il flag `needs_install`
-                // viene usato dalla UI per mostrare uno step "Setup ambiente";
-                // il wizard install eseguirà automaticamente il setup.
-                let needs_install = tokio::fs::metadata(format!("{}/node_modules", &cwd))
-                    .await
-                    .is_err();
-                for script_name in ["dev", "start", "serve", "preview"] {
-                    if scripts
-                        .map(|s| s.contains_key(script_name))
-                        .unwrap_or(false)
-                    {
-                        let svc_short = if rel.is_empty() {
-                            script_name.to_string()
-                        } else {
-                            format!("{}-{}", rel.replace('/', "-"), script_name)
-                        };
-                        suggestions.push(json!({
-                            "short":         svc_short,
-                            "unit":          format!("{}-{}.service", slug, svc_short),
-                            "label":         format!("{} {} ({})", pkg_manager, script_name, if rel.is_empty() { "root" } else { rel }),
-                            "kind":          if pkg_manager == "pnpm" { "pnpm" } else { "npm" },
-                            "command":       pkg_manager,
-                            "args":          ["run", script_name],
-                            "cwd":           cwd,
-                            "env":           { "PORT": suggest_port(&state, &project_id, &svc_short).await.to_string() },
-                            "existing":      false,
-                            "needs_install": needs_install,
-                            "pkg_manager":   pkg_manager,
-                        }));
-                        break; // un solo script per package.json
-                    }
-                }
-            }
-        }
-    }
-
-    // ── 2. .NET / launchSettings.json ──────────────────────────────────────
-    let launch_paths = find_files_named(&root, "launchSettings.json", 8).await;
-    for lp in &launch_paths {
-        let cwd = std::path::Path::new(lp)
-            .parent()
-            .and_then(|p| p.parent()) // Properties/ → project dir
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| root.clone());
-        let csproj = find_csproj_in(&cwd).await;
-        let proj_arg = csproj.as_deref().unwrap_or(".");
-        let rel = cwd
-            .strip_prefix(&root)
-            .unwrap_or("")
-            .trim_start_matches('/');
-        let svc_short = if rel.is_empty() {
-            "dotnet".to_string()
-        } else {
-            rel.replace('/', "-")
-        };
-        // needs_install: manca la directory bin/ → dotnet restore necessario
-        let needs_install = tokio::fs::metadata(format!("{}/bin", cwd)).await.is_err();
-        suggestions.push(json!({
-            "short":         svc_short,
-            "unit":          format!("{}-{}.service", slug, svc_short),
-            "label":         format!("dotnet run ({})", if rel.is_empty() { "root" } else { rel }),
-            "kind":          "dotnet",
-            "command":       "dotnet",
-            "args":          ["run", "--project", proj_arg],
-            "cwd":           cwd,
-            "env":           { "PORT": suggest_port(&state, &project_id, &svc_short).await.to_string() },
-            "existing":      false,
-            "needs_install": needs_install,
-            "pkg_manager":   "dotnet restore",
-        }));
-    }
-
-    // ── 3. Cargo.toml binaries ─────────────────────────────────────────────
-    let cargo_paths = find_files_named(&root, "Cargo.toml", 6).await;
-    for cp in &cargo_paths {
-        if let Ok(content) = tokio::fs::read_to_string(cp).await {
-            // Cerca [[bin]] entries
-            let bin_names: Vec<String> = content
-                .lines()
-                .filter_map(|l| {
-                    let t = l.trim();
-                    if t.starts_with("name") && content.contains("[[bin]]") {
-                        t.split_once('=').map(|x| x.1)
-                            .map(|v| v.trim().trim_matches('"').to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let cwd = std::path::Path::new(cp)
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| root.clone());
-            let rel = cwd
-                .strip_prefix(&root)
-                .unwrap_or("")
-                .trim_start_matches('/');
-            for bin in &bin_names {
-                let svc_short = format!("cargo-{}", bin);
-                suggestions.push(json!({
-                    "short":    svc_short,
-                    "unit":     format!("{}-{}.service", slug, svc_short),
-                    "label":    format!("cargo run --bin {} ({})", bin, if rel.is_empty() { "root" } else { rel }),
-                    "kind":     "cargo",
-                    "command":  "cargo",
-                    "args":     ["run", "--bin", bin],
-                    "cwd":      cwd,
-                    "existing": false,
-                }));
-            }
-        }
-    }
-
-    // ── 4. docker-compose.yml ──────────────────────────────────────────────
-    for dc_name in &[
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "docker-compose.dev.yml",
-        "docker-compose.dev.yaml",
-    ] {
-        let dc_path = format!("{}/{}", root, dc_name);
-        if tokio::fs::metadata(&dc_path).await.is_ok() {
-            // docker-compose espone tipicamente PIU' porte via variabili
-            // d'ambiente (es. ${PORT_FRONTEND:-20001}, ${PORT_BACKEND:-20002}).
-            // Allochiamo una porta gestita per CIASCUNA variabile e la
-            // proponiamo nell'env, invece di lasciare il dialog vuoto (che
-            // mostra il placeholder fuorviante "PORT=20000") o iniettare una
-            // singola PORT che il compose ignorerebbe. Cosi' il servizio docker
-            // usa le porte del bucket di progetto (regola I / ADR 0010).
-            let mut env_obj = serde_json::Map::new();
-            if let Ok(compose) = tokio::fs::read_to_string(&dc_path).await {
-                let mut seen = std::collections::HashSet::new();
-                for cap in RE_COMPOSE_PORT_VAR.captures_iter(&compose) {
-                    if let Some(m) = cap.get(1) {
-                        let var = m.as_str().to_string();
-                        if seen.insert(var.clone()) {
-                            let key = format!("docker-{}", var.to_lowercase());
-                            let p = suggest_port(&state, &project_id, &key).await;
-                            env_obj.insert(var, serde_json::Value::String(p.to_string()));
-                        }
-                    }
-                }
-            }
-            suggestions.push(json!({
-                "short":    "docker",
-                "unit":     format!("{}-docker.service", slug),
-                "label":    format!("docker compose up ({})", dc_name),
-                "kind":     "shell",
-                "command":  "docker",
-                "args":     ["compose", "-f", dc_name, "up"],
-                "cwd":      root,
-                "existing": false,
-                "env":      serde_json::Value::Object(env_obj),
-            }));
-            break;
-        }
-    }
-
-    // ── 5. Python entry points ─────────────────────────────────────────────
-    for py_entry in &["main.py", "app.py", "server.py", "run.py", "manage.py"] {
-        let py_path = format!("{}/{}", root, py_entry);
-        if tokio::fs::metadata(&py_path).await.is_ok() {
-            let svc_short = py_entry.strip_suffix(".py").unwrap_or(py_entry);
-            // Rileva il package manager Python e se l'ambiente è già pronto
-            let (py_pkg_manager, needs_install) = {
-                let venv_ok = tokio::fs::metadata(format!("{}/.venv", root)).await.is_ok()
-                    || tokio::fs::metadata(format!("{}/venv", root)).await.is_ok();
-                let pm = if tokio::fs::metadata(format!("{}/uv.lock", root))
-                    .await
-                    .is_ok()
-                {
-                    "uv sync"
-                } else if tokio::fs::metadata(format!("{}/poetry.lock", root))
-                    .await
-                    .is_ok()
-                {
-                    "poetry install"
-                } else if tokio::fs::metadata(format!("{}/Pipfile", root))
-                    .await
-                    .is_ok()
-                {
-                    "pipenv install"
-                } else if tokio::fs::metadata(format!("{}/requirements.txt", root))
-                    .await
-                    .is_ok()
-                {
-                    "pip install -r requirements.txt"
-                } else {
-                    ""
-                };
-                (pm, !venv_ok && !pm.is_empty())
-            };
-            suggestions.push(json!({
-                "short":         svc_short,
-                "unit":          format!("{}-{}.service", slug, svc_short),
-                "label":         format!("python {} (root)", py_entry),
-                "kind":          "python",
-                "command":       "python3",
-                "args":          [py_entry],
-                "cwd":           root,
-                "existing":      false,
-                "needs_install": needs_install,
-                "pkg_manager":   py_pkg_manager,
-            }));
-        }
-    }
-
-    // ── 6. Sito HTML statico (index.html o primo .html) senza framework ────
-    // Punto unico (regola L): stessa rilevazione del server integrato
-    // (static_preview::detect_static_entry). Proposto SOLO se nessun framework
-    // serve gia' il sito (package.json/Cargo.toml/launchSettings/python entry).
-    // Il server e' un python http.server su una PORTA ALLOCATA DA NEXUS
-    // (kind="static" -> wants_port nell'install): mai porte riservate (la 8080
-    // e' in NEXUS_RESERVED_PORTS) ne' hardcoded. La porta concreta e' iniettata
-    // dall'install al posto del placeholder __PORT__.
-    {
-        let mut has_framework = tokio::fs::metadata(format!("{}/package.json", root))
-            .await
-            .is_ok()
-            || tokio::fs::metadata(format!("{}/Cargo.toml", root))
-                .await
-                .is_ok()
-            || tokio::fs::metadata(format!("{}/launchSettings.json", root))
-                .await
-                .is_ok();
-        if !has_framework {
-            for f in &["main.py", "app.py", "server.py", "run.py", "manage.py"] {
-                if tokio::fs::metadata(format!("{}/{}", root, f)).await.is_ok() {
-                    has_framework = true;
-                    break;
-                }
-            }
-        }
-        if !has_framework {
-            if let Some(entry) = crate::static_preview::detect_static_entry(&root).await {
-                suggestions.push(json!({
-                    "short":         "static",
-                    "unit":          format!("{}-static.service", slug),
-                    "label":         format!("Server statico HTML ({entry})"),
-                    "kind":          "static",
-                    "command":       "python3",
-                    "args":          ["-m", "http.server", "__PORT__", "--bind", "127.0.0.1"],
-                    "cwd":           root,
-                    "existing":      false,
-                    "needs_install": false,
-                }));
-            }
-        }
-    }
+    let mut suggestions = detect_services_heuristic(&state, &project_id, &root, &slug).await;
 
     // Marca quelli già installati come .service files (punto unico, regola L).
     mark_existing_services(&slug, &mut suggestions).await;
