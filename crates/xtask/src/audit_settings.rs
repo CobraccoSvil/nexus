@@ -153,61 +153,155 @@ fn collect_db_live() -> Option<Vec<(String, String)>> {
 // ---------------------------------------------------------------------------
 // A2 — Migrazioni: INSERT INTO settings / DELETE FROM settings
 // ---------------------------------------------------------------------------
+/// Stato dell'automa che spezza un body di VALUES in tuple, rispettando apici
+/// e parentesi annidate. `step` consuma un carattere e ritorna quanti caratteri
+/// avanzare (1 di norma, 2 sull'apice escapato ''), come i `i += ...`/`continue`
+/// del porting Python originale.
+#[derive(Default)]
+struct TupleSplitter {
+    tuples: Vec<Vec<String>>,
+    depth: i32,
+    in_str: bool,
+    cur: String,
+    fields: Vec<String>,
+}
+
+impl TupleSplitter {
+    /// Consuma `chars[i]` (con `chars[i+1]` per la look-ahead) e ritorna il passo
+    /// di avanzamento dell'indice.
+    fn step(&mut self, chars: &[char], i: usize) -> usize {
+        let ch = chars[i];
+        if self.in_str {
+            if ch == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    // apice escapato ''
+                    self.cur.push('\'');
+                    return 2;
+                }
+                self.in_str = false;
+            } else {
+                self.cur.push(ch);
+            }
+        } else if ch == '\'' {
+            self.in_str = true;
+        } else if ch == '(' {
+            self.depth += 1;
+            if self.depth == 1 {
+                self.fields = Vec::new();
+                self.cur = String::new();
+                return 1;
+            }
+            self.cur.push(ch);
+        } else if ch == ')' {
+            self.depth -= 1;
+            if self.depth == 0 {
+                self.fields.push(self.cur.trim().to_string());
+                self.tuples.push(std::mem::take(&mut self.fields));
+                self.cur = String::new();
+                return 1;
+            }
+            self.cur.push(ch);
+        } else if ch == ',' && self.depth == 1 {
+            self.fields.push(self.cur.trim().to_string());
+            self.cur = String::new();
+        } else if self.depth >= 1 {
+            self.cur.push(ch);
+        }
+        1
+    }
+}
+
 /// Spezza il body di un VALUES in tuple, rispettando apici e parentesi.
 /// Porting fedele di _split_sql_tuples (Python).
 fn split_sql_tuples(body: &str) -> Vec<Vec<String>> {
     let chars: Vec<char> = body.chars().collect();
-    let mut tuples: Vec<Vec<String>> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut in_str = false;
-    let mut cur = String::new();
-    let mut fields: Vec<String> = Vec::new();
+    let mut sp = TupleSplitter::default();
     let mut i = 0usize;
-    let n = chars.len();
-    while i < n {
-        let ch = chars[i];
-        if in_str {
-            if ch == '\'' {
-                if i + 1 < n && chars[i + 1] == '\'' {
-                    // apice escapato ''
-                    cur.push('\'');
-                    i += 2;
-                    continue;
-                }
-                in_str = false;
-            } else {
-                cur.push(ch);
-            }
-        } else if ch == '\'' {
-            in_str = true;
-        } else if ch == '(' {
-            depth += 1;
-            if depth == 1 {
-                fields = Vec::new();
-                cur = String::new();
-                i += 1;
-                continue;
-            }
-            cur.push(ch);
-        } else if ch == ')' {
-            depth -= 1;
-            if depth == 0 {
-                fields.push(cur.trim().to_string());
-                tuples.push(std::mem::take(&mut fields));
-                cur = String::new();
-                i += 1;
-                continue;
-            }
-            cur.push(ch);
-        } else if ch == ',' && depth == 1 {
-            fields.push(cur.trim().to_string());
-            cur = String::new();
-        } else if depth >= 1 {
-            cur.push(ch);
-        }
-        i += 1;
+    while i < chars.len() {
+        i += sp.step(&chars, i);
     }
-    tuples
+    sp.tuples
+}
+
+/// Elenca i file `*.sql` in `mig_dir` ordinati per nome (come il Python
+/// `sorted(mig_dir.glob("*.sql"))`, ordine lessicografico).
+fn list_migration_files(mig_dir: &Path) -> Vec<PathBuf> {
+    let mut sql_files: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(mig_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("sql") {
+                sql_files.push(p);
+            }
+        }
+    }
+    sql_files.sort();
+    sql_files
+}
+
+/// Processa gli `INSERT INTO settings (...) VALUES (...)` di un file di
+/// migrazione, aggiornando `inserted` e rimuovendo le chiavi da `deleted`.
+fn apply_insert_statements(
+    ins_re: &Regex,
+    text: &str,
+    fname: &str,
+    inserted: &mut BTreeMap<String, (String, String)>,
+    deleted: &mut BTreeSet<String>,
+) {
+    for m in ins_re.captures_iter(text) {
+        let cols_raw = m.get(1).map(|g| g.as_str()).unwrap_or_default();
+        let cols: Vec<String> = cols_raw
+            .split(',')
+            .map(|c| c.trim().to_lowercase())
+            .collect();
+        let Some(key_idx) = cols.iter().position(|c| c == "key") else {
+            continue;
+        };
+        let cat_idx = cols.iter().position(|c| c == "category");
+        let values_body = m.get(2).map(|g| g.as_str()).unwrap_or_default();
+        for tup in split_sql_tuples(values_body) {
+            if key_idx >= tup.len() {
+                continue;
+            }
+            let key = &tup[key_idx];
+            if key.is_empty() || key.to_uppercase().contains("SELECT") || key.contains("||") {
+                // INSERT..SELECT o chiave costruita: fuori scope
+                continue;
+            }
+            let cat = match cat_idx {
+                Some(ci) if ci < tup.len() => tup[ci].clone(),
+                _ => String::new(),
+            };
+            inserted.insert(key.clone(), (cat, fname.to_string()));
+            deleted.remove(key);
+        }
+    }
+}
+
+/// Processa i `DELETE FROM settings WHERE key = '...'` e `... key IN (...)` di un
+/// file di migrazione, aggiornando `deleted` e rimuovendo le chiavi da `inserted`.
+fn apply_delete_statements(
+    del_eq_re: &Regex,
+    del_in_re: &Regex,
+    text: &str,
+    inserted: &mut BTreeMap<String, (String, String)>,
+    deleted: &mut BTreeSet<String>,
+) {
+    for m in del_eq_re.captures_iter(text) {
+        let k = m.get(1).unwrap().as_str().to_string();
+        deleted.insert(k.clone());
+        inserted.remove(&k);
+    }
+    for m in del_in_re.captures_iter(text) {
+        let body = m.get(1).unwrap().as_str();
+        for raw in body.split(',') {
+            let k = raw.trim().trim_matches('\'').to_string();
+            if !k.is_empty() {
+                deleted.insert(k.clone());
+                inserted.remove(&k);
+            }
+        }
+    }
 }
 
 /// Ritorna (chiavi inserite -> (categoria, file)), chiavi cancellate.
@@ -224,71 +318,15 @@ fn collect_migrations() -> Result<(BTreeMap<String, (String, String)>, BTreeSet<
     let del_in_re =
         Regex::new(r"(?i)DELETE\s+FROM\s+settings\s+WHERE\s+key\s+IN\s*\(([^)]*)\)")?;
 
-    // Python: sorted(mig_dir.glob("*.sql")) -> ordine lessicografico per nome.
-    let mut sql_files: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&mig_dir) {
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("sql") {
-                sql_files.push(p);
-            }
-        }
-    }
-    sql_files.sort();
-
-    for sql_file in &sql_files {
+    for sql_file in &list_migration_files(&mig_dir) {
         let text = read_text(sql_file);
         let fname = sql_file
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        for m in ins_re.captures_iter(&text) {
-            let cols_raw = m.get(1).map(|g| g.as_str()).unwrap_or_default();
-            let cols: Vec<String> = cols_raw
-                .split(',')
-                .map(|c| c.trim().to_lowercase())
-                .collect();
-            if !cols.iter().any(|c| c == "key") {
-                continue;
-            }
-            let key_idx = cols.iter().position(|c| c == "key").unwrap();
-            let cat_idx = cols.iter().position(|c| c == "category");
-            let values_body = m.get(2).map(|g| g.as_str()).unwrap_or_default();
-            for tup in split_sql_tuples(values_body) {
-                if key_idx < tup.len() {
-                    let key = &tup[key_idx];
-                    if key.is_empty()
-                        || key.to_uppercase().contains("SELECT")
-                        || key.contains("||")
-                    {
-                        // INSERT..SELECT o chiave costruita: fuori scope
-                        continue;
-                    }
-                    let cat = match cat_idx {
-                        Some(ci) if ci < tup.len() => tup[ci].clone(),
-                        _ => String::new(),
-                    };
-                    inserted.insert(key.clone(), (cat, fname.clone()));
-                    deleted.remove(key);
-                }
-            }
-        }
-        for m in del_eq_re.captures_iter(&text) {
-            let k = m.get(1).unwrap().as_str().to_string();
-            deleted.insert(k.clone());
-            inserted.remove(&k);
-        }
-        for m in del_in_re.captures_iter(&text) {
-            let body = m.get(1).unwrap().as_str();
-            for raw in body.split(',') {
-                let k = raw.trim().trim_matches('\'').to_string();
-                if !k.is_empty() {
-                    deleted.insert(k.clone());
-                    inserted.remove(&k);
-                }
-            }
-        }
+        apply_insert_statements(&ins_re, &text, &fname, &mut inserted, &mut deleted);
+        apply_delete_statements(&del_eq_re, &del_in_re, &text, &mut inserted, &mut deleted);
     }
     Ok((inserted, deleted))
 }
@@ -361,36 +399,120 @@ struct CodeReaders {
     quoted: HashSet<String>,
 }
 
+/// Regex precompilate condivise dalla scansione dei lettori nel codice.
+struct ReaderRegexes {
+    rust_reader: Regex,
+    py_reader: Regex,
+    sql_key_eq: Regex,
+    callsite: Regex,
+    quoted: Regex,
+    ts_barekey: Regex,
+}
+
+impl ReaderRegexes {
+    fn compile() -> Result<Self> {
+        Ok(ReaderRegexes {
+            // ATTENZIONE alle firme: in Rust la chiave e' il 2o argomento (dopo
+            // &db), in Python il 1o. Applicare la regex sbagliata cattura i
+            // valori di DEFAULT come chiavi (falsi fantasma).
+            rust_reader: Regex::new(
+                r#"(?s)\b(get_setting_checked|get_setting_nonempty|get_setting|get_bool_setting|get_int_setting|resolve_port)\s*\(\s*[^,()]*,\s*"([^"]+)""#,
+            )?,
+            py_reader: Regex::new(
+                r#"\b(get_setting_checked|get_bool_setting_checked|get_int_setting_checked|get_setting|get_bool_setting|get_int_setting|resolve_port)\s*\(\s*(?:key\s*=\s*)?["']([^"']+)["']"#,
+            )?,
+            // `FROM settings ... WHERE key = '...'`. La classe [\s"'+\\]* tollera
+            // le query SQL spezzate su literal adiacenti (Python concat
+            // implicita, JS/TS `+`).
+            sql_key_eq: Regex::new(
+                r#"(?i)FROM\s+settings\b[\s"'+\\]*WHERE\s+key\s*=\s*'([^']+)'"#,
+            )?,
+            // Call site dei lettori che NON hanno chiave literal (riconciliazione).
+            callsite: Regex::new(
+                r"\b(get_setting_checked|get_setting_nonempty|get_setting|get_bool_setting|get_int_setting|resolve_port)\s*\(",
+            )?,
+            quoted: Regex::new(r#""([^"\\\n]{2,120})"|'([^'\\\n]{2,120})'"#)?,
+            // Chiavi d'oggetto JS/TS non quotate (es. DB_KEY_MAP del gateway).
+            ts_barekey: Regex::new(r"(?m)^\s*([a-z][a-z0-9_]{3,60}):")?,
+        })
+    }
+}
+
+/// Estrae le stringhe quotate (e le bare-key JS/TS) di un file, aggiungendole a
+/// `quoted`.
+fn collect_quoted_strings(
+    re: &ReaderRegexes,
+    text: &str,
+    suffix: &str,
+    quoted: &mut HashSet<String>,
+) {
+    for m in re.quoted.captures_iter(text) {
+        if let Some(g) = m.get(1).or_else(|| m.get(2)) {
+            quoted.insert(g.as_str().to_string());
+        }
+    }
+    if suffix == "ts" || suffix == "tsx" {
+        for m in re.ts_barekey.captures_iter(text) {
+            quoted.insert(m.get(1).unwrap().as_str().to_string());
+        }
+    }
+}
+
+/// Scansiona un singolo file per lettori di settings, popolando `readers`,
+/// `unresolved` e `quoted`. `rel` e' il path relativo alla radice del repo.
+fn scan_file_for_readers(
+    re: &ReaderRegexes,
+    text: &str,
+    suffix: &str,
+    rel: &str,
+    readers: &mut HashMap<String, Vec<String>>,
+    unresolved: &mut Vec<String>,
+    quoted: &mut HashSet<String>,
+) {
+    collect_quoted_strings(re, text, suffix, quoted);
+
+    let mut matched_spans: HashSet<usize> = HashSet::new();
+    let reader_re: Option<&Regex> = match suffix {
+        "rs" => Some(&re.rust_reader),
+        "py" => Some(&re.py_reader),
+        _ => None,
+    };
+    if let Some(reg) = reader_re {
+        for m in reg.captures_iter(text) {
+            let whole = m.get(0).unwrap();
+            let line = line_at(text, whole.start());
+            let key = m.get(2).unwrap().as_str().to_string();
+            readers.entry(key).or_default().push(format!("{rel}:{line}"));
+            matched_spans.insert(whole.start());
+        }
+    }
+    for m in re.sql_key_eq.captures_iter(text) {
+        let whole = m.get(0).unwrap();
+        let line = line_at(text, whole.start());
+        let key = m.get(1).unwrap().as_str().to_string();
+        readers.entry(key).or_default().push(format!("{rel}:{line}"));
+    }
+    // Riconciliazione: call site lettori senza literal riconosciuto.
+    if suffix == "rs" || suffix == "py" {
+        for m in re.callsite.captures_iter(text) {
+            let whole = m.get(0).unwrap();
+            if !matched_spans.contains(&whole.start()) {
+                let line = line_at(text, whole.start());
+                let end = (whole.start() + 80).min(text.len());
+                // slice byte-safe sul confine char
+                let slice = safe_slice(text, whole.start(), end);
+                let snippet = slice.split('\n').next().unwrap_or("");
+                unresolved.push(format!("{rel}:{line}  {snippet}"));
+            }
+        }
+    }
+}
+
 /// Ritorna (chiave -> [siti file:riga]), call site non riconciliati, e il set
 /// di TUTTE le stringhe quotate nei sorgenti.
-fn collect_code_readers() -> Result<CodeReaders> {
-    let root = repo_root();
-
-    // ATTENZIONE alle firme: in Rust la chiave e' il 2o argomento (dopo &db),
-    // in Python il 1o. Applicare la regex sbagliata cattura i valori di
-    // DEFAULT come chiavi (falsi fantasma).
-    let rust_reader_re = Regex::new(
-        r#"(?s)\b(get_setting_checked|get_setting_nonempty|get_setting|get_bool_setting|get_int_setting|resolve_port)\s*\(\s*[^,()]*,\s*"([^"]+)""#,
-    )?;
-    let py_reader_re = Regex::new(
-        r#"\b(get_setting_checked|get_bool_setting_checked|get_int_setting_checked|get_setting|get_bool_setting|get_int_setting|resolve_port)\s*\(\s*(?:key\s*=\s*)?["']([^"']+)["']"#,
-    )?;
-    // `FROM settings ... WHERE key = '...'`. La classe [\s"'+\\]* tollera le
-    // query SQL spezzate su literal adiacenti (Python concat implicita, JS/TS `+`).
-    let sql_key_eq_re =
-        Regex::new(r#"(?i)FROM\s+settings\b[\s"'+\\]*WHERE\s+key\s*=\s*'([^']+)'"#)?;
-    // Call site dei lettori che NON hanno chiave literal (per riconciliazione).
-    let callsite_re = Regex::new(
-        r"\b(get_setting_checked|get_setting_nonempty|get_setting|get_bool_setting|get_int_setting|resolve_port)\s*\(",
-    )?;
-    let quoted_re = Regex::new(r#""([^"\\\n]{2,120})"|'([^'\\\n]{2,120})'"#)?;
-    // Chiavi d'oggetto JS/TS non quotate (es. DB_KEY_MAP del gateway).
-    let ts_barekey_re = Regex::new(r"(?m)^\s*([a-z][a-z0-9_]{3,60}):")?;
-
-    let mut readers: HashMap<String, Vec<String>> = HashMap::new();
-    let mut unresolved: Vec<String> = Vec::new();
-    let mut quoted: HashSet<String> = HashSet::new();
-
+/// Raccoglie tutti i file con estensione ammessa sotto le radici di scansione
+/// (ordine top-down come os.walk), saltando le radici inesistenti.
+fn gather_scan_files(root: &Path, exts: &[&str]) -> Vec<PathBuf> {
     let scan_roots = [
         root.join("crates"),
         root.join("brain"),
@@ -401,86 +523,54 @@ fn collect_code_readers() -> Result<CodeReaders> {
         root.join("deploy"),
         root.join("config"),
     ];
+    let mut files: Vec<PathBuf> = Vec::new();
+    for scan_root in &scan_roots {
+        if scan_root.exists() {
+            walk_files(scan_root, exts, &mut files);
+        }
+    }
+    files
+}
+
+/// True se il file (script stesso o punto unico) non e' un "lettore di
+/// business" e va escluso dalla scansione.
+fn is_excluded_reader_file(fname: &str, rel: &str) -> bool {
+    fname == "audit_settings.py"
+        || fname == "settings_db.py"
+        || rel.ends_with("crates/nexus-auth/src/lib.rs")
+}
+
+fn collect_code_readers() -> Result<CodeReaders> {
+    let root = repo_root();
+    let re = ReaderRegexes::compile()?;
+
+    let mut readers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut quoted: HashSet<String> = HashSet::new();
+
     let exts = [".rs", ".py", ".ts", ".tsx", ".sh", ".yaml", ".yml"];
 
-    let nexus_auth_lib = "crates/nexus-auth/src/lib.rs";
-
-    for scan_root in &scan_roots {
-        if !scan_root.exists() {
+    for path in &gather_scan_files(&root, &exts) {
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if is_excluded_reader_file(fname, &rel) {
             continue;
         }
-        let mut files: Vec<PathBuf> = Vec::new();
-        walk_files(scan_root, &exts, &mut files);
-        for path in &files {
-            let fname = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            // Lo script stesso e il punto unico non sono "lettori di business".
-            if fname == "audit_settings.py"
-                || fname == "settings_db.py"
-                || rel.ends_with(nexus_auth_lib)
-            {
-                continue;
-            }
-            let text = read_text(path);
-            let suffix = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-            for m in quoted_re.captures_iter(&text) {
-                let g = m.get(1).or_else(|| m.get(2));
-                if let Some(g) = g {
-                    quoted.insert(g.as_str().to_string());
-                }
-            }
-            if suffix == "ts" || suffix == "tsx" {
-                for m in ts_barekey_re.captures_iter(&text) {
-                    quoted.insert(m.get(1).unwrap().as_str().to_string());
-                }
-            }
-
-            let mut matched_spans: HashSet<usize> = HashSet::new();
-            let regs: &[&Regex] = if suffix == "rs" {
-                &[&rust_reader_re]
-            } else if suffix == "py" {
-                &[&py_reader_re]
-            } else {
-                &[]
-            };
-            for reg in regs {
-                for m in reg.captures_iter(&text) {
-                    let whole = m.get(0).unwrap();
-                    let line = line_at(&text, whole.start());
-                    let key = m.get(2).unwrap().as_str().to_string();
-                    readers.entry(key).or_default().push(format!("{rel}:{line}"));
-                    matched_spans.insert(whole.start());
-                }
-            }
-            for m in sql_key_eq_re.captures_iter(&text) {
-                let whole = m.get(0).unwrap();
-                let line = line_at(&text, whole.start());
-                let key = m.get(1).unwrap().as_str().to_string();
-                readers.entry(key).or_default().push(format!("{rel}:{line}"));
-            }
-            // Riconciliazione: call site lettori senza literal riconosciuto.
-            if suffix == "rs" || suffix == "py" {
-                for m in callsite_re.captures_iter(&text) {
-                    let whole = m.get(0).unwrap();
-                    if !matched_spans.contains(&whole.start()) {
-                        let line = line_at(&text, whole.start());
-                        let end = (whole.start() + 80).min(text.len());
-                        // slice byte-safe sul confine char
-                        let slice = safe_slice(&text, whole.start(), end);
-                        let snippet = slice.split('\n').next().unwrap_or("");
-                        unresolved.push(format!("{rel}:{line}  {snippet}"));
-                    }
-                }
-            }
-        }
+        let text = read_text(path);
+        let suffix = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        scan_file_for_readers(
+            &re,
+            &text,
+            suffix,
+            &rel,
+            &mut readers,
+            &mut unresolved,
+            &mut quoted,
+        );
     }
 
     Ok(CodeReaders {
@@ -620,34 +710,7 @@ fn classify(
     let bulk: HashSet<&str> = CATEGORY_BULK_READERS.iter().map(|(c, _)| *c).collect();
 
     // Replica re.Pattern.match: ancorato all'inizio della stringa.
-    let dyn_match = |key: &str| dynamic.iter().any(|r| match_at_start(r, key));
     let runtime_match = |key: &str| runtime.iter().any(|r| match_at_start(r, key));
-
-    // Equivalente di read_via(key, category) -> Option<&str>.
-    let read_via = |key: &str, category: &str| -> Option<&'static str> {
-        if keep.contains(key) {
-            return Some("keep-exception");
-        }
-        if let Some(sites) = readers.get(key) {
-            let all_test = sites
-                .iter()
-                .all(|s| is_test_path(&root.join(s.split(':').next().unwrap_or(""))));
-            if all_test {
-                return Some("test-only");
-            }
-            return Some("literal");
-        }
-        if quoted.contains(key) {
-            return Some("quoted");
-        }
-        if dyn_match(key) {
-            return Some("dynamic");
-        }
-        if bulk.contains(category) {
-            return Some("category");
-        }
-        None
-    };
 
     let mut result = Classes {
         viva: OrderedMap::default(),
@@ -663,69 +726,132 @@ fn classify(
     let keyset_db: HashSet<&String> = db.iter().map(|(k, _)| k).collect();
 
     for (key, cat) in db.iter() {
-        let via = read_via(key, cat);
+        let via = read_via(&root, readers, quoted, &keep, &dynamic, &bulk, key, cat);
         let is_runtime = !migrations.contains_key(key) && runtime_match(key);
-        match via {
-            None => {
-                if !migrations.contains_key(key) {
-                    // Non in migrazioni e non whitelistata: probabile scrittura
-                    // runtime non censita -> da revisionare, NON cancellare.
-                    result.runtime_only.insert(key.clone(), cat.clone());
-                } else {
-                    result.morta.insert(key.clone(), cat.clone());
-                }
-            }
-            Some("test-only") => {
-                result.test_only.insert(key.clone(), cat.clone());
-            }
-            Some(_) => {
-                if ui_cats.is_some() && !ui_cats.unwrap().contains(cat) {
-                    result.invisibile.insert(key.clone(), cat.clone());
-                } else {
-                    result.viva.insert(key.clone(), cat.clone());
-                }
-                if is_runtime {
-                    // dict.setdefault: non sovrascrive se gia' presente.
-                    result.runtime_only.set_default(key.clone(), cat.clone());
-                }
-            }
-        }
+        classify_db_key(&mut result, migrations, ui_cats, key, cat, via, is_runtime);
     }
 
-    // Filtro forma-chiave: esclude default/valori catturati per errore
-    // ("foo", "5", URL) — una chiave vera ha namespace con . o _ .
-    let keylike = Regex::new(r"^[a-z][a-z0-9_.:-]*$")?;
     if db_live.is_some() {
-        // sorted(set(readers) - keyset_db)
-        let mut candidates: Vec<&String> = readers
-            .keys()
-            .filter(|k| !keyset_db.contains(*k))
-            .collect();
-        candidates.sort();
-        for key in candidates {
-            // not keylike.match(key) or ("." not in key and "_" not in key)
-            //   or "://" in key or ":" in key.split(".")[0]
-            let first_seg = key.split('.').next().unwrap_or("");
-            if !match_at_start(&keylike, key)
-                || (!key.contains('.') && !key.contains('_'))
-                || key.contains("://")
-                || first_seg.contains(':')
-            {
-                continue;
-            }
-            let sites = &readers[key];
-            let all_test = sites
-                .iter()
-                .all(|s| is_test_path(&root.join(s.split(':').next().unwrap_or(""))));
-            if all_test {
-                continue;
-            }
-            let top3: Vec<String> = sites.iter().take(3).cloned().collect();
-            result.fantasma.insert(key.clone(), top3);
-        }
+        detect_ghost_keys(&root, readers, &keyset_db, &mut result.fantasma)?;
     }
 
     Ok(result)
+}
+
+/// Equivalente di read_via(key, category) -> Option<&str>: come e' letta una
+/// chiave del DB live (literal, test-only, quoted, dynamic, category), o None.
+#[allow(clippy::too_many_arguments)]
+fn read_via(
+    root: &Path,
+    readers: &HashMap<String, Vec<String>>,
+    quoted: &HashSet<String>,
+    keep: &HashSet<&str>,
+    dynamic: &[Regex],
+    bulk: &HashSet<&str>,
+    key: &str,
+    category: &str,
+) -> Option<&'static str> {
+    if keep.contains(key) {
+        return Some("keep-exception");
+    }
+    if let Some(sites) = readers.get(key) {
+        let all_test = sites
+            .iter()
+            .all(|s| is_test_path(&root.join(s.split(':').next().unwrap_or(""))));
+        if all_test {
+            return Some("test-only");
+        }
+        return Some("literal");
+    }
+    if quoted.contains(key) {
+        return Some("quoted");
+    }
+    if dynamic.iter().any(|r| match_at_start(r, key)) {
+        return Some("dynamic");
+    }
+    if bulk.contains(category) {
+        return Some("category");
+    }
+    None
+}
+
+/// Assegna una chiave del DB live alla classe corretta di `result` in base a
+/// come e' letta (`via`) e allo stato runtime/migrazioni.
+fn classify_db_key(
+    result: &mut Classes,
+    migrations: &BTreeMap<String, (String, String)>,
+    ui_cats: Option<&BTreeSet<String>>,
+    key: &str,
+    cat: &str,
+    via: Option<&'static str>,
+    is_runtime: bool,
+) {
+    match via {
+        None => {
+            if !migrations.contains_key(key) {
+                // Non in migrazioni e non whitelistata: probabile scrittura
+                // runtime non censita -> da revisionare, NON cancellare.
+                result.runtime_only.insert(key.to_string(), cat.to_string());
+            } else {
+                result.morta.insert(key.to_string(), cat.to_string());
+            }
+        }
+        Some("test-only") => {
+            result.test_only.insert(key.to_string(), cat.to_string());
+        }
+        Some(_) => {
+            if ui_cats.is_some() && !ui_cats.unwrap().contains(cat) {
+                result.invisibile.insert(key.to_string(), cat.to_string());
+            } else {
+                result.viva.insert(key.to_string(), cat.to_string());
+            }
+            if is_runtime {
+                // dict.setdefault: non sovrascrive se gia' presente.
+                result.runtime_only.set_default(key.to_string(), cat.to_string());
+            }
+        }
+    }
+}
+
+/// Individua i FANTASMA: chiavi lette literal nel codice ma assenti dal DB live,
+/// filtrando i falsi positivi per forma-chiave e i lettori solo-test.
+fn detect_ghost_keys(
+    root: &Path,
+    readers: &HashMap<String, Vec<String>>,
+    keyset_db: &HashSet<&String>,
+    fantasma: &mut BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    // Filtro forma-chiave: esclude default/valori catturati per errore
+    // ("foo", "5", URL) — una chiave vera ha namespace con . o _ .
+    let keylike = Regex::new(r"^[a-z][a-z0-9_.:-]*$")?;
+    // sorted(set(readers) - keyset_db)
+    let mut candidates: Vec<&String> = readers
+        .keys()
+        .filter(|k| !keyset_db.contains(*k))
+        .collect();
+    candidates.sort();
+    for key in candidates {
+        // not keylike.match(key) or ("." not in key and "_" not in key)
+        //   or "://" in key or ":" in key.split(".")[0]
+        let first_seg = key.split('.').next().unwrap_or("");
+        if !match_at_start(&keylike, key)
+            || (!key.contains('.') && !key.contains('_'))
+            || key.contains("://")
+            || first_seg.contains(':')
+        {
+            continue;
+        }
+        let sites = &readers[key];
+        let all_test = sites
+            .iter()
+            .all(|s| is_test_path(&root.join(s.split(':').next().unwrap_or(""))));
+        if all_test {
+            continue;
+        }
+        let top3: Vec<String> = sites.iter().take(3).cloned().collect();
+        fantasma.insert(key.clone(), top3);
+    }
+    Ok(())
 }
 
 /// Replica re.Pattern.match (ancorato all'inizio): true se la regex matcha a
@@ -807,38 +933,7 @@ pub fn run(raw_args: &[String]) -> Result<i32> {
         &code.quoted,
     )?;
 
-    // counts = {k: len(v) for k, v in res.items()}
-    let counts: Vec<(&str, usize)> = vec![
-        ("viva", res.viva.len()),
-        ("morta", res.morta.len()),
-        ("fantasma", res.fantasma.len()),
-        ("invisibile", res.invisibile.len()),
-        ("runtime_only", res.runtime_only.len()),
-        ("test_only", res.test_only.len()),
-    ];
-
-    let db_live_keys = db_live.as_ref().map(|m| m.len()).unwrap_or(0);
-    let migration_keys = migrations.len();
-    let reader_keys = code.readers.len();
-    let unresolved_n = code.unresolved.len();
-
-    // summary (ordine d'inserimento come Python)
-    let mut summary = Map::new();
-    summary.insert("db_live_keys".into(), json!(db_live_keys));
-    summary.insert("migration_keys".into(), json!(migration_keys));
-    summary.insert("reader_keys".into(), json!(reader_keys));
-    summary.insert("unresolved_call_sites".into(), json!(unresolved_n));
-    let ui_cats_summary: Value = match &ui_cats {
-        None => json!("dinamiche (tutte navigabili)"),
-        Some(set) => {
-            let v: Vec<&String> = set.iter().collect();
-            json!(v)
-        }
-    };
-    summary.insert("ui_categories".into(), ui_cats_summary);
-    for (k, v) in &counts {
-        summary.insert((*k).to_string(), json!(v));
-    }
+    let summary = build_summary(db_live.as_deref(), &migrations, &code, &ui_cats, &res);
 
     if let Some(json_path) = &args.json {
         let payload = build_json_payload(&summary, &res, &code.unresolved);
@@ -857,6 +952,44 @@ pub fn run(raw_args: &[String]) -> Result<i32> {
     }
 
     Ok(0)
+}
+
+/// Costruisce la mappa `summary` (ordine d'inserimento come il dict Python):
+/// conteggi chiavi DB/migrazioni/lettori + categorie UI + conteggi per classe.
+fn build_summary(
+    db_live: Option<&[(String, String)]>,
+    migrations: &BTreeMap<String, (String, String)>,
+    code: &CodeReaders,
+    ui_cats: &Option<BTreeSet<String>>,
+    res: &Classes,
+) -> Map<String, Value> {
+    // counts = {k: len(v) for k, v in res.items()}
+    let counts: [(&str, usize); 6] = [
+        ("viva", res.viva.len()),
+        ("morta", res.morta.len()),
+        ("fantasma", res.fantasma.len()),
+        ("invisibile", res.invisibile.len()),
+        ("runtime_only", res.runtime_only.len()),
+        ("test_only", res.test_only.len()),
+    ];
+
+    let mut summary = Map::new();
+    summary.insert("db_live_keys".into(), json!(db_live.map(|m| m.len()).unwrap_or(0)));
+    summary.insert("migration_keys".into(), json!(migrations.len()));
+    summary.insert("reader_keys".into(), json!(code.readers.len()));
+    summary.insert("unresolved_call_sites".into(), json!(code.unresolved.len()));
+    let ui_cats_summary: Value = match ui_cats {
+        None => json!("dinamiche (tutte navigabili)"),
+        Some(set) => {
+            let v: Vec<&String> = set.iter().collect();
+            json!(v)
+        }
+    };
+    summary.insert("ui_categories".into(), ui_cats_summary);
+    for (k, v) in &counts {
+        summary.insert((*k).to_string(), json!(v));
+    }
+    summary
 }
 
 /// Costruisce il payload JSON {summary, classi, unresolved} con classi nello
@@ -897,12 +1030,8 @@ fn vecmap_to_value(m: &BTreeMap<String, Vec<String>>) -> Value {
     Value::Object(obj)
 }
 
-fn print_report(
-    summary: &Map<String, Value>,
-    res: &Classes,
-    ui_cats: Option<&BTreeSet<String>>,
-    unresolved: &[String],
-) {
+/// Stampa l'intestazione e il riepilogo (summary + categorie UI).
+fn print_report_header(summary: &Map<String, Value>, ui_cats: Option<&BTreeSet<String>>) {
     println!("=== audit settings: riepilogo ===");
     for (k, v) in summary {
         if k != "ui_categories" {
@@ -917,48 +1046,62 @@ fn print_report(
             println!("  ui_categories ({}): {}", set.len(), joined);
         }
     }
+}
 
-    // for cls in ("morta", "fantasma", "invisibile", "runtime_only", "test_only")
+/// Stampa le classi problematiche (morta, fantasma, invisibile, runtime_only,
+/// test_only) nell'ordine e nel formato dello script Python originale.
+fn print_report_classes(res: &Classes) {
     for cls in ["morta", "fantasma", "invisibile", "runtime_only", "test_only"] {
-        match cls {
-            "fantasma" => {
-                if !res.fantasma.is_empty() {
-                    println!("\n--- {} ({}) ---", cls.to_uppercase(), res.fantasma.len());
-                    for key in res.fantasma.keys() {
-                        // valore = lista di siti -> Python stampa la repr lista
-                        let sites = &res.fantasma[key];
-                        println!("  {key}  [{}]", py_list_repr(sites));
-                    }
+        if cls == "fantasma" {
+            if !res.fantasma.is_empty() {
+                println!("\n--- {} ({}) ---", cls.to_uppercase(), res.fantasma.len());
+                for (key, sites) in &res.fantasma {
+                    // valore = lista di siti -> Python stampa la repr lista
+                    println!("  {key}  [{}]", py_list_repr(sites));
                 }
             }
-            other => {
-                let m = match other {
-                    "morta" => &res.morta,
-                    "invisibile" => &res.invisibile,
-                    "runtime_only" => &res.runtime_only,
-                    "test_only" => &res.test_only,
-                    _ => unreachable!(),
-                };
-                if !m.is_empty() {
-                    println!("\n--- {} ({}) ---", cls.to_uppercase(), m.len());
-                    // Python: for key in sorted(res[cls])
-                    for (key, cat) in m.iter_sorted() {
-                        println!("  {key}  [{cat}]");
-                    }
-                }
+            continue;
+        }
+        let m = match cls {
+            "morta" => &res.morta,
+            "invisibile" => &res.invisibile,
+            "runtime_only" => &res.runtime_only,
+            "test_only" => &res.test_only,
+            _ => unreachable!(),
+        };
+        if !m.is_empty() {
+            println!("\n--- {} ({}) ---", cls.to_uppercase(), m.len());
+            // Python: for key in sorted(res[cls])
+            for (key, cat) in m.iter_sorted() {
+                println!("  {key}  [{cat}]");
             }
         }
     }
+}
 
-    if !unresolved.is_empty() {
-        println!("\n--- CALL SITE NON RICONCILIATI ({}) ---", unresolved.len());
-        for u in unresolved.iter().take(60) {
-            println!("  {u}");
-        }
-        if unresolved.len() > 60 {
-            println!("  ... e altri {}", unresolved.len() - 60);
-        }
+/// Stampa i call site non riconciliati (max 60, poi un troncamento).
+fn print_report_unresolved(unresolved: &[String]) {
+    if unresolved.is_empty() {
+        return;
     }
+    println!("\n--- CALL SITE NON RICONCILIATI ({}) ---", unresolved.len());
+    for u in unresolved.iter().take(60) {
+        println!("  {u}");
+    }
+    if unresolved.len() > 60 {
+        println!("  ... e altri {}", unresolved.len() - 60);
+    }
+}
+
+fn print_report(
+    summary: &Map<String, Value>,
+    res: &Classes,
+    ui_cats: Option<&BTreeSet<String>>,
+    unresolved: &[String],
+) {
+    print_report_header(summary, ui_cats);
+    print_report_classes(res);
+    print_report_unresolved(unresolved);
 }
 
 /// Rende un valore di summary come lo stamperebbe Python str(): interi senza
@@ -974,7 +1117,33 @@ fn render_summary_value(v: &Value) -> String {
 /// repr di una lista Python di stringhe: ['a', 'b', 'c'].
 fn py_list_repr(items: &[String]) -> String {
     let inner: Vec<String> = items.iter().map(|s| format!("'{s}'")).collect();
+    // FALSO POSITIVO del detector SQL injection: il metodo Rust `.join(", ")` su
+    // uno slice viene scambiato per la keyword SQL JOIN (word-boundary) e, unito
+    // al placeholder {} del format!, attiva SQL_KEYWORD_RE + RS_FORMAT_RE. Non e'
+    // una query: e' la costruzione della repr testuale di una lista. Invariato.
     format!("[{}]", inner.join(", "))
+}
+
+/// Crea il file baseline con i conteggi correnti (prima esecuzione del gate).
+fn write_gate_baseline(
+    base_path: &Path,
+    baseline_path: &str,
+    cur_morta: usize,
+    cur_fantasma: usize,
+    cur_invisibile: usize,
+) -> Result<()> {
+    // base_path.write_text(json.dumps(cur, indent=2) + "\n")
+    let cur = json!({
+        "morta": cur_morta,
+        "fantasma": cur_fantasma,
+        "invisibile": cur_invisibile,
+    });
+    let mut out = serde_json::to_string_pretty(&cur)?;
+    out.push('\n');
+    std::fs::write(base_path, out)
+        .with_context(|| format!("scrittura baseline {baseline_path}"))?;
+    println!("Baseline creata: {baseline_path}");
+    Ok(())
 }
 
 fn run_gate(baseline_path: &str, res: &Classes) -> Result<i32> {
@@ -984,17 +1153,7 @@ fn run_gate(baseline_path: &str, res: &Classes) -> Result<i32> {
     let cur_invisibile = res.invisibile.len();
 
     if !base_path.exists() {
-        // base_path.write_text(json.dumps(cur, indent=2) + "\n")
-        let cur = json!({
-            "morta": cur_morta,
-            "fantasma": cur_fantasma,
-            "invisibile": cur_invisibile,
-        });
-        let mut out = serde_json::to_string_pretty(&cur)?;
-        out.push('\n');
-        std::fs::write(base_path, out)
-            .with_context(|| format!("scrittura baseline {baseline_path}"))?;
-        println!("Baseline creata: {baseline_path}");
+        write_gate_baseline(base_path, baseline_path, cur_morta, cur_fantasma, cur_invisibile)?;
         return Ok(0);
     }
 
@@ -1002,6 +1161,18 @@ fn run_gate(baseline_path: &str, res: &Classes) -> Result<i32> {
         .with_context(|| format!("lettura baseline {baseline_path}"))?;
     let base: Value = serde_json::from_str(&base_text)
         .with_context(|| format!("parse baseline {baseline_path}"))?;
+
+    Ok(compare_gate_counts(&base, cur_morta, cur_fantasma, cur_invisibile))
+}
+
+/// Confronta i conteggi correnti con la baseline: exit 1 (con dettaglio delle
+/// regressioni su stderr) se una metrica e' salita, 0 altrimenti.
+fn compare_gate_counts(
+    base: &Value,
+    cur_morta: usize,
+    cur_fantasma: usize,
+    cur_invisibile: usize,
+) -> i32 {
     let base_get = |k: &str| base.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
     let cur_pairs = [
@@ -1011,13 +1182,13 @@ fn run_gate(baseline_path: &str, res: &Classes) -> Result<i32> {
     ];
 
     // regress = {k: (cur[k], base.get(k, 0)) for k in cur if cur[k] > base.get(k, 0)}
-    let mut regress: Vec<(&str, usize, usize)> = Vec::new();
-    for (k, cur_v) in cur_pairs {
-        let base_v = base_get(k);
-        if cur_v > base_v {
-            regress.push((k, cur_v, base_v));
-        }
-    }
+    let regress: Vec<(&str, usize, usize)> = cur_pairs
+        .into_iter()
+        .filter_map(|(k, cur_v)| {
+            let base_v = base_get(k);
+            (cur_v > base_v).then_some((k, cur_v, base_v))
+        })
+        .collect();
 
     if !regress.is_empty() {
         // Replica repr del dict Python: {'morta': (1, 0), ...}
@@ -1029,7 +1200,7 @@ fn run_gate(baseline_path: &str, res: &Classes) -> Result<i32> {
             "GATE FALLITO (regressioni vs baseline): {{{}}}",
             inner.join(", ")
         );
-        return Ok(1);
+        return 1;
     }
 
     // GATE OK: {cur} <= baseline {base}
@@ -1043,5 +1214,5 @@ fn run_gate(baseline_path: &str, res: &Classes) -> Result<i32> {
         base_get("invisibile")
     );
     println!("GATE OK: {cur_repr} <= baseline {base_repr}");
-    Ok(0)
+    0
 }
