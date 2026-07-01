@@ -171,6 +171,45 @@ async fn build_acl(state: &AppState, claims: &Claims) -> Result<WikiAcl, (Status
     WikiAcl::from_claims(&state.wiki_deps(), claims).await.map_err(err500)
 }
 
+/// Verifica che il chiamante sia admin; altrimenti 403 con `msg`.
+/// Punto unico del gate admin per gli handler worker (regola L).
+fn require_admin(acl: &WikiAcl, msg: &str) -> Result<(), (StatusCode, String)> {
+    if acl.is_admin {
+        Ok(())
+    } else {
+        Err(err403(msg))
+    }
+}
+
+/// Traduce il parametro `scope` (`meta|project|all|assente|vuoto`) nel filtro
+/// `Option<WikiScope>` usato dai worker admin. Punto unico del parsing (regola
+/// L): `reingest`, `recompute-links` ed `extract-triples` lo condividono.
+fn parse_scope_filter(raw: Option<&str>) -> Result<Option<WikiScope>, (StatusCode, String)> {
+    match raw {
+        None | Some("") | Some("all") => Ok(None),
+        Some("meta") => Ok(Some(WikiScope::Meta)),
+        Some("project") => Ok(Some(WikiScope::Project)),
+        Some(other) => Err(err400(format!(
+            "scope invalido: {other} (atteso meta|project|all)"
+        ))),
+    }
+}
+
+/// Risposta `202 Accepted` per un worker lanciato in background: `run_id` opaco
+/// piu' l'eco dei filtri. Costruisce il corpo standard dei quattro handler async.
+fn accepted_run(run_id: Uuid, extra: Value) -> (StatusCode, Json<Value>) {
+    let mut obj = serde_json::Map::new();
+    obj.insert("ok".to_string(), json!(true));
+    obj.insert("run_id".to_string(), json!(run_id.to_string()));
+    obj.insert("wait".to_string(), json!(false));
+    if let Value::Object(map) = extra {
+        for (k, v) in map {
+            obj.insert(k, v);
+        }
+    }
+    (StatusCode::ACCEPTED, Json(Value::Object(obj)))
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Handler
 // ───────────────────────────────────────────────────────────────────────────
@@ -388,75 +427,66 @@ pub async fn reingest_handler(
     Query(q): Query<ReingestQuery>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    if !acl.is_admin {
-        return Err(err403("solo admin puo' lanciare wiki.reingest"));
-    }
+    require_admin(&acl, "solo admin puo' lanciare wiki.reingest")?;
 
-    let scope_filter: Option<WikiScope> = match q.scope.as_deref() {
-        None | Some("") | Some("all") => None,
-        Some("meta") => Some(WikiScope::Meta),
-        Some("project") => Some(WikiScope::Project),
-        Some(other) => {
-            return Err(err400(format!(
-                "scope invalido: {other} (atteso meta|project|all)"
-            )))
-        }
-    };
+    let scope_filter = parse_scope_filter(q.scope.as_deref())?;
     let project_filter = q.project_id;
-    let wait = q.wait.unwrap_or(false);
 
-    if wait {
+    if q.wait.unwrap_or(false) {
         let report = reingest::reingest_all(&state.wiki_deps(), scope_filter, project_filter)
             .await
             .map_err(err500)?;
-        Ok((
+        return Ok((
             StatusCode::OK,
             Json(serde_json::to_value(report).unwrap_or_else(|_| json!({}))),
-        ))
-    } else {
-        let run_id = Uuid::new_v4();
-        let state_cloned = state.clone();
-        tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            tracing::info!(
-                run_id = %run_id,
-                scope = ?scope_filter.map(|s| s.as_str()),
-                project_id = ?project_filter,
-                "wiki.reingest: avvio task background"
-            );
-            match reingest::reingest_all(&state_cloned.wiki_deps(), scope_filter, project_filter).await {
-                Ok(report) => {
-                    tracing::info!(
-                        run_id = %run_id,
-                        meta = report.meta_docs_ingested,
-                        projects = report.project_docs_ingested_by_project.len(),
-                        skipped = report.files_skipped,
-                        errors = report.errors.len(),
-                        elapsed_ms = report.elapsed_ms,
-                        "wiki.reingest: completato"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        run_id = %run_id,
-                        error = %e,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "wiki.reingest: fallito"
-                    );
-                }
-            }
-        });
-        Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "ok": true,
-                "run_id": run_id.to_string(),
-                "scope": scope_filter.map(|s| s.as_str()).unwrap_or("all"),
-                "project_id": project_filter,
-                "wait": false,
-            })),
-        ))
+        ));
     }
+
+    let run_id = Uuid::new_v4();
+    spawn_reingest_bg(state.clone(), run_id, scope_filter, project_filter);
+    Ok(accepted_run(
+        run_id,
+        json!({
+            "scope": scope_filter.map(|s| s.as_str()).unwrap_or("all"),
+            "project_id": project_filter,
+        }),
+    ))
+}
+
+/// Task background di `reingest_all`: logga avvio, esito e durata. Estratto da
+/// `reingest_handler` per contenerne la lunghezza (behavior-preserving).
+fn spawn_reingest_bg(
+    state: AppState,
+    run_id: Uuid,
+    scope_filter: Option<WikiScope>,
+    project_filter: Option<Uuid>,
+) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        tracing::info!(
+            run_id = %run_id,
+            scope = ?scope_filter.map(|s| s.as_str()),
+            project_id = ?project_filter,
+            "wiki.reingest: avvio task background"
+        );
+        match reingest::reingest_all(&state.wiki_deps(), scope_filter, project_filter).await {
+            Ok(report) => tracing::info!(
+                run_id = %run_id,
+                meta = report.meta_docs_ingested,
+                projects = report.project_docs_ingested_by_project.len(),
+                skipped = report.files_skipped,
+                errors = report.errors.len(),
+                elapsed_ms = report.elapsed_ms,
+                "wiki.reingest: completato"
+            ),
+            Err(e) => tracing::error!(
+                run_id = %run_id,
+                error = %e,
+                elapsed_ms = started.elapsed().as_millis(),
+                "wiki.reingest: fallito"
+            ),
+        }
+    });
 }
 
 /// `POST /api/wiki/recompute-links?scope=&project_id=&doc_id=&wait=`
@@ -469,9 +499,7 @@ pub async fn recompute_links_handler(
     Query(q): Query<RecomputeLinksQuery>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    if !acl.is_admin {
-        return Err(err403("solo admin puo' lanciare wiki.recompute-links"));
-    }
+    require_admin(&acl, "solo admin puo' lanciare wiki.recompute-links")?;
 
     let wait = q.wait.unwrap_or(false);
 
@@ -487,47 +515,12 @@ pub async fn recompute_links_handler(
             ));
         }
         let run_id = Uuid::new_v4();
-        let state_cloned = state.clone();
-        tokio::spawn(async move {
-            tracing::info!(
-                run_id = %run_id,
-                doc_id = %doc_id,
-                "wiki.recompute-links: avvio task background (singolo doc)"
-            );
-            match links_worker::recompute_links_for_doc(&state_cloned.wiki_deps(), doc_id).await {
-                Ok(rep) => tracing::info!(
-                    run_id = %run_id,
-                    scanned = rep.docs_scanned,
-                    wikilinks = rep.wikilinks_resolved,
-                    semantic_new = rep.semantic_links_created,
-                    semantic_upd = rep.semantic_links_updated,
-                    elapsed_ms = rep.elapsed_ms,
-                    "wiki.recompute-links: completato (singolo doc)"
-                ),
-                Err(e) => tracing::error!(
-                    run_id = %run_id,
-                    error = %e,
-                    "wiki.recompute-links: fallito (singolo doc)"
-                ),
-            }
-        });
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({ "ok": true, "run_id": run_id.to_string(), "wait": false })),
-        ));
+        spawn_recompute_links_doc_bg(state.clone(), run_id, doc_id);
+        return Ok(accepted_run(run_id, json!({})));
     }
 
     // Path "scope-wide".
-    let scope_filter: Option<WikiScope> = match q.scope.as_deref() {
-        None | Some("") | Some("all") => None,
-        Some("meta") => Some(WikiScope::Meta),
-        Some("project") => Some(WikiScope::Project),
-        Some(other) => {
-            return Err(err400(format!(
-                "scope invalido: {other} (atteso meta|project|all)"
-            )))
-        }
-    };
+    let scope_filter = parse_scope_filter(q.scope.as_deref())?;
     let project_filter = q.project_id;
 
     if wait {
@@ -541,7 +534,50 @@ pub async fn recompute_links_handler(
     }
 
     let run_id = Uuid::new_v4();
-    let state_cloned = state.clone();
+    spawn_recompute_links_scope_bg(state.clone(), run_id, scope_filter, project_filter);
+    Ok(accepted_run(
+        run_id,
+        json!({
+            "scope": scope_filter.map(|s| s.as_str()).unwrap_or("all"),
+            "project_id": project_filter,
+        }),
+    ))
+}
+
+/// Task background di `recompute_links_for_doc` (singolo doc): logga esito.
+fn spawn_recompute_links_doc_bg(state: AppState, run_id: Uuid, doc_id: Uuid) {
+    tokio::spawn(async move {
+        tracing::info!(
+            run_id = %run_id,
+            doc_id = %doc_id,
+            "wiki.recompute-links: avvio task background (singolo doc)"
+        );
+        match links_worker::recompute_links_for_doc(&state.wiki_deps(), doc_id).await {
+            Ok(rep) => tracing::info!(
+                run_id = %run_id,
+                scanned = rep.docs_scanned,
+                wikilinks = rep.wikilinks_resolved,
+                semantic_new = rep.semantic_links_created,
+                semantic_upd = rep.semantic_links_updated,
+                elapsed_ms = rep.elapsed_ms,
+                "wiki.recompute-links: completato (singolo doc)"
+            ),
+            Err(e) => tracing::error!(
+                run_id = %run_id,
+                error = %e,
+                "wiki.recompute-links: fallito (singolo doc)"
+            ),
+        }
+    });
+}
+
+/// Task background di `recompute_links_for_scope` (scope-wide): logga esito.
+fn spawn_recompute_links_scope_bg(
+    state: AppState,
+    run_id: Uuid,
+    scope_filter: Option<WikiScope>,
+    project_filter: Option<Uuid>,
+) {
     tokio::spawn(async move {
         tracing::info!(
             run_id = %run_id,
@@ -549,7 +585,7 @@ pub async fn recompute_links_handler(
             project_id = ?project_filter,
             "wiki.recompute-links: avvio task background"
         );
-        match links_worker::recompute_links_for_scope(&state_cloned.wiki_deps(), scope_filter, project_filter)
+        match links_worker::recompute_links_for_scope(&state.wiki_deps(), scope_filter, project_filter)
             .await
         {
             Ok(rep) => tracing::info!(
@@ -569,16 +605,6 @@ pub async fn recompute_links_handler(
             ),
         }
     });
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "ok": true,
-            "run_id": run_id.to_string(),
-            "scope": scope_filter.map(|s| s.as_str()).unwrap_or("all"),
-            "project_id": project_filter,
-            "wait": false,
-        })),
-    ))
 }
 
 /// `POST /api/wiki/recompute-titles?scope=&project_id=&doc_id=&wait=`
@@ -593,9 +619,7 @@ pub async fn recompute_titles_handler(
     Query(q): Query<RecomputeTitlesQuery>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    if !acl.is_admin {
-        return Err(err403("solo admin puo' lanciare wiki.recompute-titles"));
-    }
+    require_admin(&acl, "solo admin puo' lanciare wiki.recompute-titles")?;
 
     let wait = q.wait.unwrap_or(false);
 
@@ -611,31 +635,8 @@ pub async fn recompute_titles_handler(
             ));
         }
         let run_id = Uuid::new_v4();
-        let state_cloned = state.clone();
-        tokio::spawn(async move {
-            tracing::info!(
-                run_id = %run_id,
-                doc_id = %doc_id,
-                "wiki.recompute-titles: avvio task background (singolo doc)"
-            );
-            match title_gen::generate_title_for_doc(&state_cloned.wiki_deps(), doc_id).await {
-                Ok(rep) => tracing::info!(
-                    run_id = %run_id,
-                    updated = rep.updated,
-                    elapsed_ms = rep.elapsed_ms,
-                    "wiki.recompute-titles: completato (singolo doc)"
-                ),
-                Err(e) => tracing::error!(
-                    run_id = %run_id,
-                    error = %e,
-                    "wiki.recompute-titles: fallito (singolo doc)"
-                ),
-            }
-        });
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({ "ok": true, "run_id": run_id.to_string(), "wait": false })),
-        ));
+        spawn_recompute_titles_doc_bg(state.clone(), run_id, doc_id);
+        return Ok(accepted_run(run_id, json!({})));
     }
 
     // Path "scope-wide".
@@ -647,56 +648,13 @@ pub async fn recompute_titles_handler(
             "scope invalido: {scope_label} (atteso meta|project|all)"
         )));
     }
-
-    // Closure asincrona inline impossibile; helper inline tramite blocco.
-    let run_batch = {
-        let project_id = q.project_id;
-        move |state: AppState| async move {
-            let mut aggregated = serde_json::Map::new();
-            let mut overall_processed = 0usize;
-            let mut overall_updated = 0usize;
-
-            if do_meta {
-                let rep = title_gen::generate_titles_for_scope(&state.wiki_deps(), title_gen::TitleScope::Meta)
-                    .await?;
-                overall_processed += rep.processed_count;
-                overall_updated += rep.updated_count;
-                aggregated.insert(
-                    "meta".to_string(),
-                    serde_json::to_value(rep).unwrap_or(Value::Null),
-                );
-            }
-            if do_project {
-                let project_ids: Vec<Uuid> = if let Some(pid) = project_id {
-                    vec![pid]
-                } else {
-                    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
-                        .fetch_all(&state.db)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("SELECT projects per recompute-titles: {e}"))?
-                };
-                let mut projects_map = serde_json::Map::new();
-                for pid in project_ids {
-                    let rep = title_gen::generate_titles_for_scope(
-                        &state.wiki_deps(),
-                        title_gen::TitleScope::Project(pid),
-                    )
-                    .await?;
-                    overall_processed += rep.processed_count;
-                    overall_updated += rep.updated_count;
-                    projects_map.insert(
-                        pid.to_string(),
-                        serde_json::to_value(rep).unwrap_or(Value::Null),
-                    );
-                }
-                aggregated.insert("projects".to_string(), Value::Object(projects_map));
-            }
-            Ok::<_, anyhow::Error>((overall_processed, overall_updated, aggregated))
-        }
-    };
+    let project_id = q.project_id;
 
     if wait {
-        let (processed, updated, details) = run_batch(state.clone()).await.map_err(err500)?;
+        let (processed, updated, details) =
+            run_recompute_titles_batch(state.clone(), do_meta, do_project, project_id)
+                .await
+                .map_err(err500)?;
         return Ok((
             StatusCode::OK,
             Json(json!({
@@ -709,17 +667,107 @@ pub async fn recompute_titles_handler(
     }
 
     let run_id = Uuid::new_v4();
-    let state_cloned = state.clone();
-    let scope_clone = scope_label.clone();
-    let project_filter = q.project_id;
+    spawn_recompute_titles_batch_bg(
+        state.clone(),
+        run_id,
+        scope_label.clone(),
+        do_meta,
+        do_project,
+        project_id,
+    );
+    Ok(accepted_run(
+        run_id,
+        json!({ "scope": scope_label, "project_id": project_id }),
+    ))
+}
+
+/// Batch di rigenerazione titoli su scope meta e/o progetto. Estratto dalla
+/// closure inline di `recompute_titles_handler` in funzione libera riusabile
+/// dal path sincrono e dal task background (behavior-preserving).
+async fn run_recompute_titles_batch(
+    state: AppState,
+    do_meta: bool,
+    do_project: bool,
+    project_id: Option<Uuid>,
+) -> Result<(usize, usize, serde_json::Map<String, Value>), anyhow::Error> {
+    let mut aggregated = serde_json::Map::new();
+    let mut overall_processed = 0usize;
+    let mut overall_updated = 0usize;
+
+    if do_meta {
+        let rep =
+            title_gen::generate_titles_for_scope(&state.wiki_deps(), title_gen::TitleScope::Meta)
+                .await?;
+        overall_processed += rep.processed_count;
+        overall_updated += rep.updated_count;
+        aggregated.insert("meta".to_string(), serde_json::to_value(rep).unwrap_or(Value::Null));
+    }
+    if do_project {
+        let project_ids: Vec<Uuid> = if let Some(pid) = project_id {
+            vec![pid]
+        } else {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
+                .fetch_all(&state.db)
+                .await
+                .map_err(|e| anyhow::anyhow!("SELECT projects per recompute-titles: {e}"))?
+        };
+        let mut projects_map = serde_json::Map::new();
+        for pid in project_ids {
+            let rep = title_gen::generate_titles_for_scope(
+                &state.wiki_deps(),
+                title_gen::TitleScope::Project(pid),
+            )
+            .await?;
+            overall_processed += rep.processed_count;
+            overall_updated += rep.updated_count;
+            projects_map.insert(pid.to_string(), serde_json::to_value(rep).unwrap_or(Value::Null));
+        }
+        aggregated.insert("projects".to_string(), Value::Object(projects_map));
+    }
+    Ok((overall_processed, overall_updated, aggregated))
+}
+
+/// Task background di `generate_title_for_doc` (singolo doc): logga esito.
+fn spawn_recompute_titles_doc_bg(state: AppState, run_id: Uuid, doc_id: Uuid) {
     tokio::spawn(async move {
         tracing::info!(
             run_id = %run_id,
-            scope = %scope_clone,
-            project_id = ?project_filter,
+            doc_id = %doc_id,
+            "wiki.recompute-titles: avvio task background (singolo doc)"
+        );
+        match title_gen::generate_title_for_doc(&state.wiki_deps(), doc_id).await {
+            Ok(rep) => tracing::info!(
+                run_id = %run_id,
+                updated = rep.updated,
+                elapsed_ms = rep.elapsed_ms,
+                "wiki.recompute-titles: completato (singolo doc)"
+            ),
+            Err(e) => tracing::error!(
+                run_id = %run_id,
+                error = %e,
+                "wiki.recompute-titles: fallito (singolo doc)"
+            ),
+        }
+    });
+}
+
+/// Task background del batch titoli: logga avvio ed esito aggregato.
+fn spawn_recompute_titles_batch_bg(
+    state: AppState,
+    run_id: Uuid,
+    scope_label: String,
+    do_meta: bool,
+    do_project: bool,
+    project_id: Option<Uuid>,
+) {
+    tokio::spawn(async move {
+        tracing::info!(
+            run_id = %run_id,
+            scope = %scope_label,
+            project_id = ?project_id,
             "wiki.recompute-titles: avvio task background (batch)"
         );
-        match run_batch(state_cloned).await {
+        match run_recompute_titles_batch(state, do_meta, do_project, project_id).await {
             Ok((processed, updated, _)) => tracing::info!(
                 run_id = %run_id,
                 processed = processed,
@@ -733,16 +781,6 @@ pub async fn recompute_titles_handler(
             ),
         }
     });
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "ok": true,
-            "run_id": run_id.to_string(),
-            "scope": scope_label,
-            "project_id": q.project_id,
-            "wait": false,
-        })),
-    ))
 }
 
 /// `GET /api/wiki/docs/:id/links` — outbound + inbound del documento.
@@ -762,45 +800,7 @@ pub async fn list_doc_links(
     let (acl_clause, acl_projects) = acl.scope_clause(1);
     let acl_param_used = !acl_projects.is_empty();
 
-    // Outbound: edges da `id` verso doc visibili.
-    let outbound_sql = if acl_param_used {
-        format!(
-            "SELECT l.from_doc_id, l.to_doc_id, l.rel_type, l.confidence, l.created_by, \
-                    l.evidence, l.created_at, \
-                    d.id AS target_id, d.scope AS target_scope, d.project_id AS target_project_id, \
-                    d.slug AS target_slug, d.title AS target_title, d.kind AS target_kind \
-             FROM wiki_links l JOIN wiki_docs ON wiki_docs.id = l.to_doc_id \
-                               JOIN wiki_docs d ON d.id = l.to_doc_id \
-             WHERE l.from_doc_id = $2 AND {acl_clause} \
-             ORDER BY l.confidence DESC, l.rel_type ASC"
-        )
-    } else {
-        format!(
-            "SELECT l.from_doc_id, l.to_doc_id, l.rel_type, l.confidence, l.created_by, \
-                    l.evidence, l.created_at, \
-                    d.id AS target_id, d.scope AS target_scope, d.project_id AS target_project_id, \
-                    d.slug AS target_slug, d.title AS target_title, d.kind AS target_kind \
-             FROM wiki_links l JOIN wiki_docs ON wiki_docs.id = l.to_doc_id \
-                               JOIN wiki_docs d ON d.id = l.to_doc_id \
-             WHERE l.from_doc_id = $1 AND {acl_clause} \
-             ORDER BY l.confidence DESC, l.rel_type ASC"
-        )
-    };
-    // Inbound: edges verso `id` (l.to_doc_id = id), il doc "altro" da mostrare e'
-    // la SORGENTE (l.from_doc_id). Costruito esplicitamente (NON via replace di
-    // stringhe: la vecchia logica produceva "l.to_doc_id = 22" -> errore SQL
-    // uuid = integer). Stessi parametri di outbound: $2/$1 = id, $1 = acl.
-    let id_placeholder = if acl_param_used { "$2" } else { "$1" };
-    let inbound_sql = format!(
-        "SELECT l.from_doc_id, l.to_doc_id, l.rel_type, l.confidence, l.created_by, \
-                l.evidence, l.created_at, \
-                d.id AS target_id, d.scope AS target_scope, d.project_id AS target_project_id, \
-                d.slug AS target_slug, d.title AS target_title, d.kind AS target_kind \
-         FROM wiki_links l JOIN wiki_docs ON wiki_docs.id = l.from_doc_id \
-                           JOIN wiki_docs d ON d.id = l.from_doc_id \
-         WHERE l.to_doc_id = {id_placeholder} AND {acl_clause} \
-         ORDER BY l.confidence DESC, l.rel_type ASC"
-    );
+    let (outbound_sql, inbound_sql) = build_link_queries(&acl_clause, acl_param_used);
 
     let mut q_out = sqlx::query(&outbound_sql);
     let mut q_in = sqlx::query(&inbound_sql);
@@ -811,60 +811,16 @@ pub async fn list_doc_links(
     q_out = q_out.bind(id);
     q_in = q_in.bind(id);
 
-    use sqlx::Row;
     let outbound_rows = q_out.fetch_all(&state.db).await.map_err(err500)?;
     let inbound_rows = q_in.fetch_all(&state.db).await.map_err(err500)?;
 
-    let map_row = |row: sqlx::postgres::PgRow, edge_dir: &str| -> Value {
-        let from_id: Uuid = row.try_get("from_doc_id").unwrap_or_default();
-        let to_id: Uuid = row.try_get("to_doc_id").unwrap_or_default();
-        let rel_type: String = row.try_get("rel_type").unwrap_or_default();
-        let confidence: f32 = row.try_get("confidence").unwrap_or(0.0);
-        let created_by: String = row.try_get("created_by").unwrap_or_default();
-        let evidence: Option<String> = row.try_get("evidence").ok();
-        let target_id: Uuid = row.try_get("target_id").unwrap_or_default();
-        let target_scope: String = row.try_get("target_scope").unwrap_or_default();
-        let target_project_id: Option<Uuid> = row.try_get("target_project_id").ok();
-        let target_slug: String = row.try_get("target_slug").unwrap_or_default();
-        let target_title: String = row.try_get("target_title").unwrap_or_default();
-        let target_kind: String = row.try_get("target_kind").unwrap_or_default();
-        let doc_obj = json!({
-            "id": target_id,
-            "scope": target_scope,
-            "project_id": target_project_id,
-            "slug": target_slug,
-            "title": target_title,
-            "kind": target_kind,
-        });
-        // Contratto TS WikiLinksResponse: outbound[].to_doc, inbound[].from_doc
-        // (oggetti WikiDoc con .title). Il frontend usa l.to_doc/l.from_doc; "target"
-        // (flat) faceva l.from_doc undefined -> crash reading 'title'. Esponiamo la
-        // chiave nidificata attesa (più "target" per retrocompatibilità).
-        let doc_key = if edge_dir == "outbound" {
-            "to_doc"
-        } else {
-            "from_doc"
-        };
-        let mut obj = serde_json::Map::new();
-        obj.insert("from_doc_id".to_string(), json!(from_id));
-        obj.insert("to_doc_id".to_string(), json!(to_id));
-        obj.insert("rel_type".to_string(), json!(rel_type));
-        obj.insert("confidence".to_string(), json!(confidence));
-        obj.insert("created_by".to_string(), json!(created_by));
-        obj.insert("evidence".to_string(), json!(evidence));
-        obj.insert("direction".to_string(), json!(edge_dir));
-        obj.insert(doc_key.to_string(), doc_obj.clone());
-        obj.insert("target".to_string(), doc_obj);
-        Value::Object(obj)
-    };
-
     let outbound: Vec<Value> = outbound_rows
         .into_iter()
-        .map(|r| map_row(r, "outbound"))
+        .map(|r| map_link_row(r, "outbound"))
         .collect();
     let inbound: Vec<Value> = inbound_rows
         .into_iter()
-        .map(|r| map_row(r, "inbound"))
+        .map(|r| map_link_row(r, "inbound"))
         .collect();
 
     Ok(Json(json!({
@@ -876,6 +832,82 @@ pub async fn list_doc_links(
             "inbound": inbound.len(),
         }
     })))
+}
+
+/// Costruisce le due SQL (outbound + inbound) di `list_doc_links` con i
+/// placeholder corretti in base a `acl_param_used` ($1 = acl projects; l'id del
+/// doc va in $2 se l'acl usa un parametro, altrimenti $1). Estratta per
+/// contenere la lunghezza dell'handler (behavior-preserving).
+///
+/// Inbound: edges verso `id` (l.to_doc_id = id), il doc "altro" da mostrare e'
+/// la SORGENTE (l.from_doc_id). Costruito esplicitamente (NON via replace di
+/// stringhe: la vecchia logica produceva "l.to_doc_id = 22" -> errore SQL
+/// uuid = integer).
+fn build_link_queries(acl_clause: &str, acl_param_used: bool) -> (String, String) {
+    let id_placeholder = if acl_param_used { "$2" } else { "$1" };
+    let outbound_sql = format!(
+        "SELECT l.from_doc_id, l.to_doc_id, l.rel_type, l.confidence, l.created_by, \
+                l.evidence, l.created_at, \
+                d.id AS target_id, d.scope AS target_scope, d.project_id AS target_project_id, \
+                d.slug AS target_slug, d.title AS target_title, d.kind AS target_kind \
+         FROM wiki_links l JOIN wiki_docs ON wiki_docs.id = l.to_doc_id \
+                           JOIN wiki_docs d ON d.id = l.to_doc_id \
+         WHERE l.from_doc_id = {id_placeholder} AND {acl_clause} \
+         ORDER BY l.confidence DESC, l.rel_type ASC"
+    );
+    let inbound_sql = format!(
+        "SELECT l.from_doc_id, l.to_doc_id, l.rel_type, l.confidence, l.created_by, \
+                l.evidence, l.created_at, \
+                d.id AS target_id, d.scope AS target_scope, d.project_id AS target_project_id, \
+                d.slug AS target_slug, d.title AS target_title, d.kind AS target_kind \
+         FROM wiki_links l JOIN wiki_docs ON wiki_docs.id = l.from_doc_id \
+                           JOIN wiki_docs d ON d.id = l.from_doc_id \
+         WHERE l.to_doc_id = {id_placeholder} AND {acl_clause} \
+         ORDER BY l.confidence DESC, l.rel_type ASC"
+    );
+    (outbound_sql, inbound_sql)
+}
+
+/// Serializza una riga di `wiki_links` (con doc target arricchito) nel JSON
+/// atteso dal frontend. Estratta dalla closure di `list_doc_links`.
+/// Contratto TS WikiLinksResponse: outbound[].to_doc, inbound[].from_doc
+/// (oggetti WikiDoc con .title). Il frontend usa l.to_doc/l.from_doc; "target"
+/// (flat) faceva l.from_doc undefined -> crash reading 'title'. Esponiamo la
+/// chiave nidificata attesa (piu' "target" per retrocompatibilita').
+fn map_link_row(row: sqlx::postgres::PgRow, edge_dir: &str) -> Value {
+    use sqlx::Row;
+    let from_id: Uuid = row.try_get("from_doc_id").unwrap_or_default();
+    let to_id: Uuid = row.try_get("to_doc_id").unwrap_or_default();
+    let rel_type: String = row.try_get("rel_type").unwrap_or_default();
+    let confidence: f32 = row.try_get("confidence").unwrap_or(0.0);
+    let created_by: String = row.try_get("created_by").unwrap_or_default();
+    let evidence: Option<String> = row.try_get("evidence").ok();
+    let target_id: Uuid = row.try_get("target_id").unwrap_or_default();
+    let target_scope: String = row.try_get("target_scope").unwrap_or_default();
+    let target_project_id: Option<Uuid> = row.try_get("target_project_id").ok();
+    let target_slug: String = row.try_get("target_slug").unwrap_or_default();
+    let target_title: String = row.try_get("target_title").unwrap_or_default();
+    let target_kind: String = row.try_get("target_kind").unwrap_or_default();
+    let doc_obj = json!({
+        "id": target_id,
+        "scope": target_scope,
+        "project_id": target_project_id,
+        "slug": target_slug,
+        "title": target_title,
+        "kind": target_kind,
+    });
+    let doc_key = if edge_dir == "outbound" { "to_doc" } else { "from_doc" };
+    let mut obj = serde_json::Map::new();
+    obj.insert("from_doc_id".to_string(), json!(from_id));
+    obj.insert("to_doc_id".to_string(), json!(to_id));
+    obj.insert("rel_type".to_string(), json!(rel_type));
+    obj.insert("confidence".to_string(), json!(confidence));
+    obj.insert("created_by".to_string(), json!(created_by));
+    obj.insert("evidence".to_string(), json!(evidence));
+    obj.insert("direction".to_string(), json!(edge_dir));
+    obj.insert(doc_key.to_string(), doc_obj.clone());
+    obj.insert("target".to_string(), doc_obj);
+    Value::Object(obj)
 }
 
 /// `GET /api/wiki/graph` — JSON Cytoscape-compatible filtrato ACL.
@@ -901,97 +933,19 @@ pub async fn get_graph(
     });
 
     let (acl_clause, acl_projects) = acl.scope_clause(1);
-    let acl_param_used = !acl_projects.is_empty();
-    let mut next_idx = if acl_param_used { 2 } else { 1 };
+    let seed_doc_id = q.seed_doc_id;
 
     // ── 1) Selezione nodi ─────────────────────────────────────────────────
-    let mut node_where: Vec<String> = vec![acl_clause.clone()];
-    let mut node_binds_scope: Option<String> = None;
-    let mut node_binds_project: Option<Uuid> = None;
-
-    if let Some(s) = scope_filter {
-        node_where.push(format!("wiki_docs.scope = ${next_idx}"));
-        node_binds_scope = Some(s.as_str().to_string());
-        next_idx += 1;
-    }
-    if let Some(pid) = q.project_id {
-        node_where.push(format!("wiki_docs.project_id = ${next_idx}"));
-        node_binds_project = Some(pid);
-        next_idx += 1;
-    }
-
-    // Se seed_doc_id e' presente: restringi nodi ai vicini di 1 hop + seed.
-    let seed_doc_id = q.seed_doc_id;
-    let seed_clause = seed_doc_id.map(|_seed| {
-        let idx = next_idx;
-        next_idx += 1;
-        format!(
-            "wiki_docs.id IN ( \
-                SELECT ${idx}::uuid UNION \
-                SELECT to_doc_id FROM wiki_links WHERE from_doc_id = ${idx}::uuid UNION \
-                SELECT from_doc_id FROM wiki_links WHERE to_doc_id = ${idx}::uuid \
-             )"
-        )
-    });
-    if let Some(c) = seed_clause.as_ref() {
-        node_where.push(c.clone());
-    }
-
-    // Order: degree DESC (numero edge cui partecipa) per privilegiare i piu' centrali.
-    let nodes_sql = format!(
-        "SELECT wiki_docs.id, wiki_docs.scope, wiki_docs.project_id, wiki_docs.slug, \
-                wiki_docs.title, wiki_docs.kind, \
-                ( (SELECT COUNT(*) FROM wiki_links WHERE from_doc_id = wiki_docs.id) \
-                + (SELECT COUNT(*) FROM wiki_links WHERE to_doc_id   = wiki_docs.id) ) AS degree \
-         FROM wiki_docs WHERE {} \
-         ORDER BY degree DESC, wiki_docs.updated_at DESC \
-         LIMIT ${}",
-        node_where.join(" AND "),
-        next_idx
-    );
-
-    let mut q_nodes = sqlx::query(&nodes_sql);
-    if acl_param_used {
-        q_nodes = q_nodes.bind(acl_projects.clone());
-    }
-    if let Some(s) = node_binds_scope.as_ref() {
-        q_nodes = q_nodes.bind(s.clone());
-    }
-    if let Some(pid) = node_binds_project {
-        q_nodes = q_nodes.bind(pid);
-    }
-    if let Some(seed) = seed_doc_id {
-        q_nodes = q_nodes.bind(seed);
-    }
-    q_nodes = q_nodes.bind(max_nodes as i64);
-
-    use sqlx::Row;
-    let node_rows = q_nodes.fetch_all(&state.db).await.map_err(err500)?;
-    let mut node_ids: std::collections::HashSet<Uuid> =
-        std::collections::HashSet::with_capacity(node_rows.len());
-    let mut nodes_json: Vec<Value> = Vec::with_capacity(node_rows.len());
-    for row in node_rows {
-        let id: Uuid = row.try_get("id").unwrap_or_default();
-        let scope: String = row.try_get("scope").unwrap_or_default();
-        let project_id: Option<Uuid> = row.try_get("project_id").ok();
-        let slug: String = row.try_get("slug").unwrap_or_default();
-        let title: String = row.try_get("title").unwrap_or_default();
-        let kind: String = row.try_get("kind").unwrap_or_default();
-        let degree: i64 = row.try_get("degree").unwrap_or(0);
-        node_ids.insert(id);
-        // Formato RAW conforme al contratto TS WikiGraphNode (id/title/kind/...):
-        // NON wrappare in {data:{label}} (il frontend ricostruisce gli elementi
-        // Cytoscape da questi campi; con {data:{}} n.title era undefined -> crash).
-        nodes_json.push(json!({
-            "id": id.to_string(),
-            "title": title,
-            "slug": slug,
-            "kind": kind,
-            "scope": scope,
-            "project_id": project_id,
-            "degree": degree,
-        }));
-    }
+    let (node_ids, nodes_json) = fetch_graph_nodes(
+        &state,
+        &acl_clause,
+        &acl_projects,
+        scope_filter,
+        q.project_id,
+        seed_doc_id,
+        max_nodes,
+    )
+    .await?;
 
     if nodes_json.is_empty() {
         return Ok(Json(json!({
@@ -1003,55 +957,14 @@ pub async fn get_graph(
 
     // ── 2) Selezione edges fra nodi selezionati ───────────────────────────
     let node_id_vec: Vec<Uuid> = node_ids.iter().copied().collect();
-
-    let mut edge_where: Vec<String> = vec![
-        "wiki_links.from_doc_id = ANY($1::uuid[])".to_string(),
-        "wiki_links.to_doc_id   = ANY($1::uuid[])".to_string(),
-        "wiki_links.confidence >= $2".to_string(),
-    ];
-    let mut edge_next_idx = 3usize;
-    if predicates.is_some() {
-        edge_where.push(format!(
-            "wiki_links.rel_type = ANY(${edge_next_idx}::text[])"
-        ));
-        edge_next_idx += 1;
-    }
-    let edges_sql = format!(
-        "SELECT from_doc_id, to_doc_id, rel_type, confidence, created_by, evidence \
-         FROM wiki_links WHERE {} \
-         ORDER BY confidence DESC \
-         LIMIT ${}",
-        edge_where.join(" AND "),
-        edge_next_idx
-    );
-
-    let mut q_edges = sqlx::query(&edges_sql)
-        .bind(&node_id_vec)
-        .bind(confidence_min);
-    if let Some(preds) = predicates.as_ref() {
-        q_edges = q_edges.bind(preds.clone());
-    }
-    q_edges = q_edges.bind(max_edges as i64);
-
-    let edge_rows = q_edges.fetch_all(&state.db).await.map_err(err500)?;
-    let mut edges_json: Vec<Value> = Vec::with_capacity(edge_rows.len());
-    for row in edge_rows {
-        let from_id: Uuid = row.try_get("from_doc_id").unwrap_or_default();
-        let to_id: Uuid = row.try_get("to_doc_id").unwrap_or_default();
-        let rel_type: String = row.try_get("rel_type").unwrap_or_default();
-        let confidence: f32 = row.try_get("confidence").unwrap_or(0.0);
-        let created_by: String = row.try_get("created_by").unwrap_or_default();
-        let evidence: Option<String> = row.try_get("evidence").ok();
-        // Formato RAW conforme al contratto TS WikiGraphEdge (from/to/rel_type/...).
-        edges_json.push(json!({
-            "from": from_id.to_string(),
-            "to": to_id.to_string(),
-            "rel_type": rel_type,
-            "confidence": confidence,
-            "created_by": created_by,
-            "evidence": evidence,
-        }));
-    }
+    let edges_json = fetch_graph_edges(
+        &state,
+        &node_id_vec,
+        confidence_min,
+        predicates.as_ref(),
+        max_edges,
+    )
+    .await?;
 
     Ok(Json(json!({
         "nodes": nodes_json,
@@ -1072,6 +985,190 @@ pub async fn get_graph(
     })))
 }
 
+/// Costruisce ed esegue la query di selezione dei nodi del grafo (con filtri
+/// scope/project/seed e ordinamento per degree), poi li serializza. Ritorna
+/// l'insieme degli id selezionati (per il filtro edge) e i nodi JSON. Estratta
+/// da `get_graph` (behavior-preserving: stessi placeholder e ordine di bind).
+#[allow(clippy::too_many_arguments)]
+async fn fetch_graph_nodes(
+    state: &AppState,
+    acl_clause: &str,
+    acl_projects: &[Uuid],
+    scope_filter: Option<WikiScope>,
+    project_id: Option<Uuid>,
+    seed_doc_id: Option<Uuid>,
+    max_nodes: usize,
+) -> Result<(std::collections::HashSet<Uuid>, Vec<Value>), (StatusCode, String)> {
+    let acl_param_used = !acl_projects.is_empty();
+    let start_idx = if acl_param_used { 2 } else { 1 };
+    let (nodes_sql, bind_scope, bind_project) =
+        build_graph_nodes_sql(acl_clause, start_idx, scope_filter, project_id, seed_doc_id);
+
+    let mut q_nodes = sqlx::query(&nodes_sql);
+    if acl_param_used {
+        q_nodes = q_nodes.bind(acl_projects.to_vec());
+    }
+    if let Some(s) = bind_scope {
+        q_nodes = q_nodes.bind(s);
+    }
+    if let Some(pid) = bind_project {
+        q_nodes = q_nodes.bind(pid);
+    }
+    if let Some(seed) = seed_doc_id {
+        q_nodes = q_nodes.bind(seed);
+    }
+    q_nodes = q_nodes.bind(max_nodes as i64);
+
+    let node_rows = q_nodes.fetch_all(&state.db).await.map_err(err500)?;
+    let mut node_ids: std::collections::HashSet<Uuid> =
+        std::collections::HashSet::with_capacity(node_rows.len());
+    let mut nodes_json: Vec<Value> = Vec::with_capacity(node_rows.len());
+    for row in node_rows {
+        let (id, value) = map_graph_node_row(row);
+        node_ids.insert(id);
+        nodes_json.push(value);
+    }
+    Ok((node_ids, nodes_json))
+}
+
+/// Compone la SQL di selezione nodi del grafo con i filtri scope/project/seed a
+/// partire da `start_idx`, e ritorna anche i valori scope/project da bindare (nel
+/// medesimo ordine dei placeholder). Il placeholder di `LIMIT` e' l'indice finale.
+/// Estratta da `fetch_graph_nodes` (behavior-preserving).
+fn build_graph_nodes_sql(
+    acl_clause: &str,
+    start_idx: usize,
+    scope_filter: Option<WikiScope>,
+    project_id: Option<Uuid>,
+    seed_doc_id: Option<Uuid>,
+) -> (String, Option<String>, Option<Uuid>) {
+    let mut next_idx = start_idx;
+    let mut node_where: Vec<String> = vec![acl_clause.to_string()];
+    let mut bind_scope: Option<String> = None;
+    let mut bind_project: Option<Uuid> = None;
+
+    if let Some(s) = scope_filter {
+        node_where.push(format!("wiki_docs.scope = ${next_idx}"));
+        bind_scope = Some(s.as_str().to_string());
+        next_idx += 1;
+    }
+    if let Some(pid) = project_id {
+        node_where.push(format!("wiki_docs.project_id = ${next_idx}"));
+        bind_project = Some(pid);
+        next_idx += 1;
+    }
+    // Se seed_doc_id e' presente: restringi nodi ai vicini di 1 hop + seed.
+    if seed_doc_id.is_some() {
+        let idx = next_idx;
+        next_idx += 1;
+        node_where.push(format!(
+            "wiki_docs.id IN ( \
+                SELECT ${idx}::uuid UNION \
+                SELECT to_doc_id FROM wiki_links WHERE from_doc_id = ${idx}::uuid UNION \
+                SELECT from_doc_id FROM wiki_links WHERE to_doc_id = ${idx}::uuid \
+             )"
+        ));
+    }
+
+    // Order: degree DESC (numero edge cui partecipa) per privilegiare i piu' centrali.
+    let nodes_sql = format!(
+        "SELECT wiki_docs.id, wiki_docs.scope, wiki_docs.project_id, wiki_docs.slug, \
+                wiki_docs.title, wiki_docs.kind, \
+                ( (SELECT COUNT(*) FROM wiki_links WHERE from_doc_id = wiki_docs.id) \
+                + (SELECT COUNT(*) FROM wiki_links WHERE to_doc_id   = wiki_docs.id) ) AS degree \
+         FROM wiki_docs WHERE {} \
+         ORDER BY degree DESC, wiki_docs.updated_at DESC \
+         LIMIT ${}",
+        node_where.join(" AND "),
+        next_idx
+    );
+    (nodes_sql, bind_scope, bind_project)
+}
+
+/// Serializza una riga nodo del grafo. Ritorna `(id, json)`: l'id serve al
+/// chiamante per popolare l'insieme dei nodi selezionati. Formato RAW conforme
+/// al contratto TS WikiGraphNode (id/title/kind/...): NON wrappare in
+/// {data:{label}} (il frontend ricostruisce gli elementi Cytoscape da questi
+/// campi; con {data:{}} n.title era undefined -> crash).
+fn map_graph_node_row(row: sqlx::postgres::PgRow) -> (Uuid, Value) {
+    use sqlx::Row;
+    let id: Uuid = row.try_get("id").unwrap_or_default();
+    let scope: String = row.try_get("scope").unwrap_or_default();
+    let project_id: Option<Uuid> = row.try_get("project_id").ok();
+    let slug: String = row.try_get("slug").unwrap_or_default();
+    let title: String = row.try_get("title").unwrap_or_default();
+    let kind: String = row.try_get("kind").unwrap_or_default();
+    let degree: i64 = row.try_get("degree").unwrap_or(0);
+    let value = json!({
+        "id": id.to_string(),
+        "title": title,
+        "slug": slug,
+        "kind": kind,
+        "scope": scope,
+        "project_id": project_id,
+        "degree": degree,
+    });
+    (id, value)
+}
+
+/// Serializza una riga edge del grafo. Formato RAW conforme al contratto TS
+/// WikiGraphEdge (from/to/rel_type/...).
+fn map_graph_edge_row(row: sqlx::postgres::PgRow) -> Value {
+    use sqlx::Row;
+    let from_id: Uuid = row.try_get("from_doc_id").unwrap_or_default();
+    let to_id: Uuid = row.try_get("to_doc_id").unwrap_or_default();
+    let rel_type: String = row.try_get("rel_type").unwrap_or_default();
+    let confidence: f32 = row.try_get("confidence").unwrap_or(0.0);
+    let created_by: String = row.try_get("created_by").unwrap_or_default();
+    let evidence: Option<String> = row.try_get("evidence").ok();
+    json!({
+        "from": from_id.to_string(),
+        "to": to_id.to_string(),
+        "rel_type": rel_type,
+        "confidence": confidence,
+        "created_by": created_by,
+        "evidence": evidence,
+    })
+}
+
+/// Costruisce ed esegue la query degli edge fra i nodi selezionati, applicando
+/// soglia di confidence e (opzionale) filtro predicate. Estratta da `get_graph`.
+async fn fetch_graph_edges(
+    state: &AppState,
+    node_id_vec: &[Uuid],
+    confidence_min: f32,
+    predicates: Option<&Vec<String>>,
+    max_edges: usize,
+) -> Result<Vec<Value>, (StatusCode, String)> {
+    let mut edge_where: Vec<String> = vec![
+        "wiki_links.from_doc_id = ANY($1::uuid[])".to_string(),
+        "wiki_links.to_doc_id   = ANY($1::uuid[])".to_string(),
+        "wiki_links.confidence >= $2".to_string(),
+    ];
+    let mut edge_next_idx = 3usize;
+    if predicates.is_some() {
+        edge_where.push(format!("wiki_links.rel_type = ANY(${edge_next_idx}::text[])"));
+        edge_next_idx += 1;
+    }
+    let edges_sql = format!(
+        "SELECT from_doc_id, to_doc_id, rel_type, confidence, created_by, evidence \
+         FROM wiki_links WHERE {} \
+         ORDER BY confidence DESC \
+         LIMIT ${}",
+        edge_where.join(" AND "),
+        edge_next_idx
+    );
+
+    let mut q_edges = sqlx::query(&edges_sql).bind(node_id_vec).bind(confidence_min);
+    if let Some(preds) = predicates {
+        q_edges = q_edges.bind(preds.clone());
+    }
+    q_edges = q_edges.bind(max_edges as i64);
+
+    let edge_rows = q_edges.fetch_all(&state.db).await.map_err(err500)?;
+    Ok(edge_rows.into_iter().map(map_graph_edge_row).collect())
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Triple extraction (ADR 0017 v2 F5)
 // ───────────────────────────────────────────────────────────────────────────
@@ -1088,18 +1185,16 @@ pub async fn extract_triples_handler(
     Query(q): Query<ExtractTriplesQuery>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    if !acl.is_admin {
-        return Err(err403("solo admin puo' lanciare wiki.extract-triples"));
-    }
+    require_admin(&acl, "solo admin puo' lanciare wiki.extract-triples")?;
 
     let wait = q.wait.unwrap_or(true);
-    let override_cap = q.override_cap.unwrap_or(false);
+    // override_cap segnala la volonta' di forzare anche se cap raggiunto;
+    // `extract_triples_for_doc` non controlla il cap (lo fa solo il batch),
+    // quindi qui e' un no-op esplicito.
+    let _ = q.override_cap.unwrap_or(false);
 
     // Path: singolo doc.
     if let Some(doc_id) = q.doc_id {
-        // override_cap segnala la volonta' di forzare anche se cap raggiunto;
-        // `extract_triples_for_doc` non controlla il cap (lo fa solo il batch).
-        let _ = override_cap; // dichiarato per chiarezza, no-op qui
         if wait {
             let report = triple_extractor::extract_triples_for_doc(&state.wiki_deps(), doc_id)
                 .await
@@ -1110,33 +1205,8 @@ pub async fn extract_triples_handler(
             ));
         }
         let run_id = Uuid::new_v4();
-        let state_cloned = state.clone();
-        tokio::spawn(async move {
-            tracing::info!(
-                run_id = %run_id,
-                doc_id = %doc_id,
-                "wiki.extract-triples: avvio task background (singolo doc)"
-            );
-            match triple_extractor::extract_triples_for_doc(&state_cloned.wiki_deps(), doc_id).await {
-                Ok(rep) => tracing::info!(
-                    run_id = %run_id,
-                    extracted = rep.triples_extracted,
-                    low_conf = rep.triples_skipped_low_conf,
-                    unresolved = rep.triples_unresolved_doc,
-                    elapsed_ms = rep.elapsed_ms,
-                    "wiki.extract-triples: completato (singolo doc)"
-                ),
-                Err(e) => tracing::error!(
-                    run_id = %run_id,
-                    error = %e,
-                    "wiki.extract-triples: fallito (singolo doc)"
-                ),
-            }
-        });
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({ "ok": true, "run_id": run_id.to_string(), "wait": false })),
-        ));
+        spawn_extract_triples_doc_bg(state.clone(), run_id, doc_id);
+        return Ok(accepted_run(run_id, json!({})));
     }
 
     // Path: batch per scope.
@@ -1144,73 +1214,125 @@ pub async fn extract_triples_handler(
 
     if wait {
         // wait=true sul batch e' supportato ma puo' essere lungo (tanti doc x ~1s LLM).
-        let mut aggregated = serde_json::Map::new();
-        let mut overall_processed = 0usize;
-
-        if scope_label == "meta" || scope_label == "all" {
-            let rep = triple_extractor::extract_triples_for_scope(
-                &state.wiki_deps(),
-                triple_extractor::ExtractScope::Meta,
-            )
-            .await
-            .map_err(err500)?;
-            overall_processed += rep.processed_count;
-            aggregated.insert(
-                "meta".to_string(),
-                serde_json::to_value(rep).unwrap_or(Value::Null),
-            );
-        }
-        if scope_label == "project" || scope_label == "all" {
-            // Se project_id specifico, batch solo su quello; altrimenti tutti.
-            let project_ids: Vec<Uuid> = if let Some(pid) = q.project_id {
-                vec![pid]
-            } else {
-                sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(err500)?
-            };
-            let mut projects_map = serde_json::Map::new();
-            for pid in project_ids {
-                let rep = triple_extractor::extract_triples_for_scope(
-                    &state.wiki_deps(),
-                    triple_extractor::ExtractScope::Project(pid),
-                )
-                .await
-                .map_err(err500)?;
-                overall_processed += rep.processed_count;
-                projects_map.insert(
-                    pid.to_string(),
-                    serde_json::to_value(rep).unwrap_or(Value::Null),
-                );
-            }
-            aggregated.insert("projects".to_string(), Value::Object(projects_map));
-        }
+        let (processed, details) =
+            run_extract_triples_batch(&state, &scope_label, q.project_id).await?;
         return Ok((
             StatusCode::OK,
             Json(json!({
                 "ok": true,
-                "processed_total": overall_processed,
-                "details": aggregated,
+                "processed_total": processed,
+                "details": details,
             })),
         ));
     }
 
     // wait=false: lancia in background.
     let run_id = Uuid::new_v4();
-    let state_cloned = state.clone();
-    let scope_clone = scope_label.clone();
-    let project_id = q.project_id;
+    spawn_extract_triples_batch_bg(state.clone(), run_id, scope_label.clone(), q.project_id);
+    Ok(accepted_run(
+        run_id,
+        json!({ "scope": scope_label, "project_id": q.project_id }),
+    ))
+}
+
+/// Task background di `extract_triples_for_doc` (singolo doc): logga esito.
+fn spawn_extract_triples_doc_bg(state: AppState, run_id: Uuid, doc_id: Uuid) {
     tokio::spawn(async move {
         tracing::info!(
             run_id = %run_id,
-            scope = %scope_clone,
+            doc_id = %doc_id,
+            "wiki.extract-triples: avvio task background (singolo doc)"
+        );
+        match triple_extractor::extract_triples_for_doc(&state.wiki_deps(), doc_id).await {
+            Ok(rep) => tracing::info!(
+                run_id = %run_id,
+                extracted = rep.triples_extracted,
+                low_conf = rep.triples_skipped_low_conf,
+                unresolved = rep.triples_unresolved_doc,
+                elapsed_ms = rep.elapsed_ms,
+                "wiki.extract-triples: completato (singolo doc)"
+            ),
+            Err(e) => tracing::error!(
+                run_id = %run_id,
+                error = %e,
+                "wiki.extract-triples: fallito (singolo doc)"
+            ),
+        }
+    });
+}
+
+/// Batch sincrono di estrazione triple su scope meta e/o progetto. Ritorna
+/// `(processed_total, dettaglio_aggregato)`. Estratto da `extract_triples_handler`.
+async fn run_extract_triples_batch(
+    state: &AppState,
+    scope_label: &str,
+    project_id: Option<Uuid>,
+) -> Result<(usize, serde_json::Map<String, Value>), (StatusCode, String)> {
+    let mut aggregated = serde_json::Map::new();
+    let mut overall_processed = 0usize;
+
+    if scope_label == "meta" || scope_label == "all" {
+        let rep = triple_extractor::extract_triples_for_scope(
+            &state.wiki_deps(),
+            triple_extractor::ExtractScope::Meta,
+        )
+        .await
+        .map_err(err500)?;
+        overall_processed += rep.processed_count;
+        aggregated.insert("meta".to_string(), serde_json::to_value(rep).unwrap_or(Value::Null));
+    }
+    if scope_label == "project" || scope_label == "all" {
+        // Se project_id specifico, batch solo su quello; altrimenti tutti.
+        let project_ids = resolve_project_ids(&state.db, project_id).await?;
+        let mut projects_map = serde_json::Map::new();
+        for pid in project_ids {
+            let rep = triple_extractor::extract_triples_for_scope(
+                &state.wiki_deps(),
+                triple_extractor::ExtractScope::Project(pid),
+            )
+            .await
+            .map_err(err500)?;
+            overall_processed += rep.processed_count;
+            projects_map.insert(pid.to_string(), serde_json::to_value(rep).unwrap_or(Value::Null));
+        }
+        aggregated.insert("projects".to_string(), Value::Object(projects_map));
+    }
+    Ok((overall_processed, aggregated))
+}
+
+/// Elenco dei progetti su cui iterare: il singolo `project_id` se dato, altrimenti
+/// tutti quelli in `projects`. Punto unico della SELECT (regola L).
+async fn resolve_project_ids(
+    db: &sqlx::PgPool,
+    project_id: Option<Uuid>,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    if let Some(pid) = project_id {
+        return Ok(vec![pid]);
+    }
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
+        .fetch_all(db)
+        .await
+        .map_err(err500)
+}
+
+/// Task background del batch triple: itera scope meta/progetto loggando i fallimenti
+/// come WARN (best-effort, non blocca). Estratto da `extract_triples_handler`.
+fn spawn_extract_triples_batch_bg(
+    state: AppState,
+    run_id: Uuid,
+    scope_label: String,
+    project_id: Option<Uuid>,
+) {
+    tokio::spawn(async move {
+        tracing::info!(
+            run_id = %run_id,
+            scope = %scope_label,
             project_id = ?project_id,
             "wiki.extract-triples: avvio task background (batch)"
         );
-        if scope_clone == "meta" || scope_clone == "all" {
+        if scope_label == "meta" || scope_label == "all" {
             if let Err(e) = triple_extractor::extract_triples_for_scope(
-                &state_cloned.wiki_deps(),
+                &state.wiki_deps(),
                 triple_extractor::ExtractScope::Meta,
             )
             .await
@@ -1218,12 +1340,12 @@ pub async fn extract_triples_handler(
                 tracing::warn!(run_id=%run_id, error=%e, "batch meta fallito");
             }
         }
-        if scope_clone == "project" || scope_clone == "all" {
+        if scope_label == "project" || scope_label == "all" {
             let pids: Vec<Uuid> = if let Some(pid) = project_id {
                 vec![pid]
             } else {
                 sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
-                    .fetch_all(&state_cloned.db)
+                    .fetch_all(&state.db)
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(run_id=%run_id, "SELECT projects fallita: {e}");
@@ -1232,7 +1354,7 @@ pub async fn extract_triples_handler(
             };
             for pid in pids {
                 if let Err(e) = triple_extractor::extract_triples_for_scope(
-                    &state_cloned.wiki_deps(),
+                    &state.wiki_deps(),
                     triple_extractor::ExtractScope::Project(pid),
                 )
                 .await
@@ -1243,20 +1365,28 @@ pub async fn extract_triples_handler(
         }
         tracing::info!(run_id=%run_id, "wiki.extract-triples: task background terminato");
     });
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "ok": true,
-            "run_id": run_id.to_string(),
-            "scope": scope_label,
-            "project_id": q.project_id,
-            "wait": false,
-        })),
-    ))
 }
 
-// Trait Row necessario per le query dinamiche `sqlx::query(...)` con `try_get`.
-use sqlx::Row as _SqlxRowImportForTriples;
+// SQL di `list_doc_triples`. Outbound: subj=this, arricchimento del target SOLO
+// se obj_doc_id non nullo (i concetti liberi/external non hanno doc visibile) ->
+// LEFT JOIN. Inbound: obj=this, il subject e' sempre una doc -> JOIN.
+const SQL_DOC_TRIPLES_OUTBOUND: &str = "SELECT t.id, t.predicate, t.obj_doc_id, t.obj_text, t.obj_external, \
+            t.source, t.confidence, t.evidence, t.created_at, \
+            d.scope AS target_scope, d.slug AS target_slug, \
+            d.title AS target_title, d.kind AS target_kind, \
+            d.project_id AS target_project_id \
+     FROM wiki_concept_triples t \
+     LEFT JOIN wiki_docs d ON d.id = t.obj_doc_id \
+     WHERE t.subj_doc_id = $1 \
+     ORDER BY t.confidence DESC, t.predicate ASC";
+
+const SQL_DOC_TRIPLES_INBOUND: &str = "SELECT t.id, t.predicate, t.subj_doc_id, t.source, t.confidence, t.evidence, t.created_at, \
+            d.scope AS subj_scope, d.slug AS subj_slug, d.title AS subj_title, \
+            d.kind AS subj_kind, d.project_id AS subj_project_id \
+     FROM wiki_concept_triples t \
+     JOIN wiki_docs d ON d.id = t.subj_doc_id \
+     WHERE t.obj_doc_id = $1 \
+     ORDER BY t.confidence DESC, t.predicate ASC";
 
 /// `GET /api/wiki/docs/:id/triples` — outbound (subj=this) + inbound (obj_doc=this).
 pub async fn list_doc_triples(
@@ -1272,107 +1402,20 @@ pub async fn list_doc_triples(
         return Err(err404("documento non trovato o non accessibile"));
     }
 
-    // Outbound: subj=this. Arricchimento del target SOLO se obj_doc_id non nullo;
-    // i concetti liberi / external non hanno una doc visibile.
-    let outbound_rows = sqlx::query(
-        "SELECT t.id, t.predicate, t.obj_doc_id, t.obj_text, t.obj_external, \
-                t.source, t.confidence, t.evidence, t.created_at, \
-                d.scope AS target_scope, d.slug AS target_slug, \
-                d.title AS target_title, d.kind AS target_kind, \
-                d.project_id AS target_project_id \
-         FROM wiki_concept_triples t \
-         LEFT JOIN wiki_docs d ON d.id = t.obj_doc_id \
-         WHERE t.subj_doc_id = $1 \
-         ORDER BY t.confidence DESC, t.predicate ASC",
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
+    let outbound_rows = sqlx::query(SQL_DOC_TRIPLES_OUTBOUND)
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(err500)?;
+
+    let inbound_rows = sqlx::query(SQL_DOC_TRIPLES_INBOUND)
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
     .map_err(err500)?;
 
-    let inbound_rows = sqlx::query(
-        "SELECT t.id, t.predicate, t.subj_doc_id, t.source, t.confidence, t.evidence, t.created_at, \
-                d.scope AS subj_scope, d.slug AS subj_slug, d.title AS subj_title, \
-                d.kind AS subj_kind, d.project_id AS subj_project_id \
-         FROM wiki_concept_triples t \
-         JOIN wiki_docs d ON d.id = t.subj_doc_id \
-         WHERE t.obj_doc_id = $1 \
-         ORDER BY t.confidence DESC, t.predicate ASC",
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(err500)?;
-
-    let outbound: Vec<Value> = outbound_rows
-        .into_iter()
-        .map(|r| {
-            let tid: Uuid = r.try_get("id").unwrap_or_default();
-            let predicate: String = r.try_get("predicate").unwrap_or_default();
-            let obj_doc_id: Option<Uuid> = r.try_get("obj_doc_id").ok();
-            let obj_text: Option<String> = r.try_get("obj_text").ok();
-            let obj_external: Option<String> = r.try_get("obj_external").ok();
-            let source: String = r.try_get("source").unwrap_or_default();
-            let confidence: f32 = r.try_get("confidence").unwrap_or(0.0);
-            let evidence: Option<String> = r.try_get("evidence").ok();
-            let target_title: Option<String> = r.try_get("target_title").ok();
-            let target_slug: Option<String> = r.try_get("target_slug").ok();
-            let target_scope: Option<String> = r.try_get("target_scope").ok();
-            let target_kind: Option<String> = r.try_get("target_kind").ok();
-            let target_project_id: Option<Uuid> = r.try_get("target_project_id").ok();
-            json!({
-                "id": tid,
-                "direction": "outbound",
-                "predicate": predicate,
-                "source": source,
-                "confidence": confidence,
-                "evidence": evidence,
-                "object": {
-                    "doc_id": obj_doc_id,
-                    "text": obj_text,
-                    "external": obj_external,
-                    "title": target_title,
-                    "slug": target_slug,
-                    "scope": target_scope,
-                    "kind": target_kind,
-                    "project_id": target_project_id,
-                }
-            })
-        })
-        .collect();
-
-    let inbound: Vec<Value> = inbound_rows
-        .into_iter()
-        .map(|r| {
-            let tid: Uuid = r.try_get("id").unwrap_or_default();
-            let predicate: String = r.try_get("predicate").unwrap_or_default();
-            let subj_doc_id: Uuid = r.try_get("subj_doc_id").unwrap_or_default();
-            let source: String = r.try_get("source").unwrap_or_default();
-            let confidence: f32 = r.try_get("confidence").unwrap_or(0.0);
-            let evidence: Option<String> = r.try_get("evidence").ok();
-            let subj_title: String = r.try_get("subj_title").unwrap_or_default();
-            let subj_slug: String = r.try_get("subj_slug").unwrap_or_default();
-            let subj_scope: String = r.try_get("subj_scope").unwrap_or_default();
-            let subj_kind: String = r.try_get("subj_kind").unwrap_or_default();
-            let subj_project_id: Option<Uuid> = r.try_get("subj_project_id").ok();
-            json!({
-                "id": tid,
-                "direction": "inbound",
-                "predicate": predicate,
-                "source": source,
-                "confidence": confidence,
-                "evidence": evidence,
-                "subject": {
-                    "doc_id": subj_doc_id,
-                    "title": subj_title,
-                    "slug": subj_slug,
-                    "scope": subj_scope,
-                    "kind": subj_kind,
-                    "project_id": subj_project_id,
-                }
-            })
-        })
-        .collect();
+    let outbound: Vec<Value> = outbound_rows.into_iter().map(map_triple_outbound_row).collect();
+    let inbound: Vec<Value> = inbound_rows.into_iter().map(map_triple_inbound_row).collect();
 
     Ok(Json(json!({
         "doc_id": id,
@@ -1383,6 +1426,152 @@ pub async fn list_doc_triples(
             "inbound": inbound.len(),
         }
     })))
+}
+
+/// Serializza una tripla outbound (subj=doc corrente) col target arricchito.
+/// Estratta dalla closure di `list_doc_triples`.
+fn map_triple_outbound_row(r: sqlx::postgres::PgRow) -> Value {
+    use sqlx::Row;
+    let tid: Uuid = r.try_get("id").unwrap_or_default();
+    let predicate: String = r.try_get("predicate").unwrap_or_default();
+    let obj_doc_id: Option<Uuid> = r.try_get("obj_doc_id").ok();
+    let obj_text: Option<String> = r.try_get("obj_text").ok();
+    let obj_external: Option<String> = r.try_get("obj_external").ok();
+    let source: String = r.try_get("source").unwrap_or_default();
+    let confidence: f32 = r.try_get("confidence").unwrap_or(0.0);
+    let evidence: Option<String> = r.try_get("evidence").ok();
+    let target_title: Option<String> = r.try_get("target_title").ok();
+    let target_slug: Option<String> = r.try_get("target_slug").ok();
+    let target_scope: Option<String> = r.try_get("target_scope").ok();
+    let target_kind: Option<String> = r.try_get("target_kind").ok();
+    let target_project_id: Option<Uuid> = r.try_get("target_project_id").ok();
+    json!({
+        "id": tid,
+        "direction": "outbound",
+        "predicate": predicate,
+        "source": source,
+        "confidence": confidence,
+        "evidence": evidence,
+        "object": {
+            "doc_id": obj_doc_id,
+            "text": obj_text,
+            "external": obj_external,
+            "title": target_title,
+            "slug": target_slug,
+            "scope": target_scope,
+            "kind": target_kind,
+            "project_id": target_project_id,
+        }
+    })
+}
+
+/// Serializza una tripla inbound (obj=doc corrente) col subject arricchito.
+/// Estratta dalla closure di `list_doc_triples`.
+fn map_triple_inbound_row(r: sqlx::postgres::PgRow) -> Value {
+    use sqlx::Row;
+    let tid: Uuid = r.try_get("id").unwrap_or_default();
+    let predicate: String = r.try_get("predicate").unwrap_or_default();
+    let subj_doc_id: Uuid = r.try_get("subj_doc_id").unwrap_or_default();
+    let source: String = r.try_get("source").unwrap_or_default();
+    let confidence: f32 = r.try_get("confidence").unwrap_or(0.0);
+    let evidence: Option<String> = r.try_get("evidence").ok();
+    let subj_title: String = r.try_get("subj_title").unwrap_or_default();
+    let subj_slug: String = r.try_get("subj_slug").unwrap_or_default();
+    let subj_scope: String = r.try_get("subj_scope").unwrap_or_default();
+    let subj_kind: String = r.try_get("subj_kind").unwrap_or_default();
+    let subj_project_id: Option<Uuid> = r.try_get("subj_project_id").ok();
+    json!({
+        "id": tid,
+        "direction": "inbound",
+        "predicate": predicate,
+        "source": source,
+        "confidence": confidence,
+        "evidence": evidence,
+        "subject": {
+            "doc_id": subj_doc_id,
+            "title": subj_title,
+            "slug": subj_slug,
+            "scope": subj_scope,
+            "kind": subj_kind,
+            "project_id": subj_project_id,
+        }
+    })
+}
+
+/// Valori da bindare ai placeholder dei filtri di `list_triples`, nell'ordine
+/// in cui le clausole vengono aggiunte al WHERE (posizionali $N).
+#[derive(Default)]
+struct TripleListBinds {
+    predicate: Option<String>,
+    source: Option<String>,
+    min_conf: Option<f32>,
+    subj: Option<Uuid>,
+    obj: Option<Uuid>,
+    q: Option<String>,
+    scope: Option<String>,
+    project: Option<Uuid>,
+}
+
+/// Compone dinamicamente le clausole WHERE dei filtri di `list_triples`,
+/// assegnando i placeholder `$N` a partire da `start_idx`. Ritorna le clausole
+/// (inclusa quella ACL passata come primo elemento), il prossimo indice libero
+/// e i valori da bindare. Estratta da `list_triples` (behavior-preserving:
+/// stesso ordine di clausole e placeholder).
+fn build_triple_filters(
+    q: &ListTriplesQuery,
+    acl_clause: String,
+    start_idx: usize,
+) -> (Vec<String>, usize, TripleListBinds) {
+    let mut where_parts: Vec<String> = vec![acl_clause];
+    let mut next_idx = start_idx;
+    let mut binds = TripleListBinds::default();
+
+    if let Some(p) = q.predicate.as_ref().filter(|s| !s.is_empty()) {
+        where_parts.push(format!("t.predicate = ${next_idx}"));
+        binds.predicate = Some(p.clone());
+        next_idx += 1;
+    }
+    if let Some(s) = q.source.as_ref().filter(|s| !s.is_empty()) {
+        where_parts.push(format!("t.source = ${next_idx}"));
+        binds.source = Some(s.clone());
+        next_idx += 1;
+    }
+    if let Some(c) = q.min_confidence {
+        where_parts.push(format!("t.confidence >= ${next_idx}"));
+        binds.min_conf = Some(c.clamp(0.0, 1.0));
+        next_idx += 1;
+    }
+    if let Some(sid) = q.subj_id {
+        where_parts.push(format!("t.subj_doc_id = ${next_idx}"));
+        binds.subj = Some(sid);
+        next_idx += 1;
+    }
+    if let Some(oid) = q.obj_id {
+        where_parts.push(format!("t.obj_doc_id = ${next_idx}"));
+        binds.obj = Some(oid);
+        next_idx += 1;
+    }
+    if let Some(qs) = q.q.as_ref().filter(|s| !s.is_empty()) {
+        where_parts.push(format!("t.obj_text ILIKE ${next_idx}"));
+        binds.q = Some(format!("%{qs}%"));
+        next_idx += 1;
+    }
+    // Filtri scope/project_id: erano accettati dal frontend ma IGNORATI dal
+    // backend (i campi mancavano dalla struct), causando cross-contaminazione
+    // tra progetti — le triple di Beauty-Book apparivano anche in Marco perche'
+    // l'ACL utente vedeva entrambi. JOIN su wiki_docs gia' esistente.
+    if let Some(sc) = q.scope.as_ref().filter(|s| !s.is_empty()) {
+        where_parts.push(format!("wiki_docs.scope = ${next_idx}"));
+        binds.scope = Some(sc.clone());
+        next_idx += 1;
+    }
+    if let Some(pid) = q.project_id {
+        where_parts.push(format!("wiki_docs.project_id = ${next_idx}"));
+        binds.project = Some(pid);
+        next_idx += 1;
+    }
+
+    (where_parts, next_idx, binds)
 }
 
 /// `GET /api/wiki/triples?predicate=&source=&min_confidence=&subj_id=&obj_id=&q=&limit=&offset=`
@@ -1399,137 +1588,23 @@ pub async fn list_triples(
     let (acl_clause, acl_projects) = acl.scope_clause(1);
     let acl_param_used = !acl_projects.is_empty();
 
-    let mut where_parts: Vec<String> = vec![acl_clause];
-    let mut next_idx = if acl_param_used { 2usize } else { 1usize };
-    let mut bind_predicate: Option<String> = None;
-    let mut bind_source: Option<String> = None;
-    let mut bind_min_conf: Option<f32> = None;
-    let mut bind_subj: Option<Uuid> = None;
-    let mut bind_obj: Option<Uuid> = None;
-    let mut bind_q: Option<String> = None;
-    let mut bind_scope: Option<String> = None;
-    let mut bind_project: Option<Uuid> = None;
-
-    if let Some(p) = q.predicate.as_ref().filter(|s| !s.is_empty()) {
-        where_parts.push(format!("t.predicate = ${next_idx}"));
-        bind_predicate = Some(p.clone());
-        next_idx += 1;
-    }
-    if let Some(s) = q.source.as_ref().filter(|s| !s.is_empty()) {
-        where_parts.push(format!("t.source = ${next_idx}"));
-        bind_source = Some(s.clone());
-        next_idx += 1;
-    }
-    if let Some(c) = q.min_confidence {
-        let cc = c.clamp(0.0, 1.0);
-        where_parts.push(format!("t.confidence >= ${next_idx}"));
-        bind_min_conf = Some(cc);
-        next_idx += 1;
-    }
-    if let Some(sid) = q.subj_id {
-        where_parts.push(format!("t.subj_doc_id = ${next_idx}"));
-        bind_subj = Some(sid);
-        next_idx += 1;
-    }
-    if let Some(oid) = q.obj_id {
-        where_parts.push(format!("t.obj_doc_id = ${next_idx}"));
-        bind_obj = Some(oid);
-        next_idx += 1;
-    }
-    if let Some(qs) = q.q.as_ref().filter(|s| !s.is_empty()) {
-        where_parts.push(format!("t.obj_text ILIKE ${next_idx}"));
-        bind_q = Some(format!("%{qs}%"));
-        next_idx += 1;
-    }
-    // Filtri scope/project_id: erano accettati dal frontend ma IGNORATI dal
-    // backend (i campi mancavano dalla struct), causando cross-contaminazione
-    // tra progetti — le triple di Beauty-Book apparivano anche in Marco perche'
-    // l'ACL utente vedeva entrambi. JOIN su wiki_docs gia' esistente.
-    if let Some(sc) = q.scope.as_ref().filter(|s| !s.is_empty()) {
-        where_parts.push(format!("wiki_docs.scope = ${next_idx}"));
-        bind_scope = Some(sc.clone());
-        next_idx += 1;
-    }
-    if let Some(pid) = q.project_id {
-        where_parts.push(format!("wiki_docs.project_id = ${next_idx}"));
-        bind_project = Some(pid);
-        next_idx += 1;
-    }
+    let start_idx = if acl_param_used { 2usize } else { 1usize };
+    let (where_parts, next_idx, binds) = build_triple_filters(&q, acl_clause, start_idx);
 
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let offset = q.offset.unwrap_or(0).max(0);
-    let limit_idx = next_idx;
-    let offset_idx = next_idx + 1;
 
-    let sql = format!(
-        "SELECT t.id, t.subj_doc_id, t.predicate, t.obj_doc_id, t.obj_text, t.obj_external, \
-                t.source, t.confidence, t.evidence, t.created_at \
-         FROM wiki_concept_triples t \
-         JOIN wiki_docs ON wiki_docs.id = t.subj_doc_id \
-         WHERE {} \
-         ORDER BY t.created_at DESC, t.confidence DESC \
-         LIMIT ${} OFFSET ${}",
-        where_parts.join(" AND "),
-        limit_idx,
-        offset_idx,
-    );
-
-    let mut query = sqlx::query(&sql);
-    if acl_param_used {
-        query = query.bind(acl_projects.clone());
-    }
-    if let Some(v) = bind_predicate {
-        query = query.bind(v);
-    }
-    if let Some(v) = bind_source {
-        query = query.bind(v);
-    }
-    if let Some(v) = bind_min_conf {
-        query = query.bind(v);
-    }
-    if let Some(v) = bind_subj {
-        query = query.bind(v);
-    }
-    if let Some(v) = bind_obj {
-        query = query.bind(v);
-    }
-    if let Some(v) = bind_q {
-        query = query.bind(v);
-    }
-    if let Some(v) = bind_scope {
-        query = query.bind(v);
-    }
-    if let Some(v) = bind_project {
-        query = query.bind(v);
-    }
-    query = query.bind(limit).bind(offset);
-
-    let rows = query.fetch_all(&state.db).await.map_err(err500)?;
-    let items: Vec<Value> = rows
-        .into_iter()
-        .map(|r| {
-            let id: Uuid = r.try_get("id").unwrap_or_default();
-            let subj: Uuid = r.try_get("subj_doc_id").unwrap_or_default();
-            let predicate: String = r.try_get("predicate").unwrap_or_default();
-            let obj_doc_id: Option<Uuid> = r.try_get("obj_doc_id").ok();
-            let obj_text: Option<String> = r.try_get("obj_text").ok();
-            let obj_external: Option<String> = r.try_get("obj_external").ok();
-            let source: String = r.try_get("source").unwrap_or_default();
-            let confidence: f32 = r.try_get("confidence").unwrap_or(0.0);
-            let evidence: Option<String> = r.try_get("evidence").ok();
-            json!({
-                "id": id,
-                "subj_doc_id": subj,
-                "predicate": predicate,
-                "obj_doc_id": obj_doc_id,
-                "obj_text": obj_text,
-                "obj_external": obj_external,
-                "source": source,
-                "confidence": confidence,
-                "evidence": evidence,
-            })
-        })
-        .collect();
+    let items = fetch_triples_page(
+        &state,
+        &where_parts,
+        next_idx,
+        acl_param_used,
+        &acl_projects,
+        binds,
+        limit,
+        offset,
+    )
+    .await?;
 
     // NB: ritorniamo sia `total` (atteso dal frontend per la paginazione) sia
     // `count` (alias storico). Per ora `total = items.len()` (non e' una vera
@@ -1544,6 +1619,94 @@ pub async fn list_triples(
     })))
 }
 
+/// Compone la SQL finale (con LIMIT/OFFSET agli indici `next_idx`/`next_idx+1`),
+/// binda i parametri nell'ordine ESATTO in cui le clausole sono state aggiunte (i
+/// placeholder $N sono posizionali: acl, filtri, poi limit/offset) ed esegue la
+/// query, mappando le righe. Estratta da `list_triples` (behavior-preserving).
+#[allow(clippy::too_many_arguments)]
+async fn fetch_triples_page(
+    state: &AppState,
+    where_parts: &[String],
+    next_idx: usize,
+    acl_param_used: bool,
+    acl_projects: &[Uuid],
+    binds: TripleListBinds,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Value>, (StatusCode, String)> {
+    let sql = format!(
+        "SELECT t.id, t.subj_doc_id, t.predicate, t.obj_doc_id, t.obj_text, t.obj_external, \
+                t.source, t.confidence, t.evidence, t.created_at \
+         FROM wiki_concept_triples t \
+         JOIN wiki_docs ON wiki_docs.id = t.subj_doc_id \
+         WHERE {} \
+         ORDER BY t.created_at DESC, t.confidence DESC \
+         LIMIT ${} OFFSET ${}",
+        where_parts.join(" AND "),
+        next_idx,
+        next_idx + 1,
+    );
+
+    let mut query = sqlx::query(&sql);
+    if acl_param_used {
+        query = query.bind(acl_projects.to_vec());
+    }
+    if let Some(v) = binds.predicate {
+        query = query.bind(v);
+    }
+    if let Some(v) = binds.source {
+        query = query.bind(v);
+    }
+    if let Some(v) = binds.min_conf {
+        query = query.bind(v);
+    }
+    if let Some(v) = binds.subj {
+        query = query.bind(v);
+    }
+    if let Some(v) = binds.obj {
+        query = query.bind(v);
+    }
+    if let Some(v) = binds.q {
+        query = query.bind(v);
+    }
+    if let Some(v) = binds.scope {
+        query = query.bind(v);
+    }
+    if let Some(v) = binds.project {
+        query = query.bind(v);
+    }
+    query = query.bind(limit).bind(offset);
+
+    let rows = query.fetch_all(&state.db).await.map_err(err500)?;
+    Ok(rows.into_iter().map(map_triple_list_row).collect())
+}
+
+/// Serializza una riga della lista triple paginata (`list_triples`). Estratta
+/// dalla closure inline; formato piatto atteso dal frontend.
+fn map_triple_list_row(r: sqlx::postgres::PgRow) -> Value {
+    use sqlx::Row;
+    let id: Uuid = r.try_get("id").unwrap_or_default();
+    let subj: Uuid = r.try_get("subj_doc_id").unwrap_or_default();
+    let predicate: String = r.try_get("predicate").unwrap_or_default();
+    let obj_doc_id: Option<Uuid> = r.try_get("obj_doc_id").ok();
+    let obj_text: Option<String> = r.try_get("obj_text").ok();
+    let obj_external: Option<String> = r.try_get("obj_external").ok();
+    let source: String = r.try_get("source").unwrap_or_default();
+    let confidence: f32 = r.try_get("confidence").unwrap_or(0.0);
+    let evidence: Option<String> = r.try_get("evidence").ok();
+    json!({
+        "id": id,
+        "subj_doc_id": subj,
+        "predicate": predicate,
+        "obj_doc_id": obj_doc_id,
+        "obj_text": obj_text,
+        "obj_external": obj_external,
+        "source": source,
+        "confidence": confidence,
+        "evidence": evidence,
+    })
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Router merge
 // ───────────────────────────────────────────────────────────────────────────
@@ -1556,115 +1719,35 @@ use axum::{
 };
 
 pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
-    router
-        .route(
-            "/api/wiki/docs",
-            get(list_docs)
-                .post(create_doc)
-                .layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-        )
+    // Tutte le route wiki richiedono `require_auth`: prima le registr
+    // (senza layer per-route), poi applico il middleware UNA volta con
+    // `route_layer` — equivalente osservabile ai `.layer` per-endpoint
+    // precedenti (il layer copre le route ma non il fallback), regola L.
+    let wiki = Router::<AppState>::new()
+        .route("/api/wiki/docs", get(list_docs).post(create_doc))
         .route(
             "/api/wiki/docs/:id",
-            get(get_doc)
-                .patch(patch_doc)
-                .delete(delete_doc)
-                .layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+            get(get_doc).patch(patch_doc).delete(delete_doc),
         )
-        .route(
-            "/api/wiki/docs/:id/revisions",
-            get(list_revisions).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
+        .route("/api/wiki/docs/:id/revisions", get(list_revisions))
         .route(
             "/api/wiki/docs/:id/revisions/:version",
-            get(get_revision).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(get_revision),
         )
-        .route(
-            "/api/wiki/docs/:id/diff",
-            get(diff).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/docs/:id/restore",
-            post(restore).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/reingest",
-            post(reingest_handler).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/recompute-links",
-            post(recompute_links_handler).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/recompute-titles",
-            post(recompute_titles_handler).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/docs/:id/links",
-            get(list_doc_links).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/graph",
-            get(get_graph).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/extract-triples",
-            post(extract_triples_handler).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/docs/:id/triples",
-            get(list_doc_triples).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/triples",
-            get(list_triples).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/wiki/search",
-            post(wiki_search::search).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
+        .route("/api/wiki/docs/:id/diff", get(diff))
+        .route("/api/wiki/docs/:id/restore", post(restore))
+        .route("/api/wiki/reingest", post(reingest_handler))
+        .route("/api/wiki/recompute-links", post(recompute_links_handler))
+        .route("/api/wiki/recompute-titles", post(recompute_titles_handler))
+        .route("/api/wiki/docs/:id/links", get(list_doc_links))
+        .route("/api/wiki/graph", get(get_graph))
+        .route("/api/wiki/extract-triples", post(extract_triples_handler))
+        .route("/api/wiki/docs/:id/triples", get(list_doc_triples))
+        .route("/api/wiki/triples", get(list_triples))
+        .route("/api/wiki/search", post(wiki_search::search))
+        .route_layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            middleware::require_auth,
+        ));
+    router.merge(wiki)
 }
