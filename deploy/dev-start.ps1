@@ -85,7 +85,16 @@ foreach ($id in $order) {
   }
 }
 
-$started | ConvertTo-Json | Set-Content -Path $PIDFILE -Encoding utf8
+# Serializza SEMPRE come array JSON: in PS 5.1 `$started | ConvertTo-Json` con 1 solo
+# elemento produce un OGGETTO singolo, non un array -> dev-stop iterava male e lasciava
+# orfani. Forziamo le parentesi quadre se ConvertTo-Json le ha omesse.
+$json = $started | ConvertTo-Json -Depth 3
+if ($json -and $json -notmatch '^\s*\[') { $json = "[`n$json`n]" }
+if (-not $json) { $json = '[]' }
+Set-Content -Path $PIDFILE -Value $json -Encoding utf8
 Write-Host ''
+if ($started.Count -lt $order.Count) {
+  Write-Warning "Avviati $($started.Count)/$($order.Count) processi: alcuni servizi non sono partiti (vedi warning sopra e i log in $LOGDIR)."
+}
 Write-Host "Stack avviato ($($started.Count) processi). PID: $PIDFILE" -ForegroundColor Cyan
 Write-Host "Log: $LOGDIR   |   Stop: .\deploy\dev-stop.ps1" -ForegroundColor Cyan
