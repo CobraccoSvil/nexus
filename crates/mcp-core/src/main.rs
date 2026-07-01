@@ -93,6 +93,7 @@ mod routing_matrix;
 mod routing_matrix_auto_promoter;
 mod routing_slots;
 mod learned_instructions;
+mod db_retention;
 mod run_reaper;
 pub use nexus_tool_kit::sandbox;
 mod security;
@@ -1176,6 +1177,10 @@ async fn main() -> anyhow::Result<()> {
     // non viene reimplementato come `wiki::watcher`, gli edit Obsidian
     // restano in sincrono solo via `POST /api/wiki/reingest`.
     agent_tool_result_cache::start_cleanup_worker(state.db.clone());
+    // Retention DB (regola H): pota i checkpoint dei run terminali
+    // (nexus_graph_checkpoints cresce ~10MB/run senza pruning) + TTL sulla
+    // telemetria provider (*_health_history). Finestre DB-driven (regola G).
+    db_retention::start_retention_worker(state.db.clone());
 
     // NexusAutoFixAgent RIMOSSO (audit settings 2026-06-11): il worker
     // pollava nexus_e2e_runs ogni 300s, ma NESSUN codice ha mai scritto in
