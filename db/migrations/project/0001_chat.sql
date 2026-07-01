@@ -48,7 +48,6 @@ $function$
 -- PostgreSQL database dump
 --
 
-\restrict tTVqVtPz3nWQxwwsJFj3dXqaumfAKbtyprkpd4xR7149cQmIZifNI9T5hG2ovgW
 
 -- Dumped from database version 17.10
 -- Dumped by pg_dump version 17.10
@@ -73,7 +72,7 @@ SET default_table_access_method = heap;
 -- Name: ai_response_feedback; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.ai_response_feedback (
+CREATE TABLE IF NOT EXISTS public.ai_response_feedback (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     project_id uuid NOT NULL,
     session_id uuid NOT NULL,
@@ -98,7 +97,7 @@ CREATE TABLE public.ai_response_feedback (
 -- Name: chat_message_attachments; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.chat_message_attachments (
+CREATE TABLE IF NOT EXISTS public.chat_message_attachments (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     message_id uuid NOT NULL,
     project_id uuid NOT NULL,
@@ -122,7 +121,7 @@ CREATE TABLE public.chat_message_attachments (
 -- Name: chat_messages; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.chat_messages (
+CREATE TABLE IF NOT EXISTS public.chat_messages (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     session_id uuid NOT NULL,
     role text NOT NULL,
@@ -142,7 +141,7 @@ CREATE TABLE public.chat_messages (
 -- Name: chat_sessions; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.chat_sessions (
+CREATE TABLE IF NOT EXISTS public.chat_sessions (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     project_id uuid NOT NULL,
     user_id uuid,
@@ -162,7 +161,7 @@ CREATE TABLE public.chat_sessions (
 -- Name: nexus_conversation_summaries; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_conversation_summaries (
+CREATE TABLE IF NOT EXISTS public.nexus_conversation_summaries (
     id bigint NOT NULL,
     thread_id text NOT NULL,
     replaced_msg_count integer NOT NULL,
@@ -196,7 +195,7 @@ ALTER SEQUENCE public.nexus_conversation_summaries_id_seq OWNED BY public.nexus_
 -- Name: nexus_session_worklog; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_session_worklog (
+CREATE TABLE IF NOT EXISTS public.nexus_session_worklog (
     session_id uuid NOT NULL,
     project_id uuid,
     rendered_block text DEFAULT ''::text NOT NULL,
@@ -209,7 +208,7 @@ CREATE TABLE public.nexus_session_worklog (
 -- Name: nexus_session_worklog_events; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_session_worklog_events (
+CREATE TABLE IF NOT EXISTS public.nexus_session_worklog_events (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     session_id uuid NOT NULL,
     project_id uuid,
@@ -228,7 +227,7 @@ CREATE TABLE public.nexus_session_worklog_events (
 -- Name: project_open_sessions; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.project_open_sessions (
+CREATE TABLE IF NOT EXISTS public.project_open_sessions (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     user_id uuid NOT NULL,
     project_id uuid NOT NULL,
@@ -245,7 +244,7 @@ CREATE TABLE public.project_open_sessions (
 -- Name: prompt_corrections; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.prompt_corrections (
+CREATE TABLE IF NOT EXISTS public.prompt_corrections (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     project_id uuid NOT NULL,
     feedback_id uuid,
@@ -370,217 +369,217 @@ ALTER TABLE ONLY public.prompt_corrections
 -- Name: idx_ai_response_feedback_intent_provider_created; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_ai_response_feedback_intent_provider_created ON public.ai_response_feedback USING btree (project_id, intent, provider, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_response_feedback_intent_provider_created ON public.ai_response_feedback USING btree (project_id, intent, provider, created_at DESC);
 
 
 --
 -- Name: idx_ai_response_feedback_message_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_ai_response_feedback_message_id ON public.ai_response_feedback USING btree (message_id);
+CREATE INDEX IF NOT EXISTS idx_ai_response_feedback_message_id ON public.ai_response_feedback USING btree (message_id);
 
 
 --
 -- Name: idx_ai_response_feedback_orchestrator_run_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_ai_response_feedback_orchestrator_run_id ON public.ai_response_feedback USING btree (orchestrator_run_id);
+CREATE INDEX IF NOT EXISTS idx_ai_response_feedback_orchestrator_run_id ON public.ai_response_feedback USING btree (orchestrator_run_id);
 
 
 --
 -- Name: idx_ai_response_feedback_project_status_created; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_ai_response_feedback_project_status_created ON public.ai_response_feedback USING btree (project_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_response_feedback_project_status_created ON public.ai_response_feedback USING btree (project_id, status, created_at DESC);
 
 
 --
 -- Name: idx_ai_response_feedback_reviewed_by; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_ai_response_feedback_reviewed_by ON public.ai_response_feedback USING btree (reviewed_by);
+CREATE INDEX IF NOT EXISTS idx_ai_response_feedback_reviewed_by ON public.ai_response_feedback USING btree (reviewed_by);
 
 
 --
 -- Name: idx_ai_response_feedback_session_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_ai_response_feedback_session_id ON public.ai_response_feedback USING btree (session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_response_feedback_session_id ON public.ai_response_feedback USING btree (session_id);
 
 
 --
 -- Name: idx_ai_response_feedback_user_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_ai_response_feedback_user_id ON public.ai_response_feedback USING btree (user_id);
+CREATE INDEX IF NOT EXISTS idx_ai_response_feedback_user_id ON public.ai_response_feedback USING btree (user_id);
 
 
 --
 -- Name: idx_chat_message_attachments_display_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX idx_chat_message_attachments_display_id ON public.chat_message_attachments USING btree (display_id) WHERE (display_id IS NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_message_attachments_display_id ON public.chat_message_attachments USING btree (display_id) WHERE (display_id IS NOT NULL);
 
 
 --
 -- Name: idx_chat_message_attachments_indexed_at; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_message_attachments_indexed_at ON public.chat_message_attachments USING btree (indexed_at);
+CREATE INDEX IF NOT EXISTS idx_chat_message_attachments_indexed_at ON public.chat_message_attachments USING btree (indexed_at);
 
 
 --
 -- Name: idx_chat_message_attachments_kb_note; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_message_attachments_kb_note ON public.chat_message_attachments USING btree (kb_note_id) WHERE (kb_note_id IS NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_chat_message_attachments_kb_note ON public.chat_message_attachments USING btree (kb_note_id) WHERE (kb_note_id IS NOT NULL);
 
 
 --
 -- Name: idx_chat_message_attachments_message; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_message_attachments_message ON public.chat_message_attachments USING btree (message_id);
+CREATE INDEX IF NOT EXISTS idx_chat_message_attachments_message ON public.chat_message_attachments USING btree (message_id);
 
 
 --
 -- Name: idx_chat_message_attachments_project; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_message_attachments_project ON public.chat_message_attachments USING btree (project_id);
+CREATE INDEX IF NOT EXISTS idx_chat_message_attachments_project ON public.chat_message_attachments USING btree (project_id);
 
 
 --
 -- Name: idx_chat_message_attachments_project_hash; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_message_attachments_project_hash ON public.chat_message_attachments USING btree (project_id, content_hash) WHERE (content_hash IS NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_chat_message_attachments_project_hash ON public.chat_message_attachments USING btree (project_id, content_hash) WHERE (content_hash IS NOT NULL);
 
 
 --
 -- Name: idx_chat_messages_deleted_by_user_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_messages_deleted_by_user_id ON public.chat_messages USING btree (deleted_by_user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_deleted_by_user_id ON public.chat_messages USING btree (deleted_by_user_id);
 
 
 --
 -- Name: idx_chat_messages_kb_ingest_pending; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_messages_kb_ingest_pending ON public.chat_messages USING btree (created_at) WHERE ((role = 'user'::text) AND (kb_ingested IS NULL));
+CREATE INDEX IF NOT EXISTS idx_chat_messages_kb_ingest_pending ON public.chat_messages USING btree (created_at) WHERE ((role = 'user'::text) AND (kb_ingested IS NULL));
 
 
 --
 -- Name: idx_chat_messages_request_message_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_messages_request_message_id ON public.chat_messages USING btree (request_message_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_request_message_id ON public.chat_messages USING btree (request_message_id);
 
 
 --
 -- Name: idx_chat_messages_session; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_messages_session ON public.chat_messages USING btree (session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON public.chat_messages USING btree (session_id, created_at);
 
 
 --
 -- Name: idx_chat_messages_session_project_created; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_messages_session_project_created ON public.chat_messages USING btree (session_id, project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session_project_created ON public.chat_messages USING btree (session_id, project_id, created_at);
 
 
 --
 -- Name: idx_chat_sessions_user_project_updated; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_chat_sessions_user_project_updated ON public.chat_sessions USING btree (user_id, project_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_project_updated ON public.chat_sessions USING btree (user_id, project_id, updated_at DESC);
 
 
 --
 -- Name: idx_conv_summaries_thread_created; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_conv_summaries_thread_created ON public.nexus_conversation_summaries USING btree (thread_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conv_summaries_thread_created ON public.nexus_conversation_summaries USING btree (thread_id, created_at DESC);
 
 
 --
 -- Name: idx_project_open_sessions_user_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_project_open_sessions_user_id ON public.project_open_sessions USING btree (user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_project_open_sessions_user_id ON public.project_open_sessions USING btree (user_id, updated_at DESC);
 
 
 --
 -- Name: idx_project_open_sessions_workspace_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_project_open_sessions_workspace_id ON public.project_open_sessions USING btree (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_project_open_sessions_workspace_id ON public.project_open_sessions USING btree (workspace_id);
 
 
 --
 -- Name: idx_prompt_corrections_feedback_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_prompt_corrections_feedback_id ON public.prompt_corrections USING btree (feedback_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_corrections_feedback_id ON public.prompt_corrections USING btree (feedback_id);
 
 
 --
 -- Name: idx_prompt_corrections_message_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_prompt_corrections_message_id ON public.prompt_corrections USING btree (message_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_corrections_message_id ON public.prompt_corrections USING btree (message_id);
 
 
 --
 -- Name: idx_prompt_corrections_orchestrator_run_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_prompt_corrections_orchestrator_run_id ON public.prompt_corrections USING btree (orchestrator_run_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_corrections_orchestrator_run_id ON public.prompt_corrections USING btree (orchestrator_run_id);
 
 
 --
 -- Name: idx_prompt_corrections_project_active_created; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_prompt_corrections_project_active_created ON public.prompt_corrections USING btree (project_id, active, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prompt_corrections_project_active_created ON public.prompt_corrections USING btree (project_id, active, created_at DESC);
 
 
 --
 -- Name: idx_prompt_corrections_project_hash; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_prompt_corrections_project_hash ON public.prompt_corrections USING btree (project_id, normalized_hint_hash);
+CREATE INDEX IF NOT EXISTS idx_prompt_corrections_project_hash ON public.prompt_corrections USING btree (project_id, normalized_hint_hash);
 
 
 --
 -- Name: idx_prompt_corrections_qdrant_point_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX idx_prompt_corrections_qdrant_point_id ON public.prompt_corrections USING btree (qdrant_point_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_corrections_qdrant_point_id ON public.prompt_corrections USING btree (qdrant_point_id);
 
 
 --
 -- Name: idx_prompt_corrections_session_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_prompt_corrections_session_id ON public.prompt_corrections USING btree (session_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_corrections_session_id ON public.prompt_corrections USING btree (session_id);
 
 
 --
 -- Name: idx_prompt_corrections_type; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_prompt_corrections_type ON public.prompt_corrections USING btree (project_id, type);
+CREATE INDEX IF NOT EXISTS idx_prompt_corrections_type ON public.prompt_corrections USING btree (project_id, type);
 
 
 --
 -- Name: idx_session_worklog_events_session_created; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_session_worklog_events_session_created ON public.nexus_session_worklog_events USING btree (session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_session_worklog_events_session_created ON public.nexus_session_worklog_events USING btree (session_id, created_at);
 
 
 --
@@ -758,5 +757,4 @@ ALTER TABLE ONLY public.prompt_corrections
 -- PostgreSQL database dump complete
 --
 
-\unrestrict tTVqVtPz3nWQxwwsJFj3dXqaumfAKbtyprkpd4xR7149cQmIZifNI9T5hG2ovgW
 

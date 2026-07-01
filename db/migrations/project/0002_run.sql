@@ -29,7 +29,6 @@ $function$
 -- PostgreSQL database dump
 --
 
-\restrict KSvt1d70gdDpC0NmaeEKIvgTLbhdDanD0l4NYywHkSaT6hhg22yjhZJbYa0lkzM
 
 -- Dumped from database version 17.10
 -- Dumped by pg_dump version 17.10
@@ -54,7 +53,7 @@ SET default_table_access_method = heap;
 -- Name: agent_processes; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.agent_processes (
+CREATE TABLE IF NOT EXISTS public.agent_processes (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     project_id uuid NOT NULL,
     session_id uuid,
@@ -79,7 +78,7 @@ CREATE TABLE public.agent_processes (
 -- Name: agent_runs; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.agent_runs (
+CREATE TABLE IF NOT EXISTS public.agent_runs (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     session_id uuid NOT NULL,
     project_id uuid NOT NULL,
@@ -122,7 +121,7 @@ CREATE TABLE public.agent_runs (
 -- Name: agent_steps; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.agent_steps (
+CREATE TABLE IF NOT EXISTS public.agent_steps (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     run_id uuid NOT NULL,
     step_index integer NOT NULL,
@@ -138,7 +137,7 @@ CREATE TABLE public.agent_steps (
 -- Name: jobs; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.jobs (
+CREATE TABLE IF NOT EXISTS public.jobs (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     project_id uuid NOT NULL,
     kind text NOT NULL,
@@ -155,7 +154,7 @@ CREATE TABLE public.jobs (
 -- Name: langgraph_checkpoints; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.langgraph_checkpoints (
+CREATE TABLE IF NOT EXISTS public.langgraph_checkpoints (
     thread_id text NOT NULL,
     checkpoint_id text NOT NULL,
     checkpoint_data jsonb NOT NULL,
@@ -169,7 +168,7 @@ CREATE TABLE public.langgraph_checkpoints (
 -- Name: nexus_agent_clarifications; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_agent_clarifications (
+CREATE TABLE IF NOT EXISTS public.nexus_agent_clarifications (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     run_id uuid NOT NULL,
     project_id uuid NOT NULL,
@@ -185,7 +184,7 @@ CREATE TABLE public.nexus_agent_clarifications (
 -- Name: nexus_agent_meta_steps; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_agent_meta_steps (
+CREATE TABLE IF NOT EXISTS public.nexus_agent_meta_steps (
     id bigint NOT NULL,
     run_id uuid NOT NULL,
     kind text NOT NULL,
@@ -219,7 +218,7 @@ ALTER SEQUENCE public.nexus_agent_meta_steps_id_seq OWNED BY public.nexus_agent_
 -- Name: nexus_agent_plans; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_agent_plans (
+CREATE TABLE IF NOT EXISTS public.nexus_agent_plans (
     run_id uuid NOT NULL,
     project_id uuid NOT NULL,
     thread_id text NOT NULL,
@@ -242,7 +241,7 @@ CREATE TABLE public.nexus_agent_plans (
 -- Name: nexus_agent_todos; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_agent_todos (
+CREATE TABLE IF NOT EXISTS public.nexus_agent_todos (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     run_id uuid NOT NULL,
     project_id uuid NOT NULL,
@@ -270,7 +269,7 @@ CREATE TABLE public.nexus_agent_todos (
 -- Name: nexus_agent_traces; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_agent_traces (
+CREATE TABLE IF NOT EXISTS public.nexus_agent_traces (
     id bigint NOT NULL,
     session_id uuid NOT NULL,
     run_id uuid NOT NULL,
@@ -303,7 +302,7 @@ ALTER SEQUENCE public.nexus_agent_traces_id_seq OWNED BY public.nexus_agent_trac
 -- Name: nexus_agent_verifier_runs; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_agent_verifier_runs (
+CREATE TABLE IF NOT EXISTS public.nexus_agent_verifier_runs (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     run_id uuid NOT NULL,
     todo_id uuid,
@@ -319,7 +318,7 @@ CREATE TABLE public.nexus_agent_verifier_runs (
 -- Name: nexus_graph_checkpoints; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_graph_checkpoints (
+CREATE TABLE IF NOT EXISTS public.nexus_graph_checkpoints (
     run_id uuid NOT NULL,
     superstep bigint NOT NULL,
     next_node text NOT NULL,
@@ -333,7 +332,7 @@ CREATE TABLE public.nexus_graph_checkpoints (
 -- Name: nexus_subagent_runs; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.nexus_subagent_runs (
+CREATE TABLE IF NOT EXISTS public.nexus_subagent_runs (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     parent_run_id uuid NOT NULL,
     project_id uuid NOT NULL,
@@ -363,7 +362,7 @@ CREATE TABLE public.nexus_subagent_runs (
 -- Name: orchestrator_audit_events; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.orchestrator_audit_events (
+CREATE TABLE IF NOT EXISTS public.orchestrator_audit_events (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     run_id uuid NOT NULL,
     event_type text NOT NULL,
@@ -376,7 +375,7 @@ CREATE TABLE public.orchestrator_audit_events (
 -- Name: orchestrator_runs; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.orchestrator_runs (
+CREATE TABLE IF NOT EXISTS public.orchestrator_runs (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     project_id uuid NOT NULL,
     session_id uuid,
@@ -527,294 +526,294 @@ ALTER TABLE ONLY public.orchestrator_runs
 -- Name: idx_agent_processes_created; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_processes_created ON public.agent_processes USING btree (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_processes_created ON public.agent_processes USING btree (project_id, created_at DESC);
 
 
 --
 -- Name: idx_agent_processes_project; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_processes_project ON public.agent_processes USING btree (project_id, status);
+CREATE INDEX IF NOT EXISTS idx_agent_processes_project ON public.agent_processes USING btree (project_id, status);
 
 
 --
 -- Name: idx_agent_processes_resume_pending; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_processes_resume_pending ON public.agent_processes USING btree (stopped_at) WHERE ((resume_dispatched_at IS NULL) AND (session_id IS NOT NULL));
+CREATE INDEX IF NOT EXISTS idx_agent_processes_resume_pending ON public.agent_processes USING btree (stopped_at) WHERE ((resume_dispatched_at IS NULL) AND (session_id IS NOT NULL));
 
 
 --
 -- Name: idx_agent_processes_session_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_processes_session_id ON public.agent_processes USING btree (session_id);
+CREATE INDEX IF NOT EXISTS idx_agent_processes_session_id ON public.agent_processes USING btree (session_id);
 
 
 --
 -- Name: idx_agent_runs_kb_ingest_pending; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_kb_ingest_pending ON public.agent_runs USING btree (completed_at DESC) WHERE ((kb_ingested IS NULL) AND (status = ANY (ARRAY['completed'::text, 'failed'::text, 'aborted'::text])));
+CREATE INDEX IF NOT EXISTS idx_agent_runs_kb_ingest_pending ON public.agent_runs USING btree (completed_at DESC) WHERE ((kb_ingested IS NULL) AND (status = ANY (ARRAY['completed'::text, 'failed'::text, 'aborted'::text])));
 
 
 --
 -- Name: idx_agent_runs_nexus_override; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_nexus_override ON public.agent_runs USING btree (created_at DESC) WHERE (nexus_override_applied = true);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_nexus_override ON public.agent_runs USING btree (created_at DESC) WHERE (nexus_override_applied = true);
 
 
 --
 -- Name: idx_agent_runs_parent; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_parent ON public.agent_runs USING btree (parent_run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_parent ON public.agent_runs USING btree (parent_run_id);
 
 
 --
 -- Name: idx_agent_runs_project_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_project_id ON public.agent_runs USING btree (project_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_project_id ON public.agent_runs USING btree (project_id);
 
 
 --
 -- Name: idx_agent_runs_run_message_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_run_message_id ON public.agent_runs USING btree (run_message_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_run_message_id ON public.agent_runs USING btree (run_message_id);
 
 
 --
 -- Name: idx_agent_runs_running_heartbeat; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_running_heartbeat ON public.agent_runs USING btree (updated_at) WHERE (status = 'running'::text);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_running_heartbeat ON public.agent_runs USING btree (updated_at) WHERE (status = 'running'::text);
 
 
 --
 -- Name: idx_agent_runs_session; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_session ON public.agent_runs USING btree (session_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_session ON public.agent_runs USING btree (session_id);
 
 
 --
 -- Name: idx_agent_runs_session_active; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_session_active ON public.agent_runs USING btree (session_id) WHERE (status = ANY (ARRAY['running'::text, 'awaiting_confirmation'::text]));
+CREATE INDEX IF NOT EXISTS idx_agent_runs_session_active ON public.agent_runs USING btree (session_id) WHERE (status = ANY (ARRAY['running'::text, 'awaiting_confirmation'::text]));
 
 
 --
 -- Name: idx_agent_runs_user; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_runs_user ON public.agent_runs USING btree (user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_user ON public.agent_runs USING btree (user_id);
 
 
 --
 -- Name: idx_agent_steps_run_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_agent_steps_run_id ON public.agent_steps USING btree (run_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_agent_steps_run_id ON public.agent_steps USING btree (run_id, step_index);
 
 
 --
 -- Name: idx_checkpoints_thread_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_checkpoints_thread_id ON public.langgraph_checkpoints USING btree (thread_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_thread_id ON public.langgraph_checkpoints USING btree (thread_id, created_at DESC);
 
 
 --
 -- Name: idx_clarifications_pending; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_clarifications_pending ON public.nexus_agent_clarifications USING btree (run_id) WHERE ((user_answers IS NULL) AND (applied_defaults IS NULL));
+CREATE INDEX IF NOT EXISTS idx_clarifications_pending ON public.nexus_agent_clarifications USING btree (run_id) WHERE ((user_answers IS NULL) AND (applied_defaults IS NULL));
 
 
 --
 -- Name: idx_clarifications_project; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_clarifications_project ON public.nexus_agent_clarifications USING btree (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clarifications_project ON public.nexus_agent_clarifications USING btree (project_id, created_at DESC);
 
 
 --
 -- Name: idx_clarifications_run; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_clarifications_run ON public.nexus_agent_clarifications USING btree (run_id);
+CREATE INDEX IF NOT EXISTS idx_clarifications_run ON public.nexus_agent_clarifications USING btree (run_id);
 
 
 --
 -- Name: idx_jobs_project_status_updated; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_jobs_project_status_updated ON public.jobs USING btree (project_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_project_status_updated ON public.jobs USING btree (project_id, status, updated_at DESC);
 
 
 --
 -- Name: idx_nexus_agent_meta_steps_kind; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_nexus_agent_meta_steps_kind ON public.nexus_agent_meta_steps USING btree (kind);
+CREATE INDEX IF NOT EXISTS idx_nexus_agent_meta_steps_kind ON public.nexus_agent_meta_steps USING btree (kind);
 
 
 --
 -- Name: idx_nexus_agent_meta_steps_run; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_nexus_agent_meta_steps_run ON public.nexus_agent_meta_steps USING btree (run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_nexus_agent_meta_steps_run ON public.nexus_agent_meta_steps USING btree (run_id, created_at);
 
 
 --
 -- Name: idx_nexus_agent_traces_run; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_nexus_agent_traces_run ON public.nexus_agent_traces USING btree (run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_nexus_agent_traces_run ON public.nexus_agent_traces USING btree (run_id, seq);
 
 
 --
 -- Name: idx_nexus_agent_traces_session; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_nexus_agent_traces_session ON public.nexus_agent_traces USING btree (session_id);
+CREATE INDEX IF NOT EXISTS idx_nexus_agent_traces_session ON public.nexus_agent_traces USING btree (session_id);
 
 
 --
 -- Name: idx_nexus_graph_checkpoints_run_superstep; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_nexus_graph_checkpoints_run_superstep ON public.nexus_graph_checkpoints USING btree (run_id, superstep DESC);
+CREATE INDEX IF NOT EXISTS idx_nexus_graph_checkpoints_run_superstep ON public.nexus_graph_checkpoints USING btree (run_id, superstep DESC);
 
 
 --
 -- Name: idx_nexus_subagent_runs_project_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_nexus_subagent_runs_project_id ON public.nexus_subagent_runs USING btree (project_id);
+CREATE INDEX IF NOT EXISTS idx_nexus_subagent_runs_project_id ON public.nexus_subagent_runs USING btree (project_id);
 
 
 --
 -- Name: idx_orchestrator_audit_events_run_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_orchestrator_audit_events_run_id ON public.orchestrator_audit_events USING btree (run_id);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_audit_events_run_id ON public.orchestrator_audit_events USING btree (run_id);
 
 
 --
 -- Name: idx_orchestrator_runs_project; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_orchestrator_runs_project ON public.orchestrator_runs USING btree (project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_runs_project ON public.orchestrator_runs USING btree (project_id, created_at);
 
 
 --
 -- Name: idx_orchestrator_runs_session_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_orchestrator_runs_session_id ON public.orchestrator_runs USING btree (session_id);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_runs_session_id ON public.orchestrator_runs USING btree (session_id);
 
 
 --
 -- Name: idx_orchestrator_runs_user_id; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_orchestrator_runs_user_id ON public.orchestrator_runs USING btree (user_id);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_runs_user_id ON public.orchestrator_runs USING btree (user_id);
 
 
 --
 -- Name: idx_plans_project; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_plans_project ON public.nexus_agent_plans USING btree (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_plans_project ON public.nexus_agent_plans USING btree (project_id, created_at DESC);
 
 
 --
 -- Name: idx_plans_thread; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_plans_thread ON public.nexus_agent_plans USING btree (thread_id);
+CREATE INDEX IF NOT EXISTS idx_plans_thread ON public.nexus_agent_plans USING btree (thread_id);
 
 
 --
 -- Name: idx_subagent_runs_bg; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_subagent_runs_bg ON public.nexus_subagent_runs USING btree (parent_run_id, is_background) WHERE (status = ANY (ARRAY['running'::text, 'paused'::text]));
+CREATE INDEX IF NOT EXISTS idx_subagent_runs_bg ON public.nexus_subagent_runs USING btree (parent_run_id, is_background) WHERE (status = ANY (ARRAY['running'::text, 'paused'::text]));
 
 
 --
 -- Name: idx_subagent_runs_kind_status; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_subagent_runs_kind_status ON public.nexus_subagent_runs USING btree (kind, status);
+CREATE INDEX IF NOT EXISTS idx_subagent_runs_kind_status ON public.nexus_subagent_runs USING btree (kind, status);
 
 
 --
 -- Name: idx_subagent_runs_parent; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_subagent_runs_parent ON public.nexus_subagent_runs USING btree (parent_run_id);
+CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent ON public.nexus_subagent_runs USING btree (parent_run_id);
 
 
 --
 -- Name: idx_subagent_runs_project; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_subagent_runs_project ON public.nexus_subagent_runs USING btree (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_subagent_runs_project ON public.nexus_subagent_runs USING btree (project_id, created_at DESC);
 
 
 --
 -- Name: idx_todos_carryover; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_todos_carryover ON public.nexus_agent_todos USING btree (project_id, carry_over) WHERE (carry_over = true);
+CREATE INDEX IF NOT EXISTS idx_todos_carryover ON public.nexus_agent_todos USING btree (project_id, carry_over) WHERE (carry_over = true);
 
 
 --
 -- Name: idx_todos_depends_on; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_todos_depends_on ON public.nexus_agent_todos USING gin (depends_on);
+CREATE INDEX IF NOT EXISTS idx_todos_depends_on ON public.nexus_agent_todos USING gin (depends_on);
 
 
 --
 -- Name: idx_todos_project; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_todos_project ON public.nexus_agent_todos USING btree (project_id);
+CREATE INDEX IF NOT EXISTS idx_todos_project ON public.nexus_agent_todos USING btree (project_id);
 
 
 --
 -- Name: idx_todos_run_seq; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX idx_todos_run_seq ON public.nexus_agent_todos USING btree (run_id, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_todos_run_seq ON public.nexus_agent_todos USING btree (run_id, seq);
 
 
 --
 -- Name: idx_todos_status; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_todos_status ON public.nexus_agent_todos USING btree (run_id, status);
+CREATE INDEX IF NOT EXISTS idx_todos_status ON public.nexus_agent_todos USING btree (run_id, status);
 
 
 --
 -- Name: idx_verifier_runs_run; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_verifier_runs_run ON public.nexus_agent_verifier_runs USING btree (run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_verifier_runs_run ON public.nexus_agent_verifier_runs USING btree (run_id, created_at DESC);
 
 
 --
 -- Name: idx_verifier_runs_todo; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_verifier_runs_todo ON public.nexus_agent_verifier_runs USING btree (todo_id);
+CREATE INDEX IF NOT EXISTS idx_verifier_runs_todo ON public.nexus_agent_verifier_runs USING btree (todo_id);
 
 
 --
@@ -970,5 +969,4 @@ ALTER TABLE ONLY public.orchestrator_runs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict KSvt1d70gdDpC0NmaeEKIvgTLbhdDanD0l4NYywHkSaT6hhg22yjhZJbYa0lkzM
 
