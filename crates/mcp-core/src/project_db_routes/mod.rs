@@ -50,12 +50,15 @@ pub use migrations::{
     rollback_project_migration,
 };
 pub use provision::{
-    init_global_pools, project_data_pool, project_data_pool_by_session, project_data_pool_from,
-    provision_internal_core, provision_project_db, DbRole,
+    init_global_pools, project_data_pool, project_data_pool_by_correction_from,
+    project_data_pool_by_feedback_from, project_data_pool_by_message_from,
+    project_data_pool_by_run_from, project_data_pool_by_session, project_data_pool_by_session_from,
+    project_data_pool_from, provision_internal_core, provision_project_db, register_entity_routing,
+    DbRole,
 };
 // Esportati come fondazione; non ancora richiamati da call-site interni.
 #[allow(unused_imports)]
-pub use provision::{project_data_pool_by_session_from, project_meta_pool};
+pub use provision::project_meta_pool;
 pub use query::{
     discover_schema_candidates, execute_project_db_query, import_project_db_schema,
     read_schema_file,

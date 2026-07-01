@@ -919,6 +919,11 @@ pub async fn admin_review_feedback(
         ));
     }
 
+    // separazione DB: endpoint keyed solo dal feedback_id. ai_response_feedback e
+    // prompt_corrections (stesso progetto) vivono nel DB del progetto -> pool via
+    // directory di routing (fallback ricerca), riusato per entrambe.
+    let corrections_pool =
+        crate::project_db_routes::project_data_pool_by_feedback_from(&state.db, feedback_id).await;
     let row = sqlx::query(
         r#"
         UPDATE ai_response_feedback
@@ -935,7 +940,7 @@ pub async fn admin_review_feedback(
     .bind(&status)
     .bind(body.review_note.as_deref().unwrap_or(""))
     .bind(reviewer_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&corrections_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -948,10 +953,6 @@ pub async fn admin_review_feedback(
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if status == "resolved" || status == "rejected" {
-        // separazione DB: prompt_corrections vive nel pool del progetto (flag ON);
-        // project_id risolto dal RETURNING della UPDATE precedente, pool riusato
-        let corrections_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
         let _ = sqlx::query(
             r#"
             UPDATE prompt_corrections
@@ -1424,11 +1425,14 @@ pub async fn admin_delete_prompt_correction(
     Extension(_claims): Extension<Claims>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // separazione DB: endpoint keyed solo dalla correzione -> pool del progetto via
+    // directory di routing (fallback ricerca). A flag OFF -> meta-DB.
+    let cpool = crate::project_db_routes::project_data_pool_by_correction_from(&state.db, id).await;
     let affected = sqlx::query(
         "UPDATE prompt_corrections SET deleted_at = NOW(), active = false, updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
-    .execute(&state.db)
+    .execute(&cpool)
     .await
     .map_err(|e| {
         (

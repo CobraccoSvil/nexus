@@ -606,38 +606,65 @@ pub async fn project_data_pool(state: &AppState, project_id: Uuid) -> sqlx::PgPo
     project_data_pool_core(&state.db, &state.project_meta_pools, project_id).await
 }
 
-/// Risolve il `project_id` di una sessione chat dalla directory di routing
-/// (`nexus_data_routing` nel meta-DB, mig 0496). Serve agli handler che hanno
-/// solo `session_id` (rename/delete sessione, ecc.). `None` se non mappata.
-async fn resolve_project_for_session(meta_db: &sqlx::PgPool, session_id: Uuid) -> Option<Uuid> {
+/// Risolve il `project_id` di un'entita' (session/message/run) dalla directory di
+/// routing (`nexus_data_routing` nel meta-DB, mig 0496). Punto unico (regola L)
+/// per gli handler keyed solo dall'id dell'entita'. `None` se non mappata.
+async fn resolve_project_for_entity(
+    meta_db: &sqlx::PgPool,
+    entity_kind: &str,
+    entity_id: Uuid,
+) -> Option<Uuid> {
     sqlx::query_scalar::<_, Uuid>(
-        "SELECT project_id FROM nexus_data_routing WHERE entity_kind = 'session' AND entity_id = $1",
+        "SELECT project_id FROM nexus_data_routing WHERE entity_kind = $1 AND entity_id = $2",
     )
-    .bind(session_id)
+    .bind(entity_kind)
+    .bind(entity_id)
     .fetch_optional(meta_db)
     .await
     .ok()
     .flatten()
 }
 
-/// Come [`project_data_pool`] ma a partire da un `session_id` (handler senza
-/// `project_id` a portata di mano): risolve il progetto dalla directory di
-/// routing e delega. Flag off o sessione non mappata -> meta-DB (comportamento
-/// storico, sicuro). Punto unico per il routing per-sessione (regola L).
-async fn project_data_pool_by_session_core(
+/// Registra la mappa `entita' -> progetto` nella directory di routing (meta),
+/// idempotente. Chiamata ai punti di CREAZIONE dell'entita' (insert_message,
+/// spawn_agent_run, ...) cosi' gli endpoint keyed solo dall'id (feedback,
+/// delete, confirm/cancel run) possono risolvere il pool del progetto. Best-effort.
+pub async fn register_entity_routing(
+    meta: &sqlx::PgPool,
+    entity_kind: &str,
+    entity_id: Uuid,
+    project_id: Uuid,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(entity_kind)
+    .bind(entity_id)
+    .bind(project_id)
+    .execute(meta)
+    .await;
+}
+
+/// Come [`project_data_pool`] ma a partire dall'id di un'entita' (handler senza
+/// `project_id`): risolve il progetto dalla directory di routing e delega. Flag
+/// off o entita' non mappata -> meta-DB (storico, sicuro). Punto unico (regola L).
+async fn project_data_pool_by_entity_core(
     meta: &sqlx::PgPool,
     cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
-    session_id: Uuid,
+    entity_kind: &str,
+    entity_id: Uuid,
 ) -> sqlx::PgPool {
     if !project_separation_enabled(meta).await {
         return meta.clone();
     }
-    match resolve_project_for_session(meta, session_id).await {
+    match resolve_project_for_entity(meta, entity_kind, entity_id).await {
         Some(project_id) => project_data_pool_core(meta, cache, project_id).await,
         None => {
             tracing::warn!(
-                session_id = %session_id,
-                "routing directory: sessione non mappata, fallback al meta-DB"
+                entity_kind,
+                entity_id = %entity_id,
+                "routing directory: entita' non mappata, fallback al meta-DB"
             );
             meta.clone()
         }
@@ -645,7 +672,8 @@ async fn project_data_pool_by_session_core(
 }
 
 pub async fn project_data_pool_by_session(state: &AppState, session_id: Uuid) -> sqlx::PgPool {
-    project_data_pool_by_session_core(&state.db, &state.project_meta_pools, session_id).await
+    project_data_pool_by_entity_core(&state.db, &state.project_meta_pools, "session", session_id)
+        .await
 }
 
 // ── Registry globale del pool per-progetto (route-at-helper) ──────────────────
@@ -675,14 +703,116 @@ pub async fn project_data_pool_from(meta: &sqlx::PgPool, project_id: Uuid) -> sq
     }
 }
 
-/// Come [`project_data_pool_from`] ma a partire da `session_id` (risolto via la
-/// directory di routing). Per gli helper che hanno solo il session_id.
+/// Come [`project_data_pool_from`] ma a partire dall'id di un'entita' (risolto via
+/// la directory di routing). Base dei wrapper per session/message/run.
+async fn project_data_pool_by_entity_from(
+    meta: &sqlx::PgPool,
+    entity_kind: &str,
+    entity_id: Uuid,
+) -> sqlx::PgPool {
+    match GLOBAL_PROJECT_POOL_CACHE.get() {
+        Some(cache) => project_data_pool_by_entity_core(meta, cache, entity_kind, entity_id).await,
+        None => meta.clone(),
+    }
+}
+
+/// Pool del progetto risolto dal `session_id` (directory di routing).
 pub async fn project_data_pool_by_session_from(
     meta: &sqlx::PgPool,
     session_id: Uuid,
 ) -> sqlx::PgPool {
-    match GLOBAL_PROJECT_POOL_CACHE.get() {
-        Some(cache) => project_data_pool_by_session_core(meta, cache, session_id).await,
-        None => meta.clone(),
+    project_data_pool_by_entity_from(meta, "session", session_id).await
+}
+
+/// Elenco dei `project_id` (tabella globale `projects`, meta-DB). Serve al
+/// fallback di ricerca per gli endpoint keyed solo dall'id di un'entita' non
+/// ancora in directory (es. messaggi assistant inseriti inline con
+/// `gen_random_uuid()`, mai passati da `register_entity_routing`).
+async fn list_all_project_ids(meta: &sqlx::PgPool) -> Vec<Uuid> {
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
+        .fetch_all(meta)
+        .await
+        .unwrap_or_default()
+}
+
+/// Risolve il pool del progetto per un'entita' keyed solo dall'id: prima la
+/// directory di routing (O(1)); se assente e flag ON, CERCA l'entita' iterando i
+/// DB-progetto (`SELECT 1 FROM <table> WHERE id=$1`) e, trovatala, AUTO-REGISTRA
+/// la mappa in directory cosi' le chiamate successive sono O(1) (self-healing).
+/// Fallback sicuro al meta-DB se non trovata. Copre gli endpoint by-id anche per
+/// le entita' non registrate alla creazione (regola L, punto unico del by-id).
+async fn project_data_pool_by_search_from(
+    meta: &sqlx::PgPool,
+    entity_kind: &str,
+    table: &str,
+    entity_id: Uuid,
+) -> sqlx::PgPool {
+    let Some(cache) = GLOBAL_PROJECT_POOL_CACHE.get() else {
+        return meta.clone();
+    };
+    if !project_separation_enabled(meta).await {
+        return meta.clone();
     }
+    // Fast-path: directory.
+    if let Some(pid) = resolve_project_for_entity(meta, entity_kind, entity_id).await {
+        return project_data_pool_core(meta, cache, pid).await;
+    }
+    // Fallback: cerca l'entita' nei DB-progetto. `table` e' un identificatore
+    // costante interno (mai input utente): nessuna SQL-injection.
+    let sql = format!("SELECT 1 FROM {table} WHERE id = $1 LIMIT 1");
+    for pid in list_all_project_ids(meta).await {
+        let pool = project_data_pool_core(meta, cache, pid).await;
+        let found = sqlx::query_scalar::<_, i32>(&sql)
+            .bind(entity_id)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if found {
+            register_entity_routing(meta, entity_kind, entity_id, pid).await;
+            return pool;
+        }
+    }
+    tracing::warn!(
+        entity_kind,
+        entity_id = %entity_id,
+        "routing by-id: entita' non trovata in nessun DB-progetto, fallback al meta-DB"
+    );
+    meta.clone()
+}
+
+/// Pool del progetto risolto dal `message_id` (directory + fallback ricerca). Per
+/// gli endpoint keyed solo dal messaggio (feedback_error/positive, delete_message).
+pub async fn project_data_pool_by_message_from(
+    meta: &sqlx::PgPool,
+    message_id: Uuid,
+) -> sqlx::PgPool {
+    project_data_pool_by_search_from(meta, "message", "chat_messages", message_id).await
+}
+
+/// Pool del progetto risolto dal `run_id` (directory + fallback ricerca). Per gli
+/// endpoint keyed solo dal run (confirm/cancel run).
+pub async fn project_data_pool_by_run_from(meta: &sqlx::PgPool, run_id: Uuid) -> sqlx::PgPool {
+    project_data_pool_by_search_from(meta, "run", "agent_runs", run_id).await
+}
+
+/// Pool del progetto risolto dall'id di una `prompt_corrections` (directory +
+/// fallback ricerca). Per gli endpoint admin/memory keyed solo dalla correzione
+/// (toggle_project_memory, admin_delete_prompt_correction).
+pub async fn project_data_pool_by_correction_from(
+    meta: &sqlx::PgPool,
+    correction_id: Uuid,
+) -> sqlx::PgPool {
+    project_data_pool_by_search_from(meta, "correction", "prompt_corrections", correction_id).await
+}
+
+/// Pool del progetto risolto dall'id di un `ai_response_feedback` (directory +
+/// fallback ricerca). Per gli endpoint admin keyed solo dal feedback
+/// (admin_review_feedback).
+pub async fn project_data_pool_by_feedback_from(
+    meta: &sqlx::PgPool,
+    feedback_id: Uuid,
+) -> sqlx::PgPool {
+    project_data_pool_by_search_from(meta, "feedback", "ai_response_feedback", feedback_id).await
 }

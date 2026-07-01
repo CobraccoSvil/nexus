@@ -60,9 +60,13 @@ async fn fetch_owned_run_row(
     run_id: Uuid,
     user_id: Uuid,
 ) -> Result<sqlx::postgres::PgRow, ApiError> {
+    // Separazione DB: endpoint keyed solo dal run_id. agent_runs (+ eventuale JOIN
+    // chat_sessions) vive nel DB del progetto -> pool via directory di routing
+    // (fallback ricerca). A flag OFF -> meta-DB.
+    let run_pool = crate::project_db_routes::project_data_pool_by_run_from(db, run_id).await;
     let run_row = sqlx::query(sql)
         .bind(run_id)
-        .fetch_optional(db)
+        .fetch_optional(&run_pool)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

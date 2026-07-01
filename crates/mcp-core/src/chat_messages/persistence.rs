@@ -268,6 +268,10 @@ pub(crate) async fn insert_message(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Directory di routing (meta): registra message_id -> project_id cosi' gli
+    // endpoint keyed solo dal messaggio (feedback, delete) risolvono il pool.
+    crate::project_db_routes::register_entity_routing(db, "message", message_id, project_id).await;
+
     Ok(message_id)
 }
 pub(crate) async fn load_message_by_id(

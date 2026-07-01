@@ -1432,6 +1432,11 @@ pub async fn delete_chat_message(
     let message_id = Uuid::parse_str(&message_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
 
+    // Separazione DB: endpoint keyed solo dal message_id. chat_messages/chat_sessions
+    // vivono nel DB del progetto -> pool via directory di routing (fallback ricerca).
+    let mpool = crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id)
+        .await;
+
     let row = sqlx::query(
         r#"
         UPDATE chat_messages m
@@ -1447,7 +1452,7 @@ pub async fn delete_chat_message(
     )
     .bind(message_id)
     .bind(user_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mpool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1485,6 +1490,13 @@ pub async fn feedback_error(
         ));
     }
 
+    // Separazione DB: endpoint keyed solo dal message_id. Risolvo il pool del
+    // progetto dalla directory di routing (fallback ricerca + auto-registrazione);
+    // chat_messages/chat_sessions/ai_response_feedback/prompt_corrections vivono
+    // li'. A flag OFF -> meta-DB. ensure_project_access resta sul meta (globale).
+    let mpool = crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id)
+        .await;
+
     let row = sqlx::query(
         r#"
         SELECT
@@ -1501,7 +1513,7 @@ pub async fn feedback_error(
         "#,
     )
     .bind(message_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mpool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1562,7 +1574,7 @@ pub async fn feedback_error(
             let exists: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
                     .bind(id)
-                    .fetch_one(&state.db)
+                    .fetch_one(&mpool)
                     .await
                     .unwrap_or(false);
             if exists {
@@ -1589,7 +1601,7 @@ pub async fn feedback_error(
     )
     .bind(session_id)
     .bind(message_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mpool)
     .await
     .unwrap_or(None);
 
@@ -1621,13 +1633,9 @@ pub async fn feedback_error(
     // Preview della risposta AI sbagliata (per audit/debug, max 500 chars)
     let ai_response_preview: String = ai_response_content.chars().take(500).collect();
 
-    // NB separazione DB (gap noto): questo endpoint e' keyed solo da message_id.
-    // ai_response_feedback/prompt_corrections/chat_messages sono migrate, ma senza
-    // session_id/project_id a monte NON e' risolvibile il pool del progetto prima
-    // di leggere il messaggio (che a sua volta vive nel DB del progetto). Fix
-    // deliberato rimandato (passare session_id dal frontend, NON una directory
-    // per-messaggio): finche' e' cosi', l'intera funzione resta sul meta-DB
-    // (coerente a flag OFF). Vedi docs/db-separation-cutover-status.md.
+    // ai_response_feedback e prompt_corrections vivono nel DB del progetto (mpool);
+    // registro feedback_id/correction_id in directory dopo l'insert cosi' gli
+    // endpoint admin by-id (review/delete) risolvono il pool.
     let feedback_id = Uuid::new_v4();
     sqlx::query(
         r#"
@@ -1648,9 +1656,11 @@ pub async fn feedback_error(
     .bind(&provider)
     .bind(&model)
     .bind(comment)
-    .execute(&state.db)
+    .execute(&mpool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::project_db_routes::register_entity_routing(&state.db, "feedback", feedback_id, project_id)
+        .await;
 
     let correction_id = Uuid::new_v4();
     let point_id = correction_id.to_string();
@@ -1689,9 +1699,16 @@ pub async fn feedback_error(
         "aiResponsePreview": ai_response_preview,
         "userQuestionPreview": preceding_user_message.as_deref().unwrap_or("").chars().take(300).collect::<String>(),
     }))
-    .execute(&state.db)
+    .execute(&mpool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::project_db_routes::register_entity_routing(
+        &state.db,
+        "correction",
+        correction_id,
+        project_id,
+    )
+    .await;
 
     // Guard: se embedder/qdrant sono down, skip vettorializzazione (la correzione e' gia' in DB)
     let qdrant_ok = state
@@ -1777,6 +1794,11 @@ pub async fn feedback_positive(
         .filter(|s| !s.is_empty())
         .unwrap_or("");
 
+    // Separazione DB: endpoint keyed solo dal message_id -> pool del progetto via
+    // directory di routing (fallback ricerca). A flag OFF -> meta-DB.
+    let mpool = crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id)
+        .await;
+
     let row = sqlx::query(
         r#"
         SELECT
@@ -1792,7 +1814,7 @@ pub async fn feedback_positive(
         "#,
     )
     .bind(message_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mpool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1852,7 +1874,7 @@ pub async fn feedback_positive(
             let exists: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
                     .bind(id)
-                    .fetch_one(&state.db)
+                    .fetch_one(&mpool)
                     .await
                     .unwrap_or(false);
             if exists {
@@ -1880,7 +1902,7 @@ pub async fn feedback_positive(
     )
     .bind(message_id)
     .bind(user_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mpool)
     .await
     .unwrap_or(None);
 
@@ -1919,9 +1941,11 @@ pub async fn feedback_positive(
     .bind(&provider)
     .bind(&model)
     .bind(&comment_to_store)
-    .execute(&state.db)
+    .execute(&mpool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::project_db_routes::register_entity_routing(&state.db, "feedback", feedback_id, project_id)
+        .await;
 
     // Rinforza Q-learning: reward=1.0 (successo confermato dall'utente).
     let mut new_q_value: Option<f32> = None;

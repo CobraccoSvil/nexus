@@ -891,6 +891,12 @@ pub async fn toggle_project_memory(
     let memory_id = Uuid::parse_str(&memory_id_str)
         .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "memory id non valido"))?;
 
+    // Separazione DB: endpoint keyed solo dalla correzione. prompt_corrections vive
+    // nel DB del progetto -> pool via directory di routing (fallback ricerca). La
+    // sync Qdrant piu' sotto resta su &state.db (config collection globale).
+    let cpool =
+        crate::project_db_routes::project_data_pool_by_correction_from(&state.db, memory_id).await;
+
     // Flip the active flag
     let new_active: bool = sqlx::query_scalar(
         "UPDATE prompt_corrections SET active = NOT active, updated_at = NOW()
@@ -898,7 +904,7 @@ pub async fn toggle_project_memory(
          RETURNING active",
     )
     .bind(memory_id)
-    .fetch_one(&state.db)
+    .fetch_one(&cpool)
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -906,7 +912,7 @@ pub async fn toggle_project_memory(
     let qdrant_point_id: String =
         sqlx::query_scalar("SELECT qdrant_point_id FROM prompt_corrections WHERE id = $1")
             .bind(memory_id)
-            .fetch_one(&state.db)
+            .fetch_one(&cpool)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("toggle prompt correction: SELECT qdrant_point_id fallita: {e}");
