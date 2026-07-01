@@ -111,37 +111,90 @@ static SETUP_STEPS: &[SetupStep] = &[
 /// Restituisce la lista degli step eseguiti con il relativo esito.
 /// Il `done_marker` per `*.csproj` viene gestito tramite glob; per tutti gli
 /// altri framework il match è diretto sul nome del file.
+/// Helper di `run_env_setup`: true se l'indicatore dello step esiste in `cwd`. Per
+/// gli indicatori con glob (`*.csproj`) cerca un file con quell'estensione.
+async fn indicatore_presente(cwd: &str, indicator: &str) -> bool {
+    if indicator.contains('*') {
+        // Glob semplice: cerca file con quell'estensione nella directory
+        let ext = indicator.trim_start_matches('*');
+        tokio::fs::read_dir(cwd)
+            .await
+            .ok()
+            .map(|rd| {
+                // La lettura in async richiede un loop; usiamo std come fallback
+                // perché il read_dir async non ha un metodo .any() diretto.
+                drop(rd);
+                std::fs::read_dir(cwd)
+                    .ok()
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .any(|e| e.file_name().to_string_lossy().ends_with(ext))
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    } else {
+        tokio::fs::metadata(format!("{}/{}", cwd, indicator))
+            .await
+            .is_ok()
+    }
+}
+
+/// Helper di `run_env_setup`: esegue un singolo `step` di setup in `cwd` e ritorna
+/// la voce di log JSON con l'esito (stdout/stderr troncati alle ultime 15 righe).
+async fn esegui_setup_step(cwd: &str, unit_name: &str, step: &SetupStep) -> serde_json::Value {
+    tracing::info!(unit = %unit_name, cwd = %cwd, step = %step.label, "eseguo setup ambiente");
+    let result = tokio::process::Command::new(step.cmd)
+        .args(step.args)
+        .current_dir(cwd)
+        .output()
+        .await;
+
+    match result {
+        Ok(out) => {
+            let ok = out.status.success();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // Ultime 15 righe per non saturare la risposta JSON
+            let tail = |s: &str| {
+                s.lines()
+                    .rev()
+                    .take(15)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            if ok {
+                tracing::info!(unit = %unit_name, cwd = %cwd, step = %step.label, "setup completato");
+            } else {
+                tracing::warn!(
+                    unit = %unit_name, cwd = %cwd, step = %step.label,
+                    stderr = %stderr, "setup fallito (exit {:?})", out.status.code()
+                );
+            }
+            json!({
+                "step":   step.label,
+                "ok":     ok,
+                "stdout": tail(&stdout),
+                "stderr": if ok { "".to_string() } else { tail(&stderr) },
+            })
+        }
+        Err(e) => {
+            tracing::warn!(unit = %unit_name, cwd = %cwd, step = %step.label,
+                           "impossibile eseguire setup: {}", e);
+            json!({ "step": step.label, "ok": false, "error": e.to_string() })
+        }
+    }
+}
+
 async fn run_env_setup(cwd: &str, unit_name: &str) -> Vec<serde_json::Value> {
     let mut log: Vec<serde_json::Value> = Vec::new();
 
     for step in SETUP_STEPS {
         // Controlla se l'indicatore esiste nella directory
-        let indicator_exists = if step.indicator.contains('*') {
-            // Glob semplice: cerca file con quell'estensione nella directory
-            let ext = step.indicator.trim_start_matches('*');
-            tokio::fs::read_dir(cwd)
-                .await
-                .ok()
-                .map(|rd| {
-                    // La lettura in async richiede un loop; usiamo std come fallback
-                    // perché il read_dir async non ha un metodo .any() diretto.
-                    drop(rd);
-                    std::fs::read_dir(cwd)
-                        .ok()
-                        .map(|rd| {
-                            rd.filter_map(|e| e.ok())
-                                .any(|e| e.file_name().to_string_lossy().ends_with(ext))
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false)
-        } else {
-            tokio::fs::metadata(format!("{}/{}", cwd, step.indicator))
-                .await
-                .is_ok()
-        };
-
-        if !indicator_exists {
+        if !indicatore_presente(cwd, step.indicator).await {
             continue;
         }
 
@@ -154,51 +207,7 @@ async fn run_env_setup(cwd: &str, unit_name: &str) -> Vec<serde_json::Value> {
             continue;
         }
 
-        // Esegui lo step
-        tracing::info!(unit = %unit_name, cwd = %cwd, step = %step.label, "eseguo setup ambiente");
-        let result = tokio::process::Command::new(step.cmd)
-            .args(step.args)
-            .current_dir(cwd)
-            .output()
-            .await;
-
-        match result {
-            Ok(out) => {
-                let ok = out.status.success();
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                // Ultime 15 righe per non saturare la risposta JSON
-                let tail = |s: &str| {
-                    s.lines()
-                        .rev()
-                        .take(15)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                if ok {
-                    tracing::info!(unit = %unit_name, cwd = %cwd, step = %step.label, "setup completato");
-                } else {
-                    tracing::warn!(
-                        unit = %unit_name, cwd = %cwd, step = %step.label,
-                        stderr = %stderr, "setup fallito (exit {:?})", out.status.code()
-                    );
-                }
-                log.push(json!({
-                    "step":   step.label,
-                    "ok":     ok,
-                    "stdout": tail(&stdout),
-                    "stderr": if ok { "".to_string() } else { tail(&stderr) },
-                }));
-            }
-            Err(e) => {
-                tracing::warn!(unit = %unit_name, cwd = %cwd, step = %step.label,
-                               "impossibile eseguire setup: {}", e);
-                log.push(json!({ "step": step.label, "ok": false, "error": e.to_string() }));
-            }
-        }
+        log.push(esegui_setup_step(cwd, unit_name, step).await);
 
         // Un solo step per directory: il primo match vince.
         // (es. se c'è pnpm-lock.yaml non eseguiamo anche npm install)
@@ -875,30 +884,15 @@ async fn write_compose_env_file(cwd: &str, env_map: &std::collections::HashMap<S
 /// registro e si scrive il file. Risolve il mismatch host/container (es. vite su
 /// 20001 dentro il container vs porta host gestita) SENZA toccare i file del
 /// progetto.
-async fn generate_docker_port_override(
+/// Helper di `generate_docker_port_override`: converte i `plans` in
+/// `OverrideEntry` allocando una porta host deterministica dal registro per
+/// ciascun mapping (aggregando per service). Logica invariata.
+async fn costruisci_override_entries(
     state: &AppState,
     project_id: &Uuid,
-    cwd: &str,
-) -> Option<(String, String)> {
+    plans: Vec<super::compose_ports::PlannedMapping>,
+) -> Vec<super::compose_ports::OverrideEntry> {
     use super::compose_ports;
-    let dir = cwd.trim_end_matches('/');
-    let base_name = [
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "docker-compose.dev.yml",
-        "docker-compose.dev.yaml",
-        "compose.yml",
-        "compose.yaml",
-    ]
-    .iter()
-    .copied()
-    .find(|n| std::path::Path::new(&format!("{dir}/{n}")).exists())?;
-    let base = format!("{dir}/{base_name}");
-    let content = tokio::fs::read_to_string(&base).await.ok()?;
-    let plans = compose_ports::planned_mappings(&compose_ports::parse_service_ports(&content));
-    if plans.is_empty() {
-        return None;
-    }
     let mut entries: Vec<compose_ports::OverrideEntry> = Vec::new();
     for pm in plans {
         let key = format!("docker-{}-{}", pm.service, pm.container);
@@ -928,6 +922,34 @@ async fn generate_docker_port_override(
             });
         }
     }
+    entries
+}
+
+async fn generate_docker_port_override(
+    state: &AppState,
+    project_id: &Uuid,
+    cwd: &str,
+) -> Option<(String, String)> {
+    use super::compose_ports;
+    let dir = cwd.trim_end_matches('/');
+    let base_name = [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.dev.yml",
+        "docker-compose.dev.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ]
+    .iter()
+    .copied()
+    .find(|n| std::path::Path::new(&format!("{dir}/{n}")).exists())?;
+    let base = format!("{dir}/{base_name}");
+    let content = tokio::fs::read_to_string(&base).await.ok()?;
+    let plans = compose_ports::planned_mappings(&compose_ports::parse_service_ports(&content));
+    if plans.is_empty() {
+        return None;
+    }
+    let entries = costruisci_override_entries(state, project_id, plans).await;
     let yaml = compose_ports::render_override_yaml(&entries);
     let path = format!("{dir}/{}", compose_ports::OVERRIDE_FILE);
     match tokio::fs::write(&path, yaml).await {
@@ -2326,35 +2348,10 @@ pub(super) async fn find_csproj_in(dir: &str) -> Option<String> {
 
 /// Usa Nexus Gateway per raffinare `role` ed `essential` sui suggerimenti rilevati.
 /// Se il gateway non è disponibile o la chiamata fallisce, le suggestions restano invariate.
-pub(super) async fn refine_with_nexus(
-    state: &AppState,
-    project_id: Uuid,
-    user_id: Uuid,
-    root: &std::path::Path,
-    suggestions: &mut [Value],
-) {
-    let gw = match &state.orchestrator.nexus_gateway {
-        Some(g) => g,
-        None => return,
-    };
-
-    // Costruisce il contesto: prime directory di primo livello + lista comandi
-    let top_dirs: Vec<String> = std::fs::read_dir(root)
-        .ok()
-        .map(|it| {
-            let mut v: Vec<String> = it
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|n| !n.starts_with('.') && n != "node_modules" && n != "target")
-                .take(20)
-                .collect();
-            v.sort();
-            v
-        })
-        .unwrap_or_default();
-
-    let cmds: Vec<String> = suggestions
+/// Helper di `costruisci_prompt_classificazione`: formatta l'elenco numerato dei
+/// comandi da classificare (una riga per suggerimento).
+fn formatta_comandi_per_prompt(suggestions: &[Value]) -> Vec<String> {
+    suggestions
         .iter()
         .enumerate()
         .map(|(i, s)| {
@@ -2374,9 +2371,31 @@ pub(super) async fn refine_with_nexus(
             let group = s.get("group").and_then(|v| v.as_str()).unwrap_or("");
             format!("{i}: [{kind}][{group}] {label}  →  {cmd} {args}")
         })
-        .collect();
+        .collect()
+}
 
-    let prompt = format!(
+/// Helper di `refine_with_nexus`: costruisce il prompt di classificazione dei
+/// comandi (contesto directory di primo livello + elenco comandi numerato).
+fn costruisci_prompt_classificazione(root: &std::path::Path, suggestions: &[Value]) -> String {
+    // Costruisce il contesto: prime directory di primo livello + lista comandi
+    let top_dirs: Vec<String> = std::fs::read_dir(root)
+        .ok()
+        .map(|it| {
+            let mut v: Vec<String> = it
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| !n.starts_with('.') && n != "node_modules" && n != "target")
+                .take(20)
+                .collect();
+            v.sort();
+            v
+        })
+        .unwrap_or_default();
+
+    let cmds: Vec<String> = formatta_comandi_per_prompt(suggestions);
+
+    format!(
         "Sei un assistente per la classificazione di comandi di avvio applicazione.\n\
          Root progetto: {root}\n\
          Directory di primo livello: {top}\n\n\
@@ -2392,9 +2411,29 @@ pub(super) async fn refine_with_nexus(
         top = top_dirs.join(", "),
         n = suggestions.len(),
         cmds = cmds.join("\n"),
-    );
+    )
+}
 
-    let req = GwRequest {
+/// Helper di `refine_with_nexus`: applica la classificazione `parsed` (role,
+/// essential) sui `suggestions`, per indice, ignorando gli elementi in eccesso.
+fn applica_classificazione(suggestions: &mut [Value], parsed: &[serde_json::Value]) {
+    for (i, item) in parsed.iter().enumerate() {
+        if i >= suggestions.len() {
+            break;
+        }
+        if let Some(role) = item.get("role").and_then(|v| v.as_str()) {
+            suggestions[i]["role"] = json!(role);
+        }
+        if let Some(essential) = item.get("essential").and_then(|v| v.as_bool()) {
+            suggestions[i]["essential"] = json!(essential);
+        }
+    }
+}
+
+/// Helper di `refine_with_nexus`: costruisce la richiesta al gateway per la
+/// classificazione (modello `coder-small`, temperatura 0). Metadati as-is.
+fn costruisci_gw_request(prompt: String, project_id: Uuid, user_id: Uuid) -> GwRequest {
+    GwRequest {
         model: "coder-small".to_string(),
         messages: vec![GwMessage {
             role: "user".to_string(),
@@ -2413,7 +2452,45 @@ pub(super) async fn refine_with_nexus(
             feature: "detect_run_configs_ai".to_string(),
         },
         ..Default::default()
+    }
+}
+
+/// Helper di `refine_with_nexus`: estrae e parsa l'array JSON di classificazione
+/// dal testo (eventualmente libero) restituito dal gateway. `None` se non
+/// parsabile (loggato come warning, come nel codice originale).
+fn parse_classification_json(raw: &str) -> Option<Vec<serde_json::Value>> {
+    let raw = raw.trim();
+    let json_str = if raw.starts_with('[') {
+        raw.to_string()
+    } else if let (Some(s), Some(e)) = (raw.find('['), raw.rfind(']')) {
+        raw[s..=e].to_string()
+    } else {
+        tracing::warn!("refine_with_nexus: risposta non parsabile: {raw}");
+        return None;
     };
+    match serde_json::from_str(&json_str) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!("refine_with_nexus: JSON parse error: {e}");
+            None
+        }
+    }
+}
+
+pub(super) async fn refine_with_nexus(
+    state: &AppState,
+    project_id: Uuid,
+    user_id: Uuid,
+    root: &std::path::Path,
+    suggestions: &mut [Value],
+) {
+    let gw = match &state.orchestrator.nexus_gateway {
+        Some(g) => g,
+        None => return,
+    };
+
+    let prompt = costruisci_prompt_classificazione(root, suggestions);
+    let req = costruisci_gw_request(prompt, project_id, user_id);
 
     let resp =
         match tokio::time::timeout(std::time::Duration::from_secs(15), gw.complete(req)).await {
@@ -2429,38 +2506,29 @@ pub(super) async fn refine_with_nexus(
         };
 
     // Tenta di estrarre il blocco JSON dall'eventuale testo libero
-    let raw = resp.content.trim();
-    let json_str = if raw.starts_with('[') {
-        raw.to_string()
-    } else if let (Some(s), Some(e)) = (raw.find('['), raw.rfind(']')) {
-        raw[s..=e].to_string()
-    } else {
-        tracing::warn!("refine_with_nexus: risposta non parsabile: {raw}");
+    let Some(parsed) = parse_classification_json(&resp.content) else {
         return;
     };
 
-    let parsed: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("refine_with_nexus: JSON parse error: {e}");
-            return;
-        }
-    };
-
-    for (i, item) in parsed.iter().enumerate() {
-        if i >= suggestions.len() {
-            break;
-        }
-        if let Some(role) = item.get("role").and_then(|v| v.as_str()) {
-            suggestions[i]["role"] = json!(role);
-        }
-        if let Some(essential) = item.get("essential").and_then(|v| v.as_bool()) {
-            suggestions[i]["essential"] = json!(essential);
-        }
-    }
+    applica_classificazione(suggestions, &parsed);
 }
 
 /// Classifica il ruolo semantico di un comando di run.
+/// Prefissi di script che indicano un comando "tool" (non essenziale al run).
+const CLASSIFY_TOOL_PREFIXES: &[&str] = &[
+    "lint",
+    "format",
+    "fmt",
+    "check",
+    "typecheck",
+    "tsc",
+    "build",
+    "compile",
+    "i18n",
+    "ai:guard",
+    "quality",
+];
+
 pub(super) fn classify_role(
     kind: &str,
     name: &str,
@@ -2479,20 +2547,7 @@ pub(super) fn classify_role(
         return "test";
     }
 
-    let tool_prefixes = [
-        "lint",
-        "format",
-        "fmt",
-        "check",
-        "typecheck",
-        "tsc",
-        "build",
-        "compile",
-        "i18n",
-        "ai:guard",
-        "quality",
-    ];
-    for t in &tool_prefixes {
+    for t in CLASSIFY_TOOL_PREFIXES {
         if lname == *t || lname.starts_with(&format!("{}:", t)) {
             return "tool";
         }
