@@ -115,6 +115,22 @@ gia' migrati anche coi punti 1-5 residui aperti (degradano, non corrompono).
    nuovi dati finiscano in `beaty_book_nexus` (psql) e non nel meta-DB.
 6. Rollback sicuro: `UPDATE settings SET value='false'` -> torna al meta-DB
    (i dati scritti nel DB-progetto mentre il flag era on restano li').
+7. **Cleanup dual-presence** (dopo aver verificato il flip per un progetto): le
+   copie meta pre-flip dei dati chat/run del progetto sono ora ridondanti. Rimuovile
+   per-progetto con `scripts/db-cleanup-dual-presence.sh <PROJECT_ID>` (dry-run) poi
+   `--apply` (guardato dal flag, transazione FK-safe), infine `VACUUM (ANALYZE)`.
+
+## Igiene DB (fatta questa sessione)
+- **Schema morto rimosso** (mig 0497 + project/0003): droppate 4 tabelle mai scritte
+  da alcun codice (nexus_agent_clarifications, nexus_conversation_summaries,
+  nexus_e2e_runs, nexus_events_audit). Audit su tutto il repo.
+- **Retention** (worker `db_retention` + mig 0498 seed): pota i checkpoint dei run
+  terminali (`nexus_graph_checkpoints`, ~72% del meta-DB, ~10MB/run senza pruning) +
+  TTL sulla telemetria provider (`*_health_history`). Finestre DB-driven
+  (`db.retention.*`). Chiude alla causa la crescita illimitata (regola H).
+- **Ridondanza dual-presence**: le 24 tabelle migrate esistono in ENTRAMBI i DB;
+  `nexus` e' AVANTI (scritture live a flag OFF), `beaty_book_nexus` e' snapshot stale
+  -> ri-migrare fresco prima del flip, poi cleanup (punto 7).
 
 ## Sicurezza / stato attuale
 Flag **off**, cutover **non deployato** (gira Phase 0-1): l'app live e' intatta,
@@ -122,4 +138,5 @@ dati in dual-presenza (meta-DB + `beaty_book_nexus`). Niente da rollbackare.
 
 ## Migrazioni introdotte
 `0494` connection_role, `0495` seed flag, `0496` nexus_data_routing,
-`db/migrations/project/0001_chat.sql`, `0002_run.sql`.
+`0497` drop tabelle morte, `0498` seed retention,
+`db/migrations/project/0001_chat.sql`, `0002_run.sql`, `0003` drop dead.
