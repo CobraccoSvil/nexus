@@ -366,6 +366,7 @@ fn runtime_row_to_problem(row: sqlx::postgres::PgRow) -> Value {
 /// del restart: il file di log e' append-only e copre l'intera vita del servizio
 /// detached, quindi prendiamo solo l'ultima coda (`limit * 10`, capped 2000) —
 /// la UI conserva gli ID gia' visti via `seenLogIdsRef` (debug-panel.tsx:178).
+#[cfg(not(windows))]
 async fn read_detached_logfile(
     path: &str,
     limit: usize,
@@ -445,6 +446,7 @@ fn detect_log_level(text: &str) -> &'static str {
 /// da usare come argomento `--since` di journalctl. In formato systemd
 /// ("Sun 2026-04-26 16:30:00 CEST"), che journalctl accetta direttamente.
 /// None se il servizio non e' mai stato avviato o systemctl non risponde.
+#[cfg(not(windows))]
 async fn service_active_since(service: &str) -> Option<String> {
     let show = tokio::process::Command::new("systemctl")
         .args([
@@ -471,6 +473,7 @@ async fn service_active_since(service: &str) -> Option<String> {
 /// Esegue `journalctl` per il servizio e ritorna il testo dell'output oppure,
 /// in caso di errore/exit non-zero senza stdout, un evento gia' pronto per la UI
 /// (variante Err). Isola la costruzione args + spawn dal chiamante.
+#[cfg(not(windows))]
 async fn run_journalctl(
     service: &str,
     channel: &str,
@@ -534,6 +537,7 @@ async fn run_journalctl(
 /// dopo ogni `restart` la finestra log si "resetti" automaticamente — l'utente vede
 /// solo gli eventi del nuovo ciclo di vita del servizio, non l'intera storia che
 /// includeva crash precedenti gia' risolti.
+#[cfg(not(windows))]
 pub(super) async fn read_service_logs(
     service: &str,
     limit: usize,
@@ -573,6 +577,7 @@ pub(super) async fn read_service_logs(
 }
 
 /// Evento "nessun log dal restart" quando journalctl restituisce output vuoto.
+#[cfg(not(windows))]
 fn service_empty_log_event(service: &str, channel: &str, since: &Option<String>) -> Vec<serde_json::Value> {
     let header = match since {
         Some(ts) => format!(
@@ -594,6 +599,7 @@ fn service_empty_log_event(service: &str, channel: &str, since: &Option<String>)
 /// Evento singolo con tutto il flusso di log del servizio. Le righe sono in
 /// ordine cronologico ascendente (piu' vecchie in cima, piu' recenti in fondo)
 /// come da default di journalctl, cosi' l'auto-scroll si comporta come tail -f.
+#[cfg(not(windows))]
 fn service_tail_log_event(
     service: &str,
     channel: &str,
@@ -862,7 +868,9 @@ pub async fn get_output_events(
         }
         ch if ch.starts_with("agent:") => agent_channel_events(&proj_pool, ch, &channel).await?,
         "System" => system_channel_events(&context).await,
-        ch if ch.starts_with("svc:") => svc_channel_events(&context, ch, &channel, limit).await,
+        ch if ch.starts_with("svc:") => {
+            svc_channel_events(&context, &proj_pool, ch, &channel, limit).await
+        }
         _ => vec![project_context_event(&context, &channel)],
     };
 
@@ -1055,6 +1063,7 @@ async fn system_channel_events(context: &crate::projects::ProjectContext) -> Vec
 /// output dell'early-return originale `{ events: [] }`).
 async fn svc_channel_events(
     context: &crate::projects::ProjectContext,
+    proj_pool: &sqlx::PgPool,
     ch: &str,
     channel: &str,
     limit: i64,
@@ -1066,7 +1075,92 @@ async fn svc_channel_events(
     if !unit.starts_with(&prefix) {
         return vec![];
     }
-    read_service_logs(unit, limit as usize, channel).await
+
+    // Su Windows i servizi di progetto NON sono unit systemd ne' processi
+    // detached con logfile in /tmp: sono processi gestiti (agent_processes,
+    // kind='service') il cui stdout/stderr e' catturato in output/error_output
+    // (punto unico regola L: la stessa fonte del modello servizi Windows,
+    // list_services_windows). journalctl e /tmp/nexus-proj-*.log non esistono
+    // qui, quindi read_service_logs restava muto e la Console Debug vuota.
+    #[cfg(windows)]
+    {
+        let _ = limit;
+        let short = unit
+            .strip_prefix(&prefix)
+            .unwrap_or(unit)
+            .strip_suffix(".service")
+            .unwrap_or(unit);
+        return windows_service_log_events(proj_pool, context.project_id, short, channel).await;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = proj_pool;
+        read_service_logs(unit, limit as usize, channel).await
+    }
+}
+
+/// Log di un servizio Windows: legge output/error_output dalla riga
+/// agent_processes piu' recente (l'ultimo ciclo di vita del servizio) sul pool
+/// del progetto. Un solo evento con lo stream unificato, coerente con
+/// service_tail_log_event su Linux.
+#[cfg(windows)]
+async fn windows_service_log_events(
+    proj_pool: &sqlx::PgPool,
+    project_id: Uuid,
+    short: &str,
+    channel: &str,
+) -> Vec<Value> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT id, status, output, error_output FROM agent_processes \
+         WHERE project_id = $1 AND kind = 'service' AND label = $2 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(short)
+    .fetch_optional(proj_pool)
+    .await
+    .ok()
+    .flatten();
+
+    let Some(row) = row else {
+        return vec![];
+    };
+
+    let status: String = row.try_get("status").unwrap_or_default();
+    let output: String = row.try_get("output").unwrap_or_default();
+    let error_output: String = row.try_get("error_output").unwrap_or_default();
+
+    let mut text = String::new();
+    if !output.trim().is_empty() {
+        text.push_str(output.trim_end());
+    }
+    if !error_output.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(error_output.trim_end());
+    }
+    if text.is_empty() {
+        text = format!("Servizio '{short}' ({status}): nessun output catturato.");
+    }
+
+    // Livello: punto unico detect_log_level; forza error se il processo e' failed.
+    let level = if status == "failed" {
+        "error"
+    } else {
+        detect_log_level(&text)
+    };
+
+    vec![serde_json::json!({
+        "id": format!("winsvc-{}", row.get::<Uuid, _>("id")),
+        "channel": channel,
+        "level": level,
+        "title": format!("{short} — {status}"),
+        "text": text,
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    })]
 }
 
 /// Evento di fallback (canale non riconosciuto): riepilogo del contesto progetto.

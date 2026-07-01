@@ -1160,12 +1160,22 @@ pub async fn get_project_ports(
 /// 2. Aggiunge i MainPID dei servizi systemd --user con prefisso {slug}-
 /// 3. Scansiona /proc per qualsiasi processo con cwd nel project_root
 /// 4. Espande con tutti i processi discendenti
+#[cfg_attr(windows, allow(unreachable_code))]
 pub(super) async fn detect_project_ports(
     project_root: &str,
     slug: &str,
     project_id: Uuid,
     db: &sqlx::PgPool,
 ) -> Vec<serde_json::Value> {
+    // Windows nativo: niente systemctl/`/proc`/`ss`/docker-per-slug. I servizi
+    // sono processi gestiti (agent_processes); la rilevazione live usa un
+    // percorso dedicato (Get-NetTCPConnection + albero processi Win32_Process).
+    #[cfg(windows)]
+    {
+        let _ = (project_root, slug);
+        return detect_project_ports_windows(project_id, db).await;
+    }
+
     let mut ports: Vec<serde_json::Value> = Vec::new();
 
     // 1. PID dai processi agent — include sia 'running' che altri status purché il processo sia ancora vivo.
@@ -1412,6 +1422,148 @@ pub(super) async fn detect_project_ports(
     ports.sort_by_key(|p| p["port"].as_u64().unwrap_or(0));
     ports.dedup_by_key(|p| p["port"].as_u64().unwrap_or(0));
     ports
+}
+
+/// Rilevazione porte live su Windows. I servizi sono processi gestiti
+/// (agent_processes, kind='service'): deriva le porte in ascolto mappando gli
+/// OwningProcess delle socket LISTEN sui pid dei servizi del progetto (o loro
+/// discendenti, es. node/vite figli di `npm run dev`). Punto unico liveness:
+/// process_util::process_alive. Nessun systemctl/`/proc`.
+#[cfg(windows)]
+async fn detect_project_ports_windows(
+    project_id: Uuid,
+    db: &sqlx::PgPool,
+) -> Vec<serde_json::Value> {
+    use std::collections::{HashMap, HashSet};
+
+    // 1. pid dei servizi vivi del progetto (agent_processes migrata -> pool progetto).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let svc_rows: Vec<(Option<i32>, String)> = sqlx::query_as(
+        "SELECT pid, label FROM agent_processes \
+         WHERE project_id = $1 AND kind = 'service' \
+           AND status IN ('running', 'starting') AND pid IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(&proj_pool)
+    .await
+    .unwrap_or_default();
+
+    let mut svc_pid_label: HashMap<u32, String> = HashMap::new();
+    for (pid, label) in svc_rows {
+        if let Some(p) = pid {
+            if p > 0 && crate::process_util::process_alive(p as u32) {
+                svc_pid_label.insert(p as u32, label);
+            }
+        }
+    }
+    if svc_pid_label.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. Mappa figlio->genitore (Win32_Process) per risalire dal pid in ascolto
+    //    (node/vite) fino al pid del servizio (npm/pnpm).
+    let child_to_parent = windows_process_parents().await;
+
+    // 3. Socket TCP in ascolto: (porta, owning_pid).
+    let listening = windows_listening_ports().await;
+
+    let mut ports: Vec<serde_json::Value> = Vec::new();
+    let mut seen: HashSet<u16> = HashSet::new();
+    for (port, pid) in listening {
+        let Some(service) = resolve_service_ancestor(pid, &svc_pid_label, &child_to_parent) else {
+            continue;
+        };
+        if !seen.insert(port) {
+            continue;
+        }
+        ports.push(json!({
+            "port": port,
+            "label": service,
+            "pid": pid,
+            "state": "LISTEN",
+            "url": format!("http://localhost:{port}"),
+            "service": service,
+        }));
+    }
+    ports
+}
+
+/// Risale la catena dei genitori da `pid` finche' trova un pid servizio. Cap a
+/// 12 hop per robustezza contro cicli/pid riusati.
+#[cfg(windows)]
+fn resolve_service_ancestor(
+    pid: u32,
+    svc_pid_label: &std::collections::HashMap<u32, String>,
+    child_to_parent: &std::collections::HashMap<u32, u32>,
+) -> Option<String> {
+    let mut current = pid;
+    for _ in 0..12 {
+        if let Some(label) = svc_pid_label.get(&current) {
+            return Some(label.clone());
+        }
+        match child_to_parent.get(&current) {
+            Some(&parent) if parent != current && parent != 0 => current = parent,
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Socket TCP in ascolto via `Get-NetTCPConnection` → righe "porta,pid".
+#[cfg(windows)]
+async fn windows_listening_ports() -> Vec<(u16, u32)> {
+    let out = tokio::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetTCPConnection -State Listen | ForEach-Object { '{0},{1}' -f $_.LocalPort, $_.OwningProcess }",
+        ])
+        .output()
+        .await;
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut res = Vec::new();
+    for line in text.lines() {
+        let Some((port_s, pid_s)) = line.trim().split_once(',') else {
+            continue;
+        };
+        if let (Ok(port), Ok(pid)) = (port_s.trim().parse::<u16>(), pid_s.trim().parse::<u32>()) {
+            if port > 0 && pid > 0 {
+                res.push((port, pid));
+            }
+        }
+    }
+    res
+}
+
+/// Mappa figlio->genitore di tutti i processi via `Win32_Process` (CIM).
+#[cfg(windows)]
+async fn windows_process_parents() -> std::collections::HashMap<u32, u32> {
+    let mut map = std::collections::HashMap::new();
+    let out = tokio::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { '{0},{1}' -f $_.ProcessId, $_.ParentProcessId }",
+        ])
+        .output()
+        .await;
+    let Ok(out) = out else {
+        return map;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let Some((child_s, parent_s)) = line.trim().split_once(',') else {
+            continue;
+        };
+        if let (Ok(child), Ok(parent)) = (child_s.trim().parse::<u32>(), parent_s.trim().parse::<u32>())
+        {
+            map.insert(child, parent);
+        }
+    }
+    map
 }
 
 /// Legge porte TCP in ascolto via `ss -tlnp` → Vec<(port, pid, program)>

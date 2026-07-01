@@ -602,19 +602,31 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
         );
     }
 
-    // Agent processes bloccati (>10 minuti senza heartbeat). Separazione DB:
-    // agent_processes vive nel DB del progetto a flag ON -> iteriamo i progetti e
-    // marchiamo sul pool di ciascuno (a flag OFF tutti i pool sono il meta: la 1a
-    // iterazione marca tutto, le successive trovano gia' 'failed').
+    // Agent processes bloccati. Separazione DB: agent_processes vive nel DB del
+    // progetto a flag ON -> iteriamo i progetti e marchiamo sul pool di ciascuno
+    // (a flag OFF tutti i pool sono il meta).
+    //
+    // Distinzione per `kind` (fix definitivo, regola H):
+    //  - `kind <> 'service'`: processi one-shot (build/comando). Un blocco oltre
+    //    la soglia indica stallo reale -> reap per eta' assoluta.
+    //  - `kind = 'service'`: dev server long-running (vite, `node --watch`, ...).
+    //    Girano all'infinito PER NATURA: reaparli per eta' assoluta li uccideva a
+    //    ogni ciclo (~10 min) -> servizi sempre 'failed', pannello Porte e Console
+    //    Debug vuoti. Si reapano SOLO per LIVENESS reale (pid morto = riga orfana
+    //    dopo un riavvio di mcp-core che ha perso il monitor), stesso criterio
+    //    degli agent_runs qui sotto (updated_at), non l'eta' assoluta.
     let mut stale_processes: Vec<uuid::Uuid> = Vec::new();
     for project_id in crate::project_db_routes::list_all_project_ids(db).await {
         let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+
+        // (a) One-shot bloccati: reap per eta' assoluta.
         let mut ids = sqlx::query_scalar::<_, uuid::Uuid>(
             "UPDATE agent_processes \
              SET status = 'failed', \
                  stopped_at = NOW(), \
                  error_output = COALESCE(error_output, '') || '\nWatchdog: processo bloccato per oltre 10 minuti' \
              WHERE status = 'running' \
+               AND kind <> 'service' \
                AND started_at < NOW() - make_interval(mins => $1) \
              RETURNING id",
         )
@@ -623,6 +635,37 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
         .await
         .unwrap_or_default();
         stale_processes.append(&mut ids);
+
+        // (b) Servizi orfani: reap SOLO se il processo OS non e' piu' vivo (punto
+        // unico liveness cross-platform: process_util::process_alive).
+        let running_services: Vec<(uuid::Uuid, Option<i32>)> = sqlx::query_as(
+            "SELECT id, pid FROM agent_processes \
+             WHERE status = 'running' AND kind = 'service'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for (id, pid) in running_services {
+            let alive = matches!(pid, Some(p) if p > 0 && crate::process_util::process_alive(p as u32));
+            if alive {
+                continue;
+            }
+            let reaped = sqlx::query_scalar::<_, uuid::Uuid>(
+                "UPDATE agent_processes \
+                 SET status = 'failed', \
+                     stopped_at = NOW(), \
+                     error_output = COALESCE(error_output, '') || '\nWatchdog: servizio con pid terminato' \
+                 WHERE id = $1 AND status = 'running' \
+                 RETURNING id",
+            )
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or_default();
+            if let Some(reaped_id) = reaped {
+                stale_processes.push(reaped_id);
+            }
+        }
     }
 
     for id in &stale_processes {

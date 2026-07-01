@@ -143,14 +143,15 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
   const seenLogIdsRef = useRef<Set<string>>(new Set());
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Carica lista servizi del progetto. NB: includiamo anche i servizi
-  // `managed_by === 'detached'` (modalita' WSL: systemd --user non attivo,
-  // l'unit gira con `setsid nohup ...` e scrive il log in
-  // /tmp/nexus-proj-<unit>.log). Prima il filtro `state === 'active'`
-  // escludeva tutti i detached -> serviceNames vuoto -> Console Debug
-  // sempre vuota in WSL. Il backend `read_service_logs` ora legge il
-  // logfile detached come fallback (logs.rs), quindi qui basta non filtrarli
-  // via.
+  // Carica lista servizi del progetto. Includiamo, oltre agli `active`:
+  //  - `managed_by === 'detached'` (WSL: systemd --user non attivo, l'unit gira
+  //    con `setsid nohup ...` e scrive il log in /tmp/nexus-proj-<unit>.log);
+  //  - `managed_by === 'windows'` (Windows nativo: i servizi sono processi
+  //    gestiti in agent_processes, MAI unit systemd). Qui vanno inclusi ANCHE i
+  //    servizi non-active/failed: il loro output di crash e' catturato in
+  //    agent_processes.output/error_output e il backend lo espone via il canale
+  //    `svc:` (logs.rs windows_service_log_events). Filtrarli via -> serviceNames
+  //    vuoto -> Console Debug muta proprio quando serve diagnosticare il crash.
   useEffect(() => {
     if (!projectId) return;
     let active = true;
@@ -159,7 +160,9 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
         if (!active) return;
         const names = res.services
           .filter((s: { state: string; managed_by?: string }) =>
-            s.state === "active" || s.managed_by === "detached"
+            s.state === "active" ||
+            s.managed_by === "detached" ||
+            s.managed_by === "windows"
           )
           .map((s: { unit: string }) => s.unit);
         setServiceNames(names);
