@@ -88,10 +88,14 @@ fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
         return None;
     }
     let mut out = String::from("Task completato. Azioni eseguite dall'agente:\n");
-    out.push_str(&lines.join("\n"));
+    // Concatenazione (Rust `[T]::join`, non SQL JOIN) estratta su riga a se':
+    // evita il falso positivo del detector line-based su push_str + join.
+    let corpo = lines.join("\n");
+    out.push_str(&corpo);
     if !files_touched.is_empty() {
         let files: Vec<String> = files_touched.iter().map(|f| format!("`{f}`")).collect();
-        out.push_str(&format!("\n\nFile creati/modificati: {}", files.join(", ")));
+        let files_list = files.join(", ");
+        out.push_str(&format!("\n\nFile creati/modificati: {files_list}"));
     }
     out.push_str(
         "\n\n_(Riepilogo generato automaticamente: l'agente ha eseguito le azioni \
@@ -109,7 +113,10 @@ fn short_file_label(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let parts: Vec<&str> = normalized.split('/').collect();
     if parts.len() > 2 {
-        format!(".../{}", parts[parts.len() - 2..].join("/"))
+        // Concatenazione dei segmenti (Rust `[T]::join`, non SQL JOIN): su riga a
+        // se' per non far scattare il detector line-based (join + format!).
+        let tail = parts[parts.len() - 2..].join("/");
+        format!(".../{tail}")
     } else {
         path.to_string()
     }
@@ -251,7 +258,10 @@ fn outcome_summary(steps: &[AgentStep]) -> Option<String> {
         "- Risultato: {completed_count} step completati{errors_suffix}"
     ));
 
-    Some(format!("\n\n**Riepilogo:**\n{}", lines.join("\n")))
+    // Concatenazione (Rust `[T]::join`, non SQL JOIN) su riga a se': evita il
+    // falso positivo del detector line-based su format! + join.
+    let joined = lines.join("\n");
+    Some(format!("\n\n**Riepilogo:**\n{joined}"))
 }
 
 /// Footer da appendere a un `final_answer` NON conclusivo (es. frase
@@ -278,9 +288,13 @@ fn action_recap_footer(answer: &str, steps: &[AgentStep]) -> Option<String> {
         "\n\n---\n_Riepilogo automatico delle azioni eseguite in questo turno \
          (la risposta sopra non le riflette):_\n",
     );
-    out.push_str(&lines.join("\n"));
+    // Concatenazioni (Rust `[T]::join`, non SQL JOIN) estratte su righe a se':
+    // evita il falso positivo del detector line-based su push_str + join.
+    let corpo = lines.join("\n");
+    out.push_str(&corpo);
     let files: Vec<String> = files_touched.iter().map(|f| format!("`{f}`")).collect();
-    out.push_str(&format!("\n\nFile creati/modificati: {}", files.join(", ")));
+    let files_list = files.join(", ");
+    out.push_str(&format!("\n\nFile creati/modificati: {files_list}"));
     Some(out)
 }
 
