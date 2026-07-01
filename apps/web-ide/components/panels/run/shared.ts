@@ -20,7 +20,7 @@ export function actBtnStyle(tc: ThemeColors, color:string, busy:boolean): React.
   return {
     background:"transparent", border:`1px solid ${color}`, color:busy?tc.textMuted:color,
     borderRadius:3, padding:"1px 7px", fontSize:10, cursor:busy?"wait":"pointer",
-    fontFamily:'"JetBrains Mono", monospace', opacity:busy?0.5:1, transition:"opacity 0.15s",
+    fontFamily:'var(--font-mono)', opacity:busy?0.5:1, transition:"opacity 0.15s",
   };
 }
 

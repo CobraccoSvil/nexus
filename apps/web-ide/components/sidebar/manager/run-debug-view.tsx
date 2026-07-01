@@ -399,7 +399,7 @@ export function RunDebugView({
                                 text={s.command + (s.args?.length ? " " + s.args.join(" ") : "")}
                                 tc={tc}
                                 style={{
-                                  fontFamily: '"JetBrains Mono", monospace',
+                                  fontFamily: 'var(--font-mono)',
                                   fontSize: 10,
                                   color: tc.textMuted,
                                 }}
@@ -454,21 +454,21 @@ export function RunDebugView({
             </div>
             <div>
               <label style={labelStyle}>Comando</label>
-              <input style={{ ...inputStyle, fontFamily: '"JetBrains Mono", monospace' }}
+              <input style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
                 placeholder={KIND_PLACEHOLDER[editing.kind] ?? "comando"}
                 value={editing.command}
                 onChange={e => setEditing(prev => prev ? { ...prev, command: e.target.value } : null)} />
             </div>
             <div>
               <label style={labelStyle}>Argomenti (separati da spazio)</label>
-              <input style={{ ...inputStyle, fontFamily: '"JetBrains Mono", monospace' }}
+              <input style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
                 placeholder="--port 3000 --watch"
                 value={editing.args}
                 onChange={e => setEditing(prev => prev ? { ...prev, args: e.target.value } : null)} />
             </div>
             <div>
               <label style={labelStyle}>Working directory (opzionale)</label>
-              <input style={{ ...inputStyle, fontFamily: '"JetBrains Mono", monospace' }}
+              <input style={{ ...inputStyle, fontFamily: 'var(--font-mono)' }}
                 placeholder="lascia vuoto = root progetto"
                 value={editing.cwd}
                 onChange={e => setEditing(prev => prev ? { ...prev, cwd: e.target.value } : null)} />
@@ -523,7 +523,7 @@ export function RunDebugView({
                     ×
                   </button>
                 </div>
-                <div title={cmdFull} style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 11, color: tc.textMuted, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <div title={cmdFull} style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: tc.textMuted, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {cmdFull}
                 </div>
                 {rel && (

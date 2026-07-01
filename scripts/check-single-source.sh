@@ -72,6 +72,14 @@ assert_single "catalog query Postgres" 'pub fn list_catalog_rows' 'crates/nexus-
 assert_single "registrazione progetto" 'pub async fn register_project_records' 'crates/nexus-tool-kit/src/project_register_common.rs' crates
 assert_single "endpoint MCP server condivisi" 'pub async fn list_servers_core' 'crates/nexus-mcp-client/src/server_endpoints.rs' crates
 
+# Font tipografico (2026-07-01): punto unico in apps/web-ide/app/layout.tsx
+# (next/font/local -> --font-mono). I componenti usano var(--font-mono); vietato
+# reintrodurre stack font hardcoded negli inline style. Ricerca confinata a
+# apps/web-ide: la webview vscode-ext ha un contesto CSS separato, fuori scope.
+# NB: NexusLogo.tsx usa l'attributo SVG fontFamily="monospace" (glifo del logo),
+# non catturato dal pattern che richiede "fontFamily:" con i due punti.
+assert_single "font web-ide" "ui-monospace|['\"]JetBrains Mono|fontFamily:[[:space:]]*['\"]monospace" 'apps/web-ide/app/layout.tsx' apps/web-ide
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

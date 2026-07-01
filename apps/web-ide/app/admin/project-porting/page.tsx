@@ -91,7 +91,7 @@ export default function ProjectPortingPage() {
     flex: 1,
     padding: "8px 12px",
     fontSize: 13,
-    fontFamily: '"JetBrains Mono", monospace',
+    fontFamily: 'var(--font-mono)',
     background: tc.bgCard,
     color: tc.text,
     border: `1px solid ${tc.border}`,
@@ -117,7 +117,7 @@ export default function ProjectPortingPage() {
         padding: 24,
         maxWidth: 900,
         color: tc.text,
-        fontFamily: '"Inter", sans-serif',
+        fontFamily: 'var(--font-mono)',
       }}
     >
       <AdminPageHeader
@@ -138,7 +138,7 @@ export default function ProjectPortingPage() {
         }}
       >
         <span style={{ color: tc.textMuted }}>Base root attuale: </span>
-        <span style={{ fontFamily: '"JetBrains Mono", monospace' }}>
+        <span style={{ fontFamily: 'var(--font-mono)' }}>
           {currentBase || "..."}
         </span>
       </div>
@@ -254,7 +254,7 @@ export default function ProjectPortingPage() {
               width: "100%",
               borderCollapse: "collapse",
               fontSize: 12,
-              fontFamily: '"JetBrains Mono", monospace',
+              fontFamily: 'var(--font-mono)',
             }}
           >
             <thead>

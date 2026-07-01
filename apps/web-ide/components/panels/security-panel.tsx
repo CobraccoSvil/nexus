@@ -129,7 +129,7 @@ export function SecurityPanel({ projectId }: SecurityPanelProps) {
               transition: "width 0.3s ease",
             }} />
           </div>
-          <span style={{ fontSize: 10, fontFamily: "monospace", color: tc.text, whiteSpace: "nowrap" }}>
+          <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: tc.text, whiteSpace: "nowrap" }}>
             {used}/{max}
           </span>
         </div>
@@ -212,7 +212,7 @@ export function SecurityPanel({ projectId }: SecurityPanelProps) {
                 }}>
                   <td style={tdStyle(tc)}>{formatTime(item.ts)}</td>
                   <td style={tdStyle(tc)}>
-                    <span style={{ fontFamily: "monospace" }}>{item.action}</span>
+                    <span style={{ fontFamily: "var(--font-mono)" }}>{item.action}</span>
                   </td>
                   <td style={tdStyle(tc)}>
                     <span style={{
@@ -222,7 +222,7 @@ export function SecurityPanel({ projectId }: SecurityPanelProps) {
                       {item.resource_kind}
                     </span>
                     {item.resource_id && (
-                      <span style={{ fontFamily: "monospace", fontSize: 10 }}>
+                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 10 }}>
                         {item.resource_id}
                       </span>
                     )}
@@ -236,7 +236,7 @@ export function SecurityPanel({ projectId }: SecurityPanelProps) {
                     </span>
                   </td>
                   <td style={{ ...tdStyle(tc), maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>
-                    <span style={{ fontSize: 10, color: tc.textMuted, fontFamily: "monospace" }}>
+                    <span style={{ fontSize: 10, color: tc.textMuted, fontFamily: "var(--font-mono)" }}>
                       {Object.keys(item.details).length > 0
                         ? JSON.stringify(item.details).slice(0, 80)
                         : "-"}

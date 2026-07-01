@@ -358,7 +358,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
                     background: tc.bgInput,
                     color: tc.text,
                     fontSize: 13,
-                    fontFamily: "monospace",
+                    fontFamily: "var(--font-mono)",
                     boxSizing: "border-box",
                   }}
                 />

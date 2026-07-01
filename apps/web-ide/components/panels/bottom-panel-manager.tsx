@@ -326,7 +326,7 @@ export function BottomPanelManager({
                     borderRadius: 3,
                     padding: "1px 6px",
                     fontSize: 11,
-                    fontFamily: "monospace",
+                    fontFamily: "var(--font-mono)",
                     flexShrink: 0,
                   }}>
                     {port.port}
@@ -510,7 +510,7 @@ export function BottomPanelManager({
                       marginTop: 6,
                       whiteSpace: "pre-wrap",
                       wordBreak: "break-word",
-                      fontFamily: '"JetBrains Mono", "Consolas", monospace',
+                      fontFamily: 'var(--font-mono)',
                       lineHeight: 1.45,
                     }}
                   >
@@ -703,7 +703,7 @@ function PlaywrightLiveProgress({
 
       {/* Spec attualmente in esecuzione */}
       {isRunning && progress.current_spec && (
-        <div style={{ marginTop: 4, color: tc.textMuted, fontFamily: "monospace", fontSize: 10 }}>
+        <div style={{ marginTop: 4, color: tc.textMuted, fontFamily: "var(--font-mono)", fontSize: 10 }}>
           ▸ {progress.current_spec}
         </div>
       )}
@@ -712,7 +712,7 @@ function PlaywrightLiveProgress({
       {isRunning && tail.length > 0 && (
         <div style={{
           marginTop: 6, padding: 6, background: "rgba(0,0,0,0.2)",
-          borderRadius: 3, fontFamily: "monospace", fontSize: 10, lineHeight: 1.4,
+          borderRadius: 3, fontFamily: "var(--font-mono)", fontSize: 10, lineHeight: 1.4,
           color: tc.textMuted, maxHeight: 120, overflow: "auto",
           whiteSpace: "pre-wrap",
         }}>
@@ -728,7 +728,7 @@ function PlaywrightLiveProgress({
 
       {/* Lista specifica dei failed */}
       {!isRunning && progress.failed_specs && progress.failed_specs.length > 0 && (
-        <div style={{ marginTop: 4, color: tc.error, fontFamily: "monospace", fontSize: 10 }}>
+        <div style={{ marginTop: 4, color: tc.error, fontFamily: "var(--font-mono)", fontSize: 10 }}>
           {progress.failed_specs.slice(0, 5).map((s, i) => (
             <div key={i}>✗ {s}</div>
           ))}

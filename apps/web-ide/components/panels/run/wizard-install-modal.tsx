@@ -38,7 +38,7 @@ export function WizardInstallModal({ svc, onInstall, onCancel, tc, feedback }: W
   const inp: React.CSSProperties = {
     width:"100%", background:tc.bgCard, border:`1px solid ${tc.border}`,
     borderRadius:4, color:tc.text, padding:"4px 8px", fontSize:12,
-    fontFamily:'"JetBrains Mono", monospace', boxSizing:"border-box",
+    fontFamily:'var(--font-mono)', boxSizing:"border-box",
   };
 
   const handleInstall = async () => {
@@ -53,7 +53,7 @@ export function WizardInstallModal({ svc, onInstall, onCancel, tc, feedback }: W
     <div style={{ position:"fixed",inset:0,zIndex:9999,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center" }}>
       <div style={{ background:tc.bgCard,border:`1px solid ${tc.border}`,borderRadius:8,padding:20,width:460,maxWidth:"90vw",display:"flex",flexDirection:"column",gap:10 }}>
         <div style={{ fontWeight:700,fontSize:13,color:tc.text }}>Installa servizio — {svc.short}</div>
-        <div style={{ fontSize:11,color:tc.textMuted,fontFamily:'"JetBrains Mono", monospace',background:tc.bgSidebar,padding:"6px 8px",borderRadius:4 }}>
+        <div style={{ fontSize:11,color:tc.textMuted,fontFamily:'var(--font-mono)',background:tc.bgSidebar,padding:"6px 8px",borderRadius:4 }}>
           <div>Unit: <strong>{svc.unit}</strong></div>
           <div>Comando: {svc.command} {svc.args.join(" ")}</div>
           <div>Dir: {svc.cwd}</div>

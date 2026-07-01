@@ -404,7 +404,7 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
           minHeight: 0,
           overflow: "auto",
           padding: "6px 0",
-          fontFamily: '"JetBrains Mono", monospace',
+          fontFamily: 'var(--font-mono)',
           fontSize: 12,
         }}
       >

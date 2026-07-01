@@ -430,7 +430,7 @@ export function EditorArea({
                   minimap: { enabled: false },
                   fontSize: 13,
                   lineHeight: 20,
-                  fontFamily: '"JetBrains Mono", monospace',
+                  fontFamily: 'var(--font-mono)',
                   scrollBeyondLastLine: false,
                   wordWrap: "off",
                   tabSize: 2,

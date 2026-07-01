@@ -157,7 +157,7 @@ export function AgentActivityBar({
           </div>
           {runningCommand && (
             <div style={{
-              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+              fontFamily: "var(--font-mono)",
               fontSize: 11, color: tc.textSecondary,
               whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
             }} title={runningCommand}>
@@ -179,7 +179,7 @@ export function AgentActivityBar({
                   key={`tl-${step.stepIndex}`}
                   style={{
                     color: step.status === "failed" ? tc.error : tc.textSecondary,
-                    fontSize: 11, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                    fontSize: 11, fontFamily: "var(--font-mono)",
                     whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                   }}
                 >

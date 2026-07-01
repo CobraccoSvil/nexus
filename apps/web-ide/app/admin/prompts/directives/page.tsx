@@ -365,7 +365,7 @@ export default function SharedDirectivesPage() {
               placeholder="<direttiva>&#10;Testo della direttiva...&#10;</direttiva>"
               style={{
                 ...inputStyle,
-                fontFamily: "monospace",
+                fontFamily: "var(--font-mono)",
                 fontSize: 12,
                 lineHeight: "1.5",
                 resize: "vertical",
@@ -458,13 +458,13 @@ export default function SharedDirectivesPage() {
                       <StatusDot active={d.isActive} tc={tc} />
                     </button>
                   </td>
-                  <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 12, fontWeight: 600, color: tc.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", fontSize: 12, fontWeight: 600, color: tc.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {d.key}
                   </td>
                   <td style={tdStyle}>
                     <ScopeBadge scope={d.scope} tc={tc} />
                   </td>
-                  <td style={{ ...tdStyle, textAlign: "center", fontFamily: "monospace", fontSize: 12, color: tc.textSecondary }}>
+                  <td style={{ ...tdStyle, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 12, color: tc.textSecondary }}>
                     {d.priority}
                   </td>
                   <td style={{ ...tdStyle, fontSize: 12, color: tc.textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
@@ -472,7 +472,7 @@ export default function SharedDirectivesPage() {
                   >
                     {d.description ?? "--"}
                   </td>
-                  <td style={{ ...tdStyle, textAlign: "center", fontFamily: "monospace", fontSize: 11, color: tc.textMuted }}>
+                  <td style={{ ...tdStyle, textAlign: "center", fontFamily: "var(--font-mono)", fontSize: 11, color: tc.textMuted }}>
                     {d.content.length.toLocaleString()}
                   </td>
                   <td style={{ ...tdStyle, textAlign: "right" }}>

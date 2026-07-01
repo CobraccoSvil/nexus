@@ -72,14 +72,14 @@ function CompactTraceCard({
     >
       {/* Header: iter · provider/model · timestamp · stopReason */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <span style={{ fontWeight: 700, color: tc.accent, fontFamily: '"JetBrains Mono", monospace' }}>
+        <span style={{ fontWeight: 700, color: tc.accent, fontFamily: 'var(--font-mono)' }}>
           #{trace.iteration}
         </span>
         <span style={{ color: tc.textMuted }}>
           {trace.provider}/{trace.model}
         </span>
         {(trace.inputTokens ?? 0) > 0 && (
-          <span style={{ color: tc.textMuted, fontFamily: '"JetBrains Mono", monospace' }}>
+          <span style={{ color: tc.textMuted, fontFamily: 'var(--font-mono)' }}>
             ↑{trace.inputTokens} ↓{trace.outputTokens}
             {(trace.cacheReadTokens ?? 0) > 0 && (
               <span style={{ color: tc.success }}> ⚡{trace.cacheReadTokens}</span>
@@ -90,7 +90,7 @@ function CompactTraceCard({
           <span
             style={{
               color: cost > 0.05 ? tc.error : cost > 0.01 ? "#f97316" : tc.textMuted,
-              fontFamily: '"JetBrains Mono", monospace',
+              fontFamily: 'var(--font-mono)',
             }}
           >
             {formatCost(cost)}
@@ -116,7 +116,7 @@ function CompactTraceCard({
 
       {/* Tool calls */}
       {toolNames && (
-        <div style={{ color: tc.textMuted, fontFamily: '"JetBrains Mono", monospace' }}>
+        <div style={{ color: tc.textMuted, fontFamily: 'var(--font-mono)' }}>
           {toolNames}
         </div>
       )}
@@ -160,7 +160,7 @@ function CompactTraceCard({
                     code: (({ children }: any) => (
                       <code
                         style={{
-                          fontFamily: '"JetBrains Mono", monospace',
+                          fontFamily: 'var(--font-mono)',
                           fontSize: 10,
                           background: tc.border + "66",
                           borderRadius: 3,
@@ -182,7 +182,7 @@ function CompactTraceCard({
                           borderRadius: 4,
                           padding: "4px 8px",
                           whiteSpace: "pre-wrap",
-                          fontFamily: '"JetBrains Mono", monospace',
+                          fontFamily: 'var(--font-mono)',
                           fontSize: 10,
                           color: tc.text,
                         }}
@@ -264,14 +264,14 @@ export function InlineTracePanel({ traces }: { traces: AITraceEvent[] }) {
         }}
       >
         <span style={{ color: tc.textMuted }}>Trace AI</span>
-        <span style={{ fontFamily: '"JetBrains Mono", monospace', color: tc.textMuted }}>
+        <span style={{ fontFamily: 'var(--font-mono)', color: tc.textMuted }}>
           {traces.length} iter · ↑{totalInput} ↓{totalOutput}
           {totalCache > 0 && <span style={{ color: tc.success }}> ⚡{totalCache}</span>}
         </span>
         {totalCost !== null && (
           <span
             style={{
-              fontFamily: '"JetBrains Mono", monospace',
+              fontFamily: 'var(--font-mono)',
               color: totalCost > 0.05 ? tc.error : totalCost > 0.01 ? "#f97316" : tc.textMuted,
             }}
           >

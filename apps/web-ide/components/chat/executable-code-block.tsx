@@ -155,7 +155,7 @@ export function ExecutableCodeBlock({ code, language, projectId, tc }: Props) {
     borderBottom: `1px solid ${tc.border}`,
     borderRadius: "6px 6px 0 0",
     fontSize: 11,
-    fontFamily: '"JetBrains Mono", monospace',
+    fontFamily: 'var(--font-mono)',
     gap: 6,
   };
 
@@ -247,7 +247,7 @@ export function ExecutableCodeBlock({ code, language, projectId, tc }: Props) {
           background: tc.bgInput,
           padding: "10px 12px",
           overflowX: "auto",
-          fontFamily: '"JetBrains Mono", "Consolas", monospace',
+          fontFamily: 'var(--font-mono)',
           fontSize: 12,
           lineHeight: 1.5,
           color: tc.text,
@@ -279,7 +279,7 @@ export function ExecutableCodeBlock({ code, language, projectId, tc }: Props) {
               borderBottom: `1px solid ${tc.border}`,
               color: tc.textSecondary,
               fontSize: 10,
-              fontFamily: '"JetBrains Mono", monospace',
+              fontFamily: 'var(--font-mono)',
               cursor: "pointer",
               letterSpacing: 0.3,
             }}
@@ -294,7 +294,7 @@ export function ExecutableCodeBlock({ code, language, projectId, tc }: Props) {
               margin: 0,
               fontSize: 11.5,
               lineHeight: 1.5,
-              fontFamily: '"JetBrains Mono", "Consolas", monospace',
+              fontFamily: 'var(--font-mono)',
               overflowX: "auto",
               maxHeight: 300,
               overflowY: "auto",

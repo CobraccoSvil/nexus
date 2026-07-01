@@ -34,7 +34,7 @@ function TruncatedContent({
     <div>
       <pre
         style={{
-          fontFamily: mono ? "monospace" : "inherit",
+          fontFamily: mono ? "var(--font-mono)" : "inherit",
           fontSize: 11,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
@@ -305,7 +305,7 @@ function SingleRunPanel({
               {metrics.totalTokens > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                   <span style={{ opacity: 0.6 }}>Token totali:</span>
-                  <span style={{ fontFamily: "monospace", fontWeight: 600, color: tc.text }}>
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: tc.text }}>
                     {metrics.totalTokens.toLocaleString()}
                   </span>
                 </div>
@@ -315,7 +315,7 @@ function SingleRunPanel({
               {metrics.totalCost > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                   <span style={{ opacity: 0.6 }}>Costo:</span>
-                  <span style={{ fontFamily: "monospace", fontWeight: 600, color: tc.text }}>
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: tc.text }}>
                     ${metrics.totalCost.toFixed(6)}
                   </span>
                 </div>
@@ -325,7 +325,7 @@ function SingleRunPanel({
               {metrics.cacheHitRate > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                   <span style={{ opacity: 0.6 }}>Hit cache:</span>
-                  <span style={{ fontFamily: "monospace", fontWeight: 600, color: "#22c55e" }}>
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: "#22c55e" }}>
                     {metrics.cacheHitRate.toFixed(1)}%
                   </span>
                 </div>
@@ -335,7 +335,7 @@ function SingleRunPanel({
               {run.createdAt && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4, gridColumn: "1 / -1" }}>
                   <span style={{ opacity: 0.6 }}>Inizio:</span>
-                  <span style={{ fontFamily: "monospace", fontWeight: 500, color: tc.textMuted, fontSize: 10 }}>
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, color: tc.textMuted, fontSize: 10 }}>
                     {new Date(run.createdAt).toLocaleTimeString()}
                   </span>
                 </div>
@@ -345,7 +345,7 @@ function SingleRunPanel({
               {run.completedAt && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4, gridColumn: "1 / -1" }}>
                   <span style={{ opacity: 0.6 }}>Fine:</span>
-                  <span style={{ fontFamily: "monospace", fontWeight: 500, color: tc.textMuted, fontSize: 10 }}>
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, color: tc.textMuted, fontSize: 10 }}>
                     {new Date(run.completedAt).toLocaleTimeString()}
                   </span>
                 </div>
@@ -556,7 +556,7 @@ function SingleRunPanel({
                       {step.createdAt && (
                         <div style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 10, paddingTop: 4, borderTop: `1px solid ${tc.border}30` }}>
                           <span style={{ opacity: 0.6 }}>Eseguito:</span>
-                          <span style={{ fontFamily: "monospace", color: tc.textMuted }}>
+                          <span style={{ fontFamily: "var(--font-mono)", color: tc.textMuted }}>
                             {new Date(step.createdAt).toLocaleTimeString()}
                           </span>
                         </div>
@@ -594,7 +594,7 @@ function SingleRunPanel({
             <div
               key={action.index}
               style={{
-                fontFamily: "monospace",
+                fontFamily: "var(--font-mono)",
                 background: `${tc.border}40`,
                 borderRadius: 4,
                 padding: "2px 6px",
@@ -748,7 +748,7 @@ export function AgentStepsPanel({
             border: `1px solid ${tc.border}`,
             background: tc.bgInput,
             color: tc.textMuted,
-            fontFamily: "monospace",
+            fontFamily: "var(--font-mono)",
           }}>
             {agentRun.provider}/{agentRun.model}
           </span>

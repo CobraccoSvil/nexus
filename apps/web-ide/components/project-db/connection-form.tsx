@@ -184,7 +184,7 @@ export function ConnectionForm({
                 onChange={(v) => setConnFields((f) => ({ ...f, password: v }))}
               />
               {buildConnectionString() && (
-                <div style={{ gridColumn: "1 / -1", fontSize: 9, color: tc.textMuted, fontFamily: "monospace", wordBreak: "break-all", padding: "2px 4px", background: `${tc.border}30`, borderRadius: 3 }}>
+                <div style={{ gridColumn: "1 / -1", fontSize: 9, color: tc.textMuted, fontFamily: "var(--font-mono)", wordBreak: "break-all", padding: "2px 4px", background: `${tc.border}30`, borderRadius: 3 }}>
                   {buildConnectionString().replace(/[Pp]assword=([^;,"']+)/g, "Password=***")}
                 </div>
               )}

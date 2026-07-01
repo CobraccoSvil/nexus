@@ -258,7 +258,7 @@ function PromptRow({
   const isWarning = (p.avg_reflection_score ?? 1) < 0.65;
   return (
     <tr style={isWarning ? { background: "#fef2f2" } : undefined}>
-      <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 12, color: tc.text }}>
+      <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", fontSize: 12, color: tc.text }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           {p.prompt_key}
           {p.experimental && (

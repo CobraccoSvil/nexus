@@ -62,7 +62,7 @@ export function QuotaBadge({ projectId }: QuotaBadgeProps) {
   return (
     <div style={{
       display: "flex", alignItems: "center", gap: 8,
-      fontSize: 10, fontFamily: "monospace",
+      fontSize: 10, fontFamily: "var(--font-mono)",
       padding: "2px 8px", borderRadius: 4,
       background: tc.bgCard,
       border: `1px solid ${tc.border}`,

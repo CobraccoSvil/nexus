@@ -43,7 +43,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
         flexDirection: "column",
         background: tc.bgGradient,
         color: tc.text,
-        fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+        fontFamily: "var(--font-mono)",
       }}
     >
       <header

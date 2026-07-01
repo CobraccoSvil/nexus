@@ -187,7 +187,7 @@ export default function LongRunningPage() {
                     opacity: p.enabled ? 1 : 0.5,
                   }}
                 >
-                  <td style={{ padding: "10px 14px", fontFamily: "monospace", color: tc.text }}>
+                  <td style={{ padding: "10px 14px", fontFamily: "var(--font-mono)", color: tc.text }}>
                     {p.pattern}
                   </td>
                   <td style={{ padding: "10px 14px", color: tc.textMuted }}>

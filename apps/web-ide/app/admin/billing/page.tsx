@@ -415,7 +415,7 @@ export default function AdminBillingPage() {
               {catalog.map((m) => (
                 <tr key={`${m.provider}-${m.model}`}>
                   <td style={tdStyle(tc)}>{m.provider}</td>
-                  <td style={{ ...tdStyle(tc), fontFamily: "monospace", fontSize: 11 }}>{m.model}</td>
+                  <td style={{ ...tdStyle(tc), fontFamily: "var(--font-mono)", fontSize: 11 }}>{m.model}</td>
                   <td style={tdStyle(tc)}>{m.displayName}</td>
                   <td style={tdStyle(tc)}>
                     <span style={tierBadge(tc, m.performanceTier)}>{m.performanceTier}</span>

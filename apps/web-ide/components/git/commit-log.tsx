@@ -32,7 +32,7 @@ export function CommitLog({ logEntries }: CommitLogProps) {
               onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.background = tc.bgInput; }}
               onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
             >
-              <span style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 10, color: tc.accent, flexShrink: 0, minWidth: "40px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: tc.accent, flexShrink: 0, minWidth: "40px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {entry.shortCommit}
               </span>
               <span style={{ fontSize: 11, color: tc.textMuted, flexShrink: 0, whiteSpace: "nowrap" }}>
@@ -59,7 +59,7 @@ export function CommitLog({ logEntries }: CommitLogProps) {
                 border: `1px solid ${tc.border}`,
                 fontSize: 11,
                 color: tc.textSecondary,
-                fontFamily: '"JetBrains Mono", monospace',
+                fontFamily: 'var(--font-mono)',
                 whiteSpace: "pre-wrap",
                 wordBreak: "break-word",
               }}>

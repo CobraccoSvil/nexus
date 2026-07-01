@@ -220,7 +220,7 @@ export default function AdminAiFeedbackPage() {
                     borderRadius: 6,
                     padding: "6px 8px",
                     whiteSpace: "pre-wrap",
-                    fontFamily: '"JetBrains Mono", monospace',
+                    fontFamily: 'var(--font-mono)',
                   }}
                 >
                   {(item as AdminFeedbackItem & { correctionText?: string }).correctionText}

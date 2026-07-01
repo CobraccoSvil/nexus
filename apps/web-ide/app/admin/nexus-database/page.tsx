@@ -75,7 +75,7 @@ export default function NexusDatabasePage() {
   };
 
   return (
-    <div style={{ color: tc.text, fontFamily: "'JetBrains Mono', monospace" }}>
+    <div style={{ color: tc.text, fontFamily: "var(--font-mono)" }}>
       <AdminPageHeader
         title="Database Nexus"
         description="Statistiche e stato del database PostgreSQL interno"

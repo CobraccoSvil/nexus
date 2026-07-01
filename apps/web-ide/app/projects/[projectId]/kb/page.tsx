@@ -60,7 +60,7 @@ export default function ProjectKbPage() {
         <h1 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>
           {t("wiki.title.project")}
         </h1>
-        <span style={{ fontSize: 11, color: tc.textSecondary, fontFamily: "monospace" }}>
+        <span style={{ fontSize: 11, color: tc.textSecondary, fontFamily: "var(--font-mono)" }}>
           {projectId.slice(0, 8)}
         </span>
       </div>

@@ -165,7 +165,7 @@ export function ServerMonitorPanel() {
       {disks.slice(0, 4).map((d) => (
         <div key={d.mountPoint} style={{ marginBottom: 4 }}>
           <div style={row}>
-            <span style={{ fontFamily: "monospace", fontSize: 10 }}>{d.mountPoint}</span>
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: 10 }}>{d.mountPoint}</span>
             <span style={val}>{d.usedPercent}%</span>
           </div>
           <Bar pct={d.usedPercent} />
@@ -178,7 +178,7 @@ export function ServerMonitorPanel() {
       {/* Processi */}
       <div style={label}>Processi top CPU</div>
       <div style={{
-        fontFamily: "monospace",
+        fontFamily: "var(--font-mono)",
         fontSize: 10,
         background: tc.bgInput,
         borderRadius: 4,

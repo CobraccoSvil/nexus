@@ -123,7 +123,7 @@ export function AnalysisInsightsCard({
                         background: `${modeColor}1c`,
                         border: `1px solid ${modeColor}55`,
                         borderRadius: 3, padding: "1px 5px",
-                        fontFamily: '"JetBrains Mono", monospace',
+                        fontFamily: 'var(--font-mono)',
                         whiteSpace: "nowrap",
                       }}>
                         consiglio: {modeLabel}
@@ -141,7 +141,7 @@ export function AnalysisInsightsCard({
                       <code style={{
                         display: "block", marginTop: 3,
                         fontSize: 9, color: "#60a5fa", background: "rgba(96,165,250,0.08)",
-                        padding: "2px 4px", borderRadius: 2, fontFamily: '"JetBrains Mono", monospace',
+                        padding: "2px 4px", borderRadius: 2, fontFamily: 'var(--font-mono)',
                         wordBreak: "break-all", overflowWrap: "anywhere",
                       }}>
                         {svc.start_command}
@@ -232,7 +232,7 @@ export function AnalysisInsightsCard({
                       <div style={{
                         ...wrapStyle,
                         fontSize: 10, color: "#22c55e", marginTop: 3,
-                        fontFamily: '"JetBrains Mono", monospace',
+                        fontFamily: 'var(--font-mono)',
                       }}>
                         → {iss.suggested_fix}
                       </div>
@@ -335,7 +335,7 @@ export function AnalysisInsightsCard({
                           <code style={{
                             display: "block",
                             fontSize: 9, color: "#60a5fa", background: "rgba(96,165,250,0.08)",
-                            padding: "2px 4px", borderRadius: 2, fontFamily: '"JetBrains Mono", monospace',
+                            padding: "2px 4px", borderRadius: 2, fontFamily: 'var(--font-mono)',
                             wordBreak: "break-all", overflowWrap: "anywhere",
                             whiteSpace: "pre-wrap",
                             marginTop: 2,

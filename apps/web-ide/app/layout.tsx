@@ -1,7 +1,21 @@
 import type { ReactNode } from "react";
+import localFont from "next/font/local";
 import "./globals.css";
 import "@xterm/xterm/css/xterm.css";
 import { ThemeBody } from "./theme-body";
+
+// PUNTO UNICO tipografico (regola L): JetBrains Mono self-hosted (file variable
+// .woff2 nel repo, licenza in app/fonts/OFL.txt) — nessuna richiesta runtime a
+// font esterni. Espone --font-mono, applicata a <html> e usata dal body e da
+// tutti gli inline style. Il font e il fallback si cambiano SOLO qui.
+const jetBrainsMono = localFont({
+  src: "./fonts/jetbrains-mono-latin-wght-normal.woff2",
+  weight: "100 800",
+  style: "normal",
+  display: "swap",
+  variable: "--font-mono",
+  fallback: ["Fira Code", "monospace"],
+});
 
 export const metadata = {
   title: "Nexus",
@@ -42,7 +56,7 @@ const chunkErrorScript = `(function(){
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" className={jetBrainsMono.variable} suppressHydrationWarning>
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
         <script dangerouslySetInnerHTML={{ __html: chunkErrorScript }} />

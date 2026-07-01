@@ -153,7 +153,7 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
                 <code
                   className={className}
                   style={{
-                    fontFamily: '"JetBrains Mono", "Consolas", monospace',
+                    fontFamily: 'var(--font-mono)',
                     fontSize: 12,
                     color: tc.text,
                     whiteSpace: "pre",
@@ -197,7 +197,7 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
                     border: `1px solid ${tc.accent}`,
                     borderRadius: 4,
                     padding: "0 4px",
-                    fontFamily: '"JetBrains Mono", monospace',
+                    fontFamily: 'var(--font-mono)',
                     fontSize: "0.92em",
                     color: tc.accent,
                     cursor: "pointer",
@@ -217,7 +217,7 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
                   border: `1px solid ${tc.border}`,
                   borderRadius: 4,
                   padding: "0 4px",
-                  fontFamily: '"JetBrains Mono", monospace',
+                  fontFamily: 'var(--font-mono)',
                   fontSize: "0.92em",
                   color: tc.accent,
                 }}
@@ -279,7 +279,7 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
                   borderRadius: 6,
                   padding: "10px 12px",
                   overflowX: "auto",
-                  fontFamily: '"JetBrains Mono", "Consolas", monospace',
+                  fontFamily: 'var(--font-mono)',
                   fontSize: 12,
                   lineHeight: 1.5,
                   color: tc.text,
@@ -497,7 +497,7 @@ function SqlChatBlock({ code, tc }: { code: string; tc: ReturnType<typeof useThe
           margin: 0,
           padding: "8px 12px",
           overflowX: "auto",
-          fontFamily: '"JetBrains Mono", "Consolas", monospace',
+          fontFamily: 'var(--font-mono)',
           fontSize: 12,
           lineHeight: 1.5,
           color: tc.text,

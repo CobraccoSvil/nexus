@@ -67,7 +67,7 @@ export function BehaviorModeSection({ config, setConfig, behaviorSaved }: Behavi
                 <span style={{ fontSize: 12 }}>
                   <span style={{ color: "var(--color-accent)", fontWeight: 600 }}>{labelProvider(entry.provider)}</span>
                   <span style={{ color: "var(--color-textMuted)" }}> / </span>
-                  <span style={{ color: "var(--color-text)", fontFamily: "monospace", fontSize: 11 }}>{entry.model}</span>
+                  <span style={{ color: "var(--color-text)", fontFamily: "var(--font-mono)", fontSize: 11 }}>{entry.model}</span>
                 </span>
                 {entry.tokens && (
                   <span style={{ fontSize: 10, color: "var(--color-textMuted)", whiteSpace: "nowrap" }}>{entry.tokens}</span>

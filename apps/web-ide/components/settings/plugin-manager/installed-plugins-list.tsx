@@ -147,7 +147,7 @@ export function InstalledPluginsList({
                 </div>
                 {missingKeys.map((key) => (
                   <div key={key} style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                    <span style={{ fontFamily: "monospace", fontSize: 12, color: tc.text, minWidth: 220 }}>
+                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: tc.text, minWidth: 220 }}>
                       {key}
                     </span>
                     <input

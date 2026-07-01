@@ -193,7 +193,7 @@ function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
         const status = (t.id ? overrides[t.id] : undefined) ?? t.status ?? "pending";
         return (
           <li key={t.id ?? i} style={{ lineHeight: 1.4, display: "flex", alignItems: "flex-start", gap: 6 }}>
-            <span style={{ fontFamily: "monospace", opacity: 0.7 }}>{MARK[status] ?? MARK.pending}</span>
+            <span style={{ fontFamily: "var(--font-mono)", opacity: 0.7 }}>{MARK[status] ?? MARK.pending}</span>
             <span>
               {t.content ?? "—"}
               {t.priority && t.priority !== "normal" ? <span style={{ opacity: 0.6 }}> ({t.priority})</span> : null}
@@ -406,8 +406,8 @@ export function AgentMetaStepCard({
           textAlign: "left",
         }}
       >
-        <span aria-hidden style={{ fontFamily: "monospace" }}>{open ? "▾" : "▸"}</span>
-        <span aria-hidden style={{ fontFamily: "monospace" }}>{desc.icon}</span>
+        <span aria-hidden style={{ fontFamily: "var(--font-mono)" }}>{open ? "▾" : "▸"}</span>
+        <span aria-hidden style={{ fontFamily: "var(--font-mono)" }}>{desc.icon}</span>
         {showLabel && <span style={{ fontWeight: 600 }}>{desc.label}</span>}
         {/* Title del turno: colore testo neutro (leggibile), troncato con ellipsis
             nell'header collassato; il dettaglio completo e' nel corpo espanso. */}

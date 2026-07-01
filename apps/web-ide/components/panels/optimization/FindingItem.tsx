@@ -54,7 +54,7 @@ export function FindingItem({
               maxWidth={300}
               tc={tc}
               style={{
-                fontFamily: '"JetBrains Mono", monospace',
+                fontFamily: 'var(--font-mono)',
                 fontSize: 11,
                 color: tc.accent,
               }}

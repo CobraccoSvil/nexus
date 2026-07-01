@@ -84,7 +84,7 @@ function ToolUseBadges({ toolUses, tc }: { toolUses: ToolUseBlock[]; tc: ThemeCo
               border: `1px solid ${tc.border}`,
               background: `${tc.bgInput}80`,
               fontSize: 11,
-              fontFamily: "monospace",
+              fontFamily: "var(--font-mono)",
               maxWidth: "100%",
               overflow: "hidden",
               textOverflow: "ellipsis",
@@ -351,7 +351,7 @@ function InlineTruncated({ text, maxLen = 400, tc, mono = true }: { text: string
   return (
     <div>
       <pre style={{
-        fontFamily: mono ? "monospace" : "inherit",
+        fontFamily: mono ? "var(--font-mono)" : "inherit",
         fontSize: 11,
         whiteSpace: "pre-wrap",
         wordBreak: "break-word",
@@ -691,7 +691,7 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
                         </div>
                       )}
                       {step.createdAt && (
-                        <div style={{ fontSize: 10, opacity: 0.5, fontFamily: "monospace" }}>
+                        <div style={{ fontSize: 10, opacity: 0.5, fontFamily: "var(--font-mono)" }}>
                           {new Date(step.createdAt).toLocaleTimeString()}
                         </div>
                       )}

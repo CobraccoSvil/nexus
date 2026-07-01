@@ -91,7 +91,7 @@ export function PurposeModelsSection({
                 <div style={{ fontSize: 11, color: tc.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {p.desc}
                 </div>
-                <div style={{ fontSize: 10, color: tc.textMuted, marginTop: 2, fontFamily: "monospace" }}>{p.key}</div>
+                <div style={{ fontSize: 10, color: tc.textMuted, marginTop: 2, fontFamily: "var(--font-mono)" }}>{p.key}</div>
                 {tierActive && (
                   <div style={{ marginTop: 4, fontSize: 10, color: tc.textMuted }}>
                     Selezione dinamica dal catalog per categoria. Provider/modello sono usati solo come fallback statico.

@@ -397,7 +397,7 @@ export function StagingArea({
             minHeight: 120,
             maxHeight: 260,
             overflow: "auto",
-            fontFamily: "\"JetBrains Mono\", Menlo, monospace",
+            fontFamily: "var(--font-mono)",
             fontSize: 12,
             lineHeight: 1.5,
             color: tc.text,

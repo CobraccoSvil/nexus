@@ -166,7 +166,7 @@ export function SystemdServicesSection({
                   // Rende leggibili i comandi shell wrappati tra backtick letterali (es. `sudo systemctl start user@$(id -u)`).
                   .split("`")
                   .map((seg, i) => (i % 2 === 1
-                    ? <code key={i} style={{ fontFamily:'"JetBrains Mono", monospace', fontSize:11 }}>{seg}</code>
+                    ? <code key={i} style={{ fontFamily:'var(--font-mono)', fontSize:11 }}>{seg}</code>
                     : <span key={i}>{seg}</span>))}
               </div>
             </div>
@@ -209,10 +209,10 @@ export function SystemdServicesSection({
             <div key={svc.unit} style={{ marginBottom:6 }}>
               <div style={{ display:"flex",alignItems:"center",gap:8 }}>
                 <span style={{ color:col,fontSize:13,flexShrink:0 }}>●</span>
-                <span title={svc.unit} style={{ flex:1,minWidth:0,fontSize:12,color:tc.text,fontFamily:'"JetBrains Mono", monospace',overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
+                <span title={svc.unit} style={{ flex:1,minWidth:0,fontSize:12,color:tc.text,fontFamily:'var(--font-mono)',overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
                   {svc.short}
                 </span>
-                <span style={{ flexShrink:0,fontSize:11,color:col,fontFamily:'"JetBrains Mono", monospace' }}>
+                <span style={{ flexShrink:0,fontSize:11,color:col,fontFamily:'var(--font-mono)' }}>
                   {stateText}
                 </span>
                 {showQuickChat && (
@@ -276,7 +276,7 @@ export function SystemdServicesSection({
                       background:"transparent", border:`1px solid ${tc.border}`,
                       color:tc.textMuted, borderRadius:3, padding:"1px 6px", fontSize:10,
                       cursor: svcBusy[`${svc.unit}-uninstall`] ? "wait" : "pointer",
-                      fontFamily:'"JetBrains Mono", monospace',
+                      fontFamily:'var(--font-mono)',
                       opacity: svcBusy[`${svc.unit}-uninstall`] ? 0.5 : 1,
                     }}
                   >
@@ -290,7 +290,7 @@ export function SystemdServicesSection({
                     href={effectiveUrl}
                     target="_blank"
                     rel="noreferrer"
-                    style={{ fontSize:10,color:tc.accent,textDecoration:"none",fontFamily:'"JetBrains Mono", monospace' }}
+                    style={{ fontSize:10,color:tc.accent,textDecoration:"none",fontFamily:'var(--font-mono)' }}
                     onMouseEnter={e=>(e.currentTarget.style.textDecoration="underline")}
                     onMouseLeave={e=>(e.currentTarget.style.textDecoration="none")}
                   >

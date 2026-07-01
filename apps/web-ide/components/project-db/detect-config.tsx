@@ -82,7 +82,7 @@ export function DetectConfig({
             borderRadius: 3, border: `1px solid ${tc.border}`,
             background: "transparent", color: tc.textMuted,
             cursor: loading ? "default" : "pointer",
-            fontFamily: '"JetBrains Mono", monospace',
+            fontFamily: 'var(--font-mono)',
             opacity: loading ? 0.5 : 1,
           }}
         >
@@ -115,7 +115,7 @@ export function DetectConfig({
             </div>
           )}
           {detectedConfig.connection_string && (
-            <div style={{ fontFamily: "monospace", fontSize: 9, color: tc.textMuted, wordBreak: "break-all", marginTop: 2 }}>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: tc.textMuted, wordBreak: "break-all", marginTop: 2 }}>
               <span style={{ color: tc.textSecondary }}>Connessione:</span>{" "}
               {/* Oscura password nella connection string per sicurezza */}
               {detectedConfig.connection_string.replace(/[Pp]assword=([^;,"']+)/g, "Password=***").replace(/:([^:@]+)@/, ":***@")}

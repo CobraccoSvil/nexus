@@ -163,7 +163,7 @@ export function SecuritySettings({ items, editValues, saving, saved, onEditChang
               padding: "6px 10px",
               fontSize: 12,
               color: tc.text,
-              fontFamily: "monospace",
+              fontFamily: "var(--font-mono)",
             }}
           />
           <button

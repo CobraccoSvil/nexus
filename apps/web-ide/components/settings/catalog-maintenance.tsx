@@ -131,14 +131,14 @@ export function CatalogMaintenance() {
       )}
 
       {syncResult && (
-        <div style={{ marginTop: 12, padding: 8, borderRadius: 4, background: "var(--color-bgInput)", fontSize: 12, fontFamily: "monospace" }}>
+        <div style={{ marginTop: 12, padding: 8, borderRadius: 4, background: "var(--color-bgInput)", fontSize: 12, fontFamily: "var(--font-mono)" }}>
           Sync OK ({syncResult.source}): aggiunti <b>{syncResult.added ?? 0}</b>, aggiornati{" "}
           <b>{syncResult.updated ?? 0}</b>, ignorati <b>{syncResult.skipped ?? 0}</b>.
         </div>
       )}
 
       {probeResult && (
-        <div style={{ marginTop: 12, padding: 8, borderRadius: 4, background: "var(--color-bgInput)", fontSize: 12, fontFamily: "monospace" }}>
+        <div style={{ marginTop: 12, padding: 8, borderRadius: 4, background: "var(--color-bgInput)", fontSize: 12, fontFamily: "var(--font-mono)" }}>
           Probe completato su <b>{probeResult.total ?? 0}</b> modelli (soglia auto-disable:{" "}
           {probeResult.failure_threshold ?? "?"}): sani <b>{probeResult.healthy ?? 0}</b>, errori provider{" "}
           <b>{probeResult.provider_wide_errors ?? 0}</b>, errori modello{" "}

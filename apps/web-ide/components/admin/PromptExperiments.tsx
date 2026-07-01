@@ -264,7 +264,7 @@ function ExperimentCard({
             >
               {STATUS_LABELS[exp.status] ?? exp.status}
             </span>
-            <span style={{ fontFamily: "monospace", fontSize: 13, color: tc.text }}>
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: tc.text }}>
               {exp.prompt_key}
             </span>
             <span style={{ fontSize: 12, color: tc.textSecondary }}>
@@ -418,7 +418,7 @@ function ExperimentDetail({ data }: { data: PromptExperiment }) {
                     style={{
                       fontSize: 11, background: tc.bgCard, border: `1px solid ${borderColor}`,
                       borderRadius: 6, padding: 12, overflow: "auto", maxHeight: 256,
-                      whiteSpace: "pre-wrap", fontFamily: "monospace", color: tc.text,
+                      whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)", color: tc.text,
                     }}
                   >
                     {content ?? "(nessun contenuto)"}

@@ -5,6 +5,14 @@
    Colori sono CSS variables registrate da theme-body.tsx
    ============================================================ */
 
+/* ---------- 0. Design token tipografico ---------- */
+/* PUNTO UNICO tipografico (regola L): la variabile --font-mono e' definita da
+   next/font/local in app/layout.tsx (JetBrains Mono self-hosted) e applicata a
+   <html>, quindi ereditata ovunque, portal inclusi. Tutti gli inline style e le
+   utility usano var(--font-mono); nessun componente ridichiara lo stack (niente
+   "JetBrains Mono, ..." / ui-monospace / monospace nudo sparsi). Il font e il
+   fallback si cambiano SOLO in layout.tsx. */
+
 /* ---------- 1. Reset / base ---------- */
 body {
   margin: 0;
@@ -12,8 +20,8 @@ body {
      dimensione, inclusi i contenuti via portal (dialog/menu/toast) e i testi
      non stilizzati (es. gli stati vuoti dei pannelli). Senza family cadrebbero
      sul serif del browser (Times New Roman); senza size sui 16px di default
-     (oversize rispetto ai 12-13px dell'UI). */
-  font-family: "JetBrains Mono", "Fira Code", monospace;
+     (oversize rispetto ai 12-13px dell'UI). Lo stack e' in var(--font-mono). */
+  font-family: var(--font-mono);
   font-size: 13px;
 }
 

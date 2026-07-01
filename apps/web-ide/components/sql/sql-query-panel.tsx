@@ -282,7 +282,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
             minimap: { enabled: false },
             fontSize: 13,
             lineHeight: 20,
-            fontFamily: '"JetBrains Mono", monospace',
+            fontFamily: 'var(--font-mono)',
             automaticLayout: true,
             wordWrap: "on",
             tabSize: 2,
@@ -305,7 +305,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
               border: "1px solid #6b2828",
               borderRadius: 4,
               whiteSpace: "pre-wrap",
-              fontFamily: '"JetBrains Mono", monospace',
+              fontFamily: 'var(--font-mono)',
               marginBottom: 8,
             }}
           >
@@ -352,7 +352,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
                   border: "none",
                   borderBottom: `1px solid ${tc.border}`,
                   color: tc.text,
-                  fontFamily: '"JetBrains Mono", monospace',
+                  fontFamily: 'var(--font-mono)',
                   fontSize: 11,
                   cursor: "pointer",
                 }}
@@ -430,7 +430,7 @@ function ReadResultGrid({
                     style={{
                       padding: "3px 8px",
                       borderBottom: `1px solid ${tc.border}`,
-                      fontFamily: '"JetBrains Mono", monospace',
+                      fontFamily: 'var(--font-mono)',
                       whiteSpace: "nowrap",
                       maxWidth: 320,
                       overflow: "hidden",

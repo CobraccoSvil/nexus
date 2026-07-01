@@ -446,7 +446,7 @@ function CreatePurposeModal({
             onChange={(e) => setCommandTemplate(e.target.value)}
             placeholder="apt-get install -y libfoo libbar"
             rows={2}
-            style={{ ...inputStyle(tc), fontFamily: "monospace", resize: "vertical" }}
+            style={{ ...inputStyle(tc), fontFamily: "var(--font-mono)", resize: "vertical" }}
           />
         </FormField>
         <label style={{ display: "flex", gap: 6, fontSize: 12, color: tc.textMuted, marginTop: 8 }}>
@@ -537,7 +537,7 @@ function preStyle(tc: ReturnType<typeof useThemeColors>) {
     border: `1px solid ${tc.border}`,
     borderRadius: 4,
     fontSize: 11.5,
-    fontFamily: '"JetBrains Mono", "Consolas", monospace',
+    fontFamily: 'var(--font-mono)',
     maxHeight: 240,
     overflow: "auto" as const,
     whiteSpace: "pre-wrap" as const,

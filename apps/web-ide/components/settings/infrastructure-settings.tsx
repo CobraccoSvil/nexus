@@ -506,7 +506,7 @@ export function InfrastructureSettings({
             padding: "7px 10px",
             color: tc.text,
             fontSize: 13,
-            fontFamily: "monospace",
+            fontFamily: "var(--font-mono)",
             outline: "none",
           }}
         />
@@ -931,7 +931,7 @@ function tagStyle(
     borderRadius: 999,
     fontSize: 10,
     fontWeight: 500,
-    fontFamily: "monospace",
+    fontFamily: "var(--font-mono)",
     background: accentColor
       ? `${accentColor}14`
       : resolved === "dark" ? "#ffffff0a" : "#0000000a",

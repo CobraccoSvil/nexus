@@ -118,7 +118,7 @@ export function LegacyMcpList({
                     <span
                       key={name}
                       style={{
-                        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                        fontFamily: "var(--font-mono)",
                         fontSize: 11,
                         padding: "3px 6px",
                         borderRadius: 999,

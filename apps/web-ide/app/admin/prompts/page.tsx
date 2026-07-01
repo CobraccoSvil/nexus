@@ -710,7 +710,7 @@ export default function PromptsAdminPage() {
                   style={{
                     width: "100%",
                     minHeight: 480,
-                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                    fontFamily: "var(--font-mono)",
                     fontSize: 13,
                     lineHeight: 1.55,
                     border: `2px solid ${tc.border}`,
@@ -828,7 +828,7 @@ export default function PromptsAdminPage() {
                           maxHeight: 320,
                           overflow: "auto",
                           fontSize: 12,
-                          fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                          fontFamily: "var(--font-mono)",
                           lineHeight: 1.5,
                           color: tc.text,
                           whiteSpace: "pre-wrap",

@@ -620,7 +620,7 @@ function predicateChip(tc: ThemeColors): React.CSSProperties {
     border: `1px solid ${tc.border}`,
     borderRadius: 10,
     fontSize: 11,
-    fontFamily: "monospace",
+    fontFamily: "var(--font-mono)",
   };
 }
 

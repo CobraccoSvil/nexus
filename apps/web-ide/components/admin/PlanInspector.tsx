@@ -48,7 +48,7 @@ export function PlanInspector({ runId, onClose }: { runId: string; onClose: () =
         <header style={{ display: "flex", justifyContent: "space-between", marginBottom: 16, borderBottom: `1px solid ${tc.border}`, paddingBottom: 12 }}>
           <div>
             <h2 style={{ margin: 0 }}>Plan {runId.slice(0, 8)}</h2>
-            <div style={{ fontSize: 11, color: tc.textMuted, fontFamily: "monospace" }}>{runId}</div>
+            <div style={{ fontSize: 11, color: tc.textMuted, fontFamily: "var(--font-mono)" }}>{runId}</div>
           </div>
           <button onClick={onClose} style={{ padding: "4px 12px", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, cursor: "pointer" }}>Close</button>
         </header>
@@ -97,7 +97,7 @@ export function PlanInspector({ runId, onClose }: { runId: string; onClose: () =
                     {plan.verifierRuns.map((v) => (
                       <tr key={v.id} style={{ borderBottom: `1px solid ${tc.border}33` }}>
                         <td style={{ padding: 4 }}>{v.cycle}</td>
-                        <td style={{ padding: 4, fontFamily: "monospace" }}>{v.todoId?.slice(0, 8) ?? "-"}</td>
+                        <td style={{ padding: 4, fontFamily: "var(--font-mono)" }}>{v.todoId?.slice(0, 8) ?? "-"}</td>
                         <td style={{ padding: 4, color: v.passed ? "#16a34a" : "#dc2626" }}>{v.passed ? "PASS" : "FAIL"}</td>
                         <td style={{ padding: 4 }}>{v.durationMs ? `${v.durationMs}ms` : "-"}</td>
                         <td style={{ padding: 4 }}>{v.createdAt?.slice(11, 19)}</td>

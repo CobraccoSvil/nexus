@@ -131,7 +131,7 @@ export function ProviderBudget() {
                     </span>
                   )}
                 </div>
-                <div style={{ fontSize: 12, color: "var(--color-textMuted)", fontFamily: "monospace" }}>
+                <div style={{ fontSize: 12, color: "var(--color-textMuted)", fontFamily: "var(--font-mono)" }}>
                   ${remaining.toFixed(4)} / ${budget.toFixed(2)} ({(100 - pct).toFixed(1)}%)
                 </div>
               </div>

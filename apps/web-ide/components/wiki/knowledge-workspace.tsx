@@ -930,7 +930,7 @@ function Field({ label, value, tc }: { label: string; value: string; tc: ThemeCo
   return (
     <div style={{ display: "flex", gap: 6, fontSize: 12, marginBottom: 2 }}>
       <span style={{ color: tc.textSecondary, minWidth: 70 }}>{label}:</span>
-      <span style={{ color: tc.text, fontFamily: "monospace", fontSize: 11 }}>{value}</span>
+      <span style={{ color: tc.text, fontFamily: "var(--font-mono)", fontSize: 11 }}>{value}</span>
     </div>
   );
 }
@@ -1203,7 +1203,7 @@ function SimpleDiff({ a, b, tc }: { a: string; b: string; tc: ThemeColors }) {
         borderRadius: 4,
         border: `1px solid ${tc.border}`,
         fontSize: 11.5,
-        fontFamily: "monospace",
+        fontFamily: "var(--font-mono)",
         overflow: "auto",
         maxHeight: 600,
         whiteSpace: "pre-wrap",

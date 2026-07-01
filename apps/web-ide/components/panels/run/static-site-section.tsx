@@ -67,7 +67,7 @@ export function StaticSiteSection({ tc, projectId }: StaticSiteSectionProps) {
               minWidth: 0,
               fontSize: 12,
               color: tc.text,
-              fontFamily: '"JetBrains Mono", monospace',
+              fontFamily: 'var(--font-mono)',
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",

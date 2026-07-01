@@ -232,7 +232,7 @@ export function ProfileSelector({
               width: "100%",
               boxSizing: "border-box",
               fontSize: 12,
-              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+              fontFamily: "var(--font-mono)",
               background: "transparent",
               border: "1px solid rgba(128,128,128,0.3)",
               borderRadius: 6,

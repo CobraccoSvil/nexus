@@ -58,7 +58,7 @@ export function PortAllocationsSection({
         )}
         {portAllocations.map((a) => (
           <div key={a.id} style={{ display:"flex",alignItems:"center",gap:8,marginBottom:3 }}>
-            <span style={{ background:a.allocation_mode==="manual"?"#7c3aed":"#0ea5e9",color:"#fff",borderRadius:3,padding:"1px 6px",fontSize:9,fontFamily:'"JetBrains Mono", monospace',flexShrink:0,minWidth:48,textAlign:"center" }}>
+            <span style={{ background:a.allocation_mode==="manual"?"#7c3aed":"#0ea5e9",color:"#fff",borderRadius:3,padding:"1px 6px",fontSize:9,fontFamily:'var(--font-mono)',flexShrink:0,minWidth:48,textAlign:"center" }}>
               {a.port}
             </span>
             <span style={{ fontSize:9,color:tc.textMuted,borderRadius:2,padding:"0 4px",background:a.allocation_mode==="manual"?"rgba(124,58,237,0.1)":"rgba(14,165,233,0.1)" }}>

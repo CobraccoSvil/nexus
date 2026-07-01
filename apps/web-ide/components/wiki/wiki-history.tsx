@@ -149,7 +149,7 @@ function WikiDiffView({
         border: `1px solid ${tc.border}`,
         fontSize: 11.5,
         lineHeight: 1.5,
-        fontFamily: '"JetBrains Mono", "Consolas", monospace',
+        fontFamily: 'var(--font-mono)',
         maxHeight: 480,
         overflowY: "auto",
         whiteSpace: "pre-wrap",

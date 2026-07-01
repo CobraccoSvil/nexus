@@ -102,7 +102,7 @@ export function WikiEditor({
             border: "none",
             borderRight: `1px solid ${tc.border}`,
             padding: 14,
-            fontFamily: '"JetBrains Mono", "Consolas", monospace',
+            fontFamily: 'var(--font-mono)',
             fontSize: 12.5,
             lineHeight: 1.6,
             resize: "none",

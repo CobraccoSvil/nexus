@@ -60,7 +60,7 @@ export function GatewayConfig({ items, onSaveComplete, onRefreshProviders }: Gat
   };
 
   return (
-    <div style={{ fontFamily: "'JetBrains Mono', monospace", color: "var(--color-text)" }}>
+    <div style={{ fontFamily: "var(--font-mono)", color: "var(--color-text)" }}>
       <div style={card}>
         <div style={lbl}>Hot-Reload Configurazione</div>
         <p style={{ fontSize: 12, color: "var(--color-textMuted)", marginBottom: 12 }}>

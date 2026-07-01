@@ -74,10 +74,17 @@ function TerminalInstance({
 
       if (disposed) return;
 
+      // xterm misura i glifi su canvas e NON risolve le CSS var: leggiamo il
+      // valore computed del token unico (--font-mono, vedi globals.css) e lo
+      // passiamo risolto, cosi' il punto unico tipografico (regola L) resta uno.
+      const fontMono =
+        getComputedStyle(document.documentElement)
+          .getPropertyValue("--font-mono")
+          .trim() || "monospace";
       const term = new Terminal({
         cursorBlink: true,
         fontSize: 13,
-        fontFamily: "\"JetBrains Mono\", \"Fira Code\", Menlo, monospace",
+        fontFamily: fontMono,
         theme: isDark
           ? { background: "#0d1117", foreground: "#e6edf3", cursor: "#58a6ff", selectionBackground: "#264f78" }
           : { background: "#f5f7fa", foreground: "#1a2332", cursor: "#2b6cb0", selectionBackground: "#d0e2f7" },

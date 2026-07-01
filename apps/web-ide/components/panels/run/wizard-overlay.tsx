@@ -117,13 +117,13 @@ export function WizardOverlay({
                           background: `${modeColor}1c`,
                           border: `1px solid ${modeColor}55`,
                           borderRadius: 3, padding: "1px 5px",
-                          fontFamily: '"JetBrains Mono", monospace',
+                          fontFamily: 'var(--font-mono)',
                           whiteSpace: "nowrap", flexShrink: 0,
                         }}>{modeLabel}</span>
                       </div>
                       <div style={{
                         fontSize: 10, color: tc.textMuted,
-                        fontFamily: '"JetBrains Mono", monospace',
+                        fontFamily: 'var(--font-mono)',
                         wordBreak: "break-all", overflowWrap: "anywhere",
                       }}>
                         {svc.command} {svc.args.join(" ")}

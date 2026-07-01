@@ -104,7 +104,7 @@ export function NexusServicesSection({
                   <span title={`Controlla il LED "${svc.led}" nella statusbar`} style={{
                     fontSize:9, color:"#60a5fa", background:"rgba(96,165,250,0.12)",
                     border:"1px solid rgba(96,165,250,0.3)", borderRadius:3,
-                    padding:"1px 5px", marginLeft:7, fontFamily:'"JetBrains Mono", monospace',
+                    padding:"1px 5px", marginLeft:7, fontFamily:'var(--font-mono)',
                   }}>
                     LED: {svc.led}
                   </span>
@@ -113,7 +113,7 @@ export function NexusServicesSection({
                   <span title="Processo avviato direttamente (fuori da systemd)" style={{
                     fontSize:9, color:"#94a3b8", background:"rgba(148,163,184,0.1)",
                     border:"1px solid rgba(148,163,184,0.25)", borderRadius:3,
-                    padding:"1px 4px", marginLeft:6, fontFamily:'"JetBrains Mono", monospace',
+                    padding:"1px 4px", marginLeft:6, fontFamily:'var(--font-mono)',
                   }}>
                     diretto
                   </span>

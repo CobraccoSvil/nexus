@@ -380,7 +380,7 @@ function ProjectDatabasePageInner() {
                       <tbody>
                         {(nexusDbStats.tables ?? []).map((table, idx, arr) => (
                           <tr key={table.name} style={{ borderBottom: idx < arr.length - 1 ? `1px solid ${tc.border}` : "none" }}>
-                            <td style={{ padding: "10px 12px", color: tc.text, fontFamily: "monospace", fontSize: 12 }}>{table.name}</td>
+                            <td style={{ padding: "10px 12px", color: tc.text, fontFamily: "var(--font-mono)", fontSize: 12 }}>{table.name}</td>
                             <td style={{ padding: "10px 12px", color: tc.textMuted, textAlign: "right" }}>{table.row_count?.toLocaleString("it-IT") ?? "—"}</td>
                             <td style={{ padding: "10px 12px", color: tc.textMuted, fontSize: 12 }}>
                               {table.last_updated ? new Date(table.last_updated).toLocaleString("it-IT") : "—"}

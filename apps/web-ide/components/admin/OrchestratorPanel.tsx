@@ -174,8 +174,8 @@ export function OrchestratorPanel() {
             <tbody>
               {plans.map((p) => (
                 <tr key={p.runId} style={{ borderBottom: `1px solid ${tc.border}33` }}>
-                  <td style={{ padding: 6, fontFamily: "monospace" }}>{p.runId.slice(0, 8)}</td>
-                  <td style={{ padding: 6, fontFamily: "monospace" }}>{p.projectId.slice(0, 8)}</td>
+                  <td style={{ padding: 6, fontFamily: "var(--font-mono)" }}>{p.runId.slice(0, 8)}</td>
+                  <td style={{ padding: 6, fontFamily: "var(--font-mono)" }}>{p.projectId.slice(0, 8)}</td>
                   <td style={{ padding: 6 }}>{p.plannerModel ?? "-"}</td>
                   <td style={{ padding: 6, textAlign: "right" }}>{p.todosDone}/{p.todosTotal}</td>
                   <td style={{ padding: 6, textAlign: "right" }}>{p.verifierRuns}</td>

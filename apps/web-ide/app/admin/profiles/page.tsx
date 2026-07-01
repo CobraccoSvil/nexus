@@ -345,7 +345,7 @@ function ProfileCard({
               style={{
                 ...input,
                 resize: "vertical",
-                fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                fontFamily: "var(--font-mono)",
                 fontSize: 12,
               }}
             />
@@ -358,7 +358,7 @@ function ProfileCard({
                 background: `${tc.accent}08`,
                 borderRadius: 6,
                 padding: "10px 12px",
-                fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                fontFamily: "var(--font-mono)",
                 whiteSpace: "pre-wrap",
                 maxHeight: 200,
                 overflow: "auto",
@@ -788,7 +788,7 @@ export default function AdminProfilesPage() {
                 style={{
                   ...input,
                   resize: "vertical",
-                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                  fontFamily: "var(--font-mono)",
                   fontSize: 12,
                 }}
               />

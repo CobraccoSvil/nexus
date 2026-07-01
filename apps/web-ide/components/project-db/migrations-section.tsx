@@ -59,7 +59,7 @@ export function MigrationsSection({
             onChange={(e) => setMigForm((f) => ({ ...f, sql: e.target.value }))}
             rows={6}
             placeholder="CREATE TABLE ..."
-            style={{ padding: 6, fontSize: 11, fontFamily: "monospace", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, resize: "vertical" }}
+            style={{ padding: 6, fontSize: 11, fontFamily: "var(--font-mono)", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, resize: "vertical" }}
           />
           <label style={{ fontSize: 10, color: tc.textMuted }}>Motivo (min 10 caratteri)</label>
           <input

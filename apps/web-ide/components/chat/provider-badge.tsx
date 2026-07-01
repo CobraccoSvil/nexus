@@ -181,7 +181,7 @@ export function ProviderBadge({
         background: bg,
         border: `1px solid ${border}`,
         fontSize: 10.5,
-        fontFamily: '"JetBrains Mono", "Consolas", monospace',
+        fontFamily: 'var(--font-mono)',
         color: alpha > 0.6 ? "#fff" : "#1a1a1a",
         whiteSpace: "nowrap",
         maxWidth: 280,
