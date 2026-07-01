@@ -53,7 +53,7 @@ Ogni progetto registrato in Nexus e' un mondo a se' — risorse, config, contain
   - vietato `docker stop $(docker ps -q)`, `docker system prune`, `docker compose down` su compose globali
   - permesso solo `docker compose -f <PATH_COMPOSE_PROGETTO> down`, `docker stop <NOME_CONTAINER>` con nome esatto, oppure filtro `--filter "label=com.docker.compose.project=<SLUG>"`
 - **Container `ideai-*` sono infrastruttura Nexus, intoccabili** (`ideai-postgres-nexus-1`, `ideai-qdrant-1`, `ideai-redis-1`, `ideai-grafana-1`, ecc.). Mai fermarli/rimuoverli da agenti operanti su progetti utente.
-- **File `/home/administrator/ideai/`** appartengono al meta-progetto Nexus; modifiche solo se l'utente sta esplicitamente lavorando su Nexus.
+- **I file del repo meta-progetto Nexus** (`D:\IDEAI`) appartengono a Nexus; modifiche solo se l'utente sta esplicitamente lavorando su Nexus.
 - **Letture massive ricorsive fuori root progetto vietate** (rumore + rischio leak). Letture puntuali ammesse per debugging.
 
 Lo stesso vincolo e' replicato come tag `<safety_progetto>` nei system prompt agente principali (`system.nexus_base`, `agent.coder.base`, `agent.general.debugger`) — vedi migrazione `0096_project_isolation_rules.sql`.
@@ -299,16 +299,17 @@ aggiungilo al catalogo. Mai copiare-e-adattare.
 
 ## Esecuzione locale canonica
 
-- Ambiente di sviluppo: **solo WSL**, percorso `/home/administrator/ideai`. Non modificare mai `D:\Sviluppo\IDEAI` dall'host Windows.
-- Tutto gira in locale su WSL; nessun `preview_start` e nessun server remoto.
+- Ambiente di sviluppo locale: **Windows nativo**, repo Git in `D:\IDEAI`. Shell:
+  **PowerShell** (più la Bash tool POSIX solo per comandi Unix puntuali). Niente WSL,
+  niente percorsi `/home/...`, niente `wsl.exe`.
+- Build/gate Rust via PowerShell con toolchain MSVC (`cargo check` / `clippy` / `test`).
+- Nessun `preview_start` per il dev locale.
 - Comandi chiave:
-  - `pnpm verify` — gate completo
+  - `pnpm verify` — gate completo (turbo typecheck/lint/test + cargo check/clippy/test)
   - `pnpm smoke` — smoke test dei servizi (porte configurabili via env)
   - `pnpm xtask lint-commits <base> <head>` — controllo redazionale commit
-  - `./deploy/deploy-local.sh` — build + restart tutti i servizi in locale
-  - `./deploy/deploy-local.sh --rust` — solo Rust (es. dopo modifiche backend)
-  - `./deploy/deploy-local.sh --web` — solo web-ide (es. dopo modifiche frontend)
-  - `./deploy/deploy-local.sh --service mcp-core` — singolo servizio
+  - `deploy/deploy-local.ps1` — build + restart dei servizi Windows (WinSW); per i
+    parametri vedere lo script stesso
 
 ## Riferimenti incrociati
 

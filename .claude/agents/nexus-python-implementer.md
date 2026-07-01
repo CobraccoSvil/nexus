@@ -40,7 +40,7 @@ Leggi sempre **in questo ordine**:
 
 - Non usare `print()` per debug in produzione. Usa `logger.debug/info/warn/error`.
 - Non importare modelli AI per nome (es. `import openai; client = OpenAI(model="gpt-4")`). Usa il routing layer del brain.
-- Non leggere `/home/administrator/ideai/brain/nexus_memory/` — quel path e' deprecato (file SQLite legacy).
+- Non usare il vecchio store di memoria SQLite legacy in `brain/nexus_memory/` — e' deprecato.
 - Non modificare nessun file fuori da `brain/` o `tests/` senza ragione esplicita.
 
 ## Esempio risposta tipica

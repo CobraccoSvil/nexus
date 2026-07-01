@@ -36,7 +36,7 @@ stupefied-*/
 /projects/
 
 # Backup DB locali (pg_dump pesanti). Versionati solo su filesystem
-# WSL + D:\Backups\Nexus\ tramite deploy/backup-db-to-d.sh, mai in git.
+# locale + D:\Backups\Nexus\ tramite deploy/backup-db-to-d.sh, mai in git.
 backups/*.dump
 backups/*.sql.gz
 backups/postgres/*.dump

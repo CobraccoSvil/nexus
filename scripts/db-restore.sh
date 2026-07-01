@@ -52,8 +52,7 @@ PGPASSWORD="${PGPASSWORD:-nexus}"
 export PGPASSWORD
 PG_CONTAINER="${PG_CONTAINER:-ideai-postgres-nexus-1}"
 
-info "Stop stack Nexus…"
-./scripts/dev-wsl.sh stop >/dev/null 2>&1 || true
+info "Nota: ferma i servizi che usano il DB prima del restore (Windows: deploy/deploy-local.ps1)."
 
 info "Avvio Postgres container…"
 docker compose -f docker-compose.local.yml up -d postgres-nexus >/dev/null
@@ -105,8 +104,7 @@ fi
 
 success "Restore completato."
 
-info "Riavvio stack Nexus…"
-./scripts/dev-wsl.sh >/dev/null 2>&1 || true
+info "Restore terminato: riavvia i servizi (Windows: deploy/deploy-local.ps1)."
 
 success "Fatto."
 exit 0

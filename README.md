@@ -26,9 +26,9 @@ Enterprise monorepo scaffold for an AI-assisted development platform with:
 5. Start the Web IDE with `pnpm --filter @ai-orchestrator/web-ide dev`.
 6. Build and run the Rust core with Cargo once Rust is installed.
 
-## Database backups (WSL/dev)
+## Database backups (dev locale)
 
-If you run the local stack in WSL with `./scripts/dev-wsl.sh`, the Postgres DB lives in a Docker volume.
+When you run the local stack, the Postgres DB lives in a Docker volume (`docker-compose.local.yml`).
 To avoid losing `settings` (OAuth/API keys/routing) on `docker compose down -v`, use the backup scripts:
 
 - Create a backup:

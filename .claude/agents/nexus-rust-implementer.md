@@ -41,7 +41,7 @@ Leggi sempre **in questo ordine** prima di toccare il codice:
 
 - Non scrivere `unwrap()` o `expect()` fuori da `#[cfg(test)]` o `tests/`.
 - Non hardcodare nomi modello AI, URL provider, JWT secret, o qualsiasi altro segreto.
-- Non toccare `D:\Sviluppo\IDEAI` dall'host Windows. Sempre WSL su `/home/administrator/ideai`.
+- Operare esclusivamente nel repo Windows nativo `D:\IDEAI` via PowerShell. Niente WSL, niente percorsi `/home/...`.
 - Non scrivere emoji nel codice sorgente (eccezione: display label UI in JSX).
 - Non leggere file interi quando puoi grep + offset/limit.
 

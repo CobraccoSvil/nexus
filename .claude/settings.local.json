@@ -74,17 +74,7 @@
       "Read(//c/Users/CBRAC/.ssh//**)",
       "Bash(find D:/Sviluppo/IDEAI -name deploy* -o -name Makefile -o -name *.sh)",
       "Bash(ssh-add -l)",
-      "Bash(wsl -d Ubuntu -- bash -lc 'pwd && ls /home/administrator/ideai/scripts/dev-wsl.sh && ls /home/administrator/ideai/.env 2>&1 | head -5')",
-      "mcp__Claude_in_Chrome__computer",
-      "Bash(wsl bash *)",
-      "Bash(wsl -d Ubuntu -- ls /home/administrator/ideai/deploy/)",
-      "Bash(wsl.exe -d Ubuntu -- bash -c \"ls /home/administrator/ideai/deploy/\")",
-      "Bash(wsl.exe -d Ubuntu -- bash -c \"cd /home/administrator/ideai && ./deploy/deploy-local.sh\")",
-      "PowerShell(wsl --shutdown)",
-      "PowerShell(wsl -d Ubuntu -e bash -c \"echo OK\")",
-      "PowerShell(wsl.exe -d Ubuntu -- bash -c \"ls /home/administrator/ideai/crates/mcp-core/src/ | head -60\")",
-      "PowerShell(wsl.exe -d Ubuntu -- bash -c \"wc -l /home/administrator/ideai/crates/mcp-core/src/agent_loop.rs /home/administrator/ideai/crates/mcp-core/src/chat_messages.rs /home/administrator/ideai/crates/mcp-core/src/brain_agent_client.rs /home/administrator/ideai/crates/mcp-core/src/semantic_compact.rs /home/administrator/ideai/crates/mcp-core/src/orchestrator.rs /home/administrator/ideai/crates/mcp-core/src/main.rs\")",
-      "PowerShell(wsl.exe -d Ubuntu -- bash -c \"cd /home/administrator/ideai && cargo check --workspace 2>&1 | tail -150\")"
+      "mcp__Claude_in_Chrome__computer"
     ]
   },
   "hooks": {

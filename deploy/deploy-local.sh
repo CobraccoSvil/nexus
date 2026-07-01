@@ -78,7 +78,6 @@ SERVICES_CATALOG=(
     "web-ide|web-ide|Frontend Next.js (porta 3000)"
     "nexus-gateway|gateway|API gateway LLM (porta 4060) — Node.js"
     "admin-service|builtin|Backend admin UI (porta 4010)"
-    "chat-service|builtin|Backend chat UI (porta 4020)"
     "doc-service|builtin|Backend doc generator (porta 4030)"
     "billing-service|builtin|Backend billing/quote (porta 4040)"
     "plugin-service|builtin|Backend plugin manager (porta 4050)"
@@ -227,7 +226,7 @@ stop_service() {
     # (`target/<profilo>/<nome>`), che non compare mai nella command line dello
     # script. Il pattern e' indipendente da:
     #   - modo di invocazione: assoluto (start_service usa ${BIN_DIR}/${name})
-    #     o relativo (es. ./target/release/mcp-core avviato da Start-Dev.ps1);
+    #     o relativo (es. ./target/release/mcp-core avviato a mano);
     #   - profilo (debug|release): cosi' un restart in release ferma comunque un
     #     vecchio processo debug ancora attaccato alla porta, e viceversa.
     # L'ancoraggio finale ([[:space:]]|$) evita match parziali (es. mcp-core-x).
@@ -531,12 +530,12 @@ if $RUST_ONLY; then
     cd "$ROOT"
     cargo build ${CARGO_PROFILE_FLAG} --workspace 2>&1 | tail -10
     log "Restart servizi Rust..."
-    for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp; do
+    for svc in mcp-core admin-service billing-service doc-service plugin-service browser-bridge-mcp; do
         stop_service "$svc"
     done
     start_service "mcp-core"
     sleep 3
-    for svc in admin-service chat-service billing-service doc-service plugin-service; do
+    for svc in admin-service billing-service doc-service plugin-service; do
         start_service "$svc"
     done
     start_service_with_env "browser-bridge-mcp"
@@ -557,7 +556,7 @@ log "Arresto servizi in esecuzione..."
 # Il gateway NON e' un binario Rust standard: va fermato con la sua funzione
 # dedicata (pattern 'dist/server.js'), altrimenti stop_service non lo matcha
 # e resta un processo orfano.
-for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp; do
+for svc in mcp-core admin-service billing-service doc-service plugin-service browser-bridge-mcp; do
     stop_service "$svc"
 done
 stop_gateway
@@ -578,7 +577,7 @@ start_service "mcp-core"
 sleep 3
 
 log "Avvio microservizi..."
-for svc in admin-service chat-service billing-service doc-service plugin-service; do
+for svc in admin-service billing-service doc-service plugin-service; do
     start_service "$svc"
 done
 sleep 3
@@ -599,7 +598,6 @@ for entry in \
     "web_ide_port:web-ide" \
     "mcp_core_http_port:mcp-core" \
     "admin_service_port:admin-service" \
-    "chat_service_port:chat-service" \
     "doc_service_port:doc-service" \
     "billing_service_port:billing-service" \
     "plugin_service_port:plugin-service" \

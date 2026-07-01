@@ -1,4 +1,4 @@
-.PHONY: help dev dev-wsl dev-cloud dev-hybrid dev-onprem down stop status logs-wsl lint test build clean docker-up docker-down deploy deploy-local \
+.PHONY: help dev dev-cloud dev-hybrid dev-onprem down lint test build clean docker-up docker-down deploy deploy-local \
         bootstrap deploy-all deploy-rust deploy-web deploy-brain deploy-gateway proxy-reload health logs-prod cleanup-old
 
 # === Configurazione deploy produzione ========================================
@@ -14,12 +14,6 @@ export PROD_HOST PROXY_HOST SSH_USER DEPLOY_DIR PUBLIC_URL
 help:
 	@echo "IDEAI — comandi disponibili"
 	@echo ""
-	@echo "Sviluppo locale (WSL):"
-	@echo "  make dev-wsl          - Avvia stack completo in WSL"
-	@echo "  make stop             - Ferma tutti i servizi locali"
-	@echo "  make status           - Mostra stato servizi locali"
-	@echo "  make logs-wsl svc=core - Tail log di un servizio (core|admin|chat|neural|webide)"
-	@echo ""
 	@echo "Nexus LLM Gateway (profili):"
 	@echo "  make dev              - Start all services (cloud profile)"
 	@echo "  make dev-cloud        - Start cloud profile stack"
@@ -34,7 +28,7 @@ help:
 	@echo "  make build            - Build tutti i package"
 	@echo "  make clean            - Pulisce dist/ e node_modules"
 	@echo ""
-	@echo "Deploy locale (WSL):"
+	@echo "Deploy locale (Linux):"
 	@echo "  make deploy-local     - Build + restart tutti i servizi in locale"
 	@echo ""
 	@echo "Deploy produzione ($(PROD_HOST) <- $(PROXY_HOST), $(PUBLIC_URL)):"
@@ -55,18 +49,6 @@ help:
 	@echo "  make docker-up-cloud  - Start Docker services (cloud profile)"
 	@echo "  make docker-down      - Stop Nexus Docker services"
 	@echo "  make logs             - Tail Docker logs Nexus"
-
-dev-wsl:
-	@bash scripts/dev-wsl.sh
-
-stop:
-	@bash scripts/dev-wsl.sh stop
-
-status:
-	@bash scripts/dev-wsl.sh status
-
-logs-wsl:
-	@bash scripts/dev-wsl.sh logs $(svc)
 
 docker-up-local:
 	@docker compose -f docker-compose.local.yml up -d
