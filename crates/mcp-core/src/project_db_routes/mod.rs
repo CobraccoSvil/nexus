@@ -53,8 +53,8 @@ pub use provision::{
     init_global_pools, list_all_project_ids, project_data_pool, project_data_pool_by_correction_from,
     project_data_pool_by_feedback_from, project_data_pool_by_message_from,
     project_data_pool_by_run_from, project_data_pool_by_session, project_data_pool_by_session_from,
-    project_data_pool_from, provision_internal_core, provision_project_db, register_entity_routing,
-    DbRole,
+    project_data_pool_from, project_separation_enabled, provision_internal_core, provision_project_db,
+    register_entity_routing, DbRole,
 };
 // Esportati come fondazione; non ancora richiamati da call-site interni.
 #[allow(unused_imports)]

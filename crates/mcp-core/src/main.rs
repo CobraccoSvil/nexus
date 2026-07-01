@@ -654,6 +654,52 @@ async fn main() -> anyhow::Result<()> {
     // per-progetto (insert_message, ...) non aprono pool doppi.
     project_db_routes::init_global_pools(state.project_meta_pools.clone());
 
+    // Boot-recovery per-progetto (separazione DB): il blocco di riconciliazione PID
+    // sopra opera sul meta; a flag ON i processi agent dei progetti migrati vivono nei
+    // DB per-progetto. Qui, DOPO init_global_pools (registry pool pronto), iteriamo i
+    // progetti e marchiamo 'failed' i processi 'running'/'starting' il cui PID non e'
+    // piu' vivo. tokio::spawn: non blocca l'avvio e un errore non impedisce il boot; a
+    // flag OFF e' no-op (guard su project_separation_enabled). Mark-only: NON re-attacha
+    // il monitor (per non replicare il side-effect non idempotente di
+    // spawn_reattach_monitor); il re-attach dei processi VIVI per-progetto resta coperto
+    // dal watchdog periodico (residuo noto, degrada non corrompe).
+    {
+        let db_recover = state.db.clone();
+        tokio::spawn(async move {
+            if !project_db_routes::project_separation_enabled(&db_recover).await {
+                return;
+            }
+            use sqlx::Row;
+            for pid in project_db_routes::list_all_project_ids(&db_recover).await {
+                let pool = project_db_routes::project_data_pool_from(&db_recover, pid).await;
+                let stale = sqlx::query(
+                    "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+                for row in stale {
+                    let Ok(id) = row.try_get::<uuid::Uuid, _>("id") else {
+                        continue;
+                    };
+                    let ppid: Option<i32> = row.try_get("pid").unwrap_or(None);
+                    let alive = matches!(
+                        ppid,
+                        Some(p) if p > 0 && crate::process_util::process_alive(p as u32)
+                    );
+                    if !alive {
+                        let _ = sqlx::query(
+                            "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1 AND status IN ('running','starting')",
+                        )
+                        .bind(id)
+                        .execute(&pool)
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
     chat_learning::spawn_vector_compaction_scheduler(state.clone());
     nexus_builtin::seed_tools_and_server(&state.db).await;
     // Reindex semantico Qdrant dei tool MCP (fire-and-forget, +30s delay).

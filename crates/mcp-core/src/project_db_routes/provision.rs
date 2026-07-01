@@ -584,8 +584,9 @@ static PROJECT_SEPARATION_FLAG: once_cell::sync::Lazy<nexus_cache::TtlCache<(), 
     once_cell::sync::Lazy::new(|| nexus_cache::TtlCache::new(std::time::Duration::from_secs(30)));
 
 /// `true` se la separazione DB per-progetto e' abilitata (setting
-/// `db.project_separation.enabled`, mig 0495). Cachato 30s.
-async fn project_separation_enabled(meta_db: &sqlx::PgPool) -> bool {
+/// `db.project_separation.enabled`, mig 0495). Cachato 30s. Pubblica: usata anche dal
+/// boot-recovery per-progetto in main.rs per saltare l'iterazione a flag OFF.
+pub async fn project_separation_enabled(meta_db: &sqlx::PgPool) -> bool {
     if let Some(v) = PROJECT_SEPARATION_FLAG.get(&()) {
         return v;
     }
