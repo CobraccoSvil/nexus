@@ -1,7 +1,8 @@
 # Separazione DB per-progetto — stato del cutover (handoff)
 
-Stato al 2026-06-30. Branch: `quality/win-refactor`. Feature flag
-`db.project_separation.enabled` = **false** (sistema live invariato).
+Stato al 2026-07-01. Branch: `quality/win-refactor`. Feature flag
+`db.project_separation.enabled` = **false** (sistema live invariato). Flip validato
+tecnicamente e rollbackato; go-live in attesa di rebuild + ri-migrazione fresca.
 
 ## Obiettivo
 Spostare TUTTI i dati per-progetto di Nexus (chat, run, log, KB, costi, ...) dal
@@ -82,15 +83,35 @@ ogni progetto sia autocontenuto e portabile.
    ledger meta. Non e' un gap.
 
 ## Resta da fare (prima del flip)
-1. **Scan globali processi** (`main.rs` boot-recovery ~riga 239, `task_watchdog`):
-   `SELECT/UPDATE agent_processes` su TUTTI i progetti -> iterare `list_all_project_ids`
-   (pattern run_reaper) con dedup. NB codice `/proc`+`kill -0` Linux-specifico, in
-   porting su questa branch Windows; degrada (recovery processi parziale), NON
-   corrompe. Da fare quando il porting Windows di main.rs si stabilizza.
+1. **Scan globali processi** — stato: PARZIALE (critico fatto, boot-recovery residuo).
+   - `task_watchdog` (riconciliazione PERIODICA `agent_processes`, >10min senza
+     heartbeat): INSTRADATO per-progetto (`list_all_project_ids` + `project_data_pool_from`,
+     UPDATE idempotente). A flag ON copre i processi orfani di TUTTI i progetti. FATTO.
+   - `main.rs` boot-recovery (`SELECT id, pid FROM agent_processes` all'avvio,
+     ~riga 372): resta META-only. Instradarlo per-progetto NON e' banale per due
+     vincoli reali: (a) l'ordine di init — `init_global_pools` (registry pool) e' a
+     riga 655, DOPO il boot-recovery, quindi `project_data_pool_from` a riga 372
+     troverebbe il registry non inizializzato e ricadrebbe sempre sul meta; (b)
+     `spawn_reattach_monitor` ha un side-effect NON idempotente (spawna un task di
+     monitoring), quindi iterare i progetti a flag OFF — dove `list_all_project_ids`
+     ritorna comunque tutti i progetti mappati al meta — creerebbe monitor duplicati.
+     Il porting Windows di `spawn_reattach_monitor` (ramo `#[cfg(windows)]`, poll
+     `process_alive`) e' invece COMPLETO. Impatto del gap: a flag ON, dopo un restart
+     di mcp-core, i processi VIVI dei progetti non vengono re-attached immediatamente;
+     vengono comunque riconciliati dal `task_watchdog` periodico entro il primo ciclo
+     (degrada = ritardo, NON corrompe). Il fix incrementale (passo boot per-progetto
+     DOPO il registry, con helper condivisa + `seen` per il dedup, regola L) va fatto
+     con test di avvio dedicati, non e' bloccante per il flip.
 2. **KB (wiki_docs) resta sul meta**: i worker wiki leggono run/chat dal pool
    progetto ma scrivono `wiki_docs`/Qdrant sul meta (dominio KB non migrato).
    Multi-tenant per `scope`/`project_id`, non split-brain.
 3. **Flip + deploy + test UI** (vedi sotto).
+4. **Race provisioning progetti freschi**: RISOLTA (commit `e786a82`,
+   `PROVISION_LOCKS` in `provision.rs`). A flag ON, piu' worker che aprivano lo stesso
+   DB per-progetto MAI provisionato eseguivano il Migrator in parallelo ->
+   "_sqlx_migrations non esiste". Ora serializzato per-progetto (double-checked
+   locking). RICHIEDE UN REBUILD del binario per avere effetto (il binario in
+   esecuzione non lo contiene ancora).
 
 > Nota: tutto il codice instradato e' behavior-preserving a flag OFF
 > (`project_data_pool_*` ritorna il meta-DB). I residui 1-2 degradano ma NON
@@ -120,6 +141,31 @@ gia' migrati anche coi punti 1-5 residui aperti (degradano, non corrompono).
    per-progetto con `scripts/db-cleanup-dual-presence.sh <PROJECT_ID>` (dry-run) poi
    `--apply` (guardato dal flag, transazione FK-safe), infine `VACUUM (ANALYZE)`.
 
+### Validazione tecnica del flip (fatta questa sessione)
+Il flip e' stato acceso e verificato end-to-end sul binario corrente, poi
+rollbackato. Due bug del percorso di flip sono emersi e stati risolti:
+- **`\restrict`/`\unrestrict`**: `db/migrations/project/0001,0002` contenevano i
+  meta-comandi psql emessi da `pg_dump`, che rompono il Migrator sqlx ("errore di
+  sintassi presso \\"). Rimossi + `CREATE ... IF NOT EXISTS` (commit `358862f`).
+- **Race provisioning**: risolta con `PROVISION_LOCKS` (commit `e786a82`, punto 4 sopra).
+
+Verifica: pre-provisionando `beaty_book_nexus` con lo schema corretto (owner
+`nexus_app` — NON `nexus_admin`, altrimenti il migrator connesso come `nexus_app`
+prende "permesso negato per _sqlx_migrations") e i 3 record `_sqlx_migrations` con i
+checksum SHA-384 REALI dei file su disco, a flag ON il Migrator SALTA pulito (nessun
+errore), il binario apre 1 connessione `nexus_app` attiva su beaty (prova che il
+routing punta al DB per-progetto), health `ok`. Poi rollback a flag OFF.
+
+### Prerequisiti per il GO-LIVE definitivo (non ancora fatto)
+1. **Rebuild** del binario per includere `PROVISION_LOCKS` (`deploy/dev-build.ps1 -Rust`
+   + restart via `deploy/dev-start.ps1`): senza, i progetti FRESCHI (mai provisionati)
+   colpiscono ancora la race al primo accesso concorrente.
+2. **Ri-migrazione FRESCA** dei dati per ogni progetto vivo: `beaty_book_nexus` e'
+   stato ricreato VUOTO per validare il Migrator. Prima del go-live va ripopolato dal
+   meta (il meta e' la fonte AVANTI: 68 chat_messages, 28 agent_runs) + backfill
+   `nexus_data_routing` (procedura step 2), altrimenti a flag ON la cronologia storica
+   non sarebbe visibile (la UI leggerebbe da beaty vuoto).
+
 ## Igiene DB (fatta questa sessione)
 - **Schema morto rimosso** (mig 0497 + project/0003): droppate 4 tabelle mai scritte
   da alcun codice (nexus_agent_clarifications, nexus_conversation_summaries,
@@ -132,9 +178,21 @@ gia' migrati anche coi punti 1-5 residui aperti (degradano, non corrompono).
   `nexus` e' AVANTI (scritture live a flag OFF), `beaty_book_nexus` e' snapshot stale
   -> ri-migrare fresco prima del flip, poi cleanup (punto 7).
 
+## Ambiente di esecuzione (aggiornato)
+Lo stack NON gira piu' come servizi Windows WinSW: i 10 servizi applicativi
+(`nexus-web-ide`, `nexus-chat`, `nexus-mcp-core`, ...) sono stati disinstallati
+(`deploy/uninstall-winsw-services.ps1`, include il `nexus-chat` orfano del crate
+eliminato). Restano servizi Windows SOLO i 3 database (`postgresql-x64-17`,
+`nexus-pg-nexus`, `nexus-pg-app`, i dati devono persistere). Lo stack applicativo
+gira come PROCESSI dev via `deploy/dev-start.ps1` (build `deploy/dev-build.ps1`,
+nessun admin richiesto, niente lock `.exe` da servizio elevato durante il rebuild).
+
 ## Sicurezza / stato attuale
 Flag **off**, cutover **non deployato** (gira Phase 0-1): l'app live e' intatta,
-dati in dual-presenza (meta-DB + `beaty_book_nexus`). Niente da rollbackare.
+dati in dual-presenza (meta-DB + `beaty_book_nexus`). Niente da rollbackare. Il flip
+e' stato VALIDATO tecnicamente e rollbackato (vedi "Validazione tecnica del flip");
+`beaty_book_nexus` e' ora VUOTO (ricreato per la validazione) -> va ripopolato prima
+del go-live.
 
 ## Migrazioni introdotte
 `0494` connection_role, `0495` seed flag, `0496` nexus_data_routing,
