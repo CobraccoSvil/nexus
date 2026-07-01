@@ -336,7 +336,6 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `brain_rest_port` | `8001` | Porta del server REST FastAPI del brain Python (default 8001). Override di emergenza: BRAIN_REST_PORT. Richiede riavvio del brain. Cambiandola serve aggiornare anche brain_rest_url. |
 | `brain_rest_url` | `http://127.0.0.1:8001` | URL del server REST del brain Python (FastAPI su porta 8001). Usato da mcp-core per chiamare /agent/run/stream, /classify-intent-agentic, /catalog/sync e altri endpoint REST del brain. Override di emergenza: BRAIN_REST_URL o NEURAL_CORE_REST_URL. Richiede riavvio di mcp-core. |
 | `browser_bridge_port` | `4055` | Porta HTTP del browser-bridge-mcp (default 4055). Override: BROWSER_BRIDGE_PORT. |
-| `chat_service_port` | `4020` | Porta HTTP del microservizio chat-service (default 4020). Override: CHAT_SERVICE_PORT. |
 | `doc_service_port` | `4030` | Porta HTTP del microservizio doc-service (default 4030). Override: DOC_SERVICE_PORT. |
 | `mcp_core_http_port` | `4000` | Porta HTTP del server REST mcp-core (default 4000). Override di emergenza: MCP_SERVER_PORT o MCP_CORE_HTTP_PORT. Richiede riavvio di mcp-core. Cambiandola servono anche aggiornamenti a mcp_core_url e web-ide proxy. |
 | `mcp_core_url` | `http://127.0.0.1:4000` | URL del server HTTP mcp-core (porta 4000). Usato dal brain Python per leggere settings via _get_core_setting(), dal router semantico, dal cooldown bridge e dall'agent router client. Override di emergenza: MCP_CORE_URL. Richiede riavvio del brain. |

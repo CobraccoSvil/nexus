@@ -19,7 +19,7 @@ pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     4000, // mcp-core HTTP
     4001, // web-ide (target migrazione da 3000)
     4010, // admin-service
-    4020, // chat-service
+    4020, // ex chat-service (crate rimosso, porta resta riservata nel bucket)
     4030, // doc-service
     4040, // billing-service
     4050, // plugin-service
