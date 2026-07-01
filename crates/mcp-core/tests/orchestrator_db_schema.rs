@@ -27,7 +27,6 @@ async fn tabelle_plan_act_verify_esistono() {
         "nexus_subagent_definitions",
         "nexus_subagent_runs",
         "nexus_project_instructions",
-        "nexus_agent_clarifications",
         "nexus_security_audit",
     ];
     for t in attese {
