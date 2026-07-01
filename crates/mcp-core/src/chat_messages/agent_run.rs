@@ -140,17 +140,69 @@ fn short_file_label(path: &str) -> String {
 /// `None` se non c'e' alcuna azione concreta (ne' file modificati, ne' comandi,
 /// ne' file analizzati): turno conversazionale, stessa decisione di
 /// `buildSemanticDetail` (return "" -> qui `None`).
-fn outcome_summary(steps: &[AgentStep]) -> Option<String> {
+/// Conteggi e collezioni deduplicate estratti dagli step per il recap ricco.
+/// Popolato una volta da [`tally_steps`] e consumato dal compositore
+/// `outcome_summary` (punto unico della classificazione step->recap, regola L).
+struct StepTally {
+    /// Path dei file creati/modificati, deduplicati, in ordine di prima comparsa.
+    modified_files: Vec<String>,
+    /// Comandi eseguiti, troncati e deduplicati (parita' run-summary.ts).
+    commands: Vec<String>,
+    /// Numero di step di lettura/ricerca (file "analizzati").
+    analysis_count: usize,
+    /// Step falliti.
+    error_count: usize,
+    /// Step completati.
+    completed_count: usize,
+}
+
+/// Path del file toccato da un tool di scrittura (chiavi alternative in ordine
+/// di preferenza: path/file_path/filename). Pura, nessun side-effect.
+fn extract_write_path(step: &AgentStep) -> Option<&str> {
+    step.tool_input
+        .get("path")
+        .or_else(|| step.tool_input.get("file_path"))
+        .or_else(|| step.tool_input.get("filename"))
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.is_empty())
+}
+
+/// Comando eseguito da un tool di terminale (chiavi command/cmd/text), gia'
+/// troncato a 77 char + "..." per parita' con run-summary.ts (80 char). Pura.
+fn extract_command_short(step: &AgentStep) -> Option<String> {
+    let c = step
+        .tool_input
+        .get("command")
+        .or_else(|| step.tool_input.get("cmd"))
+        .or_else(|| step.tool_input.get("text"))
+        .and_then(|v| v.as_str())
+        .filter(|c| !c.is_empty())?;
+    let short = if c.chars().count() > 80 {
+        format!("{}...", c.chars().take(77).collect::<String>())
+    } else {
+        c.to_string()
+    };
+    Some(short)
+}
+
+/// Classifica gli step del run nei conteggi/collezioni del recap. Incapsula
+/// TUTTO il loop di match tool-group + estrazione path/comando + dedup +
+/// troncamento, cosi' il compositore `outcome_summary` resta lineare (esce da
+/// long-fn e complexity-high). Comportamento 1:1 con la versione inline
+/// precedente (dedup per prima comparsa, troncamento comandi a 77 char + "...").
+fn tally_steps(steps: &[AgentStep]) -> StepTally {
     const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "create_file", "patch_file"];
     const CMD_TOOLS: &[&str] = &["run_in_terminal", "run_command"];
     const READ_TOOLS: &[&str] = &["read_file", "search_in_files", "search_files"];
     const IGNORE_TOOLS: &[&str] = &["supervisor_check"];
 
-    let mut modified_files: Vec<String> = Vec::new();
-    let mut commands: Vec<String> = Vec::new();
-    let mut analysis_count: usize = 0;
-    let mut error_count: usize = 0;
-    let mut completed_count: usize = 0;
+    let mut tally = StepTally {
+        modified_files: Vec::new(),
+        commands: Vec::new(),
+        analysis_count: 0,
+        error_count: 0,
+        completed_count: 0,
+    };
 
     for step in steps {
         let tool = step.tool_name.as_str();
@@ -158,104 +210,110 @@ fn outcome_summary(steps: &[AgentStep]) -> Option<String> {
             continue;
         }
         if step.status == AgentStepStatus::Failed {
-            error_count += 1;
+            tally.error_count += 1;
         }
         if step.status == AgentStepStatus::Completed {
-            completed_count += 1;
+            tally.completed_count += 1;
         }
 
         if WRITE_TOOLS.contains(&tool) {
-            let path = step
-                .tool_input
-                .get("path")
-                .or_else(|| step.tool_input.get("file_path"))
-                .or_else(|| step.tool_input.get("filename"))
-                .and_then(|v| v.as_str());
-            if let Some(p) = path {
-                if !p.is_empty() && !modified_files.iter().any(|f| f == p) {
-                    modified_files.push(p.to_string());
+            if let Some(p) = extract_write_path(step) {
+                if !tally.modified_files.iter().any(|f| f == p) {
+                    tally.modified_files.push(p.to_string());
                 }
             }
         } else if CMD_TOOLS.contains(&tool) {
-            let cmd = step
-                .tool_input
-                .get("command")
-                .or_else(|| step.tool_input.get("cmd"))
-                .or_else(|| step.tool_input.get("text"))
-                .and_then(|v| v.as_str());
-            if let Some(c) = cmd {
-                if !c.is_empty() {
-                    // Tronca comandi molto lunghi (parita' run-summary.ts: 80 char,
-                    // taglio a 77 + "...").
-                    let short = if c.chars().count() > 80 {
-                        format!("{}...", c.chars().take(77).collect::<String>())
-                    } else {
-                        c.to_string()
-                    };
-                    if !commands.iter().any(|x| x == &short) {
-                        commands.push(short);
-                    }
+            if let Some(short) = extract_command_short(step) {
+                if !tally.commands.iter().any(|x| x == &short) {
+                    tally.commands.push(short);
                 }
             }
         } else if READ_TOOLS.contains(&tool) {
-            analysis_count += 1;
+            tally.analysis_count += 1;
         }
     }
 
+    tally
+}
+
+/// Riga "- Modificati N file: ..." del recap. `None` se nessun file modificato.
+/// Mostra al massimo i primi 5 con nome breve, poi "e altri K file".
+fn render_modified_files_line(files: &[String]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    const MAX_FILES: usize = 5;
+    let shown: Vec<String> = files
+        .iter()
+        .take(MAX_FILES)
+        .map(|f| format!("`{}`", short_file_label(f)))
+        .collect();
+    let extra = if files.len() > MAX_FILES {
+        format!(" e altri {} file", files.len() - MAX_FILES)
+    } else {
+        String::new()
+    };
+    // Concatenazione (Rust `[T]::join`, non SQL JOIN) su riga a se': evita il
+    // falso positivo del detector line-based su format! + join.
+    let shown_list = shown.join(", ");
+    Some(format!(
+        "- Modificati {} file: {shown_list}{extra}",
+        files.len()
+    ))
+}
+
+/// Riga "- Eseguiti N comandi: ..." del recap. `None` se nessun comando.
+/// Mostra al massimo i primi 3, poi "e altri K".
+fn render_commands_line(commands: &[String]) -> Option<String> {
+    if commands.is_empty() {
+        return None;
+    }
+    const MAX_CMDS: usize = 3;
+    let shown: Vec<String> = commands
+        .iter()
+        .take(MAX_CMDS)
+        .map(|c| format!("`{c}`"))
+        .collect();
+    let extra = if commands.len() > MAX_CMDS {
+        format!(" e altri {}", commands.len() - MAX_CMDS)
+    } else {
+        String::new()
+    };
+    // Concatenazione (Rust `[T]::join`, non SQL JOIN) su riga a se': evita il
+    // falso positivo del detector line-based su format! + join.
+    let shown_list = shown.join(", ");
+    Some(format!(
+        "- Eseguiti {} comandi: {shown_list}{extra}",
+        commands.len()
+    ))
+}
+
+fn outcome_summary(steps: &[AgentStep]) -> Option<String> {
+    let tally = tally_steps(steps);
+
     // Turno conversazionale (nessuna azione significativa): nessun recap.
-    if modified_files.is_empty() && commands.is_empty() && analysis_count == 0 {
+    if tally.modified_files.is_empty() && tally.commands.is_empty() && tally.analysis_count == 0 {
         return None;
     }
 
     let mut lines: Vec<String> = Vec::new();
-    if !modified_files.is_empty() {
-        const MAX_FILES: usize = 5;
-        let shown: Vec<String> = modified_files
-            .iter()
-            .take(MAX_FILES)
-            .map(|f| format!("`{}`", short_file_label(f)))
-            .collect();
-        let extra = if modified_files.len() > MAX_FILES {
-            format!(" e altri {} file", modified_files.len() - MAX_FILES)
-        } else {
-            String::new()
-        };
-        lines.push(format!(
-            "- Modificati {} file: {}{}",
-            modified_files.len(),
-            shown.join(", "),
-            extra
-        ));
+    if let Some(line) = render_modified_files_line(&tally.modified_files) {
+        lines.push(line);
     }
-    if !commands.is_empty() {
-        const MAX_CMDS: usize = 3;
-        let shown: Vec<String> = commands
-            .iter()
-            .take(MAX_CMDS)
-            .map(|c| format!("`{c}`"))
-            .collect();
-        let extra = if commands.len() > MAX_CMDS {
-            format!(" e altri {}", commands.len() - MAX_CMDS)
-        } else {
-            String::new()
-        };
-        lines.push(format!(
-            "- Eseguiti {} comandi: {}{}",
-            commands.len(),
-            shown.join(", "),
-            extra
-        ));
+    if let Some(line) = render_commands_line(&tally.commands) {
+        lines.push(line);
     }
-    if analysis_count > 0 {
-        lines.push(format!("- Analizzati {analysis_count} file"));
+    if tally.analysis_count > 0 {
+        lines.push(format!("- Analizzati {} file", tally.analysis_count));
     }
-    let errors_suffix = if error_count > 0 {
-        format!(", {error_count} errori")
+    let errors_suffix = if tally.error_count > 0 {
+        format!(", {} errori", tally.error_count)
     } else {
         String::new()
     };
     lines.push(format!(
-        "- Risultato: {completed_count} step completati{errors_suffix}"
+        "- Risultato: {} step completati{errors_suffix}",
+        tally.completed_count
     ));
 
     // Concatenazione (Rust `[T]::join`, non SQL JOIN) su riga a se': evita il
