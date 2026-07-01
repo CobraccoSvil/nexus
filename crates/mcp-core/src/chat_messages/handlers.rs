@@ -121,6 +121,12 @@ pub async fn send_chat_message(
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
     let context = load_session_context(&state, session_id, user_id).await?;
+    // Separazione DB: chat_sessions/agent_runs migrate nel DB del progetto.
+    // Risolvo una volta il pool del progetto per sessione e lo riuso per tutte
+    // le scritture di questo handler (flag off -> meta-DB, comportamento storico).
+    let session_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, context.session_id)
+            .await;
 
     let content = body.content.trim();
     if content.is_empty() {
@@ -171,7 +177,7 @@ pub async fn send_chat_message(
         let _ = sqlx::query("UPDATE chat_sessions SET automation_mode = $1 WHERE id = $2")
             .bind(canonical)
             .bind(context.session_id)
-            .execute(&state.db)
+            .execute(&session_pool)
             .await;
     }
 
@@ -286,7 +292,7 @@ pub async fn send_chat_message(
                 "UPDATE chat_sessions SET preferred_provider = NULL, preferred_model = NULL WHERE id = $1",
             )
             .bind(context.session_id)
-            .execute(&state.db)
+            .execute(&session_pool)
             .await;
 
             let ack_id = insert_message(
@@ -319,7 +325,7 @@ pub async fn send_chat_message(
             .bind(&switched_provider)
             .bind(&switched_model)
             .bind(context.session_id)
-            .execute(&state.db)
+            .execute(&session_pool)
             .await;
 
             // Genera un messaggio assistant di conferma e salvalo nel DB
@@ -561,7 +567,7 @@ pub async fn send_chat_message(
                 .bind(&prev_model)
                 .bind(prev_supervisor.as_str())
                 .bind(prev_run_id)
-                .execute(&state.db)
+                .execute(&session_pool)
                 .await;
 
                 // Carica contesto progetto per il nuovo run
@@ -663,6 +669,10 @@ pub async fn send_chat_message(
                         // qui (idempotente: tocca solo i run rimasti a 0, non
                         // sovrascrive un valore gia' corretto del path Python).
                         if result.total_cost > 0.0 {
+                            // agent_runs e' migrata: instrada sul pool del progetto
+                            // (risolto in-task da db_clone2 + project_id_r, come la
+                            // INSERT chat_messages piu' sotto). ai_usage_ledger (sopra)
+                            // resta su meta (dominio costi non migrato).
                             let _ = sqlx::query(
                                 "UPDATE agent_runs SET total_cost = $2, total_tokens = $3 \
                                  WHERE id = $1 AND total_cost = 0",
@@ -670,7 +680,13 @@ pub async fn send_chat_message(
                             .bind(new_run_id)
                             .bind(result.total_cost)
                             .bind(result.total_tokens as i32)
-                            .execute(&db_clone2)
+                            .execute(
+                                &crate::project_db_routes::project_data_pool_from(
+                                    &db_clone2,
+                                    project_id_r,
+                                )
+                                .await,
+                            )
                             .await;
                         }
 
@@ -978,7 +994,7 @@ pub async fn send_chat_message(
     )
     .bind(context.session_id)
     .bind(summarize_title(content))
-    .execute(&state.db)
+    .execute(&session_pool)
     .await;
 
     update_user_active_project(&state, user_id, context.project_id).await;
@@ -1966,6 +1982,10 @@ pub async fn legacy_chat(
     let session_id = if let Some(session_id) = existing_session {
         session_id
     } else {
+        // Separazione DB: la nuova chat_sessions va nel DB del progetto (routing
+        // per project_id, il session_id non esiste ancora).
+        let session_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
         let new_session_id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -1976,7 +1996,7 @@ pub async fn legacy_chat(
         .bind(new_session_id)
         .bind(project_id)
         .bind(user_id)
-        .execute(&state.db)
+        .execute(&session_pool)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         new_session_id

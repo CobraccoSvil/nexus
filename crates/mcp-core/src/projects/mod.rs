@@ -965,6 +965,10 @@ pub(crate) async fn upsert_open_session(
     let active_files_json = serde_json::to_value(active_file_paths)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // separazione DB: project_open_sessions e' migrata, instrada la scrittura sul pool del progetto
+    let project_pool =
+        crate::project_db_routes::project_data_pool_from(db, context.project_id).await;
+
     sqlx::query(
         r#"
         INSERT INTO project_open_sessions (user_id, project_id, workspace_id, active_file_paths, terminal_cwd, last_opened_at, updated_at)
@@ -982,7 +986,7 @@ pub(crate) async fn upsert_open_session(
     .bind(context.workspace_id)
     .bind(active_files_json)
     .bind(terminal_cwd)
-    .execute(db)
+    .execute(&project_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

@@ -96,6 +96,8 @@ pub(crate) async fn load_session_context(
 }
 
 pub(crate) async fn update_user_active_project(state: &AppState, user_id: Uuid, project_id: Uuid) {
+    // Separazione DB: project_open_sessions e' migrata, instrada sul pool del progetto.
+    let data_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let _ = sqlx::query(
         r#"
         INSERT INTO project_open_sessions (
@@ -108,7 +110,7 @@ pub(crate) async fn update_user_active_project(state: &AppState, user_id: Uuid, 
     )
     .bind(user_id)
     .bind(project_id)
-    .execute(&state.db)
+    .execute(&data_pool)
     .await;
 
     // Avvia indicizzazione semantica in background se non ancora eseguita.
@@ -751,7 +753,8 @@ pub(crate) async fn compact_session_core(
            AND metadata->>'totalCost' IS NOT NULL",
     )
     .bind(session_id)
-    .fetch_one(&state.db)
+    // chat_messages e' migrata: somma sul pool del progetto (chat_pool gia' risolto).
+    .fetch_one(&chat_pool)
     .await
     .unwrap_or(0.0);
 
@@ -836,6 +839,9 @@ pub async fn list_project_memories(
     let project_id = Uuid::parse_str(&project_id_str)
         .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "project id non valido"))?;
 
+    // prompt_corrections e chat_sessions sono entrambe migrate: il JOIN e' valido
+    // sul pool del progetto (separazione DB, flag OFF -> meta).
+    let mem_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let rows = sqlx::query(
         r#"
         SELECT
@@ -849,7 +855,7 @@ pub async fn list_project_memories(
         "#,
     )
     .bind(project_id)
-    .fetch_all(&state.db)
+    .fetch_all(&mem_pool)
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

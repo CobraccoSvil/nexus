@@ -966,6 +966,11 @@ pub(crate) async fn supersede_active_runs(
     } else {
         "Superato da un nuovo run."
     };
+    // Pool del progetto risolto dalla sessione (separazione DB): tabella
+    // agent_runs migrata -> instrada la UPDATE sul DB del progetto (flag off ->
+    // meta). Riusato sotto per l'ingest del worklog dei run superati.
+    let wpool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
     let cancelled_ids: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE agent_runs \
          SET status='cancelled', completed_at=NOW(), \
@@ -978,7 +983,7 @@ pub(crate) async fn supersede_active_runs(
     .bind(session_id)
     .bind(reason)
     .bind(final_msg)
-    .fetch_all(&state.db)
+    .fetch_all(&wpool)
     .await
     .unwrap_or_default();
 
@@ -1013,10 +1018,8 @@ pub(crate) async fn supersede_active_runs(
         } else {
             "superseduto (interrotto da un nuovo messaggio)"
         };
-        // Worklog nel DB del progetto (separazione DB): risolvo il pool dalla
-        // sessione una volta, fuori dal loop (flag off -> meta).
-        let wpool =
-            crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+        // Worklog nel DB del progetto (separazione DB): riuso il pool per-progetto
+        // gia' risolto sopra dalla sessione (flag off -> meta).
         for cid in &cancelled_ids {
             if let Err(e) =
                 crate::session_worklog::ingest_from_db_steps(&wpool, *cid, label).await
@@ -1718,6 +1721,10 @@ pub(crate) async fn spawn_agent_run(
             alert_msg,
         );
         // Persist run come "failed" con errore strutturato.
+        // Pool del progetto (separazione DB): tabella agent_runs migrata ->
+        // instrada l'INSERT sul DB del progetto (flag off -> meta).
+        let run_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, params.project_id).await;
         let _ = sqlx::query(
             r#"INSERT INTO agent_runs
                (id, session_id, project_id, user_id, run_message_id, status,
@@ -1734,7 +1741,7 @@ pub(crate) async fn spawn_agent_run(
         .bind(&model_str)
         .bind(params.supervisor_mode.as_str())
         .bind(&alert_msg)
-        .execute(&state.db)
+        .execute(&run_pool)
         .await;
         // Emit evento SSE con status `provider_unavailable`. La UI lo intercetta
         // (vedi chat-panel.tsx) per mostrare il banner rosso.
@@ -1799,6 +1806,10 @@ pub(crate) async fn spawn_agent_run(
         supersede_active_runs(state, params.session_id, "superseded_by_new_run").await;
 
     // Persist initial run in DB
+    // Pool del progetto (separazione DB): tabella agent_runs migrata -> instrada
+    // l'INSERT sul DB del progetto (flag off -> meta).
+    let run_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, params.project_id).await;
     let _ = sqlx::query(
         r#"INSERT INTO agent_runs
            (id, session_id, project_id, user_id, run_message_id, status,
@@ -1814,7 +1825,7 @@ pub(crate) async fn spawn_agent_run(
     .bind(&provider)
     .bind(&model_str)
     .bind(params.supervisor_mode.as_str())
-    .execute(&state.db)
+    .execute(&run_pool)
     .await;
 
     // Il loop agente gira integralmente nel brain LangGraph (Python): qui
@@ -2351,6 +2362,12 @@ pub(crate) async fn spawn_agent_run(
             // (run_via_brain) resta solo come rollback per-sessione / default
             // difensivo (riga DB assente / DB down / valore non riconosciuto).
             let engine = select_engine(&db_clone, &session_id_cp.to_string()).await;
+            // Pool del progetto risolto DENTRO il task (separazione DB): la tabella
+            // agent_runs (e agent_steps) e' migrata -> tutte le scritture del run
+            // vanno instradate sul DB del progetto. Risolto una volta dal clone del
+            // meta (db_clone) + project_id_cp catturati (flag off -> meta).
+            let run_pool =
+                crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await;
             let _ = sqlx::query("UPDATE agent_runs SET engine = $2 WHERE id = $1")
                 .bind(run_id)
                 .bind(match engine {
@@ -2358,7 +2375,7 @@ pub(crate) async fn spawn_agent_run(
                     Engine::Rust => "rust",
                     Engine::Shadow => "shadow",
                 })
-                .execute(&db_clone)
+                .execute(&run_pool)
                 .await;
             // DEBITO 2 (return su Ok) + 3 (finalize): l'esito del PRIMARIO nativo
             // converge sul medesimo `result` del path Python -> stesso finalizzatore
@@ -2656,7 +2673,8 @@ pub(crate) async fn spawn_agent_run(
                         .bind(&current_provider)
                         .bind(&current_model)
                         .bind(run_id)
-                        .execute(&db_clone)
+                        // Pool del progetto (separazione DB): agent_runs migrata.
+                        .execute(&run_pool)
                         .await;
                 tracing::info!(
                     "agent_run {}: agent_runs.provider/model aggiornato al modello effettivo {}/{} (era {}/{})",
@@ -3463,7 +3481,8 @@ pub(crate) async fn spawn_agent_run(
             .bind(&result.provider)
             .bind(&result.model)
             .bind(result.messages_json.as_deref())
-            .execute(&db_clone)
+            // Pool del progetto (separazione DB): agent_runs migrata.
+            .execute(&run_pool)
             .await;
 
             // ── Terminatore unico dello stream (FIX ordine is_final) ───────────
@@ -3597,7 +3616,8 @@ pub(crate) async fn spawn_agent_run(
                     .bind(run_id)
                     .bind(total)
                     .bind(total_tokens_fallback)
-                    .execute(&db_clone)
+                    // Pool del progetto (separazione DB): agent_runs migrata.
+                    .execute(&run_pool)
                     .await;
                             tracing::debug!(
                         "budget: cost calcolato da catalog (ledger vuoto) per {}/{} = ${:.6} (prompt={} comp={})",
@@ -3649,7 +3669,8 @@ pub(crate) async fn spawn_agent_run(
                 .bind(&step.tool_input)
                 .bind(step.tool_result.as_deref())
                 .bind(step.status.as_str())
-                .execute(&db_clone)
+                // Pool del progetto (separazione DB): agent_steps migrata.
+                .execute(&run_pool)
                 .await;
                     }
                     tracing::debug!(
@@ -3663,11 +3684,10 @@ pub(crate) async fn spawn_agent_run(
                 // strutturati dagli step e rinfresca il digest provider-neutro
                 // che il brain inietta nei run successivi della sessione.
                 // Best-effort: un errore qui non tocca l'esito del run.
-                // Worklog nel DB del progetto (separazione DB), pool per-progetto.
-                let wlpool =
-                    crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await;
+                // Worklog nel DB del progetto (separazione DB): riuso run_pool,
+                // gia' risolto in cima al task per lo stesso project_id_cp.
                 if let Err(e) = crate::session_worklog::ingest_steps_for_run(
-                    &wlpool,
+                    &run_pool,
                     session_id_cp,
                     Some(project_id_cp),
                     run_id,
@@ -3792,6 +3812,12 @@ pub(crate) async fn spawn_agent_run(
             panic_channels.remove(&panic_run_id);
 
             // 2. Aggiorna agent_runs come failed
+            // Pool del progetto (separazione DB): agent_runs (e chat_messages sotto)
+            // migrate -> instrada le scritture del panic-handler sul DB del progetto.
+            // Risolto una volta dal clone del meta (panic_db) + panic_project_id
+            // catturati (flag off -> meta); riusato per l'INSERT chat_messages sotto.
+            let panic_pool =
+                crate::project_db_routes::project_data_pool_from(&panic_db, panic_project_id).await;
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status='failed', completed_at=NOW(), \
                  final_answer=$2 WHERE id=$1",
@@ -3801,7 +3827,7 @@ pub(crate) async fn spawn_agent_run(
                 "Errore interno: il task agente e' terminato in modo imprevisto ({}). Riprova.",
                 panic_msg
             ))
-            .execute(&panic_db)
+            .execute(&panic_pool)
             .await;
 
             // 3. Inserisci un messaggio assistant per far vedere l'errore in chat
@@ -3818,7 +3844,8 @@ pub(crate) async fn spawn_agent_run(
             ))
             .bind(json!({"errorClass": "internal_panic", "agentRunId": panic_run_id.to_string()}))
             .bind(panic_user_msg_id)
-            .execute(&crate::project_db_routes::project_data_pool_from(&panic_db, panic_project_id).await)
+            // Pool del progetto (separazione DB): riuso panic_pool gia' risolto sopra.
+            .execute(&panic_pool)
             .await;
         }
     });
@@ -4088,6 +4115,11 @@ pub(crate) async fn confirm_native_run(
 
     let outcome = resume_via_native(state, &input, resume_message).await;
 
+    // Pool del progetto risolto dalla sessione (separazione DB): agent_runs
+    // migrata -> instrada le UPDATE di finalize (esito Ok/Err) sul DB del
+    // progetto. Risolto una volta, riusato in entrambi i rami (flag off -> meta).
+    let cn_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
     let status = match outcome {
         Ok(outcome) => {
             // Mapping unico esito->AgentRunResult (regola L), poi finalize essenziale.
@@ -4121,7 +4153,8 @@ pub(crate) async fn confirm_native_run(
             .bind(&result.provider)
             .bind(&result.model)
             .bind(result.messages_json.as_deref())
-            .execute(&state.db)
+            // Pool del progetto (separazione DB): agent_runs migrata.
+            .execute(&cn_pool)
             .await;
             result.status
         }
@@ -4140,7 +4173,8 @@ pub(crate) async fn confirm_native_run(
             )
             .bind(run_id)
             .bind(&msg)
-            .execute(&state.db)
+            // Pool del progetto (separazione DB): agent_runs migrata.
+            .execute(&cn_pool)
             .await;
             crate::agent_types::AgentRunStatus::Failed
         }

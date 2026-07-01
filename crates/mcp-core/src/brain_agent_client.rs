@@ -952,12 +952,17 @@ pub async fn run_via_brain(
                     // (handlers.rs) esclude i run con generation_ended_at valorizzato,
                     // evitando il 409 "la chat sembra libera". Best-effort: un errore
                     // qui non deve interrompere lo stream. IS NULL: marca una volta sola.
+                    // separazione DB: agent_runs vive sul pool del progetto (risolto da session_id)
+                    let run_pool = crate::project_db_routes::project_data_pool_by_session_from(
+                        &db, session_id,
+                    )
+                    .await;
                     let _ = sqlx::query(
                         "UPDATE agent_runs SET generation_ended_at = NOW() \
                          WHERE id = $1 AND generation_ended_at IS NULL",
                     )
                     .bind(run_id)
-                    .execute(&db)
+                    .execute(&run_pool)
                     .await;
                     acc_prompt_tokens = evt
                         .get("prompt_tokens")

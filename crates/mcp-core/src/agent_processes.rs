@@ -368,10 +368,17 @@ pub struct ProcessOutput {
 }
 
 /// Stop a running process by PID (e Docker container, se applicabile).
-pub async fn stop_process(db: &PgPool, process_id: Uuid) -> Result<String, String> {
+pub async fn stop_process(
+    db: &PgPool,
+    project_id: Uuid,
+    process_id: Uuid,
+) -> Result<String, String> {
+    // Separazione DB: agent_processes vive nel pool del progetto (flag ON),
+    // risolto dal project_id passato dal chiamante. A flag OFF -> meta-DB.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let row = sqlx::query("SELECT pid, status FROM agent_processes WHERE id=$1")
         .bind(process_id)
-        .fetch_optional(db)
+        .fetch_optional(&proj_pool)
         .await
         .map_err(|e| format!("DB error: {e}"))?
         .ok_or_else(|| "Process not found".to_string())?;
@@ -386,7 +393,7 @@ pub async fn stop_process(db: &PgPool, process_id: Uuid) -> Result<String, Strin
         "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1 AND status IN ('running','starting')",
     )
     .bind(process_id)
-    .execute(db)
+    .execute(&proj_pool)
     .await;
 
     // 1. Ferma il container Docker (se esiste) — va fatto PRIMA di killare il docker CLI

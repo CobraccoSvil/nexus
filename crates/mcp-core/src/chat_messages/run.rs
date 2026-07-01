@@ -103,6 +103,9 @@ pub(crate) async fn run_turn(
         },
     );
 
+    // separazione DB: chat_sessions e' migrata, instrada sul pool del progetto
+    let project_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     sqlx::query(
         r#"
         UPDATE chat_sessions
@@ -111,7 +114,7 @@ pub(crate) async fn run_turn(
         "#,
     )
     .bind(session_id)
-    .execute(&state.db)
+    .execute(&project_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

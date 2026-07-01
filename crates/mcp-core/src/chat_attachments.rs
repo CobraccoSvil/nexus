@@ -457,7 +457,9 @@ pub async fn persist_message_attachments(
                 )
                 .bind(project_id)
                 .bind(&content_hash)
-                .fetch_one(db)
+                // chat_message_attachments e' migrata: conta sul pool del progetto
+                // (coerente con l'INSERT sopra). Flag OFF -> meta.
+                .fetch_one(&crate::project_db_routes::project_data_pool_from(db, project_id).await)
                 .await
                 .unwrap_or(0);
                 if shared == 0 {
@@ -834,6 +836,9 @@ pub async fn index_attachments_to_kb(
         }
 
         // Aggiorna allegato con kb_note_id + indexed_at.
+        // separazione DB: chat_message_attachments e' migrata sul pool di progetto.
+        let attach_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, record.project_id).await;
         let _ = sqlx::query(
             r#"
             UPDATE chat_message_attachments
@@ -843,7 +848,7 @@ pub async fn index_attachments_to_kb(
         )
         .bind(note_id)
         .bind(record.id)
-        .execute(&state.db)
+        .execute(&attach_pool)
         .await;
 
         // Emit SSE per aggiornare il pannello KB.

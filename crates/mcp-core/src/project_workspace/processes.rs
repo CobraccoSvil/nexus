@@ -12,7 +12,7 @@ pub async fn stop_agent_process(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Process id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
-    match crate::agent_processes::stop_process(&state.db, process_id).await {
+    match crate::agent_processes::stop_process(&state.db, project_id, process_id).await {
         Ok(msg) => Ok(Json(json!({ "ok": true, "message": msg }))),
         Err(e) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e)),
     }

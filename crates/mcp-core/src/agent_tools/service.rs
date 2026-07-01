@@ -270,7 +270,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
                     proc_id = %proc.id,
                     "run_service: kill processo simile prima di riavvio"
                 );
-                let _ = crate::agent_processes::stop_process(&ctx.db, proc.id).await;
+                let _ = crate::agent_processes::stop_process(&ctx.db, ctx.project_id, proc.id).await;
             }
         }
 
@@ -541,7 +541,7 @@ pub(super) async fn tool_stop_service(ctx: &AgentToolContext, input: &Value) -> 
         Ok(id) => id,
         Err(_) => return "[Errore: process_id non valido]".to_string(),
     };
-    match crate::agent_processes::stop_process(&ctx.db, process_id).await {
+    match crate::agent_processes::stop_process(&ctx.db, ctx.project_id, process_id).await {
         Ok(msg) => {
             nexus_events::dispatcher::emit(
                 &ctx.project_channels,
@@ -616,7 +616,7 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
         .iter()
         .filter(|p| p.status == "running" || p.status == "starting")
     {
-        let _ = crate::agent_processes::stop_process(&ctx.db, proc.id).await;
+        let _ = crate::agent_processes::stop_process(&ctx.db, ctx.project_id, proc.id).await;
     }
 
     // Breve pausa per garantire che le porte siano liberate

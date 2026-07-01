@@ -104,13 +104,15 @@ pub(crate) async fn clear_session_preferred_provider_after_privacy(
     db: &sqlx::PgPool,
     session_id: uuid::Uuid,
 ) {
+    // separazione DB: chat_sessions e' una tabella migrata, instrada sul pool del progetto
+    let pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
     let _ = sqlx::query(
         "UPDATE chat_sessions \
          SET preferred_provider = NULL, preferred_model = NULL, privacy_rerouted_at = NOW() \
          WHERE id = $1",
     )
     .bind(session_id)
-    .execute(db)
+    .execute(&pool)
     .await;
 }
 /// Rileva se il messaggio è un comando di reset al routing automatico.

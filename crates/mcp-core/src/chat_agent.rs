@@ -592,11 +592,17 @@ pub async fn confirm_agent_run(
         ));
     }
 
+    // Separazione DB: agent_runs e' migrata sul pool del progetto. Risolvo una
+    // volta il pool dalla session_id del run e lo riuso per tutti gli UPDATE sotto.
+    let run_session_id: Uuid = run.get::<Uuid, _>("session_id");
+    let run_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, run_session_id).await;
+
     if !body.approved {
         // Cancella il run
         sqlx::query("UPDATE agent_runs SET status='cancelled', completed_at=NOW() WHERE id=$1")
             .bind(run_id)
-            .execute(&state.db)
+            .execute(&run_pool)
             .await
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(Json(
@@ -629,7 +635,7 @@ pub async fn confirm_agent_run(
     // Segna come running prima di riprendere (sia nativo sia brain).
     sqlx::query("UPDATE agent_runs SET status='running', completed_at=NULL WHERE id=$1")
         .bind(run_id)
-        .execute(&state.db)
+        .execute(&run_pool)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -696,7 +702,7 @@ pub async fn confirm_agent_run(
                 let _ =
                     sqlx::query("UPDATE agent_runs SET status='awaiting_confirmation' WHERE id=$1")
                         .bind(run_id)
-                        .execute(&state.db)
+                        .execute(&run_pool)
                         .await;
                 Err(api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
