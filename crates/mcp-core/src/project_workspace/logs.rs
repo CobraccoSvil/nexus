@@ -549,7 +549,11 @@ pub async fn get_output_channels(
     let user_id = parse_user_id(&claims)?;
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
-    let context = load_project_context(&state.db, project_id, user_id).await?;
+    // La chiamata vale come check di autorizzazione (fallisce con errore se
+    // l'utente non puo' accedere al progetto): va eseguita su ogni OS. Il binding
+    // e' prefissato `_` perche' `context.details.name` serve solo al blocco svc:*
+    // Linux-only piu' sotto; su Windows resta usato solo per il side-effect di auth.
+    let _context = load_project_context(&state.db, project_id, user_id).await?;
 
     // Canali fissi di sistema
     let mut channels = vec![
@@ -562,35 +566,41 @@ pub async fn get_output_channels(
         json!({ "id": "Neural Core",  "label": "Neural Core" }),
     ];
 
-    // Canali dinamici: uno per ogni servizio systemd del progetto ({slug}-*.service)
-    let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
-    let prefix = format!("{}-", slug);
-    if let Ok(svc_out) = tokio::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "list-unit-files",
-            "--type=service",
-            "--no-legend",
-            "--no-pager",
-        ])
-        .output()
-        .await
+    // Canali dinamici svc:* — uno per ogni servizio systemd del progetto
+    // ({slug}-*.service). Linux-only: su Windows non esiste systemd `--user`,
+    // i canali svc:* sono derivati piu' sotto dai servizi in `agent_processes`
+    // (kind='service'), riusando le righe gia' lette (nessuna query extra).
+    #[cfg(unix)]
     {
-        for line in String::from_utf8_lossy(&svc_out.stdout).lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            let unit = cols.first().copied().unwrap_or("");
-            let state = cols.get(1).copied().unwrap_or("");
-            if unit.starts_with(&prefix) && unit.ends_with(".service") && state != "disabled" {
-                let short = unit
-                    .strip_prefix(&prefix)
-                    .unwrap_or(unit)
-                    .strip_suffix(".service")
-                    .unwrap_or(unit);
-                channels.push(json!({
-                    "id":    format!("svc:{}", unit),
-                    "label": short,
-                    "title": unit,
-                }));
+        let slug = _context.details.name.to_lowercase().replace([' ', '_'], "-");
+        let prefix = format!("{}-", slug);
+        if let Ok(svc_out) = tokio::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "list-unit-files",
+                "--type=service",
+                "--no-legend",
+                "--no-pager",
+            ])
+            .output()
+            .await
+        {
+            for line in String::from_utf8_lossy(&svc_out.stdout).lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                let unit = cols.first().copied().unwrap_or("");
+                let state = cols.get(1).copied().unwrap_or("");
+                if unit.starts_with(&prefix) && unit.ends_with(".service") && state != "disabled" {
+                    let short = unit
+                        .strip_prefix(&prefix)
+                        .unwrap_or(unit)
+                        .strip_suffix(".service")
+                        .unwrap_or(unit);
+                    channels.push(json!({
+                        "id":    format!("svc:{}", unit),
+                        "label": short,
+                        "title": unit,
+                    }));
+                }
             }
         }
     }
@@ -612,6 +622,30 @@ pub async fn get_output_channels(
     .await
     .unwrap_or_default();
 
+    // Canali svc:* su Windows: nessun systemd, i servizi di progetto sono le righe
+    // agent_processes con kind='service'. Si riusano le righe gia' lette (nessuna
+    // query extra) generando un canale svc:{label} per label distinta, coerente
+    // con lo schema id usato dal frontend su Linux.
+    #[cfg(windows)]
+    {
+        let mut seen_svc: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in &agent_rows_raw {
+            let kind: String = row.try_get::<String, _>("kind").unwrap_or_default();
+            if kind != "service" {
+                continue;
+            }
+            let label: String = row.try_get::<String, _>("label").unwrap_or_default();
+            if label.is_empty() || !seen_svc.insert(label.clone()) {
+                continue;
+            }
+            channels.push(json!({
+                "id":    format!("svc:{}", label),
+                "label": label,
+                "title": label,
+            }));
+        }
+    }
+
     // Identifica fantasmi e li sana nel DB
     let mut orphan_ids: Vec<Uuid> = Vec::new();
     for row in &agent_rows_raw {
@@ -620,8 +654,11 @@ pub async fn get_output_channels(
             continue;
         }
         let pid: Option<i32> = row.try_get::<Option<i32>, _>("pid").ok().flatten();
+        // Liveness cross-platform: punto unico process_util::process_alive (regola L).
+        // Il precedente check inline su `/proc/{pid}` era cieco su Windows, dove
+        // avrebbe marcato come orfani (e spento) tutti i servizi realmente vivi.
         let alive = match pid {
-            Some(p) if p > 0 => std::path::Path::new(&format!("/proc/{}", p)).exists(),
+            Some(p) if p > 0 => crate::process_util::process_alive(p as u32),
             _ => false,
         };
         if !alive {

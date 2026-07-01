@@ -1072,19 +1072,11 @@ pub async fn cleanup_project_ports(
             skipped.push(json!({ "port": port, "pid": pid, "program": program, "reason": "protetto (servizio del progetto)" }));
             continue;
         }
-        // Esegue kill -TERM, fallback -KILL dopo 1s
-        let _ = tokio::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .await;
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-        let still_alive = std::path::Path::new(&format!("/proc/{}", pid)).exists();
-        if still_alive {
-            let _ = tokio::process::Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .output()
-                .await;
-        }
+        // Terminazione via punto unico cross-platform (regola L): su Unix
+        // esegue TERM+KILL con attesa e ricontrollo liveness incapsulati; su
+        // Windows fa taskkill /T /F. Il precedente `kill` inline era no-op su
+        // Windows (comando inesistente) -> porte mai liberate dal pannello.
+        crate::process_util::kill_pid(pid).await;
         killed.push(json!({ "port": port, "pid": pid, "program": program }));
     }
 
@@ -1189,8 +1181,8 @@ pub(super) async fn detect_project_ports(
             .unwrap_or_default()
             .iter()
             .filter_map(|row| row.try_get::<i32, _>("pid").ok())
-            // Verifica che il processo sia ancora vivo controllando /proc/{pid}
-            .filter(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
+            // Verifica che il processo sia ancora vivo (punto unico cross-platform).
+            .filter(|pid| crate::process_util::process_alive(*pid as u32))
             .collect();
 
     // 2a. MainPID dei servizi systemd --user `{slug}-*.service` + mappa pid→short_name
@@ -1248,7 +1240,7 @@ pub(super) async fn detect_project_ports(
             for line in show_str.lines() {
                 if let Some(val) = line.strip_prefix("MainPID=") {
                     if let Ok(pid) = val.trim().parse::<u32>() {
-                        if pid > 0 && std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                        if pid > 0 && crate::process_util::process_alive(pid) {
                             pids.push(pid);
                             pid_to_service.insert(pid, short.clone());
                         }
@@ -1264,7 +1256,7 @@ pub(super) async fn detect_project_ports(
     // sull'ExecStart del file unit su disco. Senza questo seed, pid_to_service
     // resta vuoto e TUTTE le porte risultano service=null -> nessun link in UI.
     for (pid, short) in detached_service_root_pids(slug).await {
-        if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+        if crate::process_util::process_alive(pid) {
             pid_to_service.entry(pid).or_insert(short);
         }
     }
@@ -1667,17 +1659,9 @@ async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
             if Some(pid) == own_pid {
                 continue;
             }
-            let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .output()
-                .await;
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .output()
-                    .await;
-            }
+            // Terminazione via punto unico cross-platform (regola L): TERM+KILL
+            // con ricontrollo liveness su Unix, taskkill /T /F su Windows.
+            crate::process_util::kill_pid(pid).await;
             freed.push(json!({
                 "port": port,
                 "pid": pid,
@@ -2127,24 +2111,11 @@ pub async fn delete_port_allocation(
             };
             if pid_owned_by_project {
                 let pid = binding.pid;
-                // SIGTERM grazioso
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status()
-                    .await;
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                // SIGKILL se ancora vivo
-                let still_alive = tokio::task::spawn_blocking(move || {
-                    std::path::Path::new(&format!("/proc/{}", pid)).exists()
-                })
-                .await
-                .unwrap_or(false);
-                if still_alive {
-                    let _ = tokio::process::Command::new("kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status()
-                        .await;
-                }
+                // Terminazione via punto unico cross-platform (regola L): su Unix
+                // TERM grazioso + KILL se ancora vivo dopo l'attesa incapsulata;
+                // su Windows taskkill /T /F. Il precedente `kill` inline era no-op
+                // su Windows -> la "x" del pannello non liberava la porta.
+                crate::process_util::kill_pid(pid).await;
                 killed_pid = Some(pid);
                 // Marca agent_processes come stopped (riconciliazione).
                 // Separazione DB per-progetto: agent_processes e' migrata, instrada

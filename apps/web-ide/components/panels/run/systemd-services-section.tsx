@@ -183,7 +183,7 @@ export function SystemdServicesSection({
               <div style={{ fontSize:11, padding:"2px 0 8px", display:"flex", alignItems:"center", gap:6 }}>
                 <span style={{ color:"#f59e0b", fontWeight:700 }}>•</span>
                 <span style={{ color:tc.textSecondary, lineHeight:1.4 }}>
-                  Gestiti in modalita' detached (systemd utente non attivo): avvio, arresto e stato funzionano comunque, senza systemd.
+                  {managerHint ?? "Gestiti in modalita' detached (systemd utente non attivo): avvio, arresto e stato funzionano comunque, senza systemd."}
                 </span>
               </div>
             )}

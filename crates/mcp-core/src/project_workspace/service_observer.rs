@@ -15,6 +15,14 @@
 //!
 //! Anti-spam: anomalie e crash sono emessi sulla TRANSIZIONE (quando compaiono),
 //! non a ogni ciclo finche' persistono (stato in-memory per unit).
+//!
+//! Windows nativo: l'observer e' logica interamente Linux (systemd `--user` +
+//! `/proc`). `spawn_service_observer` fa early-return su Windows (vedi in fondo),
+//! quindi tutte le funzioni/struct/import del loop restano definiti ma inutilizzati.
+//! Si silenziano `dead_code`/`unused_imports` SOLO su Windows (un punto unico di
+//! gating, regola L: evita di marcare ~30 item con `#[cfg(unix)]` in modo fragile),
+//! mantenendo il lint pieno su Unix, dove il codice e' effettivamente usato.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -745,6 +753,20 @@ fn sig_hash(s: &str) -> String {
 // ── Loop ──────────────────────────────────────────────────────────────────────
 
 /// Avvia l'observer in background. Gating runtime via `agent.observer.enabled`.
+///
+/// Su Windows nativo il monitoring dipende da systemd `--user` + `/proc`, non
+/// disponibili: il worker fa early-return e NON avvia alcun task (niente ciclo a
+/// vuoto ogni `interval_s`). L'osservabilita' runtime dei servizi utente su Windows
+/// va reimplementata nativamente (agent_processes + API Windows) in un intervento
+/// dedicato.
+#[cfg(windows)]
+pub fn spawn_service_observer(_state: AppState) {
+    tracing::info!(
+        "service_observer: monitoring processi via /proc non disponibile su Windows nativo, worker inattivo"
+    );
+}
+
+#[cfg(unix)]
 pub fn spawn_service_observer(state: AppState) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(STARTUP_DELAY_S)).await;

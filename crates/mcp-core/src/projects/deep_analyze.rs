@@ -118,6 +118,12 @@ pub(super) async fn collect_config_files(root: &Path) -> Vec<serde_json::Value> 
 }
 
 /// Recupera i servizi systemd registrati per il progetto.
+///
+/// Linux-only: interroga il bus systemd `--user` via `bash -lc`. Su Windows non
+/// esiste systemd; il ramo dedicato ritorna una lista vuota (best-effort, coerente
+/// con la natura non bloccante dell'analisi) senza spawnare `bash`/`systemctl`
+/// (assenti) e senza spammare errori.
+#[cfg(unix)]
 pub(super) async fn collect_registered_services(slug: &str) -> Vec<serde_json::Value> {
     use tokio::process::Command;
     let out = Command::new("bash")
@@ -165,6 +171,13 @@ pub(super) async fn collect_registered_services(slug: &str) -> Vec<serde_json::V
         }
     }
     services
+}
+
+/// Ramo Windows: nessun systemd. Best-effort vuoto (l'analisi profonda non
+/// dipende da questa sezione su Windows nativo).
+#[cfg(windows)]
+pub(super) async fn collect_registered_services(_slug: &str) -> Vec<serde_json::Value> {
+    Vec::new()
 }
 
 // ── Pipeline analyzer (LLM via gateway) ────────────────────────────────────────

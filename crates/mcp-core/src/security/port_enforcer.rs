@@ -20,15 +20,12 @@ use crate::project_workspace::services::{
     detect_all_port_bindings, port_allocated_to_project, project_bucket_start,
     PROJECT_PORT_BUCKET_SIZE,
 };
-use crate::process_util::process_alive;
 use crate::security::{record_audit, AuditEntry};
 
 /// Intervallo di scansione: 5s bilancia reattivita' (finestra di violazione breve)
 /// con overhead CPU (<0.1% su ss + /proc scan).
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Delay tra SIGTERM e SIGKILL: concede al processo 2s per cleanup.
-const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
 /// Richiede il pool DB per cross-referencing PID-progetto e il registry dei
@@ -95,20 +92,11 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
             "port_enforcer: violazione rilevata, processo terminato"
         );
 
-        // SIGTERM
-        kill_process(b.pid, Signal::Term).await;
-
-        // Attendi grace period
-        tokio::time::sleep(KILL_GRACE).await;
-
-        // Se ancora vivo: SIGKILL (check via spawn_blocking per non bloccare tokio)
-        let pid_check = b.pid;
-        let still_alive = tokio::task::spawn_blocking(move || process_alive(pid_check))
-            .await
-            .unwrap_or(false);
-        if still_alive {
-            kill_process(b.pid, Signal::Kill).await;
-        }
+        // Terminazione via punto unico cross-platform (regola L): incapsula la
+        // sequenza TERM -> grace -> ricontrollo liveness -> KILL su Unix e usa
+        // taskkill /T /F su Windows. Il precedente `kill` inline era no-op su
+        // Windows (comando inesistente) -> violazioni di porta mai fatte rispettare.
+        crate::process_util::kill_pid(b.pid).await;
 
         // Audit trail
         record_audit(
@@ -237,44 +225,8 @@ fn emit_violation_notification(
     );
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Signal {
-    Term,
-    Kill,
-}
-
-/// Invia un segnale al processo. Best-effort: errori loggati ma non propagati.
-async fn kill_process(pid: u32, sig: Signal) {
-    let sig_str = match sig {
-        Signal::Term => "-TERM",
-        Signal::Kill => "-KILL",
-    };
-    let result = tokio::process::Command::new("kill")
-        .args([sig_str, &pid.to_string()])
-        .output()
-        .await;
-    match result {
-        Ok(out) if out.status.success() => {
-            tracing::debug!(pid, signal = sig_str, "port_enforcer: segnale inviato");
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            tracing::warn!(pid, signal = sig_str, stderr = %stderr, "port_enforcer: kill fallito");
-        }
-        Err(e) => {
-            tracing::warn!(pid, signal = sig_str, error = %e, "port_enforcer: kill errore");
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_signal_variants() {
-        // Verifica che i variant existano (compilazione)
-        let _t = Signal::Term;
-        let _k = Signal::Kill;
-    }
-}
+// La terminazione dei processi in violazione e' delegata al punto unico
+// cross-platform `crate::process_util::kill_pid` (regola L): l'enum `Signal` e la
+// funzione `kill_process` locali (che invocavano `kill` inline, no-op su Windows)
+// sono state rimosse in favore di quella singola implementazione. La sequenza
+// TERM -> grace -> KILL su Unix e il taskkill /T /F su Windows vivono li'.

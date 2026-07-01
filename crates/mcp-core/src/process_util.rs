@@ -3,10 +3,11 @@
 //! a Windows nativo: l'implementazione storica leggeva solo `/proc/{pid}` (Linux),
 //! restituendo SEMPRE `false` su Windows (port-enforcement cieco sulla liveness).
 //!
-//! NB: nel codebase restano altri controlli di liveness inline basati su
-//! `/proc/{pid}` (project_workspace/services.rs, port_recovery.rs, logs.rs): fanno
-//! parte del sottosistema di monitoring Linux-centrico, inerte su Windows, e vanno
-//! migrati a delegare qui in un intervento dedicato (non bloccante per la baseline).
+//! I controlli di liveness e le terminazioni di singolo PID del sottosistema
+//! GESTIONE PORTE (project_workspace/services.rs, port_recovery.rs, port_registry.rs,
+//! security/port_enforcer.rs) delegano ora a questo modulo. Restano letture `/proc`
+//! puramente Linux-centriche (net/tcp, cwd, PPid/stat, comm) marcate `#[cfg(unix)]`
+//! o degradate a vuoto su Windows, dove non hanno equivalente affidabile.
 
 /// `true` se esiste un processo vivo con questo `pid`.
 ///
@@ -39,6 +40,45 @@ pub(crate) fn process_alive(pid: u32) -> bool {
         CloseHandle(handle);
         true
     }
+}
+
+/// Termina il processo `pid` in modo best-effort. PUNTO UNICO (regola L) per la
+/// terminazione di un singolo PID: sostituisce i `Command::new("kill")` inline
+/// sparsi (services, crud, port_enforcer), che su Windows erano no-op silenziosi
+/// (`kill` non esiste -> processi mai terminati, porte mai liberate).
+///
+/// - Unix: `SIGTERM` (graceful), poi `SIGKILL` se ancora vivo dopo ~500ms.
+/// - Windows: `taskkill /PID <pid> /T /F` — `/T` termina anche l'albero dei figli
+///   (unico equivalente affidabile al kill del process group POSIX), `/F` forza.
+///
+/// Anti-suicidio: non tocca mai `pid` 0 o il proprio PID (coerente regola E).
+#[cfg(unix)]
+pub(crate) async fn kill_pid(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    let _ = tokio::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    if process_alive(pid) {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output()
+            .await;
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn kill_pid(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    let _ = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()
+        .await;
 }
 
 #[cfg(test)]

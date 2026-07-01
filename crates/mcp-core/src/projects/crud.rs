@@ -484,20 +484,15 @@ pub async fn delete_project(
     .await
     .unwrap_or_default();
 
+    // Terminazione dei figli tracciati: punto unico process_util::kill_pid
+    // (Unix: SIGTERM->SIGKILL; Windows: taskkill /T /F sull'albero). Sostituisce
+    // i `kill -TERM/-KILL` inline, no-op silenziosi su Windows.
     for pid in &running_pids {
-        let _ = tokio::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .await;
+        if *pid > 0 {
+            crate::process_util::kill_pid(*pid as u32).await;
+        }
     }
     if !running_pids.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        for pid in &running_pids {
-            let _ = tokio::process::Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .output()
-                .await;
-        }
         tracing::info!(
             "delete_project: terminati {} processi figli del progetto {}",
             running_pids.len(),
@@ -507,7 +502,11 @@ pub async fn delete_project(
 
     // Fix M35: scan /proc per processi con CWD dentro project_root non registrati
     // in agent_processes (es. dev server avviati dall'agente in run precedenti e
-    // sopravvissuti a uno Stop service mal completato). Linux-only via readlink.
+    // sopravvissuti a uno Stop service mal completato). Linux-only via readlink
+    // /proc/{pid}/cwd. Su Windows non c'e' equivalente immediato per lo scan
+    // orfani per-cwd: i figli tracciati sono gia' stati terminati sopra via
+    // process_util::kill_pid, quindi il blocco resta interamente #[cfg(unix)].
+    #[cfg(unix)]
     if !root_path.is_empty() {
         let mut orphan_pids: Vec<i32> = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir("/proc").await {
@@ -527,20 +526,13 @@ pub async fn delete_project(
                 }
             }
         }
+        // Terminazione orfani via punto unico process_util::kill_pid.
         for pid in &orphan_pids {
-            let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .output()
-                .await;
+            if *pid > 0 {
+                crate::process_util::kill_pid(*pid as u32).await;
+            }
         }
         if !orphan_pids.is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            for pid in &orphan_pids {
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .output()
-                    .await;
-            }
             tracing::info!(
                 "delete_project: terminati {} processi orfani con cwd in {} (M35)",
                 orphan_pids.len(),
@@ -592,10 +584,15 @@ pub async fn delete_project(
         let path = std::path::PathBuf::from(&root_path);
         if path.exists() && path.is_dir() {
             // Tentativo soft di sistemare i permessi (ignoro errori del chmod stesso).
-            let _ = tokio::process::Command::new("chmod")
-                .args(["-R", "u+rwX", root_path.as_str()])
-                .output()
-                .await;
+            // Solo Unix: `chmod` non esiste su Windows, dove remove_dir_all gestisce
+            // gia' l'eventuale attributo readonly rimuovendolo prima della cancellazione.
+            #[cfg(unix)]
+            {
+                let _ = tokio::process::Command::new("chmod")
+                    .args(["-R", "u+rwX", root_path.as_str()])
+                    .output()
+                    .await;
+            }
             if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                 tracing::warn!(
                     "delete_project: impossibile eliminare {} ({}). DB pulito ma directory orfana.",

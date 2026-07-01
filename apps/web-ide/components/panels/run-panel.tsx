@@ -274,11 +274,11 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   }, [services, ports]);
 
   const handleUninstall = async (svc: ProjectServiceEntry) => {
-    if (!await confirmDialog(`Disinstallare il servizio "${svc.short}"?\n\nVerranno eseguiti stop + disable + rimosso il file ~/.config/systemd/user/${svc.unit}.\nL'azione e' reversibile reinstallando il servizio dal wizard.`)) return;
+    if (!await confirmDialog(`Disinstallare il servizio "${svc.short}"?\n\nIl servizio verra' fermato e rimosso dal progetto.\nL'azione e' reversibile reinstallando il servizio dal wizard.`)) return;
     setSvcBusy(p => ({...p,[`${svc.unit}-uninstall`]:true})); setSvcMsg("");
     try {
       const r = await uninstallProjectService(projectId, svc.short);
-      setSvcMsg(r.ok ? `${svc.short}: disinstallato${r.removed ? "" : " (file unit non trovato)"}` : `${svc.short}: errore disinstallazione`);
+      setSvcMsg(r.ok ? `${svc.short}: disinstallato${r.removed ? "" : " (nessun elemento da rimuovere)"}` : `${svc.short}: errore disinstallazione`);
       setTimeout(()=>{ fetchServices(); fetchPorts(); }, 1000);
     } catch { setSvcMsg(`${svc.short}: errore di rete in disinstallazione`); }
     finally { setSvcBusy(p=>({...p,[`${svc.unit}-uninstall`]:false})); setTimeout(()=>setSvcMsg(""),5000); }

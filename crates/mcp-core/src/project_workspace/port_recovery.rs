@@ -36,6 +36,10 @@ pub async fn tcp_probe(port: u16, timeout_ms: u64) -> bool {
 
 /// Legge il process group id (PGID) di `pid` da /proc/{pid}/stat (campo `pgrp`,
 /// il 3° dopo la `)` che chiude `comm`). None se non leggibile.
+///
+/// Solo Unix: i process group POSIX e `/proc` non esistono su Windows, dove la
+/// terminazione dell'albero e' gestita da `taskkill /T` (vedi `kill_process_tree`).
+#[cfg(unix)]
 async fn read_pgid(pid: u32) -> Option<u32> {
     let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
         .await
@@ -50,7 +54,8 @@ async fn read_pgid(pid: u32) -> Option<u32> {
 }
 
 /// Legge il comm (nome processo) di `pid` da /proc/{pid}/comm. None se non
-/// leggibile o pid morto.
+/// leggibile o pid morto. Solo Unix (dipende da `/proc`).
+#[cfg(unix)]
 async fn read_comm(pid: u32) -> Option<String> {
     let raw = tokio::fs::read_to_string(format!("/proc/{pid}/comm"))
         .await
@@ -62,6 +67,8 @@ async fn read_comm(pid: u32) -> Option<String> {
 /// Serve a riconoscere i servizi Nexus il cui `comm` e' il runtime generico
 /// (brain == "python3", web-ide == "node"): il modulo/entrypoint compare solo
 /// nella cmdline completa. None se illeggibile o vuoto (kernel thread / pid morto).
+/// Solo Unix (dipende da `/proc`).
+#[cfg(unix)]
 async fn read_cmdline(pid: u32) -> Option<String> {
     let raw = tokio::fs::read(format!("/proc/{pid}/cmdline")).await.ok()?;
     if raw.is_empty() {
@@ -77,7 +84,8 @@ async fn read_cmdline(pid: u32) -> Option<String> {
 /// sul solo `read_pgid(own_pid)`; questa enumerazione usa invece il `comm` REALE
 /// di OGNI membro del gruppo, criterio indipendente, e copre il caso in cui un
 /// qualunque servizio Nexus condivida il gruppo bersaglio (regola E: mai abbattere
-/// l'infrastruttura).
+/// l'infrastruttura). Solo Unix (enumera `/proc` e usa i process group POSIX).
+#[cfg(unix)]
 async fn nexus_processes_in_group(pgid: u32) -> Vec<(u32, String)> {
     let mut hits = Vec::new();
     let mut entries = match tokio::fs::read_dir("/proc").await {
@@ -109,13 +117,14 @@ async fn nexus_processes_in_group(pgid: u32) -> Vec<(u32, String)> {
 /// Il `comm` e' il match primario; la cmdline copre i servizi il cui comm e' il
 /// runtime generico (brain == "python3", web-ide == "node"), che NON comparirebbero
 /// in NEXUS_COMMS — gap che lasciava il brain scoperto dal check #4 anti-suicidio.
+/// Solo Unix: usata esclusivamente dalla logica di kill del process group POSIX.
+#[cfg(unix)]
 fn is_nexus_process(comm: Option<&str>, cmdline: Option<&str>) -> bool {
     const NEXUS_COMMS: &[&str] = &[
         "mcp-core",
         "brain",
         "nexus-gateway",
         "admin-service",
-        "chat-service",
         "doc-service",
         "billing-service",
         "plugin-service",
@@ -161,6 +170,7 @@ fn is_nexus_process(comm: Option<&str>, cmdline: Option<&str>) -> bool {
 ///      se contiene mcp-core/brain/gateway/microservizi, abort (incidente
 ///      2026-06-06: una catena dev-server scambiata per duplicati portava a un
 ///      kill di gruppo che abbatteva mcp-core).
+#[cfg(unix)]
 pub(crate) async fn kill_process_tree(pid: u32) {
     let own_pid = std::process::id();
 
@@ -246,6 +256,36 @@ pub(crate) async fn kill_process_tree(pid: u32) {
             .await;
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Termina l'intero albero di processi di `pid` su Windows.
+///
+/// Non esistono i process group POSIX ne' `/proc`: `taskkill /T /F` termina il
+/// processo E l'intera discendenza (equivalente affidabile del kill del gruppo,
+/// necessario per fermare catene `pnpm dev -> node -> vite` che altrimenti
+/// rilanciano il figlio col listener). `/F` forza (nessun graceful step: su
+/// Windows non c'e' un SIGTERM intermedio applicabile a tutto l'albero).
+///
+/// Anti-suicidio minimo (regola E): mai toccare pid 0 ne' il proprio PID. I check
+/// difensivi PGID/comm della variante Unix non hanno equivalente qui (nessun
+/// `/proc`), ma `taskkill` colpisce solo l'albero del PID indicato, non un gruppo
+/// condiviso, quindi il rischio di abbattere l'infrastruttura Nexus e' assente
+/// finche' non si passa un PID Nexus (i chiamanti a monte gia' escludono own_pid
+/// e i PID tracciati).
+#[cfg(windows)]
+pub(crate) async fn kill_process_tree(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        tracing::error!(
+            target = "port_recovery",
+            pid,
+            "kill_process_tree: RIFIUTO di uccidere pid 0 o il proprio PID (mcp-core)"
+        );
+        return;
+    }
+    let _ = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()
+        .await;
 }
 
 /// Lista (port, pid, program) in ascolto. Usa `ss` se disponibile, fallback /proc.
@@ -386,7 +426,8 @@ pub async fn kill_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<u32> {
     killed
 }
 
-#[cfg(test)]
+// `is_nexus_process` esiste solo su Unix: i test relativi vanno compilati solo li'.
+#[cfg(all(test, unix))]
 mod is_nexus_process_tests {
     use super::is_nexus_process;
 

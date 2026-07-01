@@ -56,8 +56,10 @@ async fn check_db(db: &sqlx::PgPool) -> EnvironmentCheck {
     }
 }
 
+#[cfg(unix)]
 async fn check_playwright_libs() -> EnvironmentCheck {
-    // Prova ldconfig -p
+    // Su Linux Chromium (Playwright) dipende da librerie .so di sistema (libatk,
+    // libnss, ecc.). Prova ldconfig -p; in fallback cerca in /usr/lib.
     let found = if let Ok(out) = Command::new("ldconfig").args(["-p"]).output().await {
         let stdout = String::from_utf8_lossy(&out.stdout);
         stdout.contains("libatk")
@@ -84,6 +86,19 @@ async fn check_playwright_libs() -> EnvironmentCheck {
             "libatk-1.0.so.0 missing",
         )
     }
+}
+
+#[cfg(windows)]
+async fn check_playwright_libs() -> EnvironmentCheck {
+    // Su Windows Chromium (Playwright) non richiede librerie .so di sistema:
+    // le dipendenze native sono incluse nel bundle del browser. Nessun check
+    // ldconfig/find applicabile: lo stato e' sempre OK per non generare falsi
+    // allarmi "libreria mancante".
+    EnvironmentCheck::ok(
+        "playwright_libs",
+        "Playwright system libs",
+        "nessuna libreria di sistema richiesta su Windows",
+    )
 }
 
 async fn check_playwright_browser() -> EnvironmentCheck {
@@ -152,13 +167,12 @@ async fn check_tool_runner(db: &sqlx::PgPool) -> EnvironmentCheck {
     }
 }
 
-/// Controlla i 5 microservizi Rust ausiliari (admin, chat, doc, billing, plugin).
+/// Controlla i microservizi Rust ausiliari (admin, doc, billing, plugin).
 /// Li verifica in parallelo con TCP connect (1s timeout); restituisce un check
 /// aggregato con il dettaglio per ciascun servizio.
 async fn check_microservices() -> EnvironmentCheck {
     let services = [
         ("admin-service", 4010u16),
-        ("chat-service", 4020),
         ("doc-service", 4030),
         ("billing-service", 4040),
         ("plugin-service", 4050),
@@ -219,25 +233,29 @@ async fn check_microservices() -> EnvironmentCheck {
     }
 }
 
+// NOTA (brain rimosso): il brain Python (`brain.grpc_server`) e' stato eliminato
+// dal repo (commit 75a6d62): non esiste piu' un entrypoint/servizio Python ne'
+// su Linux ne' su Windows. Il motore agentico PRIMARIO e' nativo Rust; il brain
+// resta solo come backend HTTP opzionale, non piu' come processo locale.
+// Questo check e' quindi codice morto: su Linux `pgrep` non trova nulla e su
+// Windows `pgrep` non esiste (falso allarme "not running"). Va valutata la
+// rimozione completa; per ora e' un dispatch neutro che NON segnala errori.
+#[cfg(unix)]
 async fn check_brain_service() -> EnvironmentCheck {
-    let result = Command::new("pgrep")
-        .args(["-f", "brain.grpc_server.main|nexus-brain|uvicorn"])
-        .output()
-        .await;
+    EnvironmentCheck::warn(
+        "brain_service",
+        "Nexus Brain (Python AI)",
+        "componente rimosso dal repo: motore agentico ora nativo Rust",
+    )
+}
 
-    match result {
-        Ok(out) if !out.stdout.is_empty() => {
-            let pid = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .replace('\n', ",");
-            EnvironmentCheck::ok(
-                "brain_service",
-                "Nexus Brain (Python AI)",
-                format!("pid {pid}"),
-            )
-        }
-        _ => EnvironmentCheck::error("brain_service", "Nexus Brain (Python AI)", "not running"),
-    }
+#[cfg(windows)]
+async fn check_brain_service() -> EnvironmentCheck {
+    EnvironmentCheck::warn(
+        "brain_service",
+        "Nexus Brain (Python AI)",
+        "componente rimosso dal repo: motore agentico ora nativo Rust",
+    )
 }
 
 fn check_backend_process() -> EnvironmentCheck {
@@ -246,34 +264,38 @@ fn check_backend_process() -> EnvironmentCheck {
 }
 
 async fn check_frontend_process() -> EnvironmentCheck {
-    let result = Command::new("ss").args(["-tlnp"]).output().await;
-    match result {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.contains(":3000") {
-                EnvironmentCheck::ok(
-                    "frontend_process",
-                    "Frontend web-ide",
-                    "Port 3000 listening",
-                )
-            } else {
-                EnvironmentCheck::error(
-                    "frontend_process",
-                    "Frontend web-ide",
-                    "Port 3000 not listening",
-                )
-            }
-        }
-        Err(e) => EnvironmentCheck::warn(
+    // Probe TCP portabile (regola H): un connect riuscito su 127.0.0.1:3000
+    // implica che la porta e' in ascolto, indipendentemente dall'OS. Elimina la
+    // dipendenza da `ss` (POSIX-only, falso allarme "down" su Windows). Non piu'
+    // disponibili pid/program del listener: si riporta solo lo stato in-ascolto.
+    const FRONTEND_PORT: u16 = 3000;
+    let connect = timeout(
+        Duration::from_millis(1000),
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{FRONTEND_PORT}")),
+    )
+    .await;
+    match connect {
+        Ok(Ok(_)) => EnvironmentCheck::ok(
             "frontend_process",
             "Frontend web-ide",
-            format!("ss failed: {e}"),
+            format!("Port {FRONTEND_PORT} listening"),
+        ),
+        Ok(Err(_)) | Err(_) => EnvironmentCheck::error(
+            "frontend_process",
+            "Frontend web-ide",
+            format!("Port {FRONTEND_PORT} not listening"),
         ),
     }
 }
 
 async fn check_migrations(db_url: &str) -> EnvironmentCheck {
-    // Risolve il path di sqlx-cli: prima il path esplicito, poi cerca nel PATH via `which`.
+    // Risolve il path di sqlx-cli in modo cross-platform.
+    // - Unix: path esplicito noto, poi `which` sul PATH.
+    // - Windows: `where` (where.exe) sul PATH; niente path esplicito
+    //   (l'installazione cargo mette sqlx.exe in %USERPROFILE%\.cargo\bin, gia'
+    //   nel PATH). `which` non esiste su Windows: usarlo darebbe un falso
+    //   "sqlx-cli non installato".
+    #[cfg(unix)]
     let sqlx_path = if std::path::Path::new("/home/administrator/.cargo/bin/sqlx").exists() {
         "/home/administrator/.cargo/bin/sqlx".to_string()
     } else {
@@ -282,6 +304,34 @@ async fn check_migrations(db_url: &str) -> EnvironmentCheck {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => {
                 // sqlx-cli non installato: id dedicato per mostrare il pulsante di installazione
+                return EnvironmentCheck::warn(
+                    "migrations_sqlx_missing",
+                    "DB Migrations",
+                    "sqlx-cli non installato",
+                );
+            }
+        }
+    };
+
+    #[cfg(windows)]
+    let sqlx_path = {
+        let where_out = Command::new("where").arg("sqlx").output().await;
+        match where_out {
+            // `where` puo' stampare piu' righe (path multipli): prende la prima.
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                match stdout.lines().next().map(|l| l.trim().to_string()) {
+                    Some(p) if !p.is_empty() => p,
+                    _ => {
+                        return EnvironmentCheck::warn(
+                            "migrations_sqlx_missing",
+                            "DB Migrations",
+                            "sqlx-cli non installato",
+                        );
+                    }
+                }
+            }
+            _ => {
                 return EnvironmentCheck::warn(
                     "migrations_sqlx_missing",
                     "DB Migrations",
@@ -340,6 +390,7 @@ async fn check_ai_providers(db: &sqlx::PgPool) -> EnvironmentCheck {
     }
 }
 
+#[cfg(unix)]
 async fn check_disk_space() -> EnvironmentCheck {
     let result = Command::new("df").args(["-h", "/"]).output().await;
     match result {
@@ -368,6 +419,21 @@ async fn check_disk_space() -> EnvironmentCheck {
         }
         Err(e) => EnvironmentCheck::warn("disk_space", "Disk space", format!("df failed: {e}")),
     }
+}
+
+#[cfg(windows)]
+async fn check_disk_space() -> EnvironmentCheck {
+    // Degrado pulito su Windows: `df` non esiste. L'API nativa
+    // GetDiskFreeSpaceExW richiederebbe la feature `Win32_Storage_FileSystem` di
+    // windows-sys (non abilitata nel Cargo.toml, che espone solo Foundation +
+    // System::Threading). Per non introdurre nuove dipendenze/feature e per non
+    // generare un finto errore "df failed", si riporta uno stato esplicito di
+    // metrica non disponibile (status ok: non e' un guasto, solo non misurabile).
+    EnvironmentCheck::ok(
+        "disk_space",
+        "Disk space",
+        "metrica non disponibile su Windows",
+    )
 }
 
 pub async fn get_environment_status(State(state): State<AppState>) -> ApiResult {

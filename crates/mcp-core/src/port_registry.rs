@@ -521,6 +521,10 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
 /// True se la command line (token NUL-separati di /proc/{pid}/cmdline) appartiene
 /// a un dev-server di un'app utente (Vite, Next, `pnpm dev`, ecc.). Esclude
 /// esplicitamente build/install e i processi di Nexus stesso.
+///
+/// Solo Unix: usata esclusivamente dalla scansione `/proc` della dedup dev-server,
+/// no-op su Windows.
+#[cfg(unix)]
 fn is_dev_server_cmdline(cmdline: &str) -> bool {
     let cl = cmdline.to_lowercase();
     // Esclusioni: build/install e tooling che non e' un long-running dev-server.
@@ -553,6 +557,10 @@ fn is_dev_server_cmdline(cmdline: &str) -> bool {
 /// Legge il campo 22 (`starttime`, clock ticks dall'avvio del sistema) da
 /// /proc/{pid}/stat. None se non leggibile/parsabile. Serve per individuare il
 /// processo piu' recente fra duplicati dello stesso progetto.
+///
+/// Solo Unix: `/proc` non esiste su Windows. La dedup dev-server che la usa
+/// (`cleanup_duplicate_dev_servers`) e' no-op su Windows (vedi variante dedicata).
+#[cfg(unix)]
 fn read_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `comm` (campo 2) puo' contenere spazi/parentesi: si parte da dopo l'ultima
@@ -569,7 +577,8 @@ fn read_start_time(pid: u32) -> Option<u64> {
 /// della stessa cwd: un albero `pnpm dev -> node vite -> esbuild` ha UNA sola
 /// radice e NON va trattato come N duplicati (incidente 2026-06-06: il kill di
 /// gruppo di un anello della catena abbatteva l'intero process group, mcp-core
-/// incluso).
+/// incluso). Solo Unix (dipende da `/proc`).
+#[cfg(unix)]
 fn read_ppid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after = stat.rsplit_once(')')?.1;
@@ -586,6 +595,10 @@ fn read_ppid(pid: u32) -> Option<u32> {
 /// stesso progetto (es. `pnpm run dev:frontend` vs `pnpm run dev:backend`)
 /// restano distinti. Versioni e numeri brevi (1-3 cifre, es. `vite@5.4.21`,
 /// `worker:2`) sono preservati per non collassare servizi distinti.
+///
+/// Funzione pura testabile su ogni OS. Su Windows non ha chiamanti non-test (la
+/// dedup dev-server e' no-op), quindi si sopprime dead_code lasciando i test attivi.
+#[cfg_attr(windows, allow(dead_code))]
 fn dev_server_signature(cmdline: &str) -> String {
     static RE_PORTLIKE: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"\d{4,}").unwrap());
@@ -606,6 +619,10 @@ fn dev_server_signature(cmdline: &str) -> String {
 /// toccate. Estratta per essere testabile senza /proc reale; fissa la regressione
 /// 2026-06-06 (catena scambiata per duplicati) e 2026-06-25 (frontend+backend
 /// dello stesso progetto scambiati per duplicati -> kill del backend).
+///
+/// Funzione pura testabile su ogni OS. Su Windows non ha chiamanti non-test (la
+/// dedup dev-server e' no-op), quindi si sopprime dead_code lasciando i test attivi.
+#[cfg_attr(windows, allow(dead_code))]
 fn dev_server_roots_to_kill(procs: &[(u32, u64, u32, String)]) -> Vec<u32> {
     if procs.len() < 2 {
         return Vec::new();
@@ -644,6 +661,13 @@ fn dev_server_roots_to_kill(procs: &[(u32, u64, u32, String)]) -> Vec<u32> {
 /// process group del dev-server vivo (incidente 2026-06-06). Ritorna quanti
 /// processi sono stati terminati. Gated da `agent.port_gc.dedupe_dev_servers`
 /// (regola G).
+///
+/// Solo Unix: l'intera logica dipende da `/proc` (scan, cmdline, cwd, start_time,
+/// ppid). Su Windows non e' determinabile in modo affidabile quale, tra due
+/// dev-server della stessa cwd, sia il duplicato da terminare (mancano start_time
+/// e ppid via `/proc`): la variante Windows e' un no-op sicuro (vedi sotto),
+/// perche' non terminare e' preferibile a uccidere il processo sbagliato.
+#[cfg(unix)]
 pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
     let enabled = crate::settings::get_setting(db, "agent.port_gc.dedupe_dev_servers")
         .await
@@ -787,6 +811,17 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
         warn!("cleanup_duplicate_dev_servers: terminati {killed} dev-server duplicati");
     }
     killed
+}
+
+/// Variante Windows: NO-OP sicuro. La dedup dev-server si basa su `start_time` e
+/// `ppid` letti da `/proc`, che su Windows non esistono; senza questi segnali non
+/// si puo' stabilire in modo affidabile quale istanza sia il duplicato da
+/// terminare. Degrado consapevole (regola H, no toppe): meglio non terminare
+/// nulla che rischiare di uccidere il dev-server vivo o un processo riciclato.
+/// Ritorna sempre 0 (nessun processo terminato). Chiamata da `port_gc_loop`.
+#[cfg(windows)]
+pub async fn cleanup_duplicate_dev_servers(_db: &PgPool) -> u64 {
+    0
 }
 
 /// Worker periodico di garbage-collection delle porte orfane. `interval_secs` e

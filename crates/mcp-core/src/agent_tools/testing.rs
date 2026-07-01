@@ -32,6 +32,12 @@ const PLAYWRIGHT_MAX_TIMEOUT: u64 = 900;
 /// - Esegue `ldd <binary>`, parsa le righe "X => not found", restituisce la
 ///   lista distinct (es. ["libnspr4.so", "libnss3.so", ...]).
 /// - Best-effort: errori ldd / glob falliti ritornano None (no falsi positivi).
+///
+/// Linux-only: le dipendenze condivise (`.so`) e lo strumento `ldd` esistono solo
+/// su Linux. Su Windows i browser Playwright non hanno dipendenze `.so` da
+/// verificare: il ramo dedicato ritorna sempre None (nessuna libreria mancante),
+/// cosi' il preflight non blocca mai l'esecuzione dei test.
+#[cfg(unix)]
 async fn preflight_check_chromium_libs() -> Option<Vec<String>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let cache_root = format!("{home}/.cache/ms-playwright");
@@ -85,6 +91,13 @@ async fn preflight_check_chromium_libs() -> Option<Vec<String>> {
     } else {
         Some(missing)
     }
+}
+
+/// Ramo Windows: nessuna dipendenza `.so` da verificare per Chromium. Ritorna
+/// sempre None (nessuna libreria mancante) per non bloccare i test Playwright.
+#[cfg(windows)]
+async fn preflight_check_chromium_libs() -> Option<Vec<String>> {
+    None
 }
 
 /// Porta preferita tra quelle allocate al progetto.

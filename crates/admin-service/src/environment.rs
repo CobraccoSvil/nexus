@@ -41,8 +41,10 @@ async fn check_db(db: &sqlx::PgPool) -> EnvironmentCheck {
     }
 }
 
+#[cfg(unix)]
 async fn check_playwright_libs() -> EnvironmentCheck {
-    // Prova ldconfig -p
+    // Su Linux Chromium (Playwright) dipende da librerie .so di sistema (libatk,
+    // libnss, ecc.). Prova ldconfig -p; in fallback cerca in /usr/lib.
     let found = if let Ok(out) = Command::new("ldconfig").args(["-p"]).output().await {
         let stdout = String::from_utf8_lossy(&out.stdout);
         stdout.contains("libatk")
@@ -61,6 +63,18 @@ async fn check_playwright_libs() -> EnvironmentCheck {
     } else {
         EnvironmentCheck::error("playwright_libs", "Playwright system libs", "libatk-1.0.so.0 missing")
     }
+}
+
+#[cfg(windows)]
+async fn check_playwright_libs() -> EnvironmentCheck {
+    // Su Windows Chromium (Playwright) non richiede librerie .so di sistema:
+    // le dipendenze native sono nel bundle del browser. Nessun ldconfig/find:
+    // stato sempre OK per non generare falsi allarmi "libreria mancante".
+    EnvironmentCheck::ok(
+        "playwright_libs",
+        "Playwright system libs",
+        "nessuna libreria di sistema richiesta su Windows",
+    )
 }
 
 async fn check_playwright_browser() -> EnvironmentCheck {
@@ -95,17 +109,27 @@ fn check_backend_process() -> EnvironmentCheck {
 }
 
 async fn check_frontend_process() -> EnvironmentCheck {
-    let result = Command::new("ss").args(["-tlnp"]).output().await;
-    match result {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.contains(":3000") {
-                EnvironmentCheck::ok("frontend_process", "Frontend web-ide", "Port 3000 listening")
-            } else {
-                EnvironmentCheck::error("frontend_process", "Frontend web-ide", "Port 3000 not listening")
-            }
-        }
-        Err(e) => EnvironmentCheck::warn("frontend_process", "Frontend web-ide", format!("ss failed: {e}")),
+    // Probe TCP portabile (regola H): un connect riuscito su 127.0.0.1:3000
+    // implica che la porta e' in ascolto, indipendentemente dall'OS. Elimina la
+    // dipendenza da `ss` (POSIX-only, falso allarme "down" su Windows). Non piu'
+    // disponibili pid/program del listener: si riporta solo lo stato in-ascolto.
+    const FRONTEND_PORT: u16 = 3000;
+    let connect = timeout(
+        Duration::from_millis(1000),
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{FRONTEND_PORT}")),
+    )
+    .await;
+    match connect {
+        Ok(Ok(_)) => EnvironmentCheck::ok(
+            "frontend_process",
+            "Frontend web-ide",
+            format!("Port {FRONTEND_PORT} listening"),
+        ),
+        Ok(Err(_)) | Err(_) => EnvironmentCheck::error(
+            "frontend_process",
+            "Frontend web-ide",
+            format!("Port {FRONTEND_PORT} not listening"),
+        ),
     }
 }
 
@@ -147,6 +171,7 @@ async fn check_ai_providers(db: &sqlx::PgPool) -> EnvironmentCheck {
     }
 }
 
+#[cfg(unix)]
 async fn check_disk_space() -> EnvironmentCheck {
     // Controlla il disco dove risiede Nexus (non necessariamente il root /)
     let nexus_root = std::env::var("NEXUS_ROOT")
@@ -194,6 +219,20 @@ async fn check_disk_space() -> EnvironmentCheck {
     }
 }
 
+#[cfg(windows)]
+async fn check_disk_space() -> EnvironmentCheck {
+    // Degrado pulito su Windows: `df` non esiste. admin-service NON dipende da
+    // windows-sys (a differenza di mcp-core), quindi non e' disponibile l'API
+    // nativa GetDiskFreeSpaceExW senza introdurre una nuova dipendenza. Per non
+    // generare un finto errore "df non disponibile", si riporta uno stato
+    // esplicito di metrica non misurabile (status ok: non e' un guasto).
+    EnvironmentCheck::ok(
+        "disk_space",
+        "Disk space",
+        "metrica non disponibile su Windows",
+    )
+}
+
 /// Controlla se un servizio HTTP interno risponde all'endpoint /health o /api/health
 async fn check_internal_service(id: &str, label: &str, port: u16, health_path: &str) -> EnvironmentCheck {
     let url = format!("http://127.0.0.1:{port}{health_path}");
@@ -228,7 +267,6 @@ pub async fn get_environment_status(
         disk_check,
         svc_mcp,
         svc_admin,
-        svc_chat,
         svc_doc,
         svc_billing,
         svc_plugin,
@@ -242,7 +280,6 @@ pub async fn get_environment_status(
         check_disk_space(),
         check_internal_service("svc_mcp_core",    "MCP Core (:4000)",        4000, "/api/health"),
         check_internal_service("svc_admin",        "Admin Service (:4010)",   4010, "/health"),
-        check_internal_service("svc_chat",         "Chat Service (:4020)",    4020, "/health"),
         check_internal_service("svc_doc",          "Doc Service (:4030)",     4030, "/health"),
         check_internal_service("svc_billing",      "Billing Service (:4040)", 4040, "/health"),
         check_internal_service("svc_plugin",       "Plugin Service (:4050)",  4050, "/health"),
@@ -262,7 +299,6 @@ pub async fn get_environment_status(
         // Microservizi interni
         svc_mcp,
         svc_admin,
-        svc_chat,
         svc_doc,
         svc_billing,
         svc_plugin,

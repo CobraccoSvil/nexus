@@ -659,52 +659,157 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
         .output()
         .await;
 
+    // stdout in formato grep `-rn` ("path:lineno:contenuto"). Su Windows `grep`
+    // non e' garantito: se lo spawn fallisce (Err, non exit-code != 0), si passa
+    // al fallback in Rust puro, cross-platform, che produce lo STESSO formato
+    // cosi' il post-processing (relativizzazione path + troncamento) resta unico.
+    let stdout: String = match output {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            // grep esce con 1 e stdout vuoto quando non trova nulla: non e' un errore.
+            if stdout.is_empty() && !stderr.is_empty() {
+                return format!("[grep error: {}]", stderr.trim());
+            }
+            stdout
+        }
+        // grep assente (tipico Windows nativo): ricerca in-process, best-effort.
+        Err(_) => search_in_files_rust(&search_path, pattern),
+    };
+
+    format_search_output(ctx, pattern, &stdout)
+}
+
+/// Formatta l'output della ricerca (comune a grep e al fallback Rust): rende i
+/// path relativi alla root e applica il troncamento. Punto unico (regola L): la
+/// stessa logica serviva sia al ramo grep sia al fallback Windows.
+fn format_search_output(ctx: &AgentToolContext, pattern: &str, stdout: &str) -> String {
     // Limite massimo di output: 500KB. Risultati piu' grandi causano
     // RESOURCE_EXHAUSTED gRPC (limite 16MB client Python) e consumano
     // troppi token di contesto per l'LLM. 500KB ~ 10k righe di codice.
     const MAX_OUTPUT_BYTES: usize = 500 * 1024;
     const MAX_OUTPUT_LINES: usize = 2000;
 
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            if stdout.is_empty() && !stderr.is_empty() {
-                format!("[grep error: {}]", stderr.trim())
-            } else if stdout.is_empty() {
-                format!("Nessun risultato per '{pattern}'.")
-            } else {
-                // Rendi i path relativi alla root per leggibilita'
-                let lines: Vec<String> = stdout
-                    .lines()
-                    .map(|line| {
-                        line.replacen(ctx.root_path.to_string_lossy().as_ref(), "", 1)
-                            .trim_start_matches(['/', '\\'])
-                            .to_string()
-                    })
-                    .collect();
-                let total_lines = lines.len();
-                // Troncamento: limita per numero righe e per dimensione bytes
-                let mut result = String::new();
-                for (count, line) in lines.iter().enumerate() {
-                    if count >= MAX_OUTPUT_LINES || result.len() + line.len() > MAX_OUTPUT_BYTES {
-                        let msg = format!(
-                            "\n\n[Risultato troncato: mostrate {} di {} righe. Usa un pattern piu' specifico o limita il path.]",
-                            count, total_lines
-                        );
-                        result.push_str(&msg);
+    if stdout.is_empty() {
+        return format!("Nessun risultato per '{pattern}'.");
+    }
+    // Rendi i path relativi alla root per leggibilita'
+    let lines: Vec<String> = stdout
+        .lines()
+        .map(|line| {
+            line.replacen(ctx.root_path.to_string_lossy().as_ref(), "", 1)
+                .trim_start_matches(['/', '\\'])
+                .to_string()
+        })
+        .collect();
+    let total_lines = lines.len();
+    // Troncamento: limita per numero righe e per dimensione bytes
+    let mut result = String::new();
+    for (count, line) in lines.iter().enumerate() {
+        if count >= MAX_OUTPUT_LINES || result.len() + line.len() > MAX_OUTPUT_BYTES {
+            let msg = format!(
+                "\n\n[Risultato troncato: mostrate {} di {} righe. Usa un pattern piu' specifico o limita il path.]",
+                count, total_lines
+            );
+            result.push_str(&msg);
+            break;
+        }
+        if count > 0 {
+            result.push('\n');
+        }
+        result.push_str(line);
+    }
+    result
+}
+
+/// Ricerca ricorsiva in Rust puro, fallback cross-platform quando `grep` non e'
+/// disponibile (Windows nativo). Riproduce il comportamento essenziale di
+/// `grep -rn --max-count=50 -I`:
+/// - cammina la directory con `std::fs` (nessuna dipendenza esterna);
+/// - salta le entry nascoste (nome che inizia con '.') come il resto del modulo;
+/// - salta i file binari (euristica: byte NUL nei primi 8 KB), come `-I`;
+/// - al piu' 50 righe corrispondenti per file (`--max-count=50`);
+/// - match case-sensitive come `grep` di default: `regex::Regex` (gia' dipendenza)
+///   e, se il pattern non e' una regex valida, ricerca letterale con `contains`.
+///
+/// Formato riga identico a `grep -rn`: "<path_assoluto>:<lineno>:<contenuto>".
+fn search_in_files_rust(root: &std::path::Path, pattern: &str) -> String {
+    // grep di default interpreta il pattern come espressione regolare (BRE).
+    // `regex` usa la sintassi ERE/PCRE-like: per i pattern comuni (letterali,
+    // classi, alternanze) il comportamento coincide; se la compilazione fallisce
+    // si degrada a ricerca letterale (substring), sempre case-sensitive.
+    let re = regex::Regex::new(pattern).ok();
+    let matches = |line: &str| -> bool {
+        match &re {
+            Some(r) => r.is_match(line),
+            None => line.contains(pattern),
+        }
+    };
+
+    // Budget difensivo per non camminare all'infinito su alberi enormi: ben oltre
+    // il troncamento a valle (2000 righe / 500 KB), quindi non altera il risultato.
+    const MAX_FILES_VISITED: usize = 50_000;
+    const MAX_TOTAL_MATCHES: usize = 5_000;
+    const MAX_MATCHES_PER_FILE: usize = 50;
+    const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+    let mut out = String::new();
+    let mut total_matches = 0usize;
+    let mut files_visited = 0usize;
+    // DFS iterativa (niente ricorsione: alberi profondi non fanno overflow).
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue, // permessi/inesistente: best-effort, salta
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue; // salta dotfile/dotdir (allineato a tool_list_files)
+            }
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue; // symlink/altro: non seguiamo (evita cicli)
+            }
+            files_visited += 1;
+            if files_visited > MAX_FILES_VISITED || total_matches >= MAX_TOTAL_MATCHES {
+                return out;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            // Euristica `-I`: file binario se contiene un NUL nell'intestazione.
+            if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let path_str = path.to_string_lossy();
+            let mut per_file = 0usize;
+            for (idx, line) in text.lines().enumerate() {
+                if matches(line) {
+                    out.push_str(&format!("{}:{}:{}\n", path_str, idx + 1, line));
+                    per_file += 1;
+                    total_matches += 1;
+                    if per_file >= MAX_MATCHES_PER_FILE || total_matches >= MAX_TOTAL_MATCHES {
                         break;
                     }
-                    if count > 0 {
-                        result.push('\n');
-                    }
-                    result.push_str(line);
                 }
-                result
             }
         }
-        Err(e) => format!("[Impossibile eseguire grep: {}]", e),
     }
+    out
 }
 
 pub(super) async fn tool_delete_file(ctx: &AgentToolContext, input: &Value) -> String {

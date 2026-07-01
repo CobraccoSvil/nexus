@@ -107,7 +107,7 @@ async fn compute_metrics(
     project_id: Uuid,
     slug: &str,
 ) -> Vec<(&'static str, serde_json::Value, &'static str)> {
-    let services = count_services(slug).await;
+    let services = count_services(state, project_id, slug).await;
     let containers = count_containers_up(slug).await;
     let ports = count_ports_used(state, project_id).await;
     let problems = count_problems_open(&state.db, project_id)
@@ -285,6 +285,10 @@ async fn read_primary_model(db: &sqlx::PgPool, project_id: Uuid) -> Option<Strin
 /// dal caso "manager non disponibile" (label "—/N" onesto: lo stato detached
 /// non e' osservabile via systemctl, ma `containers_up` espone gia' i container
 /// docker reali, quindi non mentiamo dicendo "0/N").
+// Su Windows la variante `InstalledOnly` non viene mai costruita (nessun probe
+// del bus systemd: il conteggio da agent_processes e' sempre esatto), ma resta
+// nel match del chiamante: silenzia il lint "variant never constructed".
+#[cfg_attr(windows, allow(dead_code))]
 enum ServiceCount {
     Counted { active: usize, installed: usize },
     InstalledOnly { installed: usize }, // manager non rispondeva
@@ -294,7 +298,14 @@ enum ServiceCount {
 /// scandagliando i file in `~/.config/systemd/user/` e i "active" via systemctl
 /// (se manager attivo); se systemd-user non c'e' (WSL/detached) ritorna
 /// `InstalledOnly` per evitare il fuorviante "0/N".
-async fn count_services(slug: &str) -> Option<ServiceCount> {
+///
+/// Ramo Linux: sorgente di verita' i file unit systemd `--user`.
+#[cfg(unix)]
+async fn count_services(
+    _state: &AppState,
+    _project_id: Uuid,
+    slug: &str,
+) -> Option<ServiceCount> {
     let home = std::env::var("HOME").ok()?;
     let dir = format!("{home}/.config/systemd/user");
     let prefix = format!("{slug}-");
@@ -339,6 +350,41 @@ async fn count_services(slug: &str) -> Option<ServiceCount> {
         }
     }
     Some(ServiceCount::Counted { active, installed })
+}
+
+/// Ramo Windows: niente systemd `--user`. I servizi di progetto sono tracciati
+/// nella tabella `agent_processes` (kind='service'), sorgente di verita' del
+/// service manager Nexus su Windows. Si contano le label distinte (installati) e
+/// quelle in stato `running`/`starting` (attivi), instradando sul pool dati del
+/// progetto (regola separazione DB per-progetto). Errore DB -> None, che il
+/// chiamante degrada a "—" senza tentare path Linux.
+#[cfg(windows)]
+async fn count_services(
+    state: &AppState,
+    project_id: Uuid,
+    _slug: &str,
+) -> Option<ServiceCount> {
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // COUNT DISTINCT label evita di gonfiare i numeri con lo storico (piu' righe
+    // per stessa label, ORDER BY created_at DESC nel resto del modulo).
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT \
+             COUNT(DISTINCT label) AS installed, \
+             COUNT(DISTINCT label) FILTER (WHERE status IN ('running', 'starting')) AS active \
+         FROM agent_processes \
+         WHERE project_id = $1 AND kind = 'service'",
+    )
+    .bind(project_id)
+    .fetch_optional(&proj_pool)
+    .await
+    .ok()
+    .flatten();
+    let (installed, active) = row?;
+    Some(ServiceCount::Counted {
+        active: active.max(0) as usize,
+        installed: installed.max(0) as usize,
+    })
 }
 
 /// Numero di container Docker del progetto in stato Up (filtro `name={slug}-`).

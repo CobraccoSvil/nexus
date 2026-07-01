@@ -1800,13 +1800,130 @@ async fn install_service_systemd(
 }
 
 // ── DELETE /api/projects/:id/services/:service ───────────────────────────────
-/// Disinstalla un servizio systemd `{slug}-{service}.service` del progetto:
-/// stop + disable + rimuove il file `~/.config/systemd/user/<unit>` + daemon-reload.
-/// Sicurezza: il nome unit risultante DEVE iniziare con `{slug}-`.
+/// Disinstalla un servizio del progetto. Dispatch per piattaforma (regola L,
+/// coerente con install/status/control): su Linux rimuove la unit systemd --user,
+/// su Windows (niente systemd) termina i processi e cancella le righe
+/// agent_processes del servizio. Sicurezza: il nome risultante DEVE appartenere
+/// al progetto (`{slug}-`).
 pub async fn uninstall_project_service(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     AxumPath((id, service)): AxumPath<(String, String)>,
+) -> ApiResult {
+    #[cfg(windows)]
+    {
+        uninstall_project_service_windows(state, claims, id, service).await
+    }
+    #[cfg(not(windows))]
+    {
+        uninstall_project_service_systemd(state, claims, id, service).await
+    }
+}
+
+/// Windows: disinstalla un servizio di progetto (processo gestito in
+/// agent_processes). Non esistono unit systemd: termina i processi ancora vivi
+/// del servizio (taskkill), rilascia le porte allocate a suo nome e CANCELLA le
+/// righe `kind='service'` con quel label — l'unico modo per farlo sparire dal
+/// pannello, perche' `list_services_windows` enumera per label e non filtra lo
+/// status. Fix definitivo (regola H): senza questo ramo, uninstall invocava
+/// `systemctl` inesistente (errore ignorato) e provava a rimuovere un file
+/// `~/.config/systemd/user/` inesistente -> rispondeva `ok:true, removed:false`
+/// ma il servizio ricompariva al primo refresh ("la cancellazione non funziona").
+#[cfg(windows)]
+async fn uninstall_project_service_windows(
+    state: AppState,
+    claims: Claims,
+    id: String,
+    service: String,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
+
+    if service.contains('/') || service.contains("..") {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+    }
+    // nome corto: rimuovi prefisso "{slug}-" e suffisso ".service" se presenti
+    // (stessa normalizzazione di control_project_service_windows / list_services_windows).
+    let short = service
+        .strip_prefix(&format!("{slug}-"))
+        .unwrap_or(&service)
+        .strip_suffix(".service")
+        .unwrap_or(&service)
+        .to_string();
+
+    // Separazione DB per-progetto: agent_processes e' migrata, instrada sul pool
+    // del progetto (flag OFF -> meta-pool, behavior-preserving).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
+    // 1. taskkill dei processi ancora vivi del servizio (running | starting).
+    let running: Vec<(Option<i32>,)> = sqlx::query_as(
+        "SELECT pid FROM agent_processes \
+         WHERE project_id = $1 AND label = $2 AND kind = 'service' \
+           AND status IN ('running', 'starting')",
+    )
+    .bind(project_id)
+    .bind(&short)
+    .fetch_all(&proj_pool)
+    .await
+    .unwrap_or_default();
+    for (pid,) in running {
+        if let Some(p) = pid {
+            let _ = tokio::process::Command::new("taskkill")
+                .args(["/PID", &p.to_string(), "/T", "/F"])
+                .output()
+                .await;
+        }
+    }
+
+    // 2. Rilascia le porte allocate a nome del servizio (best-effort). Su Windows
+    // non c'e' unit file da cui estrarle: usa nexus_port_allocations (label=short),
+    // stessa fonte del pannello Porte. Rilascio via punto unico port_registry.release.
+    let alloc_ports: Vec<(i32,)> = sqlx::query_as(
+        "SELECT port FROM nexus_port_allocations WHERE project_id = $1 AND label = $2",
+    )
+    .bind(project_id)
+    .bind(&short)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    for (port,) in alloc_ports {
+        if let Err(e) = state.port_registry.release(port as u16).await {
+            tracing::debug!(port, service = %short, "port_registry: rilascio ignorato: {e}");
+        }
+    }
+
+    // 3. Cancella le righe del servizio: e' l'unico modo per rimuoverlo dalla lista.
+    let deleted = sqlx::query(
+        "DELETE FROM agent_processes \
+         WHERE project_id = $1 AND label = $2 AND kind = 'service'",
+    )
+    .bind(project_id)
+    .bind(&short)
+    .execute(&proj_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    Ok(Json(json!({
+        "ok":             true,
+        "unit":           format!("{slug}-{short}.service"),
+        "removed":        deleted > 0,
+        "windows_native": true,
+    })))
+}
+
+/// Linux: disinstalla un servizio systemd `{slug}-{service}.service` del progetto:
+/// stop + disable + rimuove il file `~/.config/systemd/user/<unit>` + daemon-reload.
+/// Sicurezza: il nome unit risultante DEVE iniziare con `{slug}-`.
+#[cfg(not(windows))]
+async fn uninstall_project_service_systemd(
+    state: AppState,
+    claims: Claims,
+    id: String,
+    service: String,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
     let project_id = Uuid::parse_str(&id)

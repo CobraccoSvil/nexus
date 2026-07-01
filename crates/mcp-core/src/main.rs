@@ -231,9 +231,143 @@ async fn main() -> anyhow::Result<()> {
     //   inizializzato e i siti di chiamata fanno fallback silenzioso.
     nexus_bridge::NexusBridge::init_global_with_pool(Arc::new(db.clone())).await;
 
+    // Re-attach del monitoring su un processo sopravvissuto a un riavvio (Unix).
+    // Segue stdout+stderr del processo via /proc/{pid}/fd/1,2 con `tail -f --pid`,
+    // accumula l'output nel DB e, quando `tail` esce (processo terminato), marca
+    // status='stopped'. Se `tail` non parte, fa fallback a polling della liveness.
+    // Interamente Linux-centrico (dipende da /proc, `tail`, `sh`, `kill`).
+    #[cfg(unix)]
+    fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) {
+        tokio::spawn(async move {
+            let stdout_path = format!("/proc/{}/fd/1", pid_val);
+            let stderr_path = format!("/proc/{}/fd/2", pid_val);
+            let mut child = match tokio::process::Command::new("tail")
+                .args([
+                    "-f",
+                    "--pid",
+                    &pid_val.to_string(),
+                    &stdout_path,
+                    &stderr_path,
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to re-attach to process {}: {}", pid_val, e);
+                    // Non possiamo seguire l'output ma il processo risulta running
+                    // Aspettiamo che termini tramite polling
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        if !crate::process_util::process_alive(pid_val as u32) {
+                            let exit_code: Option<i32> = tokio::process::Command::new("sh")
+                                .args([
+                                    "-c",
+                                    &format!(
+                                        "cat /proc/{}/status 2>/dev/null | grep -c VmPeak",
+                                        pid_val
+                                    ),
+                                ])
+                                .output()
+                                .await
+                                .ok()
+                                .and_then(|o| String::from_utf8(o.stdout).ok())
+                                .and_then(|s| s.trim().parse().ok());
+                            let _ = sqlx::query(
+                                "UPDATE agent_processes SET status='stopped', exit_code=$2, stopped_at=NOW() WHERE id=$1"
+                            )
+                            .bind(id)
+                            .bind(exit_code.unwrap_or(-1))
+                            .execute(&db_clone)
+                            .await;
+                            break;
+                        }
+                    }
+                    return;
+                }
+            };
+
+            // Leggi output dal tail e appendilo al DB
+            use tokio::io::AsyncBufReadExt;
+            let stdout = child.stdout.take();
+            if let Some(stdout) = stdout {
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
+                let mut buf = String::new();
+                let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    tokio::select! {
+                        line = lines.next_line() => {
+                            match line {
+                                Ok(Some(l)) => { buf.push_str(&l); buf.push('\n'); }
+                                _ => break,
+                            }
+                        }
+                        _ = flush_tick.tick() => {
+                            if !buf.is_empty() {
+                                let chunk = std::mem::take(&mut buf);
+                                let _ = sqlx::query(
+                                    "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
+                                )
+                                .bind(&chunk)
+                                .bind(id)
+                                .execute(&db_clone)
+                                .await;
+                            }
+                        }
+                    }
+                }
+                if !buf.is_empty() {
+                    let _ = sqlx::query(
+                        "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
+                    )
+                    .bind(&buf)
+                    .bind(id)
+                    .execute(&db_clone)
+                    .await;
+                }
+            }
+
+            // tail è uscito: il processo originale è terminato
+            let _ = sqlx::query(
+                "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1 AND status='running'"
+            )
+            .bind(id)
+            .execute(&db_clone)
+            .await;
+        });
+    }
+
+    // Re-attach del monitoring su un processo sopravvissuto a un riavvio (Windows).
+    // /proc non esiste e non e' possibile ri-agganciare stdout/stderr di un processo
+    // gia' avviato da un'istanza precedente: ci si limita a poll della liveness via
+    // process_util::process_alive (OpenProcess) ogni 5s; quando il processo non e'
+    // piu' vivo si marca status='stopped' con exit_code=NULL (il codice di uscita
+    // reale non e' recuperabile senza aver aperto il processo come figlio).
+    #[cfg(windows)]
+    fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if !crate::process_util::process_alive(pid_val as u32) {
+                    // exit_code non determinabile su Windows senza handle del figlio:
+                    // si lascia NULL (coerente col path Unix, che scrive -1 solo se
+                    // non riesce a leggere VmPeak).
+                    let _ = sqlx::query(
+                        "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1"
+                    )
+                    .bind(id)
+                    .execute(&db_clone)
+                    .await;
+                    break;
+                }
+            }
+        });
+    }
+
     // Riconcilia i processi lasciati in stato 'running'/'starting' da un riavvio precedente.
     // - PID non più vivo → status=failed
-    // - PID ancora vivo → rimane running, si rilancia un task di monitoring su /proc/{pid}/fd
+    // - PID ancora vivo → rimane running, si rilancia un task di monitoring (OS-specifico)
     {
         use sqlx::Row;
         let stale = sqlx::query(
@@ -246,14 +380,12 @@ async fn main() -> anyhow::Result<()> {
         for row in stale {
             let id: uuid::Uuid = row.get("id");
             let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
+            // Liveness cross-platform: punto unico process_util::process_alive
+            // (Unix: /proc/{pid}; Windows: OpenProcess). Sostituisce il vecchio
+            // `kill -0`, no-op silenzioso su Windows.
             let still_alive = match pid {
-                Some(p) => tokio::process::Command::new("kill")
-                    .args(["-0", &p.to_string()])
-                    .status()
-                    .await
-                    .map(|s| s.success())
-                    .unwrap_or(false),
-                None => false,
+                Some(p) if p > 0 => crate::process_util::process_alive(p as u32),
+                _ => false,
             };
 
             if !still_alive {
@@ -276,113 +408,10 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!("Process {} alive ma pid=None: skip re-attach", id);
                     continue;
                 };
-                let db_clone = db.clone();
-                // Rilancia un task che segue stdout+stderr tramite /proc/{pid}/fd/1,2
-                tokio::spawn(async move {
-                    let stdout_path = format!("/proc/{}/fd/1", pid_val);
-                    let stderr_path = format!("/proc/{}/fd/2", pid_val);
-                    let mut child = match tokio::process::Command::new("tail")
-                        .args([
-                            "-f",
-                            "--pid",
-                            &pid_val.to_string(),
-                            &stdout_path,
-                            &stderr_path,
-                        ])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!("Failed to re-attach to process {}: {}", pid_val, e);
-                            // Non possiamo seguire l'output ma il processo risulta running
-                            // Aspettiamo che termini tramite polling
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                let alive = tokio::process::Command::new("kill")
-                                    .args(["-0", &pid_val.to_string()])
-                                    .status()
-                                    .await
-                                    .map(|s| s.success())
-                                    .unwrap_or(false);
-                                if !alive {
-                                    let exit_code: Option<i32> = tokio::process::Command::new("sh")
-                                        .args([
-                                            "-c",
-                                            &format!(
-                                                "cat /proc/{}/status 2>/dev/null | grep -c VmPeak",
-                                                pid_val
-                                            ),
-                                        ])
-                                        .output()
-                                        .await
-                                        .ok()
-                                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                                        .and_then(|s| s.trim().parse().ok());
-                                    let _ = sqlx::query(
-                                        "UPDATE agent_processes SET status='stopped', exit_code=$2, stopped_at=NOW() WHERE id=$1"
-                                    )
-                                    .bind(id)
-                                    .bind(exit_code.unwrap_or(-1))
-                                    .execute(&db_clone)
-                                    .await;
-                                    break;
-                                }
-                            }
-                            return;
-                        }
-                    };
-
-                    // Leggi output dal tail e appendilo al DB
-                    use tokio::io::AsyncBufReadExt;
-                    let stdout = child.stdout.take();
-                    if let Some(stdout) = stdout {
-                        let mut lines = tokio::io::BufReader::new(stdout).lines();
-                        let mut buf = String::new();
-                        let mut flush_tick =
-                            tokio::time::interval(std::time::Duration::from_secs(2));
-                        loop {
-                            tokio::select! {
-                                line = lines.next_line() => {
-                                    match line {
-                                        Ok(Some(l)) => { buf.push_str(&l); buf.push('\n'); }
-                                        _ => break,
-                                    }
-                                }
-                                _ = flush_tick.tick() => {
-                                    if !buf.is_empty() {
-                                        let chunk = std::mem::take(&mut buf);
-                                        let _ = sqlx::query(
-                                            "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
-                                        )
-                                        .bind(&chunk)
-                                        .bind(id)
-                                        .execute(&db_clone)
-                                        .await;
-                                    }
-                                }
-                            }
-                        }
-                        if !buf.is_empty() {
-                            let _ = sqlx::query(
-                                "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
-                            )
-                            .bind(&buf)
-                            .bind(id)
-                            .execute(&db_clone)
-                            .await;
-                        }
-                    }
-
-                    // tail è uscito: il processo originale è terminato
-                    let _ = sqlx::query(
-                        "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1 AND status='running'"
-                    )
-                    .bind(id)
-                    .execute(&db_clone)
-                    .await;
-                });
+                // Il monitoring di re-attach e' OS-specifico: su Unix segue stdout+stderr
+                // via /proc/{pid}/fd/1,2 con `tail`; su Windows /proc non esiste, quindi
+                // ci si limita a poll della liveness. Punto unico: spawn_reattach_monitor.
+                spawn_reattach_monitor(id, pid_val, db.clone());
             }
         }
     }
