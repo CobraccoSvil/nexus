@@ -20,7 +20,6 @@ const execAsync = promisify(exec);
 const ALLOWED_SERVICES = new Set([
   "nexus-core-wsl",
   "nexus-gateway",
-  "nexus-chat-wsl",
   "nexus-plugin-wsl",
   "nexus-admin-wsl",
   "nexus-billing-wsl",

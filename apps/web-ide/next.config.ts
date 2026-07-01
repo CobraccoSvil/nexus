@@ -8,7 +8,7 @@ const nextConfig: NextConfig = {
   // (il progetto redemptor ha un package-lock.json separato non rilevante).
   // Derivata dalla cwd (la build gira sempre da apps/web-ide): risale due
   // livelli alla root del monorepo. Niente path assoluto hardcoded, cosi'
-  // funziona sia su Windows (D:/IDEAI) sia su WSL (/home/administrator/ideai).
+  // funziona indipendentemente dalla posizione del repo.
   outputFileTracingRoot: path.join(process.cwd(), "..", ".."),
   typedRoutes: true,
   // Build ID univoco per invalidare la cache del browser ad ogni deploy
@@ -81,10 +81,9 @@ const nextConfig: NextConfig = {
         source: "/api/admin/:path*",
         destination: `${adminService}/api/admin/:path*`,
       },
-      // NOTA: /api/chat/* e /api/profiles/* NON vengono routati al chat-service:
-      // il chat-service è ancora uno stub incompleto (send_message non chiama mcp-core).
-      // Tutte le route chat e profiles sono già implementate in mcp-core (porta 4000)
-      // e vengono gestite dal fallback "/api/:path*" → backend qui sotto.
+      // NOTA: le route /api/chat/* e /api/profiles/* sono implementate in mcp-core
+      // (porta 4000) e gestite dal fallback "/api/:path*" → backend qui sotto. Il
+      // vecchio crate chat-service (stub abbandonato, mai attivato) è stato rimosso.
       //
       // NOTA: /api/plugins/*, /api/mcp-servers/*, /api/documents/*, /api/billing/* NON vengono
       // routati ai rispettivi microservizi (4050, 4030, 4040) perché non ancora attivi.

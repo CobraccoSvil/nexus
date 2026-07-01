@@ -74,15 +74,21 @@ ogni progetto sia autocontenuto e portabile.
    (pattern run_reaper). NB: codice `/proc`+`kill -0` Linux-specifico, in porting
    su questa branch Windows; degrada (non reconcilia i processi per-progetto), non
    corrompe.
-4. **`chat-service`** (crate separato, PROCESSO distinto): non vede il registry
-   in-process di mcp-core. Serve un resolver proprio (flag + `nexus_data_routing`
-   + `connection_secret` da `project_database_config`, NO provisioning). Via
-   regola-L: estrarre un crate basso `nexus-project-pool` (resolve+open+cache)
-   dipeso da mcp-core (che continua a provisionare) e chat-service. Query in
-   chat_messages/chat_sessions/chat_agent del crate chat-service (per-session).
-5. **Dominio costi** ("costi"): lo schema dei costi NON e' ancora nelle migrazioni
-   `db/migrations/project/*` -> il ledger billing resta sul meta-DB. Richiede
-   migrazione schema + dati + call-site (billing-service) come i domini chat/run.
+4. **`chat-service`** (crate separato, PROCESSO distinto): **NON nel percorso
+   attivo** — `next.config.ts` (righe 84-86) instrada TUTTE le `/api/chat/*` a
+   mcp-core (:4000), non a chat-service (:4020): "chat-service e' ancora uno stub
+   incompleto". Quindi NON e' bloccante per il flip. Se/quando verra' completato:
+   essendo un processo separato non vede il registry in-process di mcp-core ->
+   serve un resolver proprio (flag + `nexus_data_routing` + `connection_secret` da
+   `project_database_config`, NO provisioning), via crate basso `nexus-project-pool`
+   condiviso (regola L).
+5. **Dominio costi** ("costi"): tabella `ai_usage_ledger` (per-progetto), scritta in
+   `mcp-core/billing.rs` (righe ~368/404/438) DENTRO una transazione `db.begin()`
+   che legge/scrive anche le tabelle quote (`read_active_quotas`) NON migrate ->
+   transazione MISTA (non instradabile senza untangle). Schema NON ancora in
+   `db/migrations/project/*`. `billing-service` (crate) e' **dormiente** (next.config
+   riga 90: `/api/billing/*` non routati). Richiede: migrazione schema ledger (+
+   decidere se migrare anche le quote o splittare la tx) + dati + routing.
 6. **Flip + deploy + test UI** (vedi sotto).
 
 > Nota: tutto il codice instradato e' behavior-preserving a flag OFF

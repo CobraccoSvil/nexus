@@ -72,11 +72,11 @@ install_unit() {
 
 # Copia units dalla directory deploy (sincronizzate con il codice)
 if [ -d "${APP_PATH}/deploy/systemd" ]; then
-    for unit in nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins nexus-webide; do
+    for unit in nexus-core nexus-admin nexus-billing nexus-docs nexus-plugins nexus-webide; do
         install_unit "$unit"
     done
     systemctl daemon-reload
-    for unit in nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins nexus-webide; do
+    for unit in nexus-core nexus-admin nexus-billing nexus-docs nexus-plugins nexus-webide; do
         systemctl enable "$unit" 2>/dev/null || true
     done
     echo "  ✓ Tutte le units installate e abilitate"
@@ -112,7 +112,7 @@ cat > /etc/logrotate.d/ideai <<'LOGROTATE'
     create 0644 administrator administrator
     sharedscripts
     postrotate
-        systemctl reload nexus-core nexus-admin nexus-chat 2>/dev/null || true
+        systemctl reload nexus-core nexus-admin 2>/dev/null || true
     endscript
 }
 LOGROTATE

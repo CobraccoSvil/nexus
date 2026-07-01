@@ -53,8 +53,8 @@ impl ToolRunnerService {
     /// Risolve la sessione chat in (project_id, user_id, root_path,
     /// is_git_repo, can_write, user_role) con una singola query.
     /// Il brain e' trusted: non applichiamo qui il check di accesso
-    /// (avviene gia' a monte in chat-service al momento dell'invio
-    /// del messaggio utente).
+    /// (avviene gia' a monte negli handler chat di mcp-core al momento
+    /// dell'invio del messaggio utente).
     async fn resolve_session(&self, session_id: Uuid) -> Result<SessionInfo, Status> {
         let row = sqlx::query(
             r#"

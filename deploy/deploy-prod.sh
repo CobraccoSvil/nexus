@@ -96,7 +96,7 @@ R_SKIP_BUILD=$SKIP_BUILD
 
 # Lista unit systemd da riavviare in base ai flag
 units_to_restart=""
-[ "$BUILD_RUST" -eq 1 ] && units_to_restart="$units_to_restart nexus-core nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins"
+[ "$BUILD_RUST" -eq 1 ] && units_to_restart="$units_to_restart nexus-core nexus-admin nexus-billing nexus-docs nexus-plugins"
 [ "$BUILD_WEB" -eq 1 ]  && units_to_restart="$units_to_restart nexus-webide"
 [ "$BUILD_GATEWAY" -eq 1 ] && units_to_restart="$units_to_restart nexus-gateway"
 
@@ -131,7 +131,7 @@ if [ "$R_RUST" -eq 1 ] && [ "$R_SKIP_BUILD" -eq 0 ]; then
     ~/.cargo/bin/cargo build --release -p mcp-core 2>&1 | tail -5
     cp -f target/release/mcp-core bin/
     # Microservizi attivi (se i pacchetti esistono nel workspace)
-    for pkg in admin-service chat-service billing-service doc-service plugin-service; do
+    for pkg in admin-service billing-service doc-service plugin-service; do
         if [ -f "target/release/$pkg" ]; then
             cp -f "target/release/$pkg" bin/
         fi

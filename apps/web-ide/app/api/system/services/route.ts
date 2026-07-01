@@ -51,7 +51,6 @@ const NEXUS_SERVICES: Omit<NexusServiceInfo, "state" | "sub_state">[] = [
   // "Brain" e' stato rimosso dalla statusbar (consolidato nel LED del Core).
   { name: "nexus-core-wsl",       label: "Core (mcp-core)",  port: 4000, description: "Orchestratore + endpoint AI (/api/neural) + Tool Runner gRPC :50071", led: "Core" },
   { name: "nexus-gateway",        label: "LLM Gateway",      port: 4060, description: "Router provider AI",                      led: "OpenAI · Anthropic · …" },
-  { name: "nexus-chat-wsl",       label: "Chat Service",     port: 4020, description: "Servizio chat e agenti" },
   { name: "nexus-plugin-wsl",     label: "Plugin Service",   port: 4050, description: "Connettori MCP" },
   { name: "nexus-admin-wsl",      label: "Admin Service",    port: 4010, description: "Pannello amministrazione" },
   // Servizi di infrastruttura (system): sola lettura, richiedono root per il controllo.

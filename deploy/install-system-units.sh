@@ -75,7 +75,7 @@ done
 #       (stesso pattern dei core in deploy-local.sh start_service), usato come
 #       ExecStart: la unit esegue sempre l'ultima build debug.
 mkdir -p "$ROOT/target/nexus-current"
-for entry in chat:chat-service admin:admin-service plugin:plugin-service doc:doc-service billing:billing-service; do
+for entry in admin:admin-service plugin:plugin-service doc:doc-service billing:billing-service; do
   tmpl="${entry%%:*}"
   bin="${entry#*:}"
   src="$SRC/nexus-${tmpl}-system.service"
@@ -98,7 +98,7 @@ done
 #    (apre come owner, passa il fd al processo User=). I tail restano ok (644).
 # NB: i microservizi loggano su /tmp/nexus-<binario>.log (StandardOutput nelle
 #   loro unit), stessa logica root-owned 644.
-MICRO_LOGS="/tmp/nexus-chat-service.log /tmp/nexus-admin-service.log /tmp/nexus-plugin-service.log /tmp/nexus-doc-service.log /tmp/nexus-billing-service.log"
+MICRO_LOGS="/tmp/nexus-admin-service.log /tmp/nexus-plugin-service.log /tmp/nexus-doc-service.log /tmp/nexus-billing-service.log"
 touch /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
 chown root:root /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
 chmod 644 /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log $MICRO_LOGS
@@ -116,7 +116,7 @@ docker exec -i ideai-postgres-nexus-1 psql -U nexus -d nexus -c \
 # 4. Avvia: mcp-core, gateway e web-ide.
 #    Il gateway dipende da mcp-core (After=) -> parte nello stesso gruppo.
 #    I microservizi dipendono da mcp-core (After=) -> partono dopo.
-MICRO_UNITS="nexus-chat-service nexus-admin-service nexus-plugin-service nexus-doc-service nexus-billing-service"
+MICRO_UNITS="nexus-admin-service nexus-plugin-service nexus-doc-service nexus-billing-service"
 systemctl daemon-reload
 systemctl reset-failed nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS 2>/dev/null || true
 systemctl enable nexus-mcp-core nexus-gateway nexus-web-ide $MICRO_UNITS >/dev/null 2>&1 || true
@@ -137,7 +137,6 @@ curl -s -o /dev/null -w "  mcp-core(4000)=%{http_code}\n" --max-time 6 http://12
 curl -s -o /dev/null -w "  gateway(4060)=%{http_code}\n" --max-time 6 http://127.0.0.1:4060/providers || true
 curl -s -o /dev/null -w "  web-ide(3000)=%{http_code}\n" --max-time 6 http://127.0.0.1:3000/ || true
 # Microservizi: porte canoniche da mig 0239 (i servizi le leggono dal DB).
-curl -s -o /dev/null -w "  chat-service(4020)=%{http_code}\n"    --max-time 6 http://127.0.0.1:4020/health || true
 curl -s -o /dev/null -w "  admin-service(4010)=%{http_code}\n"   --max-time 6 http://127.0.0.1:4010/health || true
 curl -s -o /dev/null -w "  plugin-service(4050)=%{http_code}\n"  --max-time 6 http://127.0.0.1:4050/health || true
 curl -s -o /dev/null -w "  doc-service(4030)=%{http_code}\n"     --max-time 6 http://127.0.0.1:4030/health || true

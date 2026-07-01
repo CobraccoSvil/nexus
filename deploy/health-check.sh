@@ -67,7 +67,7 @@ for unit in nexus-core nexus-webide; do
 done
 
 # Microservizi opzionali (non bloccanti)
-for unit in nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins; do
+for unit in nexus-admin nexus-billing nexus-docs nexus-plugins; do
     if remote_exec_quiet "$PROD_HOST" "systemctl list-unit-files | grep -q ^${unit}.service"; then
         check "$unit active (opzionale)" \
             remote_exec_quiet "$PROD_HOST" "systemctl is-active --quiet $unit" || true

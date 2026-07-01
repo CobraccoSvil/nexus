@@ -545,7 +545,6 @@ export function InfrastructureSettings({
 const SERVICE_URL_CHECK_MAP: Record<string, string> = {
   mcp_core_url:      "svc_mcp_core",
   admin_service_url: "svc_admin",
-  chat_service_url:  "svc_chat",
   doc_service_url:   "svc_doc",
   billing_service_url: "svc_billing",
   plugin_service_url:  "svc_plugin",

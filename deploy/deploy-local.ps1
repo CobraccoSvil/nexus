@@ -61,7 +61,7 @@ function Stop-ServiceTree($name) {
 
 $doRust = $Rust -or (-not $Rust -and -not $Web)
 $doWeb  = $Web  -or (-not $Rust -and -not $Web)
-$rustSvc = 'nexus-mcp-core','nexus-gateway','nexus-admin','nexus-chat','nexus-billing','nexus-doc','nexus-plugin'
+$rustSvc = 'nexus-mcp-core','nexus-gateway','nexus-admin','nexus-billing','nexus-doc','nexus-plugin'
 
 # 1. STOP (solo se gestiamo i servizi) — kill-tree per non lasciare orfani
 if (-not $NoRestart) {

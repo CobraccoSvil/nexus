@@ -2,7 +2,7 @@
 # Restart all IDEAI microservices
 # Usage: ./restart-microservices.sh [service_name]
 #   No args: restart all
-#   With arg: restart only that service (e.g., ./restart-microservices.sh chat-service)
+#   With arg: restart only that service (e.g., ./restart-microservices.sh billing-service)
 
 set -e
 export PATH=/home/administrator/.local/bin:/home/administrator/.cargo/bin:/usr/local/bin:/usr/bin:/bin
@@ -38,7 +38,6 @@ if [ "$SERVICE" = "all" ]; then
     echo "=== Stopping all services ==="
     stop_service "mcp-core"
     stop_service "admin-service"
-    stop_service "chat-service"
     stop_service "doc-service"
     stop_service "billing-service"
     stop_service "plugin-service"
@@ -52,7 +51,6 @@ if [ "$SERVICE" = "all" ]; then
     echo "=== Starting Microservices ==="
     start_service "admin-service"
     start_service "billing-service"
-    start_service "chat-service"
     start_service "doc-service"
     start_service "plugin-service"
     sleep 3

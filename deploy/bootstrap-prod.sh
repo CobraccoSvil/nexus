@@ -158,7 +158,6 @@ QDRANT_URL=http://localhost:6334
 MCP_SERVER_PORT=4000
 WEB_APP_PORT=3000
 ADMIN_SERVICE_PORT=4010
-CHAT_SERVICE_PORT=4020
 DOC_SERVICE_PORT=4030
 BILLING_SERVICE_PORT=4040
 PLUGIN_SERVICE_PORT=4050
@@ -222,7 +221,7 @@ remote_exec "$PROD_HOST" "
         sudo systemctl enable --now \$unit
     done
     # Microservizi opzionali (best-effort, alcuni non sono ancora attivi)
-    for unit in nexus-admin nexus-chat nexus-billing nexus-docs nexus-plugins; do
+    for unit in nexus-admin nexus-billing nexus-docs nexus-plugins; do
         if [ -f /etc/systemd/system/\$unit.service ]; then
             sudo systemctl enable --now \$unit 2>/dev/null || true
         fi

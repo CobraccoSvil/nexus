@@ -28,7 +28,7 @@ log "Stop processi Nexus"
 # Migrazione gateway a Rust: il gateway e' il binario `nexus-gateway`
 # (target/debug). Il vecchio server Node (apps/nexus-gateway/dist/server.js)
 # e' stato eliminato; manteniamo solo il pattern Rust nello stop.
-for x in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp \
+for x in mcp-core admin-service billing-service doc-service plugin-service browser-bridge-mcp \
   target/debug/nexus-gateway target/release/nexus-gateway "pnpm.*web-ide"; do
   stop "$x"
 done
@@ -58,7 +58,7 @@ log "mcp-core + microservizi"
 setsid nohup env ENABLE_TOOL_RUNNER=1 DATABASE_URL="$DATABASE_URL" POSTGRES_URL="$POSTGRES_URL" \
   "${RELEASE}/mcp-core" > /tmp/nexus-mcp-core.log 2>&1 < /dev/null &
 sleep 3
-for svc in admin-service chat-service billing-service doc-service plugin-service; do
+for svc in admin-service billing-service doc-service plugin-service; do
   setsid nohup env DATABASE_URL="$DATABASE_URL" POSTGRES_URL="$POSTGRES_URL" \
     "${RELEASE}/${svc}" > "/tmp/nexus-${svc}.log" 2>&1 < /dev/null &
 done
