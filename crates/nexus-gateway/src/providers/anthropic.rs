@@ -28,6 +28,7 @@ use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::provider::{ChunkStream, LlmProvider};
+use crate::provider_error::ProviderError;
 use crate::providers::openai_compat::parse_models_response;
 use crate::types::{
     LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage, MessageContent,
@@ -269,11 +270,12 @@ impl LlmProvider for AnthropicProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            // Regola F: il body d'errore non contiene prompt utente ma dettagli
-            // del provider; lo propaghiamo al caller (il cooldown della Fase 3
-            // riconosce il billing via `is_billing_error`), senza loggarlo qui.
+            // Regola F: il body d'errore non contiene prompt utente ma dettagli del
+            // provider; lo propaghiamo al caller come `ProviderError` tipizzato che
+            // il cooldown classifica sui segnali strutturati (regola M), senza
+            // loggarlo qui.
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("anthropic HTTP {}: {}", status.as_u16(), text);
+            return Err(ProviderError::from_http("anthropic", status.as_u16(), text).into());
         }
 
         let parsed: AnthropicMessage = resp.json().await?;
@@ -299,8 +301,10 @@ impl LlmProvider for AnthropicProvider {
 
         let status = resp.status();
         if !status.is_success() {
+            // ProviderError tipizzato: classificazione cooldown sui segnali
+            // strutturati (status + error_class), non sul testo (regola M).
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("anthropic HTTP {}: {}", status.as_u16(), text);
+            return Err(ProviderError::from_http("anthropic", status.as_u16(), text).into());
         }
 
         let model_used = req.model.clone();

@@ -22,8 +22,8 @@
 //!     (`resolve_port`), validazione JWT (`Claims`, `jsonwebtoken`);
 //!   - `billing` (questo modulo): porting fedele della logica quota/ledger del
 //!     `billing-service` (`ai_quota_policies`, `ai_usage_ledger`, `ai_price_catalog`);
-//!   - moduli del crate (`FallbackChain`, `CooldownManager`, `PolicyEngine`,
-//!     `ModelAliasResolver`, `RedactionPipeline`, `SensitivityClassifier`).
+//!   - moduli del crate (`CooldownManager`, `PolicyEngine`, `ModelAliasResolver`,
+//!     `RedactionPipeline`, `SensitivityClassifier`).
 
 pub mod auth;
 pub mod billing;

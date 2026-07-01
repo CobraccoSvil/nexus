@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::provider::ChunkStream;
+use crate::provider_error::ProviderError;
 use crate::types::{
     GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
     LlmUsage, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall, TranscribeResponse,
@@ -138,10 +139,12 @@ impl OpenAiCompatClient {
         let status = resp.status();
         if !status.is_success() {
             // Regola F: il body d'errore puo' contenere dettagli del provider
-            // ma non prompt/response utente; lo propaghiamo al caller (la Fase 3
-            // distingue il billing error), senza loggarlo qui in chiaro.
+            // ma non prompt/response utente; lo propaghiamo al caller come
+            // `ProviderError` tipizzato (status + error_class strutturati) che il
+            // classificatore cooldown legge senza toccare il testo (regola M),
+            // senza loggarlo qui in chiaro.
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+            return Err(ProviderError::from_http(&self.provider_name, status.as_u16(), text).into());
         }
 
         let parsed: ChatCompletion = resp.json().await?;
@@ -184,8 +187,10 @@ impl OpenAiCompatClient {
 
         let status = resp.status();
         if !status.is_success() {
+            // ProviderError tipizzato: la classificazione cooldown avviene sui
+            // segnali strutturati (status + error_class), non sul testo (regola M).
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+            return Err(ProviderError::from_http(&self.provider_name, status.as_u16(), text).into());
         }
 
         let provider_name = self.provider_name.clone();

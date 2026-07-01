@@ -30,6 +30,7 @@ use super::gcp_auth::{
     SETTING_VERTEX_PROJECT,
 };
 use crate::provider::{ChunkStream, LlmProvider};
+use crate::provider_error::ProviderError;
 use crate::types::{
     GeneratedImage, ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk,
     LlmToolCall, LlmUsage, MessageContent, SensitivityTier, ToolCallDelta, ToolCallDeltaFunction,
@@ -727,10 +728,12 @@ impl LlmProvider for GoogleProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            // Regola F: body d'errore propagato al caller (cooldown Fase 3 lo
-            // classifica via is_billing_error), non loggato qui in chiaro.
+            // Regola F: body d'errore propagato al caller come `ProviderError`
+            // tipizzato; il cooldown classifica sui segnali strutturati (status +
+            // error_class, es. status "RESOURCE_EXHAUSTED"), non sul testo (regola
+            // M), e non lo logga qui in chiaro.
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+            return Err(ProviderError::from_http("google", status.as_u16(), text).into());
         }
 
         let parsed: GenerateContentResponse = resp.json().await?;
@@ -755,8 +758,10 @@ impl LlmProvider for GoogleProvider {
 
         let status = resp.status();
         if !status.is_success() {
+            // ProviderError tipizzato: classificazione cooldown sui segnali
+            // strutturati (status + error_class), non sul testo (regola M).
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+            return Err(ProviderError::from_http("google", status.as_u16(), text).into());
         }
 
         let model_used = req.model.clone();

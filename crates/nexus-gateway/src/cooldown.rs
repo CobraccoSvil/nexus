@@ -151,6 +151,18 @@ impl CooldownManager {
         );
     }
 
+    /// Marca il cooldown scegliendo la durata dal [`CooldownReason`] gia'
+    /// classificato. Punto unico della mappatura motivo->durata (regola L): i call
+    /// site passano il motivo derivato dai segnali strutturati dell'errore
+    /// (vedi [`crate::provider_error::cooldown_reason_for`]) e non ripetono lo
+    /// split billing/transient.
+    pub fn mark(&self, provider: &str, reason: CooldownReason, last_error: Option<String>) {
+        match reason {
+            CooldownReason::Billing => self.mark_billing(provider, last_error),
+            CooldownReason::Transient => self.mark_transient(provider, last_error),
+        }
+    }
+
     /// Marca un provider con `now` e durata espliciti. Punto unico della logica
     /// di marcatura (regola L): `mark_billing`/`mark_transient` e i test ci
     /// delegano, cosi' il calcolo di `until` ha UNA sola implementazione e i test

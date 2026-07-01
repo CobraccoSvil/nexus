@@ -6,8 +6,9 @@
 //!   2. policy_engine.decide(tier) -> lista ordinata di provider ammessi;
 //!   3. per ogni provider candidato non in cooldown: risolve l'alias modello
 //!      (skip se non risolvibile per quel provider), poi tenta la completion;
-//!   4. su errore marca il cooldown (billing/transient via `is_billing_error`,
-//!      punto unico) e passa al successivo; il primo successo vince;
+//!   4. su errore marca il cooldown (billing/transient classificato dai segnali
+//!      strutturati dell'errore via `provider_error::cooldown_reason_for`, punto
+//!      unico) e passa al successivo; il primo successo vince;
 //!   5. redaction strict-mode opzionale (pre-flight redact + post-flight rehydrate)
 //!      quando il tier elevato richiede invio cloud;
 //!   6. enforce quota PRIMA della completion (guardrail), record ledger DOPO.
@@ -39,7 +40,7 @@ use crate::batch::{
 use crate::cooldown::CooldownManager;
 use crate::model_alias_resolver::ModelAliasResolver;
 use crate::provider::LlmProvider;
-use crate::providers::is_billing_error;
+use crate::provider_error::cooldown_reason_for;
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
 use crate::types::{
@@ -294,12 +295,12 @@ async fn run_fallback(
         match rp.provider.complete(&req).await {
             Ok(resp) => return Ok(resp),
             Err(err) => {
+                // Motivo di cooldown dai SEGNALI STRUTTURATI dell'errore (status +
+                // error_class del ProviderError), mai dal testo (regola M). Punto
+                // unico `cooldown_reason_for` -> `mark` (regola L).
+                let reason = cooldown_reason_for(&err);
                 let msg = err.to_string();
-                if is_billing_error(&msg) {
-                    cooldown.mark_billing(name, Some(msg.clone()));
-                } else {
-                    cooldown.mark_transient(name, Some(msg.clone()));
-                }
+                cooldown.mark(name, reason, Some(msg.clone()));
                 failures.push(format!("{name} ({msg})"));
             }
         }
@@ -455,10 +456,11 @@ pub async fn complete(
 
 /// `POST /v1/stream`: completion in streaming SSE (auth richiesta).
 ///
-/// Differenza dal Node: la `FallbackChain` non espone uno stream multi-provider,
-/// quindi lo streaming usa il PRIMO provider risolto non in cooldown (parita'
-/// ragionevole: il caso comune e' un solo primario sano). Su errore di apertura
-/// dello stream emette un evento `error` e termina, come il `catch` del server.ts.
+/// Differenza dal Node: il fallback cross-provider (`run_fallback`) non espone
+/// uno stream multi-provider, quindi lo streaming usa il PRIMO provider risolto
+/// non in cooldown (parita' ragionevole: il caso comune e' un solo primario
+/// sano). Su errore di apertura dello stream emette un evento `error` e termina,
+/// come il `catch` del server.ts.
 pub async fn stream(
     State(state): State<AppState>,
     Json(body): Json<LlmRequest>,
@@ -599,12 +601,11 @@ async fn build_sse_stream(
             }
             Err(err) => {
                 let name = rp.provider.name();
+                // Classificazione da segnali strutturati (regola M), punto unico
+                // `cooldown_reason_for` -> `mark` (regola L).
+                let reason = cooldown_reason_for(&err);
                 let msg = err.to_string();
-                if is_billing_error(&msg) {
-                    state.cooldown.mark_billing(name, Some(msg.clone()));
-                } else {
-                    state.cooldown.mark_transient(name, Some(msg.clone()));
-                }
+                state.cooldown.mark(name, reason, Some(msg.clone()));
                 let _ = tx
                     .send(Ok(Event::default().data(json!({ "error": msg }).to_string())))
                     .await;
@@ -1626,7 +1627,14 @@ mod tests {
                     reasoning: None,
                     thinking_signature: None,
                 }),
-                Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                // Errore TIPIZZATO: status 402 + error_class strutturato, cosi' il
+                // classificatore cooldown decide sui segnali, non sul testo.
+                Behaviour::ErrBilling => Err(crate::provider_error::ProviderError::from_http(
+                    self.name.clone(),
+                    402,
+                    r#"{"error":{"type":"insufficient_quota","message":"quota"}}"#,
+                )
+                .into()),
             }
         }
         async fn stream(&self, _req: &LlmRequest) -> anyhow::Result<crate::provider::ChunkStream> {
@@ -1804,6 +1812,9 @@ mod tests {
         let resp = run_fallback(&resolved, &cooldown, &req()).await.unwrap();
         assert_eq!(resp.provider_used, "mistral");
         assert!(cooldown.is_in_cooldown("openai"));
+        // Cooldown BILLING classificato dai segnali strutturati (status 402 /
+        // error_class insufficient_quota), non dal testo del messaggio (regola M).
+        assert!(cooldown.is_billing_cooldown("openai"));
     }
 
     #[tokio::test]
