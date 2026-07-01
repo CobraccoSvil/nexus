@@ -293,6 +293,10 @@ async fn distill_project(
         .as_ref()
         .and_then(|r| r.try_get("last_wiki_cursor").ok());
 
+    // Separazione DB: nexus_session_worklog_events e' una tabella per-progetto,
+    // instrada sul pool del progetto (a flag OFF ritorna il meta-DB).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
     // Evidenza worklog (segnali deterministici di cosa va storto ripetutamente).
     let wl_rows = sqlx::query(
         "SELECT kind, payload, created_at FROM nexus_session_worklog_events \
@@ -303,7 +307,7 @@ async fn distill_project(
     .bind(project_id)
     .bind(worklog_cursor)
     .bind(settings.evidence_max_items)
-    .fetch_all(&state.db)
+    .fetch_all(&proj_pool)
     .await
     .context("SELECT evidenza worklog")?;
 

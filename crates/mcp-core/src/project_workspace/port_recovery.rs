@@ -296,12 +296,15 @@ pub async fn scan_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<(u16, u32
         .saturating_add(PROJECT_PORT_BUCKET_SIZE)
         .saturating_sub(1);
 
+    // Routing separazione DB: `agent_processes` e' una tabella migrata, va letta
+    // sul pool del progetto (a flag OFF ritorna il meta-pool, comportamento storico).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let tracked: std::collections::HashSet<i64> = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT pid FROM agent_processes WHERE project_id = $1 \
          AND status IN ('running','starting')",
     )
     .bind(project_id)
-    .fetch_all(db)
+    .fetch_all(&proj_pool)
     .await
     .unwrap_or_default()
     .into_iter()

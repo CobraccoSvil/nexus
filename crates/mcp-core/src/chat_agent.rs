@@ -95,7 +95,7 @@ pub async fn agent_stream(
     ApiError,
 > {
     let _user_id = parse_user_id(&claims)?;
-    let _session_id = Uuid::parse_str(&session_id)
+    let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
 
     let run_id: Option<Uuid> = params.get("run_id").and_then(|s| Uuid::parse_str(s).ok());
@@ -110,13 +110,18 @@ pub async fn agent_stream(
     // di eventi, POI continua col live broadcast.
     let mut replay_events: Vec<Event> = Vec::new();
     if let Some(rid) = run_id {
+        // Separazione DB: agent_steps/agent_runs sono tabelle migrate, instradate
+        // sul pool del progetto risolto via session_id (flag OFF -> meta-DB).
+        let proj_pool =
+            crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id)
+                .await;
         // Replay step dal DB
         if let Ok(rows) = sqlx::query(
             "SELECT step_index, tool_name, tool_input, tool_result, status, created_at
              FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
         )
         .bind(rid)
-        .fetch_all(&state.db)
+        .fetch_all(&proj_pool)
         .await
         {
             for r in rows {
@@ -144,7 +149,7 @@ pub async fn agent_stream(
         if let Ok(Some(run_row)) =
             sqlx::query("SELECT status, final_answer FROM agent_runs WHERE id = $1")
                 .bind(rid)
-                .fetch_optional(&state.db)
+                .fetch_optional(&proj_pool)
                 .await
         {
             let status: String = run_row.try_get("status").unwrap_or_default();

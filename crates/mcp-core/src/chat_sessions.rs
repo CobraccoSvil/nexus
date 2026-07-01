@@ -781,8 +781,10 @@ pub(crate) async fn compact_session_core(
     // digest provider-neutro le mostra nella sezione "Decisioni:" e sopravvivono
     // alla compattazione successiva (non piu' solo nel testo libero del summary).
     if !distilled_decisions.is_empty() {
+        // Worklog nel DB del progetto (separazione DB): riuso il chat_pool gia'
+        // risolto in questa funzione (flag off -> meta).
         let _ = crate::session_worklog::ingest_decisions(
-            &state.db,
+            &chat_pool,
             session_id,
             Some(project_id),
             &distilled_decisions,

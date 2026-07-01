@@ -116,6 +116,11 @@ pub async fn edit_todo(
         sets.join(", ")
     );
 
+    // Separazione DB: nexus_agent_todos vive nel DB del progetto a flag ON.
+    // Risolvo il pool una volta col project_id in scope e lo riuso per la
+    // UPDATE e per la SELECT aggregata sottostante (stesso progetto).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
     let mut query = sqlx::query_scalar::<_, String>(&sql)
         .bind(todo_id)
         .bind(run_id)
@@ -135,7 +140,7 @@ pub async fn edit_todo(
     }
 
     let new_status = query
-        .fetch_optional(&state.db)
+        .fetch_optional(&proj_pool)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -164,7 +169,7 @@ pub async fn edit_todo(
          FROM nexus_agent_todos WHERE run_id = $1",
     )
     .bind(run_id)
-    .fetch_one(&state.db)
+    .fetch_one(&proj_pool)
     .await
     {
         nexus_events::dispatcher::emit_global(
@@ -194,6 +199,9 @@ pub async fn list_backlog(
     let project_id = Uuid::parse_str(&project_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
 
+    // Separazione DB: nexus_agent_todos vive nel DB del progetto a flag ON.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
     let rows = sqlx::query_as::<_, (Uuid, String, String, Option<i32>, Option<Uuid>)>(
         "SELECT id, content, status, priority, origin_run_id \
          FROM nexus_agent_todos \
@@ -203,7 +211,7 @@ pub async fn list_backlog(
          LIMIT 50",
     )
     .bind(project_id)
-    .fetch_all(&state.db)
+    .fetch_all(&proj_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

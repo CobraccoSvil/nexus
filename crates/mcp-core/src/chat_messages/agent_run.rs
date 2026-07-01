@@ -1013,9 +1013,13 @@ pub(crate) async fn supersede_active_runs(
         } else {
             "superseduto (interrotto da un nuovo messaggio)"
         };
+        // Worklog nel DB del progetto (separazione DB): risolvo il pool dalla
+        // sessione una volta, fuori dal loop (flag off -> meta).
+        let wpool =
+            crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
         for cid in &cancelled_ids {
             if let Err(e) =
-                crate::session_worklog::ingest_from_db_steps(&state.db, *cid, label).await
+                crate::session_worklog::ingest_from_db_steps(&wpool, *cid, label).await
             {
                 tracing::warn!(error = %e, run_id = %cid, "session_worklog: ingest al supersede fallito");
             }
@@ -2132,8 +2136,14 @@ pub(crate) async fn spawn_agent_run(
         // Nota arricchita dal worklog (mig 0411): sintesi del lavoro gia'
         // svolto dal run interrotto + puntatore al blocco <session_worklog>.
         // L'ingest e' gia' avvenuto SINCRONO dentro supersede_active_runs.
-        let worklog_note = crate::session_worklog::supersede_summary(
+        // Worklog nel DB del progetto (separazione DB): risolvo il pool dalla sessione.
+        let wpool = crate::project_db_routes::project_data_pool_by_session_from(
             &state.db,
+            params.session_id,
+        )
+        .await;
+        let worklog_note = crate::session_worklog::supersede_summary(
+            &wpool,
             params.session_id,
             &superseded_runs,
         )
@@ -3653,8 +3663,11 @@ pub(crate) async fn spawn_agent_run(
                 // strutturati dagli step e rinfresca il digest provider-neutro
                 // che il brain inietta nei run successivi della sessione.
                 // Best-effort: un errore qui non tocca l'esito del run.
+                // Worklog nel DB del progetto (separazione DB), pool per-progetto.
+                let wlpool =
+                    crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await;
                 if let Err(e) = crate::session_worklog::ingest_steps_for_run(
-                    &db_clone,
+                    &wlpool,
                     session_id_cp,
                     Some(project_id_cp),
                     run_id,

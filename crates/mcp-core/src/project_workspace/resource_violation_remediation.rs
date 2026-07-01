@@ -250,11 +250,14 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
             .ok()
             .flatten();
     let Some(owner) = owner else { return };
+    // Separazione DB: chat_sessions e' una tabella migrata -> instrada sul pool
+    // del progetto (a flag OFF ritorna il meta-DB, comportamento storico).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let session: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM chat_sessions WHERE project_id = $1 ORDER BY updated_at DESC LIMIT 1",
     )
     .bind(project_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&proj_pool)
     .await
     .ok()
     .flatten();
@@ -382,12 +385,16 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
             // Chiusura del ciclo: attesa fine run, poi re-lint e stato finale.
             let state_cl = state.clone();
             tokio::spawn(async move {
+                // Separazione DB: agent_runs e' migrata -> pool del progetto
+                // (project_id in scope; a flag OFF ritorna il meta-DB).
+                let runs_pool =
+                    crate::project_db_routes::project_data_pool_from(&state_cl.db, project_id).await;
                 for _ in 0..60u32 {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     let status: Option<String> =
                         sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
                             .bind(run_id)
-                            .fetch_optional(&state_cl.db)
+                            .fetch_optional(&runs_pool)
                             .await
                             .ok()
                             .flatten();

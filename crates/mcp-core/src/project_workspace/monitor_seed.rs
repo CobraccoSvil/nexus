@@ -227,12 +227,15 @@ async fn read_usage_24h(db: &sqlx::PgPool, project_id: Uuid) -> Option<UsageWind
 
 /// Numero di agent_runs creati nelle ultime 24h per il progetto.
 async fn count_agent_runs_24h(db: &sqlx::PgPool, project_id: Uuid) -> Result<i64, String> {
+    // Separazione DB per-progetto: agent_runs e' una tabella migrata, instradiamo
+    // sul pool del progetto (a flag OFF ricade sul meta-pool, comportamento storico).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_runs \
          WHERE project_id = $1 AND created_at > NOW() - INTERVAL '24 hours'",
     )
     .bind(project_id)
-    .fetch_one(db)
+    .fetch_one(&proj_pool)
     .await
     .map_err(|e| e.to_string())
 }

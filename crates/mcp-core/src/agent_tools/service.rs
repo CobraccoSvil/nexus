@@ -589,10 +589,14 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
     // Recupera il comando originale dal processo piu' recente con questa label
     let original_command = matching[0].command.clone();
 
-    // Leggi working_dir dal record completo via DB
+    // Leggi working_dir dal record completo via DB.
+    // agent_processes e' tabella migrata: instrada sul pool del progetto
+    // corrente (separazione DB per-progetto). I processi di `matching` sono
+    // gia' filtrati per ctx.project_id da list_processes.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await;
     let work_dir_row = sqlx::query("SELECT working_dir FROM agent_processes WHERE id = $1")
         .bind(matching[0].id)
-        .fetch_optional(&*ctx.db)
+        .fetch_optional(&proj_pool)
         .await;
 
     let work_dir = match work_dir_row {

@@ -299,13 +299,16 @@ pub(super) async fn list_services_windows(
     project_id: Uuid,
     slug: &str,
 ) -> Vec<serde_json::Value> {
+    // Separazione DB per-progetto: agent_processes e' tabella migrata, instrada
+    // sul pool del progetto (flag OFF -> ritorna il meta-pool, behavior-preserving).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT label, status FROM agent_processes \
          WHERE project_id = $1 AND kind = 'service' \
          ORDER BY label, created_at DESC",
     )
     .bind(project_id)
-    .fetch_all(db)
+    .fetch_all(&proj_pool)
     .await
     .unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
@@ -557,6 +560,11 @@ async fn control_project_service_windows(
         .unwrap_or(&service)
         .to_string();
 
+    // Separazione DB per-progetto: agent_processes e' migrata, instrada le query
+    // di questo handler sul pool del progetto (flag OFF -> meta-pool). Risolto una
+    // volta sola e riusato dalle 3 query sotto (stesso project_id).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
     // STOP (anche prima parte di RESTART): taskkill dei processi running del servizio.
     if action == "stop" || action == "restart" {
         let running: Vec<(Option<i32>,)> = sqlx::query_as(
@@ -565,7 +573,7 @@ async fn control_project_service_windows(
         )
         .bind(project_id)
         .bind(&short)
-        .fetch_all(&state.db)
+        .fetch_all(&proj_pool)
         .await
         .unwrap_or_default();
         for (pid,) in running {
@@ -582,7 +590,7 @@ async fn control_project_service_windows(
         )
         .bind(project_id)
         .bind(&short)
-        .execute(&state.db)
+        .execute(&proj_pool)
         .await;
     }
 
@@ -595,7 +603,7 @@ async fn control_project_service_windows(
         )
         .bind(project_id)
         .bind(&short)
-        .fetch_optional(&state.db)
+        .fetch_optional(&proj_pool)
         .await
         .ok()
         .flatten();
@@ -1170,10 +1178,13 @@ pub(super) async fn detect_project_ports(
 
     // 1. PID dai processi agent — include sia 'running' che altri status purché il processo sia ancora vivo.
     // Lo status nel DB può essere 'failed' dopo un riavvio di mcp-core anche se il processo gira ancora.
+    // Separazione DB per-progetto: agent_processes e' migrata, instrada sul pool
+    // del progetto (flag OFF -> meta-pool, behavior-preserving).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let agent_pids: Vec<i32> =
         sqlx::query("SELECT pid FROM agent_processes WHERE project_id = $1 AND pid IS NOT NULL")
             .bind(project_id)
-            .fetch_all(db)
+            .fetch_all(&proj_pool)
             .await
             .unwrap_or_default()
             .iter()
@@ -2135,14 +2146,18 @@ pub async fn delete_port_allocation(
                         .await;
                 }
                 killed_pid = Some(pid);
-                // Marca agent_processes come stopped (riconciliazione)
+                // Marca agent_processes come stopped (riconciliazione).
+                // Separazione DB per-progetto: agent_processes e' migrata, instrada
+                // sul pool del progetto (flag OFF -> meta-pool, behavior-preserving).
+                let proj_pool =
+                    crate::project_db_routes::project_data_pool_from(&state.db, _project_id).await;
                 let upd = sqlx::query(
                     "UPDATE agent_processes SET status='stopped', stopped_at=NOW() \
                      WHERE pid = $1 AND project_id = $2 AND status IN ('running','starting')",
                 )
                 .bind(pid as i32)
                 .bind(_project_id)
-                .execute(&state.db)
+                .execute(&proj_pool)
                 .await
                 .map(|r| r.rows_affected())
                 .unwrap_or(0);

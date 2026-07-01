@@ -54,6 +54,9 @@ pub async fn get_workbench_state(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    // Separazione DB per-progetto: project_open_sessions e' una tabella migrata,
+    // instradiamo la lettura sul pool del progetto (project_id gia' in scope).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let session = sqlx::query(
         r#"
         SELECT active_file_paths, terminal_cwd, updated_at
@@ -63,7 +66,7 @@ pub async fn get_workbench_state(
     )
     .bind(user_id)
     .bind(project_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&proj_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

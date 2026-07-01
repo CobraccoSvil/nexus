@@ -206,13 +206,14 @@ fn parent_anchor(ctx: &AgentToolContext) -> Uuid {
 /// Profondita' corrente DERIVATA dalla catena `nexus_subagent_runs` (anti-ricorsione,
 /// punto unico). Il nuovo sub-run avra' `1 + max(depth)` tra i sub-run con lo stesso
 /// `parent_anchor` ancora `running`. Nessun sub-run attivo -> il nuovo e' depth 1.
-async fn current_chain_depth(ctx: &AgentToolContext, anchor: Uuid) -> i64 {
+async fn current_chain_depth(pool: &sqlx::PgPool, anchor: Uuid) -> i64 {
+    // pool: gia' instradato sul progetto dal chiamante (nexus_subagent_runs migrata).
     sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(depth)::bigint FROM nexus_subagent_runs \
          WHERE parent_run_id = $1 AND status = 'running'",
     )
     .bind(anchor)
-    .fetch_one(&*ctx.core.db)
+    .fetch_one(pool)
     .await
     .ok()
     .flatten()
@@ -220,13 +221,14 @@ async fn current_chain_depth(ctx: &AgentToolContext, anchor: Uuid) -> i64 {
 }
 
 /// Costo cumulativo gia' speso dai sub-run su questo `parent_anchor` (hard cap).
-async fn cumulative_cost(ctx: &AgentToolContext, anchor: Uuid) -> f64 {
+async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
+    // pool: gia' instradato sul progetto dal chiamante (nexus_subagent_runs migrata).
     sqlx::query_scalar::<_, f64>(
         "SELECT COALESCE(SUM(cost_usd), 0)::double precision \
          FROM nexus_subagent_runs WHERE parent_run_id = $1",
     )
     .bind(anchor)
-    .fetch_one(&*ctx.core.db)
+    .fetch_one(pool)
     .await
     .unwrap_or(0.0)
 }
@@ -357,6 +359,10 @@ async fn run_single_subagent(
         Some(s) => s,
         None => return json!({"error": "sub-agent richiede una sessione chat (session_id assente)"}),
     };
+    // Routing separazione DB: nexus_subagent_runs e' tabella migrata, vive nel DB
+    // del progetto. Risolvo una volta il pool per_progetto e lo riuso per la catena
+    // depth/costo, l'INSERT e le mark_run (a flag OFF ritorna il meta-DB).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
 
     // ── Guard 1: settings (enabled / whitelist / depth / cost) ────────────────
     let settings = match read_subagent_settings(ctx).await {
@@ -381,7 +387,7 @@ async fn run_single_subagent(
 
     // ── Guard 3: anti-ricorsione (depth DB-driven dalla catena) ───────────────
     let anchor = parent_anchor(ctx);
-    let current_depth = current_chain_depth(ctx, anchor).await + 1;
+    let current_depth = current_chain_depth(&proj_pool, anchor).await + 1;
     if current_depth > settings.max_depth {
         return json!({"error": format!(
             "depth {current_depth} > max {}: annidamento sub-agent eccessivo (anti-ricorsione)",
@@ -390,7 +396,7 @@ async fn run_single_subagent(
     }
 
     // ── Guard 4: cost cap cumulativo per parent ───────────────────────────────
-    let spent = cumulative_cost(ctx, anchor).await;
+    let spent = cumulative_cost(&proj_pool, anchor).await;
     if spent >= settings.cost_cap_usd {
         return json!({"error": format!(
             "cost cap raggiunto per parent={anchor} ({spent:.4} >= {:.4})",
@@ -461,7 +467,7 @@ async fn run_single_subagent(
     .bind(context_blob)
     .bind(expected_format)
     .bind(current_depth as i32)
-    .fetch_one(db)
+    .fetch_one(&proj_pool)
     .await
     {
         Ok(id) => id,
@@ -511,8 +517,17 @@ async fn run_single_subagent(
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await {
             Ok(res) => res,
             Err(_) => {
-                let _ = mark_run(db, subagent_run_id, "timeout", "[Sub-agent timeout]", 0, 0, 0, 0.0)
-                    .await;
+                let _ = mark_run(
+                    &proj_pool,
+                    subagent_run_id,
+                    "timeout",
+                    "[Sub-agent timeout]",
+                    0,
+                    0,
+                    0,
+                    0.0,
+                )
+                .await;
                 return json!({
                     "subagent_run_id": subagent_run_id.to_string(),
                     "kind": kind,
@@ -527,7 +542,7 @@ async fn run_single_subagent(
             let summary = o.final_answer.clone().unwrap_or_default();
             let status = if o.completed { "completed" } else { "paused" };
             let _ = mark_run(
-                db,
+                &proj_pool,
                 subagent_run_id,
                 status,
                 &summary,
@@ -562,7 +577,7 @@ async fn run_single_subagent(
         Err(e) => {
             // Fallback onesto: sub-run fallito -> errore al chiamante (come oggi).
             let msg = format!("[errore grafo nativo: {e}]");
-            let _ = mark_run(db, subagent_run_id, "failed", &msg, 0, 0, 0, 0.0).await;
+            let _ = mark_run(&proj_pool, subagent_run_id, "failed", &msg, 0, 0, 0, 0.0).await;
             tracing::warn!(
                 kind = %kind,
                 subagent_run_id = %subagent_run_id,
@@ -655,13 +670,17 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
                 .to_string()
         }
     };
+    // Routing separazione DB: nexus_subagent_runs e' migrata; il sub-run e' nel DB
+    // del progetto corrente (stesso project_id che lo ha dispatchato).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
     let row = sqlx::query(
         "SELECT id::text, status, kind, final_summary, artifacts, iterations,
                 tokens_prompt, tokens_completion, cost_usd, depth, source, is_background
          FROM nexus_subagent_runs WHERE id::text = $1",
     )
     .bind(&run_id)
-    .fetch_optional(&*ctx.core.db)
+    .fetch_optional(&proj_pool)
     .await;
     match row {
         Ok(Some(r)) => json!({
@@ -705,12 +724,16 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
         }
     };
 
+    // Routing separazione DB: nexus_subagent_runs e' migrata; il sub-run da riprendere
+    // e' nel DB del progetto corrente (stesso project_id che lo ha dispatchato).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
     let row = sqlx::query(
         "SELECT kind, task_description, context_blob, expected_format, status, depth, parent_run_id
          FROM nexus_subagent_runs WHERE id = $1",
     )
     .bind(run_id)
-    .fetch_optional(&*ctx.core.db)
+    .fetch_optional(&proj_pool)
     .await;
     let row = match row {
         Ok(Some(r)) => r,

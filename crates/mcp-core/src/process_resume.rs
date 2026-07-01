@@ -115,6 +115,9 @@ async fn announce_cap_reached_in_chat(
     cap: i64,
     label: &str,
 ) {
+    // Routing separazione DB: chat_messages e' tabella per-progetto, instradata
+    // sul pool del progetto (a flag OFF ritorna il meta-pool, comportamento storico).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let already: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM chat_messages \
          WHERE session_id = $1 \
@@ -122,7 +125,7 @@ async fn announce_cap_reached_in_chat(
            AND metadata ->> 'kind' = 'cap_reached'",
     )
     .bind(session_id)
-    .fetch_one(db)
+    .fetch_one(&proj_pool)
     .await
     .unwrap_or(0);
     if already > 0 {
@@ -280,6 +283,12 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
         let output: String = row.try_get("output").unwrap_or_default();
         let error_output: String = row.try_get("error_output").unwrap_or_default();
 
+        // Routing separazione DB: agent_processes e' tabella per-progetto. Risolvo
+        // una volta il pool del progetto e lo riuso per tutte le scritture/letture
+        // su agent_processes in questa iterazione (a flag OFF ritorna il meta-pool).
+        let proj_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
         // CAUSA RADICE del loop "la chat riparte da sola": i dev server / watcher
         // long-running (vite, nodemon, dev:*) finiscono in stato stopped/failed a
         // ogni crash o restart, ed entravano qui come fossero comandi batch
@@ -293,7 +302,7 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
                   WHERE id = $1 AND resume_dispatched_at IS NULL",
             )
             .bind(id)
-            .execute(&state.db)
+            .execute(&proj_pool)
             .await;
             tracing::debug!(
                 "process_resume: skip risveglio per servizio long-running {} (label='{}', command='{}') — non e' un batch concluso",
@@ -332,7 +341,7 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
               WHERE id = $1 AND resume_dispatched_at IS NULL",
         )
         .bind(id)
-        .execute(&state.db)
+        .execute(&proj_pool)
         .await
         .map_err(|e| e.to_string())?;
         if marked.rows_affected() == 0 {
@@ -345,7 +354,7 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
               WHERE session_id = $1 AND resume_dispatched_at > NOW() - INTERVAL '1 hour'",
         )
         .bind(session_id)
-        .fetch_one(&state.db)
+        .fetch_one(&proj_pool)
         .await
         .unwrap_or(0);
         if recent > cap {

@@ -938,7 +938,10 @@ pub async fn tool_nexus_get_worklog(
         return "nexus_get_worklog: disponibile solo nelle sessioni chat (nessuna sessione nel contesto).".to_string();
     };
     let db: &PgPool = ctx.db.as_ref();
+    // settings: config GLOBALE -> meta. Le righe worklog vivono nel DB del
+    // progetto (separazione DB): risolvo il pool dalla sessione.
     let settings = current_settings(db).await;
+    let wpool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
     let kind = input.get("kind").and_then(Value::as_str);
     let run_id = input
         .get("run_id")
@@ -966,7 +969,7 @@ pub async fn tool_nexus_get_worklog(
     .bind(run_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(db)
+    .fetch_all(&wpool)
     .await;
 
     let rows = match rows {

@@ -83,13 +83,17 @@ pub(crate) async fn maybe_trigger_debugger(
         None => return,
     };
 
+    // Pool dati del progetto (separazione DB): chat_sessions e' migrata, va letta
+    // sul DB del progetto. A flag OFF ritorna il meta-pool (comportamento storico).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
     // Sessione chat esistente del progetto (non ne creiamo: l'auto-debug e'
     // opt-in e ha senso solo dove l'utente vede la conversazione).
     let session: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM chat_sessions WHERE project_id = $1 ORDER BY updated_at DESC LIMIT 1",
     )
     .bind(project_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&proj_pool)
     .await
     .ok()
     .flatten();
@@ -210,13 +214,19 @@ pub(crate) async fn maybe_trigger_debugger(
             let state_cl = state.clone();
             let unit_cl = unit.to_string();
             tokio::spawn(async move {
+                // Pool dati del progetto (separazione DB): agent_runs e' migrata.
+                // project_id e' in scope (catturato dalla closure), quindi instradiamo
+                // sul DB del progetto. A flag OFF ritorna il meta-pool.
+                let proj_pool =
+                    crate::project_db_routes::project_data_pool_from(&state_cl.db, project_id)
+                        .await;
                 // Attende la fine del run debugger (max ~5 min), poi riavvia.
                 for _ in 0..60u32 {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     let status: Option<String> =
                         sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
                             .bind(run_id)
-                            .fetch_optional(&state_cl.db)
+                            .fetch_optional(&proj_pool)
                             .await
                             .ok()
                             .flatten();

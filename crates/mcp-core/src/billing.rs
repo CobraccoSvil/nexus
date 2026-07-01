@@ -899,6 +899,12 @@ pub async fn get_session_usage(
 
     let requester = claims_user_id(&claims)?;
 
+    // Separazione DB per-progetto: chat_sessions e chat_messages sono tabelle
+    // migrate; instrada le letture sul pool del progetto risolto dalla sessione
+    // (a flag OFF ritorna il meta-pool, comportamento storico).
+    let session_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+
     // Verify the session belongs to the requesting user (or user is admin)
     if claims.role != "admin" {
         let is_owner = sqlx::query_scalar::<_, bool>(
@@ -906,7 +912,7 @@ pub async fn get_session_usage(
         )
         .bind(session_id)
         .bind(requester)
-        .fetch_one(&state.db)
+        .fetch_one(&session_pool)
         .await
         .unwrap_or(false);
 
@@ -938,7 +944,7 @@ pub async fn get_session_usage(
         "#,
     )
     .bind(session_id)
-    .fetch_one(&state.db)
+    .fetch_one(&session_pool)
     .await
     .map_err(|e| {
         (
@@ -963,7 +969,7 @@ pub async fn get_session_usage(
         "#,
     )
     .bind(session_id)
-    .fetch_all(&state.db)
+    .fetch_all(&session_pool)
     .await
     .map_err(|e| {
         (

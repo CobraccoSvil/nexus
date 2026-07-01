@@ -672,6 +672,11 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     };
 
     // ── Live monitoring: INSERT iniziale + broadcast channel ─────────────────
+    // Separazione DB per-progetto: la tabella `jobs` e' migrata. Risolvo una
+    // sola volta il pool del progetto (per ctx.project_id in scope) e lo riuso
+    // per INSERT, UPDATE live nel task stdout e UPDATE finale.
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await;
     let job_id = Uuid::new_v4();
     let _ = sqlx::query(
         "INSERT INTO jobs (id, project_id, kind, status, input, progress, output_log) \
@@ -684,7 +689,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         "command": command_str,
         "started_at": chrono::Utc::now().to_rfc3339(),
     }))
-    .execute(&*ctx.db)
+    .execute(&proj_pool)
     .await;
     let _live_tx = crate::playwright_live::register(&ctx.playwright_channels, job_id);
     tracing::info!(job_id = %job_id, "run_playwright_tests: live job registrato");
@@ -710,7 +715,9 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
 
-    let db_for_stdout = ctx.db.clone();
+    // Separazione DB per-progetto: il task di stdout aggiorna `jobs` (migrata),
+    // quindi cattura il pool del progetto gia' risolto, non il meta-pool.
+    let db_for_stdout = proj_pool.clone();
     let channels_for_stdout = ctx.playwright_channels.clone();
     let stdout_task = tokio::spawn(async move {
         let mut full_bytes: Vec<u8> = Vec::new();
@@ -764,7 +771,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
                             .bind(&acc_log)
                             .bind(serde_json::to_value(&progress).unwrap_or(serde_json::json!({})))
                             .bind(job_id)
-                            .execute(&*db_for_stdout)
+                            .execute(&db_for_stdout)
                             .await;
                     last_db_flush = std::time::Instant::now();
                 }
@@ -776,7 +783,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
             .bind(&acc_log)
             .bind(serde_json::to_value(&progress).unwrap_or(serde_json::json!({})))
             .bind(job_id)
-            .execute(&*db_for_stdout)
+            .execute(&db_for_stdout)
             .await;
 
         (full_bytes, progress)
@@ -832,7 +839,9 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
 
     // ── 9. Finalizza il record `jobs` (UPDATE, non nuova INSERT) ───────────────
     {
-        let db = ctx.db.clone();
+        // Separazione DB per-progetto: riuso il pool del progetto gia' risolto
+        // (tabella `jobs` migrata).
+        let db = &proj_pool;
         let pid = ctx.project_id;
         let status = if exit_code == 0 { "passed" } else { "failed" };
         let label = if exit_code == 0 {
@@ -889,7 +898,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
             }))
             .bind(serde_json::to_value(&final_progress).unwrap_or(serde_json::json!({})))
             .bind(job_id)
-            .execute(&*db)
+            .execute(db)
             .await
         {
             Ok(r) => {

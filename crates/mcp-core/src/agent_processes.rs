@@ -49,6 +49,11 @@ pub async fn spawn_agent_process(
         return Err(format!("env override rifiutato: {e}"));
     }
 
+    // Separazione DB: agent_processes e' una tabella migrata; con project_id in
+    // scope instradiamo tutte le scritture/letture di questa funzione (e del task
+    // di background) sul pool del progetto. A flag OFF ritorna il meta-pool.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+
     // Insert initial DB row
     sqlx::query(
         r#"INSERT INTO agent_processes (id, project_id, session_id, label, command, working_dir, status, sandboxed, kind)
@@ -62,7 +67,7 @@ pub async fn spawn_agent_process(
     .bind(working_dir)
     .bind(will_use_docker)
     .bind(kind)
-    .execute(db)
+    .execute(&proj_pool)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -172,13 +177,14 @@ pub async fn spawn_agent_process(
     )
     .bind(pid)
     .bind(process_id)
-    .execute(db)
+    .execute(&proj_pool)
     .await;
 
     // Take stdout/stderr handles
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let db_clone = db.clone();
+    // Il task di background eredita il pool instradato del progetto (separazione DB).
+    let db_clone = proj_pool.clone();
 
     // Spawn background task to read output and flush to DB
     tokio::spawn(async move {
@@ -418,6 +424,8 @@ pub async fn stop_process(db: &PgPool, process_id: Uuid) -> Result<String, Strin
 
 /// List recent processes for a project
 pub async fn list_processes(db: &PgPool, project_id: Uuid) -> Result<Vec<ProcessSummary>, String> {
+    // Separazione DB: tabella migrata, project_id in scope -> pool del progetto.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let rows = sqlx::query(
         r#"SELECT id, label, command, pid, status, exit_code, created_at
            FROM agent_processes
@@ -426,7 +434,7 @@ pub async fn list_processes(db: &PgPool, project_id: Uuid) -> Result<Vec<Process
            LIMIT 20"#,
     )
     .bind(project_id)
-    .fetch_all(db)
+    .fetch_all(&proj_pool)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 

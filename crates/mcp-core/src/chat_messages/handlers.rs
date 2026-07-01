@@ -752,8 +752,14 @@ pub async fn send_chat_message(
                         // Worklog di sessione (mig 0411): stesso hook del
                         // percorso spawn principale — anche il resume di
                         // conferma alimenta la storia di lavoro. Best-effort.
-                        if let Err(e) = crate::session_worklog::ingest_steps_for_run(
+                        // Worklog nel DB del progetto (separazione DB), pool per-progetto.
+                        let wlpool = crate::project_db_routes::project_data_pool_from(
                             &db_clone2,
+                            project_id_r,
+                        )
+                        .await;
+                        if let Err(e) = crate::session_worklog::ingest_steps_for_run(
+                            &wlpool,
                             session_id_r,
                             Some(project_id_r),
                             new_run_id,

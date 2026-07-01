@@ -468,6 +468,9 @@ pub async fn delete_project(
     // Senza questo step un dev server attivo (es. `npm run dev`) continua a scrivere
     // dentro node_modules/.vite e race con il rm_dir_all sotto, lasciando residui
     // su disco anche dopo che il DB e' stato pulito dal CASCADE.
+    // Separazione DB: agent_processes e' una tabella migrata, instradiamo la
+    // lettura sul pool del progetto (a flag OFF ritorna il meta-DB, comportamento storico).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let running_pids: Vec<i32> = sqlx::query_scalar(
         r#"
         SELECT pid FROM agent_processes
@@ -477,7 +480,7 @@ pub async fn delete_project(
         "#,
     )
     .bind(project_id)
-    .fetch_all(&state.db)
+    .fetch_all(&proj_pool)
     .await
     .unwrap_or_default();
 

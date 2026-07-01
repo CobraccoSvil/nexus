@@ -78,6 +78,9 @@ fn record_playwright_job(
     let db = ctx.db.clone();
     let pid = ctx.project_id;
     tokio::spawn(async move {
+        // Separazione DB per-progetto: `jobs` e' tabella migrata, instrada il
+        // write sul pool del progetto (a flag OFF ritorna il meta-DB).
+        let proj_pool = crate::project_db_routes::project_data_pool_from(&db, pid).await;
         let _ = sqlx::query(
             "INSERT INTO jobs (project_id, kind, status, input) VALUES ($1, 'playwright_test', $2, $3)",
         )
@@ -87,7 +90,7 @@ fn record_playwright_job(
             "label": summary.label,
             "message": summary.message,
         }))
-        .execute(&*db)
+        .execute(&proj_pool)
         .await;
     });
 }

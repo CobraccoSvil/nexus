@@ -30,6 +30,9 @@ pub async fn persist_trace(
     seq: i32,
     payload: &Value,
 ) {
+    // Separazione DB per-progetto: nexus_agent_traces e' migrata, instrada sul
+    // pool del progetto risolto per-sessione (a flag OFF ritorna il meta-pool).
+    let proj_pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
     let res = sqlx::query(
         "INSERT INTO nexus_agent_traces (session_id, run_id, seq, payload) \
          VALUES ($1, $2, $3, $4)",
@@ -38,7 +41,7 @@ pub async fn persist_trace(
     .bind(run_id)
     .bind(seq)
     .bind(payload)
-    .execute(db)
+    .execute(&proj_pool)
     .await;
     if let Err(e) = res {
         tracing::warn!(
@@ -61,6 +64,10 @@ pub async fn get_session_traces(
     session_id: Uuid,
     user_id: Uuid,
 ) -> Result<std::collections::HashMap<String, Vec<Value>>, sqlx::Error> {
+    // Separazione DB per-progetto: nexus_agent_traces e agent_runs sono entrambe
+    // migrate, quindi la SELECT con subquery IN gira tutta sul pool del progetto
+    // risolto per-sessione (a flag OFF ritorna il meta-pool).
+    let proj_pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
     let rows = sqlx::query(
         "SELECT t.run_id, t.payload \
          FROM nexus_agent_traces t \
@@ -74,7 +81,7 @@ pub async fn get_session_traces(
     )
     .bind(session_id)
     .bind(user_id)
-    .fetch_all(db)
+    .fetch_all(&proj_pool)
     .await?;
 
     let mut runs: std::collections::HashMap<String, Vec<Value>> =

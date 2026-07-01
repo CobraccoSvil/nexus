@@ -30,11 +30,13 @@ pub async fn clear_finished_processes(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
+    // Separazione DB: agent_processes e' tabella migrata, instrada sul pool del progetto
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let result = sqlx::query(
         "DELETE FROM agent_processes WHERE project_id = $1 AND status IN ('stopped', 'failed')",
     )
     .bind(project_id)
-    .execute(&state.db)
+    .execute(&proj_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -76,19 +78,22 @@ pub async fn stream_agent_process_logs(
     {
         return (StatusCode::FORBIDDEN, "Accesso negato").into_response();
     }
+    // Separazione DB: agent_processes e' tabella migrata, instrada sul pool del progetto
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM agent_processes WHERE id=$1 AND project_id=$2)",
     )
     .bind(process_id)
     .bind(project_id)
-    .fetch_one(&state.db)
+    .fetch_one(&proj_pool)
     .await
     .unwrap_or(false);
     if !exists {
         return (StatusCode::NOT_FOUND, "Processo non trovato").into_response();
     }
 
-    let db = state.db.clone();
+    // Lo stream legge ancora agent_processes (tabella migrata): usa il pool del progetto
+    let db = proj_pool;
     // State: (offset di caratteri già inviati, terminato)
     let sse_stream = stream::unfold(
         (db, process_id, 0usize, false),

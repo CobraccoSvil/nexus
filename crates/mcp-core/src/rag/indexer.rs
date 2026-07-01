@@ -184,12 +184,22 @@ pub async fn index_attachment(
     )
     .await?;
 
+    // Separazione DB: chat_message_attachments e' una tabella migrata. La risolviamo
+    // sul pool del progetto (per project_id se presente, altrimenti per session_id);
+    // a flag-OFF / non risolvibile l'helper ritorna il meta-pool (comportamento storico).
+    let attach_pool = if let Some(pid) = project_id {
+        crate::project_db_routes::project_data_pool_from(db, pid).await
+    } else if let Some(sid) = session_id {
+        crate::project_db_routes::project_data_pool_by_session_from(db, sid).await
+    } else {
+        db.clone()
+    };
     if let Err(e) = sqlx::query(
         "UPDATE chat_message_attachments SET indexed_at = NOW(), chunk_count = $2 WHERE id = $1",
     )
     .bind(attachment_id)
     .bind(n as i32)
-    .execute(db)
+    .execute(&attach_pool)
     .await
     {
         tracing::warn!(

@@ -95,6 +95,9 @@ pub async fn get_project_problems(
     // delle 04:12 ancora elencati dopo il passed delle 04:40). Il NOT EXISTS li
     // esclude appena un run success dello stesso kind li supera: il pannello
     // riflette lo stato REALE, non lo storico.
+    // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel
+    // pool del progetto. A flag OFF project_data_pool_from ritorna il meta-DB.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let failed_jobs = sqlx::query(
         r#"
         SELECT id, kind, status, input, created_at
@@ -113,7 +116,7 @@ pub async fn get_project_problems(
         "#,
     )
     .bind(project_id)
-    .fetch_all(&state.db)
+    .fetch_all(&proj_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -595,13 +598,17 @@ pub async fn get_output_channels(
     // Canali dinamici agent: usati dal pannello Servizi (tab separato).
     // Self-healing in Rust: marca come 'stopped' nel DB i processi con status='running'
     // ma PID inesistente (residui di chat AI precedenti, restart Nexus, kill esterni).
+    // Routing separazione DB (regola E): `agent_processes` e' tabella MIGRATA,
+    // vive nel pool del progetto. A flag OFF ritorna il meta-DB. Lo riuso sotto
+    // per la sanazione UPDATE (stesso project_id).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let agent_rows_raw = sqlx::query(
         "SELECT id, label, command, status, pid, COALESCE(kind, 'service') as kind FROM agent_processes \
          WHERE project_id = $1 \
          ORDER BY created_at DESC LIMIT 20",
     )
     .bind(project_id)
-    .fetch_all(&state.db)
+    .fetch_all(&proj_pool)
     .await
     .unwrap_or_default();
 
@@ -626,7 +633,7 @@ pub async fn get_output_channels(
     if !orphan_ids.is_empty() {
         let _ = sqlx::query("UPDATE agent_processes SET status = 'stopped' WHERE id = ANY($1)")
             .bind(&orphan_ids)
-            .execute(&state.db)
+            .execute(&proj_pool)
             .await;
     }
 
@@ -688,6 +695,11 @@ pub async fn get_output_events(
         .unwrap_or(100)
         .clamp(1, 500);
 
+    // Routing separazione DB (regola E): `jobs` e `agent_processes` sono tabelle
+    // MIGRATE (vivono nel pool del progetto); `git_operations` NON e' migrata e
+    // resta sul meta-pool. A flag OFF project_data_pool_from ritorna il meta-DB.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
     let events = match channel.as_str() {
         "Git" => {
             sqlx::query(
@@ -740,7 +752,7 @@ pub async fn get_output_events(
             .bind(project_id)
             .bind(channel.as_str())
             .bind(limit)
-            .fetch_all(&state.db)
+            .fetch_all(&proj_pool)
             .await
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -768,7 +780,7 @@ pub async fn get_output_events(
                  FROM agent_processes WHERE id = $1",
             )
             .bind(proc_id)
-            .fetch_optional(&state.db)
+            .fetch_optional(&proj_pool)
             .await
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -886,6 +898,9 @@ pub async fn get_playwright_runs(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
+    // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel pool
+    // del progetto. La query `projects` piu' sotto resta sul meta-pool (non migrata).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let rows = sqlx::query(
         r#"
         SELECT id, kind, status, input, created_at, updated_at, progress
@@ -896,7 +911,7 @@ pub async fn get_playwright_runs(
         "#,
     )
     .bind(project_id)
-    .fetch_all(&state.db)
+    .fetch_all(&proj_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -958,6 +973,9 @@ pub async fn get_playwright_run_detail(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
+    // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel pool
+    // del progetto. A flag OFF project_data_pool_from ritorna il meta-DB.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let row = sqlx::query(
         r#"
         SELECT id, status, input, created_at, updated_at, progress, output_log
@@ -967,7 +985,7 @@ pub async fn get_playwright_run_detail(
     )
     .bind(run_id)
     .bind(project_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&proj_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Run non trovato"))?;
@@ -1034,13 +1052,17 @@ pub async fn stream_playwright_run(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
     let _ = load_project_context(&state.db, project_id, user_id).await?;
 
+    // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel pool
+    // del progetto. Riuso il pool sotto per il fallback row_opt (stesso progetto).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
     // Verifica che il job appartenga al progetto
     let job_exists: Option<String> = sqlx::query_scalar(
         "SELECT status FROM jobs WHERE id = $1 AND project_id = $2 AND kind = 'playwright_test'",
     )
     .bind(run_id)
     .bind(project_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&proj_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if job_exists.is_none() {
@@ -1080,7 +1102,7 @@ pub async fn stream_playwright_run(
             // Costruisce sincrono lo state finale e lo wrappa in tokio_stream::once.
             let row_opt = sqlx::query("SELECT status, progress, input FROM jobs WHERE id = $1")
                 .bind(run_id)
-                .fetch_optional(&state.db)
+                .fetch_optional(&proj_pool)
                 .await
                 .ok()
                 .flatten();
@@ -1193,10 +1215,13 @@ pub async fn clear_playwright_runs(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
+    // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel pool
+    // del progetto. A flag OFF project_data_pool_from ritorna il meta-DB.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let result =
         sqlx::query(r#"DELETE FROM jobs WHERE project_id = $1 AND kind ILIKE '%playwright%'"#)
             .bind(project_id)
-            .execute(&state.db)
+            .execute(&proj_pool)
             .await
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
