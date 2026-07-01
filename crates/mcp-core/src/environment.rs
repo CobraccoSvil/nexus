@@ -233,31 +233,6 @@ async fn check_microservices() -> EnvironmentCheck {
     }
 }
 
-// NOTA (brain rimosso): il brain Python (`brain.grpc_server`) e' stato eliminato
-// dal repo (commit 75a6d62): non esiste piu' un entrypoint/servizio Python ne'
-// su Linux ne' su Windows. Il motore agentico PRIMARIO e' nativo Rust; il brain
-// resta solo come backend HTTP opzionale, non piu' come processo locale.
-// Questo check e' quindi codice morto: su Linux `pgrep` non trova nulla e su
-// Windows `pgrep` non esiste (falso allarme "not running"). Va valutata la
-// rimozione completa; per ora e' un dispatch neutro che NON segnala errori.
-#[cfg(unix)]
-async fn check_brain_service() -> EnvironmentCheck {
-    EnvironmentCheck::warn(
-        "brain_service",
-        "Nexus Brain (Python AI)",
-        "componente rimosso dal repo: motore agentico ora nativo Rust",
-    )
-}
-
-#[cfg(windows)]
-async fn check_brain_service() -> EnvironmentCheck {
-    EnvironmentCheck::warn(
-        "brain_service",
-        "Nexus Brain (Python AI)",
-        "componente rimosso dal repo: motore agentico ora nativo Rust",
-    )
-}
-
 fn check_backend_process() -> EnvironmentCheck {
     let pid = std::process::id();
     EnvironmentCheck::ok("backend_process", "Backend mcp-core", format!("pid {pid}"))
@@ -444,7 +419,6 @@ pub async fn get_environment_status(State(state): State<AppState>) -> ApiResult 
         db_check,
         playwright_libs_check,
         playwright_browser_check,
-        brain_check,
         tool_runner_check,
         frontend_check,
         migrations_check,
@@ -455,7 +429,6 @@ pub async fn get_environment_status(State(state): State<AppState>) -> ApiResult 
         check_db(&state.db),
         check_playwright_libs(),
         check_playwright_browser(),
-        check_brain_service(),
         check_tool_runner(&state.db),
         check_frontend_process(),
         check_migrations(&db_url),
@@ -470,7 +443,6 @@ pub async fn get_environment_status(State(state): State<AppState>) -> ApiResult 
         db_check,
         playwright_libs_check,
         playwright_browser_check,
-        brain_check,
         tool_runner_check,
         backend_check,
         microservices_check,
