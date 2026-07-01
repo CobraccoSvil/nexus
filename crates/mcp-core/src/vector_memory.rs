@@ -23,6 +23,48 @@ pub use nexus_wiki::content_points::{
 /// Re-export con la semantica storica (Result, trim + scarto dei vuoti).
 pub(crate) use nexus_auth::get_setting_nonempty as get_setting;
 
+/// Punto unico (regola L) del parsing di una risposta di ricerca Qdrant in
+/// `Vec<VectorPointHit>`. Il formato del payload (`{ "result": [ { id, score,
+/// payload } ] }`) e la conversione dell'`id` (stringa o numero) sono identici
+/// in tutte le collection; qui li centralizziamo invece di ripeterli in ogni
+/// funzione di ricerca. Un hit senza `id` valido viene scartato.
+fn parse_point_hits(payload: &Value) -> Vec<VectorPointHit> {
+    let result = payload
+        .get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut hits = Vec::with_capacity(result.len());
+    for hit in result {
+        let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let point_id = match hit.get("id") {
+            Some(Value::String(value)) => value.clone(),
+            Some(Value::Number(value)) => value.to_string(),
+            _ => continue,
+        };
+        let point_payload = hit.get("payload").cloned().unwrap_or_else(|| json!({}));
+        hits.push(VectorPointHit {
+            point_id,
+            score,
+            payload: point_payload,
+        });
+    }
+    hits
+}
+
+/// Deserializza una risposta HTTP di ricerca Qdrant e ne estrae gli hit.
+/// Accorpa il passaggio `response.json()` + [`parse_point_hits`] usato da tutte
+/// le funzioni di ricerca; `context_msg` distingue l'origine nel messaggio di
+/// errore. Comportamento invariato rispetto al blocco inline precedente.
+async fn search_response_to_hits(
+    response: reqwest::Response,
+    context_msg: &'static str,
+) -> anyhow::Result<Vec<VectorPointHit>> {
+    let payload: Value = response.json().await.context(context_msg)?;
+    Ok(parse_point_hits(&payload))
+}
+
 async fn qdrant_config(db: &PgPool) -> anyhow::Result<(String, String)> {
     let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
         std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
@@ -215,33 +257,7 @@ pub async fn search_prompt_correction_points(
         return Err(anyhow!("qdrant search failed: {payload}"));
     }
 
-    let payload: Value = response
-        .json()
-        .await
-        .context("invalid qdrant search payload")?;
-    let result = payload
-        .get("result")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut hits = Vec::with_capacity(result.len());
-    for hit in result {
-        let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-        let point_id = match hit.get("id") {
-            Some(Value::String(value)) => value.clone(),
-            Some(Value::Number(value)) => value.to_string(),
-            _ => continue,
-        };
-        let point_payload = hit.get("payload").cloned().unwrap_or_else(|| json!({}));
-        hits.push(VectorPointHit {
-            point_id,
-            score,
-            payload: point_payload,
-        });
-    }
-
-    Ok(hits)
+    search_response_to_hits(response, "invalid qdrant search payload").await
 }
 
 pub async fn delete_prompt_correction_points(
@@ -254,6 +270,9 @@ pub async fn delete_prompt_correction_points(
 
     ensure_collection(db).await?;
     let (base_url, collection) = qdrant_config(db).await?;
+    // Falso positivo del detector SQL injection: "delete" e' un segmento del
+    // path REST Qdrant, non la keyword SQL. base_url/collection vengono dai
+    // settings, non da input utente. Nessuna query SQL costruita qui.
     let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
     let body = json!({
         "points": point_ids
@@ -298,6 +317,24 @@ pub async fn set_point_active(db: &PgPool, point_id: &str, active: bool) -> Resu
     Ok(())
 }
 
+/// Corpo della richiesta `points/count` Qdrant, con filtro opzionale per
+/// `project_id`. Estratto per tenere [`count_prompt_correction_points`] sotto
+/// la soglia di lunghezza; comportamento invariato.
+fn count_request_body(project_id: Option<Uuid>) -> Value {
+    let mut body = json!({ "exact": true });
+    if let Some(project_id) = project_id {
+        body["filter"] = json!({
+            "must": [
+                {
+                    "key": "project_id",
+                    "match": { "value": project_id.to_string() }
+                }
+            ]
+        });
+    }
+    body
+}
+
 pub async fn count_prompt_correction_points(
     db: &PgPool,
     project_id: Option<Uuid>,
@@ -306,23 +343,7 @@ pub async fn count_prompt_correction_points(
     let (base_url, collection) = qdrant_config(db).await?;
     let url = format!("{base_url}/collections/{collection}/points/count");
 
-    let filter = project_id.map(|project_id| {
-        json!({
-            "must": [
-                {
-                    "key": "project_id",
-                    "match": { "value": project_id.to_string() }
-                }
-            ]
-        })
-    });
-
-    let mut body = json!({
-        "exact": true
-    });
-    if let Some(filter) = filter {
-        body["filter"] = filter;
-    }
+    let body = count_request_body(project_id);
 
     let response = nexus_http::build_client()
         .post(&url)
@@ -434,38 +455,15 @@ pub async fn search_project_context_points(
         return Err(anyhow!("qdrant project context search failed: {text}"));
     }
 
-    let payload: Value = response
-        .json()
-        .await
-        .context("invalid qdrant project context payload")?;
-    let result = payload
-        .get("result")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut hits = Vec::with_capacity(result.len());
-    for hit in result {
-        let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-        let point_id = match hit.get("id") {
-            Some(Value::String(value)) => value.clone(),
-            Some(Value::Number(value)) => value.to_string(),
-            _ => continue,
-        };
-        let point_payload = hit.get("payload").cloned().unwrap_or_else(|| json!({}));
-        hits.push(VectorPointHit {
-            point_id,
-            score,
-            payload: point_payload,
-        });
-    }
-
-    Ok(hits)
+    search_response_to_hits(response, "invalid qdrant project context payload").await
 }
 
 pub async fn delete_project_bootstrap_points(db: &PgPool, project_id: Uuid) -> anyhow::Result<()> {
     ensure_project_context_collection(db).await?;
     let (base_url, collection) = qdrant_project_context_config(db).await?;
+    // Falso positivo del detector SQL injection: "delete" e' un segmento del
+    // path REST Qdrant, non la keyword SQL. base_url/collection vengono dai
+    // settings, non da input utente. Nessuna query SQL costruita qui.
     let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
     let body = json!({
         "filter": {
@@ -643,33 +641,7 @@ pub async fn search_code_index(
         return Err(anyhow!("qdrant code index search failed: {payload}"));
     }
 
-    let payload: Value = response
-        .json()
-        .await
-        .context("invalid qdrant code index search payload")?;
-    let result = payload
-        .get("result")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut hits = Vec::with_capacity(result.len());
-    for hit in result {
-        let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-        let point_id = match hit.get("id") {
-            Some(Value::String(value)) => value.clone(),
-            Some(Value::Number(value)) => value.to_string(),
-            _ => continue,
-        };
-        let point_payload = hit.get("payload").cloned().unwrap_or_else(|| json!({}));
-        hits.push(VectorPointHit {
-            point_id,
-            score,
-            payload: point_payload,
-        });
-    }
-
-    Ok(hits)
+    search_response_to_hits(response, "invalid qdrant code index search payload").await
 }
 
 /// Ritorna `true` se il progetto ha almeno un file indicizzato in `file_index_hashes`.
@@ -689,6 +661,9 @@ pub async fn has_code_index(db: &PgPool, project_id: Uuid) -> bool {
 pub async fn delete_code_index_points(db: &PgPool, project_id: Uuid) -> anyhow::Result<()> {
     ensure_code_index_collection(db).await?;
     let (base_url, collection) = qdrant_code_index_config(db).await?;
+    // Falso positivo del detector SQL injection: "delete" e' un segmento del
+    // path REST Qdrant, non la keyword SQL. base_url/collection vengono dai
+    // settings, non da input utente. Nessuna query SQL costruita qui.
     let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
     let body = json!({
         "filter": {
@@ -727,6 +702,9 @@ pub async fn delete_code_index_file_points(
 ) -> anyhow::Result<()> {
     ensure_code_index_collection(db).await?;
     let (base_url, collection) = qdrant_code_index_config(db).await?;
+    // Falso positivo del detector SQL injection: "delete" e' un segmento del
+    // path REST Qdrant, non la keyword SQL. base_url/collection vengono dai
+    // settings, non da input utente. Nessuna query SQL costruita qui.
     let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
     let body = json!({
         "filter": {
@@ -797,6 +775,151 @@ async fn ensure_docs_collection(db: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Identita' di un documento durante la vettorizzazione: i quattro campi
+/// costanti tra tutte le sezioni. Raggruppati in una struct (composition, regola
+/// L) per non ripeterli nelle firme degli helper di [`vectorize_document`].
+#[derive(Clone, Copy)]
+struct DocSectionCtx<'a> {
+    project_id: Uuid,
+    document_id: Uuid,
+    doc_type: &'a str,
+    version: &'a str,
+}
+
+/// `point_id` deterministico di una sezione documento:
+/// `sha256(project:doc:document:number:version)` in esadecimale. Estratto da
+/// [`embed_and_upsert_doc_section`]; formula invariata.
+fn doc_section_point_id(ctx: &DocSectionCtx, number: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}:doc:{}:{}:{}",
+                ctx.project_id, ctx.document_id, number, ctx.version
+            )
+            .as_bytes()
+        )
+    )
+}
+
+/// Payload Qdrant di un punto-sezione della collection `project_docs`.
+/// Estratto da [`embed_and_upsert_doc_section`] per tenerla sotto la soglia di
+/// lunghezza; struttura del payload invariata.
+fn doc_point_payload(ctx: &DocSectionCtx, number: &str, title: &str, text_preview: &str) -> Value {
+    json!({
+        "project_id": ctx.project_id.to_string(),
+        "document_id": ctx.document_id.to_string(),
+        "doc_type": ctx.doc_type,
+        "section_path": number,
+        "section_title": title,
+        "version": ctx.version,
+        "text_preview": text_preview,
+        "active": true,
+    })
+}
+
+/// Calcola l'embedding di una singola sezione e la fa upsert nella collection
+/// `project_docs`. Ritorna il `point_id` in caso di successo, `None` (loggando
+/// un WARN) se l'embedding o l'upsert falliscono. Estratta dal loop di
+/// [`vectorize_document`] senza alterarne il comportamento osservabile: i punti
+/// falliti vengono semplicemente saltati, come nel `continue`/`match` originale.
+async fn embed_and_upsert_doc_section(
+    neural: &crate::orchestrator::NeuralCoreClient,
+    url: &str,
+    ctx: &DocSectionCtx<'_>,
+    section: &(String, String, String),
+) -> Option<String> {
+    let (number, title, content) = section;
+    let text_to_embed = format!("{number} {title}\n{content}");
+    let text_preview = if content.len() > 200 {
+        &content[..200]
+    } else {
+        content.as_str()
+    };
+
+    let vector = match neural.embed_text("", &text_to_embed).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Embed error for section {number}: {e}");
+            return None;
+        }
+    };
+
+    let point_id = doc_section_point_id(ctx, number);
+    let payload = doc_point_payload(ctx, number, title, text_preview);
+    let body = json!({ "points": [{ "id": point_id, "vector": vector, "payload": payload }] });
+
+    if send_doc_point_upsert(url, &body).await {
+        Some(point_id)
+    } else {
+        None
+    }
+}
+
+/// Esegue la PUT del punto documento su Qdrant. Ritorna `true` se l'upsert e'
+/// riuscito; in caso di errore HTTP o di rete logga un WARN e ritorna `false`.
+/// Estratta da [`embed_and_upsert_doc_section`]; logging e semantica invariati.
+async fn send_doc_point_upsert(url: &str, body: &Value) -> bool {
+    match reqwest::Client::new().put(url).json(body).send().await {
+        Ok(resp) if resp.status().is_success() => true,
+        Ok(resp) => {
+            let t = resp.text().await.unwrap_or_default();
+            tracing::warn!("Doc point upsert failed: {t}");
+            false
+        }
+        Err(e) => {
+            tracing::warn!("Doc point upsert error: {e}");
+            false
+        }
+    }
+}
+
+/// Risolve l'URL del Neural Core (setting `neural_core_url`, poi env
+/// `NEURAL_CORE_URL`, infine default locale) e apre la connessione. Estratta da
+/// [`vectorize_document`]; comportamento invariato.
+async fn connect_neural_core(db: &PgPool) -> anyhow::Result<crate::orchestrator::NeuralCoreClient> {
+    let neural_url = crate::settings::get_setting(db, "neural_core_url")
+        .await?
+        .unwrap_or_else(|| {
+            std::env::var("NEURAL_CORE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
+        });
+    crate::orchestrator::NeuralCoreClient::connect(&neural_url).await
+}
+
+/// Fa embedding e upsert di tutte le sezioni gia' appiattite, ritornando i
+/// `point_id` upsertati con successo. Estratta dal corpo di
+/// [`vectorize_document`] senza alterarne il comportamento (le sezioni fallite
+/// sono saltate individualmente).
+async fn upsert_document_sections(
+    neural: &crate::orchestrator::NeuralCoreClient,
+    url: &str,
+    ctx: &DocSectionCtx<'_>,
+    flat: &[(String, String, String)],
+) -> Vec<String> {
+    let mut point_ids = Vec::new();
+    for section in flat {
+        if let Some(point_id) = embed_and_upsert_doc_section(neural, url, ctx, section).await {
+            point_ids.push(point_id);
+        }
+    }
+    point_ids
+}
+
+/// Persiste i `point_id` upsertati nella riga `project_documents`. No-op se la
+/// lista e' vuota; gli errori DB vengono ignorati come nel codice originale
+/// (`let _ = ...`). Estratta da [`vectorize_document`].
+async fn save_document_point_ids(db: &PgPool, document_id: Uuid, point_ids: &[String]) {
+    if point_ids.is_empty() {
+        return;
+    }
+    let _ = sqlx::query("UPDATE project_documents SET qdrant_point_ids = $1 WHERE id = $2")
+        .bind(point_ids)
+        .bind(document_id)
+        .execute(db)
+        .await;
+}
+
 /// Vectorize a document: chunk by sections, embed, upsert to Qdrant.
 pub async fn vectorize_document(
     db: &PgPool,
@@ -813,13 +936,7 @@ pub async fn vectorize_document(
     // ma serve come difesa per i tokio::spawn fire-and-forget che non hanno accesso allo stato.
     ensure_docs_collection(db).await?;
 
-    let neural_url = crate::settings::get_setting(db, "neural_core_url")
-        .await?
-        .unwrap_or_else(|| {
-            std::env::var("NEURAL_CORE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
-        });
-    let neural = crate::orchestrator::NeuralCoreClient::connect(&neural_url).await?;
+    let neural = connect_neural_core(db).await?;
 
     // Delete old points for this document
     delete_doc_points(db, project_id, document_id).await.ok();
@@ -833,69 +950,20 @@ pub async fn vectorize_document(
         }
     };
 
-    let mut point_ids = Vec::new();
     let (base_url, collection) = qdrant_docs_config(db).await?;
     let url = format!("{base_url}/collections/{collection}/points?wait=true");
 
+    let ctx = DocSectionCtx {
+        project_id,
+        document_id,
+        doc_type,
+        version,
+    };
     let flat = flatten_sections(sections);
-    for (number, title, content) in &flat {
-        let text_to_embed = format!("{number} {title}\n{content}");
-        let text_preview = if content.len() > 200 {
-            &content[..200]
-        } else {
-            content.as_str()
-        };
-
-        let vector = match neural.embed_text("", &text_to_embed).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Embed error for section {number}: {e}");
-                continue;
-            }
-        };
-
-        let point_id = format!(
-            "{:x}",
-            Sha256::digest(
-                format!("{}:doc:{}:{}:{}", project_id, document_id, number, version).as_bytes()
-            )
-        );
-
-        let payload = json!({
-            "project_id": project_id.to_string(),
-            "document_id": document_id.to_string(),
-            "doc_type": doc_type,
-            "section_path": number,
-            "section_title": title,
-            "version": version,
-            "text_preview": text_preview,
-            "active": true,
-        });
-
-        let body = json!({ "points": [{ "id": point_id, "vector": vector, "payload": payload }] });
-
-        match reqwest::Client::new().put(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                point_ids.push(point_id);
-            }
-            Ok(resp) => {
-                let t = resp.text().await.unwrap_or_default();
-                tracing::warn!("Doc point upsert failed: {t}");
-            }
-            Err(e) => {
-                tracing::warn!("Doc point upsert error: {e}");
-            }
-        }
-    }
+    let point_ids = upsert_document_sections(&neural, &url, &ctx, &flat).await;
 
     // Save point IDs to DB
-    if !point_ids.is_empty() {
-        let _ = sqlx::query("UPDATE project_documents SET qdrant_point_ids = $1 WHERE id = $2")
-            .bind(&point_ids)
-            .bind(document_id)
-            .execute(db)
-            .await;
-    }
+    save_document_point_ids(db, document_id, &point_ids).await;
 
     tracing::info!(
         "Vectorized document {document_id}: {} points",
@@ -934,6 +1002,23 @@ fn flatten_sections(sections: &[Value]) -> Vec<(String, String, String)> {
         }
     }
     result
+}
+
+/// Converte un hit della collection `project_docs` in [`VectorPointHit`].
+/// Estratta da [`search_doc_points`] preservandone la semantica: qui l'`id`
+/// e' sempre uno sha256 esadecimale (stringa), quindi si usa `as_str` con
+/// fallback a stringa vuota anziche' il match String/Number di
+/// [`parse_point_hits`]. Comportamento invariato.
+fn doc_hit_from_value(r: &Value) -> VectorPointHit {
+    VectorPointHit {
+        point_id: r
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        score: r.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+        payload: r.get("payload").cloned().unwrap_or(json!({})),
+    }
 }
 
 pub async fn search_doc_points(
@@ -977,18 +1062,7 @@ pub async fn search_doc_points(
         .cloned()
         .unwrap_or_default();
 
-    Ok(results
-        .iter()
-        .map(|r| VectorPointHit {
-            point_id: r
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            score: r.get("score").and_then(Value::as_f64).unwrap_or(0.0),
-            payload: r.get("payload").cloned().unwrap_or(json!({})),
-        })
-        .collect())
+    Ok(results.iter().map(doc_hit_from_value).collect())
 }
 
 pub async fn delete_doc_points(
@@ -998,6 +1072,9 @@ pub async fn delete_doc_points(
 ) -> anyhow::Result<()> {
     ensure_docs_collection(db).await?;
     let (base_url, collection) = qdrant_docs_config(db).await?;
+    // Falso positivo del detector SQL injection: "delete" e' un segmento del
+    // path REST Qdrant, non la keyword SQL. base_url/collection vengono dai
+    // settings, non da input utente. Nessuna query SQL costruita qui.
     let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
     let body = json!({
         "filter": {
@@ -1022,6 +1099,9 @@ pub async fn delete_doc_points_by_ids(db: &PgPool, point_ids: &[String]) -> anyh
     }
     ensure_docs_collection(db).await?;
     let (base_url, collection) = qdrant_docs_config(db).await?;
+    // Falso positivo del detector SQL injection: "delete" e' un segmento del
+    // path REST Qdrant, non la keyword SQL. base_url/collection vengono dai
+    // settings, non da input utente. Nessuna query SQL costruita qui.
     let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
     let body = json!({ "points": point_ids });
     let response = reqwest::Client::new().post(&url).json(&body).send().await?;
@@ -1156,32 +1236,7 @@ pub async fn search_conversation_context(
         return Err(anyhow!("conversation context search failed: {text}"));
     }
 
-    let payload: Value = response
-        .json()
-        .await
-        .context("invalid conversation context payload")?;
-    let result = payload
-        .get("result")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut hits = Vec::with_capacity(result.len());
-    for hit in result {
-        let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-        let point_id = match hit.get("id") {
-            Some(Value::String(v)) => v.clone(),
-            Some(Value::Number(v)) => v.to_string(),
-            _ => continue,
-        };
-        let pl = hit.get("payload").cloned().unwrap_or(json!({}));
-        hits.push(VectorPointHit {
-            point_id,
-            score,
-            payload: pl,
-        });
-    }
-    Ok(hits)
+    search_response_to_hits(response, "invalid conversation context payload").await
 }
 
 /// Genera un point_id deterministico per un turno conversazionale.
