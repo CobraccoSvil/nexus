@@ -1585,6 +1585,12 @@ impl Orchestrator {
             .as_deref()
             .and_then(|value| Uuid::parse_str(value).ok());
         let profile_uuid = Uuid::parse_str(&input.profile_id).ok();
+        // orchestrator_runs e' migrata: vive nel DB del progetto (separazione DB).
+        // A flag OFF / project_id non parsabile ricade sul meta-DB.
+        let orch_pool = match Uuid::parse_str(&input.project_id) {
+            Ok(pid) => crate::project_db_routes::project_data_pool_from(db, pid).await,
+            Err(_) => db.clone(),
+        };
         sqlx::query(
             r#"
             INSERT INTO orchestrator_runs (id, project_id, user_id, session_id, profile_id, status, audit_json)
@@ -1597,7 +1603,7 @@ impl Orchestrator {
         .bind(session_uuid)
         .bind(profile_uuid)
         .bind(&audit_json)
-        .execute(db)
+        .execute(&orch_pool)
         .await
         .ok(); // Non-fatal: log but don't fail the request
 
@@ -1710,6 +1716,11 @@ impl Orchestrator {
         }
 
         if !correction_ids.is_empty() {
+            // prompt_corrections e' migrata: la tabella vive nel DB del progetto
+            // (separazione DB). settings/project_learning_config sopra restano su
+            // meta (globale/non migrata); la ricerca Qdrant e' multi-tenant per
+            // payload. A flag OFF il pool ritorna il meta-DB.
+            let cpool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
             let _ = sqlx::query(
                 r#"
                 UPDATE prompt_corrections
@@ -1720,7 +1731,7 @@ impl Orchestrator {
                 "#,
             )
             .bind(&correction_ids)
-            .execute(db)
+            .execute(&cpool)
             .await;
         }
 

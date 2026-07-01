@@ -421,7 +421,11 @@ pub async fn get_session_worklog(
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
     let context = crate::chat_sessions::load_session_context(&state, session_id, user_id).await?;
-    let block = crate::session_worklog::fetch_rendered_block(&state.db, context.session_id)
+    // Worklog nel DB del progetto (separazione DB): pool risolto dalla sessione.
+    let wpool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, context.session_id)
+            .await;
+    let block = crate::session_worklog::fetch_rendered_block(&wpool, context.session_id)
         .await
         .unwrap_or_default();
     Ok(Json(json!({ "renderedBlock": block })))

@@ -1605,6 +1605,13 @@ pub async fn feedback_error(
     // Preview della risposta AI sbagliata (per audit/debug, max 500 chars)
     let ai_response_preview: String = ai_response_content.chars().take(500).collect();
 
+    // NB separazione DB (gap noto): questo endpoint e' keyed solo da message_id.
+    // ai_response_feedback/prompt_corrections/chat_messages sono migrate, ma senza
+    // session_id/project_id a monte NON e' risolvibile il pool del progetto prima
+    // di leggere il messaggio (che a sua volta vive nel DB del progetto). Fix
+    // deliberato rimandato (passare session_id dal frontend, NON una directory
+    // per-messaggio): finche' e' cosi', l'intera funzione resta sul meta-DB
+    // (coerente a flag OFF). Vedi docs/db-separation-cutover-status.md.
     let feedback_id = Uuid::new_v4();
     sqlx::query(
         r#"
