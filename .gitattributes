@@ -1,0 +1,10 @@
+# Fine-riga deterministici per i file checksummati byte-per-byte.
+#
+# Il migrator sqlx (mcp-core/src/db.rs, provisioning DB progetto) valida ogni
+# migrazione applicata confrontando lo SHA-384 dei byte del file con quello
+# registrato in _sqlx_migrations. Con core.autocrlf=true un checkout su Windows
+# puo' materializzare CRLF su un file il cui blob e' LF: stesso contenuto,
+# checksum diverso -> mcp-core rifiuta di avviarsi con "migration N was
+# previously applied but has been modified" (incidente 2026-07-02, mig 0500).
+# eol=lf rende i byte identici su ogni piattaforma e checkout.
+*.sql text eol=lf
