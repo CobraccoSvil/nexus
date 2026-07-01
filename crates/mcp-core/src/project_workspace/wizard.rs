@@ -2900,8 +2900,10 @@ pub(crate) fn collect_compose_files(root: &std::path::Path) -> Vec<std::path::Pa
     out
 }
 
-pub(super) fn detect_playwright_suggestions(root: &std::path::Path) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
+/// Helper di `detect_playwright_suggestions`: elenca le directory con una config
+/// Playwright. Preferisce la root (se ha una config); altrimenti scansiona le
+/// subdirectory di primo livello. Ordine preservato.
+fn raccogli_playwright_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut pw_dirs: Vec<std::path::PathBuf> = Vec::new();
     for c in &[
         "playwright.config.ts",
@@ -2928,109 +2930,150 @@ pub(super) fn detect_playwright_suggestions(root: &std::path::Path) -> Vec<Value
             }
         }
     }
-    for pw_dir in &pw_dirs {
-        let is_root = pw_dir == root;
-        let cwd_val: Value = if is_root {
-            Value::Null
+    pw_dirs
+}
+
+/// Helper di `emit_playwright_dir_suggestions`: deriva il contesto della `pw_dir`
+/// = `(cwd_val, pkg_manager, prefix, group)`. Logica invariata.
+fn playwright_dir_context(
+    root: &std::path::Path,
+    pw_dir: &std::path::Path,
+) -> (Value, &'static str, String, String) {
+    let is_root = pw_dir == root;
+    let cwd_val: Value = if is_root {
+        Value::Null
+    } else {
+        json!(pw_dir.to_string_lossy())
+    };
+    let pkg_manager =
+        if pw_dir.join("pnpm-lock.yaml").exists() || root.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if pw_dir.join("yarn.lock").exists() || root.join("yarn.lock").exists() {
+            "yarn"
         } else {
-            json!(pw_dir.to_string_lossy())
+            "npm"
         };
-        let pkg_manager =
-            if pw_dir.join("pnpm-lock.yaml").exists() || root.join("pnpm-lock.yaml").exists() {
-                "pnpm"
-            } else if pw_dir.join("yarn.lock").exists() || root.join("yarn.lock").exists() {
-                "yarn"
-            } else {
-                "npm"
-            };
-        let dir_label = if is_root {
-            "root".to_string()
-        } else {
-            pw_dir
-                .strip_prefix(root)
-                .ok()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|| {
-                    pw_dir
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string()
-                })
-        };
-        let prefix = if is_root {
-            String::new()
-        } else {
-            format!("[{}] ", dir_label)
-        };
-        let group = format!("playwright/{}", dir_label);
-        push_sugg(
-            &mut out,
-            format!("{}playwright test", prefix),
-            "playwright",
-            pkg_manager,
-            vec![json!("exec"), json!("playwright"), json!("test")],
-            cwd_val.clone(),
-            json!({}),
-            "test",
-            false,
-            group.clone(),
-        );
-        let variante = "test --update-snapshots";
-        let label = format!("{}playwright {}", prefix, variante);
-        push_sugg(
-            &mut out,
-            label,
-            "playwright",
-            pkg_manager,
-            vec![
-                json!("exec"),
-                json!("playwright"),
-                json!("test"),
-                json!("--update-snapshots"),
-            ],
-            cwd_val.clone(),
-            json!({}),
-            "test",
-            false,
-            group.clone(),
-        );
-        for sub in &["tests", "e2e", "test"] {
-            let tests_root = pw_dir.join(sub);
-            if !tests_root.exists() {
-                continue;
-            }
-            for spec in walkdir_specs(&tests_root).iter().take(10) {
-                let rel = spec
-                    .strip_prefix(if is_root { root } else { pw_dir })
-                    .unwrap_or(spec)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let name = spec
-                    .file_stem()
+    let dir_label = if is_root {
+        "root".to_string()
+    } else {
+        pw_dir
+            .strip_prefix(root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| {
+                pw_dir
+                    .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
-                    .trim_end_matches(".spec")
-                    .to_string();
-                push_sugg(
-                    &mut out,
-                    format!("{}playwright · {}", prefix, name),
-                    "playwright",
-                    pkg_manager,
-                    vec![
-                        json!("exec"),
-                        json!("playwright"),
-                        json!("test"),
-                        json!(rel),
-                    ],
-                    cwd_val.clone(),
-                    json!({}),
-                    "test",
-                    false,
-                    group.clone(),
-                );
-            }
+                    .to_string()
+            })
+    };
+    let prefix = if is_root {
+        String::new()
+    } else {
+        format!("[{}] ", dir_label)
+    };
+    let group = format!("playwright/{}", dir_label);
+    (cwd_val, pkg_manager, prefix, group)
+}
+
+/// Helper di `emit_playwright_dir_suggestions`: emette un suggerimento per ogni
+/// spec trovato sotto `tests`/`e2e`/`test` (max 10 per subdir). Ordine invariato.
+fn emit_playwright_specs(
+    root: &std::path::Path,
+    pw_dir: &std::path::Path,
+    cwd_val: &Value,
+    pkg_manager: &str,
+    prefix: &str,
+    group: &str,
+    out: &mut Vec<Value>,
+) {
+    let is_root = pw_dir == root;
+    for sub in &["tests", "e2e", "test"] {
+        let tests_root = pw_dir.join(sub);
+        if !tests_root.exists() {
+            continue;
         }
+        for spec in walkdir_specs(&tests_root).iter().take(10) {
+            let rel = spec
+                .strip_prefix(if is_root { root } else { pw_dir })
+                .unwrap_or(spec)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let name = spec
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .trim_end_matches(".spec")
+                .to_string();
+            push_sugg(
+                out,
+                format!("{}playwright · {}", prefix, name),
+                "playwright",
+                pkg_manager,
+                vec![
+                    json!("exec"),
+                    json!("playwright"),
+                    json!("test"),
+                    json!(rel),
+                ],
+                cwd_val.clone(),
+                json!({}),
+                "test",
+                false,
+                group.to_string(),
+            );
+        }
+    }
+}
+
+/// Helper di `detect_playwright_suggestions`: emette i suggerimenti (test, update
+/// snapshots, spec individuali) per una singola `pw_dir`. Ordine e output invariati.
+fn emit_playwright_dir_suggestions(
+    root: &std::path::Path,
+    pw_dir: &std::path::Path,
+    out: &mut Vec<Value>,
+) {
+    let (cwd_val, pkg_manager, prefix, group) = playwright_dir_context(root, pw_dir);
+    push_sugg(
+        out,
+        format!("{}playwright test", prefix),
+        "playwright",
+        pkg_manager,
+        vec![json!("exec"), json!("playwright"), json!("test")],
+        cwd_val.clone(),
+        json!({}),
+        "test",
+        false,
+        group.clone(),
+    );
+    let variante = "test --update-snapshots";
+    let label = format!("{}playwright {}", prefix, variante);
+    push_sugg(
+        out,
+        label,
+        "playwright",
+        pkg_manager,
+        vec![
+            json!("exec"),
+            json!("playwright"),
+            json!("test"),
+            json!("--update-snapshots"),
+        ],
+        cwd_val.clone(),
+        json!({}),
+        "test",
+        false,
+        group.clone(),
+    );
+    emit_playwright_specs(root, pw_dir, &cwd_val, pkg_manager, &prefix, &group, out);
+}
+
+pub(super) fn detect_playwright_suggestions(root: &std::path::Path) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let pw_dirs = raccogli_playwright_dirs(root);
+    for pw_dir in &pw_dirs {
+        emit_playwright_dir_suggestions(root, pw_dir, &mut out);
     }
     out
 }
