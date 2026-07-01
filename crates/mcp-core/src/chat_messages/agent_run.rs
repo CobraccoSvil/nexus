@@ -576,6 +576,30 @@ pub(crate) fn append_outcome_summary(
     }
 }
 
+/// Assembla il prompt della narrativa dai fatti deterministici e dal template.
+/// PURA (nessun DB, nessun LLM): estratta da `narrative_or` (regola L) cosi' che
+/// l'orchestrazione async resti snella e la costruzione del prompt sia testabile
+/// in isolamento. Comportamento 1:1: max 20 righe-azione + max 10 errori (excerpt
+/// a 120 char), poi replace dei placeholder `{{recap}}`/`{{actions}}`.
+fn build_recap_prompt(
+    base: &str,
+    facts: &crate::session_worklog::StepFacts,
+    template: &str,
+) -> String {
+    let mut actions = String::new();
+    for line in facts.action_lines.iter().take(20) {
+        actions.push_str(line);
+        actions.push('\n');
+    }
+    for e in facts.errors.iter().take(10) {
+        let excerpt = e.excerpt.chars().take(120).collect::<String>();
+        actions.push_str(&format!("- errore [{}] {}: {excerpt}\n", e.tool, e.detail));
+    }
+    template
+        .replace("{{recap}}", base)
+        .replace("{{actions}}", actions.trim())
+}
+
 /// Recap NARRATIVO opzionale (mig 0415, Fase D del flusso chat leggibile). Se il
 /// gate `agent.chat.narrative_recap_enabled` e' attivo e il run e' hollow con
 /// azioni concrete, chiede a un LLM leggero (purpose `turn_recap`) di
@@ -608,19 +632,6 @@ pub(crate) async fn narrative_or(
 
     // Riassunto dei fatti deterministici per il prompt (azioni + errori).
     let facts = crate::session_worklog::collect_step_facts(&result.steps, 200);
-    let mut actions = String::new();
-    for line in facts.action_lines.iter().take(20) {
-        actions.push_str(line);
-        actions.push('\n');
-    }
-    for e in facts.errors.iter().take(10) {
-        actions.push_str(&format!(
-            "- errore [{}] {}: {}\n",
-            e.tool,
-            e.detail,
-            e.excerpt.chars().take(120).collect::<String>()
-        ));
-    }
 
     let template = nexus_types::get_template_or_default(
         &state.db,
@@ -631,16 +642,28 @@ pub(crate) async fn narrative_or(
     if template.trim().is_empty() {
         return base;
     }
-    let prompt = template
-        .replace("{{recap}}", &base_text)
-        .replace("{{actions}}", actions.trim());
+    let prompt = build_recap_prompt(&base_text, &facts, &template);
+    run_narrative_llm(state, &provider, &model, &prompt, base).await
+}
+
+/// Chiama l'LLM leggero (`turn_recap`) col prompt gia' assemblato e ne estrae la
+/// narrativa. Estratta da `narrative_or` (regola L): isola l'unica I/O verso il
+/// gateway e la sua politica di fallback. Su risposta troppo corta (<20 char) o
+/// errore ricade su `base` (regola H). Niente payload nei log (regola F).
+async fn run_narrative_llm(
+    state: &AppState,
+    provider: &str,
+    model: &str,
+    prompt: &str,
+    base: Option<String>,
+) -> Option<String> {
     let messages_json =
         serde_json::to_string(&json!([{ "role": "user", "content": prompt }])).unwrap_or_default();
 
     match state
         .orchestrator
         .neural
-        .generate_agent_turn(&provider, &model, &messages_json, "[]", 600, "")
+        .generate_agent_turn(provider, model, &messages_json, "[]", 600, "")
         .await
     {
         Ok(v) => {
@@ -4024,47 +4047,7 @@ pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
     .await;
 
     let engine = match rows {
-        Ok(rows) if !rows.is_empty() => {
-            // Preferisci la riga con scope_key == quello richiesto; altrimenti la
-            // riga jolly '*'. (Se scope_key == '*', la prima clausola coincide.)
-            let pick = rows
-                .iter()
-                .find(|r| r.get::<String, _>("scope_key") == scope_key)
-                .or_else(|| {
-                    rows.iter()
-                        .find(|r| r.get::<String, _>("scope_key") == ENGINE_GLOBAL_SCOPE)
-                });
-            match pick {
-                Some(r) => {
-                    let raw: String = r.get("engine");
-                    match Engine::from_db(&raw) {
-                        Some(e) => e,
-                        None => {
-                            tracing::warn!(
-                                engine_raw = %raw,
-                                scope_key = %scope_key,
-                                "select_engine: valore engine non riconosciuto in nexus_orchestrator_engine, uso il motore stabile (python)"
-                            );
-                            Engine::Python
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        scope_key = %scope_key,
-                        "select_engine: nessuna riga specifica ne' jolly '*' in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
-                    );
-                    Engine::Python
-                }
-            }
-        }
-        Ok(_) => {
-            tracing::warn!(
-                scope_key = %scope_key,
-                "select_engine: nessuna riga (ne' '{scope_key}' ne' jolly '*') in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
-            );
-            Engine::Python
-        }
+        Ok(rows) => resolve_engine_from_rows(&rows, scope_key),
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -4077,6 +4060,55 @@ pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
 
     cache.insert(scope_key.to_string(), engine);
     engine
+}
+
+/// Logica PURA di risoluzione del motore dalle righe gia' lette (nessun DB,
+/// nessuna cache): pick specifico -> pick jolly '*' -> parse -> fallback
+/// difensivo `Engine::Python`. Estratta da `select_engine` (regola L: la
+/// precedenza scope-specifico/jolly vive in un solo punto, testabile senza DB).
+/// Comportamento 1:1 con la versione inline precedente (stessi warn di
+/// diagnostica su riga assente / valore engine non riconosciuto).
+fn resolve_engine_from_rows(rows: &[sqlx::postgres::PgRow], scope_key: &str) -> Engine {
+    if rows.is_empty() {
+        tracing::warn!(
+            scope_key = %scope_key,
+            "select_engine: nessuna riga (ne' '{scope_key}' ne' jolly '*') in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
+        );
+        return Engine::Python;
+    }
+
+    // Preferisci la riga con scope_key == quello richiesto; altrimenti la
+    // riga jolly '*'. (Se scope_key == '*', la prima clausola coincide.)
+    let pick = rows
+        .iter()
+        .find(|r| r.get::<String, _>("scope_key") == scope_key)
+        .or_else(|| {
+            rows.iter()
+                .find(|r| r.get::<String, _>("scope_key") == ENGINE_GLOBAL_SCOPE)
+        });
+    match pick {
+        Some(r) => {
+            let raw: String = r.get("engine");
+            match Engine::from_db(&raw) {
+                Some(e) => e,
+                None => {
+                    tracing::warn!(
+                        engine_raw = %raw,
+                        scope_key = %scope_key,
+                        "select_engine: valore engine non riconosciuto in nexus_orchestrator_engine, uso il motore stabile (python)"
+                    );
+                    Engine::Python
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                scope_key = %scope_key,
+                "select_engine: nessuna riga specifica ne' jolly '*' in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
+            );
+            Engine::Python
+        }
+    }
 }
 
 /// Avvio di un run sul motore nativo Rust (`nexus-agent-graph`).
