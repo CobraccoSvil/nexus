@@ -278,6 +278,8 @@ async fn maybe_rollback_learning_regression(
         return Ok(None);
     }
 
+    // separazione DB: ai_response_feedback vive nel pool del progetto (flag ON)
+    let feedback_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let current_errors = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
@@ -290,7 +292,7 @@ async fn maybe_rollback_learning_regression(
     .bind(project_id)
     .bind(&intent)
     .bind(applied_at)
-    .fetch_one(db)
+    .fetch_one(&feedback_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -350,6 +352,9 @@ pub(crate) async fn apply_project_learning(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "chat".to_string());
 
+    // separazione DB: ai_response_feedback vive nel pool del progetto (flag ON);
+    // pool riusato per le query feedback successive nello stesso scope
+    let feedback_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let feedback_count = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
@@ -362,7 +367,7 @@ pub(crate) async fn apply_project_learning(
     .bind(project_id)
     .bind(&intent)
     .bind(config.feedback_window_days)
-    .fetch_one(db)
+    .fetch_one(&feedback_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -395,6 +400,7 @@ pub(crate) async fn apply_project_learning(
         }));
     }
 
+    // separazione DB: ai_response_feedback nel pool del progetto (riuso feedback_pool)
     let provider_row = sqlx::query(
         r#"
         SELECT provider, COUNT(*) AS total
@@ -411,7 +417,7 @@ pub(crate) async fn apply_project_learning(
     .bind(project_id)
     .bind(&intent)
     .bind(config.feedback_window_days)
-    .fetch_optional(db)
+    .fetch_optional(&feedback_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -732,6 +738,9 @@ pub(crate) async fn dedup_on_write(
     normalized_hint_hash: &str,
     keep_id: Uuid,
 ) -> Result<i64, ApiError> {
+    // separazione DB: prompt_corrections vive nel pool del progetto (flag ON);
+    // pool riusato per la UPDATE di dedup nello stesso scope
+    let corrections_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let rows = sqlx::query(
         r#"
         SELECT id, qdrant_point_id
@@ -747,7 +756,7 @@ pub(crate) async fn dedup_on_write(
     .bind(project_id)
     .bind(intent)
     .bind(normalized_hint_hash)
-    .fetch_all(db)
+    .fetch_all(&corrections_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -771,6 +780,7 @@ pub(crate) async fn dedup_on_write(
         return Ok(0);
     }
 
+    // separazione DB: prompt_corrections nel pool del progetto (riuso corrections_pool)
     sqlx::query(
         r#"
         UPDATE prompt_corrections
@@ -784,7 +794,7 @@ pub(crate) async fn dedup_on_write(
     )
     .bind(&ids_to_prune)
     .bind(keep_id)
-    .execute(db)
+    .execute(&corrections_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -938,6 +948,10 @@ pub async fn admin_review_feedback(
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if status == "resolved" || status == "rejected" {
+        // separazione DB: prompt_corrections vive nel pool del progetto (flag ON);
+        // project_id risolto dal RETURNING della UPDATE precedente, pool riusato
+        let corrections_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
         let _ = sqlx::query(
             r#"
             UPDATE prompt_corrections
@@ -950,7 +964,7 @@ pub async fn admin_review_feedback(
         )
         .bind(feedback_id)
         .bind(&status)
-        .execute(&state.db)
+        .execute(&corrections_pool)
         .await;
 
         if status == "rejected" {
@@ -962,7 +976,7 @@ pub async fn admin_review_feedback(
                 "#,
             )
             .bind(feedback_id)
-            .fetch_all(&state.db)
+            .fetch_all(&corrections_pool)
             .await
             .unwrap_or_default();
             let _ = vector_memory::delete_prompt_correction_points(&state.db, &points).await;
@@ -1318,6 +1332,9 @@ pub async fn admin_create_prompt_correction(
         })?;
 
     // Persiste in PostgreSQL.
+    // separazione DB: prompt_corrections vive nel pool del progetto (flag ON)
+    let corrections_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let correction_id: Uuid = sqlx::query_scalar(
         r#"
         INSERT INTO prompt_corrections
@@ -1334,7 +1351,7 @@ pub async fn admin_create_prompt_correction(
     .bind(&text)
     .bind(&hash)
     .bind(&point_id)
-    .fetch_one(&state.db)
+    .fetch_one(&corrections_pool)
     .await
     .map_err(|e| {
         (
