@@ -82,6 +82,234 @@ pub struct NexusBridge {
     periodic_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// Tabella dati statica delle descrizioni canoniche dei 33 agent types
+/// "concreti" (esclusi Custom/catchall). Il router Q-Learning le usa come input
+/// per l'embedding di similarità tra task e capability, così che un task
+/// arbitrario possa essere classificato correttamente anche quando il mapping
+/// provider/model (agent_type_to_model) è parziale. E' una tabella dati (non
+/// una funzione): il contenuto e' invariato rispetto alla versione inline
+/// precedente in `new_internal`.
+static AGENT_REGISTRATIONS: &[(AgentType, &str)] = &[
+    // ── Core (4) ──────────────────────────────────────────────────────────
+    (
+        AgentType::Coder,
+        "Writes, modifies and refactors code in Rust, TypeScript, Python, and other languages. Handles feature implementation and bug fixes.",
+    ),
+    (
+        AgentType::Tester,
+        "Writes unit tests, integration tests and end-to-end tests. Generates test cases with coverage analysis.",
+    ),
+    (
+        AgentType::Reviewer,
+        "Reviews code for bugs, style issues, and security vulnerabilities. Performs code review on pull requests.",
+    ),
+    (
+        AgentType::Architect,
+        "Designs system architecture, database schemas, and API interfaces. Makes high-level structural decisions.",
+    ),
+    // ── Specializations (12) ────────────────────────────────────────────────
+    (
+        AgentType::SecurityArchitect,
+        "Designs secure systems, threat models, authentication flows, encryption schemes, and access control policies. Evaluates attack surfaces and hardens applications.",
+    ),
+    (
+        AgentType::PerformanceEngineer,
+        "Optimizes application performance, profiles CPU and memory hotspots, reduces latency and improves throughput. Benchmarks and tunes systems.",
+    ),
+    (
+        AgentType::DatabaseDesigner,
+        "Designs relational and NoSQL database schemas, indexing strategies, query optimization, and data migration plans.",
+    ),
+    (
+        AgentType::FrontendSpecialist,
+        "Builds user interfaces with React, Vue, Next.js and modern CSS. Handles component architecture, state management, and accessibility.",
+    ),
+    (
+        AgentType::BackendSpecialist,
+        "Develops server-side APIs, microservices, message queues and background workers. Focuses on scalability and reliability.",
+    ),
+    (
+        AgentType::DevOpsEngineer,
+        "Automates CI/CD pipelines, manages container orchestration, infrastructure as code, and observability stacks like Prometheus and Grafana.",
+    ),
+    (
+        AgentType::CloudArchitect,
+        "Designs cloud-native architectures on AWS, GCP, or Azure. Handles IAM, networking, serverless, and multi-region deployments.",
+    ),
+    (
+        AgentType::MobileSpecialist,
+        "Builds native and cross-platform mobile apps for iOS and Android using Swift, Kotlin, React Native, or Flutter.",
+    ),
+    (
+        AgentType::DataScientist,
+        "Analyzes datasets, builds statistical models, performs exploratory data analysis, and derives business insights from data.",
+    ),
+    (
+        AgentType::MLEngineer,
+        "Trains and deploys machine learning models, handles feature engineering, model serving, and MLOps pipelines.",
+    ),
+    (
+        AgentType::QASpecialist,
+        "Designs test strategies, writes automated regression suites, performs manual exploratory testing, and tracks defects.",
+    ),
+    (
+        AgentType::TechLead,
+        "Coordinates engineering teams, makes technical direction decisions, mentors developers, and reviews architectural choices across features.",
+    ),
+    // ── GitHub Integration (13) ─────────────────────────────────────────────
+    (
+        AgentType::GitHubPRManager,
+        "Creates, updates, and manages GitHub pull requests including titles, descriptions, reviewers, labels, and merge strategies.",
+    ),
+    (
+        AgentType::GitHubCodeReviewer,
+        "Reviews GitHub pull request diffs, leaves inline comments, suggests improvements, and approves or requests changes.",
+    ),
+    (
+        AgentType::GitHubIssueAnalyzer,
+        "Triages GitHub issues, classifies bug vs feature, extracts reproduction steps, and links related issues and PRs.",
+    ),
+    (
+        AgentType::GitHubReleaseManager,
+        "Manages GitHub releases including changelogs, semantic versioning, release notes, and tag propagation.",
+    ),
+    (
+        AgentType::GitHubWorkflowManager,
+        "Maintains GitHub Actions workflows, debugs failing jobs, optimizes cache and matrix strategies, and manages secrets.",
+    ),
+    (
+        AgentType::GitHubSecurityAnalyzer,
+        "Reviews GitHub security alerts, Dependabot advisories, code scanning results, and secret scanning findings.",
+    ),
+    (
+        AgentType::GitHubDependencyManager,
+        "Updates project dependencies via Dependabot or Renovate, resolves version conflicts, and validates compatibility.",
+    ),
+    (
+        AgentType::GitHubProjectManager,
+        "Manages GitHub Projects boards, sprint planning, issue prioritization, milestone tracking, and team assignments.",
+    ),
+    (
+        AgentType::GitHubWikiManager,
+        "Maintains GitHub wiki pages, documentation sites, and knowledge bases associated with repositories.",
+    ),
+    (
+        AgentType::GitHubDiscussionModerator,
+        "Moderates GitHub discussions, answers community questions, organizes discussion categories, and surfaces actionable feedback.",
+    ),
+    (
+        AgentType::GitHubActionsOptimizer,
+        "Profiles and speeds up GitHub Actions, reduces runner minutes, parallelizes jobs, and optimizes build caches.",
+    ),
+    (
+        AgentType::GitHubStatusMonitor,
+        "Monitors GitHub repository status checks, commit statuses, deployment statuses, and webhook health.",
+    ),
+    (
+        AgentType::GitHubIntegrationBot,
+        "Automates GitHub integrations with external systems like Slack, Jira, PagerDuty, or Discord via bots and apps.",
+    ),
+    // ── Other Specialized (4) ───────────────────────────────────────────────
+    (
+        AgentType::Researcher,
+        "Conducts technical research, compares libraries and approaches, reads academic papers, and writes evidence-based recommendations.",
+    ),
+    (
+        AgentType::Analyst,
+        "Performs business and technical analysis, builds reports, identifies trends, and translates metrics into actionable insights.",
+    ),
+    (
+        AgentType::Optimizer,
+        "Optimizes algorithms, queries, build times, and resource usage. Focuses on measurable improvements and benchmarks.",
+    ),
+    (
+        AgentType::Documenter,
+        "Writes technical documentation, API references, user guides, tutorials, and internal runbooks for engineering teams.",
+    ),
+];
+
+/// Costruisce un `SwarmExecutionResult` sintetico con un solo task, usato dai
+/// reactive learning workers quando si registra l'esito di un singolo run.
+/// Estratta da `fire_reactive_workers` per contenerne la lunghezza (long-fn);
+/// il contenuto e' invariato.
+fn single_task_swarm(
+    task_id: &str,
+    agent_type: AgentType,
+    success: bool,
+    quality_score: f32,
+    execution_time_ms: u64,
+    error: Option<String>,
+) -> Arc<SwarmExecutionResult> {
+    let task_result = TaskResult {
+        task_id: task_id.to_string(),
+        agent_type: agent_type.clone(),
+        success,
+        output: String::new(), // non disponibile qui
+        error,
+        execution_time_ms,
+        tokens_used: 0,
+    };
+    let routing = RoutingDecision {
+        agent_type,
+        q_value: quality_score,
+        confidence: quality_score,
+        candidates: Vec::new(),
+        decision_time_us: 0,
+        strategy: SelectionStrategy::Exploitation,
+    };
+    let task_outcome = SwarmTaskOutcome {
+        task_id: task_id.to_string(),
+        routing,
+        result: if success {
+            Ok(task_result)
+        } else {
+            Err(format!("task {} failed", task_id))
+        },
+    };
+    Arc::new(SwarmExecutionResult {
+        swarm_id: format!("outcome-{}", task_id),
+        task_results: vec![task_outcome],
+        success_count: if success { 1 } else { 0 },
+        failure_count: if success { 0 } else { 1 },
+        total_time_ms: execution_time_ms,
+    })
+}
+
+/// Persiste ogni entry di un `ReplicationBatch` su `nexus_replication_log`
+/// (upsert per `(namespace_id, key)`) e ritorna il numero di entry scritte con
+/// successo. Estratta da `flush_replication_pending` per contenerne la lunghezza
+/// (long-fn); comportamento invariato (best-effort per singola entry).
+async fn replicate_batch(pool: &Arc<PgPool>, batch: &ReplicationBatch) -> usize {
+    let mut ok = 0usize;
+    for e in &batch.entries {
+        let res = sqlx::query(
+            r#"
+            INSERT INTO nexus_replication_log
+                (namespace_id, key, value, author, replicated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (namespace_id, key) DO UPDATE
+            SET value = EXCLUDED.value, replicated_at = NOW()
+            "#,
+        )
+        .bind(&batch.namespace_id)
+        .bind(&e.key)
+        .bind(&e.value)
+        .bind(&e.author)
+        .execute(pool.as_ref())
+        .await;
+
+        if res.is_ok() {
+            ok += 1;
+        } else if let Err(err) = res {
+            debug!(
+                "flush_replication_pending: entry '{}' fallita: {err}",
+                e.key
+            );
+        }
+    }
+    ok
+}
+
 impl NexusBridge {
     /// Costruisce un nuovo bridge con configurazione di default.
     /// Registra i 4 core agent types nel router con descrizioni canoniche.
@@ -96,236 +324,102 @@ impl NexusBridge {
         Self::new_internal(Some(pool))
     }
 
-    fn new_internal(pool: Option<Arc<PgPool>>) -> Arc<Self> {
-        // ── Embedder: ONNX MiniLM-384d con fallback a HashEmbedder ──────
-        // Prova a caricare il modello ONNX. Se non trovato (o errore),
-        // cade back su HashEmbedder(256) in modo completamente silenzioso
-        // (solo un WARN nel log). Questo permette di sviluppare senza il
-        // file modello e di attivarlo solo in produzione.
-        let (embedder, embedder_degraded): (Arc<dyn Embedder>, bool) =
-            match OnnxMiniLmEmbedder::try_from_env() {
-                Ok(onnx) => {
-                    info!(
-                        "OnnxMiniLmEmbedder loaded: dim={}, model={}",
-                        nexus_orchestrator::MINILM_DIM,
-                        std::env::var("NEXUS_MINILM_MODEL")
-                            .unwrap_or_else(|_| nexus_orchestrator::DEFAULT_MODEL_PATH.to_string()),
-                    );
-                    (Arc::new(onnx) as Arc<dyn Embedder>, false)
-                }
-                Err(e) => {
-                    // WARN una-tantum all'avvio (non spam): stato osservabile
-                    // anche via /api/embedder-status (embedder_degraded=true).
-                    warn!(
-                        "Embedder semantico degradato: ONNX non disponibile ({e}), \
-                         uso HashEmbedder (ricerche semantiche di qualita' ridotta). \
-                         Verifica feature 'onnx' e models/minilm/."
-                    );
-                    (Arc::new(HashEmbedder::new(256)) as Arc<dyn Embedder>, true)
-                }
-            };
-
-        let config = QLearningConfig::default();
-        let router_base = QLearningRouter::new(config, embedder.clone());
-        let router = Arc::new(match pool {
-            Some(ref p) => router_base.with_pool(p.clone()),
-            None => router_base,
-        });
-
-        // Registra tutti i 33 agent types "concreti" (esclusi Custom/catchall).
-        // Le descrizioni sono canoniche e usate dal router Q-Learning come
-        // input per l'embedding di similarità tra task e capability.
-        //
-        // Scopo: dare al router una signal matrix ampia il più possibile, così
-        // che un task arbitrario possa essere classificato correttamente anche
-        // quando il mapping provider/model (agent_type_to_model) è parziale.
-        let registrations: Vec<(AgentType, &str)> = vec![
-            // ── Core (4) ──────────────────────────────────────────────────
-            (
-                AgentType::Coder,
-                "Writes, modifies and refactors code in Rust, TypeScript, Python, and other languages. Handles feature implementation and bug fixes.",
-            ),
-            (
-                AgentType::Tester,
-                "Writes unit tests, integration tests and end-to-end tests. Generates test cases with coverage analysis.",
-            ),
-            (
-                AgentType::Reviewer,
-                "Reviews code for bugs, style issues, and security vulnerabilities. Performs code review on pull requests.",
-            ),
-            (
-                AgentType::Architect,
-                "Designs system architecture, database schemas, and API interfaces. Makes high-level structural decisions.",
-            ),
-            // ── Specializations (12) ──────────────────────────────────────
-            (
-                AgentType::SecurityArchitect,
-                "Designs secure systems, threat models, authentication flows, encryption schemes, and access control policies. Evaluates attack surfaces and hardens applications.",
-            ),
-            (
-                AgentType::PerformanceEngineer,
-                "Optimizes application performance, profiles CPU and memory hotspots, reduces latency and improves throughput. Benchmarks and tunes systems.",
-            ),
-            (
-                AgentType::DatabaseDesigner,
-                "Designs relational and NoSQL database schemas, indexing strategies, query optimization, and data migration plans.",
-            ),
-            (
-                AgentType::FrontendSpecialist,
-                "Builds user interfaces with React, Vue, Next.js and modern CSS. Handles component architecture, state management, and accessibility.",
-            ),
-            (
-                AgentType::BackendSpecialist,
-                "Develops server-side APIs, microservices, message queues and background workers. Focuses on scalability and reliability.",
-            ),
-            (
-                AgentType::DevOpsEngineer,
-                "Automates CI/CD pipelines, manages container orchestration, infrastructure as code, and observability stacks like Prometheus and Grafana.",
-            ),
-            (
-                AgentType::CloudArchitect,
-                "Designs cloud-native architectures on AWS, GCP, or Azure. Handles IAM, networking, serverless, and multi-region deployments.",
-            ),
-            (
-                AgentType::MobileSpecialist,
-                "Builds native and cross-platform mobile apps for iOS and Android using Swift, Kotlin, React Native, or Flutter.",
-            ),
-            (
-                AgentType::DataScientist,
-                "Analyzes datasets, builds statistical models, performs exploratory data analysis, and derives business insights from data.",
-            ),
-            (
-                AgentType::MLEngineer,
-                "Trains and deploys machine learning models, handles feature engineering, model serving, and MLOps pipelines.",
-            ),
-            (
-                AgentType::QASpecialist,
-                "Designs test strategies, writes automated regression suites, performs manual exploratory testing, and tracks defects.",
-            ),
-            (
-                AgentType::TechLead,
-                "Coordinates engineering teams, makes technical direction decisions, mentors developers, and reviews architectural choices across features.",
-            ),
-            // ── GitHub Integration (13) ───────────────────────────────────
-            (
-                AgentType::GitHubPRManager,
-                "Creates, updates, and manages GitHub pull requests including titles, descriptions, reviewers, labels, and merge strategies.",
-            ),
-            (
-                AgentType::GitHubCodeReviewer,
-                "Reviews GitHub pull request diffs, leaves inline comments, suggests improvements, and approves or requests changes.",
-            ),
-            (
-                AgentType::GitHubIssueAnalyzer,
-                "Triages GitHub issues, classifies bug vs feature, extracts reproduction steps, and links related issues and PRs.",
-            ),
-            (
-                AgentType::GitHubReleaseManager,
-                "Manages GitHub releases including changelogs, semantic versioning, release notes, and tag propagation.",
-            ),
-            (
-                AgentType::GitHubWorkflowManager,
-                "Maintains GitHub Actions workflows, debugs failing jobs, optimizes cache and matrix strategies, and manages secrets.",
-            ),
-            (
-                AgentType::GitHubSecurityAnalyzer,
-                "Reviews GitHub security alerts, Dependabot advisories, code scanning results, and secret scanning findings.",
-            ),
-            (
-                AgentType::GitHubDependencyManager,
-                "Updates project dependencies via Dependabot or Renovate, resolves version conflicts, and validates compatibility.",
-            ),
-            (
-                AgentType::GitHubProjectManager,
-                "Manages GitHub Projects boards, sprint planning, issue prioritization, milestone tracking, and team assignments.",
-            ),
-            (
-                AgentType::GitHubWikiManager,
-                "Maintains GitHub wiki pages, documentation sites, and knowledge bases associated with repositories.",
-            ),
-            (
-                AgentType::GitHubDiscussionModerator,
-                "Moderates GitHub discussions, answers community questions, organizes discussion categories, and surfaces actionable feedback.",
-            ),
-            (
-                AgentType::GitHubActionsOptimizer,
-                "Profiles and speeds up GitHub Actions, reduces runner minutes, parallelizes jobs, and optimizes build caches.",
-            ),
-            (
-                AgentType::GitHubStatusMonitor,
-                "Monitors GitHub repository status checks, commit statuses, deployment statuses, and webhook health.",
-            ),
-            (
-                AgentType::GitHubIntegrationBot,
-                "Automates GitHub integrations with external systems like Slack, Jira, PagerDuty, or Discord via bots and apps.",
-            ),
-            // ── Other Specialized (4) ─────────────────────────────────────
-            (
-                AgentType::Researcher,
-                "Conducts technical research, compares libraries and approaches, reads academic papers, and writes evidence-based recommendations.",
-            ),
-            (
-                AgentType::Analyst,
-                "Performs business and technical analysis, builds reports, identifies trends, and translates metrics into actionable insights.",
-            ),
-            (
-                AgentType::Optimizer,
-                "Optimizes algorithms, queries, build times, and resource usage. Focuses on measurable improvements and benchmarks.",
-            ),
-            (
-                AgentType::Documenter,
-                "Writes technical documentation, API references, user guides, tutorials, and internal runbooks for engineering teams.",
-            ),
-        ];
-
-        let mut registered_agents = 0usize;
-        for (agent_type, desc) in registrations {
-            match router.register_agent(agent_type, desc) {
-                Ok(()) => registered_agents += 1,
-                Err(e) => warn!("NexusBridge: failed to register agent: {}", e),
+    /// Carica l'embedder semantico: ONNX MiniLM-384d se disponibile, altrimenti
+    /// fallback silenzioso a HashEmbedder-256d (solo un WARN). Ritorna anche il
+    /// flag `degraded` (true quando ONNX non era disponibile), osservabile via
+    /// `/api/embedder-status`. Estratto da `new_internal` per contenerne la
+    /// lunghezza (regola qualita long-fn).
+    fn build_embedder() -> (Arc<dyn Embedder>, bool) {
+        match OnnxMiniLmEmbedder::try_from_env() {
+            Ok(onnx) => {
+                info!(
+                    "OnnxMiniLmEmbedder loaded: dim={}, model={}",
+                    nexus_orchestrator::MINILM_DIM,
+                    std::env::var("NEXUS_MINILM_MODEL")
+                        .unwrap_or_else(|_| nexus_orchestrator::DEFAULT_MODEL_PATH.to_string()),
+                );
+                (Arc::new(onnx) as Arc<dyn Embedder>, false)
+            }
+            Err(e) => {
+                // WARN una-tantum all'avvio (non spam): stato osservabile
+                // anche via /api/embedder-status (embedder_degraded=true).
+                warn!(
+                    "Embedder semantico degradato: ONNX non disponibile ({e}), \
+                     uso HashEmbedder (ricerche semantiche di qualita' ridotta). \
+                     Verifica feature 'onnx' e models/minilm/."
+                );
+                (Arc::new(HashEmbedder::new(256)) as Arc<dyn Embedder>, true)
             }
         }
+    }
 
-        // Setup learning scheduler con tutti i 12 worker (Ruflo plan completo)
-        //
-        // Reactive (OnTaskComplete): UltralearnWorker, AuditWorker,
-        //   MetricsAggregationWorker, VersioningWorker
-        // Periodic: ProfilingWorker, AnomalyDetectionWorker, MemoryConsolidationWorker,
-        //   CleanupWorker, SessionPersistenceWorker, QLearningReplayWorker,
-        //   ReplicationWorker, ClusteringWorker
+    /// Descrizioni canoniche dei 33 agent types "concreti" (esclusi
+    /// Custom/catchall), usate dal router Q-Learning come input per l'embedding
+    /// di similarità tra task e capability. Estratta da `new_internal` per
+    /// contenerne la lunghezza (regola qualita long-fn); il contenuto e' invariato.
+    ///
+    /// Scopo: dare al router una signal matrix ampia il più possibile, così che
+    /// un task arbitrario possa essere classificato correttamente anche quando
+    /// il mapping provider/model (agent_type_to_model) è parziale.
+    fn agent_registrations() -> Vec<(AgentType, &'static str)> {
+        // La signal matrix e' una tabella dati statica (vedi AGENT_REGISTRATIONS):
+        // cloniamo solo l'AgentType, le descrizioni restano `&'static str`.
+        AGENT_REGISTRATIONS
+            .iter()
+            .map(|(at, desc)| (at.clone(), *desc))
+            .collect()
+    }
+
+    /// Legge `learning_auto_extract` / `learning_min_confidence` dal DB (se il
+    /// pool e' presente) restituendo `(auto_extract, min_confidence)`. Estratta
+    /// da `build_learning_scheduler` per contenerne la lunghezza (regola long-fn).
+    /// Senza pool ritorna i default in-memory `(true, 0.5)`.
+    fn read_learning_settings(pool: Option<&Arc<PgPool>>) -> (bool, f32) {
+        let Some(p) = pool else {
+            return (true, 0.5);
+        };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let auto = sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM settings WHERE key = 'learning_auto_extract'",
+                )
+                .fetch_optional(p.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+
+                let conf = sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM settings WHERE key = 'learning_min_confidence'",
+                )
+                .fetch_optional(p.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .unwrap_or(0.6); // allineato al seed DB (0002_settings.sql)
+
+                (auto, conf)
+            })
+        })
+    }
+
+    /// Costruisce il `LearningScheduler` con tutti i worker (Ruflo plan completo)
+    /// e li registra. Estratta da `new_internal` per contenerne la lunghezza
+    /// (regola long-fn); comportamento e ordine di registrazione invariati.
+    ///
+    /// Reactive (OnTaskComplete): UltralearnWorker, AuditWorker,
+    ///   MetricsAggregationWorker, VersioningWorker
+    /// Periodic: ProfilingWorker, AnomalyDetectionWorker, MemoryConsolidationWorker,
+    ///   CleanupWorker, SessionPersistenceWorker, QLearningReplayWorker,
+    ///   ReplicationWorker, ClusteringWorker
+    fn build_learning_scheduler(pool: Option<&Arc<PgPool>>) -> Arc<LearningScheduler> {
         let scheduler = Arc::new(LearningScheduler::new());
 
-        // Legge learning_auto_extract e learning_min_confidence dal DB (se disponibile).
-        // auto_extract=false disabilita UltralearnWorker; min_confidence sovrascrive la soglia.
-        let (auto_extract, min_confidence): (bool, f32) = if let Some(ref p) = pool {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let auto = sqlx::query_scalar::<_, String>(
-                        "SELECT value FROM settings WHERE key = 'learning_auto_extract'",
-                    )
-                    .fetch_optional(p.as_ref())
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|v| !v.trim().eq_ignore_ascii_case("false"))
-                    .unwrap_or(true);
-
-                    let conf = sqlx::query_scalar::<_, String>(
-                        "SELECT value FROM settings WHERE key = 'learning_min_confidence'",
-                    )
-                    .fetch_optional(p.as_ref())
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.trim().parse::<f32>().ok())
-                    .unwrap_or(0.6); // allineato al seed DB (0002_settings.sql)
-
-                    (auto, conf)
-                })
-            })
-        } else {
-            (true, 0.5)
-        };
+        // learning_auto_extract=false disabilita UltralearnWorker;
+        // learning_min_confidence sovrascrive la soglia di qualita.
+        let (auto_extract, min_confidence) = Self::read_learning_settings(pool);
 
         if auto_extract {
             scheduler.register(Arc::new(
@@ -354,7 +448,7 @@ impl NexusBridge {
         // direttive). Entrambi sono kill-switch-gated nel DB (optimizer_enabled /
         // alignment_enabled): registrarli e' sicuro, restano no-op finche' non
         // abilitati. Il PromptOptimizerWorker non era mai stato registrato prima.
-        if let Some(ref pool) = pool {
+        if let Some(pool) = pool {
             scheduler.register(Arc::new(PromptOptimizerWorker::new(pool.clone())));
             scheduler.register(Arc::new(GuidelineAlignmentWorker::new(pool.clone())));
             info!("PromptOptimizerWorker e GuidelineAlignmentWorker registrati (pool disponibile)");
@@ -362,14 +456,34 @@ impl NexusBridge {
             info!("PromptOptimizerWorker/GuidelineAlignmentWorker non registrati: pool DB assente");
         }
 
-        let observability_ns = Arc::new(MemoryNamespace::new("nexus-bridge-global"));
+        scheduler
+    }
 
-        // ── RuVector stores ──────────────────────────────────────────────────
+    /// Registra tutti gli agent type di `agent_registrations()` nel router e
+    /// ritorna quanti ne sono stati registrati con successo. Le descrizioni sono
+    /// canoniche e usate dal router Q-Learning per l'embedding di similarità tra
+    /// task e capability. Estratta da `new_internal` per contenerne la lunghezza.
+    fn register_agents(router: &QLearningRouter) -> usize {
+        let mut registered_agents = 0usize;
+        for (agent_type, desc) in Self::agent_registrations() {
+            match router.register_agent(agent_type, desc) {
+                Ok(()) => registered_agents += 1,
+                Err(e) => warn!("NexusBridge: failed to register agent: {}", e),
+            }
+        }
+        registered_agents
+    }
+
+    /// Costruisce il manager RuVector (4 collection, solo con pool) e lo store
+    /// "memory" esposto ai tool `ruvector_*`. Il boot-loading dei vettori avviene
+    /// in background in `spawn_boot_loaders`. Estratta da `new_internal` per
+    /// contenerne la lunghezza (long-fn).
+    #[allow(clippy::type_complexity)]
+    fn build_ruvector_stores(
+        pool: Option<&Arc<PgPool>>,
+    ) -> (Option<Arc<RuVectorManager>>, Arc<RuVectorStore>) {
         // Crea il manager con le 4 collection solo se abbiamo il pool.
-        // Il boot-loading avviene in background in `init_global_with_pool`.
-        let vector_stores = pool
-            .as_ref()
-            .map(|p| Arc::new(RuVectorManager::new(p.clone())));
+        let vector_stores = pool.map(|p| Arc::new(RuVectorManager::new(p.clone())));
 
         // Lo store "memory" è quello esposto ai tool ruvector_*:
         //   - Se il manager esiste, usa la sua istanza (con persistenza).
@@ -380,6 +494,30 @@ impl NexusBridge {
             }),
             None => Arc::new(RuVectorStore::new("memory")),
         };
+        (vector_stores, ruvector_store)
+    }
+
+    fn new_internal(pool: Option<Arc<PgPool>>) -> Arc<Self> {
+        // Embedder semantico (ONNX 384d con fallback HashEmbedder 256d).
+        let (embedder, embedder_degraded) = Self::build_embedder();
+
+        let config = QLearningConfig::default();
+        let router_base = QLearningRouter::new(config, embedder.clone());
+        let router = Arc::new(match pool {
+            Some(ref p) => router_base.with_pool(p.clone()),
+            None => router_base,
+        });
+
+        // Registra tutti i 33 agent types "concreti" (esclusi Custom/catchall).
+        let registered_agents = Self::register_agents(&router);
+
+        // Setup learning scheduler con tutti i worker (Ruflo plan completo).
+        let scheduler = Self::build_learning_scheduler(pool.as_ref());
+
+        let observability_ns = Arc::new(MemoryNamespace::new("nexus-bridge-global"));
+
+        // Store vettoriali RuVector (manager 4-collection + store "memory").
+        let (vector_stores, ruvector_store) = Self::build_ruvector_stores(pool.as_ref());
 
         // ── Consensus engine ─────────────────────────────────────────────────
         // SimpleMajority di default; override a runtime via consensus_vote tool.
@@ -425,8 +563,21 @@ impl NexusBridge {
     pub async fn init_global_with_pool(pool: Arc<PgPool>) {
         let bridge = NEXUS_BRIDGE.get_or_init(|| Self::new_with_pool(pool));
 
+        // Boot-loading in background (Q-values, RuVector HNSW, prompt registry).
+        bridge.spawn_boot_loaders();
+
+        // Loop periodico dei learning workers (async: salva il JoinHandle).
+        bridge.start_periodic_workers().await;
+    }
+
+    /// Spawna i tre task di boot-loading in background (non bloccano il processo):
+    /// 1. Q-values da `nexus_q_values`
+    /// 2. Vettori HNSW (4 collection RuVector in parallelo)
+    /// 3. Agent prompt registry (`nexus_prompt_templates`, chiavi `agent.*`)
+    /// Estratto da `init_global_with_pool` per contenerne la lunghezza (long-fn).
+    fn spawn_boot_loaders(&self) {
         // ── 1. Q-values ─────────────────────────────────────────────────────
-        let router = bridge.router.clone();
+        let router = self.router.clone();
         tokio::spawn(async move {
             match router.load_from_db().await {
                 Ok(n) => info!("Q-Learning: {} Q-values caricati da PostgreSQL", n),
@@ -437,7 +588,7 @@ impl NexusBridge {
         // ── 2. RuVector HNSW ─────────────────────────────────────────────────
         // Carica le 4 collection in parallelo; ogni store ricostruisce il grafo
         // HNSW in-memory dai vettori su DB (ordine stabile per created_at ASC).
-        if let Some(manager) = bridge.vector_stores.clone() {
+        if let Some(manager) = self.vector_stores.clone() {
             tokio::spawn(async move {
                 let results = manager.load_all_from_db().await;
                 let total: usize = results.iter().map(|(_, n)| n).sum();
@@ -454,72 +605,75 @@ impl NexusBridge {
         }
 
         // ── 3. Agent prompt registry ─────────────────────────────────────────
-        // Carica tutti i template agent.* dal DB e popola il registry globale
-        // di nexus-agents. Deve avvenire prima dell'esecuzione degli agenti.
-        {
-            let bridge_pool = bridge.pool.clone();
-            tokio::spawn(async move {
-                let Some(pool) = bridge_pool else {
-                    info!("Agent prompt registry: nessun DB pool, registry non popolato");
-                    return;
-                };
-                match sqlx::query(
-                    "SELECT key, content FROM nexus_prompt_templates \
-                     WHERE key LIKE 'agent.%' AND is_active = TRUE",
-                )
-                .fetch_all(pool.as_ref())
-                .await
-                {
-                    Ok(rows) => {
-                        use sqlx::Row as _;
-                        let n = rows.len();
-                        let prompts: std::collections::HashMap<String, String> = rows
-                            .into_iter()
-                            .map(|r| {
-                                let key: String = r.get("key");
-                                let content: String = r.get("content");
-                                (key, content)
-                            })
-                            .collect();
-                        nexus_orchestrator::prompt_registry::initialize(prompts);
-                        info!(
-                            "Agent prompt registry: {} template caricati da PostgreSQL",
-                            n
-                        );
-                    }
-                    Err(e) => {
-                        warn!("Agent prompt registry: errore caricamento da DB: {e}");
-                    }
-                }
-            });
-        }
+        self.spawn_prompt_registry_loader();
+    }
 
-        // ── 4. Periodic learning workers ─────────────────────────────────────
-        // Avvia il loop periodico per CleanupWorker, MemoryConsolidationWorker,
-        // MetricsAggregationWorker, PromptOptimizerWorker (trigger = Periodic o Both).
-        // Intervallo: 1800 secondi (30 minuti).
-        // NOTA COSTI: il PromptOptimizerWorker chiama direttamente l'API Anthropic
-        // (claude-haiku, max_tokens=4096) per ogni prompt candidato ad ogni tick.
-        // A 60s generava fino a 1440 chiamate/giorno. A 1800s = max 48 chiamate/giorno.
-        // L'optimizer puo' essere disabilitato completamente via DB:
-        //   UPDATE settings SET value='false' WHERE key='optimizer_enabled';
-        // Il JoinHandle viene salvato in `periodic_handle` per poter essere
-        // abortito durante il graceful shutdown (evita worker orfani).
-        {
-            let scheduler = bridge.scheduler.clone();
-            let ns = bridge.observability_ns.clone();
-            let router = bridge.router.clone();
-            let handle = scheduler.start_periodic_loop(
-                Duration::from_secs(1800),
-                Arc::new(move || {
-                    LearningContext::new()
-                        .with_namespace(ns.clone())
-                        .with_router(router.clone())
-                }),
-            );
-            *bridge.periodic_handle.lock().await = Some(handle);
-            info!("Learning workers: periodic loop avviato (interval=1800s)");
-        }
+    /// Spawna il caricamento dei template agent.* dal DB nel registry globale di
+    /// nexus-agents (deve avvenire prima dell'esecuzione degli agenti). Estratto
+    /// da `spawn_boot_loaders` per contenerne la lunghezza (long-fn).
+    fn spawn_prompt_registry_loader(&self) {
+        let bridge_pool = self.pool.clone();
+        tokio::spawn(async move {
+            let Some(pool) = bridge_pool else {
+                info!("Agent prompt registry: nessun DB pool, registry non popolato");
+                return;
+            };
+            match sqlx::query(
+                "SELECT key, content FROM nexus_prompt_templates \
+                 WHERE key LIKE 'agent.%' AND is_active = TRUE",
+            )
+            .fetch_all(pool.as_ref())
+            .await
+            {
+                Ok(rows) => {
+                    use sqlx::Row as _;
+                    let n = rows.len();
+                    let prompts: std::collections::HashMap<String, String> = rows
+                        .into_iter()
+                        .map(|r| {
+                            let key: String = r.get("key");
+                            let content: String = r.get("content");
+                            (key, content)
+                        })
+                        .collect();
+                    nexus_orchestrator::prompt_registry::initialize(prompts);
+                    info!(
+                        "Agent prompt registry: {} template caricati da PostgreSQL",
+                        n
+                    );
+                }
+                Err(e) => {
+                    warn!("Agent prompt registry: errore caricamento da DB: {e}");
+                }
+            }
+        });
+    }
+
+    /// Avvia il loop periodico dei learning workers e salva il JoinHandle in
+    /// `periodic_handle` (per l'abort durante il graceful shutdown). Estratto da
+    /// `init_global_with_pool` per contenerne la lunghezza (long-fn).
+    ///
+    /// Trigger = Periodic o Both: CleanupWorker, MemoryConsolidationWorker,
+    /// MetricsAggregationWorker, PromptOptimizerWorker. Intervallo: 1800s (30 min).
+    /// NOTA COSTI: il PromptOptimizerWorker chiama direttamente l'API Anthropic
+    /// (claude-haiku, max_tokens=4096) per ogni prompt candidato ad ogni tick.
+    /// A 60s generava fino a 1440 chiamate/giorno. A 1800s = max 48 chiamate/giorno.
+    /// L'optimizer puo' essere disabilitato completamente via DB:
+    ///   UPDATE settings SET value='false' WHERE key='optimizer_enabled';
+    async fn start_periodic_workers(&self) {
+        let scheduler = self.scheduler.clone();
+        let ns = self.observability_ns.clone();
+        let router = self.router.clone();
+        let handle = scheduler.start_periodic_loop(
+            Duration::from_secs(1800),
+            Arc::new(move || {
+                LearningContext::new()
+                    .with_namespace(ns.clone())
+                    .with_router(router.clone())
+            }),
+        );
+        *self.periodic_handle.lock().await = Some(handle);
+        info!("Learning workers: periodic loop avviato (interval=1800s)");
     }
 
     /// Accesso al singleton. Ritorna None se non inizializzato.
@@ -711,42 +865,17 @@ impl NexusBridge {
         let ns = self.observability_ns.clone();
         let router = self.router.clone();
 
-        // Costruisce un SwarmExecutionResult minimale per il singolo task
-        let task_result = TaskResult {
-            task_id: task_id.to_string(),
-            agent_type: agent_type.clone(),
-            success,
-            output: String::new(), // non disponibile qui
-            error,
-            execution_time_ms,
-            tokens_used: 0,
-        };
-        let routing = RoutingDecision {
-            agent_type,
-            q_value: quality_score,
-            confidence: quality_score,
-            candidates: Vec::new(),
-            decision_time_us: 0,
-            strategy: SelectionStrategy::Exploitation,
-        };
-        let task_outcome = SwarmTaskOutcome {
-            task_id: task_id.to_string(),
-            routing,
-            result: if success {
-                Ok(task_result)
-            } else {
-                Err(format!("task {} failed", task_id))
-            },
-        };
-        let swarm = Arc::new(SwarmExecutionResult {
-            swarm_id: format!("outcome-{}", task_id),
-            task_results: vec![task_outcome],
-            success_count: if success { 1 } else { 0 },
-            failure_count: if success { 0 } else { 1 },
-            total_time_ms: execution_time_ms,
-        });
+        let _ = task_type; // task_type usato solo per ExecutionOutcome nel chiamante
 
-        let _ = task_type; // task_type usato solo per ExecutionOutcome sopra
+        // Costruisce un SwarmExecutionResult minimale per il singolo task.
+        let swarm = single_task_swarm(
+            task_id,
+            agent_type,
+            success,
+            quality_score,
+            execution_time_ms,
+            error,
+        );
 
         // Solo se c'è un runtime Tokio attivo (evita panic in test sincroni)
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -836,33 +965,7 @@ impl NexusBridge {
             return;
         };
 
-        let mut ok = 0usize;
-        for e in &batch.entries {
-            let res = sqlx::query(
-                r#"
-                INSERT INTO nexus_replication_log
-                    (namespace_id, key, value, author, replicated_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (namespace_id, key) DO UPDATE
-                SET value = EXCLUDED.value, replicated_at = NOW()
-                "#,
-            )
-            .bind(&batch.namespace_id)
-            .bind(&e.key)
-            .bind(&e.value)
-            .bind(&e.author)
-            .execute(pool.as_ref())
-            .await;
-
-            if res.is_ok() {
-                ok += 1;
-            } else if let Err(err) = res {
-                debug!(
-                    "flush_replication_pending: entry '{}' fallita: {err}",
-                    e.key
-                );
-            }
-        }
+        let ok = replicate_batch(pool, &batch).await;
 
         info!(
             "flush_replication_pending: {}/{} entry replicate su PostgreSQL",
@@ -1122,6 +1225,24 @@ pub async fn nexus_embed(Json(req): Json<EmbedRequest>) -> (StatusCode, Json<ser
     )
 }
 
+/// Serializza le statistiche per-worker in un oggetto JSON (le struct dei
+/// worker non derivano `Serialize`). Estratta da `nexus_stats` per contenerne
+/// la lunghezza (long-fn); contenuto invariato.
+fn per_worker_stats_json(s: &nexus_orchestrator::SchedulerStats) -> serde_json::Map<String, serde_json::Value> {
+    let mut per_worker = serde_json::Map::new();
+    for (name, ws) in &s.per_worker {
+        per_worker.insert(
+            name.clone(),
+            json!({
+                "runs": ws.runs,
+                "failures": ws.failures,
+                "total_duration_ms": ws.total_duration_ms,
+            }),
+        );
+    }
+    per_worker
+}
+
 /// GET /nexus/stats — Snapshot dettagliato delle statistiche.
 ///
 /// Include: router Q-Learning (decisioni, exploration vs exploitation,
@@ -1142,17 +1263,7 @@ pub async fn nexus_stats() -> impl IntoResponse {
     let persisted = bridge.q_learning_persisted_totals().await;
 
     // Per-worker stats serializzate manualmente (no Serialize derive)
-    let mut per_worker = serde_json::Map::new();
-    for (name, ws) in &s.per_worker {
-        per_worker.insert(
-            name.clone(),
-            json!({
-                "runs": ws.runs,
-                "failures": ws.failures,
-                "total_duration_ms": ws.total_duration_ms,
-            }),
-        );
-    }
+    let per_worker = per_worker_stats_json(&s);
 
     (
         StatusCode::OK,
@@ -1252,6 +1363,17 @@ fn render_bridge_prometheus() -> Option<String> {
     let ns_entries = bridge.observability_ns().len();
 
     let mut out = String::with_capacity(2048);
+    push_router_prometheus(&mut out, &r);
+    push_scheduler_prometheus(&mut out, &s, bridge.scheduler().len(), ns_entries);
+    push_ruvector_prometheus(&mut out, &bridge);
+    push_ab_prometheus(&mut out, &r);
+
+    Some(out)
+}
+
+/// Blocco Prometheus delle metriche router Q-Learning.
+/// Estratto da `render_bridge_prometheus` per contenerne la lunghezza (long-fn).
+fn push_router_prometheus(out: &mut String, r: &nexus_orchestrator::RouterStats) {
     out.push_str("# HELP nexus_router_decisions_total Total routing decisions made\n");
     out.push_str("# TYPE nexus_router_decisions_total counter\n");
     out.push_str(&format!(
@@ -1294,7 +1416,16 @@ fn render_bridge_prometheus() -> Option<String> {
     out.push_str("# HELP nexus_router_total_rewards Cumulative reward across all updates\n");
     out.push_str("# TYPE nexus_router_total_rewards counter\n");
     out.push_str(&format!("nexus_router_total_rewards {}\n", r.total_rewards));
+}
 
+/// Blocco Prometheus delle metriche scheduler + per-worker + namespace.
+/// Estratto da `render_bridge_prometheus` per contenerne la lunghezza (long-fn).
+fn push_scheduler_prometheus(
+    out: &mut String,
+    s: &nexus_orchestrator::SchedulerStats,
+    workers_registered: usize,
+    ns_entries: usize,
+) {
     out.push_str("# HELP nexus_scheduler_runs_total Total learning worker runs\n");
     out.push_str("# TYPE nexus_scheduler_runs_total counter\n");
     out.push_str(&format!("nexus_scheduler_runs_total {}\n", s.total_runs));
@@ -1308,10 +1439,7 @@ fn render_bridge_prometheus() -> Option<String> {
 
     out.push_str("# HELP nexus_scheduler_workers Number of registered workers\n");
     out.push_str("# TYPE nexus_scheduler_workers gauge\n");
-    out.push_str(&format!(
-        "nexus_scheduler_workers {}\n",
-        bridge.scheduler().len()
-    ));
+    out.push_str(&format!("nexus_scheduler_workers {}\n", workers_registered));
 
     // Per-worker metrics
     out.push_str("# HELP nexus_worker_runs_total Runs per worker\n");
@@ -1335,8 +1463,11 @@ fn render_bridge_prometheus() -> Option<String> {
     out.push_str("# HELP nexus_namespace_entries Current entries in observability namespace\n");
     out.push_str("# TYPE nexus_namespace_entries gauge\n");
     out.push_str(&format!("nexus_namespace_entries {}\n", ns_entries));
+}
 
-    // RuVector metrics
+/// Blocco Prometheus delle metriche RuVector.
+/// Estratto da `render_bridge_prometheus` per contenerne la lunghezza (long-fn).
+fn push_ruvector_prometheus(out: &mut String, bridge: &NexusBridge) {
     let rv_nodes = bridge.ruvector().stats().total_nodes;
     out.push_str("# HELP nexus_ruvector_nodes_total Vectors in the memory RuVector store\n");
     out.push_str("# TYPE nexus_ruvector_nodes_total gauge\n");
@@ -1348,10 +1479,13 @@ fn render_bridge_prometheus() -> Option<String> {
     );
     out.push_str("# TYPE nexus_ruvector_persistent gauge\n");
     out.push_str(&format!("nexus_ruvector_persistent {}\n", rv_persistent));
+}
 
-    // ── Fase 9B: A/B routing counters ────────────────────────────────────
-    // Esposti sempre (anche quando il feature flag è 0%), così le dashboard
-    // possono mostrare zero iniziale e il delta nel tempo del rollout.
+/// Blocco Prometheus dei contatori A/B routing (Fase 9B) + forced router-level.
+/// Estratto da `render_bridge_prometheus` per contenerne la lunghezza (long-fn).
+/// I contatori A/B sono esposti sempre (anche a feature flag 0%), così le
+/// dashboard possono mostrare lo zero iniziale e il delta nel tempo del rollout.
+fn push_ab_prometheus(out: &mut String, r: &nexus_orchestrator::RouterStats) {
     let ab = crate::nexus_routing::snapshot_counters();
 
     out.push_str(
@@ -1384,8 +1518,6 @@ fn render_bridge_prometheus() -> Option<String> {
     );
     out.push_str("# TYPE nexus_router_forced_total counter\n");
     out.push_str(&format!("nexus_router_forced_total {}\n", r.forced_count));
-
-    Some(out)
 }
 
 /// POST /nexus/test-routing — invoca il router Q-Learning per un task di test
@@ -1449,6 +1581,20 @@ pub async fn nexus_test_routing(
         );
     };
 
+    let body = build_test_routing_response(&state, &decision, task_type, instructions).await;
+    (StatusCode::OK, Json(body))
+}
+
+/// Costruisce il corpo JSON della risposta di `nexus_test_routing`: risolve
+/// provider/model, prompt key e anteprima del system prompt per la decisione
+/// del router. Estratta per contenere la lunghezza di `nexus_test_routing`
+/// (long-fn); comportamento invariato.
+async fn build_test_routing_response(
+    state: &crate::AppState,
+    decision: &RoutingDecision,
+    task_type: &str,
+    instructions: &str,
+) -> serde_json::Value {
     let agent_type_str = format!("{:?}", decision.agent_type);
     let strategy_str = format!("{:?}", decision.strategy);
 
@@ -1462,30 +1608,67 @@ pub async fn nexus_test_routing(
     // Mostra solo i primi 200 caratteri per non sovraccaricare la risposta
     let system_prompt_preview: String = system_prompt.chars().take(200).collect();
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "ok",
-            "task_type": task_type,
-            "instructions_preview": instructions.chars().take(100).collect::<String>(),
-            "agent_type": agent_type_str,
-            "q_value": decision.q_value,
-            "confidence": decision.confidence,
-            "strategy": strategy_str,
-            "decision_time_us": decision.decision_time_us,
-            "candidates": decision.candidates.len(),
-            "mapped_provider": mapped_provider,
-            "mapped_model": mapped_model,
-            "prompt_key": prompt_key,
-            "system_prompt_preview": system_prompt_preview,
-            "system_prompt_available": !system_prompt.is_empty(),
-        })),
-    )
+    json!({
+        "status": "ok",
+        "task_type": task_type,
+        "instructions_preview": instructions.chars().take(100).collect::<String>(),
+        "agent_type": agent_type_str,
+        "q_value": decision.q_value,
+        "confidence": decision.confidence,
+        "strategy": strategy_str,
+        "decision_time_us": decision.decision_time_us,
+        "candidates": decision.candidates.len(),
+        "mapped_provider": mapped_provider,
+        "mapped_model": mapped_model,
+        "prompt_key": prompt_key,
+        "system_prompt_preview": system_prompt_preview,
+        "system_prompt_available": !system_prompt.is_empty(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Costruisce un mock `SwarmExecutionResult` con 5 task tutti di successo.
+    /// Helper condiviso dai test del learning loop (estratto per contenere la
+    /// lunghezza di `test_bridge_run_learning_loop_end_to_end`).
+    fn mock_swarm_5_tasks() -> Arc<SwarmExecutionResult> {
+        let make_outcome = |id: &str, agent: AgentType, ok: bool, t: u64| SwarmTaskOutcome {
+            task_id: id.to_string(),
+            routing: RoutingDecision {
+                agent_type: agent.clone(),
+                q_value: 0.5,
+                confidence: 0.8,
+                candidates: Vec::new(),
+                decision_time_us: 100,
+                strategy: SelectionStrategy::Exploitation,
+            },
+            result: Ok(TaskResult {
+                task_id: id.to_string(),
+                agent_type: agent,
+                success: ok,
+                output: "".to_string(),
+                error: None,
+                execution_time_ms: t,
+                tokens_used: 0,
+            }),
+        };
+
+        Arc::new(SwarmExecutionResult {
+            swarm_id: "bridge-e2e".to_string(),
+            task_results: vec![
+                make_outcome("t1", AgentType::Coder, true, 10),
+                make_outcome("t2", AgentType::Coder, true, 20),
+                make_outcome("t3", AgentType::Tester, true, 15),
+                make_outcome("t4", AgentType::Reviewer, true, 25),
+                make_outcome("t5", AgentType::Architect, true, 30),
+            ],
+            success_count: 5,
+            failure_count: 0,
+            total_time_ms: 100,
+        })
+    }
 
     #[test]
     fn test_bridge_initialization() {
@@ -1641,47 +1824,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_bridge_run_learning_loop_end_to_end() {
-        use nexus_orchestrator::TaskResult as AgentTaskResult;
-        use nexus_orchestrator::{RoutingDecision, SelectionStrategy};
-        use nexus_orchestrator::{SwarmExecutionResult, SwarmTaskOutcome};
-
         let bridge = NexusBridge::new();
 
-        // Costruisce un mock SwarmExecutionResult con 5 task
-        let make_outcome = |id: &str, agent: AgentType, ok: bool, t: u64| SwarmTaskOutcome {
-            task_id: id.to_string(),
-            routing: RoutingDecision {
-                agent_type: agent.clone(),
-                q_value: 0.5,
-                confidence: 0.8,
-                candidates: Vec::new(),
-                decision_time_us: 100,
-                strategy: SelectionStrategy::Exploitation,
-            },
-            result: Ok(AgentTaskResult {
-                task_id: id.to_string(),
-                agent_type: agent,
-                success: ok,
-                output: "".to_string(),
-                error: None,
-                execution_time_ms: t,
-                tokens_used: 0,
-            }),
-        };
-
-        let swarm_result = Arc::new(SwarmExecutionResult {
-            swarm_id: "bridge-e2e".to_string(),
-            task_results: vec![
-                make_outcome("t1", AgentType::Coder, true, 10),
-                make_outcome("t2", AgentType::Coder, true, 20),
-                make_outcome("t3", AgentType::Tester, true, 15),
-                make_outcome("t4", AgentType::Reviewer, true, 25),
-                make_outcome("t5", AgentType::Architect, true, 30),
-            ],
-            success_count: 5,
-            failure_count: 0,
-            total_time_ms: 100,
-        });
+        // Mock SwarmExecutionResult con 5 task (helper per contenere il test).
+        let swarm_result = mock_swarm_5_tasks();
 
         // Esegue learning loop — non deve panicare, deve popolare observability_ns
         bridge.run_learning_loop(swarm_result).await;
