@@ -1063,6 +1063,159 @@ async fn install_service_windows(
     })))
 }
 
+/// Helper di `install_service_systemd`: interpreta un token come numero di porta,
+/// tollerando apici, virgole e punti e virgola circostanti. Ritorna `None` se non
+/// e' un `u16` valido. Estratto a livello modulo per non gonfiare la host.
+#[cfg(not(windows))]
+fn parse_port_token(s: &str) -> Option<u16> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let t = t.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
+    t.parse::<u16>().ok()
+}
+
+/// Helper di `install_service_systemd`: euristica "questo comando avvia un web
+/// server". Estratto a livello modulo per non gonfiare la host.
+#[cfg(not(windows))]
+fn looks_like_web_server_command(command: &str) -> bool {
+    // Deve funzionare anche quando `command` è un path assoluto (es. /usr/bin/npm)
+    // e quando l'argomento contiene più token.
+    let lower = command.to_lowercase();
+    // Match basati su word-boundary per evitare dipendenze dalla presenza di spazi iniziali.
+    let has = |pat: &str| lower.contains(pat);
+    has("next dev")
+        || has("next start")
+        || has("react-scripts start")
+        || has("vite")
+        || has("nuxt")
+        || has("astro")
+        || (has("pnpm") && has("run") && has(" dev"))
+        || (has("npm") && has("run") && has(" dev"))
+        || (has("npm") && has(" start"))
+        || (has("yarn") && has(" dev"))
+        || (has("dotnet") && has(" run"))
+}
+
+/// Risolve quale tool reale esegue uno script npm/pnpm/yarn leggendo
+/// `package.json` nella `cwd`. Es: `pnpm run dev` → "vite" se
+/// `scripts.dev = "vite"`. Ritorna `Some(tool_command)` se trovato.
+/// Importante per Vite/Astro/Nuxt che IGNORANO $PORT env e richiedono
+/// `--port` esplicito sulla command line. Estratto a livello modulo.
+#[cfg(not(windows))]
+fn resolve_script_command(cwd: &str, exec: &str) -> Option<String> {
+    let lower = exec.to_lowercase();
+    let script_name = if lower.contains(" run dev") || lower.ends_with(" dev") {
+        "dev"
+    } else if lower.contains(" run start") || lower.contains(" start") {
+        "start"
+    } else if lower.contains(" run serve") {
+        "serve"
+    } else {
+        return None;
+    };
+    let pkg = std::path::Path::new(cwd).join("package.json");
+    let content = std::fs::read_to_string(&pkg).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let cmd = parsed
+        .get("scripts")?
+        .get(script_name)?
+        .as_str()?
+        .to_string();
+    if cmd.trim().is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
+/// Helper di `install_service_systemd`: riscrive le porte esplicite sui flag
+/// `--port`/`-p` e negli URL noti con la porta allocata, e forza `--port` per i
+/// tool che ignorano $PORT (Vite/Astro/Nuxt/Next). Estratto a livello modulo.
+#[cfg(not(windows))]
+/// Helper di `rewrite_port_flags`: sostituisce le porte esplicite (flag `--port`/
+/// `-p` e URL verso i default noti) con la porta allocata `p`. Estratto per
+/// tenere la host sotto soglia; comportamento invariato.
+#[cfg(not(windows))]
+fn sostituisci_porte_esplicite(command: &str, p: &str) -> String {
+    let mut out = command.to_string();
+    // RAFFORZAMENTO guard-rail porte (ADR 0010 / regola I): riscrive QUALUNQUE
+    // porta esplicita sui flag --port/-p con la porta ALLOCATA dal registro,
+    // non solo i default noti dei framework. Senza questo, una porta hardcoded
+    // ARBITRARIA nel bucket (es. `vite --port 20001` mai passata da
+    // request_port) sopravvive: il servizio ascolta su una porta diversa da
+    // Environment=PORT / dall'allocazione -> mismatch e kill del port-enforcer
+    // (caso reale Beauty-Book: ExecStart `--port 20001` con PORT=39598).
+    // Cattura: `--port N`, `--port=N`, ` -p N`, ` -p=N`, ` -pN`. Gruppo 1 =
+    // flag+separatore (preservato), gruppo 2 = numero (sostituito).
+    match regex::Regex::new(r"(--port[ =]|(?:^|\s)-p[ =]?)(\d{2,5})") {
+        Ok(re) => {
+            out = re
+                .replace_all(&out, |c: &regex::Captures| format!("{}{}", &c[1], p))
+                .into_owned();
+        }
+        Err(_) => {
+            // Ramo difensivo (regex statica valida: mai raggiunto in pratica).
+            for bad in [
+                "3000", "5173", "4321", "3001", "8080", "4200", "5000", "8000",
+            ] {
+                out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
+                out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
+            }
+        }
+    }
+    // URL espliciti verso i default noti -> porta allocata. Qui resta una
+    // blacklist mirata (non una regex generica) per NON riscrivere porte
+    // legittime in URL verso servizi esterni o DB (es. 5432, 6379).
+    for bad in [
+        "3000", "3001", "3002", "4200", "4321", "5173", "5174", "5000", "5001", "8000", "8080",
+        "9000",
+    ] {
+        out = out.replace(&format!("localhost:{}", bad), &format!("localhost:{}", p));
+        out = out.replace(&format!("127.0.0.1:{}", bad), &format!("127.0.0.1:{}", p));
+    }
+    out
+}
+
+/// Helper di `rewrite_port_flags`: se manca un flag di porta, aggiunge `--port`/
+/// `-p` per i tool che ignorano $PORT (Vite/Astro/Nuxt/Next). Estratto per tenere
+/// la host sotto soglia; comportamento invariato.
+#[cfg(not(windows))]
+fn forza_flag_port(command: &str, p: &str) -> String {
+    let mut out = command.to_string();
+    let lower = out.to_lowercase();
+    let has_flag = lower.contains("--port")
+        || lower
+            .split_whitespace()
+            .any(|t| t == "-p" || t.starts_with("-p"));
+    // Forza --port per tool che ignorano $PORT env var:
+    // - Vite (5173 default, ignora PORT senza --port o vite.config)
+    // - Astro (4321 default, idem)
+    // - Nuxt (3000 default, idem)
+    // - Next.js (3000 default, accetta -p)
+    // - Svelte/Kit (5173 default tramite Vite)
+    if !has_flag {
+        let needs_vite_port = lower.contains("vite") || lower.contains("svelte");
+        let needs_astro_port = lower.contains("astro");
+        let needs_nuxt_port = lower.contains("nuxt");
+        let needs_next_port = lower.contains("next dev") || lower.contains("next start");
+        if needs_vite_port || needs_astro_port || needs_nuxt_port {
+            out.push_str(&format!(" --port {}", p));
+        } else if needs_next_port {
+            out.push_str(&format!(" -p {}", p));
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn rewrite_port_flags(command: &str, target_port: u16) -> String {
+    let p = target_port.to_string();
+    let out = sostituisci_porte_esplicite(command, &p);
+    forza_flag_port(&out, &p)
+}
+
 /// Installa un servizio come unit file systemd --user e lo abilita.
 /// Body JSON: { short, command, args, cwd, env, description }
 #[cfg(not(windows))]
@@ -1233,128 +1386,6 @@ async fn install_service_systemd(
         let args_str = args.join(" ");
         format!("{} {}", resolved_command, args_str)
     };
-
-    fn parse_port_token(s: &str) -> Option<u16> {
-        let t = s.trim();
-        if t.is_empty() {
-            return None;
-        }
-        let t = t.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
-        t.parse::<u16>().ok()
-    }
-
-    fn looks_like_web_server_command(command: &str) -> bool {
-        // Deve funzionare anche quando `command` è un path assoluto (es. /usr/bin/npm)
-        // e quando l'argomento contiene più token.
-        let lower = command.to_lowercase();
-        // Match basati su word-boundary per evitare dipendenze dalla presenza di spazi iniziali.
-        let has = |pat: &str| lower.contains(pat);
-        has("next dev")
-            || has("next start")
-            || has("react-scripts start")
-            || has("vite")
-            || has("nuxt")
-            || has("astro")
-            || (has("pnpm") && has("run") && has(" dev"))
-            || (has("npm") && has("run") && has(" dev"))
-            || (has("npm") && has(" start"))
-            || (has("yarn") && has(" dev"))
-            || (has("dotnet") && has(" run"))
-    }
-
-    /// Risolve quale tool reale esegue uno script npm/pnpm/yarn leggendo
-    /// `package.json` nella `cwd`. Es: `pnpm run dev` → "vite" se
-    /// `scripts.dev = "vite"`. Ritorna `Some(tool_command)` se trovato.
-    /// Importante per Vite/Astro/Nuxt che IGNORANO $PORT env e richiedono
-    /// `--port` esplicito sulla command line.
-    fn resolve_script_command(cwd: &str, exec: &str) -> Option<String> {
-        let lower = exec.to_lowercase();
-        let script_name = if lower.contains(" run dev") || lower.ends_with(" dev") {
-            "dev"
-        } else if lower.contains(" run start") || lower.contains(" start") {
-            "start"
-        } else if lower.contains(" run serve") {
-            "serve"
-        } else {
-            return None;
-        };
-        let pkg = std::path::Path::new(cwd).join("package.json");
-        let content = std::fs::read_to_string(&pkg).ok()?;
-        let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-        let cmd = parsed
-            .get("scripts")?
-            .get(script_name)?
-            .as_str()?
-            .to_string();
-        if cmd.trim().is_empty() {
-            None
-        } else {
-            Some(cmd)
-        }
-    }
-
-    fn rewrite_port_flags(command: &str, target_port: u16) -> String {
-        let p = target_port.to_string();
-        let mut out = command.to_string();
-        // RAFFORZAMENTO guard-rail porte (ADR 0010 / regola I): riscrive QUALUNQUE
-        // porta esplicita sui flag --port/-p con la porta ALLOCATA dal registro,
-        // non solo i default noti dei framework. Senza questo, una porta hardcoded
-        // ARBITRARIA nel bucket (es. `vite --port 20001` mai passata da
-        // request_port) sopravvive: il servizio ascolta su una porta diversa da
-        // Environment=PORT / dall'allocazione -> mismatch e kill del port-enforcer
-        // (caso reale Beauty-Book: ExecStart `--port 20001` con PORT=39598).
-        // Cattura: `--port N`, `--port=N`, ` -p N`, ` -p=N`, ` -pN`. Gruppo 1 =
-        // flag+separatore (preservato), gruppo 2 = numero (sostituito).
-        match regex::Regex::new(r"(--port[ =]|(?:^|\s)-p[ =]?)(\d{2,5})") {
-            Ok(re) => {
-                out = re
-                    .replace_all(&out, |c: &regex::Captures| format!("{}{}", &c[1], p))
-                    .into_owned();
-            }
-            Err(_) => {
-                // Ramo difensivo (regex statica valida: mai raggiunto in pratica).
-                for bad in [
-                    "3000", "5173", "4321", "3001", "8080", "4200", "5000", "8000",
-                ] {
-                    out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
-                    out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
-                }
-            }
-        }
-        // URL espliciti verso i default noti -> porta allocata. Qui resta una
-        // blacklist mirata (non una regex generica) per NON riscrivere porte
-        // legittime in URL verso servizi esterni o DB (es. 5432, 6379).
-        for bad in [
-            "3000", "3001", "3002", "4200", "4321", "5173", "5174", "5000", "5001", "8000", "8080",
-            "9000",
-        ] {
-            out = out.replace(&format!("localhost:{}", bad), &format!("localhost:{}", p));
-            out = out.replace(&format!("127.0.0.1:{}", bad), &format!("127.0.0.1:{}", p));
-        }
-        let lower = out.to_lowercase();
-        let has_flag = lower.contains("--port")
-            || lower
-                .split_whitespace()
-                .any(|t| t == "-p" || t.starts_with("-p"));
-        // Forza --port per tool che ignorano $PORT env var:
-        // - Vite (5173 default, ignora PORT senza --port o vite.config)
-        // - Astro (4321 default, idem)
-        // - Nuxt (3000 default, idem)
-        // - Next.js (3000 default, accetta -p)
-        // - Svelte/Kit (5173 default tramite Vite)
-        if !has_flag {
-            let needs_vite_port = lower.contains("vite") || lower.contains("svelte");
-            let needs_astro_port = lower.contains("astro");
-            let needs_nuxt_port = lower.contains("nuxt");
-            let needs_next_port = lower.contains("next dev") || lower.contains("next start");
-            if needs_vite_port || needs_astro_port || needs_nuxt_port {
-                out.push_str(&format!(" --port {}", p));
-            } else if needs_next_port {
-                out.push_str(&format!(" -p {}", p));
-            }
-        }
-        out
-    }
 
     // Blocco Environment= per variabili d'ambiente (con policy porte: mai usare porte riservate Nexus, incl. 3000).
     let reserved: std::collections::HashSet<u16> =
@@ -2775,38 +2806,42 @@ pub(super) fn push_sugg(
 
 /// Cerca .sln fino a 2 livelli (root + primo livello di subdirectory).
 /// Per ogni .sln emette `dotnet run --project <dir>` per i csproj Web/Exe e `dotnet test` per i test.
+/// Helper di `detect_dotnet_suggestions`: true se `dir` contiene almeno un file
+/// `.sln`. Estratto a livello modulo per non gonfiare la host.
+fn dir_has_sln(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .ok()
+        .map(|d| {
+            d.flatten()
+                .any(|e| e.path().extension().map(|x| x == "sln").unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+/// Helper di `detect_dotnet_suggestions`: classifica un `.csproj` come "test"
+/// (progetto di test) o "run" (Web/Exe avviabile). Estratto a livello modulo.
+fn classify_csproj(path: &std::path::Path) -> Option<&'static str> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let name_lc = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if name_lc.contains("test")
+        || name_lc.contains("spec")
+        || content.contains("xunit")
+        || content.contains("nunit")
+        || content.contains("MSTest")
+    {
+        return Some("test");
+    }
+    if content.contains("Sdk.Web") || content.contains("OutputType>Exe") {
+        return Some("run");
+    }
+    None
+}
+
 pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
-    fn dir_has_sln(dir: &std::path::Path) -> bool {
-        std::fs::read_dir(dir)
-            .ok()
-            .map(|d| {
-                d.flatten()
-                    .any(|e| e.path().extension().map(|x| x == "sln").unwrap_or(false))
-            })
-            .unwrap_or(false)
-    }
-
-    fn classify_csproj(path: &std::path::Path) -> Option<&'static str> {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let name_lc = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase();
-        if name_lc.contains("test")
-            || name_lc.contains("spec")
-            || content.contains("xunit")
-            || content.contains("nunit")
-            || content.contains("MSTest")
-        {
-            return Some("test");
-        }
-        if content.contains("Sdk.Web") || content.contains("OutputType>Exe") {
-            return Some("run");
-        }
-        None
-    }
-
     let mut sln_dirs: Vec<(std::path::PathBuf, String)> = Vec::new();
     if dir_has_sln(root) {
         sln_dirs.push((root.to_path_buf(), String::new()));
