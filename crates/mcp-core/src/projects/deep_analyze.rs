@@ -78,43 +78,56 @@ pub(super) async fn collect_config_files(root: &Path) -> Vec<serde_json::Value> 
             };
             if let Ok(ft) = entry.file_type().await {
                 if ft.is_dir() {
-                    if depth + 1 > DEEP_ANALYZER_MAX_DEPTH {
-                        continue;
+                    if should_descend_dir(&name, depth, skip_dirs) {
+                        stack.push((path, depth + 1));
                     }
-                    if name.starts_with('.') && name != "." && name != ".github" {
-                        continue;
-                    }
-                    if skip_dirs.contains(&name.as_str()) {
-                        continue;
-                    }
-                    stack.push((path, depth + 1));
                 } else if ft.is_file() && patterns.contains(name.as_str()) {
                     if found.len() >= DEEP_ANALYZER_MAX_FILES {
                         break;
                     }
-                    let rel_path = path
-                        .strip_prefix(root)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| name.clone());
-                    let raw = tokio::fs::read(&path).await.unwrap_or_default();
-                    let truncated = raw.len() > DEEP_ANALYZER_MAX_FILE_BYTES;
-                    let bytes_slice = if truncated {
-                        &raw[..DEEP_ANALYZER_MAX_FILE_BYTES]
-                    } else {
-                        &raw[..]
-                    };
-                    let content = String::from_utf8_lossy(bytes_slice).to_string();
-                    found.push(json!({
-                        "path": rel_path,
-                        "content": content,
-                        "truncated": truncated,
-                        "size_bytes": raw.len(),
-                    }));
+                    found.push(read_config_file_entry(&path, root, &name).await);
                 }
             }
         }
     }
     found
+}
+
+/// Decide se scendere in una subdirectory durante la walk: rispetta la
+/// profondita' massima, salta le dir nascoste (eccetto `.github`) e la lista
+/// `skip_dirs`. Estratto da [`collect_config_files`] (stessa logica inline).
+fn should_descend_dir(name: &str, depth: usize, skip_dirs: &[&str]) -> bool {
+    if depth + 1 > DEEP_ANALYZER_MAX_DEPTH {
+        return false;
+    }
+    if name.starts_with('.') && name != "." && name != ".github" {
+        return false;
+    }
+    !skip_dirs.contains(&name)
+}
+
+/// Legge un file di config candidato e ne costruisce la entry JSON
+/// (`path`/`content`/`truncated`/`size_bytes`), troncando il contenuto a
+/// [`DEEP_ANALYZER_MAX_FILE_BYTES`]. Estratto da [`collect_config_files`].
+async fn read_config_file_entry(path: &Path, root: &Path, name: &str) -> serde_json::Value {
+    let rel_path = path
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| name.to_string());
+    let raw = tokio::fs::read(path).await.unwrap_or_default();
+    let truncated = raw.len() > DEEP_ANALYZER_MAX_FILE_BYTES;
+    let bytes_slice = if truncated {
+        &raw[..DEEP_ANALYZER_MAX_FILE_BYTES]
+    } else {
+        &raw[..]
+    };
+    let content = String::from_utf8_lossy(bytes_slice).to_string();
+    json!({
+        "path": rel_path,
+        "content": content,
+        "truncated": truncated,
+        "size_bytes": raw.len(),
+    })
 }
 
 /// Recupera i servizi systemd registrati per il progetto.
@@ -246,6 +259,89 @@ fn render_analyzer_prompt(
 /// chiamante non cambia il codice a valle. `Err(messaggio)` per i fallimenti
 /// non recuperabili (template assente, routing non disponibile): il chiamante
 /// li marca come run `failed`.
+/// Carica il template attivo `agent.project.analyzer` dal punto unico
+/// nexus_prompt_templates (regola L). `Err` se DB down o template assente.
+async fn load_analyzer_template(db: &sqlx::PgPool) -> Result<String, String> {
+    let template: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT content FROM nexus_prompt_templates \
+         WHERE key = 'agent.project.analyzer' AND is_active = TRUE \
+         ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("DB template analyzer: {e}"))?;
+    template.ok_or_else(|| "prompt agent.project.analyzer non trovato/attivo in DB".to_string())
+}
+
+/// Risolve `(provider, model)` per il purpose `project_analyzer` via routing per
+/// tier (mig 0461): `best_model_for_tier` sceglie il miglior modello del catalog
+/// escludendo i provider in cooldown, sostituendo il loop chain manuale del brain
+/// (regola L). Niente nome modello hardcoded (regola G). `Err` se non risolvibile.
+async fn resolve_analyzer_model(db: &sqlx::PgPool) -> Result<(String, String), String> {
+    match crate::internal_routing::resolve_purpose_model_db(db, "project_analyzer").await {
+        crate::internal_routing::PurposeResolution::Resolved {
+            provider,
+            model,
+            rationale,
+        } => {
+            tracing::info!("project_analyze: modello risolto {provider}/{model} ({rationale})");
+            Ok((provider, model))
+        }
+        other => Err(format!(
+            "routing purpose 'project_analyzer' non risolvibile: {}",
+            other.into_model("project_analyzer").err().unwrap_or_default()
+        )),
+    }
+}
+
+/// Mappa la risposta del gateway nella forma storica del brain
+/// (`status`/`insights`/`model_used`/`duration_ms`/`error`). Estratto da
+/// [`run_analyzer_completion`] (comportamento identico).
+fn map_analyzer_response(
+    resp: Result<crate::nexus_gateway::GwResponse, impl std::fmt::Display>,
+    model_used: &str,
+    started: std::time::Instant,
+) -> serde_json::Value {
+    let duration_ms = || started.elapsed().as_millis() as i64;
+    match resp {
+        Ok(resp) => {
+            let content = resp.content.trim().to_string();
+            if content.is_empty() {
+                return json!({
+                    "status": "failed",
+                    "error": format!("{model_used}: risposta vuota"),
+                    "insights": null,
+                    "model_used": model_used,
+                    "duration_ms": duration_ms(),
+                });
+            }
+            // Parsing via il punto unico llm_json (gestisce fence/preamboli).
+            match crate::llm_json::parse_llm_json(&content) {
+                Ok(parsed) => json!({
+                    "status": "completed",
+                    "insights": parsed,
+                    "model_used": model_used,
+                    "duration_ms": duration_ms(),
+                }),
+                Err(e) => json!({
+                    "status": "failed",
+                    "error": format!("{model_used}: output non parsabile come JSON: {e}"),
+                    "insights": null,
+                    "model_used": model_used,
+                    "duration_ms": duration_ms(),
+                }),
+            }
+        }
+        Err(e) => json!({
+            "status": "failed",
+            "error": format!("{model_used}: {e}"),
+            "insights": null,
+            "model_used": model_used,
+            "duration_ms": duration_ms(),
+        }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_analyzer_completion(
     db: &sqlx::PgPool,
@@ -257,17 +353,7 @@ async fn run_analyzer_completion(
     registered_services: &[serde_json::Value],
     started: std::time::Instant,
 ) -> Result<serde_json::Value, String> {
-    // Template dal punto unico nexus_prompt_templates (regola L).
-    let template: Option<String> = sqlx::query_scalar::<_, String>(
-        "SELECT content FROM nexus_prompt_templates \
-         WHERE key = 'agent.project.analyzer' AND is_active = TRUE \
-         ORDER BY version DESC LIMIT 1",
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| format!("DB template analyzer: {e}"))?;
-    let template = template
-        .ok_or_else(|| "prompt agent.project.analyzer non trovato/attivo in DB".to_string())?;
+    let template = load_analyzer_template(db).await?;
 
     let summary = if repo_summary.is_empty() {
         format!("progetto {project_name}")
@@ -283,27 +369,7 @@ async fn run_analyzer_completion(
         registered_services,
     );
 
-    // Modello risolto via routing per tier (purpose 'project_analyzer', mig 0461):
-    // best_model_for_tier sceglie il miglior modello del catalog escludendo i
-    // provider in cooldown -> sostituisce il loop chain manuale del brain (regola
-    // L). Niente nome modello hardcoded (regola G).
-    let (provider, model) =
-        match crate::internal_routing::resolve_purpose_model_db(db, "project_analyzer").await {
-            crate::internal_routing::PurposeResolution::Resolved {
-                provider,
-                model,
-                rationale,
-            } => {
-                tracing::info!("project_analyze: modello risolto {provider}/{model} ({rationale})");
-                (provider, model)
-            }
-            other => {
-                return Err(format!(
-                    "routing purpose 'project_analyzer' non risolvibile: {}",
-                    other.into_model("project_analyzer").err().unwrap_or_default()
-                ));
-            }
-        };
+    let (provider, model) = resolve_analyzer_model(db).await?;
 
     // Completion via Nexus Gateway, pinnando il provider deciso a monte (no
     // secondo routing divergente; il cooldown e' gia' stato applicato dalla
@@ -329,43 +395,8 @@ async fn run_analyzer_completion(
     };
 
     let model_used = format!("{provider}/{model}");
-    match gw.complete(gw_req).await {
-        Ok(resp) => {
-            let content = resp.content.trim().to_string();
-            if content.is_empty() {
-                return Ok(json!({
-                    "status": "failed",
-                    "error": format!("{model_used}: risposta vuota"),
-                    "insights": null,
-                    "model_used": model_used,
-                    "duration_ms": started.elapsed().as_millis() as i64,
-                }));
-            }
-            // Parsing via il punto unico llm_json (gestisce fence/preamboli).
-            match crate::llm_json::parse_llm_json(&content) {
-                Ok(parsed) => Ok(json!({
-                    "status": "completed",
-                    "insights": parsed,
-                    "model_used": model_used,
-                    "duration_ms": started.elapsed().as_millis() as i64,
-                })),
-                Err(e) => Ok(json!({
-                    "status": "failed",
-                    "error": format!("{model_used}: output non parsabile come JSON: {e}"),
-                    "insights": null,
-                    "model_used": model_used,
-                    "duration_ms": started.elapsed().as_millis() as i64,
-                })),
-            }
-        }
-        Err(e) => Ok(json!({
-            "status": "failed",
-            "error": format!("{model_used}: {e}"),
-            "insights": null,
-            "model_used": model_used,
-            "duration_ms": started.elapsed().as_millis() as i64,
-        })),
-    }
+    let resp = gw.complete(gw_req).await;
+    Ok(map_analyzer_response(resp, &model_used, started))
 }
 
 // ── Handler HTTP ──────────────────────────────────────────────────────────────
@@ -401,22 +432,7 @@ pub async fn deep_analyze_project(
     }
 
     // ── Fase sync: insert riga 'running' e return 202 ────────────────────────
-    let run_id = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO nexus_project_insights
-            (project_id, insight_version, insights, prompt_key, prompt_version,
-             status, config_files_count)
-         VALUES ($1, 1, '{}'::jsonb, 'agent.project.analyzer', 1, 'running', 0)
-         RETURNING id",
-    )
-    .bind(project_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("insert running: {e}"),
-        )
-    })?;
+    let run_id = insert_running_row(&state.db, project_id).await?;
 
     // Snapshot dei dati per la fase async (la closure vive con 'static).
     let db = state.db.clone();
@@ -427,165 +443,18 @@ pub async fn deep_analyze_project(
     let project_slug = context.details.slug.clone();
 
     tokio::spawn(async move {
-        let started = std::time::Instant::now();
-
-        // 1. Recupera l'ultima analisi statica
-        let static_analysis: serde_json::Value =
-            sqlx::query_scalar::<_, Option<serde_json::Value>>(
-                "SELECT analysis_json FROM projects WHERE id = $1",
-            )
-            .bind(project_id)
-            .fetch_optional(&db)
-            .await
-            .ok()
-            .flatten()
-            .flatten()
-            .unwrap_or(json!({}));
-
-        let lang_hint = static_analysis
-            .get("languages")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|first| first.get("language"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        let frameworks_list: Vec<String> = static_analysis
-            .get("frameworks")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let repo_summary = format!(
-            "{} file totali in {} (linguaggio dominante: {}). Framework: {}.",
-            static_analysis
-                .get("totalFiles")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            project_name,
-            if lang_hint.is_empty() {
-                "non determinato"
-            } else {
-                lang_hint.as_str()
-            },
-            if frameworks_list.is_empty() {
-                "nessuno".to_string()
-            } else {
-                frameworks_list.join(", ")
-            },
-        );
-
-        // 2. Raccoglie config files dal filesystem
-        let config_files = collect_config_files(&root).await;
-        let cfg_count = config_files.len() as i32;
-
-        // 3. Servizi systemd registrati
-        let services = collect_registered_services(&project_slug).await;
-
-        // 4. Esegue l'agente analyzer interamente in Rust (cutover brain->Rust):
-        //    template DB (punto unico nexus_prompt_templates) -> render placeholder
-        //    -> completion via Nexus Gateway -> parse JSON. Nessuna chiamata al
-        //    brain Python. La pipeline replica quella storica di /agent/project-analyze
-        //    (prompt agent.project.analyzer, mig 0094) ma il fallback per cooldown
-        //    e' delegato al routing per tier (best_model_for_tier via purpose
-        //    'project_analyzer', mig 0461) invece del loop chain manuale: il punto
-        //    unico vive nel selettore modello + gateway (regola L), non duplicato qui.
-        let brain_resp: serde_json::Value = match run_analyzer_completion(
-            &db,
-            &project_name,
-            &repo_summary,
-            &lang_hint,
-            &frameworks_list,
-            &config_files,
-            &services,
-            started,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = mark_failed(
-                    &db,
-                    run_id,
-                    &e,
-                    started.elapsed().as_millis() as i32,
-                )
-                .await;
-                return;
-            }
-        };
-
-        // 5. UPDATE finale della riga 'running'
-        let status_str = brain_resp
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("failed");
-        let model_used = brain_resp
-            .get("model_used")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let duration_ms = brain_resp
-            .get("duration_ms")
-            .and_then(|v| v.as_i64())
-            .unwrap_or_else(|| started.elapsed().as_millis() as i64)
-            as i32;
-        let insights_payload = brain_resp.get("insights").cloned().unwrap_or(json!({}));
-        let error_msg = brain_resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        let _ = sqlx::query(
-            "UPDATE nexus_project_insights
-                SET insights = $1, model_used = $2, duration_ms = $3,
-                    config_files_count = $4, status = $5, error_message = $6
-                WHERE id = $7",
-        )
-        .bind(&insights_payload)
-        .bind(&model_used)
-        .bind(duration_ms)
-        .bind(cfg_count)
-        .bind(status_str)
-        .bind(&error_msg)
-        .bind(run_id)
-        .execute(&db)
-        .await;
-
-        tracing::info!(
-            "deep_analyze background: run_id={} status={} duration_ms={}",
+        run_deep_analyze_background(
+            db,
+            neural,
+            project_id,
             run_id,
-            status_str,
-            duration_ms
-        );
-
-        // ADR 0017 v2 TODO 4 — seed knowledge da insights deep-analyze.
-        // Reimplementazione su `wiki_docs` (scope=project, kind='insight')
-        // con embedding upsert in collection unificata `wiki_content`. Solo
-        // sui run completati con successo (lo status_str == 'completed'):
-        // sui run falliti il payload e' tipicamente vuoto/parziale.
-        if status_str == "completed" {
-            let neural_for_seed = neural.clone();
-            let db_for_seed = db.clone();
-            if let Err(e) = seed_insights_to_wiki(
-                &db_for_seed,
-                &neural_for_seed,
-                project_id,
-                run_id,
-                &insights_payload,
-            )
-            .await
-            {
-                tracing::warn!(
-                    project_id = %project_id,
-                    run_id = run_id,
-                    error = %e,
-                    "deep_analyze: seed insights su wiki_docs fallito (best-effort)"
-                );
-            }
-        }
+            root,
+            project_name,
+            project_slug,
+        )
+        .await;
+        // Clone tenuti volutamente (riservati a uso futuro): li scartiamo qui per
+        // preservare l'ownership senza effetti osservabili.
         let _ = (repo_root_str, project_channels);
     });
 
@@ -595,6 +464,224 @@ pub async fn deep_analyze_project(
         "status": "running",
         "message": "Analisi avviata in background. Polla GET /api/projects/:id/insights ogni 3s finche' status != 'running'.",
     })))
+}
+
+/// Inserisce la riga insights iniziale con `status='running'` e ritorna il
+/// `run_id` generato. Estratto dalla fase sync di [`deep_analyze_project`]
+/// (query INSERT parametrizzata, comportamento identico).
+async fn insert_running_row(db: &sqlx::PgPool, project_id: Uuid) -> Result<i64, ApiError> {
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO nexus_project_insights
+            (project_id, insight_version, insights, prompt_key, prompt_version,
+             status, config_files_count)
+         VALUES ($1, 1, '{}'::jsonb, 'agent.project.analyzer', 1, 'running', 0)
+         RETURNING id",
+    )
+    .bind(project_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("insert running: {e}"),
+        )
+    })
+}
+
+/// Ricava `(lang_hint, frameworks_list, repo_summary)` dall'ultima analisi
+/// statica del progetto. Estratto da [`deep_analyze_project`] per contenere la
+/// lunghezza della fase async (comportamento identico).
+fn build_repo_summary(
+    static_analysis: &serde_json::Value,
+    project_name: &str,
+) -> (String, Vec<String>, String) {
+    let lang_hint = static_analysis
+        .get("languages")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|first| first.get("language"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let frameworks_list: Vec<String> = static_analysis
+        .get("frameworks")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let repo_summary = format!(
+        "{} file totali in {} (linguaggio dominante: {}). Framework: {}.",
+        static_analysis
+            .get("totalFiles")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        project_name,
+        if lang_hint.is_empty() {
+            "non determinato"
+        } else {
+            lang_hint.as_str()
+        },
+        if frameworks_list.is_empty() {
+            "nessuno".to_string()
+        } else {
+            frameworks_list.join(", ")
+        },
+    );
+    (lang_hint, frameworks_list, repo_summary)
+}
+
+/// Persiste il risultato dell'analyzer sulla riga 'running' e ritorna
+/// `(status_str, insights_payload)` per l'eventuale seeding. Estratto da
+/// [`deep_analyze_project`] (comportamento identico all'UPDATE inline).
+async fn persist_analyzer_result(
+    db: &sqlx::PgPool,
+    run_id: i64,
+    cfg_count: i32,
+    started: std::time::Instant,
+    brain_resp: &serde_json::Value,
+) -> (String, serde_json::Value) {
+    let status_str = brain_resp
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("failed")
+        .to_string();
+    let model_used = brain_resp
+        .get("model_used")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let duration_ms = brain_resp
+        .get("duration_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| started.elapsed().as_millis() as i64) as i32;
+    let insights_payload = brain_resp.get("insights").cloned().unwrap_or(json!({}));
+    let error_msg = brain_resp
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let _ = sqlx::query(
+        "UPDATE nexus_project_insights
+            SET insights = $1, model_used = $2, duration_ms = $3,
+                config_files_count = $4, status = $5, error_message = $6
+            WHERE id = $7",
+    )
+    .bind(&insights_payload)
+    .bind(&model_used)
+    .bind(duration_ms)
+    .bind(cfg_count)
+    .bind(&status_str)
+    .bind(&error_msg)
+    .bind(run_id)
+    .execute(db)
+    .await;
+
+    tracing::info!(
+        "deep_analyze background: run_id={} status={} duration_ms={}",
+        run_id,
+        status_str,
+        duration_ms
+    );
+
+    (status_str, insights_payload)
+}
+
+/// Corpo della fase async del deep-analyze (eseguita in un task tokio staccato).
+///
+/// Pipeline: recupero analisi statica -> raccolta config/servizi -> completion
+/// analyzer -> UPDATE riga finale -> seed insights su wiki. Estratto dalla
+/// closure di [`deep_analyze_project`] per contenerne la lunghezza; il
+/// comportamento osservabile (query, log, seed) e' identico.
+async fn run_deep_analyze_background(
+    db: sqlx::PgPool,
+    neural: crate::orchestrator::NeuralCoreClient,
+    project_id: Uuid,
+    run_id: i64,
+    root: std::path::PathBuf,
+    project_name: String,
+    project_slug: String,
+) {
+    let started = std::time::Instant::now();
+
+    // 1. Recupera l'ultima analisi statica e ne deriva il riassunto.
+    let static_analysis: serde_json::Value = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT analysis_json FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or(json!({}));
+    let (lang_hint, frameworks_list, repo_summary) =
+        build_repo_summary(&static_analysis, &project_name);
+
+    // 2. Raccoglie config files dal filesystem.
+    let config_files = collect_config_files(&root).await;
+    let cfg_count = config_files.len() as i32;
+
+    // 3. Servizi systemd registrati.
+    let services = collect_registered_services(&project_slug).await;
+
+    // 4. Esegue l'agente analyzer interamente in Rust (cutover brain->Rust):
+    //    template DB (punto unico nexus_prompt_templates) -> render placeholder
+    //    -> completion via Nexus Gateway -> parse JSON. Nessuna chiamata al
+    //    brain Python. La pipeline replica quella storica di /agent/project-analyze
+    //    (prompt agent.project.analyzer, mig 0094) ma il fallback per cooldown
+    //    e' delegato al routing per tier (best_model_for_tier via purpose
+    //    'project_analyzer', mig 0461) invece del loop chain manuale: il punto
+    //    unico vive nel selettore modello + gateway (regola L), non duplicato qui.
+    let brain_resp: serde_json::Value = match run_analyzer_completion(
+        &db,
+        &project_name,
+        &repo_summary,
+        &lang_hint,
+        &frameworks_list,
+        &config_files,
+        &services,
+        started,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = mark_failed(&db, run_id, &e, started.elapsed().as_millis() as i32).await;
+            return;
+        }
+    };
+
+    // 5. UPDATE finale della riga 'running'.
+    let (status_str, insights_payload) =
+        persist_analyzer_result(&db, run_id, cfg_count, started, &brain_resp).await;
+
+    // ADR 0017 v2 TODO 4 — seed knowledge da insights deep-analyze.
+    // Reimplementazione su `wiki_docs` (scope=project, kind='insight')
+    // con embedding upsert in collection unificata `wiki_content`. Solo
+    // sui run completati con successo (lo status_str == 'completed'):
+    // sui run falliti il payload e' tipicamente vuoto/parziale.
+    if status_str == "completed" {
+        let neural_for_seed = neural.clone();
+        let db_for_seed = db.clone();
+        if let Err(e) = seed_insights_to_wiki(
+            &db_for_seed,
+            &neural_for_seed,
+            project_id,
+            run_id,
+            &insights_payload,
+        )
+        .await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                run_id = run_id,
+                error = %e,
+                "deep_analyze: seed insights su wiki_docs fallito (best-effort)"
+            );
+        }
+    }
 }
 
 /// Helper: marca una riga insights come 'failed' con error_message.
@@ -699,132 +786,16 @@ async fn seed_insights_to_wiki(
         return Ok(());
     }
 
+    let total = items.len();
     let mut seeded = 0usize;
     for (idx, item) in items.iter().enumerate() {
-        let slug = if items.len() == 1 {
+        let slug = if total == 1 {
             format!("insight-run-{run_id}")
         } else {
             format!("insight-run-{run_id}-{idx:02}")
         };
-        let title = item
-            .title
-            .clone()
-            .unwrap_or_else(|| format!("Insight run #{run_id}"));
-        let body_md = item.body_md.clone();
-
-        // Tag base + tag per file rilevati (usati per facet search).
-        let mut tags: Vec<String> = vec!["insight".to_string(), "deep-analyze".to_string()];
-        if let Some(category) = &item.category {
-            tags.push(category.clone());
-        }
-        for fp in &item.file_paths {
-            tags.push(format!("file:{fp}"));
-        }
-        // dedup stabile
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        tags.retain(|t| seen.insert(t.clone()));
-
-        // Embed + upsert Qdrant (best-effort).
-        let snippet = if body_md.len() > 2000 {
-            &body_md[..2000]
-        } else {
-            body_md.as_str()
-        };
-        let combined = format!("{title}\n\n{snippet}");
-        let qdrant_point_id: Option<String> = match neural.embed_text("", &combined).await {
-            Ok(vector) => {
-                let doc_uuid = Uuid::new_v4();
-                let point_id = doc_uuid.to_string();
-                let payload = json!({
-                    "scope": "project",
-                    "project_id": project_id.to_string(),
-                    "doc_id": point_id,
-                    "title": title,
-                    "kind": "insight",
-                    "intent": item.category.clone().unwrap_or_default(),
-                });
-                match vector_memory::upsert_wiki_content_point(db, &point_id, vector, payload).await
-                {
-                    Ok(_) => Some(point_id),
-                    Err(e) => {
-                        tracing::debug!(
-                            slug = %slug,
-                            error = %e,
-                            "deep_analyze.seed: upsert Qdrant fallito (proseguo)"
-                        );
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    slug = %slug,
-                    error = %e,
-                    "deep_analyze.seed: embed_text fallito (proseguo senza vector)"
-                );
-                None
-            }
-        };
-
-        let body_hash = crate::wiki::vault::sha256_hex(&body_md);
-        let res = sqlx::query(
-            r#"
-            INSERT INTO wiki_docs (
-                scope, project_id, slug, title, body_md, body_hash,
-                kind, intent, tags, qdrant_point_id,
-                edit_lock, protected_sections, manually_edited,
-                generated_hash, edited_hash,
-                current_version, auto_generated, public_read
-            ) VALUES (
-                'project', $1, $2, $3, $4, $5,
-                'insight', $6, $7, $8,
-                'none', '{}', FALSE,
-                $5, NULL,
-                1, TRUE, FALSE
-            )
-            ON CONFLICT (scope, COALESCE(project_id::text,''), slug) DO UPDATE SET
-                title           = EXCLUDED.title,
-                body_md         = EXCLUDED.body_md,
-                body_hash       = EXCLUDED.body_hash,
-                tags            = EXCLUDED.tags,
-                qdrant_point_id = COALESCE(EXCLUDED.qdrant_point_id, wiki_docs.qdrant_point_id),
-                generated_hash  = CASE
-                                    WHEN wiki_docs.manually_edited THEN wiki_docs.generated_hash
-                                    ELSE EXCLUDED.body_hash
-                                  END,
-                updated_at      = NOW()
-            "#,
-        )
-        .bind(project_id)
-        .bind(&slug)
-        .bind(&title)
-        .bind(&body_md)
-        .bind(&body_hash)
-        .bind(item.category.as_deref())
-        .bind(&tags)
-        .bind(qdrant_point_id.as_deref())
-        .execute(db)
-        .await;
-
-        match res {
-            Ok(_) => {
-                seeded += 1;
-                tracing::info!(
-                    project_id = %project_id,
-                    run_id = run_id,
-                    slug = %slug,
-                    "wiki.deep_analyze: insight seedato come wiki_doc"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    project_id = %project_id,
-                    run_id = run_id,
-                    slug = %slug,
-                    error = %e,
-                    "deep_analyze.seed: INSERT wiki_docs fallito"
-                );
-            }
+        if seed_single_insight(db, neural, project_id, run_id, &slug, item).await {
+            seeded += 1;
         }
     }
 
@@ -832,10 +803,161 @@ async fn seed_insights_to_wiki(
         project_id = %project_id,
         run_id = run_id,
         seeded,
-        total = items.len(),
+        total,
         "deep_analyze.seed: completato"
     );
     Ok(())
+}
+
+/// Costruisce i tag di un insight: base (`insight`, `deep-analyze`) + categoria +
+/// `file:<path>` per ogni file rilevato, con dedup stabile (ordine preservato).
+fn build_insight_tags(item: &InsightItem) -> Vec<String> {
+    let mut tags: Vec<String> = vec!["insight".to_string(), "deep-analyze".to_string()];
+    if let Some(category) = &item.category {
+        tags.push(category.clone());
+    }
+    for fp in &item.file_paths {
+        tags.push(format!("file:{fp}"));
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    tags.retain(|t| seen.insert(t.clone()));
+    tags
+}
+
+/// Embed del testo dell'insight + upsert nella collection `wiki_content`
+/// (best-effort). Ritorna il `qdrant_point_id` se l'upsert e' andato a buon fine,
+/// `None` se embed o upsert falliscono (il doc resta comunque in DB senza vector).
+async fn embed_insight_point(
+    db: &PgPool,
+    neural: &crate::orchestrator::NeuralCoreClient,
+    project_id: Uuid,
+    item: &InsightItem,
+    title: &str,
+    body_md: &str,
+    slug: &str,
+) -> Option<String> {
+    let snippet = if body_md.len() > 2000 {
+        &body_md[..2000]
+    } else {
+        body_md
+    };
+    let combined = format!("{title}\n\n{snippet}");
+    match neural.embed_text("", &combined).await {
+        Ok(vector) => {
+            let point_id = Uuid::new_v4().to_string();
+            let payload = json!({
+                "scope": "project",
+                "project_id": project_id.to_string(),
+                "doc_id": point_id,
+                "title": title,
+                "kind": "insight",
+                "intent": item.category.clone().unwrap_or_default(),
+            });
+            match vector_memory::upsert_wiki_content_point(db, &point_id, vector, payload).await {
+                Ok(_) => Some(point_id),
+                Err(e) => {
+                    tracing::debug!(
+                        slug = %slug,
+                        error = %e,
+                        "deep_analyze.seed: upsert Qdrant fallito (proseguo)"
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                slug = %slug,
+                error = %e,
+                "deep_analyze.seed: embed_text fallito (proseguo senza vector)"
+            );
+            None
+        }
+    }
+}
+
+/// Materializza un singolo insight come `wiki_doc` (embed best-effort + upsert
+/// idempotente su `uq_wiki_docs_slug`). Ritorna `true` se l'INSERT/UPDATE e'
+/// riuscito. Estratto dal loop di [`seed_insights_to_wiki`] (comportamento
+/// identico per singolo item).
+async fn seed_single_insight(
+    db: &PgPool,
+    neural: &crate::orchestrator::NeuralCoreClient,
+    project_id: Uuid,
+    run_id: i64,
+    slug: &str,
+    item: &InsightItem,
+) -> bool {
+    let title = item
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Insight run #{run_id}"));
+    let body_md = item.body_md.clone();
+    let tags = build_insight_tags(item);
+    let qdrant_point_id =
+        embed_insight_point(db, neural, project_id, item, &title, &body_md, slug).await;
+
+    let body_hash = crate::wiki::vault::sha256_hex(&body_md);
+    let res = sqlx::query(
+        r#"
+        INSERT INTO wiki_docs (
+            scope, project_id, slug, title, body_md, body_hash,
+            kind, intent, tags, qdrant_point_id,
+            edit_lock, protected_sections, manually_edited,
+            generated_hash, edited_hash,
+            current_version, auto_generated, public_read
+        ) VALUES (
+            'project', $1, $2, $3, $4, $5,
+            'insight', $6, $7, $8,
+            'none', '{}', FALSE,
+            $5, NULL,
+            1, TRUE, FALSE
+        )
+        ON CONFLICT (scope, COALESCE(project_id::text,''), slug) DO UPDATE SET
+            title           = EXCLUDED.title,
+            body_md         = EXCLUDED.body_md,
+            body_hash       = EXCLUDED.body_hash,
+            tags            = EXCLUDED.tags,
+            qdrant_point_id = COALESCE(EXCLUDED.qdrant_point_id, wiki_docs.qdrant_point_id),
+            generated_hash  = CASE
+                                WHEN wiki_docs.manually_edited THEN wiki_docs.generated_hash
+                                ELSE EXCLUDED.body_hash
+                              END,
+            updated_at      = NOW()
+        "#,
+    )
+    .bind(project_id)
+    .bind(slug)
+    .bind(&title)
+    .bind(&body_md)
+    .bind(&body_hash)
+    .bind(item.category.as_deref())
+    .bind(&tags)
+    .bind(qdrant_point_id.as_deref())
+    .execute(db)
+    .await;
+
+    match res {
+        Ok(_) => {
+            tracing::info!(
+                project_id = %project_id,
+                run_id = run_id,
+                slug = %slug,
+                "wiki.deep_analyze: insight seedato come wiki_doc"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                run_id = run_id,
+                slug = %slug,
+                error = %e,
+                "deep_analyze.seed: INSERT wiki_docs fallito"
+            );
+            false
+        }
+    }
 }
 
 /// Item normalizzato estratto dal payload insights (categorie LLM-agnostiche).
@@ -874,43 +996,53 @@ fn extract_insight_items(insights: &Value) -> Vec<InsightItem> {
     // 2) Se il payload e' un oggetto top-level con `summary` o `overview` lo
     //    trasformiamo in un singolo item descrittivo.
     if let Some(obj) = insights.as_object() {
-        // Vuoto -> niente da seedare.
-        if obj.is_empty() {
-            return Vec::new();
-        }
-        let title = obj
-            .get("title")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let body = obj
-            .get("summary")
-            .or_else(|| obj.get("overview"))
-            .or_else(|| obj.get("description"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                // Fallback: dump JSON intero come body markdown.
-                format!(
-                    "```json\n{}\n```",
-                    serde_json::to_string_pretty(insights).unwrap_or_default()
-                )
-            });
-        if body.trim().is_empty() {
-            return Vec::new();
-        }
-        return vec![InsightItem {
-            title,
-            body_md: body,
-            category: obj
-                .get("category")
-                .or_else(|| obj.get("kind"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            file_paths: Vec::new(),
-        }];
+        return single_item_from_object(insights, obj);
     }
 
     Vec::new()
+}
+
+/// Costruisce (al piu') un singolo [`InsightItem`] descrittivo da un oggetto
+/// top-level privo di array note. Fallback: dump JSON pretty come body markdown.
+/// Estratto da [`extract_insight_items`] (comportamento identico).
+fn single_item_from_object(
+    insights: &Value,
+    obj: &serde_json::Map<String, Value>,
+) -> Vec<InsightItem> {
+    // Vuoto -> niente da seedare.
+    if obj.is_empty() {
+        return Vec::new();
+    }
+    let title = obj
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let body = obj
+        .get("summary")
+        .or_else(|| obj.get("overview"))
+        .or_else(|| obj.get("description"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            // Fallback: dump JSON intero come body markdown.
+            format!(
+                "```json\n{}\n```",
+                serde_json::to_string_pretty(insights).unwrap_or_default()
+            )
+        });
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![InsightItem {
+        title,
+        body_md: body,
+        category: obj
+            .get("category")
+            .or_else(|| obj.get("kind"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        file_paths: Vec::new(),
+    }]
 }
 
 fn parse_insight_object(obj: &serde_json::Map<String, Value>) -> InsightItem {
@@ -947,6 +1079,20 @@ fn parse_insight_object(obj: &serde_json::Map<String, Value>) -> InsightItem {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let file_paths = collect_item_file_paths(obj);
+
+    InsightItem {
+        title,
+        body_md,
+        category,
+        file_paths,
+    }
+}
+
+/// Raccoglie i path dei file citati da un insight (chiavi array note + singolo
+/// `file`), con trim, dedup e ordinamento stabile. Estratto da
+/// [`parse_insight_object`] (comportamento identico).
+fn collect_item_file_paths(obj: &serde_json::Map<String, Value>) -> Vec<String> {
     let mut file_paths: Vec<String> = Vec::new();
     for key in ["files", "file_paths", "evidence_files", "paths"] {
         if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
@@ -969,13 +1115,7 @@ fn parse_insight_object(obj: &serde_json::Map<String, Value>) -> InsightItem {
     }
     file_paths.sort();
     file_paths.dedup();
-
-    InsightItem {
-        title,
-        body_md,
-        category,
-        file_paths,
-    }
+    file_paths
 }
 
 #[cfg(test)]
