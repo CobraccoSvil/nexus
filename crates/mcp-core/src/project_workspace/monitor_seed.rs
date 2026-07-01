@@ -65,38 +65,69 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-/// Progetti con attivita' recente (sessione chat, dispatcher events o servizi
-/// installati). Evita di emettere metriche per progetti dormienti.
+/// Progetti con attivita' recente (sessione chat o agent_processes recenti).
+/// Evita di emettere metriche per progetti dormienti.
+///
+/// Separazione DB per-progetto (regola G/L): `chat_sessions` e `agent_processes`
+/// sono domini MIGRATI (vedi `db/migrations/project/0001_chat.sql`,
+/// `0002_run.sql`), quindi a flag ON vivono nel DB del progetto e NON si possono
+/// interrogare dal meta con una JOIN su `projects`. Iteriamo i progetti
+/// (`list_all_project_ids`, tabella globale meta) e sondiamo l'attivita' sul pool
+/// di CIASCUNO (`project_data_pool_from`) — stesso pattern del `task_watchdog`
+/// per i processi orfani. A flag OFF ogni pool e' il meta: comportamento storico
+/// preservato. Query per-pool best-effort: un errore degrada a "non attivo",
+/// mai rompe il round.
 async fn recent_active_projects(
-    db: &sqlx::PgPool,
+    meta: &sqlx::PgPool,
     idle_minutes: i64,
 ) -> Result<Vec<(Uuid, String)>, String> {
-    let rows = sqlx::query(
+    // Elenco (id + slug) dalla tabella globale `projects` (meta-DB).
+    let projects = sqlx::query(
         r#"
-        SELECT p.id AS project_id,
-               LOWER(REPLACE(REPLACE(p.name, ' ', '-'), '_', '-')) AS slug
-          FROM projects p
-         WHERE EXISTS (
-                   SELECT 1 FROM chat_sessions s
-                    WHERE s.project_id = p.id
-                      AND s.updated_at > NOW() - ($1::text || ' minutes')::interval
-               )
-            OR EXISTS (
-                   SELECT 1 FROM agent_processes a
-                    WHERE a.project_id = p.id
-                      AND COALESCE(a.stopped_at, a.created_at) > NOW() - ($1::text || ' minutes')::interval
-               )
-         LIMIT 50
+        SELECT id AS project_id,
+               LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) AS slug
+          FROM projects
         "#,
     )
-    .bind(idle_minutes.to_string())
-    .fetch_all(db)
+    .fetch_all(meta)
     .await
     .map_err(|e| e.to_string())?;
-    Ok(rows
-        .into_iter()
-        .map(|r| (r.get::<Uuid, _>("project_id"), r.get::<String, _>("slug")))
-        .collect())
+
+    let idle = idle_minutes.to_string();
+    let mut active: Vec<(Uuid, String)> = Vec::new();
+    for row in projects {
+        let project_id: Uuid = row.get("project_id");
+        let slug: String = row.get("slug");
+        // Pool dove risiedono i dati vivi del progetto (meta a flag OFF).
+        let pool = crate::project_db_routes::project_data_pool_from(meta, project_id).await;
+        let is_active: bool = sqlx::query_scalar(
+            r#"
+            SELECT
+                EXISTS (
+                    SELECT 1 FROM chat_sessions
+                     WHERE project_id = $1
+                       AND updated_at > NOW() - ($2::text || ' minutes')::interval
+                )
+                OR EXISTS (
+                    SELECT 1 FROM agent_processes
+                     WHERE project_id = $1
+                       AND COALESCE(stopped_at, created_at) > NOW() - ($2::text || ' minutes')::interval
+                )
+            "#,
+        )
+        .bind(project_id)
+        .bind(idle.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(false);
+        if is_active {
+            active.push((project_id, slug));
+            if active.len() >= 50 {
+                break;
+            }
+        }
+    }
+    Ok(active)
 }
 
 /// Calcola le KPI di default. Tutto best-effort: se una sorgente fallisce, la
