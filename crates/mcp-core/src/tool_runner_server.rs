@@ -56,45 +56,72 @@ impl ToolRunnerService {
     /// (avviene gia' a monte negli handler chat di mcp-core al momento
     /// dell'invio del messaggio utente).
     async fn resolve_session(&self, session_id: Uuid) -> Result<SessionInfo, Status> {
-        let row = sqlx::query(
+        // Separazione DB (flag ON): `chat_sessions` vive nel DB per-progetto, mentre
+        // `projects`/`project_members`/`workspaces`/`repositories` restano nel meta.
+        // Il JOIN cross-DB non e' eseguibile su un solo pool: lo spezziamo e ricomponiamo
+        // in Rust preservando la semantica del JOIN originale.
+        let project_pool =
+            crate::project_db_routes::project_data_pool_by_session_from(&self.deps.db, session_id)
+                .await;
+
+        // (1) Parte migrata: sessione dal pool per-progetto (nessun JOIN).
+        let session_row = sqlx::query(
             r#"
-            SELECT
-                s.project_id,
-                s.user_id,
-                COALESCE(r.root_path, w.absolute_path) AS root_path,
-                COALESCE(r.is_git_repo, FALSE)         AS is_git_repo,
-                CASE
-                    WHEN p.owner_user_id = s.user_id THEN 'owner'
-                    ELSE COALESCE(pm.role, 'viewer')
-                END AS role
+            SELECT s.project_id, s.user_id
             FROM chat_sessions s
-            JOIN projects p ON p.id = s.project_id
-            LEFT JOIN project_members pm
-                ON pm.project_id = s.project_id AND pm.user_id = s.user_id
-            LEFT JOIN workspaces w
-                ON w.project_id = s.project_id AND w.is_primary = TRUE
-            LEFT JOIN repositories r
-                ON r.project_id = s.project_id
             WHERE s.id = $1
             LIMIT 1
             "#,
         )
         .bind(session_id)
-        .fetch_optional(&self.deps.db)
+        .fetch_optional(&project_pool)
         .await
         .map_err(|e| Status::internal(format!("DB error: {e}")))?
         .ok_or_else(|| Status::not_found("session non trovata"))?;
 
-        let project_id: Uuid = row
+        let project_id: Uuid = session_row
             .try_get("project_id")
             .map_err(|e| Status::internal(format!("project_id: {e}")))?;
-        let user_id: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
+        let user_id: Option<Uuid> = session_row.try_get("user_id").unwrap_or(None);
         let user_id = user_id.ok_or_else(|| Status::failed_precondition("session senza user"))?;
-        let root_path: String = row
+
+        // (2) Parte globale: project/workspace/repository/membership dal meta,
+        // keyed dal project_id risolto. Riproduce i LEFT JOIN del query originale.
+        let meta_row = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(r.root_path, w.absolute_path) AS root_path,
+                COALESCE(r.is_git_repo, FALSE)         AS is_git_repo,
+                CASE
+                    WHEN p.owner_user_id = $2 THEN 'owner'
+                    ELSE COALESCE(pm.role, 'viewer')
+                END AS role
+            FROM projects p
+            LEFT JOIN project_members pm
+                ON pm.project_id = p.id AND pm.user_id = $2
+            LEFT JOIN workspaces w
+                ON w.project_id = p.id AND w.is_primary = TRUE
+            LEFT JOIN repositories r
+                ON r.project_id = p.id
+            WHERE p.id = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&self.deps.db)
+        .await
+        .map_err(|e| Status::internal(format!("DB error: {e}")))?
+        .ok_or_else(|| Status::not_found("progetto non trovato"))?;
+
+        // (3) Ricomposizione dei campi come faceva il JOIN.
+        let root_path: String = meta_row
             .try_get("root_path")
             .map_err(|_| Status::failed_precondition("workspace non configurato"))?;
-        let is_git_repo: bool = row.try_get("is_git_repo").unwrap_or(false);
-        let role: String = row.try_get("role").unwrap_or_else(|_| "viewer".to_string());
+        let is_git_repo: bool = meta_row.try_get("is_git_repo").unwrap_or(false);
+        let role: String = meta_row
+            .try_get("role")
+            .unwrap_or_else(|_| "viewer".to_string());
         let can_write = matches!(role.as_str(), "owner" | "admin" | "editor");
 
         Ok(SessionInfo {

@@ -191,7 +191,7 @@ pub async fn send_chat_message(
              LIMIT 1",
         )
         .bind(context.session_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&session_pool)
         .await
         .ok()
         .flatten();
@@ -378,7 +378,7 @@ pub async fn send_chat_message(
                 "SELECT preferred_provider, preferred_model FROM chat_sessions WHERE id = $1",
             )
             .bind(context.session_id)
-            .fetch_optional(&state.db)
+            .fetch_optional(&session_pool)
             .await
             .ok()
             .flatten()
@@ -508,7 +508,7 @@ pub async fn send_chat_message(
                    LIMIT 1"#,
             )
             .bind(context.session_id)
-            .fetch_optional(&state.db)
+            .fetch_optional(&session_pool)
             .await
             .ok()
             .flatten();
@@ -1022,6 +1022,14 @@ pub async fn resend_chat_message(
     let message_id = Uuid::parse_str(&message_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
 
+    // Separazione DB: chat_messages/chat_sessions/chat_message_attachments migrate
+    // nel DB del progetto. Risolvo una volta il pool del progetto a partire dal
+    // message_id (Path param) e lo riuso per tutte le SELECT su queste tabelle. Il
+    // JOIN chat_messages+chat_sessions e' su un solo pool perche' entrambe vivono
+    // nello stesso <slug>_nexus (flag off -> meta-DB, comportamento storico).
+    let msg_pool =
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
+
     let row = sqlx::query(
         r#"
         SELECT
@@ -1039,7 +1047,7 @@ pub async fn resend_chat_message(
         "#,
     )
     .bind(message_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&msg_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1090,7 +1098,7 @@ pub async fn resend_chat_message(
         )
         .bind(session_id)
         .bind(created_at)
-        .fetch_optional(&state.db)
+        .fetch_optional(&msg_pool)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
@@ -1110,7 +1118,7 @@ pub async fn resend_chat_message(
         "#,
     )
     .bind(source_user_message_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&msg_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .ok_or_else(|| {
@@ -1127,7 +1135,7 @@ pub async fn resend_chat_message(
         "#,
     )
     .bind(source_user_message_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&msg_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .unwrap_or_else(|| json!({}));
@@ -1176,7 +1184,7 @@ pub async fn resend_chat_message(
     // re-incappa nel bug del fallback al filename (vedi
     // enrich_attachments_with_ids_from_db).
     let attachments =
-        enrich_attachments_with_ids_from_db(&state.db, attachments_raw, source_user_message_id)
+        enrich_attachments_with_ids_from_db(&msg_pool, attachments_raw, source_user_message_id)
             .await;
     let attachments_metadata = if body.attachments.is_empty() {
         source_metadata

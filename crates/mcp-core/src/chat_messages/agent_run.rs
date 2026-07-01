@@ -712,6 +712,8 @@ async fn run_narrative_llm(
 /// nel filesystem del progetto. Metadata-only: niente pre-extraction, cap 10
 /// allegati piu' recenti.
 async fn build_session_attachments_block(
+    // Pool del DB PER-PROGETTO (chat_message_attachments e' migrata): risolto dal
+    // chiamante via project_data_pool_by_session_from. A flag OFF e' il meta.
     db: &PgPool,
     content: &str,
     session_id: Uuid,
@@ -779,6 +781,8 @@ async fn build_session_attachments_block(
 }
 
 pub(crate) async fn build_initial_msg_with_attachments(
+    // Pool del DB PER-PROGETTO (chat_message_attachments e' migrata): risolto dal
+    // chiamante via project_data_pool_by_session_from. A flag OFF e' il meta.
     db: &PgPool,
     content: &str,
     attachments: &[crate::orchestrator::ChatAttachment],
@@ -2220,8 +2224,14 @@ pub(crate) async fn spawn_agent_run(
     // (funzione dedicata) per non gonfiare ulteriormente spawn_agent_run, che e'
     // gia' enorme: una closure complessa inline qui faceva degenerare il typeck
     // del compilatore (ICE).
+    // chat_message_attachments vive nel DB del progetto (separazione DB): risolvo
+    // il pool per-progetto dalla sessione e lo passo alle query interne, coerente
+    // con il worklog piu' sotto. A flag OFF l'helper ritorna il meta.
+    let att_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, params.session_id)
+            .await;
     let initial_msg = build_initial_msg_with_attachments(
-        &state.db,
+        &att_pool,
         &params.content,
         &params.attachments,
         params.user_message_id,

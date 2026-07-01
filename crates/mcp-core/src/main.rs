@@ -369,6 +369,12 @@ async fn main() -> anyhow::Result<()> {
     // Riconcilia i processi lasciati in stato 'running'/'starting' da un riavvio precedente.
     // - PID non più vivo → status=failed
     // - PID ancora vivo → rimane running, si rilancia un task di monitoring (OS-specifico)
+    //
+    // NOTA (separazione DB): `agent_processes` e' MIGRATA al DB per-progetto. Questo
+    // blocco opera sul META (storico / progetti NON migrati); a flag ON il meta e'
+    // quasi vuoto -> no-op benigno. La riconciliazione dei processi per-progetto a
+    // flag ON e' gestita dal blocco NUOVO (mark-only) DOPO init_global_pools, che
+    // itera list_all_project_ids + project_data_pool_from. NON duplicare qui.
     {
         use sqlx::Row;
         let stale = sqlx::query(
@@ -1601,28 +1607,52 @@ async fn dashboard(State(state): State<AppState>) -> Json<serde_json::Value> {
     .await
     .unwrap_or(0);
 
-    let shadow_db_status = sqlx::query_scalar::<_, String>(
-        "SELECT status FROM jobs WHERE job_type = 'shadow_db_validation' ORDER BY created_at DESC LIMIT 1",
-    )
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "no_runs".to_string());
+    // orchestrator_runs e jobs sono MIGRATE al DB per-progetto (separazione DB):
+    // a flag ON le copie meta sono vuote. Questo handler non ha un project_id in
+    // scope (aggregato globale), quindi iteriamo tutti i progetti e SOMMIAMO i
+    // conteggi per-progetto (per shadow_db_status prendiamo lo stato del job piu'
+    // recente cross-progetto). A flag OFF gli helper ritornano il meta -> stessa
+    // semantica di prima (behavior-preserving). ai_usage_ledger e
+    // project_quality_findings restano sul meta (tabelle globali, non toccate).
+    let mut total_runs: i64 = 0;
+    let mut active_jobs: i64 = 0;
+    let mut latest_shadow: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+    for project_id in project_db_routes::list_all_project_ids(&state.db).await {
+        let pool = project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
+        total_runs += sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM orchestrator_runs WHERE created_at > NOW() - INTERVAL '30 days'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+
+        active_jobs += sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+
+        if let Ok(Some(row)) = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, String)>(
+            "SELECT created_at, status FROM jobs WHERE job_type = 'shadow_db_validation' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        {
+            if latest_shadow
+                .as_ref()
+                .is_none_or(|(ts, _)| row.0 > *ts)
+            {
+                latest_shadow = Some(row);
+            }
+        }
+    }
+    let shadow_db_status = latest_shadow
+        .map(|(_, status)| status)
+        .unwrap_or_else(|| "no_runs".to_string());
 
     let stats = token_stats.unwrap_or_default();
-
-    let total_runs: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM orchestrator_runs WHERE created_at > NOW() - INTERVAL '30 days'",
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
-    let active_jobs: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')")
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or(0);
 
     Json(json!({
         "tokenUsage": {

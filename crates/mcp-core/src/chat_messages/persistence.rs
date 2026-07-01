@@ -189,8 +189,13 @@ pub(crate) fn enrich_attachments_with_ids(
 /// allegati gia' persistiti in `chat_message_attachments`. Usato dai code path
 /// di resend/regenerate dove la persistenza e' avvenuta in un turno precedente
 /// e non e' disponibile il `Vec<SavedAttachment>`.
+///
+/// Separazione DB: `chat_message_attachments` e' migrata nel DB del progetto. Il
+/// chiamante DEVE passare un pool GIA' instradato al progetto (risolto via
+/// `project_data_pool_by_message_from` o affine) — NON il meta-DB, che a flag ON
+/// non contiene piu' queste righe e ritornerebbe vuoto.
 pub(crate) async fn enrich_attachments_with_ids_from_db(
-    db: &PgPool,
+    pool: &PgPool,
     atts: Vec<ChatAttachment>,
     message_id: Uuid,
 ) -> Vec<ChatAttachment> {
@@ -202,7 +207,7 @@ pub(crate) async fn enrich_attachments_with_ids_from_db(
            WHERE message_id = $1 ORDER BY created_at ASC"#,
     )
     .bind(message_id)
-    .fetch_all(db)
+    .fetch_all(pool)
     .await
     {
         Ok(r) => r,

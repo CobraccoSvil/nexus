@@ -314,14 +314,18 @@ async fn flush_output(
 /// Read the last N chars of output for a process
 pub async fn read_process_output(
     db: &PgPool,
+    project_id: Uuid,
     process_id: Uuid,
     max_chars: usize,
 ) -> Result<ProcessOutput, String> {
+    // Separazione DB: agent_processes vive nel pool del progetto (flag ON),
+    // risolto dal project_id passato dal chiamante. A flag OFF -> meta-DB.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
     let row = sqlx::query(
         "SELECT status, exit_code, output, error_output, command, pid FROM agent_processes WHERE id=$1",
     )
     .bind(process_id)
-    .fetch_optional(db)
+    .fetch_optional(&proj_pool)
     .await
     .map_err(|e| format!("DB error: {e}"))?
     .ok_or_else(|| "Process not found".to_string())?;

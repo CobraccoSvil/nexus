@@ -244,19 +244,31 @@ async fn inspect_docker_compose_health(
 }
 
 async fn run_one_round(state: &AppState) -> Result<(), String> {
-    let rows = sqlx::query(
-        "SELECT id, project_id, session_id, label, command, status, exit_code, output, error_output \
-           FROM agent_processes \
-          WHERE status IN ('stopped', 'failed') \
-            AND session_id IS NOT NULL \
-            AND resume_dispatched_at IS NULL \
-            AND stopped_at > NOW() - INTERVAL '1 hour' \
-          ORDER BY stopped_at ASC \
-          LIMIT 5",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    // Routing separazione DB: agent_processes e' tabella per-progetto. La
+    // SELECT-driver che pilota il round deve girare sul pool di OGNI progetto
+    // (a flag ON il meta e' vuoto), non sul meta. Pattern worker cross-progetto
+    // (regola G/L): itero list_all_project_ids e per ciascuno risolvo il pool
+    // per-progetto ed eseguo la SELECT-driver su quel pool, poi processo le
+    // righe come prima. A flag OFF ogni pool ritorna il meta -> behavior
+    // preservato.
+    let mut rows = Vec::new();
+    for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
+        let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
+        let project_rows = sqlx::query(
+            "SELECT id, project_id, session_id, label, command, status, exit_code, output, error_output \
+               FROM agent_processes \
+              WHERE status IN ('stopped', 'failed') \
+                AND session_id IS NOT NULL \
+                AND resume_dispatched_at IS NULL \
+                AND stopped_at > NOW() - INTERVAL '1 hour' \
+              ORDER BY stopped_at ASC \
+              LIMIT 5",
+        )
+        .fetch_all(&proj_pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        rows.extend(project_rows);
+    }
 
     let cap = load_i64(&state.db, "agent.process_resume.max_per_session_hour", 12).await;
     let tail_chars = load_u64(

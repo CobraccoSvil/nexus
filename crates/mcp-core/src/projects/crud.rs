@@ -7,6 +7,12 @@ pub async fn list_user_projects(
     Extension(claims): Extension<Claims>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
+    // Separazione DB: project_open_sessions e' una tabella MIGRATA (vive nel
+    // DB per-progetto). A flag ON un LEFT JOIN sul meta ritornerebbe sempre
+    // last_opened_at NULL. Le tabelle projects/project_members/workspaces/
+    // repositories sono GLOBALI (restano nel meta). Quindi: prima leggo il set
+    // di progetti + campi globali dal meta, poi risolvo last_opened_at per
+    // progetto dal pool per-progetto e applico l'ordinamento in Rust.
     let rows = sqlx::query(
         r#"
         SELECT
@@ -16,6 +22,7 @@ pub async fn list_user_projects(
             p.owner_user_id,
             p.visibility,
             p.analyzed_at,
+            p.created_at,
             w.id AS workspace_id,
             w.absolute_path,
             COALESCE(r.is_git_repo, FALSE) AS is_git_repo,
@@ -23,8 +30,7 @@ pub async fn list_user_projects(
             CASE
                 WHEN p.owner_user_id = $1 THEN 'owner'
                 ELSE pm.role
-            END AS current_user_role,
-            pos.updated_at AS last_opened_at
+            END AS current_user_role
         FROM projects p
         LEFT JOIN project_members pm
             ON pm.project_id = p.id AND pm.user_id = $1
@@ -32,10 +38,7 @@ pub async fn list_user_projects(
             ON w.project_id = p.id AND w.is_primary = TRUE
         LEFT JOIN repositories r
             ON r.project_id = p.id
-        LEFT JOIN project_open_sessions pos
-            ON pos.project_id = p.id AND pos.user_id = $1
         WHERE p.owner_user_id = $1 OR pm.user_id IS NOT NULL
-        ORDER BY COALESCE(pos.updated_at, p.created_at) DESC, p.name ASC
         "#,
     )
     .bind(user_id)
@@ -43,55 +46,89 @@ pub async fn list_user_projects(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let projects = rows
+    // Chiave di ordinamento originale: COALESCE(last_opened_at, created_at) DESC,
+    // name ASC. La conserviamo insieme al summary per ordinare dopo aver risolto
+    // last_opened_at dai pool per-progetto.
+    let mut entries: Vec<(chrono::DateTime<chrono::Utc>, String, UserProjectSummary)> =
+        Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let project_id = row.get::<Uuid, _>("id");
+        let role = row
+            .try_get::<Option<String>, _>("current_user_role")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "viewer".to_string());
+        let access = map_access(&role);
+        let analyzed_at = row
+            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("analyzed_at")
+            .ok()
+            .flatten()
+            .map(|ts| ts.to_rfc3339());
+        let is_analyzed = analyzed_at.is_some();
+        let created_at = row.get::<chrono::DateTime<chrono::Utc>, _>("created_at");
+
+        // last_opened_at vive nel DB per-progetto (project_open_sessions migrata):
+        // risolvo il pool del progetto e leggo il valore. A flag OFF l'helper
+        // ritorna il meta-DB (comportamento storico preservato).
+        let proj_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+        let last_opened_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            r#"
+            SELECT updated_at FROM project_open_sessions
+            WHERE project_id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&proj_pool)
+        .await
+        .ok()
+        .flatten();
+
+        let sort_key = last_opened_at.unwrap_or(created_at);
+        let name = row.get::<String, _>("name");
+
+        let summary = UserProjectSummary {
+            id: project_id.to_string(),
+            name: name.clone(),
+            slug: row.get::<String, _>("slug"),
+            owner_user_id: row.get::<Uuid, _>("owner_user_id").to_string(),
+            current_user_role: access.current_user_role,
+            can_write: access.can_write,
+            can_manage_git: access.can_manage_git,
+            is_shared: access.is_shared,
+            visibility: row.get::<String, _>("visibility"),
+            workspace_id: row
+                .try_get::<Option<Uuid>, _>("workspace_id")
+                .ok()
+                .flatten()
+                .map(|id| id.to_string()),
+            root_path: row
+                .try_get::<Option<String>, _>("absolute_path")
+                .ok()
+                .flatten(),
+            is_git_repo: row.get::<bool, _>("is_git_repo"),
+            current_branch: row
+                .try_get::<Option<String>, _>("current_branch")
+                .ok()
+                .flatten(),
+            last_opened_at: last_opened_at.map(|ts| ts.to_rfc3339()),
+            analyzed_at,
+            is_analyzed,
+            nexus_ready: is_analyzed,
+        };
+
+        entries.push((sort_key, name, summary));
+    }
+
+    // Ordinamento equivalente all'ORDER BY originale:
+    // COALESCE(last_opened_at, created_at) DESC, name ASC.
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let projects = entries
         .into_iter()
-        .map(|row| {
-            let role = row
-                .try_get::<Option<String>, _>("current_user_role")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "viewer".to_string());
-            let access = map_access(&role);
-            let analyzed_at = row
-                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("analyzed_at")
-                .ok()
-                .flatten()
-                .map(|ts| ts.to_rfc3339());
-            let is_analyzed = analyzed_at.is_some();
-            UserProjectSummary {
-                id: row.get::<Uuid, _>("id").to_string(),
-                name: row.get::<String, _>("name"),
-                slug: row.get::<String, _>("slug"),
-                owner_user_id: row.get::<Uuid, _>("owner_user_id").to_string(),
-                current_user_role: access.current_user_role,
-                can_write: access.can_write,
-                can_manage_git: access.can_manage_git,
-                is_shared: access.is_shared,
-                visibility: row.get::<String, _>("visibility"),
-                workspace_id: row
-                    .try_get::<Option<Uuid>, _>("workspace_id")
-                    .ok()
-                    .flatten()
-                    .map(|id| id.to_string()),
-                root_path: row
-                    .try_get::<Option<String>, _>("absolute_path")
-                    .ok()
-                    .flatten(),
-                is_git_repo: row.get::<bool, _>("is_git_repo"),
-                current_branch: row
-                    .try_get::<Option<String>, _>("current_branch")
-                    .ok()
-                    .flatten(),
-                last_opened_at: row
-                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_opened_at")
-                    .ok()
-                    .flatten()
-                    .map(|ts| ts.to_rfc3339()),
-                analyzed_at,
-                is_analyzed,
-                nexus_ready: is_analyzed,
-            }
-        })
+        .map(|(_, _, summary)| summary)
         .collect::<Vec<_>>();
 
     Ok(Json(json!({ "projects": projects })))

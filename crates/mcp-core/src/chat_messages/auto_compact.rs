@@ -24,6 +24,10 @@ pub(crate) async fn maybe_auto_compact(
         return;
     }
 
+    // chat_messages e' migrata al DB per-progetto: risolvi il pool una volta e
+    // usalo per le query su chat_messages (le metriche di compattazione).
+    let chat_pool = crate::project_db_routes::project_data_pool(state, project_id).await;
+
     // Conteggio messaggi user/assistant compattabili: evita il compact su
     // sessioni troppo corte (sarebbe un no-op).
     let compactable: i64 = sqlx::query_scalar::<_, i64>(
@@ -32,7 +36,7 @@ pub(crate) async fn maybe_auto_compact(
            AND role IN ('user', 'assistant')",
     )
     .bind(session_id)
-    .fetch_one(&state.db)
+    .fetch_one(&chat_pool)
     .await
     .unwrap_or(0);
     if compactable < AUTO_COMPACT_MIN_MESSAGES {
@@ -53,7 +57,7 @@ pub(crate) async fn maybe_auto_compact(
          WHERE session_id = $1 AND deleted_at IS NULL",
     )
     .bind(session_id)
-    .fetch_one(&state.db)
+    .fetch_one(&chat_pool)
     .await
     .unwrap_or(0);
     if session_tokens <= 0 {

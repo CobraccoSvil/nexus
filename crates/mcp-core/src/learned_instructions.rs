@@ -225,32 +225,49 @@ async fn scan_and_distill(state: &AppState, settings: &DistillerSettings) -> Res
 
     // Progetti con >= min_new_signals nuovi eventi error/failed_attempt oltre il
     // cursore (trigger worklog-driven; i wiki_docs sono evidenza aggiuntiva).
-    let rows = sqlx::query(
-        "SELECT e.project_id AS pid, COUNT(*) AS cnt \
-         FROM nexus_session_worklog_events e \
-         LEFT JOIN nexus_project_distill_state s ON s.project_id = e.project_id \
-         WHERE e.kind IN ('error', 'failed_attempt') \
-           AND e.project_id IS NOT NULL \
-           AND (s.last_worklog_cursor IS NULL OR e.created_at > s.last_worklog_cursor) \
-         GROUP BY e.project_id \
-         HAVING COUNT(*) >= $1 \
-         ORDER BY COUNT(*) DESC \
-         LIMIT 20",
-    )
-    .bind(settings.min_new_signals)
-    .fetch_all(&state.db)
-    .await
-    .context("SELECT progetti con segnali da distillare")?;
+    //
+    // Separazione DB (flag ON): nexus_session_worklog_events e' per-progetto,
+    // nexus_project_distill_state (cursore) vive nel meta. Il JOIN originale e'
+    // cross-DB e non eseguibile su un solo pool: si spezza. Itera i progetti,
+    // per ognuno leggi il cursore dal meta e conta i segnali sul pool del
+    // progetto; seleziona i candidati oltre soglia (top 20 per conteggio).
+    let mut candidates: Vec<(Uuid, i64)> = Vec::new();
+    for project_id in crate::project_db_routes::list_all_project_ids(&state.db).await {
+        let worklog_cursor: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT last_worklog_cursor FROM nexus_project_distill_state WHERE project_id = $1",
+        )
+        .bind(project_id)
+        .fetch_optional(&state.db)
+        .await
+        .context("SELECT cursore distill (discovery)")?
+        .flatten();
+
+        let proj_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+        let cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM nexus_session_worklog_events \
+             WHERE kind IN ('error', 'failed_attempt') \
+               AND project_id = $1 \
+               AND ($2::timestamptz IS NULL OR created_at > $2)",
+        )
+        .bind(project_id)
+        .bind(worklog_cursor)
+        .fetch_one(&proj_pool)
+        .await
+        .context("COUNT segnali worklog da distillare")?;
+
+        if cnt >= settings.min_new_signals {
+            candidates.push((project_id, cnt));
+        }
+    }
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(20);
 
     let mut done = 0usize;
-    for row in rows {
+    for (project_id, _cnt) in candidates {
         if daily_cap_reached(settings.daily_cap, &today).await {
             break;
         }
-        let project_id: Uuid = match row.try_get("pid") {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
         match distill_project(state, settings, project_id).await {
             Ok(applied) => {
                 record_distill_call(&today).await;

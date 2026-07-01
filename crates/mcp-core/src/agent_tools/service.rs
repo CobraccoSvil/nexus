@@ -374,7 +374,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
             // Read initial output
-            match crate::agent_processes::read_process_output(&ctx.db, process_id, 4000).await {
+            match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, 4000).await {
                 Ok(info) => {
                     // Auto-detect porta dall'output del servizio e registra
                     // in nexus_port_allocations per il pannello Porte.
@@ -515,7 +515,7 @@ pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Val
             return "Nessun servizio avviato per questo progetto.".to_string();
         }
         let last = &rows[0];
-        match crate::agent_processes::read_process_output(&ctx.db, last.id, 4000).await {
+        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, last.id, 4000).await {
             Ok(info) => format_process_output(&info),
             Err(e) => format!("[Errore lettura output: {}]", e),
         }
@@ -524,7 +524,7 @@ pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Val
             Ok(id) => id,
             Err(_) => return "[Errore: process_id non valido]".to_string(),
         };
-        match crate::agent_processes::read_process_output(&ctx.db, process_id, 4000).await {
+        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, 4000).await {
             Ok(info) => format_process_output(&info),
             Err(e) => format!("[Errore lettura output: {}]", e),
         }
@@ -668,7 +668,7 @@ pub(super) async fn tool_tail_service_logs(ctx: &AgentToolContext, input: &Value
     };
 
     if follow_secs == 0 {
-        return match crate::agent_processes::read_process_output(&ctx.db, process_id, max_chars)
+        return match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, max_chars)
             .await
         {
             Ok(info) => format_process_output(&info),
@@ -683,7 +683,7 @@ pub(super) async fn tool_tail_service_logs(ctx: &AgentToolContext, input: &Value
 
     let start = std::time::Instant::now();
     while start.elapsed().as_secs() < follow_secs {
-        match crate::agent_processes::read_process_output(&ctx.db, process_id, max_chars).await {
+        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, max_chars).await {
             Ok(info) => {
                 if info.stdout.len() > last_stdout_len {
                     combined_output.push_str(&info.stdout[last_stdout_len..]);
