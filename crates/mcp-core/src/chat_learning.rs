@@ -170,6 +170,67 @@ fn move_provider_to_end(chain: &[String], provider: &str) -> Vec<String> {
     }
 }
 
+/// Errore HTTP 500 uniforme per gli handler che ritornano `ApiError`.
+/// Punto unico di costruzione (CLAUDE.md regola L): evita di ripetere ovunque
+/// `api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())`.
+fn internal_err(e: impl std::fmt::Display) -> ApiError {
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// Estrae la config di learning da una riga letta da `project_learning_config`.
+fn config_from_row(row: &sqlx::postgres::PgRow) -> Result<ProjectLearningConfig, ApiError> {
+    let min_confidence_raw: String = row.try_get("min_confidence").map_err(internal_err)?;
+    let min_confidence = min_confidence_raw.parse::<f64>().unwrap_or(0.65);
+    Ok(ProjectLearningConfig {
+        enabled: row.try_get("enabled").unwrap_or(true),
+        prompt_corrections_enabled: row.try_get("prompt_corrections_enabled").unwrap_or(true),
+        auto_apply_max_changes_per_day: row.try_get("auto_apply_max_changes_per_day").unwrap_or(2),
+        feedback_threshold: row.try_get("feedback_threshold").unwrap_or(5),
+        feedback_window_days: row.try_get("feedback_window_days").unwrap_or(7),
+        min_confidence,
+        rollback_window_hours: row.try_get("rollback_window_hours").unwrap_or(24),
+    })
+}
+
+/// Fonde una richiesta di update con la config corrente: ogni campo assente
+/// nella richiesta conserva il valore attuale.
+fn merge_config(
+    current: &ProjectLearningConfig,
+    body: &UpdateProjectLearningConfigRequest,
+) -> ProjectLearningConfig {
+    ProjectLearningConfig {
+        enabled: body.enabled.unwrap_or(current.enabled),
+        prompt_corrections_enabled: body
+            .prompt_corrections_enabled
+            .unwrap_or(current.prompt_corrections_enabled),
+        auto_apply_max_changes_per_day: body
+            .auto_apply_max_changes_per_day
+            .unwrap_or(current.auto_apply_max_changes_per_day),
+        feedback_threshold: body.feedback_threshold.unwrap_or(current.feedback_threshold),
+        feedback_window_days: body
+            .feedback_window_days
+            .unwrap_or(current.feedback_window_days),
+        min_confidence: body.min_confidence.unwrap_or(current.min_confidence),
+        rollback_window_hours: body
+            .rollback_window_hours
+            .unwrap_or(current.rollback_window_hours),
+    }
+}
+
+/// Serializza la config di learning nel blocco JSON esposto dagli handler admin.
+/// Punto unico (CLAUDE.md regola L): stesso payload per get e update.
+fn config_json(config: &ProjectLearningConfig) -> Value {
+    json!({
+        "enabled": config.enabled,
+        "promptCorrectionsEnabled": config.prompt_corrections_enabled,
+        "autoApplyMaxChangesPerDay": config.auto_apply_max_changes_per_day,
+        "feedbackThreshold": config.feedback_threshold,
+        "feedbackWindowDays": config.feedback_window_days,
+        "minConfidence": config.min_confidence,
+        "rollbackWindowHours": config.rollback_window_hours,
+    })
+}
+
 async fn load_or_create_learning_config(
     db: &PgPool,
     project_id: Uuid,
@@ -188,7 +249,7 @@ async fn load_or_create_learning_config(
     .bind(project_id)
     .execute(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let row = sqlx::query(
         r#"
@@ -207,22 +268,9 @@ async fn load_or_create_learning_config(
     .bind(project_id)
     .fetch_one(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
-    let min_confidence_raw: String = row
-        .try_get("min_confidence")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let min_confidence = min_confidence_raw.parse::<f64>().unwrap_or(0.65);
-
-    Ok(ProjectLearningConfig {
-        enabled: row.try_get("enabled").unwrap_or(true),
-        prompt_corrections_enabled: row.try_get("prompt_corrections_enabled").unwrap_or(true),
-        auto_apply_max_changes_per_day: row.try_get("auto_apply_max_changes_per_day").unwrap_or(2),
-        feedback_threshold: row.try_get("feedback_threshold").unwrap_or(5),
-        feedback_window_days: row.try_get("feedback_window_days").unwrap_or(7),
-        min_confidence,
-        rollback_window_hours: row.try_get("rollback_window_hours").unwrap_or(24),
-    })
+    config_from_row(&row)
 }
 
 async fn maybe_rollback_learning_regression(
@@ -251,27 +299,17 @@ async fn maybe_rollback_learning_regression(
     .bind(project_id)
     .fetch_optional(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let Some(row) = row else {
         return Ok(None);
     };
 
-    let log_id: Uuid = row
-        .try_get("log_id")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let intent: String = row
-        .try_get("intent")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let applied_at: DateTime<Utc> = row
-        .try_get("applied_at")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let previous_chain: String = row
-        .try_get("previous_chain")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let baseline_error_count: i64 = row
-        .try_get("baseline_error_count")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let log_id: Uuid = row.try_get("log_id").map_err(internal_err)?;
+    let intent: String = row.try_get("intent").map_err(internal_err)?;
+    let applied_at: DateTime<Utc> = row.try_get("applied_at").map_err(internal_err)?;
+    let previous_chain: String = row.try_get("previous_chain").map_err(internal_err)?;
+    let baseline_error_count: i64 = row.try_get("baseline_error_count").map_err(internal_err)?;
 
     let elapsed_hours = (Utc::now() - applied_at).num_hours();
     if elapsed_hours > i64::from(config.rollback_window_hours) {
@@ -294,7 +332,7 @@ async fn maybe_rollback_learning_regression(
     .bind(applied_at)
     .fetch_one(&feedback_pool)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     if current_errors <= baseline_error_count + 2 {
         return Ok(None);
@@ -312,7 +350,7 @@ async fn maybe_rollback_learning_regression(
     .bind(&previous_chain)
     .execute(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     sqlx::query(
         r#"
@@ -326,7 +364,7 @@ async fn maybe_rollback_learning_regression(
     .bind(log_id)
     .execute(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     Ok(Some(json!({
         "logId": log_id.to_string(),
@@ -369,7 +407,7 @@ pub(crate) async fn apply_project_learning(
     .bind(config.feedback_window_days)
     .fetch_one(&feedback_pool)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     if !force && feedback_count < i64::from(config.feedback_threshold) {
         return Ok(json!({
@@ -391,7 +429,7 @@ pub(crate) async fn apply_project_learning(
     .bind(project_id)
     .fetch_one(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     if !force && todays_changes >= i64::from(config.auto_apply_max_changes_per_day) {
         return Ok(json!({
@@ -419,7 +457,7 @@ pub(crate) async fn apply_project_learning(
     .bind(config.feedback_window_days)
     .fetch_optional(&feedback_pool)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let Some(provider_row) = provider_row else {
         return Ok(json!({
@@ -430,7 +468,7 @@ pub(crate) async fn apply_project_learning(
 
     let provider: String = provider_row
         .try_get("provider")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_err)?;
     let provider_feedback_count: i64 = provider_row.try_get("total").unwrap_or(0);
     let confidence =
         (provider_feedback_count as f64 / feedback_count.max(1) as f64).max(config.min_confidence);
@@ -472,7 +510,7 @@ pub(crate) async fn apply_project_learning(
     .bind(triggered_by)
     .execute(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let project_key = format!("project_{}_routing_{}_providers", project_id, intent);
     sqlx::query(
@@ -486,7 +524,7 @@ pub(crate) async fn apply_project_learning(
     .bind(next_chain.join(","))
     .execute(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let decision_id = Uuid::new_v4();
     sqlx::query(
@@ -516,7 +554,7 @@ pub(crate) async fn apply_project_learning(
     }))
     .execute(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let rollback = maybe_rollback_learning_regression(db, project_id, &config).await?;
 
@@ -559,7 +597,7 @@ async fn run_vector_compaction(
     .bind(requested_by)
     .execute(db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     // Separazione DB: prompt_corrections vive nel pool del progetto quando
     // project_id e' noto; vector_compaction_runs (sopra/sotto) NON e' migrata e
@@ -593,7 +631,7 @@ async fn run_vector_compaction(
         .bind(project_id)
         .fetch_all(&cpool)
         .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_err)?;
 
         let candidates = rows
             .iter()
@@ -665,7 +703,7 @@ async fn run_vector_compaction(
                 .bind(*reason)
                 .execute(&cpool)
                 .await
-                .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                .map_err(internal_err)?;
 
                 point_ids_to_delete.push(item.point_id.clone());
                 deleted_count += 1;
@@ -717,7 +755,7 @@ async fn run_vector_compaction(
             .bind(&summary)
             .execute(db)
             .await
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(internal_err)?;
             Ok(summary)
         }
         Err(error) => {
@@ -767,20 +805,20 @@ pub(crate) async fn dedup_on_write(
     .bind(normalized_hint_hash)
     .fetch_all(&corrections_pool)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let mut ids_to_prune = Vec::<Uuid>::new();
     let mut points_to_prune = Vec::<String>::new();
     for row in rows {
         let id: Uuid = row
             .try_get("id")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(internal_err)?;
         if id == keep_id {
             continue;
         }
         let point_id: String = row
             .try_get("qdrant_point_id")
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(internal_err)?;
         ids_to_prune.push(id);
         points_to_prune.push(point_id);
     }
@@ -805,7 +843,7 @@ pub(crate) async fn dedup_on_write(
     .bind(keep_id)
     .execute(&corrections_pool)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let _ = vector_memory::delete_prompt_correction_points(db, &points_to_prune).await;
 
@@ -982,7 +1020,7 @@ pub async fn admin_review_feedback(
     .bind(reviewer_id)
     .fetch_optional(&corrections_pool)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let Some(row) = row else {
         return Err(api_error(StatusCode::NOT_FOUND, "Feedback non trovato"));
@@ -990,7 +1028,7 @@ pub async fn admin_review_feedback(
 
     let project_id: Uuid = row
         .try_get("project_id")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_err)?;
 
     if status == "resolved" || status == "rejected" {
         let _ = sqlx::query(
@@ -1059,15 +1097,7 @@ pub async fn admin_get_project_learning_config(
     let config = load_or_create_learning_config(&state.db, project_id).await?;
     Ok(Json(json!({
         "projectId": project_id.to_string(),
-        "config": {
-            "enabled": config.enabled,
-            "promptCorrectionsEnabled": config.prompt_corrections_enabled,
-            "autoApplyMaxChangesPerDay": config.auto_apply_max_changes_per_day,
-            "feedbackThreshold": config.feedback_threshold,
-            "feedbackWindowDays": config.feedback_window_days,
-            "minConfidence": config.min_confidence,
-            "rollbackWindowHours": config.rollback_window_hours,
-        }
+        "config": config_json(&config),
     })))
 }
 
@@ -1078,25 +1108,7 @@ pub async fn admin_update_project_learning_config(
 ) -> ApiResult {
     let project_id = parse_project_id(&project_id)?;
     let current = load_or_create_learning_config(&state.db, project_id).await?;
-    let next = ProjectLearningConfig {
-        enabled: body.enabled.unwrap_or(current.enabled),
-        prompt_corrections_enabled: body
-            .prompt_corrections_enabled
-            .unwrap_or(current.prompt_corrections_enabled),
-        auto_apply_max_changes_per_day: body
-            .auto_apply_max_changes_per_day
-            .unwrap_or(current.auto_apply_max_changes_per_day),
-        feedback_threshold: body
-            .feedback_threshold
-            .unwrap_or(current.feedback_threshold),
-        feedback_window_days: body
-            .feedback_window_days
-            .unwrap_or(current.feedback_window_days),
-        min_confidence: body.min_confidence.unwrap_or(current.min_confidence),
-        rollback_window_hours: body
-            .rollback_window_hours
-            .unwrap_or(current.rollback_window_hours),
-    };
+    let next = merge_config(&current, &body);
 
     sqlx::query(
         r#"
@@ -1122,20 +1134,12 @@ pub async fn admin_update_project_learning_config(
     .bind(next.rollback_window_hours)
     .execute(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     Ok(Json(json!({
         "ok": true,
         "projectId": project_id.to_string(),
-        "config": {
-            "enabled": next.enabled,
-            "promptCorrectionsEnabled": next.prompt_corrections_enabled,
-            "autoApplyMaxChangesPerDay": next.auto_apply_max_changes_per_day,
-            "feedbackThreshold": next.feedback_threshold,
-            "feedbackWindowDays": next.feedback_window_days,
-            "minConfidence": next.min_confidence,
-            "rollbackWindowHours": next.rollback_window_hours,
-        }
+        "config": config_json(&next),
     })))
 }
 
@@ -1163,6 +1167,28 @@ pub async fn admin_run_vector_compaction(
         .transpose()?;
     let summary = run_vector_compaction(&state.db, project_id, "manual", Some(user_id)).await?;
     Ok(Json(json!({ "ok": true, "summary": summary })))
+}
+
+/// Serializza una riga di `vector_compaction_runs` nel JSON esposto dall'API.
+fn compaction_run_json(row: &sqlx::postgres::PgRow) -> Option<Value> {
+    let id: Uuid = row.try_get("id").ok()?;
+    let started_at: DateTime<Utc> = row.try_get("started_at").ok()?;
+    let finished_at: Option<DateTime<Utc>> = row.try_get("finished_at").ok();
+    Some(json!({
+        "id": id.to_string(),
+        "projectId": row.try_get::<Option<Uuid>, _>("project_id").ok().flatten().map(|value| value.to_string()),
+        "triggerType": row.try_get::<String, _>("trigger_type").ok().unwrap_or_default(),
+        "status": row.try_get::<String, _>("status").ok().unwrap_or_default(),
+        "beforeCount": row.try_get::<i64, _>("before_count").ok().unwrap_or(0),
+        "afterCount": row.try_get::<i64, _>("after_count").ok().unwrap_or(0),
+        "dedupCount": row.try_get::<i64, _>("dedup_count").ok().unwrap_or(0),
+        "deletedCount": row.try_get::<i64, _>("deleted_count").ok().unwrap_or(0),
+        "qdrantDeletedCount": row.try_get::<i64, _>("qdrant_deleted_count").ok().unwrap_or(0),
+        "details": row.try_get::<Value, _>("details").ok().unwrap_or_else(|| json!({})),
+        "requestedBy": row.try_get::<Option<Uuid>, _>("requested_by").ok().flatten().map(|value| value.to_string()),
+        "startedAt": started_at.to_rfc3339(),
+        "finishedAt": finished_at.map(|value| value.to_rfc3339()),
+    }))
 }
 
 pub async fn admin_list_vector_compaction_runs(
@@ -1194,30 +1220,11 @@ pub async fn admin_list_vector_compaction_runs(
     .bind(limit)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(internal_err)?;
 
     let runs = rows
         .iter()
-        .filter_map(|row| {
-            let id: Uuid = row.try_get("id").ok()?;
-            let started_at: DateTime<Utc> = row.try_get("started_at").ok()?;
-            let finished_at: Option<DateTime<Utc>> = row.try_get("finished_at").ok();
-            Some(json!({
-                "id": id.to_string(),
-                "projectId": row.try_get::<Option<Uuid>, _>("project_id").ok().flatten().map(|value| value.to_string()),
-                "triggerType": row.try_get::<String, _>("trigger_type").ok().unwrap_or_default(),
-                "status": row.try_get::<String, _>("status").ok().unwrap_or_default(),
-                "beforeCount": row.try_get::<i64, _>("before_count").ok().unwrap_or(0),
-                "afterCount": row.try_get::<i64, _>("after_count").ok().unwrap_or(0),
-                "dedupCount": row.try_get::<i64, _>("dedup_count").ok().unwrap_or(0),
-                "deletedCount": row.try_get::<i64, _>("deleted_count").ok().unwrap_or(0),
-                "qdrantDeletedCount": row.try_get::<i64, _>("qdrant_deleted_count").ok().unwrap_or(0),
-                "details": row.try_get::<Value, _>("details").ok().unwrap_or_else(|| json!({})),
-                "requestedBy": row.try_get::<Option<Uuid>, _>("requested_by").ok().flatten().map(|value| value.to_string()),
-                "startedAt": started_at.to_rfc3339(),
-                "finishedAt": finished_at.map(|value| value.to_rfc3339()),
-            }))
-        })
+        .filter_map(compaction_run_json)
         .collect::<Vec<_>>();
 
     Ok(Json(json!({ "runs": runs })))
@@ -1236,36 +1243,42 @@ fn parse_compaction_cron(cron: &str) -> (u32, u32) {
     (2, 0)
 }
 
+/// Legge il cron dalla setting DB (hot-reload ad ogni iterazione) e calcola
+/// (hour, minute, cron_str, attesa fino alla prossima esecuzione).
+async fn next_compaction_wait(db: &PgPool) -> (u32, u32, String, Duration) {
+    let cron_str = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'vector_compaction_schedule_cron'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "0 2 * * *".to_string());
+
+    let (hour, minute) = parse_compaction_cron(&cron_str);
+
+    let now = Local::now();
+    let today = now.date_naive();
+    let mut next = today.and_hms_opt(hour, minute, 0).unwrap_or_else(|| {
+        today
+            .and_hms_milli_opt(hour, minute, 0, 0)
+            .expect("valid time")
+    });
+
+    if now.naive_local() >= next {
+        next += chrono::Duration::days(1);
+    }
+
+    let wait = (next - now.naive_local())
+        .to_std()
+        .unwrap_or_else(|_| Duration::from_secs(60 * 60));
+    (hour, minute, cron_str, wait)
+}
+
 pub fn spawn_vector_compaction_scheduler(state: AppState) {
     tokio::spawn(async move {
         loop {
-            // Legge il cron dalla setting DB ad ogni iterazione (permette hot-reload).
-            let cron_str = sqlx::query_scalar::<_, String>(
-                "SELECT value FROM settings WHERE key = 'vector_compaction_schedule_cron'",
-            )
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "0 2 * * *".to_string());
-
-            let (hour, minute) = parse_compaction_cron(&cron_str);
-
-            let now = Local::now();
-            let today = now.date_naive();
-            let mut next = today.and_hms_opt(hour, minute, 0).unwrap_or_else(|| {
-                today
-                    .and_hms_milli_opt(hour, minute, 0, 0)
-                    .expect("valid time")
-            });
-
-            if now.naive_local() >= next {
-                next += chrono::Duration::days(1);
-            }
-
-            let wait = (next - now.naive_local())
-                .to_std()
-                .unwrap_or_else(|_| Duration::from_secs(60 * 60));
+            let (hour, minute, cron_str, wait) = next_compaction_wait(&state.db).await;
 
             tracing::info!(
                 "vector_compaction_scheduler: prossima run alle {:02}:{:02} (cron='{}', wait={:.0}min)",
@@ -1397,7 +1410,7 @@ pub async fn admin_create_prompt_correction(
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("DB insert fallito: {e}")})),
+            Json(json!({"error": format!("inserimento nel DB fallito: {e}")})),
         )
     })?;
 
@@ -1413,13 +1426,14 @@ pub async fn admin_create_prompt_correction(
 
 /// GET /api/admin/prompt-corrections
 /// Lista le correzioni attive.
+///
+/// Vista admin GLOBALE: prompt_corrections e' migrata -> aggrega iterando i
+/// DB-progetto. A flag OFF tutti i pool sono il meta (dedup per id evita i
+/// duplicati); a flag ON ogni progetto ha le sue righe. Top 100 globale.
 pub async fn admin_list_prompt_corrections(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Vista admin GLOBALE: prompt_corrections e' migrata -> aggrega iterando i
-    // DB-progetto. A flag OFF tutti i pool sono il meta (dedup per id evita i
-    // duplicati); a flag ON ogni progetto ha le sue righe. Top 100 globale.
     let mut rows = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
@@ -1450,14 +1464,10 @@ pub async fn admin_list_prompt_corrections(
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.id.to_string(),
-                "projectId": r.project_id.to_string(),
-                "intent": r.intent,
-                "text": r.correction_text,
-                "qdrantPointId": r.qdrant_point_id,
-                "active": r.active,
-                "status": r.status,
-                "retrievedCount": r.retrieved_count,
+                "id": r.id.to_string(), "projectId": r.project_id.to_string(),
+                "intent": r.intent, "text": r.correction_text,
+                "qdrantPointId": r.qdrant_point_id, "active": r.active,
+                "status": r.status, "retrievedCount": r.retrieved_count,
                 "createdAt": r.created_at.to_rfc3339(),
             })
         })
