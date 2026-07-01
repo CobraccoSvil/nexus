@@ -602,20 +602,28 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
         );
     }
 
-    // Agent processes bloccati (>10 minuti senza heartbeat)
-    let stale_processes = sqlx::query_scalar::<_, uuid::Uuid>(
-        "UPDATE agent_processes \
-         SET status = 'failed', \
-             stopped_at = NOW(), \
-             error_output = COALESCE(error_output, '') || '\nWatchdog: processo bloccato per oltre 10 minuti' \
-         WHERE status = 'running' \
-           AND started_at < NOW() - make_interval(mins => $1) \
-         RETURNING id",
-    )
-    .bind(STALE_PROCESS_MINUTES)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    // Agent processes bloccati (>10 minuti senza heartbeat). Separazione DB:
+    // agent_processes vive nel DB del progetto a flag ON -> iteriamo i progetti e
+    // marchiamo sul pool di ciascuno (a flag OFF tutti i pool sono il meta: la 1a
+    // iterazione marca tutto, le successive trovano gia' 'failed').
+    let mut stale_processes: Vec<uuid::Uuid> = Vec::new();
+    for project_id in crate::project_db_routes::list_all_project_ids(db).await {
+        let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+        let mut ids = sqlx::query_scalar::<_, uuid::Uuid>(
+            "UPDATE agent_processes \
+             SET status = 'failed', \
+                 stopped_at = NOW(), \
+                 error_output = COALESCE(error_output, '') || '\nWatchdog: processo bloccato per oltre 10 minuti' \
+             WHERE status = 'running' \
+               AND started_at < NOW() - make_interval(mins => $1) \
+             RETURNING id",
+        )
+        .bind(STALE_PROCESS_MINUTES)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        stale_processes.append(&mut ids);
+    }
 
     for id in &stale_processes {
         tracing::warn!("task_watchdog: terminato agent process bloccato id={}", id);
