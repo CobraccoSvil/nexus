@@ -1,8 +1,11 @@
 # Separazione DB per-progetto — stato del cutover (handoff)
 
 Stato al 2026-07-01. Branch: `quality/win-refactor`. Feature flag
-`db.project_separation.enabled` = **false** (sistema live invariato). Flip validato
-tecnicamente e rollbackato; go-live in attesa di rebuild + ri-migrazione fresca.
+`db.project_separation.enabled` = **true** — **GO-LIVE ESEGUITO E CONFERMATO E2E**.
+I dati per-progetto di beaty-book vivono ora in `beaty_book_nexus`; lettura e
+scrittura instradate, nessuno split-brain (verifica: nuovi messaggi in beaty, meta
+fermo). Rebuild col fix PROVISION_LOCKS + ri-migrazione fresca (2808 righe) + backfill
+routing completati. Resta opzionale il cleanup dual-presence (copie meta ridondanti).
 
 ## Obiettivo
 Spostare TUTTI i dati per-progetto di Nexus (chat, run, log, KB, costi, ...) dal
@@ -201,24 +204,28 @@ gira come PROCESSI dev via `deploy/dev-start.ps1` (build `deploy/dev-build.ps1`,
 nessun admin richiesto, niente lock `.exe` da servizio elevato durante il rebuild).
 
 ## Sicurezza / stato attuale
-Flag **off**, cutover **non deployato** (gira Phase 0-1): l'app live e' intatta,
-dati in dual-presenza (meta-DB + `beaty_book_nexus`). Niente da rollbackare. Il flip
-e' stato VALIDATO tecnicamente e rollbackato (vedi "Validazione tecnica del flip");
-`beaty_book_nexus` e' ora VUOTO (ricreato per la validazione) -> va ripopolato prima
-del go-live.
+Flag **true** — **GO-LIVE ATTIVO**. `beaty_book_nexus` e' la fonte viva dei dati
+per-progetto (chat/run); il meta conserva le copie pre-flip (dual-presenza) come rete
+di rollback. Rollback in un comando: `UPDATE settings SET value='false'` -> torna a
+leggere/scrivere dal meta entro ~30s (i dati scritti in beaty a flag ON restano li',
+da ri-sincronizzare se si vuole tornare stabilmente su meta).
 
-### RISCHIO NOTO: flip accidentale con beaty vuoto (audit fine-sessione)
-Il flag `db.project_separation.enabled` e' un setting come gli altri: scrivibile
-dalla UI admin generica (`admin-service/src/settings.rs`, route `PUT /setting/:key`,
-NESSUNA whitelist sui setting critici). Con `beaty_book_nexus` attualmente VUOTO, un
-flip accidentale a `'true'` renderebbe la cronologia storica (68 chat_messages + 28
-agent_runs, che vivono solo nel meta) INVISIBILE in UI entro 30s (TTL cache flag).
-NON c'e' perdita dati: rollback a `'false'` ripristina tutto. Mitigazioni possibili
-(in ordine di preferenza): (a) fare la ri-migrazione fresca subito prima del go-live e
-non lasciare beaty vuoto a lungo; (b) guard/whitelist sui setting critici in
-`admin-service` (il flip di questo flag richiede una procedura, non un toggle UI);
-(c) lasciare il flag `false` e trattare beaty-vuoto come stato transitorio noto.
-Finche' beaty resta vuoto, NON esporre/usare il toggle di questo flag dalla UI.
+Verifica E2E del go-live (2026-07-01, ~15:18): inviato un messaggio da UI su beaty-book
+-> `beaty_book_nexus.chat_messages` 68 -> 70 (user + assistant), `nexus.chat_messages`
+FERMO a 68 (nessuno split-brain), `nexus_data_routing` auto-aggiornato. Migrator salta
+pulito (fix PROVISION_LOCKS nel binario rebuiltato), 2 connessioni nexus_app attive su
+beaty, health ok.
+
+### Cleanup dual-presence (prossimo passo, opzionale)
+Le copie meta pre-flip (chat/run di beaty) sono ora ridondanti. CONSIGLIO: attendere
+qualche giorno di go-live stabile prima di rimuoverle (restano la rete di rollback).
+Poi `scripts/db-cleanup-dual-presence.sh 98138624-... --apply` + `VACUUM (ANALYZE)`.
+
+### Nota: rischio flip accidentale (ora mitigato)
+Il flag e' scrivibile dalla UI admin generica (`admin-service/src/settings.rs`,
+`PUT /setting/:key`, nessuna whitelist). Con beaty ora POPOLATO il rischio del flip
+accidentale e' neutralizzato (un flip off->on->off non nasconde piu' la cronologia).
+Resta valido come hardening futuro: whitelist/guard sui setting critici.
 
 ## Migrazioni introdotte
 `0494` connection_role, `0495` seed flag, `0496` nexus_data_routing,
