@@ -484,338 +484,23 @@ pub async fn send_chat_message(
     };
 
     // ── Ripresa run interrotto (riprendi / continua / resume) ─────────────
-    if automation_mode != AutomationMode::Study {
-        let is_resume_request = {
-            let lower = content.trim().to_lowercase();
-            lower == "riprendi"
-                || lower == "continua"
-                || lower == "resume"
-                || lower == "riprendi dall'interruzione"
-                || lower.starts_with("riprendi ")
-                || lower.starts_with("continua da")
-        };
-
-        if is_resume_request {
-            // Cerca l'ultimo run interrupted di questa sessione con history salvata
-            let interrupted_run = sqlx::query(
-                r#"SELECT id, provider, model, messages_json, iteration_count, supervisor_mode
-                   FROM agent_runs
-                   WHERE session_id = $1
-                     AND status = 'interrupted'
-                     AND messages_json IS NOT NULL
-                     AND messages_json != ''
-                   ORDER BY created_at DESC
-                   LIMIT 1"#,
-            )
-            .bind(context.session_id)
-            .fetch_optional(&session_pool)
-            .await
-            .ok()
-            .flatten();
-
-            if let Some(prev_run) = interrupted_run {
-                let prev_run_id: Uuid = prev_run.get("id");
-                let prev_provider: String = prev_run.get("provider");
-                let prev_model: String = prev_run.get("model");
-                let prev_messages_json: String = prev_run.get("messages_json");
-                let prev_iterations: i32 = prev_run.get("iteration_count");
-
-                tracing::info!(
-                    "Resuming interrupted run {} (iter={}, supervisor={}) for session {}",
-                    prev_run_id,
-                    prev_iterations,
-                    prev_run
-                        .try_get::<String, _>("supervisor_mode")
-                        .unwrap_or_else(|_| "none".into()),
-                    context.session_id
-                );
-
-                // Crea nuovo run collegato al precedente
-                let new_run_id = Uuid::new_v4();
-                let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
-                state.agent_channels.insert(new_run_id, tx.clone());
-
-                let prev_supervisor_str: String = prev_run
-                    .try_get("supervisor_mode")
-                    .unwrap_or_else(|_| "none".to_string());
-                let prev_supervisor = SupervisorMode::from_str(&prev_supervisor_str);
-
-                // Last-wins atomico (punto unico, regola L): cancella TUTTI i run
-                // attivi della sessione (incluso il precedente) PRIMA di inserire
-                // il nuovo. Elimina la race "INSERT-poi-UPDATE" che lasciava due
-                // run attivi per una finestra, e ferma cooperativamente il vecchio.
-                let _ = crate::chat_messages::agent_run::supersede_active_runs(
-                    &state,
-                    context.session_id,
-                    "resume",
-                )
-                .await;
-
-                let _ = sqlx::query(
-                    r#"INSERT INTO agent_runs
-                       (id, session_id, project_id, user_id, run_message_id, status,
-                        automation_mode, provider, model, supervisor_mode, iteration_count, parent_run_id, created_at)
-                       VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9,0,$10,NOW())"#,
-                )
-                .bind(new_run_id)
-                .bind(context.session_id)
-                .bind(context.project_id)
-                .bind(user_id)
-                .bind(user_message_id)
-                .bind(automation_mode.as_str())
-                .bind(&prev_provider)
-                .bind(&prev_model)
-                .bind(prev_supervisor.as_str())
-                .bind(prev_run_id)
-                .execute(&session_pool)
-                .await;
-
-                // Carica contesto progetto per il nuovo run
-                if let Ok(proj) = load_project_context(&state.db, context.project_id, user_id).await
-                {
-                    let db_clone2 = state.db.clone();
-                    let channels2 = state.agent_channels.clone();
-                    let proj_channels2 = state.project_channels.clone();
-                    let neural2 = state.orchestrator.neural.clone();
-                    let term2 = state.terminal_consumers.clone();
-                    let session_id_r = context.session_id;
-                    let project_id_r = context.project_id;
-                    let msg_id_r = user_message_id;
-                    let provider_r = prev_provider.clone();
-                    let model_r = prev_model.clone();
-                    let automation_r = automation_mode;
-                    let supervisor_r = prev_supervisor;
-                    let template_cache_r = state.template_cache.clone();
-                    let routing_thresholds_for_resume =
-                        state.orchestrator.routing_thresholds.clone();
-                    let user_role_r = claims.role.clone();
-
-                    let _ = (
-                        &neural2,
-                        &term2,
-                        &automation_r,
-                        &supervisor_r,
-                        &user_role_r,
-                        &proj,
-                        &prev_messages_json,
-                    );
-                    tokio::spawn(async move {
-                        let resume_tpl = crate::prompt_templates::get_template_or_default(
-                            &db_clone2,
-                            &template_cache_r,
-                            "automation.run_resume_instruction",
-                        )
-                        .await;
-                        let resume_prompt =
-                            resume_tpl.replace("{{prev_iterations}}", &prev_iterations.to_string());
-
-                        let resume_history =
-                            build_recent_conversation_history(&db_clone2, session_id_r, 8).await;
-
-                        let tools_for_resume =
-                            crate::brain_agent_client::build_tools_json_for_agent(
-                                &db_clone2,
-                                user_id,
-                                project_id_r,
-                                &automation_r,
-                                &provider_r,
-                                &model_r,
-                            )
-                            .await;
-
-                        // Re-leggo soglia SSE silence (mig 0132) — cache 60s.
-                        let sse_silence_resume: u64 =
-                            match routing_thresholds_for_resume.current_async().await {
-                                Ok(t) => t.sse_heartbeat_max_silence_secs,
-                                Err(_) => 120,
-                            };
-
-                        let mut result = crate::brain_agent_client::run_via_brain(
-                            new_run_id,
-                            session_id_r,
-                            provider_r,
-                            model_r,
-                            String::new(),
-                            resume_prompt,
-                            tx,
-                            resume_history,
-                            tools_for_resume,
-                            sse_silence_resume,
-                            true, // emit_final_event: caller singolo-shot, nessun retry loop
-                            automation_r.as_str().to_string(),
-                            None, // intent_hint: resume di conferma, nessuna disambiguazione risolta
-                            db_clone2.clone(),
-                        )
-                        .await;
-                        channels2.remove(&new_run_id);
-
-                        // Riconciliazione costo/token dal ledger (punto unico,
-                        // regola L): se il path brain non propaga il costo ma il
-                        // gateway ha gia' scritto il ledger per il run, il metadata
-                        // del messaggio assistant (e quindi la UI) mostra il costo
-                        // reale invece di $0.00.
-                        let ledger_totals =
-                            crate::chat_messages::agent_run::fetch_ledger_totals(
-                                &db_clone2,
-                                new_run_id,
-                            )
-                            .await;
-                        let _ = crate::chat_messages::agent_run::reconcile_run_cost_from_ledger(
-                            &mut result,
-                            &ledger_totals,
-                        );
-                        // finalize_agent_run NON scrive token/costo: se il brain non
-                        // li ha persistiti su agent_runs ma il ledger li ha, allinea
-                        // qui (idempotente: tocca solo i run rimasti a 0, non
-                        // sovrascrive un valore gia' corretto del path Python).
-                        if result.total_cost > 0.0 {
-                            // agent_runs e' migrata: instrada sul pool del progetto
-                            // (risolto in-task da db_clone2 + project_id_r, come la
-                            // INSERT chat_messages piu' sotto). ai_usage_ledger (sopra)
-                            // resta su meta (dominio costi non migrato).
-                            let _ = sqlx::query(
-                                "UPDATE agent_runs SET total_cost = $2, total_tokens = $3 \
-                                 WHERE id = $1 AND total_cost = 0",
-                            )
-                            .bind(new_run_id)
-                            .bind(result.total_cost)
-                            .bind(result.total_tokens as i32)
-                            .execute(
-                                &crate::project_db_routes::project_data_pool_from(
-                                    &db_clone2,
-                                    project_id_r,
-                                )
-                                .await,
-                            )
-                            .await;
-                        }
-
-                        // Esito CERTO anche sul resume (regola L + ADR 0025): stesso
-                        // punto unico dello spawn principale. compose_turn_answer
-                        // garantisce un messaggio (risposta reale + recap, oppure
-                        // recap/placeholder se hollow); canonical_run_status declassa
-                        // l'hollow-senza-lavoro a failed_diagnosed. Prima il resume
-                        // inseriva nulla per i run vuoti e finalizzava lo status grezzo.
-                        let resume_answer =
-                            crate::chat_messages::agent_run::compose_turn_answer(&result);
-                        // Recap narrativo opzionale (mig 0415): stesso punto unico
-                        // del finalize spawn. Gate off di default -> no-op.
-                        let resume_answer =
-                            crate::chat_messages::agent_run::narrative_or(&state, &result, resume_answer)
-                                .await;
-                        let resume_status =
-                            crate::chat_messages::agent_run::canonical_run_status(&result);
-                        if let Some(answer) = resume_answer.clone() {
-                            // Recap RICCO in coda anche sul resume (FIX D3, regola L):
-                            // stesso punto unico append_outcome_summary dello spawn,
-                            // cosi' il content persistito coincide col recap live e
-                            // non diverge dopo un refresh.
-                            let answer = crate::chat_messages::agent_run::append_outcome_summary(
-                                answer,
-                                &result.steps,
-                            );
-                            let mut meta = serde_json::json!({
-                                "provider": &result.provider,
-                                "model": &result.model,
-                                "agentRunId": new_run_id.to_string(),
-                                "iterationCount": result.iteration_count,
-                                "automationMode": "automatic",
-                                "resumed": true,
-                                "hollowCompletion": result.hollow_completion,
-                                "promptTokens": result.prompt_tokens,
-                                "completionTokens": result.completion_tokens,
-                                "totalTokens": result.total_tokens,
-                                "totalCost": result.total_cost,
-                                "currency": "USD",
-                            });
-                            // FIX D4: persisti il reasoning anche sul resume cosi'
-                            // il blocco "Ragionamento" sopravvive al refresh.
-                            if let Some(reasoning) = result
-                                .reasoning
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                            {
-                                if let Some(obj) = meta.as_object_mut() {
-                                    obj.insert("reasoning".to_string(), serde_json::json!(reasoning));
-                                }
-                            }
-                            let _ = sqlx::query(
-                                r#"INSERT INTO chat_messages
-                                   (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
-                                   VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
-                            )
-                            .bind(session_id_r)
-                            .bind(project_id_r)
-                            .bind(&answer)
-                            .bind(meta)
-                            .bind(msg_id_r)
-                            .execute(&crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await)
-                            .await;
-                        }
-
-                        let _run_completed = resume_status.is_success();
-                        let resume_status_str = resume_status.as_str();
-                        crate::agent_types::finalize_agent_run(
-                            &db_clone2,
-                            new_run_id,
-                            resume_status,
-                            resume_answer.as_deref().or(result.final_answer.as_deref()),
-                            result.iteration_count,
-                        )
-                        .await;
-
-                        // Worklog di sessione (mig 0411): stesso hook del
-                        // percorso spawn principale — anche il resume di
-                        // conferma alimenta la storia di lavoro. Best-effort.
-                        // Worklog nel DB del progetto (separazione DB), pool per-progetto.
-                        let wlpool = crate::project_db_routes::project_data_pool_from(
-                            &db_clone2,
-                            project_id_r,
-                        )
-                        .await;
-                        if let Err(e) = crate::session_worklog::ingest_steps_for_run(
-                            &wlpool,
-                            session_id_r,
-                            Some(project_id_r),
-                            new_run_id,
-                            resume_status_str,
-                            &result.steps,
-                        )
-                        .await
-                        {
-                            tracing::warn!(error = %e, "session_worklog: ingest al resume fallito");
-                        }
-
-                        // ADR 0017 v2 TODO 7: il worker
-                        // `wiki::run_summary_worker` (avviato in main.rs,
-                        // intervallo 60s default) ingesta i run terminali in
-                        // `wiki_docs` (scope=project, kind='run_summary').
-                        // Idempotenza via `agent_runs.kb_ingested` (mig 0304).
-                        let _ = (
-                            &db_clone2,
-                            &neural2,
-                            &proj_channels2,
-                            new_run_id,
-                            _run_completed,
-                        );
-                    });
-
-                    return Ok(Json(json!({
-                        "sessionId": context.session_id.to_string(),
-                        "userMessage": user_message,
-                        "agentRun": {
-                            "runId": new_run_id.to_string(),
-                            "status": "running",
-                            "provider": prev_provider,
-                            "model": prev_model,
-                            "resumed": true,
-                        },
-                        "savedAttachments": saved_attachments_json.clone(),
-                    })));
-                }
-            }
-        }
+    // Estratto in helper coeso (behavior-preserving): Some(view) => early return
+    // con il run risvegliato; None => nessun resume, si prosegue col flusso normale.
+    if let Some(resume_view) = try_resume_interrupted_run(
+        &state,
+        &claims,
+        &context,
+        &session_pool,
+        content,
+        automation_mode,
+        user_id,
+        user_message_id,
+        &user_message,
+        &saved_attachments_json,
+    )
+    .await
+    {
+        return Ok(Json(resume_view));
     }
 
     // ── DLP check (Nexus Sicurezza & Privacy) ────────────────────────────────
@@ -1012,6 +697,349 @@ pub async fn send_chat_message(
         "savedAttachments": saved_attachments_json,
     })))
 }
+
+/// Ripresa run interrotto (riprendi / continua / resume), estratta da
+/// send_chat_message (behavior-preserving). Some(view) => il resume e' partito
+/// e il chiamante fa early-return; None => nessun resume, flusso normale.
+#[allow(clippy::too_many_arguments)]
+async fn try_resume_interrupted_run(
+    state: &AppState,
+    claims: &Claims,
+    context: &crate::chat_sessions::SessionContext,
+    session_pool: &PgPool,
+    content: &str,
+    automation_mode: AutomationMode,
+    user_id: Uuid,
+    user_message_id: Uuid,
+    user_message: &ChatMessageView,
+    saved_attachments_json: &Value,
+) -> Option<Value> {
+    if automation_mode == AutomationMode::Study {
+        return None;
+    }
+
+    let is_resume_request = {
+        let lower = content.trim().to_lowercase();
+        lower == "riprendi"
+            || lower == "continua"
+            || lower == "resume"
+            || lower == "riprendi dall'interruzione"
+            || lower.starts_with("riprendi ")
+            || lower.starts_with("continua da")
+    };
+    if !is_resume_request {
+        return None;
+    }
+
+    // Cerca l'ultimo run interrupted di questa sessione con history salvata
+    let prev_run = sqlx::query(
+        r#"SELECT id, provider, model, messages_json, iteration_count, supervisor_mode
+           FROM agent_runs
+           WHERE session_id = $1
+             AND status = 'interrupted'
+             AND messages_json IS NOT NULL
+             AND messages_json != ''
+           ORDER BY created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(context.session_id)
+    .fetch_optional(session_pool)
+    .await
+    .ok()
+    .flatten()?;
+
+    let prev_run_id: Uuid = prev_run.get("id");
+    let prev_provider: String = prev_run.get("provider");
+    let prev_model: String = prev_run.get("model");
+    let prev_messages_json: String = prev_run.get("messages_json");
+    let prev_iterations: i32 = prev_run.get("iteration_count");
+
+    tracing::info!(
+        "Resuming interrupted run {} (iter={}, supervisor={}) for session {}",
+        prev_run_id,
+        prev_iterations,
+        prev_run
+            .try_get::<String, _>("supervisor_mode")
+            .unwrap_or_else(|_| "none".into()),
+        context.session_id
+    );
+
+    // Crea nuovo run collegato al precedente
+    let new_run_id = Uuid::new_v4();
+    let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
+    state.agent_channels.insert(new_run_id, tx.clone());
+
+    let prev_supervisor_str: String = prev_run
+        .try_get("supervisor_mode")
+        .unwrap_or_else(|_| "none".to_string());
+    let prev_supervisor = SupervisorMode::from_str(&prev_supervisor_str);
+
+    // Last-wins atomico (punto unico, regola L): cancella TUTTI i run
+    // attivi della sessione (incluso il precedente) PRIMA di inserire
+    // il nuovo. Elimina la race "INSERT-poi-UPDATE" che lasciava due
+    // run attivi per una finestra, e ferma cooperativamente il vecchio.
+    let _ = crate::chat_messages::agent_run::supersede_active_runs(
+        state,
+        context.session_id,
+        "resume",
+    )
+    .await;
+
+    let _ = sqlx::query(
+        r#"INSERT INTO agent_runs
+           (id, session_id, project_id, user_id, run_message_id, status,
+            automation_mode, provider, model, supervisor_mode, iteration_count, parent_run_id, created_at)
+           VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9,0,$10,NOW())"#,
+    )
+    .bind(new_run_id)
+    .bind(context.session_id)
+    .bind(context.project_id)
+    .bind(user_id)
+    .bind(user_message_id)
+    .bind(automation_mode.as_str())
+    .bind(&prev_provider)
+    .bind(&prev_model)
+    .bind(prev_supervisor.as_str())
+    .bind(prev_run_id)
+    .execute(session_pool)
+    .await;
+
+    // Carica contesto progetto per il nuovo run
+    let Ok(proj) = load_project_context(&state.db, context.project_id, user_id).await else {
+        // Comportamento storico: senza contesto progetto il resume non parte
+        // e il chiamante prosegue col flusso normale.
+        return None;
+    };
+
+    let state_for_task = state.clone();
+    let db_clone2 = state.db.clone();
+    let channels2 = state.agent_channels.clone();
+    let proj_channels2 = state.project_channels.clone();
+    let neural2 = state.orchestrator.neural.clone();
+    let term2 = state.terminal_consumers.clone();
+    let session_id_r = context.session_id;
+    let project_id_r = context.project_id;
+    let msg_id_r = user_message_id;
+    let provider_r = prev_provider.clone();
+    let model_r = prev_model.clone();
+    let automation_r = automation_mode;
+    let supervisor_r = prev_supervisor;
+    let template_cache_r = state.template_cache.clone();
+    let routing_thresholds_for_resume = state.orchestrator.routing_thresholds.clone();
+    let user_role_r = claims.role.clone();
+
+    let _ = (
+        &neural2,
+        &term2,
+        &automation_r,
+        &supervisor_r,
+        &user_role_r,
+        &proj,
+        &prev_messages_json,
+    );
+    tokio::spawn(async move {
+        let resume_tpl = crate::prompt_templates::get_template_or_default(
+            &db_clone2,
+            &template_cache_r,
+            "automation.run_resume_instruction",
+        )
+        .await;
+        let resume_prompt =
+            resume_tpl.replace("{{prev_iterations}}", &prev_iterations.to_string());
+
+        let resume_history =
+            build_recent_conversation_history(&db_clone2, session_id_r, 8).await;
+
+        let tools_for_resume = crate::brain_agent_client::build_tools_json_for_agent(
+            &db_clone2,
+            user_id,
+            project_id_r,
+            &automation_r,
+            &provider_r,
+            &model_r,
+        )
+        .await;
+
+        // Re-leggo soglia SSE silence (mig 0132) — cache 60s.
+        let sse_silence_resume: u64 = match routing_thresholds_for_resume.current_async().await {
+            Ok(t) => t.sse_heartbeat_max_silence_secs,
+            Err(_) => 120,
+        };
+
+        let mut result = crate::brain_agent_client::run_via_brain(
+            new_run_id,
+            session_id_r,
+            provider_r,
+            model_r,
+            String::new(),
+            resume_prompt,
+            tx,
+            resume_history,
+            tools_for_resume,
+            sse_silence_resume,
+            true, // emit_final_event: caller singolo-shot, nessun retry loop
+            automation_r.as_str().to_string(),
+            None, // intent_hint: resume di conferma, nessuna disambiguazione risolta
+            db_clone2.clone(),
+        )
+        .await;
+        channels2.remove(&new_run_id);
+
+        // Riconciliazione costo/token dal ledger (punto unico,
+        // regola L): se il path brain non propaga il costo ma il
+        // gateway ha gia' scritto il ledger per il run, il metadata
+        // del messaggio assistant (e quindi la UI) mostra il costo
+        // reale invece di $0.00.
+        let ledger_totals =
+            crate::chat_messages::agent_run::fetch_ledger_totals(&db_clone2, new_run_id).await;
+        let _ = crate::chat_messages::agent_run::reconcile_run_cost_from_ledger(
+            &mut result,
+            &ledger_totals,
+        );
+        // finalize_agent_run NON scrive token/costo: se il brain non
+        // li ha persistiti su agent_runs ma il ledger li ha, allinea
+        // qui (idempotente: tocca solo i run rimasti a 0, non
+        // sovrascrive un valore gia' corretto del path Python).
+        if result.total_cost > 0.0 {
+            // agent_runs e' migrata: instrada sul pool del progetto
+            // (risolto in-task da db_clone2 + project_id_r, come la
+            // INSERT chat_messages piu' sotto). ai_usage_ledger (sopra)
+            // resta su meta (dominio costi non migrato).
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET total_cost = $2, total_tokens = $3 \
+                 WHERE id = $1 AND total_cost = 0",
+            )
+            .bind(new_run_id)
+            .bind(result.total_cost)
+            .bind(result.total_tokens as i32)
+            .execute(
+                &crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await,
+            )
+            .await;
+        }
+
+        // Esito CERTO anche sul resume (regola L + ADR 0025): stesso
+        // punto unico dello spawn principale. compose_turn_answer
+        // garantisce un messaggio (risposta reale + recap, oppure
+        // recap/placeholder se hollow); canonical_run_status declassa
+        // l'hollow-senza-lavoro a failed_diagnosed. Prima il resume
+        // inseriva nulla per i run vuoti e finalizzava lo status grezzo.
+        let resume_answer = crate::chat_messages::agent_run::compose_turn_answer(&result);
+        // Recap narrativo opzionale (mig 0415): stesso punto unico
+        // del finalize spawn. Gate off di default -> no-op.
+        let resume_answer =
+            crate::chat_messages::agent_run::narrative_or(&state_for_task, &result, resume_answer)
+                .await;
+        let resume_status = crate::chat_messages::agent_run::canonical_run_status(&result);
+        if let Some(answer) = resume_answer.clone() {
+            // Recap RICCO in coda anche sul resume (FIX D3, regola L):
+            // stesso punto unico append_outcome_summary dello spawn,
+            // cosi' il content persistito coincide col recap live e
+            // non diverge dopo un refresh.
+            let answer = crate::chat_messages::agent_run::append_outcome_summary(
+                answer,
+                &result.steps,
+            );
+            let mut meta = serde_json::json!({
+                "provider": &result.provider,
+                "model": &result.model,
+                "agentRunId": new_run_id.to_string(),
+                "iterationCount": result.iteration_count,
+                "automationMode": "automatic",
+                "resumed": true,
+                "hollowCompletion": result.hollow_completion,
+                "promptTokens": result.prompt_tokens,
+                "completionTokens": result.completion_tokens,
+                "totalTokens": result.total_tokens,
+                "totalCost": result.total_cost,
+                "currency": "USD",
+            });
+            // FIX D4: persisti il reasoning anche sul resume cosi'
+            // il blocco "Ragionamento" sopravvive al refresh.
+            if let Some(reasoning) = result
+                .reasoning
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(obj) = meta.as_object_mut() {
+                    obj.insert("reasoning".to_string(), serde_json::json!(reasoning));
+                }
+            }
+            let _ = sqlx::query(
+                r#"INSERT INTO chat_messages
+                   (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
+                   VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
+            )
+            .bind(session_id_r)
+            .bind(project_id_r)
+            .bind(&answer)
+            .bind(meta)
+            .bind(msg_id_r)
+            .execute(
+                &crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await,
+            )
+            .await;
+        }
+
+        let _run_completed = resume_status.is_success();
+        let resume_status_str = resume_status.as_str();
+        crate::agent_types::finalize_agent_run(
+            &db_clone2,
+            new_run_id,
+            resume_status,
+            resume_answer.as_deref().or(result.final_answer.as_deref()),
+            result.iteration_count,
+        )
+        .await;
+
+        // Worklog di sessione (mig 0411): stesso hook del
+        // percorso spawn principale — anche il resume di
+        // conferma alimenta la storia di lavoro. Best-effort.
+        // Worklog nel DB del progetto (separazione DB), pool per-progetto.
+        let wlpool =
+            crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await;
+        if let Err(e) = crate::session_worklog::ingest_steps_for_run(
+            &wlpool,
+            session_id_r,
+            Some(project_id_r),
+            new_run_id,
+            resume_status_str,
+            &result.steps,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "session_worklog: ingest al resume fallito");
+        }
+
+        // ADR 0017 v2 TODO 7: il worker
+        // `wiki::run_summary_worker` (avviato in main.rs,
+        // intervallo 60s default) ingesta i run terminali in
+        // `wiki_docs` (scope=project, kind='run_summary').
+        // Idempotenza via `agent_runs.kb_ingested` (mig 0304).
+        let _ = (
+            &db_clone2,
+            &neural2,
+            &proj_channels2,
+            new_run_id,
+            _run_completed,
+        );
+    });
+
+    Some(json!({
+        "sessionId": context.session_id.to_string(),
+        "userMessage": user_message,
+        "agentRun": {
+            "runId": new_run_id.to_string(),
+            "status": "running",
+            "provider": prev_provider,
+            "model": prev_model,
+            "resumed": true,
+        },
+        "savedAttachments": saved_attachments_json.clone(),
+    }))
+}
+
 pub async fn resend_chat_message(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
