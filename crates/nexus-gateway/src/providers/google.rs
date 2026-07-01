@@ -240,60 +240,69 @@ impl GoogleProvider {
             .await
             .unwrap_or_default();
         let backend = if raw.trim().eq_ignore_ascii_case("vertex") {
-            let project = nexus_auth::get_setting(db, SETTING_VERTEX_PROJECT)
-                .await
-                .unwrap_or_default();
-            if project.trim().is_empty() {
-                anyhow::bail!(
-                    "backend Vertex selezionato ma '{}' vuoto in DB",
-                    SETTING_VERTEX_PROJECT
-                );
-            }
-            let location = nexus_auth::get_setting(db, SETTING_VERTEX_LOCATION)
-                .await
-                .unwrap_or_default();
-            let location = if location.trim().is_empty() {
-                VERTEX_DEFAULT_LOCATION.to_string()
-            } else {
-                location.trim().to_string()
-            };
-            // Region candidate per discovery + fallback inference (mig 0476).
-            // CSV ordinato per preferenza; sempre non vuoto (se il setting manca
-            // si usa la sola `location`). La `location` di prima scelta e'
-            // garantita come PRIMO elemento (anteposta se assente dal CSV) cosi'
-            // l'inference parte sempre dalla region UE di data-residency.
-            let discovery_raw = nexus_auth::get_setting(db, SETTING_VERTEX_DISCOVERY_LOCATIONS)
-                .await
-                .unwrap_or_default();
-            let discovery_locations = build_discovery_locations(&discovery_raw, &location);
-            let credentials = nexus_auth::get_setting(db, SETTING_VERTEX_CREDENTIALS_JSON)
-                .await
-                .unwrap_or_default();
-            if credentials.trim().is_empty() {
-                anyhow::bail!(
-                    "backend Vertex selezionato ma '{}' vuoto in DB",
-                    SETTING_VERTEX_CREDENTIALS_JSON
-                );
-            }
-            let auth = VertexAuth::from_credentials_json(self.http.clone(), &credentials)?;
-            tracing::info!(
-                project = %project,
-                location = %location,
-                discovery_locations = %discovery_locations.join(","),
-                "google provider: backend vertex"
-            );
-            GoogleBackend::Vertex {
-                project: project.trim().to_string(),
-                location,
-                discovery_locations,
-                auth: Arc::new(auth),
-            }
+            self.build_vertex_backend(db).await?
         } else {
             GoogleBackend::Gemini
         };
         let backend = Arc::new(backend);
         self.backend.insert((), backend.clone());
         Ok(backend)
+    }
+
+    /// Costruisce il ramo [`GoogleBackend::Vertex`] leggendo project/location/
+    /// discovery/credentials dai settings (regola G). Estratto da
+    /// [`resolved_backend`] per contenerne la lunghezza (regola A); il bivio
+    /// gemini/vertex resta nel chiamante. Propaga errore se project o credenziali
+    /// mancano (niente fallback nascosto ad ADC/env).
+    async fn build_vertex_backend(&self, db: &PgPool) -> anyhow::Result<GoogleBackend> {
+        let project = nexus_auth::get_setting(db, SETTING_VERTEX_PROJECT)
+            .await
+            .unwrap_or_default();
+        if project.trim().is_empty() {
+            anyhow::bail!(
+                "backend Vertex selezionato ma '{}' vuoto in DB",
+                SETTING_VERTEX_PROJECT
+            );
+        }
+        let location = nexus_auth::get_setting(db, SETTING_VERTEX_LOCATION)
+            .await
+            .unwrap_or_default();
+        let location = if location.trim().is_empty() {
+            VERTEX_DEFAULT_LOCATION.to_string()
+        } else {
+            location.trim().to_string()
+        };
+        // Region candidate per discovery + fallback inference (mig 0476).
+        // CSV ordinato per preferenza; sempre non vuoto (se il setting manca
+        // si usa la sola `location`). La `location` di prima scelta e'
+        // garantita come PRIMO elemento (anteposta se assente dal CSV) cosi'
+        // l'inference parte sempre dalla region UE di data-residency.
+        let discovery_raw = nexus_auth::get_setting(db, SETTING_VERTEX_DISCOVERY_LOCATIONS)
+            .await
+            .unwrap_or_default();
+        let discovery_locations = build_discovery_locations(&discovery_raw, &location);
+        let credentials = nexus_auth::get_setting(db, SETTING_VERTEX_CREDENTIALS_JSON)
+            .await
+            .unwrap_or_default();
+        if credentials.trim().is_empty() {
+            anyhow::bail!(
+                "backend Vertex selezionato ma '{}' vuoto in DB",
+                SETTING_VERTEX_CREDENTIALS_JSON
+            );
+        }
+        let auth = VertexAuth::from_credentials_json(self.http.clone(), &credentials)?;
+        tracing::info!(
+            project = %project,
+            location = %location,
+            discovery_locations = %discovery_locations.join(","),
+            "google provider: backend vertex"
+        );
+        Ok(GoogleBackend::Vertex {
+            project: project.trim().to_string(),
+            location,
+            discovery_locations,
+            auth: Arc::new(auth),
+        })
     }
 
     /// Costruisce la `RequestBuilder` POST verso l'endpoint corretto in base al
@@ -373,39 +382,61 @@ impl GoogleProvider {
     ) -> anyhow::Result<reqwest::Response> {
         let Some(regions) = self.vertex_regions_for_model(backend, model) else {
             // Backend Gemini: nessuna region, un solo invio.
-            return Ok(self
-                .build_post_in_region(backend, "", model, stream)
-                .await?
-                .json(body)
-                .send()
-                .await?);
+            return self.post_body_in_region(backend, "", model, stream, body).await;
         };
+        self.send_across_regions(backend, model, stream, body, &regions)
+            .await
+    }
 
+    /// Costruisce la richiesta per la `region` indicata e la invia (build + json +
+    /// send). Punto unico dell'invio di un singolo tentativo (regola L): condiviso
+    /// dal ramo Gemini (region vuota) e dal loop di fallback Vertex.
+    async fn post_body_in_region(
+        &self,
+        backend: &GoogleBackend,
+        region: &str,
+        model: &str,
+        stream: bool,
+        body: &GenerateContentRequest,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(self
+            .build_post_in_region(backend, region, model, stream)
+            .await?
+            .json(body)
+            .send()
+            .await?)
+    }
+
+    /// Itera le `regions` nell'ordine di preferenza inviando la richiesta finche'
+    /// una risponde non-404 (mig 0476). Estratto da [`send_with_region_fallback`]
+    /// per contenerne la lunghezza (regola A): la scelta gemini/vertex resta nel
+    /// chiamante, qui vive solo il loop Vertex. Un 404 significa "modello assente
+    /// in quella region": si prova la successiva. Al primo 2xx la region viene
+    /// cachata per il modello. Se TUTTE danno 404/errore si ritorna l'ultimo esito.
+    async fn send_across_regions(
+        &self,
+        backend: &GoogleBackend,
+        model: &str,
+        stream: bool,
+        body: &GenerateContentRequest,
+        regions: &[String],
+    ) -> anyhow::Result<reqwest::Response> {
         let mut last: Option<anyhow::Result<reqwest::Response>> = None;
-        for region in &regions {
-            let resp = self
-                .build_post_in_region(backend, region, model, stream)
-                .await?
-                .json(body)
-                .send()
-                .await;
-            match resp {
+        for region in regions {
+            match self.post_body_in_region(backend, region, model, stream, body).await {
+                Ok(r) if r.status().as_u16() == 404 => {
+                    // Modello non disponibile in questa region: prova la successiva
+                    // (regola G: la lista arriva dal DB). Non logghiamo il body (F).
+                    tracing::warn!(
+                        model = %model,
+                        region = %region,
+                        "vertex 404: modello assente in region, provo la successiva"
+                    );
+                    last = Some(Ok(r));
+                }
                 Ok(r) => {
-                    if r.status().as_u16() == 404 {
-                        // Modello non disponibile in questa region: prova la
-                        // successiva (regola G: niente fallback hardcoded, la
-                        // lista arriva dal DB). Non logghiamo il body (regola F).
-                        tracing::warn!(
-                            model = %model,
-                            region = %region,
-                            "vertex 404: modello assente in region, provo la successiva"
-                        );
-                        last = Some(Ok(r));
-                        continue;
-                    }
-                    // Primo status non-404: questa risposta vince. Se 2xx, cacha
-                    // la region per il modello cosi' le richieste successive
-                    // saltano direttamente qui.
+                    // Primo status non-404: questa risposta vince. Se 2xx, cacha la
+                    // region cosi' le richieste successive saltano direttamente qui.
                     if r.status().is_success() {
                         self.vertex_model_region
                             .insert(model.to_string(), region.clone());
@@ -413,21 +444,20 @@ impl GoogleProvider {
                     return Ok(r);
                 }
                 Err(e) => {
-                    // Errore di trasporto (non un 404 applicativo): lo trattiamo
-                    // come tentativo fallito e proviamo la region successiva,
-                    // conservandolo come ultimo esito.
+                    // Errore di trasporto (non un 404 applicativo): tentativo
+                    // fallito, provo la region successiva conservando l'esito.
                     tracing::warn!(
                         model = %model,
                         region = %region,
                         "vertex errore di trasporto, provo la region successiva"
                     );
-                    last = Some(Err(anyhow::Error::new(e)));
+                    last = Some(Err(e));
                 }
             }
         }
-        // Tutte le region hanno dato 404 (o errore di trasporto): ritorna
-        // l'ultimo esito raccolto. `regions` non e' mai vuoto (discovery_locations
-        // garantito non vuoto), quindi `last` e' sempre `Some`.
+        // Tutte le region hanno dato 404 (o errore di trasporto): ritorna l'ultimo
+        // esito. `regions` non e' mai vuoto (discovery_locations garantito non
+        // vuoto), quindi `last` e' sempre `Some`.
         match last {
             Some(r) => r,
             None => anyhow::bail!("vertex: nessuna region candidata per il modello {model}"),
@@ -512,6 +542,152 @@ impl GoogleProvider {
         }
         url
     }
+
+    /// Autodiscovery Gemini direct: `GET {base_url}/models?key=...` ->
+    /// `{ "models": [{ "name": "models/gemini-..." }] }`. Estratto da
+    /// [`list_models`](LlmProvider::list_models) (regola A) per contenerne la
+    /// lunghezza; la normalizzazione a basename delega al parser puro.
+    async fn list_gemini_models(&self) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(format!("{}/models", self.base_url))
+            .query(&[("key", &self.api_key)])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Regola F: il body d'errore non contiene prompt/response utente.
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("google GET models HTTP {}: {}", status.as_u16(), text);
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(parse_google_models_response(&body))
+    }
+
+    /// Autodiscovery Vertex multi-region (mig 0476): interroga OGNI region
+    /// candidata e unisce i risultati. europe-west4 NON espone i gemini-3.x,
+    /// 'global' si': iterando le scopriamo entrambe. Una region che fallisce
+    /// (non-2xx / rete) e' loggata WARN e saltata, senza far fallire l'intero
+    /// discovery (degrado parziale). Estratto da
+    /// [`list_models`](LlmProvider::list_models) (regola A).
+    async fn list_vertex_models(
+        &self,
+        discovery_locations: &[String],
+        auth: &Arc<VertexAuth>,
+    ) -> anyhow::Result<Vec<String>> {
+        let token = auth.access_token().await?;
+        let mut all: Vec<String> = Vec::new();
+        let mut ok_regions = 0usize;
+        for region in discovery_locations {
+            let url = format!(
+                "https://{region}-aiplatform.googleapis.com/v1beta1/publishers/google/models"
+            );
+            match self.http.get(url).bearer_auth(&token).send().await {
+                Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        all.extend(parse_google_models_response(&body));
+                        ok_regions += 1;
+                    }
+                    Err(_) => tracing::warn!(
+                        region = %region,
+                        "vertex discovery: risposta models non parsabile, salto"
+                    ),
+                },
+                Ok(r) => tracing::warn!(
+                    region = %region,
+                    status = r.status().as_u16(),
+                    "vertex discovery: GET models non-2xx, salto la region"
+                ),
+                Err(_) => tracing::warn!(
+                    region = %region,
+                    "vertex discovery: errore di rete su GET models, salto la region"
+                ),
+            }
+        }
+        if ok_regions == 0 {
+            anyhow::bail!(
+                "vertex discovery: nessuna delle {} region ha risposto",
+                discovery_locations.len()
+            );
+        }
+        // Dedup mantenendo output deterministico (parita' col parser puro, che
+        // ordina+deduplica per region; qui ri-uniamo le liste cross-region).
+        all.sort();
+        all.dedup();
+        Ok(all)
+    }
+
+    /// Fase START della video-gen Veo: POST `:predictLongRunning` e ritorna
+    /// l'`operation name` (non vuoto). Estratto da
+    /// [`generate_video`](LlmProvider::generate_video) (regola A). Regola F: il
+    /// body d'errore e' propagato al caller, non loggato in chiaro.
+    async fn start_veo_operation(
+        &self,
+        project: &str,
+        location: &str,
+        auth: &Arc<VertexAuth>,
+        req: &VideoGenRequest,
+    ) -> anyhow::Result<String> {
+        let token = auth.access_token().await?;
+        let body = build_predict_long_running_request(&req.prompt, req.duration_seconds);
+        let start_url = vertex_action_endpoint(project, location, &req.model, "predictLongRunning");
+        let resp = self
+            .http
+            .post(start_url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+        }
+        let start_parsed: LongRunningStartResponse = resp.json().await?;
+        start_parsed.name.filter(|s| !s.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(":predictLongRunning non ha restituito un operation name")
+        })
+    }
+
+    /// Poll-loop dell'operation long-running Veo: GET `{poll_url}` ogni
+    /// [`VIDEO_POLL_INTERVAL`] finche' l'operation e' `done` o scade il
+    /// `poll_timeout` (regola H: niente attesa infinita). Estratto da
+    /// [`generate_video`](LlmProvider::generate_video) (regola A). Rinfresca il
+    /// token ad ogni giro (i poll lunghi superano la scadenza). Ritorna il
+    /// [`ParsedVideo`] estratto dall'operation conclusa.
+    async fn poll_veo_operation(
+        &self,
+        poll_url: &str,
+        auth: &Arc<VertexAuth>,
+        start: Instant,
+        poll_timeout: Duration,
+    ) -> anyhow::Result<ParsedVideo> {
+        loop {
+            if start.elapsed() >= poll_timeout {
+                anyhow::bail!(
+                    "video-generation: timeout dopo {}s in attesa dell'operation Veo (setting {})",
+                    poll_timeout.as_secs(),
+                    VIDEO_POLL_TIMEOUT_SETTING
+                );
+            }
+            tokio::time::sleep(VIDEO_POLL_INTERVAL).await;
+
+            // Token rinfrescato ad ogni giro (la cache interna evita refresh inutili):
+            // i poll lunghi possono superare la scadenza del token.
+            let poll_token = auth.access_token().await?;
+            let poll_resp = self.http.get(poll_url).bearer_auth(&poll_token).send().await?;
+            let poll_status = poll_resp.status();
+            if !poll_status.is_success() {
+                let text = poll_resp.text().await.unwrap_or_default();
+                anyhow::bail!("google HTTP {} (poll): {}", poll_status.as_u16(), text);
+            }
+            let op: LongRunningOperation = poll_resp.json().await?;
+            match parse_operation_response(op)? {
+                OperationOutcome::Pending => continue,
+                OperationOutcome::Done(video) => return Ok(video),
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -585,37 +761,7 @@ impl LlmProvider for GoogleProvider {
 
         let model_used = req.model.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<LlmStreamChunk>>(32);
-
-        tokio::spawn(async move {
-            let mut bytes = resp.bytes_stream();
-            let mut parser = GoogleSseParser::new(model_used);
-
-            loop {
-                match bytes.next().await {
-                    Some(Ok(buf)) => parser.push_bytes(&String::from_utf8_lossy(&buf)),
-                    Some(Err(e)) => {
-                        let _ = tx.send(Err(anyhow::Error::new(e))).await;
-                        return;
-                    }
-                    None => {
-                        parser.flush_leftover();
-                        while let Some(chunk) = parser.pending.pop_front() {
-                            if tx.send(Ok(chunk)).await.is_err() {
-                                return;
-                            }
-                        }
-                        return;
-                    }
-                }
-
-                while let Some(chunk) = parser.pending.pop_front() {
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        });
-
+        tokio::spawn(pump_google_sse(resp, model_used, tx));
         Ok(ReceiverStream::new(rx).boxed())
     }
 
@@ -667,77 +813,12 @@ impl LlmProvider for GoogleProvider {
         // [`parse_google_models_response`] (parita' col brain `list_models_live`).
         let backend = self.resolved_backend().await?;
         match backend.as_ref() {
-            GoogleBackend::Gemini => {
-                let resp = self
-                    .http
-                    .get(format!("{}/models", self.base_url))
-                    .query(&[("key", &self.api_key)])
-                    .send()
-                    .await?;
-                let status = resp.status();
-                if !status.is_success() {
-                    // Regola F: il body d'errore non contiene prompt/response utente.
-                    let text = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("google GET models HTTP {}: {}", status.as_u16(), text);
-                }
-                let body: serde_json::Value = resp.json().await?;
-                Ok(parse_google_models_response(&body))
-            }
+            GoogleBackend::Gemini => self.list_gemini_models().await,
             GoogleBackend::Vertex {
                 discovery_locations,
                 auth,
                 ..
-            } => {
-                // Discovery multi-region (mig 0476): interroghiamo OGNI region
-                // candidata e uniamo i risultati. europe-west4 NON espone i
-                // gemini-3.x, 'global' si': iterando le scopriamo entrambe. Una
-                // region che fallisce (non-2xx / rete) e' loggata WARN e saltata,
-                // senza far fallire l'intero discovery (degrado parziale).
-                let token = auth.access_token().await?;
-                let mut all: Vec<String> = Vec::new();
-                let mut ok_regions = 0usize;
-                for region in discovery_locations {
-                    let url = format!(
-                        "https://{region}-aiplatform.googleapis.com/v1beta1/publishers/google/models"
-                    );
-                    let resp = self.http.get(url).bearer_auth(&token).send().await;
-                    match resp {
-                        Ok(r) if r.status().is_success() => {
-                            match r.json::<serde_json::Value>().await {
-                                Ok(body) => {
-                                    all.extend(parse_google_models_response(&body));
-                                    ok_regions += 1;
-                                }
-                                Err(_) => tracing::warn!(
-                                    region = %region,
-                                    "vertex discovery: risposta models non parsabile, salto"
-                                ),
-                            }
-                        }
-                        Ok(r) => tracing::warn!(
-                            region = %region,
-                            status = r.status().as_u16(),
-                            "vertex discovery: GET models non-2xx, salto la region"
-                        ),
-                        Err(_) => tracing::warn!(
-                            region = %region,
-                            "vertex discovery: errore di rete su GET models, salto la region"
-                        ),
-                    }
-                }
-                if ok_regions == 0 {
-                    anyhow::bail!(
-                        "vertex discovery: nessuna delle {} region ha risposto",
-                        discovery_locations.len()
-                    );
-                }
-                // Dedup mantenendo output deterministico (parita' col parser puro,
-                // che ordina+deduplica per ogni singola region; qui ri-uniamo le
-                // liste cross-region).
-                all.sort();
-                all.dedup();
-                Ok(all)
-            }
+            } => self.list_vertex_models(discovery_locations, auth).await,
         }
     }
 
@@ -824,65 +905,66 @@ impl LlmProvider for GoogleProvider {
         let poll_timeout = Duration::from_secs(self.configured_video_poll_timeout_secs().await);
 
         // 1. START: :predictLongRunning -> operation name.
-        let token = auth.access_token().await?;
-        let body = build_predict_long_running_request(&req.prompt, req.duration_seconds);
-        let start_url = vertex_action_endpoint(project, location, &req.model, "predictLongRunning");
-        let resp = self
-            .http
-            .post(start_url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
+        let operation_name = self
+            .start_veo_operation(project, location, auth, req)
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            // Regola F: body d'errore propagato al caller (cooldown lo classifica),
-            // non loggato qui in chiaro.
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
-        }
-        let start_parsed: LongRunningStartResponse = resp.json().await?;
-        let operation_name = start_parsed.name.filter(|s| !s.is_empty()).ok_or_else(|| {
-            anyhow::anyhow!(":predictLongRunning non ha restituito un operation name")
-        })?;
 
         // 2. POLL: GET {operation_name} finche' done o timeout (regola H).
         let poll_url = format!(
             "https://{location}-aiplatform.googleapis.com/v1/{operation_name}"
         );
-        loop {
-            if start.elapsed() >= poll_timeout {
-                anyhow::bail!(
-                    "video-generation: timeout dopo {}s in attesa dell'operation Veo (setting {})",
-                    poll_timeout.as_secs(),
-                    VIDEO_POLL_TIMEOUT_SETTING
-                );
-            }
-            tokio::time::sleep(VIDEO_POLL_INTERVAL).await;
+        let video = self
+            .poll_veo_operation(&poll_url, auth, start, poll_timeout)
+            .await?;
 
-            // Token rinfrescato ad ogni giro (la cache interna evita refresh inutili):
-            // i poll lunghi possono superare la scadenza del token.
-            let poll_token = auth.access_token().await?;
-            let poll_resp = self.http.get(&poll_url).bearer_auth(&poll_token).send().await?;
-            let poll_status = poll_resp.status();
-            if !poll_status.is_success() {
-                let text = poll_resp.text().await.unwrap_or_default();
-                anyhow::bail!("google HTTP {} (poll): {}", poll_status.as_u16(), text);
+        // 3. ESTRAZIONE: mappa il video estratto al contratto.
+        let latency_ms = start.elapsed().as_millis() as u64;
+        Ok(VideoGenResponse {
+            video_base64: video.video_base64,
+            url: video.url,
+            mime: video.mime,
+            model_used: req.model.clone(),
+            provider_used: "google".to_string(),
+            latency_ms,
+        })
+    }
+}
+
+/// Task di forwarding dello stream SSE Google: consuma i bytes della `resp`,
+/// li da' in pasto al [`GoogleSseParser`] e inoltra i chunk pronti sul canale
+/// `tx`. Estratto dal corpo di [`GoogleProvider::stream`] (regola A) per
+/// contenerne la lunghezza; comportamento identico (un errore di trasporto
+/// chiude il canale, il flush finale svuota il leftover del parser). Interrompe
+/// non appena il ricevitore e' droppato (`tx.send` fallisce).
+async fn pump_google_sse(
+    resp: reqwest::Response,
+    model_used: String,
+    tx: tokio::sync::mpsc::Sender<anyhow::Result<LlmStreamChunk>>,
+) {
+    let mut bytes = resp.bytes_stream();
+    let mut parser = GoogleSseParser::new(model_used);
+
+    loop {
+        match bytes.next().await {
+            Some(Ok(buf)) => parser.push_bytes(&String::from_utf8_lossy(&buf)),
+            Some(Err(e)) => {
+                let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                return;
             }
-            let op: LongRunningOperation = poll_resp.json().await?;
-            match parse_operation_response(op)? {
-                OperationOutcome::Pending => continue,
-                OperationOutcome::Done(video) => {
-                    let latency_ms = start.elapsed().as_millis() as u64;
-                    return Ok(VideoGenResponse {
-                        video_base64: video.video_base64,
-                        url: video.url,
-                        mime: video.mime,
-                        model_used: req.model.clone(),
-                        provider_used: "google".to_string(),
-                        latency_ms,
-                    });
+            None => {
+                parser.flush_leftover();
+                while let Some(chunk) = parser.pending.pop_front() {
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
                 }
+                return;
+            }
+        }
+
+        while let Some(chunk) = parser.pending.pop_front() {
+            if tx.send(Ok(chunk)).await.is_err() {
+                return;
             }
         }
     }
@@ -1218,13 +1300,20 @@ fn clean_schema_for_google(schema: &serde_json::Value) -> serde_json::Value {
 /// `budget` (fix hollow completion: i token di reasoning sono conteggiati dentro
 /// il tetto di output, parita' col Python ~494 `_effective_output_tokens`).
 fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateContentRequest {
-    let mut system_instruction: Option<GoogleContent> = None;
-    let mut contents: Vec<GoogleContent> = Vec::new();
+    let (system_instruction, contents) = build_google_contents(req);
+    GenerateContentRequest {
+        contents,
+        system_instruction,
+        generation_config: build_generation_config(req, thinking),
+        tools: build_google_tools(req),
+        tool_config: build_google_tool_config(req),
+    }
+}
 
-    // Mappa id->name di TUTTE le tool-call in history (parita' col Python
-    // `_convert_messages_to_google` ~769-775): Gemini vuole il NOME del tool nel
-    // functionResponse, non l'id. Costruita prima del loop cosi' un tool-result
-    // puo' risolvere il nome anche se la call e' in un turno precedente.
+/// Costruisce la mappa `tool_call_id -> tool_name` di TUTTE le tool-call in
+/// history (parita' Python ~769-775). Estratto da [`build_google_contents`]
+/// (regola A). Funzione PURA.
+fn build_tool_id_to_name(req: &LlmRequest) -> std::collections::HashMap<String, String> {
     let mut id_to_name: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for msg in &req.messages {
@@ -1234,17 +1323,44 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
             }
         }
     }
+    id_to_name
+}
+
+/// Svuota il buffer `pending` (functionResponse accumulate) in un unico turno
+/// `user`, se non vuoto. Punto unico (regola L) del raggruppamento richiesto da
+/// Gemini, condiviso dal flush inline e da quello finale di
+/// [`build_google_contents`]. No-op se `pending` e' vuoto.
+fn flush_pending_responses(contents: &mut Vec<GoogleContent>, pending: &mut Vec<GooglePart>) {
+    if pending.is_empty() {
+        return;
+    }
+    contents.push(GoogleContent {
+        role: Some("user".to_string()),
+        parts: std::mem::take(pending),
+    });
+}
+
+/// Converte i messaggi del contratto nei `contents[]` Google, separando il
+/// `system` come `systemInstruction`. Estratto da [`build_request_body`]
+/// (regola A/L, punto unico della conversione history). Raggruppa le
+/// functionResponse in un unico turno user (invariante Gemini) e chiude
+/// richiamando [`reconcile_function_call_response_pairs`].
+fn build_google_contents(req: &LlmRequest) -> (Option<GoogleContent>, Vec<GoogleContent>) {
+    let mut system_instruction: Option<GoogleContent> = None;
+    let mut contents: Vec<GoogleContent> = Vec::new();
+
+    // Mappa id->name di TUTTE le tool-call in history: Gemini vuole il NOME del
+    // tool nel functionResponse, non l'id (costruita prima del loop cosi' un
+    // tool-result risolve il nome anche se la call e' in un turno precedente).
+    let id_to_name = build_tool_id_to_name(req);
 
     // Buffer functionResponse: Gemini vuole TUTTE le functionResponse di un turno
     // model multi-functionCall raggruppate in UN unico turno user (altrimenti HTTP
     // 400 "number of function response parts is equal to function call parts").
     let mut pending_fn_responses: Vec<GooglePart> = Vec::new();
     for msg in &req.messages {
-        if msg.role.as_str() != "tool" && !pending_fn_responses.is_empty() {
-            contents.push(GoogleContent {
-                role: Some("user".to_string()),
-                parts: std::mem::take(&mut pending_fn_responses),
-            });
+        if msg.role.as_str() != "tool" {
+            flush_pending_responses(&mut contents, &mut pending_fn_responses);
         }
         match msg.role.as_str() {
             "system" => {
@@ -1253,82 +1369,16 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
                     parts: vec![GooglePart::text(content_to_string(&msg.content))],
                 });
             }
-            // Tool-result: Gemini lo vuole come una part `functionResponse` su un
-            // messaggio role=`user` (parita' col Python ~818-842, response
-            // `{"result": ...}`). Il NOME del tool si risolve dalla mappa
-            // id->name; se l'id e' sconosciuto si ripiega sull'id grezzo (Gemini
-            // rifiuterebbe il mismatch, ma e' il fallback meno dannoso).
-            "tool" => {
-                let name = msg
-                    .tool_call_id
-                    .as_ref()
-                    .and_then(|id| id_to_name.get(id).cloned())
-                    .or_else(|| msg.tool_call_id.clone())
-                    .unwrap_or_default();
-                let response = serde_json::json!({ "result": content_to_string(&msg.content) });
-                // Accumula: raggruppate sotto in UN turno user (Gemini parity).
-                pending_fn_responses.push(GooglePart::function_response(name, response));
-            }
-            // Assistant con tool-call: emette role=`model` con una part
-            // `functionCall` per ciascuna call (parita' col Python ~807-817). La
-            // thought_signature va sulla PRIMA part del turno.
+            "tool" => pending_fn_responses.push(tool_result_to_part(msg, &id_to_name)),
             "assistant" if msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) => {
-                let mut parts: Vec<GooglePart> = Vec::new();
-                // Eventuale testo dell'assistant prima delle call (raro).
-                if let MessageContent::Text(t) = &msg.content {
-                    if !t.is_empty() {
-                        parts.push(GooglePart::text(t.clone()));
-                    }
-                }
-                for tc in msg.tool_calls.as_ref().unwrap() {
-                    // arguments e' una stringa JSON nel contratto; Gemini vuole un
-                    // oggetto in `args` (parita' col mapping Anthropic ~606-608).
-                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    parts.push(GooglePart::function_call(tc.function.name.clone(), args));
-                }
-                if parts.is_empty() {
-                    parts.push(GooglePart::text(String::new()));
-                }
-                if let Some(first) = parts.first_mut() {
-                    first.thought_signature = msg.thinking_signature.clone();
-                }
-                contents.push(GoogleContent {
-                    role: Some("model".to_string()),
-                    parts,
-                });
+                contents.push(assistant_tool_call_content(msg));
             }
-            role => {
-                // RI-PASSAGGIO thought_signature: se il turno assistant la porta,
-                // va riattaccata alla PRIMA part del turno (parita' col Python
-                // `_convert_messages_to_google` ~776-798). Obbligatoria su
-                // Gemini 3, raccomandata su 2.5. Solo sui turni `model`.
-                let signature = if map_role(role) == "model" {
-                    msg.thinking_signature.clone()
-                } else {
-                    None
-                };
-                let mut parts = content_to_parts(&msg.content);
-                // La signature si attacca alla PRIMA part del turno (vuota se
-                // assente). `content_to_parts` garantisce almeno una part.
-                if let Some(first) = parts.first_mut() {
-                    first.thought_signature = signature;
-                }
-                contents.push(GoogleContent {
-                    role: Some(map_role(role).to_string()),
-                    parts,
-                });
-            }
+            role => contents.push(plain_message_content(role, msg)),
         }
     }
     // Flush finale delle functionResponse accumulate (history che termina con
     // uno o piu' tool-result): stesso raggruppamento in un unico turno user.
-    if !pending_fn_responses.is_empty() {
-        contents.push(GoogleContent {
-            role: Some("user".to_string()),
-            parts: std::mem::take(&mut pending_fn_responses),
-        });
-    }
+    flush_pending_responses(&mut contents, &mut pending_fn_responses);
 
     // Riconciliazione invariante Gemini (punto unico, regola L): per ogni content
     // `model` con N functionCall, il content `user` successivo deve avere
@@ -1337,10 +1387,87 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
     // ("number of function response parts is equal to function call parts"). La
     // riconciliazione sintetizza i response mancanti e scarta quelli orfani.
     reconcile_function_call_response_pairs(&mut contents);
+    (system_instruction, contents)
+}
 
-    // Fix hollow completion: alza il tetto di output del budget thinking cosi'
-    // i max_tokens richiesti restano interi per la risposta utente. Solo quando il
-    // thinking e' ATTIVO: con thinking assente/disabilitato il tetto resta intatto.
+/// Mappa un messaggio `role="tool"` nella sua part `functionResponse` (turno
+/// `user`, response `{"result": ...}`). Il NOME del tool si risolve dalla mappa
+/// id->name; se l'id e' sconosciuto si ripiega sull'id grezzo (Gemini
+/// rifiuterebbe il mismatch, ma e' il fallback meno dannoso). Parita' Python
+/// ~818-842. Estratto da [`build_google_contents`].
+fn tool_result_to_part(
+    msg: &crate::types::LlmMessage,
+    id_to_name: &std::collections::HashMap<String, String>,
+) -> GooglePart {
+    let name = msg
+        .tool_call_id
+        .as_ref()
+        .and_then(|id| id_to_name.get(id).cloned())
+        .or_else(|| msg.tool_call_id.clone())
+        .unwrap_or_default();
+    let response = serde_json::json!({ "result": content_to_string(&msg.content) });
+    GooglePart::function_response(name, response)
+}
+
+/// Costruisce il content `role="model"` per un assistant con tool-call: una part
+/// `functionCall` per ciascuna call (parita' Python ~807-817), preceduta
+/// dall'eventuale testo. La thought_signature va sulla PRIMA part del turno.
+/// Estratto da [`build_google_contents`].
+fn assistant_tool_call_content(msg: &crate::types::LlmMessage) -> GoogleContent {
+    let mut parts: Vec<GooglePart> = Vec::new();
+    // Eventuale testo dell'assistant prima delle call (raro).
+    if let MessageContent::Text(t) = &msg.content {
+        if !t.is_empty() {
+            parts.push(GooglePart::text(t.clone()));
+        }
+    }
+    for tc in msg.tool_calls.as_ref().into_iter().flatten() {
+        // arguments e' una stringa JSON nel contratto; Gemini vuole un oggetto
+        // in `args` (parita' col mapping Anthropic ~606-608).
+        let args: serde_json::Value =
+            serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        parts.push(GooglePart::function_call(tc.function.name.clone(), args));
+    }
+    if parts.is_empty() {
+        parts.push(GooglePart::text(String::new()));
+    }
+    if let Some(first) = parts.first_mut() {
+        first.thought_signature = msg.thinking_signature.clone();
+    }
+    GoogleContent {
+        role: Some("model".to_string()),
+        parts,
+    }
+}
+
+/// Costruisce il content per un messaggio ordinario (user/assistant-testo).
+/// RI-PASSAGGIO thought_signature: se il turno mappa a `model`, va riattaccata
+/// alla PRIMA part (parita' Python ~776-798; obbligatoria su Gemini 3). Estratto
+/// da [`build_google_contents`].
+fn plain_message_content(role: &str, msg: &crate::types::LlmMessage) -> GoogleContent {
+    let signature = if map_role(role) == "model" {
+        msg.thinking_signature.clone()
+    } else {
+        None
+    };
+    let mut parts = content_to_parts(&msg.content);
+    // La signature si attacca alla PRIMA part del turno (vuota se assente).
+    // `content_to_parts` garantisce almeno una part.
+    if let Some(first) = parts.first_mut() {
+        first.thought_signature = signature;
+    }
+    GoogleContent {
+        role: Some(map_role(role).to_string()),
+        parts,
+    }
+}
+
+/// Costruisce il `generationConfig` (temperature + maxOutputTokens + thinking).
+/// Estratto da [`build_request_body`] (regola A). Fix hollow completion: quando
+/// il thinking e' ATTIVO alza il tetto di output del budget cosi' i max_tokens
+/// richiesti restano interi per la risposta. Ritorna `None` se nessun campo e'
+/// valorizzato.
+fn build_generation_config(req: &LlmRequest, thinking: GoogleThinking) -> Option<GenerationConfig> {
     let max_output_tokens = match (req.max_tokens, thinking) {
         (Some(mt), GoogleThinking::Enabled(budget)) => Some(mt.saturating_add(budget)),
         (mt, _) => mt,
@@ -1364,30 +1491,26 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
         }),
     };
 
-    let generation_config =
-        if req.temperature.is_some() || max_output_tokens.is_some() || thinking_config.is_some() {
-            Some(GenerationConfig {
-                temperature: req.temperature,
-                max_output_tokens,
-                thinking_config,
-            })
-        } else {
-            None
-        };
+    if req.temperature.is_some() || max_output_tokens.is_some() || thinking_config.is_some() {
+        Some(GenerationConfig {
+            temperature: req.temperature,
+            max_output_tokens,
+            thinking_config,
+        })
+    } else {
+        None
+    }
+}
 
-    // functionDeclarations native Gemini: ogni tool del contratto OpenAI diventa
-    // una FunctionDeclaration con lo schema normalizzato al subset Google
-    // (clean_schema_for_google). Senza questo blocco, `tool_config` (mode=ANY) e'
-    // inerte e il modello emette i control-token nel testo invece di una
-    // functionCall. Parita' col brain `google_provider.py` (un solo elemento
-    // Tool contenente tutte le declarations) e con openai_compat/anthropic, che
-    // dichiarano i tool nel body. NOTA thinking+tools: il gate disable_for_tools
-    // e' applicato al confine col provider da [`resolve_thinking`], che con tool
-    // presenti restituisce `GoogleThinking::DisabledForTools` -> thinkingConfig
-    // esplicito budget 0 (vedi sopra). Necessario perche' qui i `tools` sono
-    // valorizzati: senza il gate Gemini userebbe il thinking ON di default,
-    // incompatibile col function-calling forzato.
-    let tools = req.tools.as_ref().map(|defs| {
+/// Costruisce le `functionDeclarations` native Gemini: ogni tool del contratto
+/// OpenAI diventa una FunctionDeclaration con lo schema normalizzato al subset
+/// Google (clean_schema_for_google). Senza questo blocco, `tool_config`(mode=ANY)
+/// e' inerte e il modello emette i control-token nel testo invece di una
+/// functionCall. Parita' col brain (un solo elemento Tool con tutte le
+/// declarations). Estratto da [`build_request_body`] (regola A). NOTA
+/// thinking+tools: il gate disable_for_tools e' applicato da [`resolve_thinking`].
+fn build_google_tools(req: &LlmRequest) -> Option<Vec<GoogleToolDecl>> {
+    req.tools.as_ref().map(|defs| {
         let decls: Vec<GoogleFunctionDeclaration> = defs
             .iter()
             .map(|t| GoogleFunctionDeclaration {
@@ -1400,24 +1523,26 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
         vec![GoogleToolDecl {
             function_declarations: decls,
         }]
-    });
+    })
+}
 
-    // tool_choice mappato a `tool_config.function_calling_config.mode` via il
-    // punto unico (regola L). Lo iniettiamo SEMPRE quando ci sono `tools`: se il
-    // chiamante fornisce un vincolo riconosciuto (auto/required/none/function) si
-    // usa quello, altrimenti si applica il DEFAULT ESPLICITO `mode=AUTO`.
-    //
-    // QUIRK GEMINI (fix definitivo, regola H): i modelli "thinking" (gemini-2.5/
-    // 3.x) con `tools` presenti ma SENZA `toolConfig` rispondono in modo NON
-    // deterministico con un turno vuoto (zero output token, finishReason STOP,
-    // nessuna functionCall) invece di chiamare il tool. Diagnosticato sul
-    // tool-probe di mcp-core (`generate_agent_turn` non invia `tool_choice`):
-    // ~1 richiesta su 3 tornava vuota -> a soglia tutti i gemini finivano
-    // auto-disabilitati con `tool_probe_failed`. Inviando esplicitamente
-    // `functionCallingConfig.mode=AUTO` il function calling torna deterministico
-    // (3/3 OK in verifica). Senza tool (`req.tools` None) nessun tool_config: un
-    // `toolConfig` orfano sarebbe rifiutato da Gemini.
-    let tool_config = req.tools.as_ref().map(|_| {
+/// Costruisce il `tool_config.function_calling_config` via il punto unico di
+/// mapping (regola L). Presente SOLO quando ci sono `tools`: se il chiamante
+/// fornisce un vincolo riconosciuto (auto/required/none/function) si usa quello,
+/// altrimenti il DEFAULT ESPLICITO `mode=AUTO`. Estratto da
+/// [`build_request_body`] (regola A).
+///
+/// QUIRK GEMINI (fix definitivo, regola H): i modelli "thinking" (gemini-2.5/
+/// 3.x) con `tools` presenti ma SENZA `toolConfig` rispondono in modo NON
+/// deterministico con un turno vuoto (zero output token, finishReason STOP,
+/// nessuna functionCall) invece di chiamare il tool. Diagnosticato sul tool-probe
+/// di mcp-core (`generate_agent_turn` non invia `tool_choice`): ~1 richiesta su 3
+/// tornava vuota -> a soglia tutti i gemini finivano auto-disabilitati con
+/// `tool_probe_failed`. Inviando esplicitamente `functionCallingConfig.mode=AUTO`
+/// il function calling torna deterministico (3/3 OK in verifica). Senza tool
+/// (`req.tools` None) nessun tool_config: un `toolConfig` orfano sarebbe rifiutato.
+fn build_google_tool_config(req: &LlmRequest) -> Option<GoogleToolConfig> {
+    req.tools.as_ref().map(|_| {
         let function_calling_config = req
             .tool_choice
             .as_ref()
@@ -1426,15 +1551,7 @@ fn build_request_body(req: &LlmRequest, thinking: GoogleThinking) -> GenerateCon
         GoogleToolConfig {
             function_calling_config,
         }
-    });
-
-    GenerateContentRequest {
-        contents,
-        system_instruction,
-        generation_config,
-        tools,
-        tool_config,
-    }
+    })
 }
 
 /// Testo (in inglese, neutro lato API) della risposta sintetica usata per le
@@ -1485,68 +1602,85 @@ fn reconcile_function_call_response_pairs(contents: &mut Vec<GoogleContent>) {
             i += 1;
             continue;
         }
-
-        // Recupera (consumando) le functionResponse del content successivo, se e'
-        // il turno user che le porta. Le indicizziamo per name in code FIFO cosi'
-        // piu' call con lo stesso nome consumano response distinte nell'ordine.
-        let mut by_name: std::collections::HashMap<String, VecDeque<GooglePart>> =
-            std::collections::HashMap::new();
-        let has_next_user_responses = contents
-            .get(i + 1)
-            .is_some_and(|c| c.parts.iter().any(|p| p.function_response.is_some()));
-        if has_next_user_responses {
-            let next_parts = std::mem::take(&mut contents[i + 1].parts);
-            for part in next_parts {
-                // Le part non-functionResponse in mezzo ai tool-result (raro)
-                // vengono scartate: il turno user di response e' dedicato ad essi.
-                if let Some(name) = part.function_response.as_ref().map(|fr| fr.name.clone()) {
-                    by_name.entry(name).or_default().push_back(part);
-                }
-            }
-        }
-
-        // Ricostruisci le response NELLO STESSO ORDINE delle call: per ogni call
-        // consuma una response con lo stesso name; se non c'e', sintetizzala.
-        let mut reconciled: Vec<GooglePart> = Vec::with_capacity(call_names.len());
-        for name in &call_names {
-            let matched = by_name.get_mut(name).and_then(|q| q.pop_front());
-            match matched {
-                Some(part) => reconciled.push(part),
-                None => reconciled.push(GooglePart::function_response(
-                    name.clone(),
-                    serde_json::json!({ "error": SYNTHETIC_TOOL_RESULT_MESSAGE }),
-                )),
-            }
-        }
-        // Tutte le response rimaste in `by_name` sono orfane (name senza call
-        // corrispondente) e vengono SCARTATE: non finiscono nel turno.
-
-        if has_next_user_responses {
-            // Sovrascrive il turno user successivo con i response riconciliati.
-            contents[i + 1].parts = reconciled;
-        } else {
-            // Nessun turno user con response dopo il model (history troncata
-            // subito dopo le call): inserisce un nuovo turno user di soli
-            // response sintetici per ripristinare l'invariante.
-            contents.insert(
-                i + 1,
-                GoogleContent {
-                    role: Some("user".to_string()),
-                    parts: reconciled,
-                },
-            );
-        }
+        reconcile_model_turn(contents, i, &call_names);
         // Salta sia il turno model sia il turno user di response (quest'ultimo
         // non contiene functionCall e non va ri-processato come turno model).
         i += 2;
     }
+    drop_orphan_leading_responses(contents);
+}
 
-    // Passata finale: scarta le functionResponse che NON sono precedute da un
-    // turno model con functionCall (response orfane "di testa", caso degenere:
-    // un tool-result come primo messaggio, senza alcuna call). Inviarle a Gemini
-    // produrrebbe comunque un 400 (functionResponse senza functionCall). Le parts
-    // non-functionResponse dello stesso turno restano; un turno che resta senza
-    // parts viene rimosso del tutto per non spedire un content vuoto.
+/// Riconcilia il turno `user` che segue il turno model in posizione `i` (con
+/// `call_names` functionCall) affinche' porti ESATTAMENTE una functionResponse
+/// per call, nello stesso ordine (name-correlato, FIFO sui duplicati). Le
+/// response mancanti sono sintetizzate, le orfane scartate; se non c'e' turno
+/// user successivo ne inserisce uno. Estratto da
+/// [`reconcile_function_call_response_pairs`] (regola A).
+fn reconcile_model_turn(contents: &mut Vec<GoogleContent>, i: usize, call_names: &[String]) {
+    // Recupera (consumando) le functionResponse del content successivo, se e' il
+    // turno user che le porta, indicizzate per name in code FIFO.
+    let has_next_user_responses = contents
+        .get(i + 1)
+        .is_some_and(|c| c.parts.iter().any(|p| p.function_response.is_some()));
+    let mut by_name = if has_next_user_responses {
+        collect_responses_by_name(std::mem::take(&mut contents[i + 1].parts))
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Ricostruisci le response NELLO STESSO ORDINE delle call: per ogni call
+    // consuma una response con lo stesso name; se non c'e', sintetizzala. Le
+    // response rimaste in `by_name` sono orfane e vengono scartate.
+    let mut reconciled: Vec<GooglePart> = Vec::with_capacity(call_names.len());
+    for name in call_names {
+        match by_name.get_mut(name).and_then(|q| q.pop_front()) {
+            Some(part) => reconciled.push(part),
+            None => reconciled.push(GooglePart::function_response(
+                name.clone(),
+                serde_json::json!({ "error": SYNTHETIC_TOOL_RESULT_MESSAGE }),
+            )),
+        }
+    }
+
+    if has_next_user_responses {
+        // Sovrascrive il turno user successivo con i response riconciliati.
+        contents[i + 1].parts = reconciled;
+    } else {
+        // Nessun turno user con response dopo il model (history troncata subito
+        // dopo le call): inserisce un nuovo turno user di soli response sintetici.
+        contents.insert(
+            i + 1,
+            GoogleContent {
+                role: Some("user".to_string()),
+                parts: reconciled,
+            },
+        );
+    }
+}
+
+/// Indicizza le functionResponse di un turno per name in code FIFO, cosi' piu'
+/// call con lo stesso nome consumano response distinte nell'ordine. Le part
+/// non-functionResponse vengono scartate. Estratto da [`reconcile_model_turn`].
+fn collect_responses_by_name(
+    parts: Vec<GooglePart>,
+) -> std::collections::HashMap<String, VecDeque<GooglePart>> {
+    let mut by_name: std::collections::HashMap<String, VecDeque<GooglePart>> =
+        std::collections::HashMap::new();
+    for part in parts {
+        if let Some(name) = part.function_response.as_ref().map(|fr| fr.name.clone()) {
+            by_name.entry(name).or_default().push_back(part);
+        }
+    }
+    by_name
+}
+
+/// Passata finale: scarta le functionResponse che NON sono precedute da un turno
+/// model con functionCall (response orfane "di testa", caso degenere: un
+/// tool-result come primo messaggio). Inviarle a Gemini produrrebbe un 400. Le
+/// parts non-functionResponse dello stesso turno restano; un turno che resta
+/// senza parts viene rimosso. Estratto da
+/// [`reconcile_function_call_response_pairs`] (regola A).
+fn drop_orphan_leading_responses(contents: &mut Vec<GoogleContent>) {
     let mut j = 0;
     while j < contents.len() {
         let prev_is_model_with_calls = j
@@ -1679,6 +1813,79 @@ fn mime_from_url(url: &str) -> Option<String> {
 
 /// Mappa una `GenerateContentResponse` nel contratto [`LlmResponse`]: concatena
 /// le `parts[].text` del primo candidate e normalizza il `finishReason`.
+/// Testo/reasoning/tool-call/signature estratti dalle parts di un candidate
+/// Gemini (risposta non-stream). Aggregatore intermedio di
+/// [`collect_candidate_parts`], consumato da [`from_generate_response`].
+#[derive(Default)]
+struct CandidateParts {
+    content: String,
+    reasoning: String,
+    thinking_signature: Option<String>,
+    tool_calls: Vec<LlmToolCall>,
+}
+
+/// Scandisce le `parts` del candidate separando testo utente, reasoning
+/// (`thought=true`), tool-call e thoughtSignature (catturata una sola volta).
+/// Estratto da [`from_generate_response`] (regola A). Funzione PURA.
+fn collect_candidate_parts(candidate: Option<&GoogleCandidate>) -> CandidateParts {
+    let mut acc = CandidateParts::default();
+    let Some(c) = candidate else {
+        return acc;
+    };
+    for part in &c.content.parts {
+        if acc.thinking_signature.is_none() {
+            if let Some(sig) = &part.thought_signature {
+                if !sig.is_empty() {
+                    acc.thinking_signature = Some(sig.clone());
+                }
+            }
+        }
+        // functionCall: il modello chiede di eseguire un tool. Gemini non emette
+        // un id di tool-call, ne sintetizziamo uno stabile cosi' il brain puo'
+        // correlare il functionResponse nel round-trip (parita' Python ~589).
+        // La part-functionCall non porta testo: passa oltre.
+        if let Some(fc) = &part.function_call {
+            acc.tool_calls.push(LlmToolCall {
+                id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                kind: "function".to_string(),
+                function: ToolFunctionCall {
+                    name: fc.name.clone(),
+                    // Il contratto vuole `arguments` come STRINGA JSON (parita'
+                    // Anthropic ~761): serializziamo l'oggetto args.
+                    arguments: function_args_to_string(&fc.args),
+                },
+            });
+            continue;
+        }
+        if let Some(text) = &part.text {
+            if part.thought.unwrap_or(false) {
+                acc.reasoning.push_str(text);
+            } else {
+                acc.content.push_str(text);
+            }
+        }
+    }
+    acc
+}
+
+/// Mappa l'`usageMetadata` Gemini (non-stream) nel contratto [`LlmUsage`],
+/// azzerando i conteggi quando il metadata e' assente. Estratto da
+/// [`from_generate_response`] (regola A). Funzione PURA.
+fn usage_from_metadata(meta: Option<GoogleUsageMetadata>) -> LlmUsage {
+    meta.map(|u| LlmUsage {
+        input_tokens: u.prompt_token_count,
+        output_tokens: u.candidates_token_count,
+        cache_read_tokens: u.cached_content_token_count,
+        cache_creation_tokens: None,
+    })
+    .unwrap_or(LlmUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+    })
+}
+
 fn from_generate_response(
     resp: GenerateContentResponse,
     model_used: String,
@@ -1690,80 +1897,27 @@ fn from_generate_response(
     // reasoning interno va in `reasoning`, non nel content (parita' col Python
     // ~575-583). La `thoughtSignature` (gia' base64 nell'API REST) si cattura
     // una sola volta, dovunque appaia (parita' col Python ~567-574).
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut thinking_signature: Option<String> = None;
-    let mut tool_calls: Vec<LlmToolCall> = Vec::new();
-
-    if let Some(c) = candidate.as_ref() {
-        for part in &c.content.parts {
-            if thinking_signature.is_none() {
-                if let Some(sig) = &part.thought_signature {
-                    if !sig.is_empty() {
-                        thinking_signature = Some(sig.clone());
-                    }
-                }
-            }
-            // functionCall: il modello chiede di eseguire un tool. Gemini non
-            // emette un id di tool-call, ne sintetizziamo uno stabile cosi' il
-            // brain puo' correlare il functionResponse nel round-trip (parita'
-            // col Python ~589 `toolu_{uuid}`). La part-functionCall non porta
-            // testo: passa oltre.
-            if let Some(fc) = &part.function_call {
-                tool_calls.push(LlmToolCall {
-                    id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-                    kind: "function".to_string(),
-                    function: ToolFunctionCall {
-                        name: fc.name.clone(),
-                        // Il contratto vuole `arguments` come STRINGA JSON
-                        // (parita' Anthropic ~761): serializziamo l'oggetto args.
-                        arguments: function_args_to_string(&fc.args),
-                    },
-                });
-                continue;
-            }
-            if let Some(text) = &part.text {
-                if part.thought.unwrap_or(false) {
-                    reasoning.push_str(text);
-                } else {
-                    content.push_str(text);
-                }
-            }
-        }
-    }
+    let parts = collect_candidate_parts(candidate.as_ref());
 
     // Quando ci sono tool-call, Gemini segnala finishReason=STOP: per parita' col
     // contratto (Anthropic/OpenAI usano "tool_calls"), forziamo il segnale che il
     // brain usa per capire che deve eseguire i tool.
-    let finish_reason = if tool_calls.is_empty() {
+    let finish_reason = if parts.tool_calls.is_empty() {
         map_finish_reason(candidate.as_ref().and_then(|c| c.finish_reason.as_deref()))
     } else {
         "tool_calls".to_string()
     };
 
-    let usage = resp
-        .usage_metadata
-        .map(|u| LlmUsage {
-            input_tokens: u.prompt_token_count,
-            output_tokens: u.candidates_token_count,
-            cache_read_tokens: u.cached_content_token_count,
-            cache_creation_tokens: None,
-        })
-        .unwrap_or(LlmUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-        });
+    let usage = usage_from_metadata(resp.usage_metadata);
 
     LlmResponse {
-        content,
+        content: parts.content,
         // functionCall native Gemini -> tool_calls del contratto (parita' coi
         // peer anthropic/openai_compat). `None` quando il turno non chiede tool.
-        tool_calls: if tool_calls.is_empty() {
+        tool_calls: if parts.tool_calls.is_empty() {
             None
         } else {
-            Some(tool_calls)
+            Some(parts.tool_calls)
         },
         usage,
         model_used,
@@ -1771,12 +1925,12 @@ fn from_generate_response(
         latency_ms,
         finish_reason,
         privacy_rerouted: None,
-        reasoning: if reasoning.is_empty() {
+        reasoning: if parts.reasoning.is_empty() {
             None
         } else {
-            Some(reasoning)
+            Some(parts.reasoning)
         },
-        thinking_signature,
+        thinking_signature: parts.thinking_signature,
     }
 }
 
@@ -1800,6 +1954,70 @@ fn map_finish_reason(raw: Option<&str>) -> String {
         _ => "stop",
     }
     .to_string()
+}
+
+/// Delta di testo/reasoning/tool-call estratti dalle parts di un chunk SSE.
+/// Aggregatore intermedio di [`collect_stream_parts`], consumato da
+/// [`GoogleSseParser::chunk_from_response`].
+#[derive(Default)]
+struct StreamParts {
+    delta: String,
+    reasoning_delta: String,
+    tool_call_delta: Option<ToolCallDelta>,
+}
+
+/// Scandisce le parts di un chunk SSE separando testo utente (`delta`),
+/// reasoning (`thought=true`, `reasoning_delta`) e la PRIMA functionCall come
+/// [`ToolCallDelta`] gia' completo (Gemini non frammenta gli args nello stream).
+/// Estratto da [`GoogleSseParser::chunk_from_response`] (regola A). Funzione PURA.
+fn collect_stream_parts(candidate: Option<&GoogleCandidate>) -> StreamParts {
+    let mut acc = StreamParts::default();
+    let Some(c) = candidate else {
+        return acc;
+    };
+    for part in &c.content.parts {
+        if acc.tool_call_delta.is_none() {
+            if let Some(fc) = &part.function_call {
+                acc.tool_call_delta = Some(ToolCallDelta {
+                    index: 0,
+                    id: Some(format!("call_{}", uuid::Uuid::new_v4().simple())),
+                    function: Some(ToolCallDeltaFunction {
+                        name: Some(fc.name.clone()),
+                        // arguments come stringa JSON completa in un colpo.
+                        arguments: Some(function_args_to_string(&fc.args)),
+                    }),
+                });
+                continue; // la part-functionCall non porta text
+            }
+        }
+        if let Some(text) = &part.text {
+            if part.thought.unwrap_or(false) {
+                acc.reasoning_delta.push_str(text);
+            } else {
+                acc.delta.push_str(text);
+            }
+        }
+    }
+    acc
+}
+
+/// Determina il `finish_reason` di un chunk SSE. Quando il chunk porta una
+/// tool-call segnaliamo "tool_calls" al consumer (parita' col mapping
+/// non-stream): Gemini puo' mandare functionCall con finishReason=STOP (o senza
+/// finish nel chunk della call). Estratto da
+/// [`GoogleSseParser::chunk_from_response`] (regola A).
+fn stream_finish_reason(candidate: Option<&GoogleCandidate>, has_tool_call: bool) -> Option<String> {
+    let mapped = candidate
+        .and_then(|c| c.finish_reason.as_deref())
+        .map(|r| map_finish_reason(Some(r)));
+    if has_tool_call {
+        match mapped.as_deref() {
+            None | Some("stop") => Some("tool_calls".to_string()),
+            _ => mapped,
+        }
+    } else {
+        mapped
+    }
 }
 
 /// Parser SSE Google (`?alt=sse`): ogni riga `data: {GenerateContentResponse}`
@@ -1857,59 +2075,16 @@ impl GoogleSseParser {
     fn chunk_from_response(&self, resp: GenerateContentResponse) -> Option<LlmStreamChunk> {
         let candidate = resp.candidates.into_iter().next();
 
-        // Separa testo utente da reasoning (part `thought=true`): il primo va in
-        // `delta`, il secondo in `reasoning_delta` (parita' col Python streaming).
-        let mut delta = String::new();
-        let mut reasoning_delta = String::new();
-        // Gemini emette la functionCall completa dentro una part (non frammentata
-        // carattere-per-carattere come OpenAI): produciamo un singolo
-        // ToolCallDelta gia' completo, prendendo la prima functionCall della part
-        // list (parita' con openai_compat che yield-a tc[0]).
-        let mut tool_call_delta: Option<ToolCallDelta> = None;
-        if let Some(c) = candidate.as_ref() {
-            for part in &c.content.parts {
-                if tool_call_delta.is_none() {
-                    if let Some(fc) = &part.function_call {
-                        tool_call_delta = Some(ToolCallDelta {
-                            index: 0,
-                            id: Some(format!("call_{}", uuid::Uuid::new_v4().simple())),
-                            function: Some(ToolCallDeltaFunction {
-                                name: Some(fc.name.clone()),
-                                // arguments come stringa JSON completa in un colpo
-                                // (Gemini non frammenta gli args nello stream).
-                                arguments: Some(function_args_to_string(&fc.args)),
-                            }),
-                        });
-                        continue; // la part-functionCall non porta text
-                    }
-                }
-                if let Some(text) = &part.text {
-                    if part.thought.unwrap_or(false) {
-                        reasoning_delta.push_str(text);
-                    } else {
-                        delta.push_str(text);
-                    }
-                }
-            }
-        }
+        // Separa testo utente da reasoning (part `thought=true`) ed estrae
+        // l'eventuale tool-call (parita' col Python streaming).
+        let stream_parts = collect_stream_parts(candidate.as_ref());
+        let StreamParts {
+            delta,
+            reasoning_delta,
+            tool_call_delta,
+        } = stream_parts;
 
-        // Quando il chunk porta una tool-call, segnaliamo "tool_calls" al consumer
-        // (parita' col mapping non-stream): Gemini puo' mandare functionCall con
-        // finishReason=STOP (o senza finish nel chunk della call).
-        let finish_reason = {
-            let mapped = candidate
-                .as_ref()
-                .and_then(|c| c.finish_reason.as_deref())
-                .map(|r| map_finish_reason(Some(r)));
-            if tool_call_delta.is_some() {
-                match mapped.as_deref() {
-                    None | Some("stop") => Some("tool_calls".to_string()),
-                    _ => mapped,
-                }
-            } else {
-                mapped
-            }
-        };
+        let finish_reason = stream_finish_reason(candidate.as_ref(), tool_call_delta.is_some());
 
         let usage = resp.usage_metadata.as_ref().map(|u| LlmUsage {
             input_tokens: u.prompt_token_count,
