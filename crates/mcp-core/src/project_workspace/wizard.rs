@@ -2360,12 +2360,10 @@ pub(super) fn is_essential(role: &str, name: &str, kind: &str) -> bool {
     }
 }
 
-/// Raccoglie directory dei workspace JS (package.json::workspaces + pnpm-workspace.yaml),
-/// fallback a scan di `apps/*`, `packages/*`, `services/*`, `crates/*` e subdir dirette.
-pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut dirs: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+/// Helper di `collect_workspace_dirs`: pattern workspace da `package.json`
+/// (`workspaces` come array o come oggetto con `packages`). Vuoto se assente.
+fn patterns_da_package_json(root: &std::path::Path) -> Vec<String> {
     let mut patterns: Vec<String> = Vec::new();
-
     if let Ok(content) = std::fs::read_to_string(root.join("package.json")) {
         if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(ws) = pkg.get("workspaces") {
@@ -2384,7 +2382,13 @@ pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::P
             }
         }
     }
+    patterns
+}
 
+/// Helper di `collect_workspace_dirs`: pattern workspace da `pnpm-workspace.yaml`
+/// (blocco `packages:`). Vuoto se assente.
+fn patterns_da_pnpm_workspace(root: &std::path::Path) -> Vec<String> {
+    let mut patterns: Vec<String> = Vec::new();
     if let Ok(content) = std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
         let mut in_packages = false;
         for line in content.lines() {
@@ -2406,16 +2410,19 @@ pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::P
             }
         }
     }
+    patterns
+}
 
-    if patterns.is_empty() {
-        for std_dir in &["apps", "packages", "services"] {
-            patterns.push(format!("{}/*", std_dir));
-        }
-        patterns.push("*".to_string());
-    }
-
+/// Helper di `collect_workspace_dirs`: espande i `patterns` in directory con
+/// `package.json`, deduplicando contro `dirs` (che parte dalla root). Preserva
+/// l'ordine e la semantica originali; comportamento invariato.
+fn espandi_pattern_workspace(
+    root: &std::path::Path,
+    patterns: &[String],
+    dirs: &mut Vec<std::path::PathBuf>,
+) {
     let skip = ["node_modules", "target", "dist", ".next", "build", "out"];
-    for pat in &patterns {
+    for pat in patterns {
         let (parent, is_glob) = if let Some(p) = pat.strip_suffix("/*") {
             (root.join(p), true)
         } else if pat == "*" {
@@ -2447,6 +2454,23 @@ pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::P
             dirs.push(parent);
         }
     }
+}
+
+/// Raccoglie directory dei workspace JS (package.json::workspaces + pnpm-workspace.yaml),
+/// fallback a scan di `apps/*`, `packages/*`, `services/*`, `crates/*` e subdir dirette.
+pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    let mut patterns: Vec<String> = patterns_da_package_json(root);
+    patterns.extend(patterns_da_pnpm_workspace(root));
+
+    if patterns.is_empty() {
+        for std_dir in &["apps", "packages", "services"] {
+            patterns.push(format!("{}/*", std_dir));
+        }
+        patterns.push("*".to_string());
+    }
+
+    espandi_pattern_workspace(root, &patterns, &mut dirs);
     dirs
 }
 
@@ -2841,7 +2865,10 @@ fn classify_csproj(path: &std::path::Path) -> Option<&'static str> {
     None
 }
 
-pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
+/// Helper di `detect_dotnet_suggestions`: elenca le directory che contengono una
+/// soluzione `.sln` (root + primo livello). La root ha label vuota. Estratto per
+/// tenere la host sotto soglia; comportamento invariato.
+fn raccogli_sln_dirs(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
     let mut sln_dirs: Vec<(std::path::PathBuf, String)> = Vec::new();
     if dir_has_sln(root) {
         sln_dirs.push((root.to_path_buf(), String::new()));
@@ -2859,6 +2886,119 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
             }
         }
     }
+    sln_dirs
+}
+
+/// Helper di `detect_dotnet_suggestions`: dentro una `sln_dir` classifica i
+/// `.csproj` (subdir + diretti) in avviabili (`runnable`) e presenza di test.
+/// Ritorna `(runnable, has_tests)`. Estratto per tenere la host sotto soglia.
+fn scansiona_csproj(sln_dir: &std::path::Path) -> (Vec<std::path::PathBuf>, bool) {
+    let mut runnable: Vec<std::path::PathBuf> = Vec::new();
+    let mut has_tests = false;
+    if let Ok(entries) = std::fs::read_dir(sln_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let search_dirs: Vec<std::path::PathBuf> = if p.is_dir() { vec![p] } else { vec![] };
+            for dir in search_dirs {
+                if let Ok(inner) = std::fs::read_dir(&dir) {
+                    for ie in inner.flatten() {
+                        let ip = ie.path();
+                        if ip.extension().map(|x| x == "csproj").unwrap_or(false) {
+                            match classify_csproj(&ip) {
+                                Some("run") => runnable.push(ip),
+                                Some("test") => has_tests = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            // anche .csproj direttamente nella sln_dir
+            if e.path().extension().map(|x| x == "csproj").unwrap_or(false) {
+                match classify_csproj(&e.path()) {
+                    Some("run") => runnable.push(e.path()),
+                    Some("test") => has_tests = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    (runnable, has_tests)
+}
+
+/// Helper di `detect_dotnet_suggestions`: emette i suggerimenti `dotnet run` per
+/// una `sln_dir`. Se non ci sono csproj avviabili emette un `run` generico basato
+/// sul `dir_label`. Estratto per tenere la host sotto soglia; output invariato.
+fn emit_dotnet_run(
+    out: &mut Vec<Value>,
+    root: &std::path::Path,
+    dir_label: &str,
+    runnable: &[std::path::PathBuf],
+    group: &str,
+    run_essential: bool,
+) {
+    let sdk_notice = " [richiede .NET SDK]";
+    if runnable.is_empty() {
+        let run_args: Vec<serde_json::Value> = if dir_label.is_empty() {
+            vec![json!("run")]
+        } else {
+            vec![json!("run"), json!("--project"), json!(dir_label.to_string())]
+        };
+        let cmd = if dir_label.is_empty() {
+            format!("dotnet run{}", sdk_notice)
+        } else {
+            format!("dotnet run --project {}{}", dir_label, sdk_notice)
+        };
+        out.push(json!({ "label": cmd, "kind": "shell", "command": "dotnet",
+            "args": run_args, "cwd": null, "env": {},
+            "role": "backend", "essential": run_essential, "group": group }));
+    } else {
+        for csproj in runnable {
+            let rel = csproj.strip_prefix(root).unwrap_or(csproj);
+            let proj_dir = rel
+                .parent()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let cmd = if proj_dir.is_empty() {
+                format!("dotnet run{}", sdk_notice)
+            } else {
+                format!("dotnet run --project {}{}", proj_dir, sdk_notice)
+            };
+            let run_args: Vec<serde_json::Value> = if proj_dir.is_empty() {
+                vec![json!("run")]
+            } else {
+                vec![json!("run"), json!("--project"), json!(proj_dir.clone())]
+            };
+            out.push(json!({ "label": cmd, "kind": "shell", "command": "dotnet",
+                "args": run_args, "cwd": null, "env": {},
+                "role": "backend", "essential": run_essential, "group": group }));
+        }
+    }
+}
+
+/// Helper di `detect_dotnet_suggestions`: emette il suggerimento `dotnet test`
+/// per una `sln_dir` con progetti di test. Estratto per tenere la host sotto
+/// soglia; output invariato.
+fn emit_dotnet_test(out: &mut Vec<Value>, dir_label: &str, group: &str) {
+    let test_cmd = if dir_label.is_empty() {
+        "dotnet test".to_string()
+    } else {
+        format!("dotnet test {}", dir_label)
+    };
+    let test_args: Vec<serde_json::Value> = if dir_label.is_empty() {
+        vec![json!("test")]
+    } else {
+        vec![json!("test"), json!(dir_label.to_string())]
+    };
+    out.push(
+        json!({ "label": test_cmd, "kind": "shell", "command": "dotnet",
+        "args": test_args, "cwd": null, "env": {},
+        "role": "test", "essential": false, "group": group }),
+    );
+}
+
+pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
+    let sln_dirs = raccogli_sln_dirs(root);
 
     // `dotnet run` richiede il .NET SDK installato sull'host, che non è disponibile
     // nel sandbox. Impostiamo sempre essential=false e aggiungiamo il suffisso al gruppo
@@ -2883,92 +3023,10 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
             dir_label.clone()
         };
         let group = format!("{}{}", base_group, group_suffix);
-        let mut runnable: Vec<std::path::PathBuf> = Vec::new();
-        let mut has_tests = false;
-
-        if let Ok(entries) = std::fs::read_dir(sln_dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                let search_dirs: Vec<std::path::PathBuf> =
-                    if p.is_dir() { vec![p] } else { vec![] };
-                for dir in search_dirs {
-                    if let Ok(inner) = std::fs::read_dir(&dir) {
-                        for ie in inner.flatten() {
-                            let ip = ie.path();
-                            if ip.extension().map(|x| x == "csproj").unwrap_or(false) {
-                                match classify_csproj(&ip) {
-                                    Some("run") => runnable.push(ip),
-                                    Some("test") => has_tests = true,
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                // anche .csproj direttamente nella sln_dir
-                if e.path().extension().map(|x| x == "csproj").unwrap_or(false) {
-                    match classify_csproj(&e.path()) {
-                        Some("run") => runnable.push(e.path()),
-                        Some("test") => has_tests = true,
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        let sdk_notice = " [richiede .NET SDK]";
-        if runnable.is_empty() {
-            let run_args: Vec<serde_json::Value> = if dir_label.is_empty() {
-                vec![json!("run")]
-            } else {
-                vec![json!("run"), json!("--project"), json!(dir_label.clone())]
-            };
-            let cmd = if dir_label.is_empty() {
-                format!("dotnet run{}", sdk_notice)
-            } else {
-                format!("dotnet run --project {}{}", dir_label, sdk_notice)
-            };
-            out.push(json!({ "label": cmd, "kind": "shell", "command": "dotnet",
-                "args": run_args, "cwd": null, "env": {},
-                "role": "backend", "essential": run_essential, "group": group }));
-        } else {
-            for csproj in &runnable {
-                let rel = csproj.strip_prefix(root).unwrap_or(csproj);
-                let proj_dir = rel
-                    .parent()
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_default();
-                let cmd = if proj_dir.is_empty() {
-                    format!("dotnet run{}", sdk_notice)
-                } else {
-                    format!("dotnet run --project {}{}", proj_dir, sdk_notice)
-                };
-                let run_args: Vec<serde_json::Value> = if proj_dir.is_empty() {
-                    vec![json!("run")]
-                } else {
-                    vec![json!("run"), json!("--project"), json!(proj_dir.clone())]
-                };
-                out.push(json!({ "label": cmd, "kind": "shell", "command": "dotnet",
-                    "args": run_args, "cwd": null, "env": {},
-                    "role": "backend", "essential": run_essential, "group": group.clone() }));
-            }
-        }
+        let (runnable, has_tests) = scansiona_csproj(sln_dir);
+        emit_dotnet_run(&mut out, root, dir_label, &runnable, &group, run_essential);
         if has_tests {
-            let test_cmd = if dir_label.is_empty() {
-                "dotnet test".to_string()
-            } else {
-                format!("dotnet test {}", dir_label)
-            };
-            let test_args: Vec<serde_json::Value> = if dir_label.is_empty() {
-                vec![json!("test")]
-            } else {
-                vec![json!("test"), json!(dir_label.clone())]
-            };
-            out.push(
-                json!({ "label": test_cmd, "kind": "shell", "command": "dotnet",
-                "args": test_args, "cwd": null, "env": {},
-                "role": "test", "essential": false, "group": group.clone() }),
-            );
+            emit_dotnet_test(&mut out, dir_label, &group);
         }
     }
     out
