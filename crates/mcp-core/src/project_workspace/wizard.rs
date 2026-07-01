@@ -757,7 +757,8 @@ async fn write_compose_env_file(cwd: &str, env_map: &std::collections::HashMap<S
             out.push(format!("{}={}", k, v));
         }
     }
-    let content = format!("{}\n", out.join("\n"));
+    let corpo = out.join("\n");
+    let content = format!("{}\n", corpo);
     match tokio::fs::write(&env_path, &content).await {
         Ok(()) => tracing::info!(
             "docker-compose: .env aggiornato con le porte gestite del bucket ({})",
@@ -937,7 +938,8 @@ pub(crate) fn derive_frontend_sibling_env(
         || (exec_lower.contains("pnpm") && exec_lower.contains("start"));
     if wants_nextauth && !env_map.contains_key("NEXTAUTH_URL") {
         if let Some(p) = env_map.get("PORT").and_then(|s| s.parse::<u16>().ok()) {
-            env_map.insert("NEXTAUTH_URL".to_string(), format!("http://localhost:{}", p));
+            let url = format!("http://localhost:{}", p);
+            env_map.insert("NEXTAUTH_URL".to_string(), url);
         }
     }
 }
@@ -1010,7 +1012,8 @@ async fn install_service_windows(
     let full_command = if args.is_empty() {
         command.to_string()
     } else {
-        format!("{} {}", command, args.join(" "))
+        let args_str = args.join(" ");
+        format!("{} {}", command, args_str)
     };
 
     // env: stringa "K=V" per riga, oppure oggetto JSON.
@@ -1227,7 +1230,8 @@ async fn install_service_systemd(
     let exec_start = if args.is_empty() {
         resolved_command
     } else {
-        format!("{} {}", resolved_command, args.join(" "))
+        let args_str = args.join(" ");
+        format!("{} {}", resolved_command, args_str)
     };
 
     fn parse_port_token(s: &str) -> Option<u16> {
@@ -2635,9 +2639,11 @@ pub(super) fn detect_playwright_suggestions(root: &std::path::Path) -> Vec<Value
             false,
             group.clone(),
         );
+        let variante = "test --update-snapshots";
+        let label = format!("{}playwright {}", prefix, variante);
         push_sugg(
             &mut out,
-            format!("{}playwright test --update-snapshots", prefix),
+            label,
             "playwright",
             pkg_manager,
             vec![
