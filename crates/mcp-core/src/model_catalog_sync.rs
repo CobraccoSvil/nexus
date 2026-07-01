@@ -1068,453 +1068,30 @@ async fn sync_provider(
 
         match catalog_models.get(api_model) {
             None => {
-                if insert_new_disabled {
-                    // performance_tier inferito dal nome (non il default 'medium'
-                    // dello schema): evita che i modelli piccoli scoperti via API
-                    // entrino come 'medium' nel pool agentico. Vedi
-                    // infer_tier_from_name + migrazione 0354.
-                    let inferred_tier = infer_tier_from_name(provider, api_model);
-                    // pricing_state='unknown': costo 0 qui e' un PLACEHOLDER non
-                    // raffinato, NON un modello gratuito (regola H, mig 0477). Niente
-                    // promozione automatica a 'free': la distingue solo l'admin/seed.
-                    let res = sqlx::query(
-                        "INSERT INTO ai_price_catalog \
-                         (provider, model, display_name, input_cost_per_million_tokens, \
-                          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, pricing_state, effective_from) \
-                         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, 'unknown', NOW()) \
-                         ON CONFLICT (provider, model) DO NOTHING",
-                    )
-                    .bind(provider)
-                    .bind(api_model)
-                    .bind(api_model)
-                    .bind(inferred_tier)
-                    .execute(db)
-                    .await;
-                    if let Ok(r) = res {
-                        if r.rows_affected() > 0 {
-                            inserted += 1;
-                            audit_log(
-                                db,
-                                provider,
-                                api_model,
-                                "inserted",
-                                json!({"source":"api_discovery"}),
-                            )
-                            .await;
-                            tracing::info!(
-                                "catalog_sync[{}]: + nuovo modello rilevato '{}'",
-                                provider,
-                                api_model
-                            );
-
-                            // Probe-on-insert: subito dopo l'INSERT (modello e'
-                            // is_enabled=false di default), prova una chiamata
-                            // di test al provider. Se passa, abilita; se fallisce
-                            // con model_not_found/hollow, marca esplicitamente
-                            // il motivo cosi' l'admin sa che NON va abilitato
-                            // manualmente. Cosi' i modelli "fantasma" (es. la
-                            // famiglia gemini-3.x al 05/2026) non possono mai
-                            // entrare enabled via auto-discovery.
-                            if let Some(orch) = orchestrator {
-                                match probe_model_on_insert(orch, provider, api_model).await {
-                                    ProbeOnInsertResult::Healthy => {
-                                        // Infer capabilities dal nome: il modello e'
-                                        // ora utilizzabile, ma il routing filtra per
-                                        // capability matching e capabilities=[] lo
-                                        // renderebbe invisibile. Popoliamo SOLO se
-                                        // attualmente vuoto (rispetta override admin).
-                                        let inferred_caps =
-                                            infer_capabilities_from_name(provider, api_model);
-                                        let caps_json = json!(inferred_caps);
-                                        // Classificazione flag canonici (ADR 0024):
-                                        // discovery -> solo euristica nome (niente
-                                        // metadata LiteLLM). Scritti SOLO su righe
-                                        // 'auto' (le 'manual' restano intatte).
-                                        let vision_routable = load_vision_routable(db).await;
-                                        let cc = classify_capabilities(
-                                            provider,
-                                            api_model,
-                                            None,
-                                            None,
-                                            None,
-                                            &vision_routable,
-                                        );
-                                        // Gate allowlist (ADR 0025): abilita SOLO se il
-                                        // modello e' ammesso dalla model_selection_policy.
-                                        // Cosi' i modelli legacy (pruned dalla 0320) non
-                                        // rientrano via probe-on-insert.
-                                        let allowed =
-                                            model_passes_selection_policy(db, provider, api_model)
-                                                .await;
-                                        let _ = sqlx::query(
-                                            "UPDATE ai_price_catalog \
-                                             SET is_enabled = $8, \
-                                                 auto_disabled_at = CASE WHEN $8 THEN NULL ELSE NOW() END, \
-                                                 auto_disabled_reason = CASE WHEN $8 THEN NULL ELSE 'fuori model_selection_policy (mig 0320)' END, \
-                                                 updated_at = NOW(), \
-                                                 capabilities = CASE \
-                                                     WHEN capabilities IS NULL OR capabilities = '[]'::jsonb \
-                                                         THEN $3::jsonb \
-                                                     ELSE capabilities \
-                                                 END, \
-                                                 supports_tool_use = CASE WHEN capability_source='auto' THEN $4 ELSE supports_tool_use END, \
-                                                 supports_vision = CASE WHEN capability_source='auto' THEN $5 ELSE supports_vision END, \
-                                                 is_thinking = CASE WHEN capability_source='auto' THEN $6 ELSE is_thinking END, \
-                                                 uses_thinking_mode = CASE WHEN capability_source='auto' THEN $7 ELSE uses_thinking_mode END, \
-                                                 agentic_thinking_policy = CASE WHEN capability_source='auto' THEN $9 ELSE agentic_thinking_policy END \
-                                             WHERE provider = $1 AND model = $2 AND is_enabled = false",
-                                        )
-                                        .bind(provider)
-                                        .bind(api_model)
-                                        .bind(&caps_json)
-                                        .bind(cc.supports_tool_use)
-                                        .bind(cc.supports_vision)
-                                        .bind(cc.is_thinking)
-                                        .bind(cc.uses_thinking_mode)
-                                        .bind(allowed)
-                                        .bind(cc.agentic_thinking_policy)
-                                        .execute(db)
-                                        .await;
-                                        audit_log(
-                                            db, provider, api_model,
-                                            if allowed { "probe_ok_on_insert" } else { "probe_ok_but_outside_policy" },
-                                            json!({"action": if allowed {"auto_enabled"} else {"kept_disabled_outside_allowlist"}, "inferred_capabilities": inferred_caps}),
-                                        )
-                                        .await;
-                                        tracing::info!(
-                                            "catalog_sync[{}]: probe OK su '{}' -> {} (policy allowlist)",
-                                            provider, api_model, if allowed {"abilitato"} else {"lasciato disabilitato (fuori allowlist)"}
-                                        );
-                                    }
-                                    ProbeOnInsertResult::ModelBroken(kind) => {
-                                        let reason = format!("failed_initial_probe:{}", kind);
-                                        let _ = sqlx::query(
-                                            "UPDATE ai_price_catalog \
-                                             SET auto_disabled_at = NOW(), \
-                                                 auto_disabled_reason = $3, updated_at = NOW() \
-                                             WHERE provider = $1 AND model = $2",
-                                        )
-                                        .bind(provider)
-                                        .bind(api_model)
-                                        .bind(&reason)
-                                        .execute(db)
-                                        .await;
-                                        audit_log(
-                                            db,
-                                            provider,
-                                            api_model,
-                                            "probe_failed_on_insert",
-                                            json!({"reason": reason}),
-                                        )
-                                        .await;
-                                        tracing::warn!(
-                                            "catalog_sync[{}]: probe FAIL su nuovo modello '{}' (reason={}) -> resta disabled",
-                                            provider, api_model, kind
-                                        );
-                                    }
-                                    ProbeOnInsertResult::ProviderDown(kind) => {
-                                        // Provider giu' (quota/billing/auth): non possiamo
-                                        // sapere se il modello e' valido. Lasciamo disabled
-                                        // con motivazione esplicita: il model_health_probe
-                                        // worker (run periodico) lo riabilitera' quando il
-                                        // provider torna up E il probe passa.
-                                        let reason = format!("provider_down_on_insert:{}", kind);
-                                        let _ = sqlx::query(
-                                            "UPDATE ai_price_catalog SET auto_disabled_reason = $3, updated_at = NOW() \
-                                             WHERE provider = $1 AND model = $2",
-                                        )
-                                        .bind(provider)
-                                        .bind(api_model)
-                                        .bind(&reason)
-                                        .execute(db)
-                                        .await;
-                                        tracing::info!(
-                                            "catalog_sync[{}]: probe inconclusive (provider down: {}) su '{}' -> resta disabled, model_health_probe lo rivedra'",
-                                            provider, kind, api_model
-                                        );
-                                    }
-                                    ProbeOnInsertResult::Inconclusive(reason) => {
-                                        tracing::debug!(
-                                            "catalog_sync[{}]: probe inconclusive su '{}': {} -> resta disabled (default)",
-                                            provider, api_model, reason
-                                        );
-                                    }
-                                    ProbeOnInsertResult::Transient(kind) => {
-                                        // Errore opaco/transitorio al confine
-                                        // gateway/provider: il modello appena
-                                        // scoperto resta disabilitato (default),
-                                        // SENZA reason punitivo. Il model_health_probe
-                                        // periodico lo rivalutera' a provider stabile.
-                                        tracing::debug!(
-                                            "catalog_sync[{}]: probe transitorio su '{}': {} -> resta disabled (riprovato dal probe periodico)",
-                                            provider, api_model, kind
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if insert_new_disabled
+                    && insert_new_chat_model(db, orchestrator, provider, api_model).await
+                {
+                    inserted += 1;
                 }
             }
             Some(&(is_enabled, manual_locked)) => {
-                // FIX A (regola H): riallinea supports_vision dei modelli GIA'
-                // presenti (capability_source='auto') da classify_capabilities a
-                // ogni passata. Prima il sync toccava SOLO is_enabled: una
-                // correzione dell'euristica vision (o la rimozione di un falso
-                // positivo come mistral) non si propagava ai modelli esistenti ->
-                // serviva una migrazione-dati manuale (es. 0372). Ora si propaga
-                // da sola. Le righe 'manual' (curate dall'admin) restano intatte.
+                tier_realigned += realign_existing_model(db, provider, api_model).await;
+                if reenable_existing_model(db, provider, api_model, is_enabled, manual_locked).await
                 {
-                    let vision_routable = load_vision_routable(db).await;
-                    let cc = classify_capabilities(
-                        provider,
-                        api_model,
-                        None,
-                        None,
-                        None,
-                        &vision_routable,
-                    );
-                    let _ = sqlx::query(
-                        "UPDATE ai_price_catalog SET supports_vision = $3, updated_at = NOW() \
-                         WHERE provider = $1 AND model = $2 AND capability_source = 'auto' \
-                           AND supports_vision <> $3",
-                    )
-                    .bind(provider)
-                    .bind(api_model)
-                    .bind(cc.supports_vision)
-                    .execute(db)
-                    .await;
-
-                    // Stesso principio (regola H + L) per performance_tier: la
-                    // correzione dell'euristica infer_tier_from_name (es. i
-                    // flagship con naming recente) deve propagarsi alle righe
-                    // 'auto' GIA' presenti, non solo ai nuovi insert. Prima il
-                    // tier era scritto SOLO all'INSERT (ON CONFLICT DO NOTHING),
-                    // quindi i modelli flagship restavano 'medium' e l'auto-
-                    // promoter non li selezionava come 'heavy'. UPDATE mirato
-                    // (solo dove il tier differisce); le righe 'manual' restano
-                    // intatte (guard capability_source='auto').
-                    let inferred_tier = infer_tier_from_name(provider, api_model);
-                    let tier_res = sqlx::query(
-                        "UPDATE ai_price_catalog SET performance_tier = $3, updated_at = NOW() \
-                         WHERE provider = $1 AND model = $2 AND capability_source = 'auto' \
-                           AND performance_tier IS DISTINCT FROM $3",
-                    )
-                    .bind(provider)
-                    .bind(api_model)
-                    .bind(inferred_tier)
-                    .execute(db)
-                    .await;
-                    if let Ok(r) = tier_res {
-                        if r.rows_affected() > 0 {
-                            tier_realigned += 1;
-                            tracing::info!(
-                                "catalog_sync[{}]: tier riallineato '{}' -> {}",
-                                provider,
-                                api_model,
-                                inferred_tier
-                            );
-                        }
-                    }
-                }
-                // Re-enable SOLO se il modello e' ammesso dalla policy (ADR 0025):
-                // un legacy ricomparso nell'API non deve rientrare.
-                let policy_ok = model_passes_selection_policy(db, provider, api_model).await;
-                if !is_enabled && !manual_locked && policy_ok {
-                    // Modello disabilitato dal worker (missing_from_api) ma ricomparso: re-enable.
-                    // Il reason si azzera SOLO se appartiene al ciclo is_enabled: i reason del
-                    // ciclo tool-capability ('malformed_tool_calls', 'tool_probe_failed:%')
-                    // vanno PRESERVATI — azzerarli lasciava supports_tool_use=false orfano
-                    // (reason NULL), irraggiungibile dal ri-test del probe (incidente
-                    // magistral-small-2509, 2026-06-10).
-                    let sql = format!(
-                        "UPDATE ai_price_catalog SET is_enabled = true, effective_from = NOW(), \
-                         auto_disabled_at = NULL, \
-                         auto_disabled_reason = CASE WHEN {tool_reason} \
-                                                     THEN auto_disabled_reason \
-                                                     ELSE NULL END, \
-                         updated_at = NOW() \
-                         WHERE provider = $1 AND model = $2",
-                        tool_reason = crate::tool_capability::TOOL_REASON_PREDICATE_SQL
-                    );
-                    let res = sqlx::query(&sql)
-                    .bind(provider)
-                    .bind(api_model)
-                    .execute(db)
-                    .await;
-                    if let Ok(r) = res {
-                        if r.rows_affected() > 0 {
-                            reenabled += 1;
-                            audit_log(db, provider, api_model, "reenabled", json!({})).await;
-                            tracing::info!(
-                                "catalog_sync[{}]: re-enabled '{}' (ricomparso API)",
-                                provider,
-                                api_model
-                            );
-                        }
-                    }
-                } else if !is_enabled && manual_locked {
-                    // Skip: admin lo ha disabilitato manualmente, non riabilitare anche se ricompare.
-                    tracing::debug!(
-                        "catalog_sync[{}]: skip re-enable '{}' (manual_locked)",
-                        provider,
-                        api_model
-                    );
+                    reenabled += 1;
                 }
             }
         }
     }
 
-    // 1bis. Modelli gia' nel catalog (is_enabled=true) che NON passano la
-    // blacklist `is_chat_compatible_model`: vanno auto-disabilitati. Senza
-    // questo passo, l'unico controllo di compatibility e' all'INSERT (riga
-    // sopra), quindi un modello entrato in catalog prima dell'aggiornamento
-    // della blacklist (es. gemini-3.5-flash, regola H CLAUDE.md) resta ON
-    // per sempre. `manual_locked` viene rispettato: se l'admin ha deciso di
-    // tenerlo abilitato a mano, non lo tocchiamo.
-    for (catalog_model, (is_enabled, manual_locked)) in &catalog_models {
-        // GATE MEDIA (regola L): un modello media (image-gen/audio/video) NON e'
-        // chat-compatibile per design e non rientra nella chat model_selection_policy:
-        // NON deve essere auto-disabilitato da questo prune chat. La sua eleggibilita'
-        // dipende dai flag supports_<media>, gestiti altrove (insert/realign + admin).
-        if classify_media_kind(catalog_model).is_some() {
-            continue;
-        }
-        if *is_enabled && !manual_locked {
-            // Prune self-healing (ADR 0025): un modello enabled va disabilitato se
-            // non e' chat-compatibile (blacklist) OPPURE non passa la
-            // model_selection_policy (famiglia legacy). Cosi' i modelli vecchi non
-            // restano enabled neanche se entrati prima dell'aggiornamento policy.
-            let chat_ok = is_chat_compatible_model(catalog_model);
-            let policy_ok = model_passes_selection_policy(db, provider, catalog_model).await;
-            if !chat_ok || !policy_ok {
-                let reason = if !chat_ok {
-                    "not_chat_compatible"
-                } else {
-                    "fuori model_selection_policy (legacy)"
-                };
-                let res = sqlx::query(
-                    "UPDATE ai_price_catalog SET is_enabled = false, \
-                     auto_disabled_at = NOW(), auto_disabled_reason = $3 \
-                     WHERE provider = $1 AND model = $2",
-                )
-                .bind(provider)
-                .bind(catalog_model)
-                .bind(reason)
-                .execute(db)
-                .await;
-                if let Ok(r) = res {
-                    if r.rows_affected() > 0 {
-                        disabled += 1;
-                        audit_log(
-                            db,
-                            provider,
-                            catalog_model,
-                            "disabled",
-                            json!({ "reason": reason }),
-                        )
-                        .await;
-                        tracing::warn!(
-                            "catalog_sync[{}]: disabled '{}' ({})",
-                            provider,
-                            catalog_model,
-                            reason,
-                        );
-                    }
-                }
-            }
-        }
-    }
+    // 1bis. Prune dei modelli gia' nel catalog non piu' chat-compatibili o fuori
+    // policy (self-healing, ADR 0025).
+    disabled += prune_incompatible_models(db, provider, &catalog_models).await;
 
-    // 2. Modelli del catalog enabled non piu' nell'API -> disable
+    // 2. Modelli del catalog enabled non piu' nell'API -> disable.
     if disable_missing {
-        for (catalog_model, (is_enabled, _manual_locked)) in &catalog_models {
-            if *is_enabled && !api_set.contains(catalog_model.as_str()) {
-                // Skip alias "senza data" (es. claude-haiku-4-5) se l'API ritorna lo
-                // stesso modello con suffisso data (es. claude-haiku-4-5-20251001).
-                // Anthropic ritorna solo dated, ma il catalog/routing usa l'alias
-                // perche' e' piu' stabile (l'alias punta sempre alla versione corrente).
-                let has_dated_in_api = api_models.iter().any(|api_m| {
-                    if !api_m.starts_with(catalog_model.as_str())
-                        || api_m.len() <= catalog_model.len()
-                    {
-                        return false;
-                    }
-                    let suffix = &api_m[catalog_model.len()..];
-                    suffix.starts_with('-')
-                        && suffix.len() == 9
-                        && suffix[1..].chars().all(|c| c.is_ascii_digit())
-                });
-                if has_dated_in_api {
-                    continue; // alias preservato (es. claude-haiku-4-5)
-                }
-
-                // Skip alias con suffisso data se la base name e' nell'API.
-                // Es: catalog "claude-sonnet-4-6-20251201" disabilitato solo se
-                // anche "claude-sonnet-4-6" non e' nell'API.
-                let base_name = strip_date_suffix(catalog_model);
-                if base_name.as_str() != catalog_model.as_str()
-                    && api_set.contains(base_name.as_str())
-                {
-                    continue;
-                }
-
-                // FIX 2 (catalog_sync probe-aware): la lista upstream LiteLLM/
-                // provider e' un INDIZIO, non la verita'. La verita' e' l'account:
-                // se il probe (model_health_probe) trova ancora il modello SANO,
-                // non spegnerlo solo perche' "datato" / non piu' in lista. Cosi'
-                // evitiamo l'inversione diagnosticata (modello funzionante per
-                // l'account disabilitato perche' rimosso da upstream).
-                // Disabilitiamo solo se anche l'health reale lo conferma rotto.
-                if model_recently_healthy(db, provider, catalog_model).await {
-                    // Annotazione diagnostica idempotente: il modello resta
-                    // is_enabled=true (NON tocchiamo auto_disabled_*), ma
-                    // l'audit_log registra la decisione cosi' e' rintracciabile
-                    // perche' un modello "datato" e' rimasto attivo.
-                    tracing::info!(
-                        "catalog_sync[{}]: '{}' assente da upstream MA probe recente healthy -> NON disabilito (legacy, lascio is_enabled=true)",
-                        provider, catalog_model,
-                    );
-                    audit_log(
-                        db,
-                        provider,
-                        catalog_model,
-                        "kept_enabled_legacy",
-                        json!({"reason":"missing_from_api_but_recently_healthy"}),
-                    )
-                    .await;
-                    continue;
-                }
-
-                let res = sqlx::query(
-                    "UPDATE ai_price_catalog SET is_enabled = false, \
-                     auto_disabled_at = NOW(), auto_disabled_reason = 'missing_from_api' \
-                     WHERE provider = $1 AND model = $2",
-                )
-                .bind(provider)
-                .bind(catalog_model)
-                .execute(db)
-                .await;
-                if let Ok(r) = res {
-                    if r.rows_affected() > 0 {
-                        disabled += 1;
-                        audit_log(
-                            db,
-                            provider,
-                            catalog_model,
-                            "disabled",
-                            json!({"reason":"missing_from_api"}),
-                        )
-                        .await;
-                        tracing::warn!(
-                            "catalog_sync[{}]: - disabled '{}' (non piu nell API)",
-                            provider,
-                            catalog_model,
-                        );
-                    }
-                }
-            }
-        }
+        disabled +=
+            disable_missing_models(db, provider, &catalog_models, &api_models, &api_set).await;
     }
 
     if tier_realigned > 0 {
@@ -1526,6 +1103,479 @@ async fn sync_provider(
     }
 
     Ok((inserted, disabled, reenabled))
+}
+
+/// 1bis. Auto-disabilita i modelli GIA' nel catalog (is_enabled=true) non piu'
+/// chat-compatibili (blacklist) O fuori model_selection_policy (famiglia legacy).
+/// Estratta da `sync_provider` senza cambi di comportamento. Ritorna quante righe
+/// sono state disabilitate.
+///
+/// Senza questo passo l'unico controllo di compatibility e' all'INSERT, quindi un
+/// modello entrato prima dell'aggiornamento della blacklist (es. gemini-3.5-flash,
+/// regola H CLAUDE.md) resterebbe ON per sempre. `manual_locked` viene rispettato.
+/// I modelli media (image-gen/audio/video) sono esclusi dal prune chat: la loro
+/// eleggibilita' dipende dai flag supports_<media>, gestiti altrove.
+async fn prune_incompatible_models(
+    db: &PgPool,
+    provider: &str,
+    catalog_models: &std::collections::HashMap<String, (bool, bool)>,
+) -> u32 {
+    let mut disabled = 0u32;
+    for (catalog_model, (is_enabled, manual_locked)) in catalog_models {
+        // GATE MEDIA (regola L): un media non e' chat-compatibile per design.
+        if classify_media_kind(catalog_model).is_some() {
+            continue;
+        }
+        if !*is_enabled || *manual_locked {
+            continue;
+        }
+        let chat_ok = is_chat_compatible_model(catalog_model);
+        let policy_ok = model_passes_selection_policy(db, provider, catalog_model).await;
+        if chat_ok && policy_ok {
+            continue;
+        }
+        let reason = if !chat_ok {
+            "not_chat_compatible"
+        } else {
+            "fuori model_selection_policy (legacy)"
+        };
+        let res = sqlx::query(
+            "UPDATE ai_price_catalog SET is_enabled = false, \
+             auto_disabled_at = NOW(), auto_disabled_reason = $3 \
+             WHERE provider = $1 AND model = $2",
+        )
+        .bind(provider)
+        .bind(catalog_model)
+        .bind(reason)
+        .execute(db)
+        .await;
+        if let Ok(r) = res {
+            if r.rows_affected() > 0 {
+                disabled += 1;
+                audit_log(
+                    db,
+                    provider,
+                    catalog_model,
+                    "disabled",
+                    json!({ "reason": reason }),
+                )
+                .await;
+                tracing::warn!(
+                    "catalog_sync[{}]: disabled '{}' ({})",
+                    provider,
+                    catalog_model,
+                    reason,
+                );
+            }
+        }
+    }
+    disabled
+}
+
+/// True se `api_model` e' `catalog_model` seguito da un suffisso data ISO
+/// `-YYYYMMDD` (9 caratteri, dash + 8 cifre). Usata per preservare gli alias
+/// "senza data" quando l'API ritorna solo la variante datata.
+fn is_dated_variant_of(api_model: &str, catalog_model: &str) -> bool {
+    if !api_model.starts_with(catalog_model) || api_model.len() <= catalog_model.len() {
+        return false;
+    }
+    let suffix = &api_model[catalog_model.len()..];
+    suffix.starts_with('-') && suffix.len() == 9 && suffix[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// 2. Disabilita i modelli del catalog enabled non piu' presenti nell'API.
+/// Estratta da `sync_provider` senza cambi di comportamento. Ritorna quante righe
+/// sono state disabilitate. Preserva gli alias (con/senza suffisso data) e i
+/// modelli "recentemente sani" secondo l'account (FIX 2: la lista upstream e' un
+/// INDIZIO, non la verita').
+async fn disable_missing_models(
+    db: &PgPool,
+    provider: &str,
+    catalog_models: &std::collections::HashMap<String, (bool, bool)>,
+    api_models: &[String],
+    api_set: &std::collections::HashSet<&str>,
+) -> u32 {
+    let mut disabled = 0u32;
+    for (catalog_model, (is_enabled, _manual_locked)) in catalog_models {
+        if !*is_enabled || api_set.contains(catalog_model.as_str()) {
+            continue;
+        }
+        // Skip alias "senza data" (es. claude-haiku-4-5) se l'API ritorna lo stesso
+        // modello con suffisso data (es. claude-haiku-4-5-20251001). Anthropic
+        // ritorna solo dated, ma il catalog/routing usa l'alias (piu' stabile).
+        if api_models
+            .iter()
+            .any(|api_m| is_dated_variant_of(api_m, catalog_model))
+        {
+            continue; // alias preservato (es. claude-haiku-4-5)
+        }
+
+        // Skip alias con suffisso data se la base name e' nell'API.
+        // Es: catalog "claude-sonnet-4-6-20251201" disabilitato solo se anche
+        // "claude-sonnet-4-6" non e' nell'API.
+        let base_name = strip_date_suffix(catalog_model);
+        if base_name.as_str() != catalog_model.as_str() && api_set.contains(base_name.as_str()) {
+            continue;
+        }
+
+        // FIX 2 (catalog_sync probe-aware): la lista upstream LiteLLM/provider e'
+        // un INDIZIO, non la verita'. La verita' e' l'account: se il probe
+        // (model_health_probe) trova ancora il modello SANO, non spegnerlo solo
+        // perche' "datato" / non piu' in lista. Disabilitiamo solo se anche
+        // l'health reale lo conferma rotto.
+        if model_recently_healthy(db, provider, catalog_model).await {
+            // Annotazione diagnostica idempotente: il modello resta is_enabled=true
+            // (NON tocchiamo auto_disabled_*), ma l'audit_log registra la decisione
+            // cosi' e' rintracciabile perche' un modello "datato" e' rimasto attivo.
+            tracing::info!(
+                "catalog_sync[{}]: '{}' assente da upstream MA probe recente healthy -> NON disabilito (legacy, lascio is_enabled=true)",
+                provider, catalog_model,
+            );
+            audit_log(
+                db,
+                provider,
+                catalog_model,
+                "kept_enabled_legacy",
+                json!({"reason":"missing_from_api_but_recently_healthy"}),
+            )
+            .await;
+            continue;
+        }
+
+        let res = sqlx::query(
+            "UPDATE ai_price_catalog SET is_enabled = false, \
+             auto_disabled_at = NOW(), auto_disabled_reason = 'missing_from_api' \
+             WHERE provider = $1 AND model = $2",
+        )
+        .bind(provider)
+        .bind(catalog_model)
+        .execute(db)
+        .await;
+        if let Ok(r) = res {
+            if r.rows_affected() > 0 {
+                disabled += 1;
+                audit_log(
+                    db,
+                    provider,
+                    catalog_model,
+                    "disabled",
+                    json!({"reason":"missing_from_api"}),
+                )
+                .await;
+                tracing::warn!(
+                    "catalog_sync[{}]: - disabled '{}' (non piu nell API)",
+                    provider,
+                    catalog_model,
+                );
+            }
+        }
+    }
+    disabled
+}
+
+/// INSERT di un nuovo modello CHAT scoperto via API discovery (default sicuro
+/// is_enabled=false) + probe-on-insert. Estratta dal ramo `None` di
+/// `sync_provider` senza cambi di comportamento. Ritorna `true` se la riga e'
+/// stata inserita (rows_affected>0).
+///
+/// pricing_state='unknown': costo 0 e' un PLACEHOLDER non raffinato, NON un
+/// modello gratuito (regola H, mig 0477). performance_tier inferito dal nome
+/// (non il default 'medium' dello schema): evita che i modelli piccoli entrino
+/// come 'medium' nel pool agentico (infer_tier_from_name + mig 0354).
+async fn insert_new_chat_model(
+    db: &PgPool,
+    orchestrator: Option<&Orchestrator>,
+    provider: &str,
+    api_model: &str,
+) -> bool {
+    let inferred_tier = infer_tier_from_name(provider, api_model);
+    let res = sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, display_name, input_cost_per_million_tokens, \
+          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, pricing_state, effective_from) \
+         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, 'unknown', NOW()) \
+         ON CONFLICT (provider, model) DO NOTHING",
+    )
+    .bind(provider)
+    .bind(api_model)
+    .bind(api_model)
+    .bind(inferred_tier)
+    .execute(db)
+    .await;
+    if let Ok(r) = res {
+        if r.rows_affected() > 0 {
+            audit_log(
+                db,
+                provider,
+                api_model,
+                "inserted",
+                json!({"source":"api_discovery"}),
+            )
+            .await;
+            tracing::info!(
+                "catalog_sync[{}]: + nuovo modello rilevato '{}'",
+                provider,
+                api_model
+            );
+            // Probe-on-insert: subito dopo l'INSERT (modello e' is_enabled=false di
+            // default), prova una chiamata di test al provider. Se passa, abilita;
+            // se fallisce con model_not_found/hollow, marca esplicitamente il motivo
+            // cosi' l'admin sa che NON va abilitato manualmente. Cosi' i modelli
+            // "fantasma" (es. la famiglia gemini-3.x al 05/2026) non possono mai
+            // entrare enabled via auto-discovery.
+            if let Some(orch) = orchestrator {
+                probe_new_model_on_insert(db, orch, provider, api_model).await;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Riallinea `supports_vision` e `performance_tier` di un modello GIA' presente
+/// (righe `capability_source='auto'`) all'euristica corrente. Estratta da
+/// `sync_provider` senza cambi di comportamento. Ritorna 1 se il tier e' stato
+/// riallineato (rows_affected>0), 0 altrimenti — cosi' il chiamante mantiene il
+/// contatore `tier_realigned` invariato.
+///
+/// FIX A (regola H): prima il sync toccava SOLO is_enabled, quindi una correzione
+/// dell'euristica vision/tier non si propagava ai modelli esistenti (serviva una
+/// migrazione-dati manuale). Ora si propaga da sola; le righe 'manual' (curate
+/// dall'admin) restano intatte (guard capability_source='auto').
+async fn realign_existing_model(db: &PgPool, provider: &str, api_model: &str) -> u32 {
+    let vision_routable = load_vision_routable(db).await;
+    let cc = classify_capabilities(provider, api_model, None, None, None, &vision_routable);
+    let _ = sqlx::query(
+        "UPDATE ai_price_catalog SET supports_vision = $3, updated_at = NOW() \
+         WHERE provider = $1 AND model = $2 AND capability_source = 'auto' \
+           AND supports_vision <> $3",
+    )
+    .bind(provider)
+    .bind(api_model)
+    .bind(cc.supports_vision)
+    .execute(db)
+    .await;
+
+    // Stesso principio (regola H + L) per performance_tier: UPDATE mirato (solo
+    // dove il tier differisce); le righe 'manual' restano intatte.
+    let inferred_tier = infer_tier_from_name(provider, api_model);
+    let tier_res = sqlx::query(
+        "UPDATE ai_price_catalog SET performance_tier = $3, updated_at = NOW() \
+         WHERE provider = $1 AND model = $2 AND capability_source = 'auto' \
+           AND performance_tier IS DISTINCT FROM $3",
+    )
+    .bind(provider)
+    .bind(api_model)
+    .bind(inferred_tier)
+    .execute(db)
+    .await;
+    if let Ok(r) = tier_res {
+        if r.rows_affected() > 0 {
+            tracing::info!(
+                "catalog_sync[{}]: tier riallineato '{}' -> {}",
+                provider,
+                api_model,
+                inferred_tier
+            );
+            return 1;
+        }
+    }
+    0
+}
+
+/// Re-enable di un modello GIA' presente disabilitato ma ricomparso nell'API,
+/// SOLO se ammesso dalla policy (ADR 0025). Estratta da `sync_provider` senza
+/// cambi di comportamento. Ritorna `true` se una riga e' stata riabilitata.
+async fn reenable_existing_model(
+    db: &PgPool,
+    provider: &str,
+    api_model: &str,
+    is_enabled: bool,
+    manual_locked: bool,
+) -> bool {
+    // Re-enable SOLO se il modello e' ammesso dalla policy (ADR 0025): un legacy
+    // ricomparso nell'API non deve rientrare.
+    let policy_ok = model_passes_selection_policy(db, provider, api_model).await;
+    if !is_enabled && !manual_locked && policy_ok {
+        // Modello disabilitato dal worker (missing_from_api) ma ricomparso.
+        // Il reason si azzera SOLO se appartiene al ciclo is_enabled: i reason del
+        // ciclo tool-capability ('malformed_tool_calls', 'tool_probe_failed:%')
+        // vanno PRESERVATI — azzerarli lasciava supports_tool_use=false orfano
+        // (reason NULL), irraggiungibile dal ri-test del probe (incidente
+        // magistral-small-2509, 2026-06-10).
+        let sql = format!(
+            "UPDATE ai_price_catalog SET is_enabled = true, effective_from = NOW(), \
+             auto_disabled_at = NULL, \
+             auto_disabled_reason = CASE WHEN {tool_reason} \
+                                         THEN auto_disabled_reason \
+                                         ELSE NULL END, \
+             updated_at = NOW() \
+             WHERE provider = $1 AND model = $2",
+            tool_reason = crate::tool_capability::TOOL_REASON_PREDICATE_SQL
+        );
+        let res = sqlx::query(&sql)
+            .bind(provider)
+            .bind(api_model)
+            .execute(db)
+            .await;
+        if let Ok(r) = res {
+            if r.rows_affected() > 0 {
+                audit_log(db, provider, api_model, "reenabled", json!({})).await;
+                tracing::info!(
+                    "catalog_sync[{}]: re-enabled '{}' (ricomparso API)",
+                    provider,
+                    api_model
+                );
+                return true;
+            }
+        }
+    } else if !is_enabled && manual_locked {
+        // Skip: admin lo ha disabilitato manualmente, non riabilitare anche se ricompare.
+        tracing::debug!(
+            "catalog_sync[{}]: skip re-enable '{}' (manual_locked)",
+            provider,
+            api_model
+        );
+    }
+    false
+}
+
+/// Probe-on-insert di un nuovo modello appena scoperto (is_enabled=false di
+/// default). Chiama il provider con una completion di test e, in base all'esito,
+/// abilita/annota il modello. Estratta da `sync_provider` (comportamento
+/// invariato): un unico ramo `match` sul risultato del probe.
+async fn probe_new_model_on_insert(
+    db: &PgPool,
+    orch: &Orchestrator,
+    provider: &str,
+    api_model: &str,
+) {
+    match probe_model_on_insert(orch, provider, api_model).await {
+        ProbeOnInsertResult::Healthy => {
+            apply_probe_healthy(db, provider, api_model).await;
+        }
+        ProbeOnInsertResult::ModelBroken(kind) => {
+            let reason = format!("failed_initial_probe:{}", kind);
+            let _ = sqlx::query(
+                "UPDATE ai_price_catalog \
+                 SET auto_disabled_at = NOW(), \
+                     auto_disabled_reason = $3, updated_at = NOW() \
+                 WHERE provider = $1 AND model = $2",
+            )
+            .bind(provider)
+            .bind(api_model)
+            .bind(&reason)
+            .execute(db)
+            .await;
+            audit_log(
+                db,
+                provider,
+                api_model,
+                "probe_failed_on_insert",
+                json!({"reason": reason}),
+            )
+            .await;
+            tracing::warn!(
+                "catalog_sync[{}]: probe FAIL su nuovo modello '{}' (reason={}) -> resta disabled",
+                provider, api_model, kind
+            );
+        }
+        ProbeOnInsertResult::ProviderDown(kind) => {
+            // Provider giu' (quota/billing/auth): non possiamo sapere se il
+            // modello e' valido. Lasciamo disabled con motivazione esplicita: il
+            // model_health_probe worker (run periodico) lo riabilitera' quando il
+            // provider torna up E il probe passa.
+            let reason = format!("provider_down_on_insert:{}", kind);
+            let _ = sqlx::query(
+                "UPDATE ai_price_catalog SET auto_disabled_reason = $3, updated_at = NOW() \
+                 WHERE provider = $1 AND model = $2",
+            )
+            .bind(provider)
+            .bind(api_model)
+            .bind(&reason)
+            .execute(db)
+            .await;
+            tracing::info!(
+                "catalog_sync[{}]: probe inconclusive (provider down: {}) su '{}' -> resta disabled, model_health_probe lo rivedra'",
+                provider, kind, api_model
+            );
+        }
+        ProbeOnInsertResult::Inconclusive(reason) => {
+            tracing::debug!(
+                "catalog_sync[{}]: probe inconclusive su '{}': {} -> resta disabled (default)",
+                provider, api_model, reason
+            );
+        }
+        ProbeOnInsertResult::Transient(kind) => {
+            // Errore opaco/transitorio al confine gateway/provider: il modello
+            // appena scoperto resta disabilitato (default), SENZA reason punitivo.
+            // Il model_health_probe periodico lo rivalutera' a provider stabile.
+            tracing::debug!(
+                "catalog_sync[{}]: probe transitorio su '{}': {} -> resta disabled (riprovato dal probe periodico)",
+                provider, api_model, kind
+            );
+        }
+    }
+}
+
+/// Ramo `Healthy` del probe-on-insert: infersce capabilities/tier dal nome,
+/// classifica i flag canonici (ADR 0024) e applica il gate allowlist (ADR 0025)
+/// abilitando il modello SOLO se ammesso dalla model_selection_policy. Scrive i
+/// flag SOLO su righe 'auto' (le 'manual' restano intatte). Estratta da
+/// `sync_provider` senza cambi di comportamento.
+async fn apply_probe_healthy(db: &PgPool, provider: &str, api_model: &str) {
+    // Infer capabilities dal nome: il modello e' ora utilizzabile, ma il routing
+    // filtra per capability matching e capabilities=[] lo renderebbe invisibile.
+    // Popoliamo SOLO se attualmente vuoto (rispetta override admin).
+    let inferred_caps = infer_capabilities_from_name(provider, api_model);
+    let caps_json = json!(inferred_caps);
+    // Classificazione flag canonici (ADR 0024): discovery -> solo euristica nome
+    // (niente metadata LiteLLM). Scritti SOLO su righe 'auto'.
+    let vision_routable = load_vision_routable(db).await;
+    let cc = classify_capabilities(provider, api_model, None, None, None, &vision_routable);
+    // Gate allowlist (ADR 0025): abilita SOLO se il modello e' ammesso dalla
+    // model_selection_policy. Cosi' i modelli legacy (pruned dalla 0320) non
+    // rientrano via probe-on-insert.
+    let allowed = model_passes_selection_policy(db, provider, api_model).await;
+    let _ = sqlx::query(
+        "UPDATE ai_price_catalog \
+         SET is_enabled = $8, \
+             auto_disabled_at = CASE WHEN $8 THEN NULL ELSE NOW() END, \
+             auto_disabled_reason = CASE WHEN $8 THEN NULL ELSE 'fuori model_selection_policy (mig 0320)' END, \
+             updated_at = NOW(), \
+             capabilities = CASE \
+                 WHEN capabilities IS NULL OR capabilities = '[]'::jsonb \
+                     THEN $3::jsonb \
+                 ELSE capabilities \
+             END, \
+             supports_tool_use = CASE WHEN capability_source='auto' THEN $4 ELSE supports_tool_use END, \
+             supports_vision = CASE WHEN capability_source='auto' THEN $5 ELSE supports_vision END, \
+             is_thinking = CASE WHEN capability_source='auto' THEN $6 ELSE is_thinking END, \
+             uses_thinking_mode = CASE WHEN capability_source='auto' THEN $7 ELSE uses_thinking_mode END, \
+             agentic_thinking_policy = CASE WHEN capability_source='auto' THEN $9 ELSE agentic_thinking_policy END \
+         WHERE provider = $1 AND model = $2 AND is_enabled = false",
+    )
+    .bind(provider)
+    .bind(api_model)
+    .bind(&caps_json)
+    .bind(cc.supports_tool_use)
+    .bind(cc.supports_vision)
+    .bind(cc.is_thinking)
+    .bind(cc.uses_thinking_mode)
+    .bind(allowed)
+    .bind(cc.agentic_thinking_policy)
+    .execute(db)
+    .await;
+    audit_log(
+        db, provider, api_model,
+        if allowed { "probe_ok_on_insert" } else { "probe_ok_but_outside_policy" },
+        json!({"action": if allowed {"auto_enabled"} else {"kept_disabled_outside_allowlist"}, "inferred_capabilities": inferred_caps}),
+    )
+    .await;
+    tracing::info!(
+        "catalog_sync[{}]: probe OK su '{}' -> {} (policy allowlist)",
+        provider, api_model, if allowed {"abilitato"} else {"lasciato disabilitato (fuori allowlist)"}
+    );
 }
 
 /// Rimuove suffisso data ISO (es. -20251201) dal model name per gestire alias.
