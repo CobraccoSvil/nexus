@@ -36,10 +36,10 @@ use crate::batch::{
     build_anthropic_batch_body, parse_anthropic_batch_id, parse_anthropic_results,
     parse_anthropic_status, BatchStatusResponse, CreateBatchBody, CreateBatchResponse,
 };
-use crate::cooldown::CooldownManager;
+use crate::cooldown::{CooldownManager, RetryPolicy};
 use crate::model_alias_resolver::ModelAliasResolver;
 use crate::provider::LlmProvider;
-use crate::providers::is_billing_error;
+use crate::providers::{classify_provider_error, ProviderErrorKind, ProviderHttpError};
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
 use crate::redaction::sensitivity_classifier::SensitivityClassifier;
 use crate::types::{
@@ -186,7 +186,11 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
         })?;
 
     // Fallback chain manuale (modello per-provider): primo successo vince.
-    let mut response = run_fallback(&resolved, &state.cooldown, &redacted_req).await?;
+    // `strict`: quando il provider e' pinnato (scelta utente / routing gia'
+    // risolto, nessuno swap possibile) si RITENTA lo stesso modello sui
+    // transitori e si attende un cooldown breve invece di fallire subito.
+    let strict = req.pin_provider.is_some();
+    let mut response = run_fallback(&resolved, &state.cooldown, &redacted_req, strict).await?;
 
     // Reidratazione post-flight: ripristina gli originali nei placeholder.
     response = pipeline.rehydrate(&response, &mut map);
@@ -262,46 +266,72 @@ fn strip_model_prefix(model: &str) -> String {
     }
 }
 
-/// Esegue il fallback sui provider risolti: salta i cooldown, prova in ordine,
-/// marca il cooldown sull'errore (billing/transient) e prosegue. Punto unico
-/// dello stato cooldown e della classificazione billing (regola L).
+/// Esegue il fallback sui provider risolti: prova in ordine, con retry sullo
+/// STESSO modello per gli errori transitori quando `strict` (pin: nessuno swap
+/// possibile). Punto unico dello stato cooldown e della classificazione errore
+/// (regola L).
+///
+/// `strict = true` (provider pinnato / routing gia' risolto): il modello scelto
+/// NON viene mai sostituito. Su transitorio (429/5xx/timeout) si ritenta lo
+/// stesso modello con backoff; su cooldown transitorio BREVE si attende il
+/// residuo invece di fallire subito. Errore solo su billing/quota, errore lato
+/// client (400/404/403-per-modello) o retry esauriti.
+///
+/// `strict = false` (chain multi-provider, path non-pin): un tentativo per
+/// provider, poi passa al successivo (comportamento storico).
 async fn run_fallback(
     resolved: &[ResolvedProvider],
     cooldown: &CooldownManager,
     base_req: &LlmRequest,
+    strict: bool,
 ) -> Result<LlmResponse, PipelineError> {
     let mut failures: Vec<String> = Vec::new();
+    let policy = cooldown.retry_policy();
 
     for rp in resolved {
         let name = rp.provider.name();
+
         if cooldown.is_in_cooldown(name) {
-            // Includi il motivo nel messaggio: se billing, il brain (che legge il
-            // body del 500) lo riconosce come billing e applica il cooldown lungo
-            // invece di riprovare il provider a ogni iterazione.
             let secs = cooldown.seconds_remaining(name);
             if cooldown.is_billing_cooldown(name) {
+                // Billing: il provider e' inutilizzabile finche' non si ricarica.
+                // Il messaggio lo segnala cosi' il chiamante applica il cooldown
+                // lungo invece di riprovare a ogni iterazione.
                 failures.push(format!("{name} (cooldown billing, {secs}s rimanenti)"));
+                continue;
+            }
+            // Cooldown transitorio BREVE + strict pin (nessuno swap): attendi il
+            // residuo e ritenta lo stesso modello, invece del hard-fail storico
+            // (causa dell'errore "tutti i provider hanno fallito -> google
+            // (cooldown 21s)"). Oltre il tetto, propaga. NB: `secs` e' troncato a
+            // interi, quindi un residuo sub-secondo vale 0: attendere 0s = procedi
+            // subito (il cooldown e' di fatto scaduto), non e' un caso di hard-fail.
+            if strict && secs <= policy.wait_short_cooldown_cap_s {
+                tracing::info!(
+                    provider = name,
+                    wait_s = secs,
+                    "gateway: attendo cooldown transitorio breve prima di ritentare (strict pin)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
             } else {
                 failures.push(format!("{name} (in cooldown, {secs}s rimanenti)"));
+                continue;
             }
-            continue;
         }
 
         // Richiesta col modello reale risolto per questo provider.
         let mut req = base_req.clone();
         req.model = rp.model.clone();
 
-        match rp.provider.complete(&req).await {
-            Ok(resp) => return Ok(resp),
-            Err(err) => {
-                let msg = err.to_string();
-                if is_billing_error(&msg) {
-                    cooldown.mark_billing(name, Some(msg.clone()));
-                } else {
-                    cooldown.mark_transient(name, Some(msg.clone()));
-                }
-                failures.push(format!("{name} ({msg})"));
+        match complete_with_retry(rp.provider.as_ref(), &req, name, cooldown, &policy, strict).await
+        {
+            Ok(resp) => {
+                // Successo reale: se il provider era in cooldown transitorio,
+                // liberalo subito (ha appena risposto 200).
+                cooldown.clear(name);
+                return Ok(resp);
             }
+            Err(msg) => failures.push(format!("{name} ({msg})")),
         }
     }
 
@@ -309,6 +339,90 @@ async fn run_fallback(
         "tutti i provider hanno fallito -> {}",
         failures.join("; ")
     )))
+}
+
+/// Chiama `provider.complete` con retry sullo STESSO modello per errori
+/// transitori (Fase B1, strict pin). Classifica l'errore col punto unico
+/// [`classify_provider_error`] (regola L):
+///   - Billing   -> `mark_billing`, niente retry, errore (ricarica necessaria);
+///   - ClientError -> niente cooldown, niente retry, errore (colpa nostra/config
+///     o singolo modello non abilitato: ritentare non aiuta);
+///   - Transient -> retry con backoff+jitter; dopo l'ultimo tentativo
+///     `mark_transient` (cooldown breve, liberato dal re-probe appena sano).
+///
+/// `strict = false` prova una volta sola (la chain passa al provider successivo).
+async fn complete_with_retry(
+    provider: &dyn LlmProvider,
+    req: &LlmRequest,
+    name: &str,
+    cooldown: &CooldownManager,
+    policy: &RetryPolicy,
+    strict: bool,
+) -> Result<LlmResponse, String> {
+    let max_attempts = if strict { policy.max_attempts.max(1) } else { 1 };
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match provider.complete(req).await {
+            Ok(resp) => return Ok(resp),
+            Err(err) => {
+                // Classificazione DETERMINISTICA su status/codice strutturato
+                // (regola H): il testo del messaggio serve solo per log/display.
+                let kind = classify_provider_error(&err);
+                // `Retry-After` autoritativo dal provider (RFC 9457/7231), se c'e'.
+                let retry_after = err
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<ProviderHttpError>())
+                    .and_then(|h| h.retry_after_seconds);
+                let msg = err.to_string();
+                match kind {
+                    ProviderErrorKind::Billing => {
+                        cooldown.mark_billing(name, Some(msg.clone()));
+                        return Err(msg);
+                    }
+                    ProviderErrorKind::ClientError => {
+                        // Colpa nostra/config o modello singolo non abilitato:
+                        // ne' cooldown (il provider e' sano) ne' retry.
+                        return Err(msg);
+                    }
+                    ProviderErrorKind::Transient => {
+                        let cap_s = policy.wait_short_cooldown_cap_s.max(0) as u64;
+                        // Se il provider chiede un'attesa piu' lunga del tetto, non
+                        // bloccare la richiesta cosi' a lungo: arrenditi (cooldown
+                        // breve; la riprova successiva o il re-probe recuperano).
+                        if attempt >= max_attempts || retry_after.is_some_and(|s| s > cap_s) {
+                            cooldown.mark_transient(name, Some(msg.clone()));
+                            return Err(msg);
+                        }
+                        // Onora `Retry-After` (autoritativo) se presente e sotto il
+                        // tetto; altrimenti backoff esponenziale+jitter calcolato.
+                        let delay = match retry_after {
+                            Some(s) => s.saturating_mul(1000),
+                            None => policy.backoff_ms(attempt, jitter_seed()),
+                        };
+                        tracing::warn!(
+                            provider = name,
+                            attempt,
+                            delay_ms = delay,
+                            honored_retry_after = retry_after.is_some(),
+                            "gateway: errore transitorio, retry stesso modello"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Seed per il jitter del backoff: nanosecondi dell'orologio di sistema. Serve
+/// solo a de-sincronizzare client concorrenti (non e' crittografico); in caso di
+/// errore dell'orologio ripiega su 0 (backoff senza jitter, comunque valido).
+fn jitter_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
 }
 
 // ── Health / providers ──────────────────────────────────────────────────────
@@ -599,11 +713,15 @@ async fn build_sse_stream(
             }
             Err(err) => {
                 let name = rp.provider.name();
+                let kind = classify_provider_error(&err);
                 let msg = err.to_string();
-                if is_billing_error(&msg) {
-                    state.cooldown.mark_billing(name, Some(msg.clone()));
-                } else {
-                    state.cooldown.mark_transient(name, Some(msg.clone()));
+                match kind {
+                    ProviderErrorKind::Billing => state.cooldown.mark_billing(name, Some(msg.clone())),
+                    // Colpa nostra/config o modello non abilitato: niente cooldown.
+                    ProviderErrorKind::ClientError => {}
+                    ProviderErrorKind::Transient => {
+                        state.cooldown.mark_transient(name, Some(msg.clone()))
+                    }
                 }
                 let _ = tx
                     .send(Ok(Event::default().data(json!({ "error": msg }).to_string())))
@@ -1485,6 +1603,8 @@ mod tests {
     enum Behaviour {
         Ok,
         ErrBilling,
+        /// Errore lato client (400 invalid_request): non ritentabile, non da cooldown.
+        ErrClient,
     }
 
     struct FakeProvider {
@@ -1502,6 +1622,10 @@ mod tests {
         audio_out_capable: bool,
         /// Se il provider dichiara `supports_video_gen()` (default `false`).
         video_capable: bool,
+        /// Numero di chiamate iniziali a `complete` che falliscono con un errore
+        /// TRANSITORIO (503) prima di comportarsi secondo `behaviour`. Serve ai
+        /// test del retry strict-pin. Default 0 (nessun fallimento transitorio).
+        transient_fail_calls: usize,
     }
 
     impl FakeProvider {
@@ -1510,6 +1634,23 @@ mod tests {
                 name: name.to_string(),
                 behaviour,
                 calls: AtomicUsize::new(0),
+                transient_fail_calls: 0,
+                models_result: None,
+                image_capable: false,
+                audio_capable: false,
+                audio_out_capable: false,
+                video_capable: false,
+            })
+        }
+
+        /// Variante che fallisce `fail_n` volte con errore TRANSITORIO poi risponde
+        /// OK. Per i test del retry strict-pin.
+        fn transient_then_ok(name: &str, fail_n: usize) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                behaviour: Behaviour::Ok,
+                calls: AtomicUsize::new(0),
+                transient_fail_calls: fail_n,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -1524,6 +1665,7 @@ mod tests {
                 name: name.to_string(),
                 behaviour: Behaviour::Ok,
                 calls: AtomicUsize::new(0),
+                transient_fail_calls: 0,
                 models_result: Some(models_result),
                 image_capable: false,
                 audio_capable: false,
@@ -1538,6 +1680,7 @@ mod tests {
                 name: name.to_string(),
                 behaviour,
                 calls: AtomicUsize::new(0),
+                transient_fail_calls: 0,
                 models_result: None,
                 image_capable: true,
                 audio_capable: false,
@@ -1552,6 +1695,7 @@ mod tests {
                 name: name.to_string(),
                 behaviour,
                 calls: AtomicUsize::new(0),
+                transient_fail_calls: 0,
                 models_result: None,
                 image_capable: false,
                 audio_capable: true,
@@ -1566,6 +1710,7 @@ mod tests {
                 name: name.to_string(),
                 behaviour,
                 calls: AtomicUsize::new(0),
+                transient_fail_calls: 0,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -1580,6 +1725,7 @@ mod tests {
                 name: name.to_string(),
                 behaviour,
                 calls: AtomicUsize::new(0),
+                transient_fail_calls: 0,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -1607,7 +1753,19 @@ mod tests {
             &[0, 1, 2]
         }
         async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            // Prime `transient_fail_calls` chiamate: errore transitorio (503),
+            // emesso come ProviderHttpError (status certo) come i provider reali.
+            if idx < self.transient_fail_calls {
+                return Err(crate::providers::ProviderHttpError {
+                    provider: self.name.clone(),
+                    status: 503,
+                    code: None,
+                    retry_after_seconds: None,
+                    message: "service unavailable (transient test)".into(),
+                }
+                .into());
+            }
             match self.behaviour {
                 Behaviour::Ok => Ok(LlmResponse {
                     content: "ok".into(),
@@ -1626,7 +1784,23 @@ mod tests {
                     reasoning: None,
                     thinking_signature: None,
                 }),
-                Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                // Errori strutturati (status + codice), come i provider reali.
+                Behaviour::ErrBilling => Err(crate::providers::ProviderHttpError {
+                    provider: self.name.clone(),
+                    status: 402,
+                    code: Some("insufficient_quota".into()),
+                    retry_after_seconds: None,
+                    message: "insufficient_quota".into(),
+                }
+                .into()),
+                Behaviour::ErrClient => Err(crate::providers::ProviderHttpError {
+                    provider: self.name.clone(),
+                    status: 400,
+                    code: Some("invalid_request_error".into()),
+                    retry_after_seconds: None,
+                    message: "invalid request: bad field".into(),
+                }
+                .into()),
             }
         }
         async fn stream(&self, _req: &LlmRequest) -> anyhow::Result<crate::provider::ChunkStream> {
@@ -1662,6 +1836,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                Behaviour::ErrClient => anyhow::bail!("HTTP 400 invalid_request: bad field"),
             }
         }
         fn supports_audio_in(&self) -> bool {
@@ -1680,6 +1855,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                Behaviour::ErrClient => anyhow::bail!("HTTP 400 invalid_request: bad field"),
             }
         }
         fn supports_audio_out(&self) -> bool {
@@ -1696,6 +1872,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                Behaviour::ErrClient => anyhow::bail!("HTTP 400 invalid_request: bad field"),
             }
         }
         fn supports_video_gen(&self) -> bool {
@@ -1716,6 +1893,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                Behaviour::ErrClient => anyhow::bail!("HTTP 400 invalid_request: bad field"),
             }
         }
     }
@@ -1781,7 +1959,7 @@ mod tests {
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req()).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false).await.unwrap();
         assert_eq!(resp.provider_used, "openai");
         assert_eq!(resp.model_used, "gpt-x");
     }
@@ -1801,9 +1979,114 @@ mod tests {
             },
         ];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req()).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false).await.unwrap();
         assert_eq!(resp.provider_used, "mistral");
         assert!(cooldown.is_in_cooldown("openai"));
+    }
+
+    #[tokio::test]
+    async fn strict_retry_transitorio_poi_successo() {
+        // Provider pinnato: 2 fallimenti transitori (503) poi OK. Strict pin
+        // ritenta lo STESSO modello e vince; nessun cooldown residuo.
+        let p = FakeProvider::transient_then_ok("google", 2);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let resp = run_fallback(&resolved, &cooldown, &req(), true)
+            .await
+            .unwrap();
+        assert_eq!(resp.provider_used, "google");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3); // 2 falliti + 1 ok
+        assert!(!cooldown.is_in_cooldown("google"));
+    }
+
+    #[tokio::test]
+    async fn strict_retry_esaurito_marca_transient() {
+        // 5 fallimenti transitori, max 3 tentativi: si arrende e marca cooldown
+        // BREVE (non billing).
+        let p = FakeProvider::transient_then_ok("google", 5);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(&resolved, &cooldown, &req(), true)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.message.contains("tutti i provider hanno fallito"));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3); // esattamente max_attempts
+        assert!(cooldown.is_in_cooldown("google"));
+        assert!(!cooldown.is_billing_cooldown("google"));
+    }
+
+    #[tokio::test]
+    async fn strict_billing_nessun_retry() {
+        // Billing: nessun retry (serve ricarica), cooldown lungo immediato.
+        let p = FakeProvider::new("openai", Behaviour::ErrBilling);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gpt-x".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(&resolved, &cooldown, &req(), true)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.message.contains("tutti i provider hanno fallito"));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1); // un solo tentativo
+        assert!(cooldown.is_billing_cooldown("openai"));
+    }
+
+    #[tokio::test]
+    async fn strict_client_error_nessun_retry_nessun_cooldown() {
+        // 400 invalid_request: colpa nostra/config. Nessun retry, NESSUN cooldown
+        // (il provider e' sano, non va penalizzato).
+        let p = FakeProvider::new("google", Behaviour::ErrClient);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(&resolved, &cooldown, &req(), true)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.message.contains("tutti i provider hanno fallito"));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1); // niente retry
+        assert!(!cooldown.is_in_cooldown("google")); // niente cooldown
+    }
+
+    #[tokio::test]
+    async fn strict_attende_cooldown_transitorio_breve_poi_ritenta() {
+        // Google in cooldown transitorio breve (1s): strict pin attende e ritenta
+        // lo stesso modello invece del hard-fail "-> google (cooldown 21s)".
+        let p = FakeProvider::new("google", Behaviour::Ok);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        // 2s cosi' seconds_remaining (troncato) e' ~1: esercita un'attesa reale.
+        cooldown.mark_at(
+            "google",
+            crate::cooldown::CooldownReason::Transient,
+            None,
+            chrono::Utc::now(),
+            2,
+        );
+        let resp = run_fallback(&resolved, &cooldown, &req(), true)
+            .await
+            .unwrap();
+        assert_eq!(resp.provider_used, "google");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1842,7 +2125,7 @@ mod tests {
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req()).await.err().unwrap();
+        let err = run_fallback(&resolved, &cooldown, &req(), false).await.err().unwrap();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("openai"));
     }
@@ -1904,7 +2187,7 @@ mod tests {
         let cooldown = CooldownManager::new();
         cooldown.mark_billing("anthropic", Some("credit balance too low".into()));
 
-        let err = run_fallback(&resolved, &cooldown, &req())
+        let err = run_fallback(&resolved, &cooldown, &req(), false)
             .await
             .expect_err("provider pinnato in cooldown deve fallire");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1925,7 +2208,7 @@ mod tests {
         let resolved = vec![rp];
 
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req())
+        let err = run_fallback(&resolved, &cooldown, &req(), false)
             .await
             .expect_err("provider pinnato fallito deve dare errore, non fallback");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);

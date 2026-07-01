@@ -273,7 +273,7 @@ impl LlmProvider for AnthropicProvider {
             // del provider; lo propaghiamo al caller (il cooldown della Fase 3
             // riconosce il billing via `is_billing_error`), senza loggarlo qui.
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("anthropic HTTP {}: {}", status.as_u16(), text);
+            return Err(anthropic_http_error(status.as_u16(), text).into());
         }
 
         let parsed: AnthropicMessage = resp.json().await?;
@@ -300,7 +300,7 @@ impl LlmProvider for AnthropicProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("anthropic HTTP {}: {}", status.as_u16(), text);
+            return Err(anthropic_http_error(status.as_u16(), text).into());
         }
 
         let model_used = req.model.clone();
@@ -375,9 +375,10 @@ impl LlmProvider for AnthropicProvider {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            // Regola F: il body d'errore non contiene prompt/response utente.
+            // Errore strutturato anche sulla lista modelli (regola M): status +
+            // codice, mai testo da classificare.
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("anthropic GET /models HTTP {}: {}", status.as_u16(), text);
+            return Err(anthropic_http_error(status.as_u16(), text).into());
         }
         let body: serde_json::Value = resp.json().await?;
         Ok(parse_models_response(&body))
@@ -816,6 +817,21 @@ pub fn is_anthropic_billing_error(msg: &str) -> bool {
     m.contains("plans & billing")
         || m.contains("upgrade or purchase credits")
         || m.contains("billing required")
+}
+
+/// Costruisce un [`super::ProviderHttpError`] per Anthropic. Anthropic NON espone
+/// un codice d'errore strutturato per il credito (il segnale e' solo nel testo del
+/// messaggio, es. 400 "Your credit balance is too low"): qui — e SOLO qui, dentro
+/// l'adapter che conosce il formato Anthropic — quel quirk viene tradotto in un
+/// codice `"billing"`. Cosi' il classificatore generico
+/// (`classify_provider_error`) resta DETERMINISTICO su status+codice (regola H):
+/// il match testuale e' confinato al provider, non sparso nel punto di decisione.
+fn anthropic_http_error(status: u16, body: String) -> super::ProviderHttpError {
+    let mut e = super::ProviderHttpError::from_response("anthropic", status, body);
+    if e.code.is_none() && is_anthropic_billing_error(&e.message) {
+        e.code = Some("billing".to_string());
+    }
+    e
 }
 
 /// Parser SSE dell'API Messages. Gli eventi rilevanti:

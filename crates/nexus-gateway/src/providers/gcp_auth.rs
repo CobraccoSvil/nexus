@@ -248,10 +248,12 @@ impl VertexAuth {
 
         let status = resp.status();
         if !status.is_success() {
-            // Regola F: il body puo' contenere dettagli ma non segreti; lo
-            // propaghiamo al caller per il cooldown, non lo logghiamo qui.
+            // Errore strutturato: il token endpoint alimenta il cooldown, quindi
+            // status + codice, mai testo da classificare (regola M).
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("token endpoint Vertex HTTP {}: {}", status.as_u16(), body);
+            return Err(
+                super::ProviderHttpError::from_response("google", status.as_u16(), body).into(),
+            );
         }
 
         let parsed: TokenResponse = resp

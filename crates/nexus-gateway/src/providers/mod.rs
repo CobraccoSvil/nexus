@@ -21,5 +21,8 @@ pub use deepseek::DeepSeekProvider;
 pub use google::GoogleProvider;
 pub use mistral::MistralProvider;
 pub use openai::OpenAiProvider;
-pub use openai_compat::{is_billing_error, OpenAiCompatClient};
+pub use openai_compat::{
+    classify_provider_error, is_billing_error, OpenAiCompatClient, ProviderErrorKind,
+    ProviderHttpError,
+};
 pub use vllm::VllmProvider;

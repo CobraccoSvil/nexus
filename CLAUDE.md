@@ -297,6 +297,65 @@ domanda, FERMATI: cerca il punto unico nel catalogo (ADR 0026); se esiste, deleg
 se e' un concern nuovo, crea PRIMA il punto unico col meccanismo corretto, poi
 aggiungilo al catalogo. Mai copiare-e-adattare.
 
+## M. Stato tecnico dai segnali strutturati, mai dal testo (regola assoluta)
+
+Regola autoritativa e vincolante per qualunque decisione basata sull'esito di una
+richiesta a un provider/modello/servizio esterno o interno: **le informazioni
+tecniche su una richiesta (successo, fallimento, tipo di errore, ritentabilita',
+credito, rate-limit, esito di un run) devono essere lette da SEGNALI STRUTTURATI e
+codificati alla fonte, MAI dedotte dal parsing del testo umano del messaggio.**
+
+Il testo in linguaggio naturale cambia per provider, versione dell'API e lingua:
+classificarci sopra e' fragile per definizione ed e' una toppa (regola H).
+
+### Cosa e' vietato
+
+- **Classificare un errore con `contains("...")`/regex sul messaggio** (es.
+  `msg.contains("insufficient_quota")`, `contains("not enabled")`, `contains("rate
+  limit")`) per decidere retry, cooldown, fallback, billing, routing.
+- **Dedurre l'esito di un run dell'agente** dal matching di frasi ("non riesco",
+  "unable to", ...): l'esito va da un CAMPO strutturato (enum) dichiarato dal
+  modello o da una verifica oggettiva.
+- **Ri-derivare informazione strutturata da una stringa gia' appiattita** (es.
+  formattare `"HTTP {status}: {body}"` e poi ri-parsarne lo status con una regex).
+
+### Cosa e' richiesto
+
+1. **Segnale primario: lo status/codice macchina.** Per un errore HTTP: lo
+   **status code numerico** (certo, standard) e il **codice d'errore strutturato**
+   dal JSON del provider (`error.type`/`error.code`/`error.status` — identificatore
+   macchina stabile). Vedi ADR 0033.
+2. **Propagare l'errore in forma tipizzata**, non come stringa: il punto di
+   costruzione (l'adapter che conosce il formato) codifica status+codice in un tipo
+   (`ProviderHttpError` nel gateway); il punto di decisione fa `downcast`, non
+   `to_string()`. Trasporto errori tramite tipi/predicati (`reqwest::Error::status()`,
+   `is_timeout()`), non messaggi.
+3. **Il testo umano solo per display/log**, mai per decidere (come RFC 9457
+   distingue `type`/`code` da `detail`).
+4. **Quirk di un provider senza codice strutturato** (raro) va ISOLATO nel suo
+   adapter, che traduce il proprio errore in un codice strutturato; il punto di
+   decisione generico resta deterministico.
+5. **Esito conversazione/run**: preferire output strutturato del modello (tool a
+   schema strict / structured outputs, enum `outcome`/`blocker`/`refusal`) e
+   verifica oggettiva (`final_gate`), mai il pattern-matching della prosa. Vedi
+   ADR 0034.
+
+### Punto unico e riferimenti
+
+- Classificazione errori provider: `classify_provider_error(&anyhow::Error)` +
+  `ProviderHttpError` in `crates/nexus-gateway/src/providers/openai_compat.rs`
+  (punto unico, regola L). Tutti i provider (openai/deepseek/mistral/vllm via
+  `OpenAiCompatClient`, google incl. Vertex, anthropic) emettono `ProviderHttpError`
+  su OGNI risposta HTTP non-2xx, incluse liste modelli, poll e token endpoint.
+- ADR 0033 (classificazione deterministica), ADR 0034 (esito strutturato).
+
+### Conseguenza pratica
+
+Prima di scrivere un `if msg.contains(...)` per decidere qualcosa su una richiesta,
+FERMATI: quel segnale esiste gia' in forma strutturata (status, codice, campo enum)
+o va reso disponibile alla fonte. Un PR che classifica lo stato tecnico dal testo e'
+rifiutato come toppa (regola H).
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo locale: **Windows nativo**, repo Git in `D:\IDEAI`. Shell:

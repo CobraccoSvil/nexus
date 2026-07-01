@@ -514,7 +514,9 @@ impl GoogleProvider {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !is_thinking_budget_error(&text) {
-            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+            return Err(
+                super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),
+            );
         }
 
         // Quirk confermato: ri-eseguo OMETTENDO il thinkingConfig (GoogleThinking::
@@ -556,9 +558,12 @@ impl GoogleProvider {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            // Regola F: il body d'errore non contiene prompt/response utente.
+            // Errore strutturato anche sulla lista modelli (regola M): status +
+            // codice, mai testo da classificare.
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google GET models HTTP {}: {}", status.as_u16(), text);
+            return Err(
+                super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),
+            );
         }
         let body: serde_json::Value = resp.json().await?;
         Ok(parse_google_models_response(&body))
@@ -641,7 +646,9 @@ impl GoogleProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+            return Err(
+                super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),
+            );
         }
         let start_parsed: LongRunningStartResponse = resp.json().await?;
         start_parsed.name.filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -678,8 +685,12 @@ impl GoogleProvider {
             let poll_resp = self.http.get(poll_url).bearer_auth(&poll_token).send().await?;
             let poll_status = poll_resp.status();
             if !poll_status.is_success() {
+                // Errore strutturato anche sul poll (regola M): status + codice.
                 let text = poll_resp.text().await.unwrap_or_default();
-                anyhow::bail!("google HTTP {} (poll): {}", poll_status.as_u16(), text);
+                return Err(
+                    super::ProviderHttpError::from_response("google", poll_status.as_u16(), text)
+                        .into(),
+                );
             }
             let op: LongRunningOperation = poll_resp.json().await?;
             match parse_operation_response(op)? {
@@ -730,7 +741,9 @@ impl LlmProvider for GoogleProvider {
             // Regola F: body d'errore propagato al caller (cooldown Fase 3 lo
             // classifica via is_billing_error), non loggato qui in chiaro.
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+            return Err(
+                super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),
+            );
         }
 
         let parsed: GenerateContentResponse = resp.json().await?;
@@ -756,7 +769,9 @@ impl LlmProvider for GoogleProvider {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+            return Err(
+                super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),
+            );
         }
 
         let model_used = req.model.clone();
@@ -861,7 +876,9 @@ impl LlmProvider for GoogleProvider {
             // Regola F: body d'errore propagato al caller (cooldown lo classifica
             // via is_billing_error), non loggato qui in chiaro.
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("google HTTP {}: {}", status.as_u16(), text);
+            return Err(
+                super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),
+            );
         }
 
         let parsed: PredictResponse = resp.json().await?;

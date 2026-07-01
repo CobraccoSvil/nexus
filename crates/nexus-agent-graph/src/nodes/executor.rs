@@ -216,6 +216,13 @@ pub struct ExecutorConfig {
     /// Soglia ripetizione azione produttiva (`agent.repeated_action_threshold`,
     /// default 2).
     pub repeated_action_threshold: i64,
+    /// Soglia ripetizione azione di SOLA LETTURA
+    /// (`agent.repeated_action_threshold.read_only`, default 4). Piu' alta di
+    /// quella produttiva: una rilettura idempotente (read_file/list_files/grep)
+    /// non "insiste a vuoto" come un build che fallisce, quindi non deve far
+    /// scattare la macchina GUIDE->ABORT su un modello capace alla prima
+    /// ripetizione accidentale (regola H, causa radice del falso-stallo lettura).
+    pub repeated_action_threshold_read_only: i64,
     /// `true` abilita lo stadio force_diagnose per repeated_action
     /// (`agent.repeated_action.force_diagnose_enabled`).
     pub repeated_action_force_diagnose_enabled: bool,
@@ -296,6 +303,7 @@ impl Default for ExecutorConfig {
             exploration_loop_threshold: 6,
             progress_controller_enabled: false,
             repeated_action_threshold: 2,
+            repeated_action_threshold_read_only: 4,
             repeated_action_force_diagnose_enabled: false,
             reallocation_threshold: 3,
             tool_choice_forcing_enabled: false,
@@ -1159,7 +1167,15 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 .as_ref()
                 .map(|h| h.failed && matches!(h.tool_name.as_str(), "run_service" | "service_restart"))
                 .unwrap_or(false);
-            let ra_threshold = self.cfg.repeated_action_threshold;
+            // Soglia dedicata per le LETTURE idempotenti (piu' alta): una
+            // rilettura accidentale non deve innescare subito GUIDE->ABORT su un
+            // modello capace. Le azioni produttive (build/test/edit) mantengono la
+            // soglia bassa (2) perche' ripeterle a vuoto e' davvero uno stallo.
+            let ra_threshold = if ra_read_only {
+                self.cfg.repeated_action_threshold_read_only
+            } else {
+                self.cfg.repeated_action_threshold
+            };
             let matched = ra_label.as_ref().map(|_| ra_count >= ra_threshold).unwrap_or(false);
             if !matched {
                 progress_guided.remove("repeated_action");
@@ -1247,7 +1263,32 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         // di aver fallito". Solo a 0 file modificati resta l'abort secco.
                         let touched =
                             crate::routing::signals::modified_files_from_messages(&messages, 40);
-                        let (ra_text, ra_stop) = if touched.is_empty() {
+                        let (ra_text, ra_stop) = if !touched.is_empty() {
+                            (
+                                format!(
+                                    "ESITO: modifiche applicate ai file: {}.\nMi sono fermato \
+perche' '{label}' si ripeteva senza ulteriore progresso; verifica i risultati (build/test) \
+per confermare la correzione.",
+                                    touched.join(", ")
+                                ),
+                                StopReason::EndTurn,
+                            )
+                        } else if ra_read_only {
+                            // Lettura idempotente ripetuta: il contenuto e' GIA' nel
+                            // contesto. NON e' un fallimento del modello (era la causa
+                            // del falso "il modello non riesce" su modelli capaci):
+                            // chiudi in modo ONESTO instradando al final_gate, che
+                            // valuta l'esito reale, invece dell'abort "non completato".
+                            (
+                                format!(
+                                    "Ho gia' raccolto il contenuto necessario: '{label}' e' stato \
+letto e il risultato e' nel contesto qui sopra. Concludo con quanto raccolto invece di \
+rileggere di nuovo lo stesso bersaglio. Se manca un dato specifico per completare, indica \
+UN bersaglio DIVERSO da esaminare, altrimenti rispondi con il risultato."
+                                ),
+                                StopReason::EndTurn,
+                            )
+                        } else {
                             (
                                 format!(
                                     "ESITO: non completato.\nMi sono bloccato ripetendo la stessa \
@@ -1258,16 +1299,6 @@ diverso; se sei bloccato da una dipendenza/credenziale/permesso/servizio mancant
 indicalo esplicitamente."
                                 ),
                                 stop_reason_from_str(dec.stop_reason.as_deref()),
-                            )
-                        } else {
-                            (
-                                format!(
-                                    "ESITO: modifiche applicate ai file: {}.\nMi sono fermato \
-perche' '{label}' si ripeteva senza ulteriore progresso; verifica i risultati (build/test) \
-per confermare la correzione.",
-                                    touched.join(", ")
-                                ),
-                                StopReason::EndTurn,
                             )
                         };
                         tracing::warn!(

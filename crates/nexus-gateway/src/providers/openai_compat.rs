@@ -140,8 +140,7 @@ impl OpenAiCompatClient {
             // Regola F: il body d'errore puo' contenere dettagli del provider
             // ma non prompt/response utente; lo propaghiamo al caller (la Fase 3
             // distingue il billing error), senza loggarlo qui in chiaro.
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+            return Err(provider_http_error(&self.provider_name, resp).await.into());
         }
 
         let parsed: ChatCompletion = resp.json().await?;
@@ -184,8 +183,7 @@ impl OpenAiCompatClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+            return Err(provider_http_error(&self.provider_name, resp).await.into());
         }
 
         let provider_name = self.provider_name.clone();
@@ -269,15 +267,9 @@ impl OpenAiCompatClient {
         let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
         let status = resp.status();
         if !status.is_success() {
-            // Regola F: il body d'errore non contiene prompt/response utente; lo
-            // propaghiamo al caller, che aggrega best-effort, senza loggarlo qui.
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "{} GET /models HTTP {}: {}",
-                self.provider_name,
-                status.as_u16(),
-                text
-            );
+            // Errore strutturato anche sulla lista modelli (regola M): status +
+            // codice, mai testo da classificare. Il caller aggrega best-effort.
+            return Err(provider_http_error(&self.provider_name, resp).await.into());
         }
         let body: serde_json::Value = resp.json().await?;
         Ok(parse_models_response(&body))
@@ -319,8 +311,7 @@ impl OpenAiCompatClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+            return Err(provider_http_error(&self.provider_name, resp).await.into());
         }
 
         let parsed: ImagesResponse = resp.json().await?;
@@ -376,8 +367,7 @@ impl OpenAiCompatClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+            return Err(provider_http_error(&self.provider_name, resp).await.into());
         }
 
         let parsed: TranscriptionResponse = resp.json().await?;
@@ -428,8 +418,7 @@ impl OpenAiCompatClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} HTTP {}: {}", self.provider_name, status.as_u16(), text);
+            return Err(provider_http_error(&self.provider_name, resp).await.into());
         }
 
         // Content-Type per il MIME reale; se assente lo deriviamo dal formato
@@ -978,6 +967,179 @@ pub fn is_billing_error(msg: &str) -> bool {
         || m.contains("payment required")
         || m.contains("billing")
         || (m.contains("credit balance") && m.contains("too low"))
+}
+
+/// Classe di errore provider ai fini della strategia retry/cooldown.
+/// Punto unico (regola L): i call site (`run_fallback`, streaming) NON
+/// reimplementano il match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    /// Crediti/quota/fatturazione: il provider e' inutilizzabile finche' non si
+    /// ricarica. NIENTE retry; cooldown lungo (mark_billing).
+    Billing,
+    /// Errore lato richiesta o configurazione (4xx client): 400 invalid_request,
+    /// 401/403 auth o modello non abilitato, 404 model not found, 422. Ritentare
+    /// NON aiuta e mettere in cooldown il PROVIDER e' sbagliato (il problema e' la
+    /// singola richiesta o il singolo modello). NIENTE retry, NIENTE cooldown.
+    ClientError,
+    /// Transitorio (429 rate-limit, 5xx, timeout, connessione) o ignoto:
+    /// ritentabile con backoff. Solo dopo l'esaurimento dei retry si applica un
+    /// cooldown breve (transient).
+    Transient,
+}
+
+/// Errore HTTP di un provider, con lo status NUMERICO (segnale CERTO) e il
+/// codice d'errore STRUTTURATO estratto dal JSON (`error.code`/`error.type`/
+/// `error.status`, identificatore macchina STABILE). Sostituisce la
+/// classificazione fragile sul testo del messaggio (regola H): il testo puo'
+/// cambiare per provider/versione/lingua, lo status e il codice no.
+///
+/// `Display` e' IDENTICO al vecchio `bail!("{provider} HTTP {status}: {body}")`
+/// cosi' i chiamanti legacy che leggono `to_string()` (es. `is_billing_error`
+/// in `fallback.rs`) non cambiano comportamento, mentre il codice nuovo fa
+/// `downcast` per accedere ai campi strutturati.
+#[derive(Debug)]
+pub struct ProviderHttpError {
+    pub provider: String,
+    pub status: u16,
+    /// Codice d'errore strutturato dal body JSON (lowercase), se presente.
+    pub code: Option<String>,
+    /// Secondi indicati dall'header `Retry-After` (RFC 9457/7231), se il provider
+    /// lo fornisce (es. Mistral/OpenAI su 429). Segnale AUTORITATIVO di quanto
+    /// attendere prima di ritentare: ha precedenza sul backoff calcolato.
+    pub retry_after_seconds: Option<u64>,
+    /// Body grezzo, SOLO per logging/display: mai usato per classificare.
+    pub message: String,
+}
+
+impl std::fmt::Display for ProviderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} HTTP {}: {}", self.provider, self.status, self.message)
+    }
+}
+
+impl std::error::Error for ProviderHttpError {}
+
+impl ProviderHttpError {
+    /// Costruisce dall'HTTP status + body grezzo, estraendo il codice d'errore
+    /// STRUTTURATO dal JSON (non dalla prosa).
+    pub fn from_response(provider: &str, status: u16, body: String) -> Self {
+        let code = extract_structured_error_code(&body);
+        Self {
+            provider: provider.to_string(),
+            status,
+            code,
+            retry_after_seconds: None,
+            message: body,
+        }
+    }
+
+    /// Imposta i secondi di `Retry-After` (builder). `None` lascia il default.
+    pub fn with_retry_after(mut self, secs: Option<u64>) -> Self {
+        self.retry_after_seconds = secs;
+        self
+    }
+}
+
+/// Parsa l'header `Retry-After` in secondi. RFC 7231: gestiamo il formato
+/// "delta-seconds" (intero); una data HTTP ritorna `None` (ripiego sul backoff
+/// calcolato). Punto unico (regola L): i provider lo leggono da qui.
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    // Clamp difensivo: un Retry-After assurdo non deve bloccare la richiesta per
+    // ore; il caller applica comunque il proprio tetto.
+    raw.trim().parse::<u64>().ok().map(|s| s.min(3600))
+}
+
+/// Costruisce un [`ProviderHttpError`] da una `Response` non-2xx catturando
+/// status, header `Retry-After` e body (async: consuma la response). Punto unico
+/// della costruzione errore HTTP dei provider OpenAI-compat (regola L).
+pub async fn provider_http_error(provider: &str, resp: reqwest::Response) -> ProviderHttpError {
+    let status = resp.status().as_u16();
+    let retry_after = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    ProviderHttpError::from_response(provider, status, body).with_retry_after(retry_after)
+}
+
+/// Estrae il codice d'errore STRUTTURATO da un body JSON di errore provider.
+/// Cerca (in ordine) `error.type`, `error.code` (se stringa), `error.status`
+/// (enum Google), e i corrispettivi top-level. Ritorna il valore in lowercase.
+/// NB: parsa CAMPI JSON del contratto macchina del provider, non testo libero.
+fn extract_structured_error_code(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let candidates = [
+        v.pointer("/error/type"),
+        v.pointer("/error/code"),
+        v.pointer("/error/status"),
+        v.get("type"),
+        v.get("code"),
+        v.get("status"),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if let Some(s) = c.as_str() {
+            if !s.is_empty() {
+                return Some(s.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// Classifica in modo DETERMINISTICO da status HTTP + codice strutturato.
+/// Lo status e' il segnale primario; il codice ESCALA a Billing solo un 429/402
+/// quando e' un identificatore di credito inequivocabile (non prosa).
+fn classify_by_status_code(status: u16, code: Option<&str>) -> ProviderErrorKind {
+    // Codice STRUTTURATO di credito/fatturazione (identificatore macchina).
+    // Conservativo: solo codici inequivocabili, cosi' non si scambia un
+    // rate-limit (429) per un provider "down per credito".
+    if let Some(c) = code {
+        if c.contains("insufficient_quota")
+            || c.contains("billing")
+            || c.contains("payment_required")
+            || c.contains("account_deactivated")
+        {
+            return ProviderErrorKind::Billing;
+        }
+    }
+    // Mappatura verificata sulle tabelle ufficiali (Anthropic/OpenAI, 2026):
+    //   402 billing_error (Anthropic) -> Billing;
+    //   400/401/403/404/413/422 (+ altri 4xx non ritentabili) -> ClientError:
+    //     ritentare NON aiuta (413 request_too_large: la richiesta e' troppo
+    //     grande, un retro identico rifallisce);
+    //   408/425/429 (timeout/too-early/rate-limit), 5xx e 529 overloaded (Anthropic)
+    //     -> Transient (ritentabili).
+    match status {
+        402 => ProviderErrorKind::Billing,
+        400 | 401 | 403 | 404 | 405 | 406 | 409 | 410 | 413 | 415 | 422 => {
+            ProviderErrorKind::ClientError
+        }
+        _ => ProviderErrorKind::Transient,
+    }
+}
+
+/// Classifica un errore provider in modo DETERMINISTICO (regola H, punto unico
+/// regola L). Ordine dei segnali CERTI:
+///   1. [`ProviderHttpError`] nella catena -> status + codice strutturato;
+///   2. `reqwest::Error` -> `status()` se presente, altrimenti timeout/connessione
+///      (predicati tipizzati) -> transitorio;
+///   3. sconosciuto (es. parse di un body 200) -> transitorio (default sicuro:
+///      ritentare e' innocuo, non penalizza un provider sano).
+/// NESSUNA classificazione basata sul testo del messaggio.
+pub fn classify_provider_error(err: &anyhow::Error) -> ProviderErrorKind {
+    for cause in err.chain() {
+        if let Some(http) = cause.downcast_ref::<ProviderHttpError>() {
+            return classify_by_status_code(http.status, http.code.as_deref());
+        }
+        if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = re.status() {
+                return classify_by_status_code(status.as_u16(), None);
+            }
+            // Nessuno status = errore di trasporto (timeout/connessione/body):
+            // transitorio CERTO (predicati tipizzati, non testo).
+            return ProviderErrorKind::Transient;
+        }
+    }
+    ProviderErrorKind::Transient
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,5 +2028,115 @@ mod tests {
         assert!(is_billing_error("BILLING hard limit reached"));
         assert!(!is_billing_error("rate limit exceeded, retry later"));
         assert!(!is_billing_error("model not found"));
+    }
+
+    #[test]
+    fn extract_structured_error_code_da_json() {
+        // OpenAI/DeepSeek/Mistral: error.code / error.type.
+        assert_eq!(
+            extract_structured_error_code(
+                r#"{"error":{"code":"insufficient_quota","type":"insufficient_quota"}}"#
+            )
+            .as_deref(),
+            Some("insufficient_quota")
+        );
+        assert_eq!(
+            extract_structured_error_code(
+                r#"{"error":{"type":"invalid_request_error","message":"bad"}}"#
+            )
+            .as_deref(),
+            Some("invalid_request_error")
+        );
+        // Google: error.code e' NUMERICO -> si usa error.status (enum).
+        assert_eq!(
+            extract_structured_error_code(
+                r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"x"}}"#
+            )
+            .as_deref(),
+            Some("invalid_argument")
+        );
+        // Body non-JSON o senza campi: None.
+        assert_eq!(extract_structured_error_code("502 Bad Gateway (html)"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_delta_seconds_e_clamp() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut h = HeaderMap::new();
+        assert_eq!(parse_retry_after(&h), None); // header assente
+        h.insert(RETRY_AFTER, HeaderValue::from_static("5"));
+        assert_eq!(parse_retry_after(&h), Some(5));
+        // Valore assurdo: clamp a 3600.
+        h.insert(RETRY_AFTER, HeaderValue::from_static("999999"));
+        assert_eq!(parse_retry_after(&h), Some(3600));
+        // Formato data HTTP (non delta-seconds): non gestito -> None.
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn classify_deterministica_da_status_e_codice() {
+        let http = |status, code: Option<&str>| {
+            anyhow::Error::new(ProviderHttpError {
+                provider: "p".into(),
+                status,
+                code: code.map(|c| c.to_string()),
+                retry_after_seconds: None,
+                message: "body".into(),
+            })
+        };
+        // Codice di credito strutturato -> Billing anche su 429 (OpenAI usa 429).
+        assert_eq!(
+            classify_provider_error(&http(429, Some("insufficient_quota"))),
+            ProviderErrorKind::Billing
+        );
+        assert_eq!(
+            classify_provider_error(&http(402, None)),
+            ProviderErrorKind::Billing
+        );
+        // 4xx client -> ClientError (niente retry, niente cooldown).
+        assert_eq!(
+            classify_provider_error(&http(400, Some("invalid_request_error"))),
+            ProviderErrorKind::ClientError
+        );
+        assert_eq!(
+            classify_provider_error(&http(403, Some("permission_denied"))),
+            ProviderErrorKind::ClientError
+        );
+        assert_eq!(
+            classify_provider_error(&http(404, None)),
+            ProviderErrorKind::ClientError
+        );
+        // 413 request_too_large (OpenAI/Anthropic): non ritentabile -> ClientError.
+        assert_eq!(
+            classify_provider_error(&http(413, None)),
+            ProviderErrorKind::ClientError
+        );
+        // 429 rate-limit puro (senza codice credito) -> Transient (ritentabile).
+        assert_eq!(
+            classify_provider_error(&http(429, Some("rate_limit_exceeded"))),
+            ProviderErrorKind::Transient
+        );
+        assert_eq!(
+            classify_provider_error(&http(429, None)),
+            ProviderErrorKind::Transient
+        );
+        // 5xx server e 529 overloaded (Anthropic) -> Transient.
+        assert_eq!(
+            classify_provider_error(&http(503, None)),
+            ProviderErrorKind::Transient
+        );
+        assert_eq!(
+            classify_provider_error(&http(529, Some("overloaded_error"))),
+            ProviderErrorKind::Transient
+        );
+        // Errore non-HTTP (es. parse) -> default sicuro Transient.
+        assert_eq!(
+            classify_provider_error(&anyhow::anyhow!("json parse fallito")),
+            ProviderErrorKind::Transient
+        );
     }
 }

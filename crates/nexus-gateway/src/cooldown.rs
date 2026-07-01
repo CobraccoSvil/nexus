@@ -53,6 +53,47 @@ pub const DEFAULT_TRANSIENT_SECONDS: i64 = 30;
 /// Fallback intervallo di re-probe: 600 secondi (10 minuti).
 pub const DEFAULT_REPROBE_INTERVAL_SECONDS: u64 = 600;
 
+/// Fallback numero massimo di tentativi sullo STESSO modello (strict pin): 3.
+pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// Fallback ritardo base del backoff esponenziale: 500ms.
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 500;
+
+/// Fallback tetto del backoff esponenziale: 8s.
+pub const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 8000;
+
+/// Fallback tetto di attesa di un cooldown transitorio BREVE prima di ritentare
+/// lo stesso modello (strict pin): 45s. Oltre questo, si propaga l'errore invece
+/// di bloccare la richiesta troppo a lungo.
+pub const DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S: i64 = 45;
+
+/// Politica di retry sullo stesso modello (strict pin). Risolta da DB o fallback.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Tentativi totali sullo stesso provider+model prima di arrendersi.
+    pub max_attempts: u32,
+    /// Ritardo base del backoff esponenziale (ms).
+    pub base_delay_ms: u64,
+    /// Tetto del backoff esponenziale (ms).
+    pub max_backoff_ms: u64,
+    /// Massimo cooldown transitorio da attendere prima di ritentare (secondi).
+    pub wait_short_cooldown_cap_s: i64,
+}
+
+impl RetryPolicy {
+    /// Ritardo (ms) prima del tentativo `attempt` (1-based, dopo il 1o fallimento
+    /// `attempt=1`): `min(base * 2^(attempt-1), max)` + jitter deterministico
+    /// derivato da `seed` (nessun `rand`: `seed` e' fornito dal chiamante, es.
+    /// nanosecondi dell'istante, cosi' resta testabile). Il jitter e' fino al 25%.
+    pub fn backoff_ms(&self, attempt: u32, seed: u64) -> u64 {
+        let exp = attempt.saturating_sub(1).min(16);
+        let raw = self.base_delay_ms.saturating_mul(1u64 << exp);
+        let capped = raw.min(self.max_backoff_ms).max(1);
+        let jitter = seed % (capped / 4 + 1);
+        capped.saturating_add(jitter)
+    }
+}
+
 /// TTL della cache settings (60s, allineato al resto del gateway).
 const SETTINGS_TTL: Duration = Duration::from_secs(60);
 
@@ -86,11 +127,17 @@ pub struct CooldownState {
     pub last_error: Option<String>,
 }
 
-/// Durate di cooldown effettive (gia' risolte da DB o fallback).
+/// Durate di cooldown + politica di retry effettive (gia' risolte da DB o
+/// fallback). Un solo set globale in cache (regola L): cooldown e retry sono lo
+/// stesso concern di affidabilita' del gateway.
 #[derive(Debug, Clone, Copy)]
 struct Durations {
     billing_seconds: i64,
     transient_seconds: i64,
+    retry_max_attempts: u32,
+    retry_base_delay_ms: u64,
+    retry_max_backoff_ms: u64,
+    wait_short_cooldown_cap_s: i64,
 }
 
 impl Default for Durations {
@@ -98,6 +145,10 @@ impl Default for Durations {
         Self {
             billing_seconds: DEFAULT_BILLING_SECONDS,
             transient_seconds: DEFAULT_TRANSIENT_SECONDS,
+            retry_max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+            retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+            retry_max_backoff_ms: DEFAULT_RETRY_MAX_BACKOFF_MS,
+            wait_short_cooldown_cap_s: DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S,
         }
     }
 }
@@ -131,6 +182,35 @@ impl CooldownManager {
     /// Durate correnti: da cache settings se valide, altrimenti fallback.
     fn current_durations(&self) -> Durations {
         self.durations.get(&()).unwrap_or_default()
+    }
+
+    /// SOLO test: inietta durate/retry rapide (backoff ~1ms) cosi' i test del
+    /// retry non introducono sleep reali. Non usato in produzione.
+    #[cfg(test)]
+    pub fn set_fast_for_test(&self) {
+        self.durations.insert(
+            (),
+            Durations {
+                billing_seconds: 3600,
+                transient_seconds: 30,
+                retry_max_attempts: 3,
+                retry_base_delay_ms: 1,
+                retry_max_backoff_ms: 2,
+                wait_short_cooldown_cap_s: 45,
+            },
+        );
+    }
+
+    /// Politica di retry corrente (strict pin): da cache settings se valida,
+    /// altrimenti fallback. Punto unico (regola L): `run_fallback` la legge da qui.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        let d = self.current_durations();
+        RetryPolicy {
+            max_attempts: d.retry_max_attempts.max(1),
+            base_delay_ms: d.retry_base_delay_ms.max(1),
+            max_backoff_ms: d.retry_max_backoff_ms.max(1),
+            wait_short_cooldown_cap_s: d.wait_short_cooldown_cap_s.max(0),
+        }
     }
 
     /// Marca un provider in cooldown billing. Usa l'orologio reale.
@@ -276,7 +356,11 @@ impl CooldownManager {
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT key, value FROM settings \
              WHERE key IN ('gateway.cooldown.billing_seconds', \
-                           'gateway.cooldown.transient_seconds')",
+                           'gateway.cooldown.transient_seconds', \
+                           'gateway.retry.max_attempts', \
+                           'gateway.retry.base_delay_ms', \
+                           'gateway.retry.max_backoff_ms', \
+                           'gateway.retry.wait_short_cooldown_cap_s')",
         )
         .fetch_all(pool)
         .await;
@@ -285,12 +369,39 @@ impl CooldownManager {
             Ok(rows) => {
                 let mut d = Durations::default();
                 for (key, value) in &rows {
-                    if let Ok(n) = value.trim().parse::<i64>() {
-                        match key.as_str() {
-                            "gateway.cooldown.billing_seconds" => d.billing_seconds = n,
-                            "gateway.cooldown.transient_seconds" => d.transient_seconds = n,
-                            _ => {}
+                    let v = value.trim();
+                    match key.as_str() {
+                        "gateway.cooldown.billing_seconds" => {
+                            if let Ok(n) = v.parse::<i64>() {
+                                d.billing_seconds = n;
+                            }
                         }
+                        "gateway.cooldown.transient_seconds" => {
+                            if let Ok(n) = v.parse::<i64>() {
+                                d.transient_seconds = n;
+                            }
+                        }
+                        "gateway.retry.max_attempts" => {
+                            if let Ok(n) = v.parse::<u32>() {
+                                d.retry_max_attempts = n;
+                            }
+                        }
+                        "gateway.retry.base_delay_ms" => {
+                            if let Ok(n) = v.parse::<u64>() {
+                                d.retry_base_delay_ms = n;
+                            }
+                        }
+                        "gateway.retry.max_backoff_ms" => {
+                            if let Ok(n) = v.parse::<u64>() {
+                                d.retry_max_backoff_ms = n;
+                            }
+                        }
+                        "gateway.retry.wait_short_cooldown_cap_s" => {
+                            if let Ok(n) = v.parse::<i64>() {
+                                d.wait_short_cooldown_cap_s = n;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 self.durations.insert((), d);

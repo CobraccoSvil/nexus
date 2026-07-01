@@ -808,13 +808,18 @@ async fn forcing_early_action_scatta_se_turno_precedente_non_ha_agito() {
 #[tokio::test]
 async fn lettura_ripetuta_identica_informativa_guida_a_concludere() {
     // FIX #2 loop-control (regola H): una LETTURA ripetuta identica (stesso path)
-    // oltre soglia (repeated_action_threshold=2, default) scatta come repeated_action
-    // di SOLA LETTURA. Su un turno INFORMATIVO (action_oriented=false) il
-    // progress_controller inietta un nudge "concludi con testo" SENZA forzare un'altra
-    // tool call, ben prima del cap esplorazione 2x (=12) e dell'escalation. Cosi' il
-    // loop read-only non arriva a 14 iterazioni.
+    // oltre la soglia read-only scatta come repeated_action di SOLA LETTURA. Su un
+    // turno INFORMATIVO (action_oriented=false) il progress_controller inietta un
+    // nudge "concludi con testo" SENZA forzare un'altra tool call, ben prima del
+    // cap esplorazione 2x (=12) e dell'escalation. Cosi' il loop read-only non
+    // arriva a 14 iterazioni. Qui la soglia read-only e' 2 per esercitare il GUIDE
+    // al 2o read (la soglia di produzione e' piu' alta: testiamo la DECISIONE).
     let rc = Arc::new(StubRunControlStore::default());
-    let (n, _m, _s) = node(cfg_resolved(), rc); // progress_controller ON
+    let cfg = ExecutorConfig {
+        repeated_action_threshold_read_only: 2,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc); // progress_controller ON
     let llm = Arc::new(StubLlmGateway::with_text("Concludo a parole."));
     let ctx = ctx_with(llm.clone(), false);
     // read_file stesso path 2 volte, entrambe RIUSCITE (la rilettura riuscita
@@ -878,6 +883,8 @@ async fn lettura_ripetuta_identica_action_oriented_orienta_all_edit() {
         routing_model: "claude-x".to_string(),
         progress_controller_enabled: true,
         tool_choice_style: Some("anthropic_any".to_string()),
+        // Soglia read-only a 2 per esercitare il GUIDE al 2o read (vedi test gemello).
+        repeated_action_threshold_read_only: 2,
         ..ExecutorConfig::default()
     };
     let (n, _m, _s) = node(cfg, rc); // progress_controller ON
@@ -929,6 +936,71 @@ async fn lettura_ripetuta_identica_action_oriented_orienta_all_edit() {
         req.force_tool_choice, Some(true),
         "lettura ripetuta su un fix -> force-action verso l'edit"
     );
+}
+
+#[tokio::test]
+async fn lettura_ripetuta_esaurita_chiude_onestamente_non_fallimento() {
+    // FASE 4 (regola H): un read-only ripetuto oltre soglia, gia' guidato e
+    // senza candidato escalation, NON deve chiudere con "ESITO: non completato /
+    // mi sono bloccato" (percepito come incapacita' del modello capace). Deve
+    // chiudere in modo ONESTO instradando al final_gate (EndTurn), invitando a
+    // rispondere con quanto raccolto. Causa radice del falso "il modello non riesce".
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        repeated_action_threshold_read_only: 2,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc); // progress_controller ON
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    // read_file stesso path 2 volte, entrambe RIUSCITE: contenuto GIA' nel contesto.
+    let messages = vec![
+        human("dimmi cosa contiene il file"),
+        ai_tool("read_file", json!({"path": "src/main.rs"})),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String("fn main() {}".into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        },
+        ai_tool("read_file", json!({"path": "src/main.rs"})),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c2".into(),
+                content: Value::String("fn main() {}".into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        },
+    ];
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        action_oriented: Some(false),
+        // Gia' guidato e diagnosticato -> il prossimo stadio e' ABORT (nessun
+        // candidato escalation dallo stub) -> chiusura onesta per read-only.
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Chiusura ONESTA verso final_gate: EndTurn, non LoopAbort.
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    let result = out.result.as_deref().unwrap();
+    assert!(
+        result.contains("Ho gia' raccolto il contenuto"),
+        "atteso messaggio onesto, non un fallimento: {result}"
+    );
+    assert!(
+        !result.contains("ESITO: non completato"),
+        "una lettura idempotente non deve dichiarare fallimento del modello"
+    );
+    // LLM non chiamato (chiusura prima del modello).
+    assert!(llm.seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

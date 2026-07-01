@@ -602,6 +602,7 @@ async fn load_executor_config(
         g1_max_nudges: setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await,
         progress_controller_enabled: setting_bool(db, "agent.progress_controller_enabled", d.progress_controller_enabled).await,
         repeated_action_threshold: setting_i64(db, "agent.repeated_action_threshold", d.repeated_action_threshold).await,
+        repeated_action_threshold_read_only: setting_i64(db, "agent.repeated_action_threshold.read_only", d.repeated_action_threshold_read_only).await,
         repeated_action_force_diagnose_enabled: setting_bool(db, "agent.repeated_action_force_diagnose_enabled", d.repeated_action_force_diagnose_enabled).await,
         reallocation_threshold: setting_i64(db, "agent.loop.resource_reallocation_threshold", d.reallocation_threshold).await,
         upscale_enabled: setting_bool(db, "agent.upscale.enabled", d.upscale_enabled).await,
