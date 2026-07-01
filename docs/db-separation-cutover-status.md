@@ -97,11 +97,17 @@ ogni progetto sia autocontenuto e portabile.
      ritorna comunque tutti i progetti mappati al meta — creerebbe monitor duplicati.
      Il porting Windows di `spawn_reattach_monitor` (ramo `#[cfg(windows)]`, poll
      `process_alive`) e' invece COMPLETO. Impatto del gap: a flag ON, dopo un restart
-     di mcp-core, i processi VIVI dei progetti non vengono re-attached immediatamente;
-     vengono comunque riconciliati dal `task_watchdog` periodico entro il primo ciclo
-     (degrada = ritardo, NON corrompe). Il fix incrementale (passo boot per-progetto
-     DOPO il registry, con helper condivisa + `seen` per il dedup, regola L) va fatto
-     con test di avvio dedicati, non e' bloccante per il flip.
+     di mcp-core, i processi VIVI dei progetti non vengono re-attached immediatamente.
+     PRECISAZIONE (audit): la copertura del `task_watchdog` periodico e' PARZIALE per i
+     processi VIVI — il watchdog marca `failed` solo i processi BLOCCATI (>10min senza
+     heartbeat), ma NON re-attacha un monitor ai processi vivi; quindi un processo di
+     progetto ancora vivo dopo un restart resta senza monitoring di liveness finche' non
+     ne parte uno nuovo. Il blocco reattach `agent_processes` a `main.rs:372-418` usa
+     `&db` diretto (meta), quindi NON e' instradato affatto (distinto dal reap dei run,
+     che invece e' instradato in `run_reaper`). Degrada (monitoring parziale dei processi
+     vivi al restart), NON corrompe. Il fix incrementale (passo boot per-progetto DOPO
+     il registry, con helper condivisa + `seen` per il dedup, regola L) va fatto con
+     test di avvio dedicati, non e' bloccante per il flip.
 2. **KB (wiki_docs) resta sul meta**: i worker wiki leggono run/chat dal pool
    progetto ma scrivono `wiki_docs`/Qdrant sul meta (dominio KB non migrato).
    Multi-tenant per `scope`/`project_id`, non split-brain.
@@ -128,6 +134,13 @@ gia' migrati anche coi punti 1-5 residui aperti (degradano, non corrompono).
    vecchie no -> senza backfill ricadono su meta a flag ON):
    `INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id) SELECT 'session', id, project_id FROM chat_sessions ON CONFLICT DO NOTHING;`
    (da eseguire nel meta-DB per i progetti gia' migrati).
+   NB (audit): il backfill sopra e' SESSION-only. Gli endpoint by-run/by-message si
+   risolvono derivati (via `session_id` + resolver self-healing), quindi il backfill
+   run non e' strettamente necessario, ma per gli endpoint by-run PURI il primo accesso
+   dipende dal fallback iterativo. Per completezza/performance conviene backfillare
+   anche i run: `INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id)
+   SELECT 'run', id, project_id FROM agent_runs WHERE project_id IS NOT NULL ON CONFLICT DO NOTHING;`
+   (stato attuale: 24/28 run di beaty gia' in routing, 4 coperti solo dal fallback).
 3. `deploy/deploy-local.ps1 -Rust` (rebuild + restart, applica le migrazioni).
 4. `UPDATE settings SET value='true' WHERE key='db.project_separation.enabled';`
    (cache flag TTL 30s -> attende max 30s; nessun redeploy).
@@ -193,6 +206,19 @@ dati in dual-presenza (meta-DB + `beaty_book_nexus`). Niente da rollbackare. Il 
 e' stato VALIDATO tecnicamente e rollbackato (vedi "Validazione tecnica del flip");
 `beaty_book_nexus` e' ora VUOTO (ricreato per la validazione) -> va ripopolato prima
 del go-live.
+
+### RISCHIO NOTO: flip accidentale con beaty vuoto (audit fine-sessione)
+Il flag `db.project_separation.enabled` e' un setting come gli altri: scrivibile
+dalla UI admin generica (`admin-service/src/settings.rs`, route `PUT /setting/:key`,
+NESSUNA whitelist sui setting critici). Con `beaty_book_nexus` attualmente VUOTO, un
+flip accidentale a `'true'` renderebbe la cronologia storica (68 chat_messages + 28
+agent_runs, che vivono solo nel meta) INVISIBILE in UI entro 30s (TTL cache flag).
+NON c'e' perdita dati: rollback a `'false'` ripristina tutto. Mitigazioni possibili
+(in ordine di preferenza): (a) fare la ri-migrazione fresca subito prima del go-live e
+non lasciare beaty vuoto a lungo; (b) guard/whitelist sui setting critici in
+`admin-service` (il flip di questo flag richiede una procedura, non un toggle UI);
+(c) lasciare il flag `false` e trattare beaty-vuoto come stato transitorio noto.
+Finche' beaty resta vuoto, NON esporre/usare il toggle di questo flag dalla UI.
 
 ## Migrazioni introdotte
 `0494` connection_role, `0495` seed flag, `0496` nexus_data_routing,
