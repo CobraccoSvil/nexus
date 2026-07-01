@@ -480,11 +480,33 @@ pub async fn provision_internal_core(
 /// Risolve da `project_database_config` (connection_role='nexus_metadata'); se
 /// assente provisiona `<slug>_nexus`, ne applica lo schema (db/migrations/project)
 /// e cacha il pool. Tutti i percorsi passano da qui, mai aprendo pool a mano.
+/// Lock per-progetto che SERIALIZZA provision+migrazione: il sqlx-migrator NON e'
+/// concurrency-safe (piu' worker che iterano i progetti a flag-on aprono lo stesso
+/// pool insieme -> race su `_sqlx_migrations`, "relazione non esiste"). Il primo
+/// che entra provisiona+migra+cacha; gli altri attendono e ritrovano il pool.
+static PROVISION_LOCKS: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 async fn project_meta_pool_core(
     meta: &sqlx::PgPool,
     cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     project_id: Uuid,
 ) -> Result<std::sync::Arc<sqlx::PgPool>, String> {
+    if let Some(pool) = cache.get(&project_id) {
+        return Ok(pool);
+    }
+    // Serializza provision+migrazione per questo progetto (vedi PROVISION_LOCKS).
+    let lock = {
+        let mut map = PROVISION_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(project_id)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().await;
+    // Doppio controllo: un altro worker potrebbe aver provisionato durante l'attesa.
     if let Some(pool) = cache.get(&project_id) {
         return Ok(pool);
     }
