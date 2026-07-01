@@ -629,6 +629,65 @@ pub(crate) fn parse_branch_line(line: &str) -> Option<GitBranchInfo> {
     })
 }
 
+/// Estrae il nome branch dalla riga header `## branch...upstream` del porcelain.
+fn parse_porcelain_branch_header(line: &str) -> String {
+    let header = line.trim_start_matches("## ");
+    header
+        .split("...")
+        .next()
+        .unwrap_or(header)
+        .split_whitespace()
+        .next()
+        .unwrap_or(header)
+        .to_string()
+}
+
+/// Classifica il `kind` di un cambiamento in base ai due caratteri di stato.
+fn classify_git_change_kind(staged_status: &str, worktree_status: &str, untracked: bool) -> &'static str {
+    if untracked {
+        "untracked"
+    } else if staged_status == "D" || worktree_status == "D" {
+        "deleted"
+    } else if staged_status == "R" || worktree_status == "R" {
+        "renamed"
+    } else if staged_status == "A" {
+        "added"
+    } else {
+        "modified"
+    }
+}
+
+/// Interpreta una singola riga di stato (non header) del porcelain in un
+/// GitFileChange. Ritorna None per righe troppo corte per essere valide.
+fn parse_git_status_line(line: &str) -> Option<GitFileChange> {
+    if line.len() < 4 {
+        return None;
+    }
+
+    let staged_status = line[0..1].to_string();
+    let worktree_status = line[1..2].to_string();
+    let raw_path = line[3..].trim();
+    let path = raw_path
+        .split(" -> ")
+        .last()
+        .unwrap_or(raw_path)
+        .to_string();
+    let untracked_flag = staged_status == "?" && worktree_status == "?";
+    let staged_flag = staged_status != " " && staged_status != "?";
+    let unstaged_flag = worktree_status != " " && worktree_status != "?";
+    let kind = classify_git_change_kind(&staged_status, &worktree_status, untracked_flag);
+
+    Some(GitFileChange {
+        path,
+        staged_status,
+        worktree_status,
+        kind: kind.to_string(),
+        staged: staged_flag,
+        unstaged: unstaged_flag,
+        untracked: untracked_flag,
+    })
+}
+
 pub(crate) fn parse_git_status_porcelain(output: &str, is_git_repo: bool) -> GitRepositoryState {
     if !is_git_repo {
         return GitRepositoryState {
@@ -647,62 +706,21 @@ pub(crate) fn parse_git_status_porcelain(output: &str, is_git_repo: bool) -> Git
 
     for (idx, line) in output.lines().enumerate() {
         if idx == 0 && line.starts_with("## ") {
-            let header = line.trim_start_matches("## ");
-            let branch = header
-                .split("...")
-                .next()
-                .unwrap_or(header)
-                .split_whitespace()
-                .next()
-                .unwrap_or(header);
-            current_branch = Some(branch.to_string());
+            current_branch = Some(parse_porcelain_branch_header(line));
             continue;
         }
 
-        if line.len() < 4 {
+        let Some(change) = parse_git_status_line(line) else {
             continue;
-        }
-
-        let staged_status = line[0..1].to_string();
-        let worktree_status = line[1..2].to_string();
-        let raw_path = line[3..].trim();
-        let path = raw_path
-            .split(" -> ")
-            .last()
-            .unwrap_or(raw_path)
-            .to_string();
-        let untracked_flag = staged_status == "?" && worktree_status == "?";
-        let staged_flag = staged_status != " " && staged_status != "?";
-        let unstaged_flag = worktree_status != " " && worktree_status != "?";
-        let kind = if untracked_flag {
-            "untracked"
-        } else if staged_status == "D" || worktree_status == "D" {
-            "deleted"
-        } else if staged_status == "R" || worktree_status == "R" {
-            "renamed"
-        } else if staged_status == "A" {
-            "added"
-        } else {
-            "modified"
         };
 
-        let change = GitFileChange {
-            path,
-            staged_status,
-            worktree_status,
-            kind: kind.to_string(),
-            staged: staged_flag,
-            unstaged: unstaged_flag,
-            untracked: untracked_flag,
-        };
-
-        if untracked_flag {
+        if change.untracked {
             untracked.push(change);
         } else {
-            if staged_flag {
+            if change.staged {
                 staged.push(change.clone());
             }
-            if unstaged_flag {
+            if change.unstaged {
                 unstaged.push(change);
             }
         }
@@ -761,6 +779,109 @@ pub(crate) async fn refresh_git_snapshot(
         .await;
 
     Ok(state)
+}
+
+/// Persiste su `repositories` un repo git auto-rilevato al LOAD (UPDATE, con
+/// fallback INSERT se la riga non esiste). Estratto da `load_project_context`
+/// per mantenere quella funzione sotto la soglia di lunghezza.
+async fn persist_detected_git_repo(
+    db: &PgPool,
+    project_id: Uuid,
+    repository_root_path: &Path,
+    current_branch: &Option<String>,
+    detected: &GitRepoInfo,
+) -> Result<(), ApiError> {
+    let remote_url = detected.remotes.iter().find_map(|(_, fetch_url, _)| {
+        let trimmed = fetch_url.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    let update_result = sqlx::query(
+        r#"
+        UPDATE repositories
+        SET is_git_repo = TRUE,
+            root_path = $2,
+            current_branch = COALESCE($3, current_branch),
+            remote_url = COALESCE($4, remote_url)
+        WHERE project_id = $1
+        "#,
+    )
+    .bind(project_id)
+    .bind(repository_root_path.to_string_lossy().to_string())
+    .bind(current_branch.clone())
+    .bind(remote_url.clone())
+    .execute(db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if update_result.rows_affected() == 0 {
+        sqlx::query(
+            r#"
+            INSERT INTO repositories (id, project_id, provider, remote_url, root_path, is_git_repo, current_branch)
+            VALUES ($1, $2, 'local', $3, $4, TRUE, $5)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(project_id)
+        .bind(remote_url)
+        .bind(repository_root_path.to_string_lossy().to_string())
+        .bind(current_branch.clone())
+        .execute(db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Costruisce `UserProjectDetails` dalla row del progetto. Estratto da
+/// `load_project_context` (regola L: la mappatura row->details e' un blocco
+/// coeso riusabile e mantiene la funzione chiamante sotto soglia).
+fn build_project_details(
+    row: &sqlx::postgres::PgRow,
+    access: &ProjectAccessPolicy,
+    root_path: &Path,
+    repository_root_path: &Path,
+    is_git_repo: bool,
+    current_branch: &Option<String>,
+) -> UserProjectDetails {
+    let analyzed_at = row
+        .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("analyzed_at")
+        .ok()
+        .flatten();
+
+    UserProjectDetails {
+        id: row.get::<Uuid, _>("id").to_string(),
+        name: row.get::<String, _>("name"),
+        slug: row.get::<String, _>("slug"),
+        owner_user_id: row.get::<Uuid, _>("owner_user_id").to_string(),
+        visibility: row.get::<String, _>("visibility"),
+        current_user_role: access.current_user_role.clone(),
+        can_write: access.can_write,
+        can_manage_git: access.can_manage_git,
+        is_shared: access.is_shared,
+        workspace_id: row
+            .try_get::<Option<Uuid>, _>("workspace_id")
+            .ok()
+            .flatten()
+            .map(|id| id.to_string()),
+        root_path: Some(root_path.to_string_lossy().to_string()),
+        repository_root_path: Some(repository_root_path.to_string_lossy().to_string()),
+        is_git_repo,
+        current_branch: current_branch.clone(),
+        analyzed_at: analyzed_at.map(|ts| ts.to_rfc3339()),
+        is_analyzed: analyzed_at.is_some(),
+        nexus_ready: analyzed_at.is_some(),
+        default_profile_id: row
+            .try_get::<Option<Uuid>, _>("default_profile_id")
+            .ok()
+            .flatten()
+            .map(|id| id.to_string()),
+    }
 }
 
 pub(crate) async fn load_project_context(
@@ -846,49 +967,14 @@ pub(crate) async fn load_project_context(
             is_git_repo = true;
             repository_root_path = detected.root_path.clone();
             current_branch = detected.current_branch.clone().or(current_branch);
-            let remote_url = detected.remotes.iter().find_map(|(_, fetch_url, _)| {
-                let trimmed = fetch_url.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            });
-
-            let update_result = sqlx::query(
-                r#"
-                UPDATE repositories
-                SET is_git_repo = TRUE,
-                    root_path = $2,
-                    current_branch = COALESCE($3, current_branch),
-                    remote_url = COALESCE($4, remote_url)
-                WHERE project_id = $1
-                "#,
+            persist_detected_git_repo(
+                db,
+                project_id,
+                &repository_root_path,
+                &current_branch,
+                &detected,
             )
-            .bind(project_id)
-            .bind(repository_root_path.to_string_lossy().to_string())
-            .bind(current_branch.clone())
-            .bind(remote_url.clone())
-            .execute(db)
-            .await
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-            if update_result.rows_affected() == 0 {
-                sqlx::query(
-                    r#"
-                    INSERT INTO repositories (id, project_id, provider, remote_url, root_path, is_git_repo, current_branch)
-                    VALUES ($1, $2, 'local', $3, $4, TRUE, $5)
-                    "#,
-                )
-                .bind(Uuid::new_v4())
-                .bind(project_id)
-                .bind(remote_url)
-                .bind(repository_root_path.to_string_lossy().to_string())
-                .bind(current_branch.clone())
-                .execute(db)
-                .await
-                .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
+            .await?;
         }
     }
 
@@ -899,46 +985,14 @@ pub(crate) async fn load_project_context(
     // dei progetti pre-esistenti dalla UI di Nexus. Le scritture sul filesystem
     // restano protette dai path_within sulla project root, non dalla root globale.
 
-    let details = UserProjectDetails {
-        id: row.get::<Uuid, _>("id").to_string(),
-        name: row.get::<String, _>("name"),
-        slug: row.get::<String, _>("slug"),
-        owner_user_id: row.get::<Uuid, _>("owner_user_id").to_string(),
-        visibility: row.get::<String, _>("visibility"),
-        current_user_role: access.current_user_role.clone(),
-        can_write: access.can_write,
-        can_manage_git: access.can_manage_git,
-        is_shared: access.is_shared,
-        workspace_id: row
-            .try_get::<Option<Uuid>, _>("workspace_id")
-            .ok()
-            .flatten()
-            .map(|id| id.to_string()),
-        root_path: Some(root_path.to_string_lossy().to_string()),
-        repository_root_path: Some(repository_root_path.to_string_lossy().to_string()),
+    let details = build_project_details(
+        &row,
+        &access,
+        &root_path,
+        &repository_root_path,
         is_git_repo,
-        current_branch: current_branch.clone(),
-        analyzed_at: row
-            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("analyzed_at")
-            .ok()
-            .flatten()
-            .map(|ts| ts.to_rfc3339()),
-        is_analyzed: row
-            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("analyzed_at")
-            .ok()
-            .flatten()
-            .is_some(),
-        nexus_ready: row
-            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("analyzed_at")
-            .ok()
-            .flatten()
-            .is_some(),
-        default_profile_id: row
-            .try_get::<Option<Uuid>, _>("default_profile_id")
-            .ok()
-            .flatten()
-            .map(|id| id.to_string()),
-    };
+        &current_branch,
+    );
 
     Ok(ProjectContext {
         project_id,
@@ -1477,42 +1531,21 @@ pub(super) async fn ensure_unique_slug(
     }
 }
 
-pub(super) async fn detect_git_repo(path: &Path) -> GitRepoInfo {
-    let root_output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .output()
-        .await;
-
-    let Ok(root_output) = root_output else {
-        return GitRepoInfo {
-            is_git_repo: false,
-            root_path: path.to_path_buf(),
-            current_branch: None,
-            remotes: Vec::new(),
-        };
-    };
-
-    if !root_output.status.success() {
-        return GitRepoInfo {
-            is_git_repo: false,
-            root_path: path.to_path_buf(),
-            current_branch: None,
-            remotes: Vec::new(),
-        };
+/// Ritorna un GitRepoInfo "vuoto" (repo non rilevato) ancorato al path dato.
+fn git_repo_info_absent(path: &Path) -> GitRepoInfo {
+    GitRepoInfo {
+        is_git_repo: false,
+        root_path: path.to_path_buf(),
+        current_branch: None,
+        remotes: Vec::new(),
     }
+}
 
-    let root_path = PathBuf::from(
-        String::from_utf8_lossy(&root_output.stdout)
-            .trim()
-            .to_string(),
-    );
-
-    let current_branch = Command::new("git")
+/// Interroga il branch corrente (`rev-parse --abbrev-ref HEAD`) della repo in `root_path`.
+async fn detect_git_current_branch(root_path: &Path) -> Option<String> {
+    Command::new("git")
         .arg("-C")
-        .arg(&root_path)
+        .arg(root_path)
         .arg("rev-parse")
         .arg("--abbrev-ref")
         .arg("HEAD")
@@ -1521,11 +1554,14 @@ pub(super) async fn detect_git_repo(path: &Path) -> GitRepoInfo {
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+}
 
+/// Interroga ed effettua il parsing di `git remote -v` in una lista (nome, fetch_url, push_url).
+async fn detect_git_remotes(root_path: &Path) -> Vec<(String, String, String)> {
     let remotes_output = Command::new("git")
         .arg("-C")
-        .arg(&root_path)
+        .arg(root_path)
         .arg("remote")
         .arg("-v")
         .output()
@@ -1550,10 +1586,37 @@ pub(super) async fn detect_git_repo(path: &Path) -> GitRepoInfo {
         }
     }
 
-    let remotes = remotes_by_name
+    remotes_by_name
         .into_iter()
         .map(|(name, (fetch_url, push_url))| (name, fetch_url, push_url))
-        .collect();
+        .collect()
+}
+
+pub(super) async fn detect_git_repo(path: &Path) -> GitRepoInfo {
+    let root_output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .await;
+
+    let Ok(root_output) = root_output else {
+        return git_repo_info_absent(path);
+    };
+
+    if !root_output.status.success() {
+        return git_repo_info_absent(path);
+    }
+
+    let root_path = PathBuf::from(
+        String::from_utf8_lossy(&root_output.stdout)
+            .trim()
+            .to_string(),
+    );
+
+    let current_branch = detect_git_current_branch(&root_path).await;
+    let remotes = detect_git_remotes(&root_path).await;
 
     GitRepoInfo {
         is_git_repo: true,
