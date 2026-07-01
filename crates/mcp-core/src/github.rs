@@ -1072,7 +1072,21 @@ async fn build_remote_status(
     let branch_status = parse_branch_remote_status(&status_stdout);
     let last_commit_title = read_last_commit_title(&context.repository_root_path).await;
 
-    match load_origin_remote(&context.repository_root_path).await {
+    let resolution = load_origin_remote(&context.repository_root_path).await;
+    resolve_origin_remote_status(db, user_id, resolution, branch_status, last_commit_title).await
+}
+
+/// Mappa la risoluzione dell'origin remote sul response finale: i remote non
+/// pubblicabili (Missing/Other/Ssh) diventano stati "unavailable" con la reason
+/// appropriata; il remote GitHub HTTPS viene arricchito con i dati API.
+async fn resolve_origin_remote_status(
+    db: &PgPool,
+    user_id: Uuid,
+    resolution: GitHubRemoteResolution,
+    branch_status: BranchRemoteStatus,
+    last_commit_title: Option<String>,
+) -> anyhow::Result<GitHubRemoteStatusResponse> {
+    match resolution {
         GitHubRemoteResolution::Missing => Ok(unavailable_remote_status(
             "missing_origin_remote",
             Some("origin".to_string()),
@@ -1926,6 +1940,37 @@ async fn create_repo_via_api(
     Ok((status, resp_body))
 }
 
+/// Estrae e valida i campi del body di create-repo: `name` (obbligatorio,
+/// validato), `private` (default true), `description` (default vuoto),
+/// `auto_init` (default false).
+fn parse_create_repo_body(
+    body: &serde_json::Value,
+) -> Result<(String, bool, String, bool), ApiError> {
+    let name = body
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?
+        .to_string();
+    validate_repo_name(&name)?;
+
+    let private = body
+        .get("private")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let description = body
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let auto_init = body
+        .get("auto_init")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok((name, private, description, auto_init))
+}
+
 /// Crea il repository via API e valida lo status: ritorna il corpo JSON su 2xx,
 /// altrimenti l'errore standard "GitHub API <status> — <message>".
 async fn create_repo_checked(
@@ -2001,37 +2046,27 @@ pub async fn github_create_repo(
     )
     .await?;
 
-    let name = body
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?;
-
-    validate_repo_name(name)?;
-
-    let private = body
-        .get("private")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let description = body
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let auto_init = body
-        .get("auto_init")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let (name, private, description, auto_init) = parse_create_repo_body(&body)?;
 
     let resp_body = create_repo_checked(
         &authorized.access_token,
-        name,
+        &name,
         private,
-        description,
+        &description,
         auto_init,
     )
     .await?;
 
+    finalize_created_repo(resp_body, &context, private).await
+}
+
+/// Estrae i campi del repo creato, configura (non-fatale) l'origin sul progetto
+/// se e' un repo git, e costruisce la risposta JSON di `github_create_repo`.
+async fn finalize_created_repo(
+    resp_body: serde_json::Value,
+    context: &ProjectContext,
+    private: bool,
+) -> ApiResult {
     let clone_url = github_repo_field(&resp_body, "clone_url", "");
     let html_url = github_repo_field(&resp_body, "html_url", "");
     let full_name = github_repo_field(&resp_body, "full_name", "");
@@ -2271,13 +2306,25 @@ pub async fn github_publish_project(
     // ── 1-2. Prepara repo git locale (init, .gitignore, config, add+commit) ─
     prepare_local_git_repo(&root, &commit_message).await?;
 
-    // ── 3. Crea repo su GitHub (o riusa quello esistente su 422) ─────────
+    // ── 3-5. Crea/riusa repo remoto, configura origin, push ───────────────
+    publish_repo_and_push(&authorized, &root, &name, private, &description).await
+}
+
+/// Crea (o riusa) il repository remoto, configura l'origin in modo fatale, esegue
+/// il push e ritorna la risposta JSON. Passi 3-5 del flusso di publish.
+async fn publish_repo_and_push(
+    authorized: &GitHubAuthorizedUser,
+    root: &std::path::Path,
+    name: &str,
+    private: bool,
+    description: &str,
+) -> ApiResult {
     let resp_body = create_or_reuse_github_repo(
         &authorized.access_token,
         &authorized.username,
-        &name,
+        name,
         private,
-        &description,
+        description,
     )
     .await?;
 
@@ -2288,11 +2335,11 @@ pub async fn github_publish_project(
 
     // ── 4. Configura origin (idempotente, fatale in publish) ─────────────
     if !clone_url.is_empty() {
-        set_origin_remote_required(&root, &clone_url).await?;
+        set_origin_remote_required(root, &clone_url).await?;
     }
 
     // ── 5. Push con token iniettato ──────────────────────────────────────
-    let pushed = push_to_origin(&authorized.access_token, &root, &default_branch).await;
+    let pushed = push_to_origin(&authorized.access_token, root, &default_branch).await;
 
     Ok(Json(json!({
         "ok": true,
