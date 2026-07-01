@@ -207,37 +207,24 @@ pub fn extract_function_bodies(source: &str, max_fns: usize) -> Vec<FunctionBody
     result
 }
 
-pub fn analyze_source(file_path: &str, source: &str) -> QualityReport {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut findings = Vec::new();
-
-    // Line metrics. Usiamo saturating_sub perche' count_comment_lines
-    // puo' contare lo stesso line piu' volte (es. line in mezzo a commento
-    // multilinea conta sia per il blocco che per la riga marker), portando
-    // a comment_lines > total_lines - blank_lines e quindi underflow su usize.
-    let total_lines = lines.len();
-    let blank_lines = lines.iter().filter(|l| l.trim().is_empty()).count();
-    let comment_lines = count_comment_lines(&lines);
-    let code_lines = total_lines
-        .saturating_sub(blank_lines)
-        .saturating_sub(comment_lines);
-
-    // Run all analyzers
-    findings.extend(check_complexity(&lines, file_path));
-    findings.extend(check_long_functions(&lines));
-    findings.extend(check_naming_conventions(&lines, file_path));
-    findings.extend(check_code_smells(&lines));
-    findings.extend(check_todos_fixmes(&lines));
-    findings.extend(check_dead_code_hints(&lines));
-    findings.extend(check_untyped_variables(&lines, file_path));
-    findings.extend(check_unused_imports(&lines, file_path));
-    findings.extend(check_missing_docs(&lines, file_path));
-    findings.extend(check_comment_quality(&lines, file_path));
-    findings.extend(check_unused_variables(&lines, file_path));
-    findings.extend(check_too_many_params(&lines, file_path));
-    findings.extend(check_repeated_literals(&lines, file_path));
-    findings.extend(check_db_queries_in_loops(&lines, file_path, &RuleOverrides::empty()));
-    findings.extend(check_duplicate_blocks_detailed(&lines));
+// Esegue tutti gli analizzatori per-riga/per-funzione e appende i loro finding,
+// incluso il detector SQL injection (ADR 0021).
+fn run_all_analyzers(lines: &[&str], file_path: &str, source: &str, findings: &mut Vec<QualityFinding>) {
+    findings.extend(check_complexity(lines, file_path));
+    findings.extend(check_long_functions(lines));
+    findings.extend(check_naming_conventions(lines, file_path));
+    findings.extend(check_code_smells(lines));
+    findings.extend(check_todos_fixmes(lines));
+    findings.extend(check_dead_code_hints(lines));
+    findings.extend(check_untyped_variables(lines, file_path));
+    findings.extend(check_unused_imports(lines, file_path));
+    findings.extend(check_missing_docs(lines, file_path));
+    findings.extend(check_comment_quality(lines, file_path));
+    findings.extend(check_unused_variables(lines, file_path));
+    findings.extend(check_too_many_params(lines, file_path));
+    findings.extend(check_repeated_literals(lines, file_path));
+    findings.extend(check_db_queries_in_loops(lines, file_path, &RuleOverrides::empty()));
+    findings.extend(check_duplicate_blocks_detailed(lines));
 
     // SQL injection nel codice applicativo (ADR 0021): detector unico condiviso
     // con il tool MCP. Gira solo su file di codice (.rs/.py/.ts/.js); per i .sql
@@ -254,10 +241,24 @@ pub fn analyze_source(file_path: &str, source: &str) -> QualityReport {
             ),
         });
     }
+}
 
-    let duplicate_blocks = find_duplicate_blocks(&lines);
+// Calcola le metriche aggregate (righe, complessita max, lunghezza media).
+fn compute_metrics(lines: &[&str]) -> QualityMetrics {
+    // Line metrics. Usiamo saturating_sub perche' count_comment_lines
+    // puo' contare lo stesso line piu' volte (es. line in mezzo a commento
+    // multilinea conta sia per il blocco che per la riga marker), portando
+    // a comment_lines > total_lines - blank_lines e quindi underflow su usize.
+    let total_lines = lines.len();
+    let blank_lines = lines.iter().filter(|l| l.trim().is_empty()).count();
+    let comment_lines = count_comment_lines(lines);
+    let code_lines = total_lines
+        .saturating_sub(blank_lines)
+        .saturating_sub(comment_lines);
 
-    let functions = extract_functions(&lines);
+    let duplicate_blocks = find_duplicate_blocks(lines);
+
+    let functions = extract_functions(lines);
     let max_complexity = functions.iter().map(|f| f.complexity).max().unwrap_or(0);
     let avg_function_length = if functions.is_empty() {
         0.0
@@ -265,18 +266,28 @@ pub fn analyze_source(file_path: &str, source: &str) -> QualityReport {
         functions.iter().map(|f| f.length as f64).sum::<f64>() / functions.len() as f64
     };
 
+    QualityMetrics {
+        total_lines,
+        code_lines,
+        comment_lines,
+        blank_lines,
+        max_complexity,
+        avg_function_length,
+        duplicate_blocks,
+    }
+}
+
+pub fn analyze_source(file_path: &str, source: &str) -> QualityReport {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut findings = Vec::new();
+
+    run_all_analyzers(&lines, file_path, source, &mut findings);
+    let metrics = compute_metrics(&lines);
+
     QualityReport {
         file_path: file_path.to_string(),
         findings,
-        metrics: QualityMetrics {
-            total_lines,
-            code_lines,
-            comment_lines,
-            blank_lines,
-            max_complexity,
-            avg_function_length,
-            duplicate_blocks,
-        },
+        metrics,
     }
 }
 
@@ -351,6 +362,23 @@ fn extract_functions(lines: &[&str]) -> Vec<FunctionInfo> {
     functions
 }
 
+// Costruisce il finding "alta complessita" se la soglia (>10) e' superata.
+// severity high oltre 20. Estratto per tenere `check_complexity` sotto soglia
+// senza alterare la logica di scansione delle graffe (comportamento invariato).
+fn complexity_finding(name: &str, complexity: usize, fn_start: usize) -> Option<QualityFinding> {
+    if complexity <= 10 {
+        return None;
+    }
+    Some(QualityFinding {
+        category: "complexity".into(),
+        severity: if complexity > 20 { "high" } else { "medium" }.into(),
+        title: format!("High cyclomatic complexity in `{}`", name),
+        detail: format!("Complexity: {} (threshold: 10)", complexity),
+        line: Some(fn_start + 1),
+        suggested_comment: None,
+    })
+}
+
 fn check_complexity(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
     // For JS/TS files, `match` is not a control-flow keyword — it's commonly used as a
     // variable name (e.g. `const match of`, `match.index`). Including `\bmatch\b` would
@@ -381,17 +409,7 @@ fn check_complexity(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
                     } else if ch == '}' && found_open {
                         depth -= 1;
                         if depth == 0 {
-                            if complexity > 10 {
-                                findings.push(QualityFinding {
-                                    category: "complexity".into(),
-                                    severity: if complexity > 20 { "high" } else { "medium" }
-                                        .into(),
-                                    title: format!("High cyclomatic complexity in `{}`", name),
-                                    detail: format!("Complexity: {} (threshold: 10)", complexity),
-                                    line: Some(fn_start + 1),
-                                    suggested_comment: None,
-                                });
-                            }
+                            findings.extend(complexity_finding(&name, complexity, fn_start));
                             i = j;
                             break;
                         }
@@ -495,9 +513,8 @@ fn check_naming_conventions(lines: &[&str], file_path: &str) -> Vec<QualityFindi
     findings
 }
 
-fn check_code_smells(lines: &[&str]) -> Vec<QualityFinding> {
-    let mut findings = Vec::new();
-
+// Smell per-riga: righe troppo lunghe (> 120 char, code) e `.unwrap()`.
+fn code_smells_per_line(lines: &[&str], findings: &mut Vec<QualityFinding>) {
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
 
@@ -518,8 +535,6 @@ fn check_code_smells(lines: &[&str]) -> Vec<QualityFinding> {
             });
         }
 
-        // Deep nesting — collected per-region below (not per-line)
-
         // Unwrap usage in non-test code
         if t.contains(".unwrap()") && !t.starts_with("//") {
             findings.push(QualityFinding {
@@ -532,65 +547,71 @@ fn check_code_smells(lines: &[&str]) -> Vec<QualityFinding> {
             });
         }
     }
+}
 
-    // Deep nesting — grouped by contiguous region to avoid one finding per line.
-    // A region is a run of non-blank, non-comment lines with indent >= 24 (6 levels).
-    // We emit one finding per region pointing to the first line of that region.
-    {
-        let mut region_start: Option<(usize, usize)> = None; // (line_idx, max_indent)
-        let mut region_lines: usize = 0;
+// Emette il finding di regione fortemente indentata.
+fn emit_deep_nesting(start: usize, max_indent: usize, count: usize, findings: &mut Vec<QualityFinding>) {
+    findings.push(QualityFinding {
+        category: "complexity".into(),
+        severity: "medium".into(),
+        title: "Deeply nested code".into(),
+        detail: format!(
+            "Region of {} line(s) starting here — max indentation level ~{} (threshold: 6)",
+            count,
+            max_indent / 4
+        ),
+        line: Some(start + 1),
+        suggested_comment: None,
+    });
+}
 
-        let emit = |start: usize, max_indent: usize, count: usize, findings: &mut Vec<QualityFinding>| {
-            findings.push(QualityFinding {
-                category: "complexity".into(),
-                severity: "medium".into(),
-                title: "Deeply nested code".into(),
-                detail: format!(
-                    "Region of {} line(s) starting here — max indentation level ~{} (threshold: 6)",
-                    count,
-                    max_indent / 4
-                ),
-                line: Some(start + 1),
-                suggested_comment: None,
-            });
-        };
+// Deep nesting — grouped by contiguous region to avoid one finding per line.
+// A region is a run of non-blank, non-comment lines with indent >= 24 (6 levels).
+// We emit one finding per region pointing to the first line of that region.
+fn code_smells_deep_nesting(lines: &[&str], findings: &mut Vec<QualityFinding>) {
+    let mut region_start: Option<(usize, usize)> = None; // (line_idx, max_indent)
+    let mut region_lines: usize = 0;
 
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with("//") {
-                // Blank/comment: close any open region but don't start new one
-                if let Some((start, max_indent)) = region_start.take() {
-                    emit(start, max_indent, region_lines, &mut findings);
-                }
-                region_lines = 0;
-                continue;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") {
+            // Blank/comment: close any open region but don't start new one
+            if let Some((start, max_indent)) = region_start.take() {
+                emit_deep_nesting(start, max_indent, region_lines, findings);
             }
-            let indent = line.len() - line.trim_start().len();
-            if indent >= 24 {
-                match region_start.as_mut() {
-                    None => {
-                        region_start = Some((i, indent));
-                        region_lines = 1;
-                    }
-                    Some((_, max_indent)) => {
-                        if indent > *max_indent { *max_indent = indent; }
-                        region_lines += 1;
-                    }
-                }
-            } else {
-                // Indent dropped — close region if open
-                if let Some((start, max_indent)) = region_start.take() {
-                    emit(start, max_indent, region_lines, &mut findings);
-                }
-                region_lines = 0;
-            }
+            region_lines = 0;
+            continue;
         }
-        // Close any trailing region
-        if let Some((start, max_indent)) = region_start.take() {
-            emit(start, max_indent, region_lines, &mut findings);
+        let indent = line.len() - line.trim_start().len();
+        if indent >= 24 {
+            match region_start.as_mut() {
+                None => {
+                    region_start = Some((i, indent));
+                    region_lines = 1;
+                }
+                Some((_, max_indent)) => {
+                    if indent > *max_indent { *max_indent = indent; }
+                    region_lines += 1;
+                }
+            }
+        } else {
+            // Indent dropped — close region if open
+            if let Some((start, max_indent)) = region_start.take() {
+                emit_deep_nesting(start, max_indent, region_lines, findings);
+            }
+            region_lines = 0;
         }
     }
+    // Close any trailing region
+    if let Some((start, max_indent)) = region_start.take() {
+        emit_deep_nesting(start, max_indent, region_lines, findings);
+    }
+}
 
+fn check_code_smells(lines: &[&str]) -> Vec<QualityFinding> {
+    let mut findings = Vec::new();
+    code_smells_per_line(lines, &mut findings);
+    code_smells_deep_nesting(lines, &mut findings);
     findings
 }
 
@@ -665,6 +686,57 @@ fn find_duplicate_blocks(lines: &[&str]) -> usize {
     blocks.values().filter(|&&c| c > 1).count()
 }
 
+// Segnala l'uso di `any` in TS su una singola riga (gia' trimmata in `t`).
+fn untyped_ts_any(t: &str, i: usize) -> Option<QualityFinding> {
+    if t.contains(": any") || t.contains("as any") || t.contains("<any>") {
+        return Some(QualityFinding {
+            category: "typing".into(),
+            severity: "medium".into(),
+            title: "TypeScript `any` type used".into(),
+            detail: "Replace `any` with a specific type to improve type safety".into(),
+            line: Some(i + 1),
+            suggested_comment: Some("// TODO: replace `any` with a specific type".into()),
+        });
+    }
+    None
+}
+
+// Segnala l'uso di `var` legacy in JS su una singola riga.
+fn untyped_js_var(line: &str, i: usize) -> Option<QualityFinding> {
+    if RE_JS_VAR_DECL.is_match(line) {
+        return Some(QualityFinding {
+            category: "typing".into(),
+            severity: "low".into(),
+            title: "Use of `var` instead of `const`/`let`".into(),
+            detail: "Prefer `const` or `let` for block scoping".into(),
+            line: Some(i + 1),
+            suggested_comment: None,
+        });
+    }
+    None
+}
+
+// Segnala una funzione Python i cui parametri (esclusi self/virgole) non hanno
+// annotazioni di tipo.
+fn untyped_py_params(line: &str, i: usize) -> Option<QualityFinding> {
+    let cap = RE_PY_FN_PARAMS.captures(line)?;
+    let params = &cap[1];
+    if !params.trim().is_empty()
+        && !params.contains(':')
+        && !params.replace("self", "").replace(',', "").trim().is_empty()
+    {
+        return Some(QualityFinding {
+            category: "typing".into(),
+            severity: "low".into(),
+            title: "Python function missing type annotations".into(),
+            detail: "Add type hints to improve code clarity and tooling support".into(),
+            line: Some(i + 1),
+            suggested_comment: Some("# TODO: add type annotations".into()),
+        });
+    }
+    None
+}
+
 fn check_untyped_variables(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
     let mut findings = Vec::new();
     let is_ts = file_path.ends_with(".ts") || file_path.ends_with(".tsx");
@@ -675,46 +747,58 @@ fn check_untyped_variables(lines: &[&str], file_path: &str) -> Vec<QualityFindin
         let t = line.trim();
         if t.starts_with("//") || t.starts_with('#') { continue; }
 
-        if is_ts && (t.contains(": any") || t.contains("as any") || t.contains("<any>")) {
-            findings.push(QualityFinding {
-                category: "typing".into(),
-                severity: "medium".into(),
-                title: "TypeScript `any` type used".into(),
-                detail: "Replace `any` with a specific type to improve type safety".into(),
-                line: Some(i + 1),
-                suggested_comment: Some("// TODO: replace `any` with a specific type".into()),
-            });
-        }
-        if is_js && RE_JS_VAR_DECL.is_match(line) {
-            findings.push(QualityFinding {
-                category: "typing".into(),
-                severity: "low".into(),
-                title: "Use of `var` instead of `const`/`let`".into(),
-                detail: "Prefer `const` or `let` for block scoping".into(),
-                line: Some(i + 1),
-                suggested_comment: None,
-            });
-        }
-        if is_py {
-            if let Some(cap) = RE_PY_FN_PARAMS.captures(line) {
-                let params = &cap[1];
-                if !params.trim().is_empty()
-                    && !params.contains(':')
-                    && !params.replace("self", "").replace(',', "").trim().is_empty()
-                {
-                    findings.push(QualityFinding {
-                        category: "typing".into(),
-                        severity: "low".into(),
-                        title: "Python function missing type annotations".into(),
-                        detail: "Add type hints to improve code clarity and tooling support".into(),
-                        line: Some(i + 1),
-                        suggested_comment: Some("# TODO: add type annotations".into()),
-                    });
+        if is_ts { findings.extend(untyped_ts_any(t, i)); }
+        if is_js { findings.extend(untyped_js_var(line, i)); }
+        if is_py { findings.extend(untyped_py_params(line, i)); }
+    }
+    findings
+}
+
+// Costruisce un finding "import possibilmente non usato" con dettaglio dato.
+fn unused_import_finding(name: &str, i: usize, detail: &str) -> QualityFinding {
+    QualityFinding {
+        category: "dead_code".into(),
+        severity: "low".into(),
+        title: format!("Possibly unused import `{}`", name),
+        detail: detail.into(),
+        line: Some(i + 1),
+        suggested_comment: None,
+    }
+}
+
+// Import TS/JS `import { X, Y } from '...'` non referenziati altrove nel file.
+fn unused_imports_ts_js(lines: &[&str], full_text: &str, findings: &mut Vec<QualityFinding>) {
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(cap) = RE_TS_NAMED_IMPORT.captures(line) {
+            for name in cap[1].split(',') {
+                let trimmed = name.trim().split(" as ").last().unwrap_or("").trim();
+                if trimmed.is_empty() { continue; }
+                // Conta le occorrenze fuori dalla riga di import.
+                if full_text.matches(trimmed).count() <= 1 {
+                    findings.push(unused_import_finding(
+                        trimmed, i, "This import may not be used anywhere in the file",
+                    ));
                 }
             }
         }
     }
-    findings
+}
+
+// Import Python non referenziati altrove nel file.
+fn unused_imports_py(lines: &[&str], full_text: &str, findings: &mut Vec<QualityFinding>) {
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if let Some(cap) = RE_PY_IMPORT.captures(t) {
+            let name = cap[1].split(" as ").last().unwrap_or("").trim();
+            let name = name.split(',').next().unwrap_or("").trim();
+            if name.is_empty() { continue; }
+            if full_text.matches(name).count() <= 1 {
+                findings.push(unused_import_finding(
+                    name, i, "This import may not be used in the file",
+                ));
+            }
+        }
+    }
 }
 
 fn check_unused_imports(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
@@ -725,52 +809,71 @@ fn check_unused_imports(lines: &[&str], file_path: &str) -> Vec<QualityFinding> 
 
     let full_text = lines.join("\n");
 
-    if is_ts_js {
-        // Match: import { X, Y } from '...' or import X from '...'
-        for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = RE_TS_NAMED_IMPORT.captures(line) {
-                for name in cap[1].split(',') {
-                    let trimmed = name.trim().split(" as ").last().unwrap_or("").trim();
-                    if trimmed.is_empty() { continue; }
-                    // Count occurrences outside the import line
-                    let count = full_text.matches(trimmed).count();
-                    if count <= 1 {
-                        findings.push(QualityFinding {
-                            category: "dead_code".into(),
-                            severity: "low".into(),
-                            title: format!("Possibly unused import `{}`", trimmed),
-                            detail: "This import may not be used anywhere in the file".into(),
-                            line: Some(i + 1),
-                            suggested_comment: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    if is_py {
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim();
-            if let Some(cap) = RE_PY_IMPORT.captures(t) {
-                let name = cap[1].split(" as ").last().unwrap_or("").trim();
-                let name = name.split(',').next().unwrap_or("").trim();
-                if name.is_empty() { continue; }
-                let count = full_text.matches(name).count();
-                if count <= 1 {
-                    findings.push(QualityFinding {
-                        category: "dead_code".into(),
-                        severity: "low".into(),
-                        title: format!("Possibly unused import `{}`", name),
-                        detail: "This import may not be used in the file".into(),
-                        line: Some(i + 1),
-                        suggested_comment: None,
-                    });
-                }
-            }
-        }
-    }
+    if is_ts_js { unused_imports_ts_js(lines, &full_text, &mut findings); }
+    if is_py { unused_imports_py(lines, &full_text, &mut findings); }
     findings
+}
+
+// `pub fn`/`pub async fn` Rust non preceduta da doc-comment o attributo.
+fn missing_docs_rust(lines: &[&str], t: &str, i: usize) -> Option<QualityFinding> {
+    if !(t.starts_with("pub fn") || t.starts_with("pub async fn")) {
+        return None;
+    }
+    let prev = if i > 0 { lines[i - 1].trim() } else { "" };
+    if !prev.starts_with("///") && !prev.starts_with("#[") {
+        return Some(QualityFinding {
+            category: "docs".into(),
+            severity: "low".into(),
+            title: "Public function without documentation".into(),
+            detail: "Add `/// ` doc comment to describe this function".into(),
+            line: Some(i + 1),
+            suggested_comment: Some("/// TODO: document this function".into()),
+        });
+    }
+    None
+}
+
+// `export function`/`export class` TS non preceduta da blocco JSDoc.
+fn missing_docs_ts(lines: &[&str], t: &str, i: usize) -> Option<QualityFinding> {
+    let is_export = t.starts_with("export function") || t.starts_with("export async function")
+        || t.starts_with("export class") || t.starts_with("export default function");
+    if !is_export {
+        return None;
+    }
+    let prev = if i > 0 { lines[i - 1].trim() } else { "" };
+    if !prev.starts_with("*/") && !prev.starts_with("*") && !prev.starts_with("/**") {
+        return Some(QualityFinding {
+            category: "docs".into(),
+            severity: "low".into(),
+            title: "Exported function/class without JSDoc".into(),
+            detail: "Add `/** */` JSDoc comment to describe this export".into(),
+            line: Some(i + 1),
+            suggested_comment: Some("/** TODO: document this export */".into()),
+        });
+    }
+    None
+}
+
+// `def`/`async def` Python la cui prima riga di corpo non e' una docstring.
+fn missing_docs_py(lines: &[&str], t: &str, i: usize) -> Option<QualityFinding> {
+    if !(t.starts_with("def ") || t.starts_with("async def ")) {
+        return None;
+    }
+    let next_code = lines.iter().skip(i + 1)
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim())
+        .unwrap_or("");
+    if !next_code.starts_with("\"\"\"") && !next_code.starts_with("'''") {
+        return Some(QualityFinding {
+            category: "docs".into(),
+            severity: "low".into(),
+            title: "Python function without docstring".into(),
+            detail: "Add a docstring to describe the function".into(),
+            line: Some(i + 1),
+            suggested_comment: Some("# TODO: add docstring".into()),
+        });
+    }
+    None
 }
 
 fn check_missing_docs(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
@@ -781,105 +884,38 @@ fn check_missing_docs(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
 
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
-        if is_rust {
-            // pub fn not preceded by ///
-            if t.starts_with("pub fn") || t.starts_with("pub async fn") {
-                let prev = if i > 0 { lines[i - 1].trim() } else { "" };
-                if !prev.starts_with("///") && !prev.starts_with("#[") {
-                    findings.push(QualityFinding {
-                        category: "docs".into(),
-                        severity: "low".into(),
-                        title: "Public function without documentation".into(),
-                        detail: "Add `/// ` doc comment to describe this function".into(),
-                        line: Some(i + 1),
-                        suggested_comment: Some("/// TODO: document this function".into()),
-                    });
-                }
-            }
-        }
-        if is_ts {
-            // export function/class without JSDoc
-            if t.starts_with("export function") || t.starts_with("export async function")
-                || t.starts_with("export class") || t.starts_with("export default function")
-            {
-                let prev = if i > 0 { lines[i - 1].trim() } else { "" };
-                if !prev.starts_with("*/") && !prev.starts_with("*") && !prev.starts_with("/**") {
-                    findings.push(QualityFinding {
-                        category: "docs".into(),
-                        severity: "low".into(),
-                        title: "Exported function/class without JSDoc".into(),
-                        detail: "Add `/** */` JSDoc comment to describe this export".into(),
-                        line: Some(i + 1),
-                        suggested_comment: Some("/** TODO: document this export */".into()),
-                    });
-                }
-            }
-        }
-        if is_py {
-            // def without docstring: check if next non-empty line starts with """
-            if t.starts_with("def ") || t.starts_with("async def ") {
-                let next_code = lines.iter().skip(i + 1)
-                    .find(|l| !l.trim().is_empty())
-                    .map(|l| l.trim())
-                    .unwrap_or("");
-                if !next_code.starts_with("\"\"\"") && !next_code.starts_with("'''") {
-                    findings.push(QualityFinding {
-                        category: "docs".into(),
-                        severity: "low".into(),
-                        title: "Python function without docstring".into(),
-                        detail: "Add a docstring to describe the function".into(),
-                        line: Some(i + 1),
-                        suggested_comment: Some("# TODO: add docstring".into()),
-                    });
-                }
-            }
-        }
+        if is_rust { findings.extend(missing_docs_rust(lines, t, i)); }
+        if is_ts { findings.extend(missing_docs_ts(lines, t, i)); }
+        if is_py { findings.extend(missing_docs_py(lines, t, i)); }
     }
     findings
 }
 
-fn check_comment_quality(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
-    let mut findings = Vec::new();
-    let total = lines.len();
-    if total == 0 { return findings; }
-
-    let comment_count = count_comment_lines(lines);
-
-    // File > 100 lines with 0 comments
-    if total > 100 && comment_count == 0 {
-        findings.push(QualityFinding {
-            category: "comments".into(),
-            severity: "medium".into(),
-            title: "No comments in large file".into(),
-            detail: format!("File has {} lines but no comments — add comments to aid understanding", total),
-            line: None,
-            suggested_comment: Some("// Add comments explaining the purpose and logic of key sections".into()),
-        });
-    }
-
-    // Magic numbers (not in .sql files)
-    if !file_path.ends_with(".sql") {
-        for (i, line) in lines.iter().enumerate() {
-            if RE_MAGIC_SKIP.is_match(line) { continue; }
-            if let Some(m) = RE_MAGIC_NUMBER.find(line) {
-                let num: u64 = m.as_str().parse().unwrap_or(0);
-                // skip common non-magic: port numbers like 3000, 4000, 8080 are OK
-                if num > 99 && num != 100 && num != 1000 && num != 1024 {
-                    findings.push(QualityFinding {
-                        category: "comments".into(),
-                        severity: "low".into(),
-                        title: format!("Magic number `{}`", m.as_str()),
-                        detail: "Consider extracting as a named constant with a comment explaining its purpose".into(),
-                        line: Some(i + 1),
-                        suggested_comment: Some(format!("// TODO: extract {} as a named constant", m.as_str())),
-                    });
-                    break; // only first per line
-                }
+// Segnala i "magic number" (non nei .sql), uno per riga al massimo.
+fn comment_magic_numbers(lines: &[&str], file_path: &str, findings: &mut Vec<QualityFinding>) {
+    if file_path.ends_with(".sql") { return; }
+    for (i, line) in lines.iter().enumerate() {
+        if RE_MAGIC_SKIP.is_match(line) { continue; }
+        if let Some(m) = RE_MAGIC_NUMBER.find(line) {
+            let num: u64 = m.as_str().parse().unwrap_or(0);
+            // skip common non-magic: port numbers like 3000, 4000, 8080 are OK
+            if num > 99 && num != 100 && num != 1000 && num != 1024 {
+                findings.push(QualityFinding {
+                    category: "comments".into(),
+                    severity: "low".into(),
+                    title: format!("Magic number `{}`", m.as_str()),
+                    detail: "Consider extracting as a named constant with a comment explaining its purpose".into(),
+                    line: Some(i + 1),
+                    suggested_comment: Some(format!("// TODO: extract {} as a named constant", m.as_str())),
+                });
+                break; // only first per line
             }
         }
     }
+}
 
-    // Complex blocks without comments (> 15 lines with branches, no comment)
+// Segnala i blocchi complessi (> 15 righe, >= 3 branch) privi di commento.
+fn comment_complex_blocks(lines: &[&str], findings: &mut Vec<QualityFinding>) {
     let mut block_start = 0;
     let mut branch_count = 0;
     let mut has_comment = false;
@@ -908,8 +944,77 @@ fn check_comment_quality(lines: &[&str], file_path: &str) -> Vec<QualityFinding>
             has_comment = false;
         }
     }
+}
 
+fn check_comment_quality(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
+    let mut findings = Vec::new();
+    let total = lines.len();
+    if total == 0 { return findings; }
+
+    let comment_count = count_comment_lines(lines);
+
+    // File > 100 lines with 0 comments
+    if total > 100 && comment_count == 0 {
+        findings.push(QualityFinding {
+            category: "comments".into(),
+            severity: "medium".into(),
+            title: "No comments in large file".into(),
+            detail: format!("File has {} lines but no comments — add comments to aid understanding", total),
+            line: None,
+            suggested_comment: Some("// Add comments explaining the purpose and logic of key sections".into()),
+        });
+    }
+
+    comment_magic_numbers(lines, file_path, &mut findings);
+    comment_complex_blocks(lines, &mut findings);
     findings
+}
+
+// Costruisce un finding "variabile non usata" con dettaglio dato.
+fn unused_var_finding(name: &str, i: usize, detail: String) -> QualityFinding {
+    QualityFinding {
+        category: "dead_code".into(),
+        severity: "low".into(),
+        title: format!("Unused variable `{}`", name),
+        detail,
+        line: Some(i + 1),
+        suggested_comment: None,
+    }
+}
+
+// const/let TS/JS dichiarate ma non referenziate altrove nel file.
+fn unused_vars_ts_js(lines: &[&str], source: &str, findings: &mut Vec<QualityFinding>) {
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with("//") || t.starts_with("export ") { continue; }
+        for cap in RE_TSJS_DECL.captures_iter(line) {
+            let name = &cap[1];
+            if name == "_" || name.starts_with('_') { continue; }
+            // Conta le occorrenze nel file (esclusa la dichiarazione stessa).
+            if source.matches(name).count() <= 1 {
+                findings.push(unused_var_finding(
+                    name, i, format!("`{}` è dichiarata ma non usata nel file", name),
+                ));
+            }
+        }
+    }
+}
+
+// let Rust (non prefissate da `_`) dichiarate ma non referenziate.
+fn unused_vars_rust(lines: &[&str], source: &str, findings: &mut Vec<QualityFinding>) {
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with("//") { continue; }
+        for cap in RE_RS_LET_DECL.captures_iter(line) {
+            let name = &cap[1];
+            if name.starts_with('_') { continue; }
+            if source.matches(name).count() <= 1 {
+                findings.push(unused_var_finding(
+                    name, i, format!("`{}` è dichiarata ma non usata", name),
+                ));
+            }
+        }
+    }
 }
 
 /// Variabili dichiarate ma mai usate nel file (oltre agli import già coperti da check_unused_imports).
@@ -922,53 +1027,8 @@ fn check_unused_variables(lines: &[&str], file_path: &str) -> Vec<QualityFinding
 
     let source = lines.join("\n");
 
-    if is_ts || is_js {
-        // const/let foo = ... dove foo non appare altrove
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim();
-            if t.starts_with("//") || t.starts_with("export ") { continue; }
-            for cap in RE_TSJS_DECL.captures_iter(line) {
-                let name = &cap[1];
-                if name == "_" || name.starts_with('_') { continue; }
-                // Conta le occorrenze nel file (esclusa la dichiarazione stessa)
-                let count = source.matches(name).count();
-                if count <= 1 {
-                    findings.push(QualityFinding {
-                        category: "dead_code".into(),
-                        severity: "low".into(),
-                        title: format!("Unused variable `{}`", name),
-                        detail: format!("`{}` è dichiarata ma non usata nel file", name),
-                        line: Some(i + 1),
-                        suggested_comment: None,
-                    });
-                }
-            }
-        }
-    }
-
-    if is_rs {
-        // let foo = ... (non prefissata da _) mai usata
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim();
-            if t.starts_with("//") { continue; }
-            for cap in RE_RS_LET_DECL.captures_iter(line) {
-                let name = &cap[1];
-                if name.starts_with('_') { continue; }
-                let count = source.matches(name).count();
-                if count <= 1 {
-                    findings.push(QualityFinding {
-                        category: "dead_code".into(),
-                        severity: "low".into(),
-                        title: format!("Unused variable `{}`", name),
-                        detail: format!("`{}` è dichiarata ma non usata", name),
-                        line: Some(i + 1),
-                        suggested_comment: None,
-                    });
-                }
-            }
-        }
-    }
-
+    if is_ts || is_js { unused_vars_ts_js(lines, &source, &mut findings); }
+    if is_rs { unused_vars_rust(lines, &source, &mut findings); }
     findings
 }
 
@@ -990,6 +1050,10 @@ fn check_too_many_params(lines: &[&str], file_path: &str) -> Vec<QualityFinding>
                     category: "maintainability".into(),
                     severity: "medium".into(),
                     title: format!("Too many parameters in `{}`", &cap[1]),
+                    // FALSO POSITIVO del detector SQL injection: la parola inglese
+                    // "into" (grouping into...) combinata col placeholder {} del
+                    // format! attiva SQL_KEYWORD_RE + RS_FORMAT_RE. Non e' una query:
+                    // e' testo di un messaggio diagnostico. Lasciato invariato.
                     detail: format!("{} parameters (threshold: 5) — consider grouping into a struct/object", param_count),
                     line: Some(i + 1),
                     suggested_comment: None,
