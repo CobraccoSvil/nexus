@@ -34,29 +34,73 @@ ogni progetto sia autocontenuto e portabile.
 - Dati di `beaty-book` migrati in `beaty_book_nexus`: chat (9 tab) + run (15 tab),
   conteggi verificati. ~93K righe **orfane purgate** dal meta-DB (langgraph 50647,
   meta_steps 36701, graph 5240, traces 617) con backup id.
-- Cutover core mcp-core instradato: session CRUD, `list_chat_messages`,
+- **Dominio chat** instradato: session CRUD, `list_chat_messages`,
   `load_session_context`, `insert_message`/`load_message_by_id`, 3 insert del
   motore agente (response/panic/resume), `persist_message_attachments`,
-  compattazione, worklog.
+  compattazione, worklog (chiamanti in agent_run/handlers/chat_sessions/chat_agent
+  + leaf tool `nexus_get_worklog`).
+- **Dominio run - punto di assemblaggio** (`native_engine` run_native/run_shadow,
+  commit motore run): risolto `run_db` una volta dal session_id e passato a TUTTe
+  le store del grafo (run_control->agent_runs, steps->agent_steps, meta_steps,
+  todos/plans, verifier_runs, criteria, checkpointer->nexus_graph_checkpoints,
+  event_sink->nexus_agent_traces, replay LLM/tool). Punto unico (regola L): le
+  ~120 query delle store NON vanno instradate a mano. `todo_store` misto
+  (todos/plans su run_db + settings su meta). Restano su meta le porte che leggono
+  SOLO config/catalogo globali (summary_store/next_actions/escalation/upscale).
+- **Dominio run - call-site standalone** (~24 file, workflow route+verify):
+  agent_processes, jobs, agent_runs, nexus_agent_todos, nexus_subagent_runs,
+  nexus_agent_traces, monitoring project_workspace, billing counts, trace/rag/
+  subagent tool, process_resume. Ogni funzione distingue migrate (->pool progetto)
+  da globali (settings/projects/users/git_operations/catalogo ->meta).
+- **Worker cross-progetto**: run_reaper + wiki run_summary/chat_note.
+- **Hot-path learning**: `orchestrator/core.rs` INSERT orchestrator_runs + UPDATE
+  prompt_corrections (retrieved_count) sul pool del progetto.
 
 ## Resta da fare (prima del flip)
-1. **Helper mcp-core residui**: SELECT worklog, lista `prompt_corrections`,
-   `ai_response_feedback` (JOIN `users` -> id logico), cascata `vector_memory`
-   (`upsert_prompt_correction_point` scrive `prompt_corrections`).
-2. **Worker cross-progetto** (`run_reaper`, `run_summary_worker`,
-   `chat_note_worker`): fanno una query su TUTTI i progetti. Vanno **ristrutturati**
-   per iterare l'elenco progetti e girare per-progetto sul pool di ciascuno, con
-   `WHERE project_id = $p` (cosi' funziona sia flag off su meta sia flag on su
-   `<slug>_nexus`, senza duplicati).
-3. **`chat-service`** (crate separato): non vede il registry globale di mcp-core.
-   Serve il suo resolver (replica di `project_data_pool` + accesso a
-   `project_database_config` / `nexus_data_routing`).
-4. **Flip + deploy + test UI** (vedi sotto).
+1. **`chat_learning.rs`** (in corso): query per-progetto instradate; le viste
+   admin GLOBALI (`admin_list_feedback_errors` con `LEFT JOIN users` + nessun
+   filtro progetto; `run_vector_compaction`; `admin_retrain`) richiedono
+   iterazione progetti + split del JOIN verso `users` (meta). Il JOIN
+   `prompt_corrections`↔`chat_sessions` (entrambe migrate) e' invece instradabile.
+2. **Endpoint feedback message-keyed** (`feedback_error`, `feedback_positive` in
+   `chat_messages/handlers.rs`): keyed solo da `message_id`, senza session/project
+   a monte -> il pool non e' risolvibile prima di leggere il messaggio (che vive
+   nel DB del progetto). **Restano su meta** (coerenti a flag OFF). Fix deliberato:
+   passare `session_id` nel body dal frontend, oppure directory `message->project`
+   (sconsigliata: una riga di routing per messaggio). A flag ON questi 2 endpoint
+   degradano (404), NON corrompono.
+3. **Scan globali processi** (`main.rs` boot-recovery riga ~239, `task_watchdog`):
+   `SELECT/UPDATE agent_processes` su TUTTI i progetti -> iterare `list_project_ids`
+   (pattern run_reaper). NB: codice `/proc`+`kill -0` Linux-specifico, in porting
+   su questa branch Windows; degrada (non reconcilia i processi per-progetto), non
+   corrompe.
+4. **`chat-service`** (crate separato, PROCESSO distinto): non vede il registry
+   in-process di mcp-core. Serve un resolver proprio (flag + `nexus_data_routing`
+   + `connection_secret` da `project_database_config`, NO provisioning). Via
+   regola-L: estrarre un crate basso `nexus-project-pool` (resolve+open+cache)
+   dipeso da mcp-core (che continua a provisionare) e chat-service. Query in
+   chat_messages/chat_sessions/chat_agent del crate chat-service (per-session).
+5. **Dominio costi** ("costi"): lo schema dei costi NON e' ancora nelle migrazioni
+   `db/migrations/project/*` -> il ledger billing resta sul meta-DB. Richiede
+   migrazione schema + dati + call-site (billing-service) come i domini chat/run.
+6. **Flip + deploy + test UI** (vedi sotto).
 
-## Procedura di flip (quando 1-3 sono completi)
-1. Convertire e committare 1-3; `pnpm verify` verde.
+> Nota: tutto il codice instradato e' behavior-preserving a flag OFF
+> (`project_data_pool_*` ritorna il meta-DB). I punti 1-5 residui degradano ma NON
+> corrompono a flag ON: viste admin incomplete / feedback 404 / recovery processi
+> parziale / costi sul meta. Nessuno crea split-brain dei WRITE del dominio
+> chat/run gia' instradati.
+
+## Procedura di flip
+Il grosso (dominio chat + run) e' instradato: si puo' flippare per i progetti
+gia' migrati anche coi punti 1-5 residui aperti (degradano, non corrompono).
+1. `pnpm verify` verde.
 2. Migrare i dati residui dei domini non ancora copiati per i progetti vivi
-   (oltre chat+run gia' fatti).
+   (oltre chat+run gia' fatti) e **backfillare `nexus_data_routing`** per le
+   sessioni ESISTENTI (le nuove si auto-registrano a chat_sessions.rs:261; le
+   vecchie no -> senza backfill ricadono su meta a flag ON):
+   `INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id) SELECT 'session', id, project_id FROM chat_sessions ON CONFLICT DO NOTHING;`
+   (da eseguire nel meta-DB per i progetti gia' migrati).
 3. `deploy/deploy-local.ps1 -Rust` (rebuild + restart, applica le migrazioni).
 4. `UPDATE settings SET value='true' WHERE key='db.project_separation.enabled';`
    (cache flag TTL 30s -> attende max 30s; nessun redeploy).
