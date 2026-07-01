@@ -726,9 +726,9 @@ pub async fn project_data_pool_by_session_from(
 
 /// Elenco dei `project_id` (tabella globale `projects`, meta-DB). Serve al
 /// fallback di ricerca per gli endpoint keyed solo dall'id di un'entita' non
-/// ancora in directory (es. messaggi assistant inseriti inline con
-/// `gen_random_uuid()`, mai passati da `register_entity_routing`).
-async fn list_all_project_ids(meta: &sqlx::PgPool) -> Vec<Uuid> {
+/// ancora in directory, e alle viste admin GLOBALI che aggregano i domini migrati
+/// iterando i DB-progetto (regola L, punto unico dell'elenco progetti).
+pub async fn list_all_project_ids(meta: &sqlx::PgPool) -> Vec<Uuid> {
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
         .fetch_all(meta)
         .await

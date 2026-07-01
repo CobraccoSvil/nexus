@@ -561,6 +561,15 @@ async fn run_vector_compaction(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Separazione DB: prompt_corrections vive nel pool del progetto quando
+    // project_id e' noto; vector_compaction_runs (sopra/sotto) NON e' migrata e
+    // resta sul meta. NB: con project_id=None (compaction GLOBALE) al flag ON
+    // questo processa solo il meta (vuoto) -> la compaction globale va triggerata
+    // per-progetto (project_id valorizzato). A flag OFF -> meta, invariato.
+    let cpool = match project_id {
+        Some(pid) => crate::project_db_routes::project_data_pool_from(db, pid).await,
+        None => db.clone(),
+    };
     let compaction_result = async {
         let rows = sqlx::query(
             r#"
@@ -582,7 +591,7 @@ async fn run_vector_compaction(
             "#,
         )
         .bind(project_id)
-        .fetch_all(db)
+        .fetch_all(&cpool)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -654,7 +663,7 @@ async fn run_vector_compaction(
                 )
                 .bind(item.id)
                 .bind(*reason)
-                .execute(db)
+                .execute(&cpool)
                 .await
                 .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -826,35 +835,66 @@ pub(crate) async fn dedup_on_write(
 // ── Public admin handlers ──
 
 pub async fn admin_list_feedback_errors(State(state): State<AppState>) -> ApiResult {
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            f.id,
-            f.project_id,
-            f.session_id,
-            f.message_id,
-            f.user_id,
-            f.intent,
-            f.provider,
-            f.model,
-            f.error_comment,
-            f.status,
-            f.review_note,
-            f.created_at,
-            u.email AS user_email,
-            pc.correction_text,
-            pc.metadata AS correction_metadata,
-            pc.retrieved_count
-        FROM ai_response_feedback f
-        LEFT JOIN users u ON u.id = f.user_id
-        LEFT JOIN prompt_corrections pc ON pc.feedback_id = f.id
-        ORDER BY f.created_at DESC
-        LIMIT 200
-        "#,
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Vista admin GLOBALE: ai_response_feedback + prompt_corrections sono migrate
+    // (JOIN valido sul pool del progetto); `users` NON e' migrata (resta su meta)
+    // -> split del JOIN. Aggrega iterando i DB-progetto (a flag OFF i pool sono il
+    // meta -> dedup per id), poi risolve le email utente dal meta. Top 200 globale.
+    let mut rows: Vec<sqlx::postgres::PgRow> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
+        let pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
+        let batch = sqlx::query(
+            r#"
+            SELECT f.id, f.project_id, f.session_id, f.message_id, f.user_id, f.intent,
+                   f.provider, f.model, f.error_comment, f.status, f.review_note, f.created_at,
+                   pc.correction_text, pc.metadata AS correction_metadata, pc.retrieved_count
+            FROM ai_response_feedback f
+            LEFT JOIN prompt_corrections pc ON pc.feedback_id = f.id
+            ORDER BY f.created_at DESC
+            LIMIT 200
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for r in batch {
+            if let Ok(id) = r.try_get::<Uuid, _>("id") {
+                if seen.insert(id) {
+                    rows.push(r);
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        let bb = b.try_get::<DateTime<Utc>, _>("created_at").ok();
+        let aa = a.try_get::<DateTime<Utc>, _>("created_at").ok();
+        bb.cmp(&aa)
+    });
+    rows.truncate(200);
+
+    // Risolvi le email utente dal meta-DB (`users` non migrata): un solo SELECT.
+    let user_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<Uuid, _>("user_id").ok())
+        .collect();
+    let mut email_by_user: std::collections::HashMap<Uuid, String> =
+        std::collections::HashMap::new();
+    if !user_ids.is_empty() {
+        if let Ok(urows) = sqlx::query("SELECT id, email FROM users WHERE id = ANY($1)")
+            .bind(&user_ids)
+            .fetch_all(&state.db)
+            .await
+        {
+            for ur in urows {
+                if let (Ok(uid), Ok(email)) = (
+                    ur.try_get::<Uuid, _>("id"),
+                    ur.try_get::<String, _>("email"),
+                ) {
+                    email_by_user.insert(uid, email);
+                }
+            }
+        }
+    }
 
     let feedbacks = rows
         .iter()
@@ -880,7 +920,7 @@ pub async fn admin_list_feedback_errors(State(state): State<AppState>) -> ApiRes
                 "sessionId": session_id.to_string(),
                 "messageId": message_id.to_string(),
                 "userId": user_id.to_string(),
-                "userEmail": row.try_get::<Option<String>, _>("user_email").ok().flatten(),
+                "userEmail": email_by_user.get(&user_id).cloned(),
                 "intent": row.try_get::<Option<String>, _>("intent").ok().flatten(),
                 "provider": row.try_get::<Option<String>, _>("provider").ok().flatten(),
                 "model": row.try_get::<Option<String>, _>("model").ok().flatten(),
@@ -1377,24 +1417,34 @@ pub async fn admin_list_prompt_corrections(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, project_id, intent, correction_text, qdrant_point_id,
-               active, status, retrieved_count, created_at
-        FROM prompt_corrections
-        WHERE deleted_at IS NULL
-        ORDER BY created_at DESC
-        LIMIT 100
-        "#
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("DB error: {e}")})),
+    // Vista admin GLOBALE: prompt_corrections e' migrata -> aggrega iterando i
+    // DB-progetto. A flag OFF tutti i pool sono il meta (dedup per id evita i
+    // duplicati); a flag ON ogni progetto ha le sue righe. Top 100 globale.
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
+        let pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
+        let batch = sqlx::query!(
+            r#"
+            SELECT id, project_id, intent, correction_text, qdrant_point_id,
+                   active, status, retrieved_count, created_at
+            FROM prompt_corrections
+            WHERE deleted_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 100
+            "#
         )
-    })?;
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for r in batch {
+            if seen.insert(r.id) {
+                rows.push(r);
+            }
+        }
+    }
+    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    rows.truncate(100);
 
     let corrections: Vec<Value> = rows
         .into_iter()
