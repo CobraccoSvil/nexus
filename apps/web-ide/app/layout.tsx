@@ -39,18 +39,35 @@ const themeScript = `(function(){
   } catch(e) {}
 })()`;
 
-// Se un chunk JS non si carica (build vecchio in cache), ricarica la pagina una sola volta
+// Se un chunk JS non si carica (build vecchio dopo un deploy), ricarica la pagina
+// una sola volta. Vanno intercettati DUE canali distinti, altrimenti l'auto-reload
+// non scatta:
+//  - resource error del <script src="/_next/static/..."> -> NON fa bubbling, va
+//    ascoltato in fase di cattura (terzo argomento true);
+//  - ChunkLoadError da import() dinamico -> arriva come unhandledrejection, non
+//    come evento 'error' sincrono.
 const chunkErrorScript = `(function(){
-  window.addEventListener('error', function(e) {
-    if (e && e.message && e.message.indexOf('Loading chunk') !== -1) {
-      var key = 'nexus:chunkReload';
-      var last = sessionStorage.getItem(key);
-      var now = Date.now();
-      if (!last || now - parseInt(last, 10) > 30000) {
-        sessionStorage.setItem(key, String(now));
-        window.location.reload();
-      }
+  function isChunkErr(msg, target){
+    if (msg && (msg.indexOf('Loading chunk') !== -1 || msg.indexOf('ChunkLoadError') !== -1)) return true;
+    if (target && target.tagName === 'SCRIPT' && target.src && target.src.indexOf('/_next/static/') !== -1) return true;
+    return false;
+  }
+  function reloadOnce(){
+    var key = 'nexus:chunkReload';
+    var last = sessionStorage.getItem(key);
+    var now = Date.now();
+    if (!last || now - parseInt(last, 10) > 30000) {
+      sessionStorage.setItem(key, String(now));
+      window.location.reload();
     }
+  }
+  window.addEventListener('error', function(e){
+    if (isChunkErr(e && e.message, e && e.target)) reloadOnce();
+  }, true);
+  window.addEventListener('unhandledrejection', function(e){
+    var r = e && e.reason;
+    var msg = r ? ((r.name || '') + ' ' + (r.message || '')) : '';
+    if (isChunkErr(msg, null)) reloadOnce();
   });
 })();`;
 

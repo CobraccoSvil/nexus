@@ -49,7 +49,15 @@ Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
   $op = Get-Process -Id $_ -ErrorAction SilentlyContinue
   if ($op -and $op.ProcessName -eq 'node') {
     cmd /c "taskkill /PID $($op.Id) /T /F >nul 2>nul"
-    Write-Host ("fermato (per porta :{0}) web-ide pid {1}" -f $webPort, $op.Id) -ForegroundColor Yellow
+    Start-Sleep -Milliseconds 500
+    if (Get-Process -Id $op.Id -ErrorAction SilentlyContinue) {
+      # Sopravvive al kill: orfano a integrita' piu' alta (avviato da shell elevata).
+      # Un dev-stop non-admin non puo' terminarlo -> avvisa invece di fallire muto.
+      Write-Warning ("web-ide pid {0} occupa ancora :{1} dopo il kill: processo probabilmente ELEVATO. Rilancia questo script da una PowerShell come amministratore." -f $op.Id, $webPort)
+    }
+    else {
+      Write-Host ("fermato (per porta :{0}) web-ide pid {1}" -f $webPort, $op.Id) -ForegroundColor Yellow
+    }
   }
 }
 Write-Host 'Stack fermato.' -ForegroundColor Cyan
