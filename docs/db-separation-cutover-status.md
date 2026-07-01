@@ -56,46 +56,46 @@ ogni progetto sia autocontenuto e portabile.
 - **Hot-path learning**: `orchestrator/core.rs` INSERT orchestrator_runs + UPDATE
   prompt_corrections (retrieved_count) sul pool del progetto.
 
+## Completato (porting separazione DB)
+1. **Dominio chat + run instradato + write split-brain chiuse**: audit avversariale
+   del write-path (4 gruppi tabelle) -> instradato il ciclo di vita `agent_runs`
+   (spawn/finalize/panic/confirm/cancel), mutazioni sessione, `stop_process`,
+   worklog, e le letture incoerenti. Vedi commit be215c6.
+2. **Endpoint by-id** (feedback_error/positive, delete_chat_message, confirm/cancel
+   run, toggle_project_memory, admin_review/delete): risolti via **directory di
+   routing generalizzata** `nexus_data_routing` (entity_kind session/message/run/
+   correction/feedback) con `register_entity_routing` ai punti di creazione +
+   resolver `project_data_pool_by_{message,run,correction,feedback}_from`. I
+   resolver hanno fallback a ricerca iterando i DB-progetto + AUTO-registrazione
+   (self-healing) per le entita' inserite inline. Commit 3d78d44.
+3. **`chat_learning`**: query per-progetto instradate; viste admin GLOBALI
+   (`admin_list_feedback_errors` con split del JOIN `users`, `admin_list_prompt_
+   corrections`, `run_vector_compaction`) via iterazione progetti + dedup. Commit
+   a100f6f.
+4. **`chat-service` ELIMINATO**: era uno stub abbandonato non nel percorso (tutte
+   le `/api/chat/*` vanno a mcp-core). Crate + riferimenti rimossi (commit 1519c1b).
+5. **Dominio costi**: RESTA sul meta-DB **per design**. Le quote (`ai_quota_policies`,
+   scope `user`/`project`/`user_project`) aggregano `ai_usage_ledger` per utente
+   CROSS-progetto; migrare il ledger per-progetto romperebbe l'enforcement quota
+   utente (impossibile sommare cross-DB in una transazione `FOR UPDATE`). La
+   visibilita' costi per-progetto e' data dalla colonna `project_id` filtrata sul
+   ledger meta. Non e' un gap.
+
 ## Resta da fare (prima del flip)
-1. **`chat_learning.rs`** (in corso): query per-progetto instradate; le viste
-   admin GLOBALI (`admin_list_feedback_errors` con `LEFT JOIN users` + nessun
-   filtro progetto; `run_vector_compaction`; `admin_retrain`) richiedono
-   iterazione progetti + split del JOIN verso `users` (meta). Il JOIN
-   `prompt_corrections`↔`chat_sessions` (entrambe migrate) e' invece instradabile.
-2. **Endpoint feedback message-keyed** (`feedback_error`, `feedback_positive` in
-   `chat_messages/handlers.rs`): keyed solo da `message_id`, senza session/project
-   a monte -> il pool non e' risolvibile prima di leggere il messaggio (che vive
-   nel DB del progetto). **Restano su meta** (coerenti a flag OFF). Fix deliberato:
-   passare `session_id` nel body dal frontend, oppure directory `message->project`
-   (sconsigliata: una riga di routing per messaggio). A flag ON questi 2 endpoint
-   degradano (404), NON corrompono.
-3. **Scan globali processi** (`main.rs` boot-recovery riga ~239, `task_watchdog`):
-   `SELECT/UPDATE agent_processes` su TUTTI i progetti -> iterare `list_project_ids`
-   (pattern run_reaper). NB: codice `/proc`+`kill -0` Linux-specifico, in porting
-   su questa branch Windows; degrada (non reconcilia i processi per-progetto), non
-   corrompe.
-4. **`chat-service`** (crate separato, PROCESSO distinto): **NON nel percorso
-   attivo** — `next.config.ts` (righe 84-86) instrada TUTTE le `/api/chat/*` a
-   mcp-core (:4000), non a chat-service (:4020): "chat-service e' ancora uno stub
-   incompleto". Quindi NON e' bloccante per il flip. Se/quando verra' completato:
-   essendo un processo separato non vede il registry in-process di mcp-core ->
-   serve un resolver proprio (flag + `nexus_data_routing` + `connection_secret` da
-   `project_database_config`, NO provisioning), via crate basso `nexus-project-pool`
-   condiviso (regola L).
-5. **Dominio costi** ("costi"): tabella `ai_usage_ledger` (per-progetto), scritta in
-   `mcp-core/billing.rs` (righe ~368/404/438) DENTRO una transazione `db.begin()`
-   che legge/scrive anche le tabelle quote (`read_active_quotas`) NON migrate ->
-   transazione MISTA (non instradabile senza untangle). Schema NON ancora in
-   `db/migrations/project/*`. `billing-service` (crate) e' **dormiente** (next.config
-   riga 90: `/api/billing/*` non routati). Richiede: migrazione schema ledger (+
-   decidere se migrare anche le quote o splittare la tx) + dati + routing.
-6. **Flip + deploy + test UI** (vedi sotto).
+1. **Scan globali processi** (`main.rs` boot-recovery ~riga 239, `task_watchdog`):
+   `SELECT/UPDATE agent_processes` su TUTTI i progetti -> iterare `list_all_project_ids`
+   (pattern run_reaper) con dedup. NB codice `/proc`+`kill -0` Linux-specifico, in
+   porting su questa branch Windows; degrada (recovery processi parziale), NON
+   corrompe. Da fare quando il porting Windows di main.rs si stabilizza.
+2. **KB (wiki_docs) resta sul meta**: i worker wiki leggono run/chat dal pool
+   progetto ma scrivono `wiki_docs`/Qdrant sul meta (dominio KB non migrato).
+   Multi-tenant per `scope`/`project_id`, non split-brain.
+3. **Flip + deploy + test UI** (vedi sotto).
 
 > Nota: tutto il codice instradato e' behavior-preserving a flag OFF
-> (`project_data_pool_*` ritorna il meta-DB). I punti 1-5 residui degradano ma NON
-> corrompono a flag ON: viste admin incomplete / feedback 404 / recovery processi
-> parziale / costi sul meta. Nessuno crea split-brain dei WRITE del dominio
-> chat/run gia' instradati.
+> (`project_data_pool_*` ritorna il meta-DB). I residui 1-2 degradano ma NON
+> corrompono a flag ON. Nessuno split-brain dei WRITE dei domini chat/run/learning
+> gia' instradati.
 
 ## Procedura di flip
 Il grosso (dominio chat + run) e' instradato: si puo' flippare per i progetti
