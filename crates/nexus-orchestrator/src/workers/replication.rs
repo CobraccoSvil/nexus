@@ -149,7 +149,7 @@ impl LearningWorker for ReplicationWorker {
         // Tentativo 1: usa il router per persistere (se disponibile)
         // In futuro: router.persist_namespace_batch(&batch)
         // Per ora: serializza il batch nel namespace come `replication:pending`
-        // Un consumer esterno (es. chat-service) può leggere questa chiave e
+        // Un consumer esterno (es. un microservizio Nexus) può leggere questa chiave e
         // fare la scrittura su PostgreSQL.
         let value = serde_json::to_value(&batch).unwrap_or(serde_json::Value::Null);
         ns.set_with_ttl(

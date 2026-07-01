@@ -30,7 +30,7 @@ if (Test-Path $PIDFILE) {
 # (node.exe) resta ESCLUSO: killare per nome ucciderebbe altri Node non correlati
 # (viene fermato sopra tramite il pidfile).
 $names = 'mcp-core', 'nexus-gateway', 'admin-service', 'billing-service',
-'doc-service', 'plugin-service', 'chat-service', 'qdrant', 'GarnetServer'
+'doc-service', 'plugin-service', 'qdrant', 'GarnetServer'
 foreach ($n in $names) {
   Get-Process -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
     cmd /c "taskkill /PID $($_.Id) /T /F >nul 2>nul"

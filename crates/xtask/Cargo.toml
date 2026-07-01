@@ -16,6 +16,12 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 mcp-quality = { path = "../mcp-quality" }
+# audit-settings A1 (DB live): connessione sqlx diretta a DATABASE_URL invece di
+# `docker exec psql` (regola G: config dal DB, niente hardcode infrastruttura).
+# tokio: runtime current-thread effimero per la singola query async.
+sqlx = { workspace = true }
+tokio = { workspace = true }
+dotenvy = { workspace = true }
 
 [lints]
 workspace = true
