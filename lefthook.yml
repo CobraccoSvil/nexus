@@ -12,6 +12,10 @@
 pre-commit:
   parallel: false
   commands:
+    # NB Windows: i comandi sono estratti in script (path singolo, senza quote
+    # annidate) perche' lefthook su Windows PERDE le virgolette di
+    # `run: bash -lc "cmd con spazi"` -> il tool gira senza subcomando e stampa
+    # l'usage con exit 1 (falso fallimento). Stesso motivo di check-no-emoji.sh.
     turbo_quick:
       glob:
         - "*.ts"
@@ -19,7 +23,7 @@ pre-commit:
         - "*.js"
         - "*.jsx"
         - "*.json"
-      run: bash -lc "pnpm exec turbo run typecheck lint --continue"
+      run: bash scripts/hook-turbo-quick.sh
       fail_text: "pre-commit turbo fallito: correggi typecheck/lint."
 
     cargo_check_quick:
@@ -28,7 +32,7 @@ pre-commit:
         - "*.toml"
         - "*.yaml"
         - "*.yml"
-      run: bash -lc "cargo check --workspace"
+      run: bash scripts/hook-cargo-check.sh
       fail_text: "pre-commit cargo fallito: correggi cargo check."
 
     # Guard dei punti unici (regola L / ADR 0026): grep istantaneo, blocca nuove
@@ -39,7 +43,7 @@ pre-commit:
         - "*.rs"
         - "*.ts"
         - "*.tsx"
-      run: bash -lc "bash scripts/check-single-source.sh"
+      run: bash scripts/check-single-source.sh
       fail_text: "pre-commit: regressione su un punto unico (regola L / ADR 0026)."
 
 commit-msg:
