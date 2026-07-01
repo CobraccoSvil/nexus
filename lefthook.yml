@@ -9,13 +9,16 @@
 
 # Emergenza: LEFTHOOK=0
 
+# NB Windows: lefthook word-splitta il campo 'run' ignorando le virgolette, quindi
+# 'bash -lc "comando con spazi"' veniva eseguito come 'bash -lc comando con spazi'
+# (bash riceveva come command string solo il primo token -> falso-verde). Per i
+# comandi non banali si invoca SEMPRE uno script dedicato in scripts/ con due soli
+# token ('bash scripts/<nome>.sh'); cosi' nessuna interpolazione li corrompe.
+# Pattern di riferimento: commit-msg no-emoji -> scripts/check-no-emoji.sh.
+
 pre-commit:
   parallel: false
   commands:
-    # NB Windows: i comandi sono estratti in script (path singolo, senza quote
-    # annidate) perche' lefthook su Windows PERDE le virgolette di
-    # `run: bash -lc "cmd con spazi"` -> il tool gira senza subcomando e stampa
-    # l'usage con exit 1 (falso fallimento). Stesso motivo di check-no-emoji.sh.
     turbo_quick:
       glob:
         - "*.ts"
@@ -23,16 +26,19 @@ pre-commit:
         - "*.js"
         - "*.jsx"
         - "*.json"
-      run: bash scripts/hook-turbo-quick.sh
+      run: bash scripts/precommit-turbo.sh
       fail_text: "pre-commit turbo fallito: correggi typecheck/lint."
 
+    # Solo sorgenti Rust e manifest cargo: nessun file *.yaml/*.yml e' input di
+    # 'cargo check' (verificato: niente include_str! di yaml, build.rs leggono solo
+    # .proto). Il glob yaml/yml ereditato dallo scaffold iniziale faceva girare un
+    # cargo check dell'intero workspace a ogni commit di config (es. questo stesso
+    # lefthook.yml): 10+ minuti inutili che spingono verso --no-verify (vietato, C).
     cargo_check_quick:
       glob:
         - "*.rs"
         - "*.toml"
-        - "*.yaml"
-        - "*.yml"
-      run: bash scripts/hook-cargo-check.sh
+      run: bash scripts/precommit-cargo-check.sh
       fail_text: "pre-commit cargo fallito: correggi cargo check."
 
     # Guard dei punti unici (regola L / ADR 0026): grep istantaneo, blocca nuove
@@ -60,10 +66,6 @@ commit-msg:
 post-commit:
   parallel: false
   commands:
-    # NB Windows: comando estratto in script (path singolo, senza quote annidate
-    # ne' continuazioni multilinea) perche' Git Bash corrompe il corpo JSON del
-    # curl inline -> "syntax error: unexpected end of file" con exit 2 (falso
-    # fallimento). Stesso motivo di hook-turbo-quick.sh / hook-cargo-check.sh.
     meta_docs_ingest:
-      run: bash scripts/hook-meta-docs-ingest.sh
+      run: bash scripts/postcommit-meta-docs.sh
       fail_text: ""
