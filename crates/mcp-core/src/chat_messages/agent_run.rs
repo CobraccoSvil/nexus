@@ -373,15 +373,17 @@ fn is_report_hollow(result: &crate::agent_types::AgentRunResult) -> bool {
 }
 
 /// Status canonico del run: declassa l'hollow SENZA LAVORO (0 step + risposta
-/// vuota, oppure rinuncia esplicita) a `FailedDiagnosed` — mai un "completed"
-/// muto (esito certo). L'hollow CON step completati resta lo status originale.
+/// vuota) a `FailedDiagnosed` — mai un "completed" muto (esito certo).
+/// L'hollow CON step completati resta lo status originale. La rinuncia
+/// esplicita non passa piu' da qui: e' dichiarata via task_complete
+/// (refusal/blocked, ADR 0034 — la detection lessicale RESIGNED e' stata
+/// rimossa, ADR 0018 fase 3).
 pub(crate) fn canonical_run_status(
     result: &crate::agent_types::AgentRunResult,
 ) -> AgentRunStatus {
     if is_report_hollow(result) {
-        let no_work = (result.steps.is_empty()
-            && result.hollow_completion_kind.contains("EMPTY_ANSWER"))
-            || result.hollow_completion_kind == "RESIGNED";
+        let no_work = result.steps.is_empty()
+            && result.hollow_completion_kind.contains("EMPTY_ANSWER");
         if no_work {
             return AgentRunStatus::FailedDiagnosed;
         }
@@ -2987,9 +2989,9 @@ pub(crate) async fn spawn_agent_run(
                         );
                         }
                     } else if result.hollow_completion {
-                        // Hollow generico NON dovuto al tool-forcing (empty answer /
-                        // resigned con content): mantiene la semantica storica sul
-                        // contatore consecutive_failures -> is_enabled=false a soglia 3.
+                        // Hollow generico NON dovuto al tool-forcing (empty answer):
+                        // mantiene la semantica storica sul contatore
+                        // consecutive_failures -> is_enabled=false a soglia 3.
                         let new_count: Option<i32> = sqlx::query_scalar(
                             "UPDATE ai_price_catalog
                             SET consecutive_failures = consecutive_failures + 1,
@@ -3388,7 +3390,6 @@ pub(crate) async fn spawn_agent_run(
                                 "empty_after_text"
                             }
                         }
-                        "RESIGNED" => "resigned_after_few_steps",
                         "NO_TOOLS" => "no_tool_calls",
                         _ => "unknown",
                     };
@@ -3572,17 +3573,17 @@ pub(crate) async fn spawn_agent_run(
             //
             // Esito CERTO (mai "completed" vuoto): un run hollow confermato dopo
             // l'esaurimento dei retry, che NON ha eseguito alcuna azione e non ha
-            // prodotto risposta (EMPTY_ANSWER con steps vuoti) oppure ha rinunciato
-            // esplicitamente (RESIGNED), non e' un successo: marcarlo 'completed'
-            // mostrava all'utente un esito ambiguo ("completato" + nessun
-            // contenuto). Lo si declassa all'esito canonico failed_diagnosed: la
-            // diagnosi e' il placeholder/recap gia' composto sopra (answer_owned).
-            // Un hollow con step completati resta invece Completed (il lavoro c'e',
-            // manca solo la conferma testuale del modello).
+            // prodotto risposta (EMPTY_ANSWER con steps vuoti), non e' un successo:
+            // marcarlo 'completed' mostrava all'utente un esito ambiguo
+            // ("completato" + nessun contenuto). Lo si declassa all'esito canonico
+            // failed_diagnosed: la diagnosi e' il placeholder/recap gia' composto
+            // sopra (answer_owned). Un hollow con step completati resta invece
+            // Completed. La rinuncia esplicita e' gestita dal segnale strutturato
+            // task_complete (ADR 0034), non piu' dalla detection lessicale RESIGNED
+            // (rimossa, ADR 0018 fase 3).
             let hollow_no_work = report_hollow
-                && ((result.steps.is_empty()
-                    && result.hollow_completion_kind.contains("EMPTY_ANSWER"))
-                    || result.hollow_completion_kind == "RESIGNED");
+                && result.steps.is_empty()
+                && result.hollow_completion_kind.contains("EMPTY_ANSWER");
             // Esito CERTO (errore provider): un run che si chiuderebbe `completed`
             // ma la cui unica risposta e' il messaggio di errore provider
             // sintetizzato dall'executor SENZA token di completion e' un
@@ -4896,12 +4897,14 @@ mod tests_finalize_turn {
             "EMPTY_ANSWER", Some("fix"),
         );
         assert_eq!(canonical_run_status(&r), AgentRunStatus::FailedDiagnosed);
-        // RESIGNED -> failed_diagnosed anche con risposta.
+        // La rinuncia esplicita non e' piu' un kind lessicale (RESIGNED rimosso,
+        // ADR 0018 fase 3): un completed con risposta e kind vuoto resta tale
+        // (la rinuncia dichiarata passa da task_complete refusal/blocked).
         let r2 = mk_result(
             AgentRunStatus::Completed, vec![], Some("non posso"), true,
-            "RESIGNED", Some("fix"),
+            "", Some("fix"),
         );
-        assert_eq!(canonical_run_status(&r2), AgentRunStatus::FailedDiagnosed);
+        assert_eq!(canonical_run_status(&r2), AgentRunStatus::Completed);
     }
 
     #[test]

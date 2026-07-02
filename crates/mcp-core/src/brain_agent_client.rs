@@ -1332,58 +1332,15 @@ pub async fn run_via_brain(
         status == AgentRunStatus::Completed && had_tools && steps.is_empty() && iteration <= 1;
     let hollow_empty_answer = status == AgentRunStatus::Completed && final_answer_empty;
 
-    // ── Detection "RESIGNED" ─────────────────────────────────────────────
-    // Il modello completa con content NON vuoto MA il content e' una
-    // rinuncia ("non posso", "non riesco", "mi dispiace") E non ha chiamato
-    // nessun tool. Significa che ha capacita' insufficiente per il task.
-    // Visto in prod 2026-05-20: gemini-2.5-flash su task fix complesso
-    // ha emesso 422 token con "Non e' possibile eseguire le operazioni
-    // richieste..." senza usare alcun tool.
-    //
-    // Pattern indicativi di rinuncia (italiano + inglese). False positives
-    // mitigati richiedendo:
-    //   - had_tools=true (intent richiede tool, quindi 0 tool call e' sintomo)
-    //   - steps.is_empty() (nessun tool effettivamente invocato)
-    //   - final_answer NON vuoto ma matcha pattern
-    let resigned_patterns = [
-        "non riesco a",
-        "non posso eseguire",
-        "non posso accedere",
-        "non posso interagire",
-        "non e' possibile eseguire",
-        "non è possibile eseguire",
-        "mi dispiace, ma non posso",
-        "mi dispiace ma non posso",
-        "i'm unable to",
-        "i cannot access",
-        "i cannot execute",
-        "i can't interact",
-        "i'm sorry, i can't",
-        "sembra che il server",
-        "il server non e' disponibile",
-        "il server non è disponibile",
-    ];
-    let final_lc = final_answer.to_lowercase();
-    let matches_resigned = resigned_patterns.iter().any(|p| final_lc.contains(p));
-    // RESIGNED rilevato quando:
-    //  - status=Completed
-    //  - had_tools=true (intent richiede tool)
-    //  - final_answer non vuoto MA matcha pattern di rinuncia
-    //  - iteration <= 2 (rinuncia presto, dopo max 1-2 step)
-    // Non richiediamo steps.is_empty(): il modello potrebbe aver provato
-    // 1 tool che ha fallito, e poi aver "rinunciato" emettendo un messaggio
-    // tipo "Non riesco a..." invece di provare strategie alternative.
-    let hollow_resigned = status == AgentRunStatus::Completed
-        && had_tools
-        && !final_answer_empty
-        && matches_resigned
-        && iteration <= 2;
-
-    let hollow_completion = hollow_no_tools || hollow_empty_answer || hollow_resigned;
+    // La detection "RESIGNED" (blacklist di frasi di rinuncia sul testo) e'
+    // stata RIMOSSA (ADR 0018 fase 3, regola M): la rinuncia va dichiarata dal
+    // modello in forma STRUTTURATA via task_complete (outcome=blocked/partial,
+    // refusal=true — ADR 0034, gestita nel path nativo da declared_refusal/
+    // blocked in agent_run.rs). Restano i soli segnali strutturali hollow:
+    // zero tool su intent che li richiede, risposta vuota.
+    let hollow_completion = hollow_no_tools || hollow_empty_answer;
     let hollow_kind: &str = if !hollow_completion {
         ""
-    } else if hollow_resigned {
-        "RESIGNED"
     } else if hollow_empty_answer && !hollow_no_tools {
         "EMPTY_ANSWER"
     } else if hollow_empty_answer {

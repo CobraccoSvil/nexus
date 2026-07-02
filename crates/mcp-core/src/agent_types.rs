@@ -272,10 +272,12 @@ pub struct AgentRunResult {
     #[serde(default)]
     pub hollow_no_tools: bool,
     /// Sottotipo specifico dell'hollow_completion per la diagnostica QW2:
-    /// "EMPTY_ANSWER" | "NO_TOOLS" | "EMPTY_ANSWER+NO_TOOLS" | "RESIGNED" | "".
+    /// "EMPTY_ANSWER" | "NO_TOOLS" | "EMPTY_ANSWER+NO_TOOLS" | "".
     /// Vuoto se hollow_completion=false. Propagato dal caller (brain_agent_client)
     /// al persistente (chat_messages/agent_run) per il log in
-    /// `nexus_provider_empty_responses` (mig 0291).
+    /// `nexus_provider_empty_responses` (mig 0291). Il kind lessicale "RESIGNED"
+    /// e' stato rimosso (ADR 0018 fase 3): la rinuncia e' dichiarata dal modello
+    /// via task_complete (refusal/blocked, ADR 0034).
     #[serde(default)]
     pub hollow_completion_kind: String,
     /// Ragionamento (thinking) accumulato del run: concatenazione di tutti i
