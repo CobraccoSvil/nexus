@@ -201,7 +201,8 @@ pub async fn run_one_round(db: &PgPool) -> anyhow::Result<PromoteStats> {
 
 /// Disattiva le righe "stale" della routing matrix: righe `is_active=true` e
 /// `manual_override=false` il cui `(provider, model_id)` NON ha piu' nel catalog
-/// un modello sano (`is_enabled=true AND consecutive_failures=0`).
+/// un modello ABILITATO (`is_enabled=true`; salute = solo is_enabled, la probe
+/// auto-disabilita a soglia — ADR 0025, niente filtro consecutive_failures).
 ///
 /// Idempotente: una seconda esecuzione non tocca nulla (le righe sono gia'
 /// `is_active=false`). RISPETTA `manual_override=true` — quelle righe non
@@ -237,9 +238,17 @@ pub async fn cleanup_stale_rows(db: &PgPool) -> sqlx::Result<u64> {
     const STALE_TAG: &str = " [auto-cleanup: modello non disponibile nel catalog]";
 
     // Disattiva le righe stale. Il NOT EXISTS confronta la riga matrix con un
-    // modello sano nel catalog (case-insensitive sul provider per coerenza con
-    // il resto del sistema). Appende il marcatore a notes solo se non gia'
-    // presente (idempotenza sul testo di notes).
+    // modello presente e ABILITATO nel catalog (case-insensitive sul provider per
+    // coerenza col resto del sistema). Appende il marcatore a notes solo se non
+    // gia' presente (idempotenza sul testo di notes).
+    //
+    // NB: la salute e' garantita SOLO da is_enabled (punto unico: la probe
+    // auto-disabilita a soglia). NON si filtra consecutive_failures, coerente
+    // col filtro candidati del promote (ADR 0025 / FASE 2b): pretendere
+    // failures=0 qui creava starvation — la riga spenta non riceve traffico,
+    // il contatore non si azzera mai, la riga resta spenta per sempre (visto
+    // il 2026-07-02: deepseek/google/mistral promossi con score alto e subito
+    // rispenti dal cleanup, matrice ridotta ai soli manual_override).
     let res = sqlx::query(
         "UPDATE nexus_routing_matrix m
             SET is_active = false,
@@ -254,7 +263,6 @@ pub async fn cleanup_stale_rows(db: &PgPool) -> sqlx::Result<u64> {
                  WHERE LOWER(c.provider) = LOWER(m.provider)
                    AND c.model = m.model_id
                    AND c.is_enabled = true
-                   AND c.consecutive_failures = 0
             )",
     )
     .bind(STALE_TAG)
@@ -433,7 +441,10 @@ pub async fn heal_orphan_pinned_models(db: &PgPool) -> sqlx::Result<u64> {
         let dead_model: String = o.try_get("dead_model").unwrap_or_default();
         let tier: String = o.try_get("tier").unwrap_or_default();
 
-        // 2. Carica i candidati sani dello stesso (provider, tier).
+        // 2. Carica i candidati abilitati dello stesso (provider, tier).
+        //    Salute = solo is_enabled (ADR 0025, come load_catalog e il cleanup):
+        //    pretendere consecutive_failures=0 lasciava il modello deprecato
+        //    senza sostituto quando tutti i candidati avevano counter stale.
         let cand_rows = sqlx::query(
             "SELECT model, COALESCE(is_featured, false) AS is_featured,
                     COALESCE(context_window, 8192) AS context_window,
@@ -442,7 +453,6 @@ pub async fn heal_orphan_pinned_models(db: &PgPool) -> sqlx::Result<u64> {
               WHERE LOWER(provider) = LOWER($1)
                 AND performance_tier = $2
                 AND is_enabled = true
-                AND consecutive_failures = 0
                 AND model <> $3",
         )
         .bind(&provider)
@@ -648,8 +658,8 @@ fn select_top_candidates(req: &IntentRequirement, catalog: &[CatalogModel]) -> V
 
 /// Punto unico di selezione modello per un requisito tier+capability (regola L).
 ///
-/// Carica il catalog SANO (`is_enabled = true`, `consecutive_failures = 0`) e
-/// usa lo STESSO scoring di `select_top_candidates` che governa la
+/// Carica il catalog ABILITATO (`is_enabled = true`; salute = solo is_enabled,
+/// ADR 0025) e usa lo STESSO scoring di `select_top_candidates` che governa la
 /// `nexus_routing_matrix` per intent. Ritorna i `(provider, model)` ordinati per
 /// score (uno per provider, max 3): il chiamante puo' scorrere la lista
 /// saltando i provider in cooldown.
@@ -1122,9 +1132,11 @@ mod tests {
     }
 
     /// Regola PURA: la riga matrix va disattivata dal cleanup?
-    /// True sse: e' attiva, non manuale, e nel catalog NON esiste un modello sano
-    /// (`is_enabled=true AND consecutive_failures=0`) con stesso provider
-    /// (case-insensitive) e stesso model_id.
+    /// True sse: e' attiva, non manuale, e nel catalog NON esiste un modello
+    /// ABILITATO (`is_enabled=true`) con stesso provider (case-insensitive) e
+    /// stesso model_id. La salute e' SOLO is_enabled (ADR 0025): pretendere
+    /// consecutive_failures=0 creava starvation (riga spenta -> zero traffico ->
+    /// counter mai azzerato -> riga spenta per sempre, incidente 2026-07-02).
     /// Identica alla condizione della query SQL di `cleanup_stale_rows`.
     fn row_should_be_deactivated(row: &MatrixRowRef, catalog: &[CatalogHealthRef]) -> bool {
         if !row.is_active || row.manual_override {
@@ -1134,7 +1146,6 @@ mod tests {
             c.provider.eq_ignore_ascii_case(&row.provider)
                 && c.model == row.model_id
                 && c.is_enabled
-                && c.consecutive_failures == 0
         });
         !has_healthy
     }
@@ -1165,11 +1176,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_deactivates_row_with_failing_model() {
-        // Modello enabled ma con consecutive_failures>0 -> non e' "sano".
+    fn cleanup_keeps_row_with_failing_but_enabled_model() {
+        // REGRESSIONE incidente 2026-07-02: modello enabled con
+        // consecutive_failures>0 e' ancora "sano" per il cleanup (la salute e'
+        // solo is_enabled, ADR 0025). Il vecchio filtro failures=0 spegneva la
+        // riga -> zero traffico -> counter mai azzerato -> starvation.
         let row = mrow("openai", "gpt-5", true, false);
         let catalog = vec![chealth("openai", "gpt-5", true, 2)];
-        assert!(row_should_be_deactivated(&row, &catalog));
+        assert!(!row_should_be_deactivated(&row, &catalog));
     }
 
     #[test]
