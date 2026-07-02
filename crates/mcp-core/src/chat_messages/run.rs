@@ -73,6 +73,10 @@ pub(crate) async fn run_turn(
         "intent": payload["intent"].as_str().unwrap_or("chat"),
         "runId": run_id,
         "promptTokens": payload["prompt_tokens"].as_i64().unwrap_or(0),
+        // Turno singolo (nessun loop agentico): l'ultimo prompt coincide col
+        // totale. Alimenta il context ratio della UI (nel path agentico i due
+        // valori divergono: vedi agent_run.rs, lastPromptTokens).
+        "lastPromptTokens": payload["prompt_tokens"].as_i64().unwrap_or(0),
         "completionTokens": payload["completion_tokens"].as_i64().unwrap_or(0),
         "totalTokens": payload["total_tokens"].as_i64().unwrap_or(0),
         "totalCost": payload["total_cost"].as_f64().unwrap_or(0.0),

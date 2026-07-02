@@ -694,6 +694,12 @@ export function useChat(
               ...run.usage,
               totalPromptTokens:
                 usage.lastPromptTokens || usage.promptTokens || run.usage?.totalPromptTokens,
+              // Riempimento contesto (ratio ctx%): il motore nativo emette
+              // promptTokens PER-TURNO nell'evento agent_usage, il ponte brain
+              // emette lastPromptTokens esplicito. Campo dedicato, mai il
+              // cumulativo di billing.
+              lastPromptTokens:
+                usage.lastPromptTokens ?? usage.promptTokens ?? run.usage?.lastPromptTokens,
               totalCompletionTokens: usage.completionTokens ?? run.usage?.totalCompletionTokens,
               totalTokens: usage.totalTokens ?? run.usage?.totalTokens,
             },
@@ -1096,6 +1102,10 @@ export function useChat(
                   ...run.usage,
                   totalPromptTokens:
                     usage.lastPromptTokens || usage.promptTokens || run.usage?.totalPromptTokens,
+                  // Come nella sottoscrizione primaria: campo dedicato al
+                  // riempimento contesto (per-turno), mai il cumulativo billing.
+                  lastPromptTokens:
+                    usage.lastPromptTokens ?? usage.promptTokens ?? run.usage?.lastPromptTokens,
                   totalCompletionTokens: usage.completionTokens ?? run.usage?.totalCompletionTokens,
                   totalTokens: usage.totalTokens ?? run.usage?.totalTokens,
                 },

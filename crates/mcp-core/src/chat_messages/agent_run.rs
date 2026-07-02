@@ -1327,7 +1327,12 @@ async fn native_outcome_to_run_result(
         completion_tokens: outcome.completion_tokens.max(0) as u32,
         total_tokens: outcome.total_tokens.max(0) as u32,
         total_cost: outcome.total_cost,
-        last_prompt_tokens: None,
+        // Lo stato del grafo nativo e' last-write per-turno: outcome.prompt_tokens
+        // E' il prompt dell'ultima iterazione (riempimento contesto corrente).
+        // Va catturato qui, PRIMA che reconcile_run_cost_from_ledger sovrascriva
+        // prompt_tokens col cumulativo di billing del ledger.
+        last_prompt_tokens: (outcome.prompt_tokens > 0)
+            .then_some(outcome.prompt_tokens as u32),
         error_class: None,
         stop_reason,
         // Intent del turno: pilota la decisione hollow/conversational del
@@ -3467,6 +3472,16 @@ pub(crate) async fn spawn_agent_run(
                     "totalCost": result.total_cost,
                     "currency": "USD",
                 });
+                // Context ratio UI: prompt dell'ULTIMA chiamata LLM del run.
+                // `promptTokens` qui sopra e' il CUMULATIVO di tutte le
+                // iterazioni (billing): usato come riempimento contesto
+                // produceva percentuali assurde (es. 5046% ctx). Aggiunto SOLO
+                // se presente: senza il campo la UI nasconde la percentuale.
+                if let Some(last_pt) = result.last_prompt_tokens.filter(|v| *v > 0) {
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.insert("lastPromptTokens".to_string(), json!(last_pt));
+                    }
+                }
                 // FIX D4: persisti il ragionamento (thinking) accumulato del run.
                 // LIVE viaggiava solo come evento SSE `agent_thinking` (volatile):
                 // al refresh il blocco "Ragionamento" spariva. Salvandolo qui nel
@@ -5058,6 +5073,35 @@ mod tests_finalize_turn {
             (r.total_cost, r.prompt_tokens, r.completion_tokens, r.total_tokens),
             before,
             "result invariato quando il ledger e' vuoto"
+        );
+    }
+
+    #[test]
+    fn ledger_preserva_last_prompt_tokens_per_context_ratio() {
+        // Regressione badge "5046% ctx": last_prompt_tokens (prompt dell'ULTIMA
+        // iterazione, numeratore del context ratio della UI) NON deve essere
+        // toccato dalla riconciliazione ledger, che sovrascrive prompt_tokens
+        // col CUMULATIVO di billing di tutte le iterazioni del run. Se i due
+        // campi tornassero a coincidere, il ratio esploderebbe di nuovo sui run
+        // multi-iterazione.
+        let mut r = mk_result(
+            AgentRunStatus::Completed, vec![write_step()], Some("fatto"), false,
+            "", Some("fix"),
+        );
+        r.last_prompt_tokens = Some(42_000);
+        let ledger = super::LedgerTotals {
+            total_cost: 0.5,
+            prompt_tokens: 1_650_000, // cumulativo multi-iterazione
+            completion_tokens: 40_000,
+            total_tokens: 1_690_000,
+        };
+        let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
+        assert!(applied, "ledger con costo > 0 e' autoritativo per il billing");
+        assert_eq!(r.prompt_tokens, 1_650_000, "billing dal ledger (cumulativo)");
+        assert_eq!(
+            r.last_prompt_tokens,
+            Some(42_000),
+            "il riempimento contesto resta quello dell'ultima iterazione"
         );
     }
 

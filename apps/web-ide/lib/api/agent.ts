@@ -43,6 +43,11 @@ interface AgentPendingAction {
 
 interface AgentRunUsage {
   totalPromptTokens?: number;
+  /** Prompt token dell'ultima iterazione (riempimento contesto). Popolato SOLO
+      dagli eventi live agent_usage: i run letti dal DB non lo hanno (il ratio
+      ctx% ricade sul lastPromptTokens del messaggio assistant persistito).
+      totalPromptTokens NON va usato per il ratio: dal DB e' il cumulativo. */
+  lastPromptTokens?: number;
   totalCompletionTokens?: number;
   totalTokens?: number;
   cacheReadTokens?: number;

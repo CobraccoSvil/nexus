@@ -218,6 +218,9 @@ export function createTerminalMessage(
     provider: run.provider,
     model: run.model,
     promptTokens: run.usage?.totalPromptTokens,
+    // Riempimento contesto dell'ultima iterazione (live): tiene coerente il
+    // ratio ctx% del messaggio sintetico con quello persistito dal backend.
+    lastPromptTokens: run.usage?.lastPromptTokens,
     completionTokens: run.usage?.totalCompletionTokens,
     totalTokens: run.usage?.totalTokens,
     totalCost: run.totalCostUsd,

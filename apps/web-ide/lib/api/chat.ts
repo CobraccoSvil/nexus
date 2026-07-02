@@ -26,6 +26,12 @@ export interface ChatMessage {
   intent?: string;
   runId?: string;
   promptTokens?: number;
+  /** Prompt token dell'ULTIMA chiamata LLM del run (riempimento contesto).
+      Diverso da promptTokens, che nel path agentico e' il CUMULATIVO di tutte
+      le iterazioni (billing): il ratio ctx% deve usare SOLO questo campo.
+      Undefined per i messaggi persistiti prima della sua introduzione (la UI
+      nasconde la percentuale). */
+  lastPromptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
   totalCost?: number;
