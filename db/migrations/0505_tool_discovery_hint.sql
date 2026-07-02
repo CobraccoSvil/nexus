@@ -1,4 +1,4 @@
--- Migrazione 0504: aggiunge la sezione <tool_discovery> ai system prompt
+-- Migrazione 0505: aggiunge la sezione <tool_discovery> ai system prompt
 -- coder/base per indirizzare l'agente verso i tool di verifica (ADR 0019 L4),
 -- in particolare il nuovo `nexus_verify_change` (mig 0503, ADR 0019 L3).
 --
@@ -19,6 +19,6 @@ BEGIN
       AND is_active = TRUE
       AND content NOT LIKE '%' || sentinel || '%';
 
-    RAISE NOTICE 'Migrazione 0504 applicata: tool_discovery ADR 0019 L4 iniettata nei system prompt';
+    RAISE NOTICE 'Migrazione 0505 applicata: tool_discovery ADR 0019 L4 iniettata nei system prompt';
 END
 $$;
