@@ -695,8 +695,13 @@ async fn project_data_pool_by_entity_core(
 }
 
 pub async fn project_data_pool_by_session(state: &AppState, session_id: Uuid) -> sqlx::PgPool {
-    project_data_pool_by_entity_core(&state.db, &state.project_meta_pools, "session", session_id)
-        .await
+    // Self-healing (regola L, stesso punto unico del by-id): directory O(1); se
+    // la sessione NON e' mappata (creata prima della registrazione, o INSERT in
+    // directory fallito) NON si degrada al meta — a flag ON le tabelle chat sul
+    // meta sono VUOTE e la sessione "sparisce" dalla UI (fetch 404/lista vuota
+    // -> il client svuota la chat, incidente 2026-07-02). Si CERCA la sessione
+    // nei DB-progetto e si auto-registra la mappa per le chiamate successive.
+    project_data_pool_by_search_from(&state.db, "session", "chat_sessions", session_id).await
 }
 
 // ── Registry globale del pool per-progetto (route-at-helper) ──────────────────

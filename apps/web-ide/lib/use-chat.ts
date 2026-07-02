@@ -167,7 +167,12 @@ export function useChat(
     (async () => {
       try {
         const history = await getChatMessages(sessionId);
-        if (history.messages) setMessages(history.messages);
+        // Lista NON vuota richiesta: un array vuoto (es. lettura instradata su
+        // un pool sbagliato durante il fallback di routing) NON deve
+        // sovrascrivere la storia visibile — "la chat sparisce" (2026-07-02).
+        if (history.messages && history.messages.length > 0) {
+          setMessages(history.messages);
+        }
       } catch {
         // ignore: il TokenUsage e' gia' aggiornato; il refresh dei messaggi
         // riavverra' al prossimo turno.
@@ -341,8 +346,12 @@ export function useChat(
       setIsReady(true);
     } catch (e) {
       setError(formatChatError(e, "Impossibile inizializzare la chat."));
-      setMessages([]);
-      setSessionId(null);
+      // NON svuotare una storia gia' caricata: un refresh fallito (backend
+      // occupato, fetch transitoria KO) faceva "sparire" la chat pur avendo i
+      // messaggi in memoria (incidente 2026-07-02). Si azzera solo se non
+      // avevamo ancora nulla (primo bootstrap fallito).
+      setMessages((current) => (current.length > 0 ? current : []));
+      setSessionId((current) => current ?? null);
       setIsReady(false);
     } finally {
       setIsLoading(false);

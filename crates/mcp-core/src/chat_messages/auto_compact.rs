@@ -39,7 +39,13 @@ pub(crate) async fn maybe_auto_compact(
     .fetch_one(&chat_pool)
     .await
     .unwrap_or(0);
-    if compactable < AUTO_COMPACT_MIN_MESSAGES {
+    // Il gate sul minimo messaggi NON e' assoluto: una sessione con pochi turni
+    // ma token estremi (run agentici lunghi accumulano milioni di token in un
+    // solo messaggio assistant) restava "gonfia senza mai comprimersi"
+    // (incidente 2026-07-02). Sotto il minimo si rimanda SOLO se il ratio non
+    // e' estremo (>= 2x soglia); il check completo del ratio avviene sotto.
+    // Serve comunque ALMENO una coppia user/assistant da poter piegare.
+    if compactable < 2 {
         return;
     }
 
@@ -88,6 +94,11 @@ pub(crate) async fn maybe_auto_compact(
 
     let ratio = session_tokens as f64 / context_window as f64;
     if ratio < cfg.ratio {
+        return;
+    }
+    // Gate minimo messaggi, ratio-aware (vedi sopra): sotto AUTO_COMPACT_MIN_MESSAGES
+    // si compatta solo se il ratio e' estremo (>= 2x soglia).
+    if compactable < AUTO_COMPACT_MIN_MESSAGES && ratio < cfg.ratio * 2.0 {
         return;
     }
 
