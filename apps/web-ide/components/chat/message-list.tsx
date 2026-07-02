@@ -159,7 +159,12 @@ function ThinkingPanel({ thinking }: { thinking: string }) {
 
 function isRunSummaryMessage(msg: ChatMessage): boolean {
   if (msg.role !== "assistant") return false;
-  if (msg.totalTokens && msg.totalTokens > 0) return true;
+  // SOLO i recap legacy "--- **Riepilogo run**". La scorciatoia
+  // `totalTokens > 0` classificava come riepilogo QUALSIASI risposta di un
+  // run concluso (tutte hanno token > 0): con risposte assistant consecutive
+  // (messaggi accodati, risvegli process_resume) le risposte VERE finivano
+  // nel gruppo collassato che mostra solo i contatori -> "le risposte sono
+  // invisibili" (incidente 2026-07-02).
   const trimmed = (msg.content ?? "").trim();
   return trimmed.startsWith("---") && trimmed.includes("**Riepilogo run**");
 }
@@ -266,9 +271,18 @@ function RunSummaryGroup({ messages, tc }: { messages: ChatMessage[]; tc: ThemeC
           {messages.map((m) => {
             const { tokens, model } = getRunInfo(m);
             return (
-              <div key={m.id} style={{ fontSize: 11, color: tc.textMuted, display: "flex", gap: 6 }}>
-                <span style={{ color: tc.textSecondary }}>{tokens.toLocaleString("it-IT")} tok</span>
-                {model && <span>· {model}</span>}
+              <div key={m.id} style={{ fontSize: 11, color: tc.textMuted }}>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <span style={{ color: tc.textSecondary }}>{tokens.toLocaleString("it-IT")} tok</span>
+                  {model && <span>· {model}</span>}
+                </div>
+                {/* Contenuto del recap: senza, il gruppo espanso mostrava solo i
+                    contatori e il testo restava irraggiungibile. */}
+                {(m.content ?? "").trim() && (
+                  <div style={{ marginTop: 2, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                    {(m.content ?? "").trim()}
+                  </div>
+                )}
               </div>
             );
           })}
