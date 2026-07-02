@@ -416,6 +416,127 @@ pub fn tool_result_outcome_after(recent: &[Message], idx: usize, max_ahead: usiz
     None
 }
 
+/// Cap del testo estratto per il confronto output-progresso (evita di
+/// confrontare blob enormi: la testa e' sufficiente a distinguere due esiti).
+const OUTPUT_COMPARE_CAP: usize = 4000;
+
+/// Soglia di similarita' (Jaccard su righe) oltre cui due output della STESSA
+/// azione sono considerati "lo stesso esito". Sotto soglia = l'esito e'
+/// CAMBIATO -> la ripetizione mostra PROGRESSO (es. build che fallisce con
+/// errori diversi dopo ogni correzione), non uno stallo.
+///
+/// Taratura CONSERVATIVA (0.75): un esito identico con 1-2 righe volatili su
+/// 10 (timestamp/durate, "Done in 741ms") resta ~0.82 -> SIMILE (stallo, come
+/// storico); due errori davvero diversi condividono solo il boilerplate ->
+/// tipicamente < 0.75 -> DIVERSO (progresso). Nel dubbio si classifica SIMILE:
+/// la feature puo' solo salvare run che progrediscono, mai nascondere uno
+/// stallo piu' di quanto facesse il comportamento storico.
+pub const OUTPUT_SIMILARITY_THRESHOLD: f64 = 0.75;
+
+/// TESTO del primo tool_result dopo `idx` (gemello di
+/// [`tool_result_outcome_after`], stessa finestra e STESSE FORME accettate:
+/// `Message::Tool` langchain E `Message::Human` con blocchi `ToolResult`):
+/// usato per il confronto output-progresso. Cap [`OUTPUT_COMPARE_CAP`].
+/// `None` se nessun tool_result nella finestra.
+fn tool_result_text_after(recent: &[Message], idx: usize, max_ahead: usize) -> Option<String> {
+    let end = (idx + 1 + max_ahead).min(recent.len());
+    for nm in recent.iter().take(end).skip(idx + 1) {
+        let content = match nm {
+            Message::Tool { content, .. } => content,
+            Message::Human { content } if matches!(content, MessageContent::Blocks(_)) => content,
+            _ => continue,
+        };
+        let text: String = match content {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Blocks(blocks) => {
+                let parts: Vec<String> = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolResult { content, .. } => {
+                            Some(content_value_to_text(content))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                // Human senza alcun blocco ToolResult: non e' un tool_result
+                // (es. un nudge testuale a blocchi) -> continua a cercare.
+                if parts.is_empty() {
+                    continue;
+                }
+                parts.join("\n")
+            }
+        };
+        return Some(text.chars().take(OUTPUT_COMPARE_CAP).collect());
+    }
+    None
+}
+
+/// Forma testuale di un content di tool_result (stringa diretta o JSON
+/// serializzato): solo per il CONFRONTO strutturale, mai per decidere sul
+/// significato del testo (regola M).
+fn content_value_to_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// CONFRONTO STRUTTURALE di due output della stessa azione: Jaccard
+/// sull'insieme delle righe trimmate non vuote, soglia
+/// [`OUTPUT_SIMILARITY_THRESHOLD`]. E' una misura di uguaglianza fuzzy del
+/// dato grezzo (le righe volatili tipo "Done in 741ms" pesano 1/N), NON una
+/// classificazione semantica del contenuto (regola M rispettata: nessun
+/// pattern-matching sul significato). Due output entrambi vuoti sono simili.
+pub fn outputs_similar(a: &str, b: &str) -> bool {
+    let lines = |s: &str| -> std::collections::HashSet<String> {
+        s.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let la = lines(a);
+    let lb = lines(b);
+    if la.is_empty() && lb.is_empty() {
+        return true;
+    }
+    let inter = la.intersection(&lb).count() as f64;
+    let union = la.union(&lb).count() as f64;
+    union > 0.0 && (inter / union) >= OUTPUT_SIMILARITY_THRESHOLD
+}
+
+/// `true` se le ultime DUE occorrenze della signature `target_sig` nella
+/// finestra recente hanno prodotto OUTPUT DIVERSI (sotto soglia di
+/// similarita'): la ripetizione sta facendo PROGRESSO — es. `npm run build`
+/// rilanciata dopo ogni correzione, che fallisce con errori via via diversi —
+/// e NON va chiusa come loop (incidente "run_command: npm run build si
+/// ripeteva senza ulteriore progresso" su un modello che stava convergendo).
+/// `false` se gli output sono uguali (stallo vero) o se non ci sono almeno
+/// due occorrenze con output confrontabile.
+pub fn repeated_signature_output_progress(
+    messages: &[Message],
+    target_sig: &str,
+    lookback: usize,
+) -> bool {
+    let recent = tail_messages(messages, lookback);
+    let mut outputs: Vec<String> = Vec::new();
+    for (idx, m) in recent.iter().enumerate() {
+        for (name, input) in message_tool_uses(m) {
+            if build_signature(name, input) == target_sig {
+                if let Some(text) = tool_result_text_after(recent, idx, 3) {
+                    outputs.push(text);
+                }
+            }
+        }
+    }
+    if outputs.len() < 2 {
+        return false;
+    }
+    let last = &outputs[outputs.len() - 1];
+    let prev = &outputs[outputs.len() - 2];
+    !outputs_similar(prev, last)
+}
+
 /// Conta le chiamate `request_port` negli ultimi `lookback` messaggi (default 16).
 /// Segnale STRUTTURALE del loop di riallocazione. NESSUN filtro su input/label.
 /// Vedi `_count_recent_request_port`.
@@ -626,6 +747,9 @@ pub fn detect_repeated_action_detailed(
     let mut last_productive_idx: Option<usize> = None;
     let mut read_first_idx: Vec<(String, usize)> = Vec::new();
     let mut last_sig: Option<String> = None;
+    // sig -> testo dell'ULTIMO tool_result visto (per il confronto
+    // output-progresso delle azioni produttive fallite ripetute).
+    let mut last_outputs: Vec<(String, String)> = Vec::new();
     for (idx, m) in recent.iter().enumerate() {
         for (name, input) in message_tool_uses(m) {
             let Some(keys) = repeated_action_keys(name) else {
@@ -685,6 +809,29 @@ pub fn detect_repeated_action_detailed(
                 // Azione produttiva ESEGUITA: segna il progresso che "scusa" le
                 // successive riletture read-only delle signature gia' viste.
                 last_productive_idx = Some(idx);
+            }
+            // OUTPUT-PROGRESSO (regola M/H): per un'azione PRODUTTIVA FALLITA
+            // ripetuta, se l'esito TESTUALE dell'occorrenza corrente differisce
+            // da quello della precedente (confronto STRUTTURALE, outputs_similar:
+            // mai semantica del testo), l'azione sta PROGREDENDO — es. `npm run
+            // build` rilanciata dopo ogni correzione che fallisce con errori via
+            // via diversi — e il conteggio RIPARTE. Solo la ripetizione con lo
+            // STESSO esito e' uno stallo (incidente "run_command: npm run build
+            // si ripeteva senza ulteriore progresso" su un run che convergeva).
+            if !is_read_only_repeatable_tool(name) && outcome == Some(true) {
+                let cur_out = tool_result_text_after(recent, idx, 3).unwrap_or_default();
+                if let Some((_, prev_out)) =
+                    last_outputs.iter_mut().find(|(s, _)| *s == sig)
+                {
+                    if !outputs_similar(prev_out, &cur_out) {
+                        if let Some((_, c)) = counts.iter_mut().find(|(s, _)| *s == sig) {
+                            *c = 0;
+                        }
+                    }
+                    *prev_out = cur_out;
+                } else {
+                    last_outputs.push((sig.clone(), cur_out));
+                }
             }
             bump(&mut counts, &sig);
             let label_value: String = target.chars().take(120).collect();
@@ -1164,6 +1311,86 @@ mod tests {
             tool_call_id: "c1".into(),
             content: MessageContent::text(text),
         }
+    }
+
+    #[test]
+    fn outputs_similar_confronto_strutturale() {
+        // Stesso errore con la sola riga di durata diversa -> SIMILI.
+        let a = "vite build\nerror TS2345 in bookingService.ts:42\nfailed\nDone in 741ms\nl1\nl2\nl3\nl4\nl5\nl6";
+        let b = "vite build\nerror TS2345 in bookingService.ts:42\nfailed\nDone in 488ms\nl1\nl2\nl3\nl4\nl5\nl6";
+        assert!(outputs_similar(a, b));
+        // Errori DIVERSI -> non simili (progresso).
+        let c = "vite build\nerror TS2551 in LoginPage.tsx:10\nfailed\nDone in 500ms";
+        assert!(!outputs_similar(a, c));
+        // Entrambi vuoti -> simili.
+        assert!(outputs_similar("", ""));
+    }
+
+    #[test]
+    fn build_ripetuta_con_errori_diversi_non_e_stallo() {
+        // REGRESSIONE "run_command: npm run build si ripeteva senza ulteriore
+        // progresso": la STESSA firma (input identico) fallita 3 volte ma con
+        // OUTPUT DIVERSI (un errore corretto per volta) e' PROGRESSO -> il
+        // conteggio riparte a ogni esito nuovo e il detector NON scatta.
+        let build = || ai_tool_input("run_command", json!({"command": "npm run build"}));
+        let err = |t: &str| human_tool_result(Some(1), true, t);
+        let msgs = vec![
+            build(),
+            err("error TS1 in a.ts:1\nriga2\nriga3\nriga4"),
+            build(),
+            err("error TS2 in b.ts:9\naltra2\naltra3\naltra4"),
+            build(),
+            err("error TS3 in c.ts:5\nancora2\nancora3\nancora4"),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24);
+        assert!(
+            hit.as_ref().map(|h| h.count).unwrap_or(0) < 2,
+            "build con errori diversi non deve contare come ripetizione: {hit:?}"
+        );
+    }
+
+    #[test]
+    fn build_ripetuta_con_stesso_errore_e_stallo() {
+        // Contro-prova: 3 build fallite con lo STESSO output -> stallo vero.
+        let build = || ai_tool_input("run_command", json!({"command": "npm run build"}));
+        let stesso = "error TS1 in a.ts:1\nriga2\nriga3\nriga4";
+        let msgs = vec![
+            build(),
+            human_tool_result(Some(1), true, stesso),
+            build(),
+            human_tool_result(Some(1), true, stesso),
+            build(),
+            human_tool_result(Some(1), true, stesso),
+        ];
+        let hit = detect_repeated_action_detailed(&msgs, 24).expect("stallo atteso");
+        assert!(hit.count >= 3);
+        assert!(hit.failed);
+    }
+
+    #[test]
+    fn signature_output_progress_true_su_esiti_diversi() {
+        let sig = build_signature("run_command", &json!({"command": "npm run build"}));
+        let build = || ai_tool_input("run_command", json!({"command": "npm run build"}));
+        // Esiti diversi -> progresso.
+        let msgs = vec![
+            build(),
+            human_tool_result(Some(1), true, "error TS1 in a.ts\nx\ny\nz"),
+            build(),
+            human_tool_result(Some(1), true, "error TS2 in b.ts\nk\nw\nq"),
+        ];
+        assert!(repeated_signature_output_progress(&msgs, &sig, 24));
+        // Esiti uguali -> nessun progresso.
+        let stesso = "error TS1 in a.ts\nx\ny\nz";
+        let msgs2 = vec![
+            build(),
+            human_tool_result(Some(1), true, stesso),
+            build(),
+            human_tool_result(Some(1), true, stesso),
+        ];
+        assert!(!repeated_signature_output_progress(&msgs2, &sig, 24));
+        // Una sola occorrenza -> nessun progresso dichiarabile.
+        let msgs3 = vec![build(), human_tool_result(Some(1), true, stesso)];
+        assert!(!repeated_signature_output_progress(&msgs3, &sig, 24));
     }
 
     #[test]

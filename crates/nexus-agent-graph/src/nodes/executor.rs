@@ -2545,7 +2545,24 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
         // post-escalation (floor repeated_action).
         let mut signature_loop_promoted = false;
         let mut loop_close_result: Option<String> = None;
-        if let Some(loop_sig) = &det.loop_signature {
+        // OUTPUT-PROGRESSO (regola M/H): una firma ripetuta i cui ULTIMI due
+        // esiti TESTUALI differiscono sta PROGREDENDO (es. build rilanciata dopo
+        // ogni correzione che fallisce con errori via via diversi): NON e' un
+        // loop. Confronto STRUTTURALE degli output (punto unico
+        // repeated_signature_output_progress), mai semantica del testo.
+        let loop_sig_effective = det.loop_signature.as_ref().filter(|sig| {
+            let progress =
+                crate::routing::signals::repeated_signature_output_progress(&messages, sig, 24);
+            if progress {
+                tracing::info!(
+                    target: "nexus_agent_graph::executor",
+                    sig = %sig,
+                    "signature ripetuta ma con esiti DIVERSI (output-progresso): non e' un loop"
+                );
+            }
+            !progress
+        });
+        if let Some(loop_sig) = loop_sig_effective {
             let tool_name = loop_sig.split_once('|').map(|(t, _)| t).unwrap_or(loop_sig);
             tracing::warn!(
                 target: "nexus_agent_graph::executor",
