@@ -1137,6 +1137,18 @@ pub async fn launch_run_config(
         None
     };
 
+    let kind = crate::agent_processes::kind_for_run_config_role(role.as_deref());
+    if kind == "service" {
+        // PUNTO UNICO anti-duplicato (regola L): come run_service e wizard
+        // install, il lancio di una run config servizio ferma prima i processi
+        // running dello stesso scopo (label esatta o variante simile).
+        let _ = crate::agent_processes::stop_similar_running_services(
+            &state.db,
+            project_id,
+            &label,
+        )
+        .await;
+    }
     let process_id = crate::agent_processes::spawn_agent_process(
         &state.db,
         project_id,
@@ -1147,7 +1159,7 @@ pub async fn launch_run_config(
         Some(context.root_path.clone()),
         Some(env_vars),
         state.sandbox_available,
-        crate::agent_processes::kind_for_run_config_role(role.as_deref()),
+        kind,
         service_image,
     )
     .await

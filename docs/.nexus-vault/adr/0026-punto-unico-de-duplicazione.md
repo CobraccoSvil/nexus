@@ -93,6 +93,7 @@ condividere codice (fragile base class, accoppiamento al genitore).
 | Estrazione JSON da output LLM (Rust, paritetico ADR 0032) | `crates/nexus-types/src/llm_json.rs` (re-export in mcp-core via `crate::llm_json`) | esistente |
 | Estensioni file di codice (CODE_EXTENSIONS) | `crates/nexus-types/src/code_files.rs` (re-export in `mcp-core::projects`) | esistente |
 | Servizi AI del wiki (embed/completion/purpose) | trait `WikiAiServices` in `nexus-wiki::deps` (impl `AppStateWikiAi` in `mcp-core::wiki`, delega a NeuralCoreClient + internal_routing) | esistente |
+| Identita' e dedup servizi di progetto (label generiche, similarity con split trattini, stop duplicati pre-spawn) | `mcp-core/src/agent_processes.rs` (`is_generic_service_label`, `similar_service_labels`, `stop_similar_running_services`); delegano: tool `run_service`, wizard install Windows, start/restart pannello, launch run config; visibilita' voci pannello Windows in `project_workspace/services.rs::visible_windows_services` | esistente |
 
 ### Enforcement
 

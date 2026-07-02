@@ -289,10 +289,56 @@ pub(super) async fn list_services_fallback(
     services
 }
 
+/// Voci del pannello Servizi Windows a partire dalle righe storiche di
+/// agent_processes (label, status, created_at — ordinate per label,
+/// created_at DESC). Funzione pura testabile (punto unico, regola L):
+/// - per ogni label conta la riga PIU' RECENTE (stato corrente del servizio);
+/// - una label running/starting e' sempre visibile (va potuta fermare);
+/// - una label MORTA e' nascosta se generica ("Service": tentativo storico,
+///   non un servizio) o se superseded da una label simile con storia piu'
+///   recente ("frontend-dev" morta dopo che "frontend" l'ha sostituita).
+/// Ritorna (label, running) ordinate per label.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn visible_windows_services(
+    rows: &[(String, String, chrono::DateTime<chrono::Utc>)],
+) -> Vec<(String, bool)> {
+    // Riga piu' recente per label: rows e' gia' ordinata (label, created_at DESC),
+    // quindi la prima occorrenza di ogni label e' la sua riga piu' recente.
+    let mut seen = std::collections::HashSet::new();
+    let mut latest: Vec<(&str, bool, chrono::DateTime<chrono::Utc>)> = Vec::new();
+    for (label, status, created_at) in rows {
+        if !seen.insert(label.as_str()) {
+            continue;
+        }
+        let running = matches!(status.as_str(), "running" | "starting");
+        latest.push((label.as_str(), running, *created_at));
+    }
+    let mut visible: Vec<(String, bool)> = latest
+        .iter()
+        .filter(|(label, running, created_at)| {
+            if *running {
+                return true;
+            }
+            if crate::agent_processes::is_generic_service_label(label) {
+                return false;
+            }
+            !latest.iter().any(|(other, _, other_created)| {
+                other != label
+                    && other_created > created_at
+                    && crate::agent_processes::similar_service_labels(label, other)
+            })
+        })
+        .map(|(label, running, _)| ((*label).to_string(), *running))
+        .collect();
+    visible.sort_by(|a, b| a.0.cmp(&b.0));
+    visible
+}
+
 /// Windows: elenca i servizi di progetto come processi gestiti (agent_processes
 /// kind='service'), nella STESSA shape di list_services_fallback. Su Windows non
 /// esistono unit systemd: l'install (install_service_windows) registra i servizi
-/// qui. Dedup per label tenendo lo stato piu' recente.
+/// qui. Voci calcolate da visible_windows_services (dedup per label, voci
+/// fantasma nascoste).
 #[cfg(windows)]
 pub(super) async fn list_services_windows(
     db: &sqlx::PgPool,
@@ -302,8 +348,8 @@ pub(super) async fn list_services_windows(
     // Separazione DB per-progetto: agent_processes e' tabella migrata, instrada
     // sul pool del progetto (flag OFF -> ritorna il meta-pool, behavior-preserving).
     let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT label, status FROM agent_processes \
+    let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT label, status, created_at FROM agent_processes \
          WHERE project_id = $1 AND kind = 'service' \
          ORDER BY label, created_at DESC",
     )
@@ -311,23 +357,18 @@ pub(super) async fn list_services_windows(
     .fetch_all(&proj_pool)
     .await
     .unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
-    let mut services: Vec<serde_json::Value> = Vec::new();
-    for (label, status) in rows {
-        if !seen.insert(label.clone()) {
-            continue;
-        }
-        let running = matches!(status.as_str(), "running" | "starting");
-        services.push(json!({
-            "unit":       format!("{slug}-{label}.service"),
-            "short":      label,
-            "state":      if running { "active" } else { "inactive" },
-            "sub":        if running { "running" } else { "dead" },
-            "managed_by": "windows",
-        }));
-    }
-    services.sort_by(|a, b| a["short"].as_str().cmp(&b["short"].as_str()));
-    services
+    visible_windows_services(&rows)
+        .into_iter()
+        .map(|(label, running)| {
+            json!({
+                "unit":       format!("{slug}-{label}.service"),
+                "short":      label,
+                "state":      if running { "active" } else { "inactive" },
+                "sub":        if running { "running" } else { "dead" },
+                "managed_by": "windows",
+            })
+        })
+        .collect()
 }
 
 // ── POST /api/projects/:id/services/:service/:action ─────────────────────────
@@ -565,8 +606,11 @@ async fn control_project_service_windows(
     // volta sola e riusato dalle 3 query sotto (stesso project_id).
     let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
 
-    // STOP (anche prima parte di RESTART): taskkill dei processi running del servizio.
-    if action == "stop" || action == "restart" {
+    // STOP esplicito: taskkill dei soli processi running di QUESTA label (lo
+    // stop richiesto dall'utente non deve toccare gli altri servizi). Per
+    // start/restart la parte di stop e' delegata al punto unico piu' sotto,
+    // che copre anche le varianti simili della stessa label.
+    if action == "stop" {
         let running: Vec<(Option<i32>,)> = sqlx::query_as(
             "SELECT pid FROM agent_processes \
              WHERE project_id = $1 AND label = $2 AND kind = 'service' AND status = 'running'",
@@ -596,6 +640,16 @@ async fn control_project_service_windows(
 
     // START (anche seconda parte di RESTART): ri-spawn dalla definizione piu' recente.
     if action == "start" || action == "restart" {
+        // PUNTO UNICO anti-duplicato (regola L): ferma la label esatta E le
+        // varianti dello stesso scopo ("frontend-dev" quando riavvii
+        // "frontend") prima dello spawn. Senza questo, start/restart dal
+        // pannello accumulava server duplicati sulla stessa codebase.
+        let _ = crate::agent_processes::stop_similar_running_services(
+            &state.db,
+            project_id,
+            &short,
+        )
+        .await;
         let def: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT command, working_dir FROM agent_processes \
              WHERE project_id = $1 AND label = $2 AND kind = 'service' \
@@ -2604,5 +2658,85 @@ mod tests {
         ));
         // `docker compose` senza `up` (es. ps/logs) non e' un servizio di avvio.
         assert!(!is_docker_compose_service("/usr/bin/docker compose ps"));
+    }
+
+    fn riga(
+        label: &str,
+        status: &str,
+        minuti_fa: i64,
+    ) -> (String, String, chrono::DateTime<chrono::Utc>) {
+        // Base fissa: i test non dipendono dall'orologio di sistema.
+        let base = chrono::DateTime::parse_from_rfc3339("2026-07-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        (
+            label.to_string(),
+            status.to_string(),
+            base - chrono::Duration::minutes(minuti_fa),
+        )
+    }
+
+    #[test]
+    fn voce_generica_morta_nascosta_running_visibile() {
+        // Regressione "Service" fantasma: tentativo storico fallito, non un
+        // servizio. Ma se GIRA deve restare visibile (va potuta fermare).
+        let rows = vec![
+            riga("Service", "failed", 60),
+            riga("backend", "running", 10),
+        ];
+        let visible = super::visible_windows_services(&rows);
+        assert_eq!(visible, vec![("backend".to_string(), true)]);
+
+        let rows = vec![riga("Service", "running", 60)];
+        let visible = super::visible_windows_services(&rows);
+        assert_eq!(visible, vec![("Service".to_string(), true)]);
+    }
+
+    #[test]
+    fn variante_morta_superseded_da_label_simile_piu_recente() {
+        // Regressione doppio vite: "frontend-dev" morta dopo che "frontend"
+        // l'ha sostituita non e' un servizio a se', sparisce dal pannello.
+        let rows = vec![
+            riga("frontend", "running", 5),
+            riga("frontend-dev", "stopped", 30),
+        ];
+        let visible = super::visible_windows_services(&rows);
+        assert_eq!(visible, vec![("frontend".to_string(), true)]);
+    }
+
+    #[test]
+    fn duplicati_entrambi_running_restano_entrambi_visibili() {
+        // Finche' girano entrambi l'utente deve poterli vedere e fermare.
+        let rows = vec![
+            riga("frontend", "running", 5),
+            riga("frontend-dev", "running", 30),
+        ];
+        let visible = super::visible_windows_services(&rows);
+        assert_eq!(
+            visible,
+            vec![
+                ("frontend".to_string(), true),
+                ("frontend-dev".to_string(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn servizio_fermo_senza_sostituto_resta_visibile() {
+        // Un servizio spento ma non superseded va mostrato (va potuto riavviare);
+        // conta la riga PIU' RECENTE della label, non le storiche.
+        let rows = vec![
+            riga("backend", "stopped", 10),
+            riga("backend", "running", 60),
+            riga("frontend", "running", 5),
+        ];
+        let visible = super::visible_windows_services(&rows);
+        assert_eq!(
+            visible,
+            vec![
+                ("backend".to_string(), false),
+                ("frontend".to_string(), true)
+            ]
+        );
     }
 }

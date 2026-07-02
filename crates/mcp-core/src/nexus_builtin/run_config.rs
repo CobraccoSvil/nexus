@@ -378,6 +378,14 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
         Some(std::path::PathBuf::from(&root_path))
     };
 
+    let kind = crate::agent_processes::kind_for_run_config_role(role.as_deref());
+    if kind == "service" {
+        // PUNTO UNICO anti-duplicato (regola L): come run_service e wizard
+        // install, il lancio di una run config servizio ferma prima i processi
+        // running dello stesso scopo (label esatta o variante simile).
+        let _ =
+            crate::agent_processes::stop_similar_running_services(db, project_id, &label).await;
+    }
     match crate::agent_processes::spawn_agent_process(
         db,
         project_id,
@@ -388,7 +396,7 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
         project_root,
         None,
         crate::sandbox::sandbox_enabled(),
-        crate::agent_processes::kind_for_run_config_role(role.as_deref()),
+        kind,
         None,
     )
     .await

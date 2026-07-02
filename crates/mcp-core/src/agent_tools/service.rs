@@ -144,10 +144,15 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         kind
     };
 
+    // Una label esplicita ma GENERICA ("Service", "server") equivale a nessuna
+    // label: non identifica uno scopo, crea una voce autonoma nel pannello che
+    // sfugge alla dedup e resta per sempre. La si scarta e si deriva dallo
+    // scopo (kind_hint) come per la label mancante. Punto unico: regola L.
     let explicit_label = input
         .get("label")
         .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty());
+        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !crate::agent_processes::is_generic_service_label(s));
     let label = explicit_label.unwrap_or("Service").to_string();
 
     // Resolve working directory
@@ -260,43 +265,18 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
     }
 
     // ── Deduplicazione servizi: kill processi simili + cleanup orfani ────────
-    // L'agente AI spesso usa label leggermente diverse per lo stesso servizio
-    // ("Backend Taskboard", "Backend API", "Taskboard Backend"). Per evitare
-    // duplicati, confrontiamo con similarita' normalizzata oltre che esatta.
+    // Delegata al PUNTO UNICO stop_similar_running_services (regola L), lo
+    // stesso usato da wizard install, start/restart del pannello e run config:
+    // query dedicata sui running kind='service' (nessun LIMIT come
+    // list_processes) e similarity che splitta anche trattini/underscore
+    // ("frontend-dev" ~ "frontend").
+    let _ = crate::agent_processes::stop_similar_running_services(
+        &ctx.db,
+        ctx.project_id,
+        &label,
+    )
+    .await;
     if let Ok(existing) = crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
-        let label_lower = label.to_lowercase();
-        let label_words: std::collections::HashSet<&str> = label_lower.split_whitespace().collect();
-
-        for proc in existing
-            .iter()
-            .filter(|p| p.status == "running" || p.status == "starting")
-        {
-            let proc_lower = proc.label.to_lowercase();
-            let proc_words: std::collections::HashSet<&str> =
-                proc_lower.split_whitespace().collect();
-
-            // Match esatto o similarita': almeno una parola significativa in comune
-            // (escludiamo parole generiche come "service", "server", "run")
-            let dominated = proc.label == label || {
-                const GENERIC: &[&str] = &["service", "server", "run", "dev", "start"];
-                let meaningful_common = label_words
-                    .intersection(&proc_words)
-                    .filter(|w| !GENERIC.contains(w) && w.len() > 2)
-                    .count();
-                meaningful_common > 0
-            };
-
-            if dominated {
-                tracing::info!(
-                    old_label = %proc.label,
-                    new_label = %label,
-                    proc_id = %proc.id,
-                    "run_service: kill processo simile prima di riavvio"
-                );
-                let _ = crate::agent_processes::stop_process(&ctx.db, ctx.project_id, proc.id).await;
-            }
-        }
-
         // Cleanup porte allocate per processi morti di questo progetto. Preserva
         // la label che stiamo (ri)avviando ora: la sua porta spenta verra'
         // adottata, non rilasciata (fix deadlock allocazione stantia).

@@ -21,6 +21,77 @@ pub fn kind_for_run_config_role(role: Option<&str>) -> &'static str {
     }
 }
 
+/// Parole che da sole non identificano un servizio: usate sia per riconoscere
+/// le label generiche ("Service", "server") sia per escluderle dal confronto
+/// di similarita' tra label.
+const GENERIC_SERVICE_WORDS: &[&str] = &["service", "server", "run", "dev", "start", "app"];
+
+/// Parole significative di una label servizio: lowercase, split su spazi,
+/// trattini, underscore e punti ("frontend-dev" -> {"frontend"}), escluse le
+/// parole generiche e quelle troppo corte.
+fn significant_service_words(label: &str) -> std::collections::HashSet<String> {
+    label
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '.')
+        .filter(|w| w.len() > 2 && !GENERIC_SERVICE_WORDS.contains(w))
+        .map(String::from)
+        .collect()
+}
+
+/// Una label e' generica quando non ha nessuna parola significativa
+/// ("Service", "server", "dev-server"): non identifica uno scopo e non deve
+/// diventare una voce autonoma del pannello Servizi.
+pub fn is_generic_service_label(label: &str) -> bool {
+    significant_service_words(label).is_empty()
+}
+
+/// PUNTO UNICO (regola L): due label indicano lo stesso servizio di progetto?
+/// Match esatto case-insensitive oppure almeno una parola significativa in
+/// comune ("frontend-dev" ~ "frontend", "Backend API" ~ "backend").
+pub fn similar_service_labels(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+        || !significant_service_words(a).is_disjoint(&significant_service_words(b))
+}
+
+/// PUNTO UNICO (regola L): ferma i processi `kind='service'` running/starting
+/// del progetto la cui label indica lo stesso servizio di `label`. Da chiamare
+/// PRIMA di ogni spawn di un servizio, da QUALUNQUE call site (tool agente
+/// run_service, wizard install, start/restart del pannello, run config):
+/// senza questo, ogni percorso di avvio lascia in vita il server precedente e
+/// il progetto accumula duplicati sulla stessa codebase (due vite, due backend).
+/// Ritorna le label fermate.
+pub async fn stop_similar_running_services(
+    db: &PgPool,
+    project_id: Uuid,
+    label: &str,
+) -> Vec<String> {
+    // agent_processes e' tabella migrata: instrada sul pool del progetto.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, label FROM agent_processes \
+         WHERE project_id = $1 AND kind = 'service' AND status IN ('running','starting')",
+    )
+    .bind(project_id)
+    .fetch_all(&proj_pool)
+    .await
+    .unwrap_or_default();
+
+    let mut stopped = Vec::new();
+    for (id, other) in rows {
+        if similar_service_labels(label, &other) {
+            tracing::info!(
+                old_label = %other,
+                new_label = %label,
+                process_id = %id,
+                "servizio duplicato dello stesso scopo fermato prima del nuovo avvio"
+            );
+            let _ = stop_process(db, project_id, id).await;
+            stopped.push(other);
+        }
+    }
+    stopped
+}
+
 /// Spawns a background process on the server, captures output into the DB.
 /// Returns the process UUID immediately (fire-and-forget for the caller).
 ///
@@ -492,7 +563,7 @@ pub struct ProcessSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::kind_for_run_config_role;
+    use super::{is_generic_service_label, kind_for_run_config_role, similar_service_labels};
 
     #[test]
     fn run_config_tool_e_test_sono_task_non_servizi() {
@@ -505,5 +576,30 @@ mod tests {
         assert_eq!(kind_for_run_config_role(Some("service")), "service");
         // Config antiche senza role: conservativo, resta servizio.
         assert_eq!(kind_for_run_config_role(None), "service");
+    }
+
+    #[test]
+    fn label_generiche_riconosciute() {
+        // Regressione voce fantasma "Service": label senza parole significative.
+        assert!(is_generic_service_label("Service"));
+        assert!(is_generic_service_label("server"));
+        assert!(is_generic_service_label("dev-server"));
+        assert!(!is_generic_service_label("backend"));
+        assert!(!is_generic_service_label("frontend-dev"));
+        assert!(!is_generic_service_label("Backend API"));
+    }
+
+    #[test]
+    fn similarity_label_stesso_servizio() {
+        // Regressione doppio vite: "frontend-dev" e "frontend" sono lo stesso
+        // servizio (il trattino va splittato come lo spazio).
+        assert!(similar_service_labels("frontend-dev", "frontend"));
+        assert!(similar_service_labels("Backend API", "backend"));
+        assert!(similar_service_labels("Backend", "backend")); // case-insensitive
+        assert!(similar_service_labels("Service", "service")); // eq, pur generica
+        // Scopi diversi NON si fondono.
+        assert!(!similar_service_labels("frontend", "backend"));
+        assert!(!similar_service_labels("Service", "backend"));
+        assert!(!similar_service_labels("worker-emails", "frontend"));
     }
 }

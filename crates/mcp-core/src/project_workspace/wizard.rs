@@ -1222,6 +1222,13 @@ async fn install_service_windows(
     // env: stringa "K=V" per riga, oppure oggetto JSON.
     let env_map = parse_env_body(&body);
 
+    // PUNTO UNICO anti-duplicato (regola L): l'install del wizard spawnava a
+    // fianco dei processi gia' running dello stesso scopo (due vite, due
+    // backend sulla stessa codebase). Ferma prima la label esatta e le
+    // varianti simili ("frontend-dev" vs "frontend").
+    let stopped =
+        crate::agent_processes::stop_similar_running_services(&state.db, project_id, short).await;
+
     let process_id = spawn_service_windows(
         &state,
         project_id,
@@ -1238,6 +1245,7 @@ async fn install_service_windows(
         "windows_native": true,
         "process_id": process_id,
         "service": short,
+        "stopped_duplicates": stopped,
         "message": format!(
             "Servizio '{}' avviato come processo gestito (su Windows non si usano unit systemd).",
             short
