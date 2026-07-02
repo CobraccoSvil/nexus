@@ -555,6 +555,147 @@ un modello piu' capace: cambia approccio ed ESEGUI il prossimo step concreto.",
 }
 
 #[tokio::test]
+async fn abort_con_task_complete_forza_turno_dichiarativo() {
+    // ADR 0034: chiusura di sistema (Abort repeated_action, nessun candidato di
+    // escalation) con task_complete NEL catalogo -> NIENTE chiusura testuale:
+    // il nodo chiede il turno DICHIARATIVO (G1Escalated + flag) cosi' l'esito
+    // del run sara' la dichiarazione strutturata del modello.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota -> Abort
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: edit_fallito_x2(),
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        tools_json: Some(vec![
+            json!({"name": "edit_file"}),
+            json!({"name": "task_complete"}),
+        ]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(
+        out.extra.get("force_outcome_declaration").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        out.extra.get("outcome_declaration_forced").and_then(Value::as_bool),
+        Some(true)
+    );
+    // Nessuna chiusura testuale di sistema e nessuna chiamata LLM qui.
+    assert!(out.result.is_none());
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn abort_senza_task_complete_chiusura_storica() {
+    // Contro-prova ADR 0034: senza la definizione di task_complete nel catalogo
+    // del run il turno dichiarativo non e' possibile -> chiusura onesta storica.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: edit_fallito_x2(),
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert!(out.result.as_deref().unwrap().contains("continua a fallire"));
+}
+
+#[tokio::test]
+async fn turno_dichiarativo_riduce_catalogo_a_task_complete() {
+    // ADR 0034: al rientro col flag force_outcome_declaration il catalogo del
+    // turno e' ridotto a SOLO task_complete (il modello DEVE dichiarare) e il
+    // flag viene consumato nel delta (una sola finestra dichiarativa).
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("dichiaro"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut messages = edit_fallito_x2();
+    let floor = messages.len() as i64;
+    messages.push(human("Chiama ORA il tool task_complete dichiarando l'esito."));
+    let mut extra = serde_json::Map::new();
+    extra.insert("force_outcome_declaration".into(), json!(true));
+    extra.insert("outcome_declaration_forced".into(), json!(true));
+    extra.insert("repeat_scan_floor".into(), json!(floor));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        tools_json: Some(vec![
+            json!({"name": "edit_file"}),
+            json!({"name": "task_complete"}),
+        ]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // La chiamata LLM e' avvenuta col SOLO task_complete nel catalogo.
+    let req = llm.seen.lock().unwrap().last().cloned().expect("LLM chiamato");
+    let tool_names: Vec<&str> = req
+        .tools
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(tool_names, vec!["task_complete"]);
+    // Flag consumato: la finestra dichiarativa e' una sola.
+    assert!(out.extra.get("force_outcome_declaration").is_none());
+    assert_eq!(
+        out.extra.get("outcome_declaration_forced").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn dichiarazione_avvenuta_chiude_con_summary() {
+    // ADR 0034: dopo il turno dichiarativo forzato (flag consumato) con
+    // declared_outcome presente, la testa dell'executor chiude d'autorita' col
+    // summary DICHIARATO: nessuna chiamata LLM aggiuntiva, esito dal segnale
+    // macchina.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut extra = serde_json::Map::new();
+    extra.insert("outcome_declaration_forced".into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("sistema il file")],
+        declared_outcome: Some(json!({
+            "outcome": "blocked",
+            "summary": "Serve la API key di produzione per proseguire.",
+            "blocker": "credential"
+        })),
+        tools_json: Some(vec![json!({"name": "task_complete"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(
+        out.result.as_deref(),
+        Some("Serve la API key di produzione per proseguire.")
+    );
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn escalation_current_pair_ancora_a_model_used_senza_sticky() {
     // Senza sticky, la coppia corrente per l'escalation e' (provider_used,
     // model_used) — l'ultima chiamata REALE, smart-upscale incluso — NON il

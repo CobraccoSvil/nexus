@@ -554,6 +554,59 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
             HeadGate::G1Cap | HeadGate::Proceed => {}
         }
 
+        // ── Chiusura del turno DICHIARATIVO forzato (ADR 0034) ────────────────
+        // Se un ramo di chiusura coordinata ha FORZATO la dichiarazione
+        // (`outcome_declaration_forced`) e il modello HA dichiarato via
+        // task_complete (`declared_outcome` presente, flag `force_outcome_
+        // declaration` gia' consumato dal turno dichiarativo), il run chiude
+        // QUI d'autorita' col summary dichiarato: nessun turno LLM aggiuntivo.
+        // L'esito canonico a valle viene dal segnale MACCHINA (outcome/blocker/
+        // refusal, regola M), non dal testo.
+        let declaration_was_forced = state
+            .extra
+            .get("outcome_declaration_forced")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let declaration_pending = state
+            .extra
+            .get("force_outcome_declaration")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if declaration_was_forced && !declaration_pending {
+            if let Some(decl) = &state.declared_outcome {
+                let outcome_kind = decl
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sconosciuto")
+                    .to_string();
+                let close_text = decl
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Esito dichiarato: {outcome_kind}."));
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    outcome = %outcome_kind,
+                    "chiusura post-dichiarazione forzata (ADR 0034): esito strutturato"
+                );
+                return Ok(StateDelta {
+                    messages: Some(vec![Message::Ai {
+                        content: MessageContent::text(close_text.clone()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    }]),
+                    result: Some(Some(close_text)),
+                    pending_tool_uses: Some(Some(vec![])),
+                    stop_reason: Some(Some(StopReason::EndTurn)),
+                    iterations: Some(Some(iters_in + 1)),
+                    ..Default::default()
+                }
+                .into_opaque());
+            }
+        }
+
         // Stato di lavoro mutabile (replica le variabili locali del Python che i
         // nudge mutano: messages / tools_json / system_text).
         let mut messages: Vec<Message> = state.messages.clone();
@@ -843,6 +896,12 @@ descrivere, ESEGUI subito il prossimo step concreto con un tool call.",
                 .into_opaque());
             }
             // Catena esaurita / auto_escalations >= 3: cap secco G1 (py:1994-2003).
+            // ADR 0034: prima della chiusura di sistema, UN turno dichiarativo
+            // forzato — l'esito del run diventa la dichiarazione strutturata
+            // del modello invece del testo sintetico qui sotto.
+            if let Some(delta) = self.forced_declaration_delta(state, iters_in) {
+                return Ok(delta);
+            }
             let cap_text = format!(
                 "Modello non risponde con azione dopo {} tentativi e anche i modelli \
 piu' capaci provati in escalation non hanno agito. Fermo l'esecuzione: riformula \
@@ -1302,6 +1361,17 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         // di aver fallito". Solo a 0 file modificati resta l'abort secco.
                         let touched =
                             crate::routing::signals::modified_files_from_messages(&messages, 40);
+                        // ADR 0034: sui sottocasi di FALLIMENTO (0 file toccati,
+                        // non read-only) prova PRIMA il turno dichiarativo: la
+                        // chiusura diventa l'esito strutturato del modello
+                        // (outcome/blocker/summary) invece del testo di sistema.
+                        // I sottocasi con lavoro prodotto o read-only instradano
+                        // gia' al final_gate (esito oggettivo): restano invariati.
+                        if touched.is_empty() && !ra_read_only {
+                            if let Some(delta) = self.forced_declaration_delta(state, iters_in) {
+                                return Ok(delta);
+                            }
+                        }
                         let (ra_text, ra_stop) = if !touched.is_empty() {
                             (
                                 format!(
@@ -1611,6 +1681,37 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                 "forced text response: rimozione tool per forzare risposta testuale"
             );
             tools_json.clear();
+        }
+
+        // ── Turno DICHIARATIVO forzato (ADR 0034): catalogo = solo task_complete ─
+        // Richiesto da un ramo di chiusura coordinata (forced_declaration_delta):
+        // il modello DEVE dichiarare l'esito strutturato. Ricostruito da
+        // state.tools_json (non da tools_json locale) cosi' vince su ogni strip
+        // precedente (forza-azione/forced-text). Il flag e' consumato nel delta
+        // finale del turno (una sola finestra dichiarativa).
+        let declaring_turn = state
+            .extra
+            .get("force_outcome_declaration")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if declaring_turn {
+            let decl_only: Vec<Value> = state
+                .tools_json
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| {
+                    t.get("name").and_then(Value::as_str) == Some(TASK_COMPLETE_TOOL_NAME)
+                })
+                .collect();
+            if !decl_only.is_empty() {
+                tools_json = decl_only;
+                force_action_hard = true;
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    "turno dichiarativo (ADR 0034): catalogo ridotto a task_complete + tool choice forzata"
+                );
+            }
         }
 
         // ── Risoluzione provider/model: sticky > override > routing (py:2460-2521) ─
@@ -2576,6 +2677,13 @@ modo piu' specifico."
             // repeated_action, mentre lo storico pre-promozione non conta piu'.
             extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
         }
+        if declaring_turn {
+            // Finestra dichiarativa consumata (ADR 0034): una sola, che il
+            // modello abbia dichiarato o no. `outcome_declaration_forced` resta
+            // true: la testa dell'executor chiude col summary se la dichiarazione
+            // c'e'; i rami di chiusura non ri-forzano (una tantum).
+            extra_out.remove("force_outcome_declaration");
+        }
         delta.extra = Some(extra_out);
 
         // next_actions.derive (py:3379-3402) + unfulfilled-report (py:3404-3429):
@@ -2600,6 +2708,70 @@ impl ExecutorNode {
             state.model_override.as_deref(),
             &self.cfg.routing_provider,
             &self.cfg.routing_model,
+        )
+    }
+
+    /// Turno DICHIARATIVO forzato (ADR 0034): prima di una chiusura di sistema
+    /// (abort anti-loop / cap G1 a catalogo esaurito) il modello riceve UN turno
+    /// col catalogo ridotto a solo `task_complete` e tool choice forzata, cosi'
+    /// l'esito del run e' la SUA dichiarazione strutturata (outcome/blocker/
+    /// summary, regola M) invece di un testo sintetico di sistema.
+    ///
+    /// `None` (il chiamante procede con la chiusura storica) se:
+    /// - il turno dichiarativo e' GIA' stato concesso in questo run
+    ///   (`outcome_declaration_forced`, una tantum: se il modello non dichiara
+    ///   nemmeno sotto forcing, la chiusura successiva e' quella secca);
+    /// - il catalogo del run NON contiene `task_complete` (senza definizione il
+    ///   modello non puo' chiamarlo: niente turno a vuoto).
+    fn forced_declaration_delta(&self, state: &AgentState, iters_in: i64) -> Option<OpaqueDelta> {
+        let already = state
+            .extra
+            .get("outcome_declaration_forced")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if already {
+            return None;
+        }
+        let has_tool = state
+            .tools_json
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.get("name").and_then(Value::as_str) == Some(TASK_COMPLETE_TOOL_NAME));
+        if !has_tool {
+            return None;
+        }
+        let nudge = human_msg(
+            "Il turno sta per chiudere senza un esito dichiarato. Chiama ORA il tool \
+task_complete dichiarando l'esito REALE del lavoro: outcome=done SOLO se il lavoro e' \
+completo e verificato; blocked (con blocker valorizzato) se una causa esterna ti ferma; \
+partial se hai completato solo una parte (indica in next_step cosa resta); needs_input se \
+serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'utente.",
+        );
+        let mut extra_out = state.extra.clone();
+        extra_out.insert("force_outcome_declaration".to_string(), json!(true));
+        extra_out.insert("outcome_declaration_forced".to_string(), json!(true));
+        // Grazia sui detector di stallo: il turno dichiarativo non deve essere
+        // corto-circuitato dalle azioni pre-chiusura (stesso floor del fix
+        // escalation, punto unico repeat_scan_floor).
+        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            "chiusura di sistema -> turno dichiarativo forzato (ADR 0034): il modello dichiara l'esito"
+        );
+        Some(
+            StateDelta {
+                messages: Some(vec![nudge]),
+                recent_tool_signatures: Some(Some(vec![])),
+                g1_reroute_count: Some(Some(0)),
+                action_nudge_count: Some(Some(0)),
+                pending_tool_uses: Some(Some(vec![])),
+                stop_reason: Some(Some(StopReason::G1Escalated)),
+                iterations: Some(Some(iters_in + 1)),
+                extra: Some(extra_out),
+                ..Default::default()
+            }
+            .into_opaque(),
         )
     }
 

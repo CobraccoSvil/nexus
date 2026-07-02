@@ -1570,4 +1570,22 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       }
     }
   }
+  ,
+  {
+    "name": "task_complete",
+    "description": "Dichiara l'esito FINALE del task in forma strutturata (ADR 0034). Chiamalo come ULTIMA azione del turno, sempre: outcome=done SOLO a lavoro completato e verificato; blocked se una causa ESTERNA impedisce di proseguire (valorizza blocker); partial se hai completato solo una parte del lavoro (indica in next_step cosa resta); needs_input se serve una decisione o un'informazione dall'utente. Il summary e' il resoconto umano finale mostrato all'utente: scrivilo completo. Non dichiarare done se non hai verificato il risultato.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "outcome": {"type": "string", "enum": ["done", "blocked", "partial", "needs_input"], "description": "Esito macchina del task: done = completato e verificato; blocked = fermo per causa esterna; partial = completato in parte; needs_input = serve input umano."},
+        "summary": {"type": "string", "description": "Resoconto umano finale del lavoro svolto (o del blocco). Mostrato all'utente."},
+        "next_step": {"type": "string", "description": "Cosa resta da fare (obbligatorio con outcome=partial, utile con blocked/needs_input)."},
+        "blocked_by": {"type": "string", "description": "Descrizione testuale della causa del blocco (solo display)."},
+        "blocker": {"type": "string", "enum": ["dependency", "credential", "permission", "service", "request_ambiguity", "safety"], "description": "Categoria macchina della causa del blocco (con outcome=blocked)."},
+        "refusal": {"type": "boolean", "description": "true se stai rifiutando il task per ragioni di safety/policy (non per incapacita' tecnica)."},
+        "files_touched": {"type": "array", "items": {"type": "string"}, "description": "Percorsi dei file che hai creato o modificato in questo run."}
+      },
+      "required": ["outcome", "summary"]
+    }
+  }
 ]"#;

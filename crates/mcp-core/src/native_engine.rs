@@ -339,6 +339,13 @@ pub struct NativeRunOutcome {
     /// il run nativo non scriveva mai questa colonna -> NULL). `None` se la
     /// serializzazione fallisce o la conversazione e' vuota.
     pub messages_json: Option<String>,
+    /// Esito DICHIARATO dal modello via `task_complete` (ADR 0034): il dict
+    /// normalizzato (`outcome`/`summary`/`blocker`/`refusal`/...) dello stato
+    /// (`declared_outcome`). Segnale MACCHINA per lo status canonico del
+    /// finalizzatore (blocked/needs_input/refusal -> BlockedNeedsInput,
+    /// partial -> FailedDiagnosed); il summary e' testo umano di display.
+    /// `None` se il modello non ha dichiarato.
+    pub declared_outcome: Option<serde_json::Value>,
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -1345,6 +1352,7 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         } else {
             serde_json::to_string(&state.messages).ok()
         },
+        declared_outcome: state.declared_outcome.clone(),
     }
 }
 

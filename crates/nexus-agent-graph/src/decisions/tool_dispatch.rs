@@ -87,17 +87,37 @@ pub fn apply_run_notes(current: Option<&str>, tool_input: &Value) -> Option<Stri
 //  normalize_declared_outcome (task_complete)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Outcome validi dichiarabili via `task_complete` (`_VALID_OUTCOMES` Python).
-pub const VALID_OUTCOMES: &[&str] = &["done", "blocked", "needs_input"];
+/// Outcome validi dichiarabili via `task_complete` (`_VALID_OUTCOMES` Python +
+/// `partial` da ADR 0034: lavoro completato solo in parte, dichiarato onestamente).
+pub const VALID_OUTCOMES: &[&str] = &["done", "blocked", "needs_input", "partial"];
+
+/// Categorie macchina della causa di blocco (`blocker`, ADR 0034): segnale ENUM,
+/// mai dedotto dalla prosa (regola M). Fuori enum -> campo scartato (il resto
+/// della dichiarazione resta valido).
+pub const VALID_BLOCKERS: &[&str] = &[
+    "dependency",
+    "credential",
+    "permission",
+    "service",
+    "request_ambiguity",
+    "safety",
+];
+
+/// Cap sul numero di voci accettate in `files_touched` (self-report, solo
+/// display/telemetria: il ground truth resta `modified_files_from_messages`).
+const FILES_TOUCHED_CAP: usize = 50;
 
 /// Valida/normalizza l'input di `task_complete`. `None` se invalido (outcome fuori
 /// enum o input non-oggetto): il chiamante ricade sui segnali strutturali come se la
-/// dichiarazione non ci fosse. 1:1 con `normalize_declared_outcome` Python.
+/// dichiarazione non ci fosse. Base 1:1 con `normalize_declared_outcome` Python,
+/// estesa dai campi ADR 0034 (`blocker`, `refusal`, `files_touched`).
 ///
 /// L'output mantiene SEMPRE `outcome` e `summary` (anche vuoto), e aggiunge
 /// `next_step`/`blocked_by` SOLO se truthy (stringa non vuota dopo trim), come
-/// Python (`if v:`). Le chiavi sono inserite in ordine: outcome, summary, next_step,
-/// blocked_by (preserve_order del workspace mantiene l'ordine d'inserimento).
+/// Python (`if v:`). `blocker` solo se nell'enum [`VALID_BLOCKERS`]; `refusal`
+/// solo se `true`; `files_touched` solo se array non vuoto di stringhe non vuote
+/// (cap [`FILES_TOUCHED_CAP`]). Le chiavi sono inserite in ordine d'inserimento
+/// (preserve_order del workspace).
 pub fn normalize_declared_outcome(tool_input: &Value) -> Option<Value> {
     let obj = tool_input.as_object()?;
     let outcome = obj
@@ -127,6 +147,31 @@ pub fn normalize_declared_outcome(tool_input: &Value) -> Option<Value> {
             if !v.is_empty() {
                 out.insert(k.to_string(), Value::String(v.to_string()));
             }
+        }
+    }
+    // `blocker` (ADR 0034): categoria macchina, accettata SOLO se nell'enum.
+    if let Some(b) = obj.get("blocker").and_then(Value::as_str) {
+        let b = b.trim().to_lowercase();
+        if VALID_BLOCKERS.contains(&b.as_str()) {
+            out.insert("blocker".to_string(), Value::String(b));
+        }
+    }
+    // `refusal` (ADR 0034): bool, incluso solo se true (assente = false).
+    if obj.get("refusal").and_then(Value::as_bool) == Some(true) {
+        out.insert("refusal".to_string(), Value::Bool(true));
+    }
+    // `files_touched` (ADR 0034): self-report, solo display/telemetria.
+    if let Some(arr) = obj.get("files_touched").and_then(Value::as_array) {
+        let files: Vec<Value> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .take(FILES_TOUCHED_CAP)
+            .map(|s| Value::String(s.to_string()))
+            .collect();
+        if !files.is_empty() {
+            out.insert("files_touched".to_string(), Value::Array(files));
         }
     }
     Some(Value::Object(out))
@@ -388,6 +433,42 @@ mod tests {
     fn normalize_outcome_invalido() {
         assert_eq!(normalize_declared_outcome(&json!({"outcome": "fatto"})), None);
         assert_eq!(normalize_declared_outcome(&json!([1, 2])), None);
+    }
+
+    #[test]
+    fn normalize_outcome_adr0034_campi_estesi() {
+        // "partial" e' un outcome valido; blocker nell'enum passa; refusal=true
+        // passa; files_touched filtrato (vuoti scartati, trim applicato).
+        let out = normalize_declared_outcome(&json!({
+            "outcome": "PARTIAL",
+            "summary": "meta' lavoro",
+            "blocker": " SERVICE ",
+            "refusal": true,
+            "files_touched": [" src/a.ts ", "", "src/b.ts"]
+        }))
+        .unwrap();
+        assert_eq!(out["outcome"], json!("partial"));
+        assert_eq!(out["blocker"], json!("service"));
+        assert_eq!(out["refusal"], json!(true));
+        assert_eq!(out["files_touched"], json!(["src/a.ts", "src/b.ts"]));
+    }
+
+    #[test]
+    fn normalize_outcome_adr0034_campi_estesi_scartati() {
+        // blocker fuori enum -> scartato (il resto valido resta); refusal=false
+        // -> assente; files_touched non-array -> assente.
+        let out = normalize_declared_outcome(&json!({
+            "outcome": "blocked",
+            "summary": "fermo",
+            "blocker": "colpa-del-meteo",
+            "refusal": false,
+            "files_touched": "src/a.ts"
+        }))
+        .unwrap();
+        assert_eq!(out["outcome"], json!("blocked"));
+        assert!(out.get("blocker").is_none());
+        assert!(out.get("refusal").is_none());
+        assert!(out.get("files_touched").is_none());
     }
 
     #[test]

@@ -1288,10 +1288,45 @@ async fn native_outcome_to_run_result(
                 | StopReason::G1CapReached
         )
     );
+    // Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
+    // MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
+    // (regola M). Ha precedenza sul forced_close: una dichiarazione onesta
+    // (es. blocked su credenziale mancante) e' piu' specifica del segnale
+    // generico di chiusura coordinata.
+    let declared_kind = outcome
+        .declared_outcome
+        .as_ref()
+        .and_then(|v| v.get("outcome"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let declared_refusal = outcome
+        .declared_outcome
+        .as_ref()
+        .and_then(|v| v.get("refusal"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let declared_summary = outcome
+        .declared_outcome
+        .as_ref()
+        .and_then(|v| v.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let status = if !outcome.completed && outcome.resume_at.is_some() {
         AgentRunStatus::AwaitingConfirmation
     } else if matches!(outcome.stop_reason, Some(StopReason::Error)) {
         AgentRunStatus::Failed
+    } else if declared_refusal
+        || matches!(declared_kind.as_deref(), Some("blocked") | Some("needs_input"))
+    {
+        // Bloccato per causa esterna / serve input umano / rifiuto safety:
+        // esito canonico BlockedNeedsInput (parita' WAVE 3.2 del path brain).
+        AgentRunStatus::BlockedNeedsInput
+    } else if matches!(declared_kind.as_deref(), Some("partial")) {
+        // Lavoro dichiarato PARZIALE: onesto, non un successo (mai "completed"
+        // su una dichiarazione esplicita di incompletezza).
+        AgentRunStatus::FailedDiagnosed
     } else if forced_close {
         AgentRunStatus::FailedDiagnosed
     } else {
@@ -1315,7 +1350,13 @@ async fn native_outcome_to_run_result(
         status,
         steps,
         pending_actions: Vec::new(),
-        final_answer: outcome.final_answer,
+        // Il summary DICHIARATO fa da risposta quando il modello ha chiuso con
+        // task_complete senza produrre testo (parita' WAVE 3.2): mai un
+        // "completed" muto se il modello ha comunque dichiarato l'esito.
+        final_answer: outcome
+            .final_answer
+            .filter(|s| !s.trim().is_empty())
+            .or(declared_summary),
         provider,
         model,
         iteration_count: outcome.iterations.max(0) as u32,
@@ -4506,6 +4547,7 @@ mod tests_select_engine {
             user_intent: Some("code".to_string()),
             reasoning: None,
             messages_json: Some(r#"[{"role":"user","content":"ciao"}]"#.to_string()),
+            declared_outcome: None,
         }
     }
 
@@ -4554,6 +4596,64 @@ mod tests_select_engine {
             r.messages_json.as_deref(),
             Some(r#"[{"role":"user","content":"ciao"}]"#)
         );
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_declared_outcome_stati_canonici(pool: sqlx::PgPool) {
+        // ADR 0034: l'esito DICHIARATO via task_complete e' un segnale MACCHINA
+        // che decide lo status canonico (mai la prosa, regola M).
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+
+        // blocked -> BlockedNeedsInput; senza testo, il summary fa da risposta.
+        let mut o = outcome_base();
+        o.final_answer = None;
+        o.declared_outcome = Some(serde_json::json!({
+            "outcome": "blocked",
+            "summary": "Serve la API key.",
+            "blocker": "credential"
+        }));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
+        assert_eq!(r.final_answer.as_deref(), Some("Serve la API key."));
+
+        // partial -> FailedDiagnosed (dichiarazione onesta di incompletezza,
+        // mai "completed" su un lavoro dichiarato parziale).
+        let mut o = outcome_base();
+        o.declared_outcome =
+            Some(serde_json::json!({"outcome": "partial", "summary": "meta'"}));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
+
+        // refusal=true -> BlockedNeedsInput anche con outcome=done dichiarato.
+        let mut o = outcome_base();
+        o.declared_outcome = Some(serde_json::json!({
+            "outcome": "done", "summary": "no", "refusal": true
+        }));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
+
+        // Il declared ha precedenza sul forced_close (dichiarazione onesta
+        // post-abort piu' specifica del segnale generico di chiusura).
+        let mut o = outcome_base();
+        o.stop_reason = Some(StopReason::LoopAbort);
+        o.declared_outcome = Some(serde_json::json!({
+            "outcome": "blocked", "summary": "fermo", "blocker": "service"
+        }));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
+
+        // done senza refusal: Completed (poi final_gate/hollow a valle).
+        let mut o = outcome_base();
+        o.declared_outcome =
+            Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
     }
 
     #[sqlx::test]

@@ -140,12 +140,15 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
         let reroute_count = state.g1_reroute_count.unwrap_or(0);
         let max_nudges = cfg.g1_max_nudges;
         if reroute_count < max_nudges {
-            // Esito DICHIARATO dal modello (segnale PRIMARIO): done/blocked/needs_input
-            // -> chiusura, niente G1. (`elif` Python: nessun ramo successivo).
+            // Esito DICHIARATO dal modello (segnale PRIMARIO, ADR 0034):
+            // done/blocked/needs_input/partial -> chiusura, niente G1.
+            // "partial" e' una dichiarazione ONESTA di lavoro incompleto:
+            // rimandare il modello a lavorare contro la sua stessa
+            // dichiarazione produrrebbe il loop, non la completezza.
             let declared = declared_outcome_kind(state);
             if matches!(
                 declared.as_deref(),
-                Some("done") | Some("blocked") | Some("needs_input")
+                Some("done") | Some("blocked") | Some("needs_input") | Some("partial")
             ) {
                 // Nessun reroute: si cade ai gate finali sotto.
             } else if signals::has_productive_action_in_history(&state.messages)
@@ -330,6 +333,23 @@ mod tests {
         s.action_oriented = Some(true); // anche action: declared vince.
         s.declared_outcome = Some(json!({"outcome": "done", "summary": "fatto"}));
         s.user_intent = Some("chat".into()); // non software -> learner.
+        assert_eq!(
+            route_after_executor(&s, &RoutingConfig::default()),
+            NodeTarget::Learner
+        );
+    }
+
+    #[test]
+    fn declared_partial_chiude_senza_g1() {
+        // ADR 0034: "partial" e' una dichiarazione ONESTA di lavoro incompleto;
+        // rimandare il modello a lavorare contro la sua stessa dichiarazione
+        // produrrebbe il loop, non la completezza -> chiusura, niente G1.
+        let mut s = base();
+        s.stop_reason = Some(StopReason::EndTurn);
+        s.action_oriented = Some(true);
+        s.declared_outcome =
+            Some(json!({"outcome": "partial", "summary": "meta' fatta", "next_step": "resto"}));
+        s.user_intent = Some("chat".into());
         assert_eq!(
             route_after_executor(&s, &RoutingConfig::default()),
             NodeTarget::Learner
