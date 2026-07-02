@@ -490,6 +490,23 @@ pub(crate) fn resolve_provider_model(
     ProviderResolution::Resolved(p, m)
 }
 
+/// Punto unico (regola L) della GRAZIA POST-ESCALATION: indice minimo (nel
+/// prefisso persistito di `messages`) da cui i detector di stallo basati sui
+/// messaggi (repeated_action 6c, resource_reallocation 6d) contano le azioni.
+/// Scritto in `extra["repeat_scan_floor"]` da OGNI ramo che promuove un
+/// modello: le azioni del modello precedente non contano piu' come stallo,
+/// cosi' il promosso ha una finestra pulita e fa ALMENO una chiamata prima di
+/// qualunque nuova decisione (incidente run c4fa064b). Clampato a `len`.
+fn repeat_scan_floor(state: &AgentState, len: usize) -> usize {
+    state
+        .extra
+        .get("repeat_scan_floor")
+        .and_then(Value::as_i64)
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0)
+        .min(len)
+}
+
 #[async_trait]
 impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
     fn id(&self) -> NodeId {
@@ -752,16 +769,10 @@ piu' specifico, oppure riprova con un modello piu' capace.",
             // gli input (catena/cooldown/cross) arrivano dalla porta. Solo a catena
             // ESAURITA (o auto_escalations >= 3) chiudiamo davvero al cap secco
             // (ramo `not _g1_picked`).
-            let g1_cur_provider = state
-                .provider_used
-                .clone()
-                .or_else(|| state.sticky_provider.clone())
-                .or_else(|| state.provider_override.clone());
-            let g1_cur_model = state
-                .model_used
-                .clone()
-                .or_else(|| state.sticky_model.clone())
-                .or_else(|| state.model_override.clone());
+            // Coppia corrente = risoluzione del turno (punto unico, regola L):
+            // dopo una promozione sticky il "corrente" e' il promosso, anche se
+            // non ha ancora fatto una chiamata (vedi escalation_current_pair).
+            let (g1_cur_provider, g1_cur_model) = self.escalation_current_pair(state);
             let g1_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
             // `_g1_picked = _pick(...) if _g1_escal < 3 else None` (py:1962-1966).
             let g1_picked = if g1_escal < 3 {
@@ -774,11 +785,17 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                     )
                     .await
                     .unwrap_or_default();
+                // Indice catena 0 (non g1_escal): la catena della porta e'
+                // RELATIVA al corrente (chain_for filtra rank > corrente) e il
+                // corrente AVANZA via sticky a ogni promozione; l'indice storico
+                // (pensato per la catena assoluta per base_model del Python)
+                // saltava sistematicamente un tier a ogni escalation successiva.
+                // Il CAP resta su auto_escalations < 3 (qui sopra).
                 pick_escalation_model(
                     &inputs.chain,
                     g1_cur_provider.as_deref(),
                     g1_cur_model.as_deref(),
-                    g1_escal,
+                    0,
                     inputs.provider_in_cooldown,
                     inputs.cross_provider.as_ref(),
                 )
@@ -805,10 +822,16 @@ descrivere, ESEGUI subito il prossimo step concreto con un tool call.",
                 );
                 let mut extra_out = state.extra.clone();
                 extra_out.insert("auto_escalations".to_string(), json!(g1_escal + 1));
+                // Grazia post-escalation: il promosso riparte con finestra pulita
+                // sull'asse repeated_action (vedi floor nel check 6c).
+                extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
                 return Ok(StateDelta {
                     messages: Some(vec![esc_nudge]),
                     sticky_provider: Some(Some(pick.provider)),
                     sticky_model: Some(Some(pick.model)),
+                    // Finestra pulita anche per il signature-loop: le firme del
+                    // modello precedente non pesano sul promosso.
+                    recent_tool_signatures: Some(Some(vec![])),
                     g1_reroute_count: Some(Some(0)),
                     action_nudge_count: Some(Some(0)),
                     pending_tool_uses: Some(Some(vec![])),
@@ -929,16 +952,8 @@ la richiesta in modo piu' specifico.",
                 .get("auto_escalations")
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            let expl_cur_provider = state
-                .provider_used
-                .clone()
-                .or_else(|| state.sticky_provider.clone())
-                .or_else(|| state.provider_override.clone());
-            let expl_cur_model = state
-                .model_used
-                .clone()
-                .or_else(|| state.sticky_model.clone())
-                .or_else(|| state.model_override.clone());
+            // Coppia corrente = risoluzione del turno (punto unico, regola L).
+            let (expl_cur_provider, expl_cur_model) = self.escalation_current_pair(state);
             let expl_picked = if expl_escal < 3 {
                 let inputs = self
                     .escalation
@@ -949,11 +964,13 @@ la richiesta in modo piu' specifico.",
                     )
                     .await
                     .unwrap_or_default();
+                // Indice catena 0: catena RELATIVA al corrente, che avanza via
+                // sticky (vedi ramo G1); il cap resta su auto_escalations < 3.
                 pick_escalation_model(
                     &inputs.chain,
                     expl_cur_provider.as_deref(),
                     expl_cur_model.as_deref(),
-                    expl_escal,
+                    0,
                     inputs.provider_in_cooldown,
                     inputs.cross_provider.as_ref(),
                 )
@@ -1003,11 +1020,15 @@ esecuzione/verifica), oppure rispondi a parole se era una domanda.",
                     );
                     let mut extra_out = state.extra.clone();
                     extra_out.insert("auto_escalations".to_string(), json!(expl_escal + 1));
+                    // Grazia post-escalation (vedi floor nel check 6c).
+                    extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
                     progress_guided.insert("exploration".to_string());
                     return Ok(StateDelta {
                         messages: Some(vec![esc_nudge]),
                         sticky_provider: Some(Some(pick.provider)),
                         sticky_model: Some(Some(pick.model)),
+                        // Finestra pulita anche per il signature-loop.
+                        recent_tool_signatures: Some(Some(vec![])),
                         g1_reroute_count: Some(Some(0)),
                         action_nudge_count: Some(Some(0)),
                         pending_tool_uses: Some(Some(vec![])),
@@ -1141,7 +1162,19 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
             // stesso file con old_string DIVERSI sono azioni distinte (count 1) e
             // non scattano falsi stalli. `hit.failed` discrimina l'edit/write
             // FALLITO per scegliere il nudge specifico "copia l'old_string esatto".
-            let ra_hit = detect_repeated_action_detailed(&messages, 24);
+            //
+            // GRAZIA POST-ESCALATION (incidente run c4fa064b): le azioni PRECEDENTI
+            // all'ultima promozione di modello NON contano piu' come stallo. Senza
+            // questo floor, al rientro da un Action::Escalate (G1Continue) il
+            // detector rivedeva gli STESSI messaggi immutati e ri-decideva subito:
+            // l'intero budget escalation (3) veniva bruciato in pochi millisecondi
+            // senza che il modello promosso facesse nemmeno UNA chiamata, e il run
+            // chiudeva in ABORT "il modello non riesce". Il floor (indice nel
+            // prefisso PERSISTITO di `messages`) e' scritto da ogni ramo che
+            // promuove; i nudge transitori del turno stanno dopo quel prefisso,
+            // quindi lo slice resta coerente.
+            let ra_scan_from = repeat_scan_floor(state, messages.len());
+            let ra_hit = detect_repeated_action_detailed(&messages[ra_scan_from..], 24);
             let ra_label = ra_hit.as_ref().map(|h| h.label.clone());
             let ra_count = ra_hit.as_ref().map(|h| h.count).unwrap_or(0);
             let ra_edit_failed = ra_hit
@@ -1192,12 +1225,8 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 // prima di abortire su azione ripetuta, promuovi a un modello piu'
                 // capace invece di arrenderti.
                 let ra_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
-                let ra_cur_provider = state.provider_used.clone()
-                    .or_else(|| state.sticky_provider.clone())
-                    .or_else(|| state.provider_override.clone());
-                let ra_cur_model = state.model_used.clone()
-                    .or_else(|| state.sticky_model.clone())
-                    .or_else(|| state.model_override.clone());
+                // Coppia corrente = risoluzione del turno (punto unico, regola L).
+                let (ra_cur_provider, ra_cur_model) = self.escalation_current_pair(state);
                 let ra_picked = if ra_escal < 3 {
                     let inputs = self
                         .escalation
@@ -1208,11 +1237,13 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         )
                         .await
                         .unwrap_or_default();
+                    // Indice catena 0: catena RELATIVA al corrente, che avanza
+                    // via sticky (vedi ramo G1); cap su auto_escalations < 3.
                     pick_escalation_model(
                         &inputs.chain,
                         ra_cur_provider.as_deref(),
                         ra_cur_model.as_deref(),
-                        ra_escal,
+                        0,
                         inputs.provider_in_cooldown,
                         inputs.cross_provider.as_ref(),
                     )
@@ -1368,11 +1399,17 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                         );
                         let mut extra_out = state.extra.clone();
                         extra_out.insert("auto_escalations".to_string(), json!(ra_escal + 1));
+                        // Grazia post-escalation: senza questo floor il rientro
+                        // rivedeva le stesse azioni e ri-decideva in pochi ms,
+                        // bruciando il budget senza chiamare il promosso.
+                        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
                         progress_guided.insert("repeated_action".to_string());
                         return Ok(StateDelta {
                             messages: Some(vec![esc_nudge]),
                             sticky_provider: Some(Some(pick.provider)),
                             sticky_model: Some(Some(pick.model)),
+                            // Finestra pulita anche per il signature-loop.
+                            recent_tool_signatures: Some(Some(vec![])),
                             g1_reroute_count: Some(Some(0)),
                             action_nudge_count: Some(Some(0)),
                             pending_tool_uses: Some(Some(vec![])),
@@ -1392,19 +1429,20 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
 
         // (6d) resource_reallocation (py:2321-2383).
         if progress_on {
-            let rp_count = count_recent_request_port(&messages, 16);
+            // Grazia post-escalation ANCHE su questo asse: senza il floor, al
+            // rientro da un Escalate i request_port pre-promozione erano ancora
+            // nella finestra e l'asse ri-decideva subito (stessa classe
+            // dell'incidente c4fa064b, spostata dal 6c al 6d).
+            let rp_scan_from = repeat_scan_floor(state, messages.len());
+            let rp_count = count_recent_request_port(&messages[rp_scan_from..], 16);
             let rp_threshold = self.cfg.reallocation_threshold;
             if rp_count < rp_threshold {
                 progress_guided.remove("resource_reallocation");
             } else {
                 // Candidato escalation (stesso pattern di repeated_action/esplorazione).
                 let rp_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
-                let rp_cur_provider = state.provider_used.clone()
-                    .or_else(|| state.sticky_provider.clone())
-                    .or_else(|| state.provider_override.clone());
-                let rp_cur_model = state.model_used.clone()
-                    .or_else(|| state.sticky_model.clone())
-                    .or_else(|| state.model_override.clone());
+                // Coppia corrente = risoluzione del turno (punto unico, regola L).
+                let (rp_cur_provider, rp_cur_model) = self.escalation_current_pair(state);
                 let rp_picked = if rp_escal < 3 {
                     let inputs = self
                         .escalation
@@ -1415,11 +1453,13 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                         )
                         .await
                         .unwrap_or_default();
+                    // Indice catena 0: catena RELATIVA al corrente, che avanza
+                    // via sticky (vedi ramo G1); cap su auto_escalations < 3.
                     pick_escalation_model(
                         &inputs.chain,
                         rp_cur_provider.as_deref(),
                         rp_cur_model.as_deref(),
-                        rp_escal,
+                        0,
                         inputs.provider_in_cooldown,
                         inputs.cross_provider.as_ref(),
                     )
@@ -1487,11 +1527,15 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                         );
                         let mut extra_out = state.extra.clone();
                         extra_out.insert("auto_escalations".to_string(), json!(rp_escal + 1));
+                        // Grazia post-escalation (vedi floor nel check 6c).
+                        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
                         progress_guided.insert("resource_reallocation".to_string());
                         return Ok(StateDelta {
                             messages: Some(vec![esc_nudge]),
                             sticky_provider: Some(Some(pick.provider)),
                             sticky_model: Some(Some(pick.model)),
+                            // Finestra pulita anche per il signature-loop.
+                            recent_tool_signatures: Some(Some(vec![])),
                             g1_reroute_count: Some(Some(0)),
                             action_nudge_count: Some(Some(0)),
                             pending_tool_uses: Some(Some(vec![])),
@@ -1973,10 +2017,17 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                                 .insert("auto_escalations".to_string(), json!(cd_escal + 1));
                             extra_out
                                 .insert("failover_tried".to_string(), json!(tried));
+                            // Grazia post-escalation (vedi floor nel check 6c).
+                            extra_out.insert(
+                                "repeat_scan_floor".to_string(),
+                                json!(state.messages.len()),
+                            );
                             return Ok(StateDelta {
                                 messages: Some(vec![esc_nudge]),
                                 sticky_provider: Some(Some(pick.provider)),
                                 sticky_model: Some(Some(pick.model)),
+                                // Finestra pulita anche per il signature-loop.
+                                recent_tool_signatures: Some(Some(vec![])),
                                 g1_reroute_count: Some(Some(0)),
                                 action_nudge_count: Some(Some(0)),
                                 pending_tool_uses: Some(Some(vec![])),
@@ -2124,6 +2175,12 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
         // `escalations` (auto_escalations) cresce di 1 quando il loop scala il
         // modello (py:3284); resta invariato altrimenti. Tracciato per il delta.
         let mut escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+        // `true` quando il signature-loop ha promosso e ri-eseguito il turno col
+        // modello promosso: rende la promozione STICKY nel delta finale (prima era
+        // one-shot: il turno successivo ricadeva sul modello di routing debole, che
+        // rientrava subito in loop — incidente run c4fa064b) e fa partire la grazia
+        // post-escalation (floor repeated_action).
+        let mut signature_loop_promoted = false;
         let mut loop_close_result: Option<String> = None;
         if let Some(loop_sig) = &det.loop_signature {
             let tool_name = loop_sig.split_once('|').map(|(t, _)| t).unwrap_or(loop_sig);
@@ -2146,11 +2203,13 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                     .escalation_inputs(state.user_intent.as_deref(), Some(&provider), Some(&model))
                     .await
                     .unwrap_or_default();
+                // Indice catena 0: catena RELATIVA al corrente (vedi ramo G1);
+                // il cap resta su escalations < 3 (qui sopra).
                 if let Some(pick) = pick_escalation_model(
                     &inputs.chain,
                     Some(&provider),
                     Some(&model),
-                    escalations,
+                    0,
                     inputs.provider_in_cooldown,
                     inputs.cross_provider.as_ref(),
                 ) {
@@ -2213,6 +2272,7 @@ riassumi lo stato."
                         model = pick.model;
                         new_signatures = vec![]; // reset accumulator dopo escalation (py:3265)
                         tried_escalation = true;
+                        signature_loop_promoted = true;
                     }
                 }
             }
@@ -2395,13 +2455,18 @@ modo piu' specifico."
             }
         }
 
-        // sticky: aggiornato solo se cascade ha fatto fallback (o gia' presente).
-        let sticky_provider = if cascade_did_fallback {
+        // sticky: aggiornato se cascade ha fatto fallback O se il signature-loop
+        // ha promosso il modello in questo turno. Prima la promozione del
+        // signature-loop era one-shot (eff==provider dopo la riassegnazione ->
+        // cascade_did_fallback=false -> sticky invariato): il turno successivo
+        // ricadeva sul modello di routing debole, vanificando l'escalation.
+        let sticky_promote = cascade_did_fallback || signature_loop_promoted;
+        let sticky_provider = if sticky_promote {
             Some(eff_provider.clone())
         } else {
             state.sticky_provider.clone()
         };
-        let sticky_model = if cascade_did_fallback {
+        let sticky_model = if sticky_promote {
             Some(eff_model.clone())
         } else {
             state.sticky_model.clone()
@@ -2504,6 +2569,13 @@ modo piu' specifico."
         // iteration_budget, ...).
         let mut extra_out = state.extra.clone();
         extra_out.insert("auto_escalations".to_string(), json!(escalations));
+        if signature_loop_promoted {
+            // Grazia post-escalation: il floor parte dal prefisso persistito
+            // corrente, cosi' l'assistant del promosso (appeso da questo delta)
+            // e le sue azioni successive contano da zero nel detector
+            // repeated_action, mentre lo storico pre-promozione non conta piu'.
+            extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        }
         delta.extra = Some(extra_out);
 
         // next_actions.derive (py:3379-3402) + unfulfilled-report (py:3404-3429):
@@ -2529,6 +2601,45 @@ impl ExecutorNode {
             &self.cfg.routing_provider,
             &self.cfg.routing_model,
         )
+    }
+
+    /// Coppia (provider, model) CORRENTE ai fini dell'escalation (punto unico,
+    /// regola L). Priorita' A COPPIE COERENTI (mai provider di una fonte +
+    /// model di un'altra): sticky > (provider_used, model_used) > override >
+    /// routing.
+    ///
+    /// - `sticky` per primo: una promozione appena scritta NON ha ancora
+    ///   chiamato, quindi `model_used` e' stantio; il vecchio ordine
+    ///   `model_used`-first faceva credere al selettore di essere ancora sul
+    ///   modello debole e ri-proponeva lo stesso candidato, bruciando il
+    ///   budget escalation (incidente run c4fa064b: 2 ESCALATE identici
+    ///   back-to-back -> ABORT).
+    /// - `model_used` prima di override/routing: riflette l'ULTIMA chiamata
+    ///   REALE, upscale e cascade inclusi — il filtro finestra-aware della
+    ///   catena deve ancorarsi alla finestra del modello davvero in uso, non
+    ///   a quella del modello di routing pre-upscale.
+    fn escalation_current_pair(&self, state: &AgentState) -> (Option<String>, Option<String>) {
+        let pair = |p: &Option<String>, m: &Option<String>| -> Option<(String, String)> {
+            match (p.as_deref(), m.as_deref()) {
+                (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => {
+                    Some((p.to_string(), m.to_string()))
+                }
+                _ => None,
+            }
+        };
+        let picked = pair(&state.sticky_provider, &state.sticky_model)
+            .or_else(|| pair(&state.provider_used, &state.model_used))
+            .or_else(|| pair(&state.provider_override, &state.model_override))
+            .or_else(|| {
+                pair(
+                    &Some(self.cfg.routing_provider.clone()),
+                    &Some(self.cfg.routing_model.clone()),
+                )
+            });
+        match picked {
+            Some((p, m)) => (Some(p), Some(m)),
+            None => (None, None),
+        }
     }
 
     /// Costruisce il delta di chiusura d'autorita' su `done` ripetuto >=3

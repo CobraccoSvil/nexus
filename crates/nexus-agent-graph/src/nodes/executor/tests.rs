@@ -443,6 +443,146 @@ async fn repeated_action_edit_fallito_diagnose_prima_di_abort() {
     assert!(has_specific_nudge, "atteso il nudge specifico edit-fallito nel prompt");
 }
 
+/// Messaggi con lo STESSO edit_file fallito 2 volte (signature identica).
+fn edit_fallito_x2() -> Vec<Message> {
+    let mut messages = vec![human("modifica il file")];
+    for _ in 0..2 {
+        messages.push(ai_tool(
+            "edit_file",
+            json!({"path": "src/lib.rs", "old_string": "fn alpha() {}"}),
+        ));
+        messages.push(Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String("old_string non trovato".into()),
+                is_error: true,
+                exit_code: None,
+            }]),
+        });
+    }
+    messages
+}
+
+#[tokio::test]
+async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
+    // REGRESSIONE run c4fa064b (parte 1): edit fallito ripetuto, asse gia'
+    // guidato E diagnosticato, CON candidato di escalation -> il nodo ESCALA
+    // (sticky promosso + G1Escalated) e scrive la grazia post-escalation
+    // (repeat_scan_floor = lunghezza del prefisso messaggi persistito), invece
+    // di chiudere con la diagnosi come risposta finale.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let messages = edit_fallito_x2();
+    let msg_len = messages.len() as i64;
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_provider.as_deref(), Some("anthropic"));
+    assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
+    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("repeat_scan_floor").and_then(Value::as_i64),
+        Some(msg_len)
+    );
+    // LLM NON chiamato in questo passaggio: il self-loop rientra col promosso.
+    assert!(llm.seen.lock().unwrap().is_empty());
+    // La coppia corrente interrogata alla porta e' la risoluzione del turno
+    // (sticky > override > routing), qui il routing anthropic/claude-x.
+    let seen = esc.seen.lock().unwrap();
+    assert_eq!(seen.last().unwrap().1.as_deref(), Some("anthropic"));
+    assert_eq!(seen.last().unwrap().2.as_deref(), Some("claude-x"));
+}
+
+#[tokio::test]
+async fn repeated_action_dopo_escalate_il_promosso_fa_il_turno() {
+    // REGRESSIONE run c4fa064b (parte 2): al RIENTRO dall'escalation
+    // (G1Continue), con la grazia scritta (repeat_scan_floor) e lo sticky
+    // promosso, il detector NON ri-scatta sulle azioni pre-escalation e il
+    // turno viene ESEGUITO dal modello promosso (una chiamata LLM col modello
+    // sticky). Prima del fix: il rientro rivedeva gli stessi messaggi e
+    // bruciava l'intero budget escalation (3) in pochi millisecondi -> ABORT
+    // "il modello non riesce", senza che il promosso facesse UNA chiamata.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("procedo col fix"));
+    let ctx = ctx_with(llm.clone(), false);
+    // Stato POST-merge del delta Escalate: azioni pre-escalation + nudge,
+    // sticky promosso, contatore e floor scritti.
+    let mut messages = edit_fallito_x2();
+    let floor = messages.len() as i64;
+    messages.push(human(
+        "Hai ripetuto la stessa azione senza progresso. Ora rispondi tu, che sei \
+un modello piu' capace: cambia approccio ed ESEGUI il prossimo step concreto.",
+    ));
+    let mut extra = serde_json::Map::new();
+    extra.insert("auto_escalations".into(), json!(1));
+    extra.insert("repeat_scan_floor".into(), json!(floor));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        sticky_provider: Some("anthropic".into()),
+        sticky_model: Some("claude-piu-capace".into()),
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-x".into()),
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Nessuna nuova decisione di stallo: il turno e' stato eseguito.
+    assert_ne!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_ne!(out.forced_close_unverified, Some(true));
+    // UNA chiamata LLM, col modello PROMOSSO (sticky > override > routing).
+    let calls = llm.seen.lock().unwrap();
+    assert_eq!(calls.len(), 1, "il promosso deve fare il turno");
+    assert_eq!(calls.last().unwrap().provider, "anthropic");
+    assert_eq!(calls.last().unwrap().model, "claude-piu-capace");
+}
+
+#[tokio::test]
+async fn escalation_current_pair_ancora_a_model_used_senza_sticky() {
+    // Senza sticky, la coppia corrente per l'escalation e' (provider_used,
+    // model_used) — l'ultima chiamata REALE, smart-upscale incluso — NON il
+    // modello di routing: il filtro finestra-aware della catena deve ancorarsi
+    // alla finestra del modello davvero in uso (un ancoraggio al routing
+    // pre-upscale puo' promuovere un modello con finestra minore del contesto
+    // corrente).
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: edit_fallito_x2(),
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-upscalato-1m".into()),
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        ..Default::default()
+    };
+    let _ = n.run(&state, &ctx).await.expect("run");
+    let seen = esc.seen.lock().unwrap();
+    assert_eq!(seen.last().unwrap().1.as_deref(), Some("anthropic"));
+    assert_eq!(seen.last().unwrap().2.as_deref(), Some("claude-upscalato-1m"));
+}
+
 #[tokio::test]
 async fn happy_path_tool_use_produce_pending() {
     let rc = Arc::new(StubRunControlStore::default());
@@ -1319,6 +1459,14 @@ async fn signature_loop_escalation_riesegue() {
     // La porta escalation e' stata interrogata col modello corrente.
     let seen = esc.seen.lock().unwrap();
     assert_eq!(seen.last().unwrap().2.as_deref(), Some("claude-x"));
+    // REGRESSIONE run c4fa064b: la promozione del signature-loop e' STICKY (i
+    // turni successivi restano sul promosso invece di ricadere sul modello di
+    // routing debole, che rientrava subito in loop) e fa partire la grazia
+    // post-escalation (floor del detector repeated_action = prefisso persistito
+    // pre-turno, qui il solo messaggio human).
+    assert_eq!(out.sticky_provider.as_deref(), Some("anthropic"));
+    assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
+    assert_eq!(out.extra.get("repeat_scan_floor").and_then(Value::as_i64), Some(1));
 }
 
 #[tokio::test]
