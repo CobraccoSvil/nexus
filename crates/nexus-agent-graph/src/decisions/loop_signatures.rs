@@ -127,6 +127,64 @@ pub fn detect_signature_loop(recent: &[String], new_signatures: &[String]) -> Lo
     }
 }
 
+/// Variante PROGRESS-AWARE di [`detect_signature_loop`] (punto unico, regola L —
+/// stessa esclusione "rilettura-dopo-progresso" del detector `repeated_action`):
+/// per una firma di tool READ-ONLY contano SOLO le occorrenze successive
+/// all'ULTIMA azione PRODUTTIVA nella finestra. Il pattern di debugging
+/// "leggi -> correggi -> builda (fallisce) -> rileggi l'errore" produce la
+/// stessa firma di lettura 3 volte con edit/build in mezzo: NON e' uno stallo
+/// (incidente run b833a83d: gemini-2.5-pro ucciso dal loop-detector mentre
+/// stava convergendo su una build rossa). Le firme PRODUTTIVE (edit/comando
+/// identico ripetuto) contano sempre: ripeterle a vuoto E' il loop.
+///
+/// `is_read_only(name)` e' il predicato del chiamante (l'executor passa
+/// `EXPLORATION_ONLY_TOOLS`, fonte unica della classificazione read-only):
+/// il modulo resta puro e senza dipendenze dal routing.
+pub fn detect_signature_loop_progress_aware(
+    recent: &[String],
+    new_signatures: &[String],
+    is_read_only: impl Fn(&str) -> bool,
+) -> LoopDetection {
+    let mut combined: Vec<String> = Vec::with_capacity(recent.len() + new_signatures.len());
+    combined.extend_from_slice(recent);
+    combined.extend_from_slice(new_signatures);
+
+    let sig_name = |sig: &str| -> String {
+        sig.split_once('|').map(|(n, _)| n.to_string()).unwrap_or_else(|| sig.to_string())
+    };
+
+    let mut loop_signature: Option<String> = None;
+    if combined.len() >= LOOP_THRESHOLD && !new_signatures.is_empty() {
+        let window_len = LOOP_THRESHOLD * 2;
+        let start = combined.len().saturating_sub(window_len);
+        let window = &combined[start..];
+        // Posizione dell'ULTIMA firma produttiva nella finestra: le occorrenze
+        // read-only PRECEDENTI sono "scontate" dal progresso.
+        let last_productive = window.iter().rposition(|s| !is_read_only(&sig_name(s)));
+        for sig in new_signatures {
+            let read_only = is_read_only(&sig_name(sig));
+            let count = if read_only {
+                let from = last_productive.map(|p| p + 1).unwrap_or(0);
+                window[from..].iter().filter(|s| *s == sig).count()
+            } else {
+                window.iter().filter(|s| *s == sig).count()
+            };
+            if count >= LOOP_THRESHOLD {
+                loop_signature = Some(sig.clone());
+                break;
+            }
+        }
+    }
+
+    let cap_start = combined.len().saturating_sub(RECENT_SIGNATURES_CAP);
+    let updated_signatures = combined[cap_start..].to_vec();
+
+    LoopDetection {
+        loop_signature,
+        updated_signatures,
+    }
+}
+
 /// Stato del contatore di esplorazione consecutiva, prima/dopo l'aggiornamento.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplorationCounterUpdate {
@@ -234,6 +292,48 @@ mod tests {
         let new2 = vec!["a|1".into()];
         let out2 = detect_signature_loop(&recent2, &new2);
         assert_eq!(out2.loop_signature, None);
+    }
+
+    fn read_only(name: &str) -> bool {
+        EXPLORATION_ONLY_TOOLS.contains(&name)
+    }
+
+    #[test]
+    fn progress_aware_rilettura_debugging_non_e_loop() {
+        // REGRESSIONE run b833a83d: leggi -> correggi -> builda (fallisce) ->
+        // rileggi l'errore -> rileggi. Le letture PRECEDENTI l'azione produttiva
+        // sono scontate dal progresso: 2 occorrenze dopo l'edit/build -> NO loop.
+        let read = build_signature("read_file", &json!({"path": "bookingService.ts"}));
+        let edit = build_signature("edit_file", &json!({"path": "bookingService.ts"}));
+        let build = build_signature("run_command", &json!({"command": "pnpm build"}));
+        let recent = vec![read.clone(), edit, build, read.clone()];
+        let out =
+            detect_signature_loop_progress_aware(&recent, std::slice::from_ref(&read), read_only);
+        assert_eq!(out.loop_signature, None, "rilettura post-progresso non e' stallo");
+        // La coda aggiornata resta completa (il filtro e' solo sul conteggio).
+        assert_eq!(out.updated_signatures.len(), 5);
+    }
+
+    #[test]
+    fn progress_aware_loop_vero_scatta() {
+        // Tre letture identiche SENZA alcuna azione produttiva in mezzo: stallo.
+        let read = build_signature("read_file", &json!({"path": "x"}));
+        let recent = vec![read.clone(), "list_files|abc".into(), read.clone()];
+        let out =
+            detect_signature_loop_progress_aware(&recent, std::slice::from_ref(&read), read_only);
+        assert_eq!(out.loop_signature, Some(read));
+    }
+
+    #[test]
+    fn progress_aware_produttiva_ripetuta_scatta_sempre() {
+        // Un edit/comando IDENTICO ripetuto 3 volte e' loop anche se in mezzo
+        // ci sono altre produttive: il filtro vale solo per i read-only.
+        let edit = build_signature("edit_file", &json!({"path": "x", "old_string": "a"}));
+        let other = build_signature("run_command", &json!({"command": "ls"}));
+        let recent = vec![edit.clone(), other, edit.clone()];
+        let out =
+            detect_signature_loop_progress_aware(&recent, std::slice::from_ref(&edit), read_only);
+        assert_eq!(out.loop_signature, Some(edit));
     }
 
     #[test]

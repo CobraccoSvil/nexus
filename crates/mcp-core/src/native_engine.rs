@@ -346,6 +346,17 @@ pub struct NativeRunOutcome {
     /// partial -> FailedDiagnosed); il summary e' testo umano di display.
     /// `None` se il modello non ha dichiarato.
     pub declared_outcome: Option<serde_json::Value>,
+    /// Classe d'errore STRUTTURATA del run (`extra.error_class` dello stato, es.
+    /// `context_overflow` — ADR 0016 D2): segnale MACCHINA per il finalizzatore
+    /// (regola M: mai dedotta dal testo). `None` se il run non ha classificato.
+    pub error_class: Option<String>,
+    /// Segnale AUTORITATIVO (mig 0386) che il run e' stato chiuso da un abort
+    /// anti-loop senza verifica: sopravvive alla riscrittura di `stop_reason`
+    /// operata dal final_gate sul ramo forced_close. Senza questo trasporto il
+    /// mapping deduceva il forced-close SOLO da stop_reason e un loop ripulito
+    /// dal final_gate finiva "completed" col testo di sistema come risposta
+    /// (run b833a83d).
+    pub forced_close_unverified: bool,
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -660,8 +671,38 @@ async fn load_executor_config(
         // della porta PgSummaryStore (agent.context.rolling_summary_model).
         rolling_summary_enabled: setting_bool(db, "agent.context.rolling_summary_enabled", d.rolling_summary_enabled).await,
         rolling_keep_recent: setting_i64(db, "agent.context.rolling_keep_recent_turns", d.rolling_keep_recent).await,
+        // ── hard cap post-brake (ADR 0016 fase D2, mig 0286) ──────────────────
+        // Ratio dal DB (0.95 in produzione; il Default 0.0 = gate OFF vale SOLO
+        // a DB irraggiungibile) + template del messaggio overflow risolto qui
+        // (regola G: il testo redazionale vive SOLO in nexus_prompt_templates).
+        hard_cap_ratio: setting_f64(db, "agent.context.hard_cap_ratio", d.hard_cap_ratio).await,
+        overflow_message_template: {
+            let key = setting_string(
+                db,
+                "agent.context.overflow_message_key",
+                "system.context_overflow",
+            )
+            .await;
+            resolve_prompt_template(db, &key).await.unwrap_or_default()
+        },
         ..ExecutorConfig::default()
     }
+}
+
+/// Risolve un template attivo da `nexus_prompt_templates` per chiave (stesso SQL
+/// di `summary_store::system_prompt`, qui parametrico: punto unico locale del
+/// lookup template per le config del motore nativo). `None` se assente/vuoto.
+async fn resolve_prompt_template(db: &PgPool, key: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT content FROM nexus_prompt_templates \
+         WHERE key = $1 AND is_active = TRUE LIMIT 1",
+    )
+    .bind(key)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .filter(|t| !t.trim().is_empty())
 }
 
 /// Costruisce la [`TodoRunnerConfig`] DB-driven (regola G): legge dal DB il kind
@@ -1353,6 +1394,12 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             serde_json::to_string(&state.messages).ok()
         },
         declared_outcome: state.declared_outcome.clone(),
+        error_class: state
+            .extra
+            .get("error_class")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
     }
 }
 
@@ -2439,6 +2486,48 @@ mod tests {
         // token_brake dal DB (0.55 < 0.70 default).
         assert!((cfg.token_brake.max_context_ratio - 0.55).abs() < 1e-9);
         assert!((cfg.forced_rag_ratio - 0.30).abs() < 1e-9);
+    }
+
+    #[sqlx::test]
+    async fn load_executor_config_hard_cap_e_template_overflow(pool: sqlx::PgPool) {
+        // ADR 0016 D2: hard_cap_ratio dal DB + template overflow risolto da
+        // nexus_prompt_templates via la chiave in agent.context.overflow_message_key.
+        create_settings_table(&pool).await;
+        set_setting(&pool, "agent.context.hard_cap_ratio", "0.95").await;
+        sqlx::query(
+            "CREATE TABLE nexus_prompt_templates ( \
+                 key TEXT PRIMARY KEY, \
+                 content TEXT NOT NULL, \
+                 is_active BOOLEAN NOT NULL DEFAULT TRUE \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create nexus_prompt_templates");
+        sqlx::query(
+            "INSERT INTO nexus_prompt_templates (key, content, is_active) VALUES \
+             ('system.context_overflow', 'Stima %ESTIMATED_TOKENS% su %MAX_WINDOW%.', TRUE)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert template");
+
+        let cfg = load_executor_config(&pool, "anthropic", "claude-x", 200_000).await;
+        assert!((cfg.hard_cap_ratio - 0.95).abs() < 1e-9, "ratio dal DB");
+        assert_eq!(
+            cfg.overflow_message_template,
+            "Stima %ESTIMATED_TOKENS% su %MAX_WINDOW%."
+        );
+    }
+
+    #[sqlx::test]
+    async fn load_executor_config_hard_cap_safe_default_senza_template(pool: sqlx::PgPool) {
+        // Rovescio safe-DB-down: chiave assente e tabella template inesistente ->
+        // ratio 0.0 (gate OFF) e template vuoto, nessun panico (regola G).
+        create_settings_table(&pool).await;
+        let cfg = load_executor_config(&pool, "anthropic", "claude-x", 200_000).await;
+        assert_eq!(cfg.hard_cap_ratio, 0.0, "gate OFF a chiave assente");
+        assert!(cfg.overflow_message_template.is_empty());
     }
 
     #[sqlx::test]

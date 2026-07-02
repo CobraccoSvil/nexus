@@ -1354,7 +1354,7 @@ async fn signature_loop_chiude() {
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
-        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        recent_tool_signatures: Some(vec![sig.clone(), "list_files|abc".into(), sig.clone()]),
         tools_json: Some(vec![json!({"name": "read_file"})]),
         ..Default::default()
     };
@@ -1608,7 +1608,7 @@ async fn signature_loop_escalation_riesegue() {
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
-        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        recent_tool_signatures: Some(vec![sig.clone(), "list_files|abc".into(), sig.clone()]),
         tools_json: Some(vec![json!({"name": "read_file"})]),
         ..Default::default()
     };
@@ -1712,7 +1712,7 @@ async fn signature_loop_escalation_non_forza_tool_choice() {
         action_oriented: Some(true),
         iterations: Some(1),
         stop_reason: Some(StopReason::EndTurn),
-        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        recent_tool_signatures: Some(vec![sig.clone(), "list_files|abc".into(), sig.clone()]),
         tools_json: Some(vec![json!({"name": "read_file"})]),
         ..Default::default()
     };
@@ -1739,7 +1739,7 @@ async fn signature_loop_senza_escalation_chiude_secco() {
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
-        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        recent_tool_signatures: Some(vec![sig.clone(), "list_files|abc".into(), sig.clone()]),
         tools_json: Some(vec![json!({"name": "read_file"})]),
         ..Default::default()
     };
@@ -1751,6 +1751,43 @@ async fn signature_loop_senza_escalation_chiude_secco() {
     assert!(out.result.as_deref().unwrap().contains("[LOOP RILEVATO]"));
     assert!(out.pending_tool_uses.unwrap().is_empty());
     assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(0));
+    // Il segnale STRUTTURATO di chiusura anti-loop viaggia nel delta: il
+    // finalizzatore mappa FailedDiagnosed anche se il final_gate riscrive
+    // stop_reason (run b833a83d chiudeva "completed" col testo di sistema).
+    assert_eq!(out.forced_close_unverified, Some(true));
+}
+
+#[tokio::test]
+async fn signature_loop_secco_con_task_complete_forza_dichiarazione() {
+    // ADR 0034: chiusura secca del signature-loop (nessun candidato di
+    // escalation) con task_complete NEL catalogo -> turno dichiarativo forzato
+    // invece del "[LOOP RILEVATO]" di sistema: l'esito del run sara' la
+    // dichiarazione strutturata del modello.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota
+    let same_input = json!({"path": "x"});
+    let sig = build_signature("read_file", &same_input);
+    let llm = llm_tool_call("read_file", same_input.clone());
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("leggi")],
+        recent_tool_signatures: Some(vec![sig.clone(), "list_files|abc".into(), sig.clone()]),
+        tools_json: Some(vec![
+            json!({"name": "read_file"}),
+            json!({"name": "task_complete"}),
+        ]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(
+        out.extra.get("force_outcome_declaration").and_then(Value::as_bool),
+        Some(true)
+    );
+    // Nessuna chiusura testuale di sistema.
+    assert!(out.result.is_none());
 }
 
 #[tokio::test]
@@ -1769,7 +1806,7 @@ async fn signature_loop_cap_escalations_chiude_secco() {
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
-        recent_tool_signatures: Some(vec![sig.clone(), "altro|abc".into(), sig.clone()]),
+        recent_tool_signatures: Some(vec![sig.clone(), "list_files|abc".into(), sig.clone()]),
         tools_json: Some(vec![json!({"name": "read_file"})]),
         extra,
         ..Default::default()
@@ -2285,6 +2322,133 @@ async fn smart_upscale_sotto_soglia_non_promuove() {
     assert_eq!(req.model, "claude-x");
     // select_upscale_model NON chiamata (gate should_upscale falso).
     assert!(upscale.selected.lock().unwrap().is_empty());
+}
+
+// ── hard cap post-brake (ADR 0016 fase D2) ────────────────────────────────────
+
+#[tokio::test]
+async fn hard_cap_termina_il_run_senza_chiamare_llm() {
+    // Un singolo messaggio enorme che il brake NON puo' comprimere (primo human
+    // preservato): la stima resta oltre ratio*window -> fail-fast strutturato,
+    // NESSUNA chiamata LLM, messaggio dal template renderizzato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        context_window: 100,
+        hard_cap_ratio: 0.95,
+        overflow_message_template:
+            "Contesto stimato %ESTIMATED_TOKENS% token oltre la finestra %MAX_WINDOW%."
+                .to_string(),
+        ..ExecutorConfig::default()
+    };
+    let (n, meta) = node_ports(cfg, rc, next_actions, billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text("MAI CHIAMATO"));
+    let ctx = ctx_with(llm.clone(), false);
+    let big = "x".repeat(2000); // ~500 token stimati >> 95 (0.95*100)
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human(&big)],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Chiusura strutturata: StopReason::Error + error_class macchina (regola M).
+    assert_eq!(out.stop_reason, Some(StopReason::Error));
+    assert_eq!(
+        out.extra.get("error_class").and_then(|v| v.as_str()),
+        Some("context_overflow")
+    );
+    // Messaggio dal template DB renderizzato (placeholder sostituiti).
+    let result = out.result.expect("result presente");
+    assert!(result.contains("oltre la finestra 100"), "result: {result}");
+    assert!(!result.contains("%ESTIMATED_TOKENS%"));
+    // NESSUNA chiamata LLM: fail-fast prima della richiesta al provider.
+    assert!(llm.seen.lock().unwrap().is_empty(), "LLM non deve essere chiamato");
+    // Meta_step strutturato context_overflow persistito.
+    let metas = meta.meta_steps.lock().unwrap();
+    assert!(
+        metas.iter().any(|m| m.get("kind").and_then(|k| k.as_str()) == Some("context_overflow")),
+        "meta_step context_overflow atteso"
+    );
+}
+
+#[tokio::test]
+async fn hard_cap_inerte_con_ratio_default() {
+    // Default safe-DB-down (`hard_cap_ratio=0.0`): gate spento, il run procede
+    // e l'LLM viene chiamato anche con contesto oltre la window.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        context_window: 100,
+        ..ExecutorConfig::default()
+    };
+    let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
+    let ctx = ctx_with(llm.clone(), false);
+    let big = "x".repeat(2000);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human(&big)],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::Error));
+    assert_eq!(llm.seen.lock().unwrap().len(), 1, "LLM chiamato normalmente");
+}
+
+#[tokio::test]
+async fn hard_cap_non_scatta_dopo_upscale_a_window_grande() {
+    // L'upscale promuove a un modello con window molto piu' grande: il gate usa
+    // la window EFFETTIVA del modello promosso e NON scatta (ordine
+    // upscale -> brake -> hard cap).
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::promoting_to_window(
+        100,
+        "google",
+        "gemini-2.5-pro",
+        100_000,
+    ));
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        context_window: 100,
+        hard_cap_ratio: 0.95,
+        upscale_enabled: true,
+        ..ExecutorConfig::default()
+    };
+    let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
+    let ctx = ctx_with(llm.clone(), false);
+    let big = "x".repeat(2000); // ~500 token: oltre la window 100, sotto 95k
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human(&big)],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Nessun overflow: il run e' proseguito col modello promosso.
+    assert_ne!(out.stop_reason, Some(StopReason::Error));
+    assert_eq!(out.model_used.as_deref(), Some("gemini-2.5-pro"));
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(req.model, "gemini-2.5-pro");
 }
 
 // ── rolling-summary (intervento 3): aggancio al cambio-fase ───────────────────
