@@ -198,9 +198,6 @@ static FILE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("regex file path valido")
 });
 
-/// Hint di modelli "weak" (substring sul model_id). Vedi `_WEAK_MODELS_HINT`.
-const WEAK_MODELS_HINT: &[&str] = &["mini", "nano", "haiku", "lite", "small", "flash-lite"];
-
 /// Mappa label complexity del classifier LLM -> score 0-100. Vedi
 /// `_COMPLEXITY_LABEL_SCORE` Python.
 fn complexity_label_score(label: &str) -> Option<i64> {
@@ -238,9 +235,15 @@ pub fn estimate_prompt_complexity(prompt: &str, config: &AdaptiveBudgetConfig) -
 /// Calcola il budget di iterazioni per un run agente. Ritorna
 /// `(iter_budget, complexity_score)`. Vedi `compute_iteration_budget` Python
 /// (config PASSATA come parametro).
+///
+/// `performance_tier` viene dal catalog (`ai_price_catalog.performance_tier`,
+/// risolto a monte, regola G): sostituisce la vecchia blacklist di substring
+/// sul nome modello (`WEAK_MODELS_HINT`, violazione regola G — un nuovo modello
+/// "mini" richiedeva una patch al codice). `Some("light")` = modello leggero ->
+/// moltiplicatore di budget; qualunque altro valore o `None` = nessun boost.
 pub fn compute_iteration_budget(
     prompt: &str,
-    model: Option<&str>,
+    performance_tier: Option<&str>,
     classifier_complexity: Option<&str>,
     agentic_score: Option<f64>,
     config: &AdaptiveBudgetConfig,
@@ -260,12 +263,9 @@ pub fn compute_iteration_budget(
     let base = config.iteration_budget_base;
     let per_pt = config.iteration_budget_per_complexity_point;
     let mut budget = base + per_pt * score;
-    // Modelli weak (mini/nano/haiku/lite): piu' budget per arrivare al risultato.
-    if let Some(m) = model {
-        let ml = m.to_lowercase();
-        if WEAK_MODELS_HINT.iter().any(|h| ml.contains(h)) {
-            budget = (budget as f64 * config.weak_model_multiplier) as i64;
-        }
+    // Modelli LIGHT (tier dal catalog): piu' budget per arrivare al risultato.
+    if performance_tier.map(str::trim) == Some("light") {
+        budget = (budget as f64 * config.weak_model_multiplier) as i64;
     }
     (budget.min(config.iteration_budget_max), score)
 }
@@ -357,10 +357,15 @@ mod tests {
     #[test]
     fn budget_weak_model_cap() {
         let cfg = AdaptiveBudgetConfig::default();
+        // Tier "light" dal catalog (non piu' substring sul nome modello).
         let (budget, _) =
-            compute_iteration_budget("x", Some("gpt-4o-mini"), Some("high"), None, &cfg);
+            compute_iteration_budget("x", Some("light"), Some("high"), None, &cfg);
         // (60 + 280) * 1.5 = 510 -> cap 300.
         assert_eq!(budget, 300);
+        // Tier medium/heavy o assente: nessun moltiplicatore.
+        let (b_med, _) = compute_iteration_budget("x", Some("medium"), Some("low"), None, &cfg);
+        let (b_none, _) = compute_iteration_budget("x", None, Some("low"), None, &cfg);
+        assert_eq!(b_med, b_none);
     }
 
     #[test]

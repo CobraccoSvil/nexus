@@ -155,8 +155,11 @@ struct ComplexityInput {
 #[derive(Debug, Deserialize)]
 struct BudgetInput {
     prompt: String,
+    /// Tier dal catalog (sostituisce il vecchio campo `model`: la funzione non
+    /// legge piu' il nome modello — regola G, niente substring su nomi).
+    /// Fixture con solo `model` restano deserializzabili (campo ignorato).
     #[serde(default)]
-    model: Option<String>,
+    performance_tier: Option<String>,
     #[serde(default)]
     classifier_complexity: Option<String>,
     #[serde(default)]
@@ -253,7 +256,7 @@ fn golden_parita_python() {
                     serde_json::from_value(c.input.clone()).expect("BudgetInput");
                 let (budget, score) = helpers::compute_iteration_budget(
                     &i.prompt,
-                    i.model.as_deref(),
+                    i.performance_tier.as_deref(),
                     i.classifier_complexity.as_deref(),
                     i.agentic_score,
                     &cfg_budget,
