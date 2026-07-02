@@ -252,6 +252,10 @@ pub struct FinalGateNode {
     /// Motore criteri (sotto-sistema delegato). mcp-core lo implementera' col
     /// ToolRunner gRPC; nei test e' stubato.
     criteria: std::sync::Arc<dyn crate::runtime::ports::CriteriaRunner>,
+    /// Persistenza dei meta-step di fase `final_gate` (narrazione live in chat:
+    /// "Verifico il risultato" / esito). Pattern emit+persist, punto unico
+    /// [`crate::nodes::emit_phase_meta`] (regola L).
+    meta_steps: std::sync::Arc<dyn crate::runtime::ports::MetaStepStore>,
 }
 
 impl FinalGateNode {
@@ -261,11 +265,13 @@ impl FinalGateNode {
         cfg: FinalGateConfig,
         routing_cfg: RoutingConfig,
         criteria: std::sync::Arc<dyn crate::runtime::ports::CriteriaRunner>,
+        meta_steps: std::sync::Arc<dyn crate::runtime::ports::MetaStepStore>,
     ) -> Self {
         Self {
             cfg,
             routing_cfg,
             criteria,
+            meta_steps,
         }
     }
 
@@ -566,6 +572,17 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
         let cycle = state.final_gate_cycle.unwrap_or(0) + 1;
         let max_cycles = self.cfg.max_cycles;
 
+        // Narrazione live: la chat racconta che parte la verifica oggettiva.
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            ctx.exec_mode(),
+            "final_gate",
+            format!("Verifico il risultato (build/test, tentativo {cycle}/{max_cycles})"),
+            serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "start"}),
+        )
+        .await;
+
         // ── Esecuzione criteri (sotto-sistema delegato) ───────────────────────
         // GATING SHADOW: ExecMode::Replay in shadow (zero side-effect), punto
         // unico ctx.exec_mode() (regola L). Un guasto infrastrutturale del runner
@@ -592,6 +609,15 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 cycle,
                 "final_gate: passato -> chiusura"
             );
+            crate::nodes::emit_phase_meta(
+                ctx.emit.as_ref(),
+                self.meta_steps.as_ref(),
+                ctx.exec_mode(),
+                "final_gate",
+                "Verifica superata".to_string(),
+                serde_json::json!({"cycle": cycle, "phase": "passed"}),
+            )
+            .await;
             return Ok(StateDelta {
                 final_gate_cycle: Some(Some(0)),
                 stop_reason: Some(Some(StopReason::EndTurn)),
@@ -614,6 +640,15 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 max_cycles,
                 "final_gate: chiusura senza re-executor"
             );
+            crate::nodes::emit_phase_meta(
+                ctx.emit.as_ref(),
+                self.meta_steps.as_ref(),
+                ctx.exec_mode(),
+                "final_gate",
+                "Verifica non superata: chiudo (limite tentativi)".to_string(),
+                serde_json::json!({"cycle": cycle, "phase": "forced_close", "forced": forced_close}),
+            )
+            .await;
             return Ok(StateDelta {
                 final_gate_cycle: Some(Some(0)),
                 stop_reason: Some(Some(StopReason::EndTurn)),
@@ -630,6 +665,15 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             max_cycles,
             "final_gate: fallito -> re-executor"
         );
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            ctx.exec_mode(),
+            "final_gate",
+            format!("Verifica fallita: rimando in correzione ({cycle}/{max_cycles})"),
+            serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "failed"}),
+        )
+        .await;
         let block = Self::render_failed_block(state, cycle, max_cycles, &results);
         let hm = Message::Human {
             content: MessageContent::text(block),
@@ -669,7 +713,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::ports::ExecMode;
-    use crate::runtime::test_doubles::{NullEventSink, StubCriteriaRunner, StubLlmGateway, StubToolExecutor};
+    use crate::runtime::test_doubles::{NullEventSink, StubCriteriaRunner, StubLlmGateway, StubMetaStepStore, StubToolExecutor};
     use crate::runtime::AgentNodeCtx;
     use crate::state::{ContentBlock, Message, MessageContent};
 
@@ -721,7 +765,7 @@ mod tests {
         cfg: FinalGateConfig,
         criteria: Arc<dyn crate::runtime::ports::CriteriaRunner>,
     ) -> FinalGateNode {
-        FinalGateNode::new(cfg, RoutingConfig::default(), criteria)
+        FinalGateNode::new(cfg, RoutingConfig::default(), criteria, std::sync::Arc::new(StubMetaStepStore::default()))
     }
 
     /// Messaggio AI con un tool_use mutativo: rende il task "software"

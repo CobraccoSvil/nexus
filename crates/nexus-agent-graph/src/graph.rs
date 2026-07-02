@@ -529,6 +529,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 todos.clone(),
+                meta_steps.clone(),
             )),
             todo_runner: Arc::new(TodoRunnerNode::new(
                 TodoRunnerConfig::default(),
@@ -553,6 +554,7 @@ mod tests {
                 run_control.clone(),
                 todos.clone(),
                 offload.clone(),
+                meta_steps.clone(),
             )),
             verifier: Arc::new(VerifierNode::new(
                 VerifierConfig::default(),
@@ -561,11 +563,13 @@ mod tests {
                 todos.clone(),
                 stub_criteria(),
                 verifier_runs,
+                meta_steps.clone(),
             )),
             final_gate: Arc::new(FinalGateNode::new(
                 FinalGateConfig::default(),
                 RoutingConfig::default(),
                 stub_criteria(),
+                meta_steps.clone(),
             )),
             reflection: Arc::new(ReflectionNode::new(ReflectionConfig::default())),
             learner: Arc::new(LearnerNode::new(LearnerConfig::default())),

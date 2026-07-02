@@ -79,23 +79,8 @@ export function upsertSyntheticAssistantMessage(
   return [...current, message];
 }
 
-/** Stati di un run considerati terminali (run concluso, non piu' in esecuzione). */
-export function isStatusTerminal(status: string): boolean {
-  return (
-    status === "completed" ||
-    status === "failed" ||
-    status === "timed_out" ||
-    status === "cancelled" ||
-    status === "interrupted" ||
-    status === "loop_aborted" ||
-    status === "provider_unavailable" ||
-    // Esiti canonici macchina a stati (mig 0386): terminali.
-    status === "completed_verified" ||
-    status === "failed_diagnosed" ||
-    // ADR 0034: blocked_needs_input e' TERMINALE — il run e' concluso con la
-    // dichiarazione onesta "serve input umano"; il prossimo messaggio crea un
-    // nuovo run (nessun resume esiste per questo stato, a differenza di
-    // awaiting_confirmation che resta un run sospeso).
-    status === "blocked_needs_input"
-  );
-}
+/** Stati di un run considerati terminali (run concluso, non piu' in esecuzione).
+ *  DELEGA al punto unico [`isAgentRunTerminal`] in api/agent.ts (regola L):
+ *  prima le due liste erano duplicate ed erano DIVERGENTI su
+ *  blocked_needs_input (terminale da ADR 0034). */
+export { isAgentRunTerminal as isStatusTerminal } from "../api/agent";

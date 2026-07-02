@@ -38,4 +38,27 @@ pub use router::RouterNode;
 pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};
 pub use tool_dispatch::{ToolDispatchConfig, ToolDispatchNode};
 pub use understanding::{UnderstandingConfig, UnderstandingNode};
+
+/// NARRAZIONE LIVE di una FASE semantica del run (punto unico, regola L):
+/// emette il meta-step verso la chat (`EventSink`, no-op in shadow) e lo
+/// persiste per il ripristino post-reload (`MetaStepStore`, gata Real).
+/// Best-effort: non fallisce mai il turno. Usato da executor / tool_dispatch /
+/// final_gate / planner — i due canali (live vs storico) restano trait separati
+/// per contratto (vedi doc di `MetaStepStore`), qui si compongono UNA volta.
+pub(crate) async fn emit_phase_meta(
+    emit: &dyn crate::runtime::ports::EventSink,
+    store: &dyn crate::runtime::ports::MetaStepStore,
+    mode: crate::runtime::ports::ExecMode,
+    kind: &str,
+    title: String,
+    payload: serde_json::Value,
+) {
+    emit.emit(crate::runtime::ports::SseEvent::MetaStep {
+        kind: kind.to_string(),
+        title: title.clone(),
+        payload: payload.clone(),
+    });
+    let meta = serde_json::json!({"kind": kind, "title": title, "payload": payload});
+    let _ = store.persist_meta_step(meta, mode).await;
+}
 pub use verifier::{suggest_remediation, VerifierConfig, VerifierNode};

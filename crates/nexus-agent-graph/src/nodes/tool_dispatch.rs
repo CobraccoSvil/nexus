@@ -102,7 +102,8 @@ use crate::decisions::tool_dispatch::{
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::runtime::ports::{
-    AgentStepStore, ContextOffload, ExecMode, RunControlStore, SseEvent, ToolCall, TodoStore,
+    AgentStepStore, ContextOffload, ExecMode, MetaStepStore, RunControlStore, SseEvent, ToolCall,
+    TodoStore,
     ToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
@@ -230,6 +231,9 @@ pub struct ToolDispatchNode {
     todos: Arc<dyn TodoStore>,
     /// Offload del contesto verso RAG (best-effort, degrado a troncamento).
     offload: Arc<dyn ContextOffload>,
+    /// Persistenza dei meta-step semantici `tool_executed` (narrazione live,
+    /// gata Real). Stesso pattern emit+persist dell'`executor_call` (regola L).
+    meta_steps: Arc<dyn MetaStepStore>,
 }
 
 impl ToolDispatchNode {
@@ -243,6 +247,7 @@ impl ToolDispatchNode {
         run_control: Arc<dyn RunControlStore>,
         todos: Arc<dyn TodoStore>,
         offload: Arc<dyn ContextOffload>,
+        meta_steps: Arc<dyn MetaStepStore>,
     ) -> Self {
         Self {
             cfg,
@@ -251,6 +256,7 @@ impl ToolDispatchNode {
             run_control,
             todos,
             offload,
+            meta_steps,
         }
     }
 
@@ -767,6 +773,24 @@ dell'utente.";
             .zip(results.iter())
             .map(|(b, r)| tool_executed_meta_step(b, r.is_error, exec_provider, exec_model))
             .collect();
+        // NARRAZIONE LIVE: ogni tool eseguito diventa una riga della cronaca in
+        // chat ("tool edit_file — src/x.ts", "errore run_command — pnpm build").
+        // Prima restavano solo nel canale stato (delta) e NON arrivavano mai al
+        // frontend ne' al DB: la timeline mostrava solo gli executor_call
+        // ("quale modello") — incidente narrazione 2026-07-02. Pattern
+        // emit (live, sink no-op in shadow) + persist (storico, gata Real),
+        // identico all'executor_call (regola L).
+        for ms in &tool_steps {
+            crate::nodes::emit_phase_meta(
+                ctx.emit.as_ref(),
+                self.meta_steps.as_ref(),
+                ctx.exec_mode(),
+                &ms.kind,
+                ms.title.clone(),
+                ms.payload.clone(),
+            )
+            .await;
+        }
 
         // ── SSE tool_result verso il frontend (parita' 1:1 con run_via_brain) ──
         // Un evento per ogni risultato, correlato alla ToolUse via `tool_call_id`,
@@ -1091,7 +1115,7 @@ mod tests {
     use crate::runtime::ports::{PortError, SseEvent, ToolOutcome};
     use crate::runtime::test_doubles::{
         NullEventSink, RecordingEventSink, StubAgentStepStore, StubContextOffload, StubLlmGateway,
-        StubRunControlStore, StubTodoStore,
+        StubMetaStepStore, StubRunControlStore, StubTodoStore,
     };
     use crate::runtime::AgentNodeCtx;
     use crate::routing::config::RoutingConfig;
@@ -1199,6 +1223,7 @@ mod tests {
             rc.clone(),
             Arc::new(StubTodoStore::with_todos(vec![])),
             Arc::new(StubContextOffload::default()),
+            Arc::new(StubMetaStepStore::default()),
         );
         (n, steps, rc)
     }
@@ -1211,7 +1236,15 @@ mod tests {
         offload: Arc<StubContextOffload>,
     ) -> (ToolDispatchNode, Arc<StubAgentStepStore>) {
         let steps = Arc::new(StubAgentStepStore::default());
-        let n = ToolDispatchNode::new(cfg, tools, steps.clone(), rc, todos, offload);
+        let n = ToolDispatchNode::new(
+            cfg,
+            tools,
+            steps.clone(),
+            rc,
+            todos,
+            offload,
+            Arc::new(StubMetaStepStore::default()),
+        );
         (n, steps)
     }
 
@@ -1645,6 +1678,7 @@ mod tests {
             rc.clone(),
             Arc::new(StubTodoStore::with_todos(vec![])),
             Arc::new(StubContextOffload::default()),
+            Arc::new(StubMetaStepStore::default()),
         );
         let ctx = ctx_with(true, CancellationToken::new()); // shadow
         let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
@@ -1695,6 +1729,7 @@ mod tests {
             Arc::new(StubRunControlStore::default()),
             Arc::new(ReminderStore),
             Arc::new(StubContextOffload::default()),
+            Arc::new(StubMetaStepStore::default()),
         );
         let ctx = ctx_with(false, CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
@@ -2100,6 +2135,7 @@ mod golden {
                 rc,
                 Arc::new(StubTodoStore::with_todos(vec![])),
                 Arc::new(StubContextOffload::default()),
+                Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
             );
             let context = ctx();
             let delta = node.run(&st, &context).await.expect("run ok");

@@ -313,8 +313,10 @@ impl VerifierNode {
         store: Arc<dyn TodoStore>,
         criteria: Arc<dyn CriteriaRunner>,
         runs: Arc<dyn VerifierRunStore>,
+        meta_steps: Arc<dyn crate::runtime::ports::MetaStepStore>,
     ) -> Self {
-        let final_gate = FinalGateNode::new(final_gate_cfg, routing_cfg.clone(), criteria.clone());
+        let final_gate =
+            FinalGateNode::new(final_gate_cfg, routing_cfg.clone(), criteria.clone(), meta_steps);
         Self {
             cfg,
             routing_cfg,
@@ -987,6 +989,7 @@ mod tests {
             store,
             criteria,
             runs,
+            Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
         )
     }
 

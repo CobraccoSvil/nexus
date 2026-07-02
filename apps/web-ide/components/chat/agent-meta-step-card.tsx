@@ -159,6 +159,17 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   // (executor.rs kind=executor_call): la riga prende il colore del provider e il
   // nome provider/modello e' mostrato nel badge a destra.
   executor_call: { icon: "◇", label: "Modello", accent: "#64748b", defaultOpen: false },
+  // Hard cap contesto (ADR 0016 D2): il run termina fail-fast quando la stima
+  // token resta oltre il limite del modello anche dopo brake/upscale.
+  context_overflow: { icon: "!", label: "Contesto oltre il limite", accent: "#ef4444", defaultOpen: true },
+  // Fasi della narrazione live (emesse dal grafo nativo via emit_phase_meta):
+  // promozione di modello (escalation/failover), interruzione anti-loop,
+  // verifica oggettiva del final_gate, ciclo dichiarativo ADR 0034.
+  escalation: { icon: "▲", label: "Cambio modello", accent: "#0ea5e9", defaultOpen: true },
+  loop_break: { icon: "◼", label: "Interruzione", accent: "#ef4444", defaultOpen: true },
+  final_gate: { icon: "✓", label: "Verifica", accent: "#22c55e", defaultOpen: false },
+  declaration_request: { icon: "…", label: "Richiesta esito", accent: "#f59e0b", defaultOpen: false },
+  outcome_declared: { icon: "◆", label: "Esito dichiarato", accent: "#22c55e", defaultOpen: true },
 };
 
 const DEFAULT_DESC: KindDescriptor = {
