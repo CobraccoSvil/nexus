@@ -2109,9 +2109,10 @@ async fn unfulfilled_report_sostituisce_in_confirm() {
     let billing = Arc::new(StubBillingCooldownPort::default());
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
-    // Promessa monca (testo che il detector unfulfilled riconosce come futuro 1p).
+    // Report STRUTTURALE di passi pendenti (ADR 0018 fase 3: il segnale del
+    // ramo report e' detect_pending_steps_report_with, non piu' la narrazione).
     let llm = Arc::new(StubLlmGateway::with_text(
-        "Ora attendo che il servizio parta e poi verifichero' il risultato.",
+        "Analisi fatta. Prossimi passi:\n1. Avviare il servizio\n2. Verificare il login",
     ));
     let ctx = ctx_with(llm.clone(), false);
     let state = AgentState {
@@ -2132,6 +2133,48 @@ async fn unfulfilled_report_sostituisce_in_confirm() {
     assert!(result.contains("NON e' completato"));
     // Il resoconto cita il file toccato dalla history.
     assert!(result.contains("login.ts"));
+}
+
+#[tokio::test]
+async fn g1_nudge_scatta_via_segnale_strutturale_senza_blacklist() {
+    // REGRESSIONE ADR 0018 fase 3 (caso Beauty-Book chat 7): turno precedente
+    // chiuso end_turn con ZERO tool call, tool disponibili, richiesta d'azione.
+    // Con la blacklist lessicale rimossa il nudge G1 deve scattare comunque,
+    // dal solo segnale STRUTTURALE (structural_unfulfilled_signal).
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
+    let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![
+            human("sistema il login"),
+            Message::Ai {
+                content: MessageContent::text("Procedero' a creare il file di login."),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+        ],
+        // Turno precedente: end_turn SENZA tool call (segnale strutturale).
+        stop_reason: Some(StopReason::EndTurn),
+        iterations: Some(1),
+        action_oriented: Some(true),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _out = apply(state, delta);
+    // Il nudge G1 e' stato iniettato: la richiesta LLM contiene il messaggio
+    // forza-azione ("AGISCI ADESSO"), senza alcun match lessicale sulla prosa.
+    let req = llm.seen.lock().unwrap().last().cloned().unwrap();
+    let nudged = req
+        .messages
+        .iter()
+        .any(|m| m.content.to_string().contains("AGISCI ADESSO"));
+    assert!(nudged, "nudge G1 atteso via segnale strutturale");
 }
 
 #[tokio::test]
@@ -2160,22 +2203,21 @@ async fn unfulfilled_report_non_sostituisce_in_automatic() {
 }
 
 #[tokio::test]
-async fn unfulfilled_report_segue_il_lessicale_ignorando_closure_fulfilled() {
-    // DISTINZIONE LOAD-BEARING (regola L): il ramo report POST end_turn usa SOLO
-    // il detector lessicale (1:1 col Python :3413, che NON consulta closure_verdict
-    // in questo ramo), a differenza del ramo G1 (closure-first, py:1913-1917).
-    // Setup adversariale: closure_verdict = fulfilled (compiuto) MA il testo e' una
-    // promessa monca che il detector lessicale riconosce come NON compiuta. Il ramo
-    // report DEVE seguire il lessicale -> SOSTITUIRE col resoconto onesto, ignorando
-    // il verdetto closure fulfilled. Con la vecchia logica closure-first il ramo
-    // avrebbe visto fulfilled e NON avrebbe sostituito: questo test la cattura.
+async fn unfulfilled_report_segue_il_segnale_post_ignorando_closure_fulfilled() {
+    // DISTINZIONE LOAD-BEARING (regola L): il ramo report POST end_turn valuta il
+    // TESTO FINALE (report strutturale di passi pendenti, ADR 0018 fase 3) e NON
+    // consulta closure_verdict, a differenza del ramo G1 (closure-first).
+    // Setup adversariale: closure_verdict = fulfilled (compiuto, potenzialmente
+    // stale del turno precedente) MA il testo finale elenca passi pendenti. Il
+    // ramo report DEVE seguire il segnale sul testo -> SOSTITUIRE col resoconto
+    // onesto, ignorando il verdetto closure fulfilled.
     let rc = Arc::new(StubRunControlStore::default());
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::default());
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
     let llm = Arc::new(StubLlmGateway::with_text(
-        "Ora attendo che il servizio parta e poi verifichero' il risultato.",
+        "Analisi fatta. Prossimi passi:\n1. Avviare il servizio\n2. Verificare il login",
     ));
     let ctx = ctx_with(llm.clone(), false);
     let state = AgentState {
@@ -2194,8 +2236,8 @@ async fn unfulfilled_report_segue_il_lessicale_ignorando_closure_fulfilled() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     let result = out.result.as_deref().unwrap();
-    // SOSTITUITO dal resoconto onesto: il lessicale "unfulfilled" ha prevalso sul
-    // closure "fulfilled". La vecchia logica closure-first avrebbe lasciato il testo.
+    // SOSTITUITO dal resoconto onesto: il report strutturale sul testo finale ha
+    // prevalso sul closure "fulfilled" (che qui e' deliberatamente ignorato).
     assert!(result.contains("resoconto onesto"));
     assert!(result.contains("NON e' completato"));
     assert!(result.contains("login.ts"));

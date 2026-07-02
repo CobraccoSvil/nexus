@@ -5,8 +5,11 @@
 //! come parametro ([`super::config::RoutingConfig`], regola G). Punto unico
 //! (regola L): se un giorno il path Rust sara' imboccato, i nodi delegano qui.
 //!
-//! Riferimenti Python (`brain/agents/nodes/helpers.py` salvo nota):
-//!   - `_detect_unfulfilled_intent`        -> [`detect_unfulfilled_intent`]
+//! Riferimenti Python (`brain/agents/nodes/helpers.py` salvo nota).
+//! `_detect_unfulfilled_intent` (blacklist lessicale INTENT_NARRATION) e' stato
+//! RIMOSSO (ADR 0018 fase 3): il segnale strutturale
+//! [`crate::decisions::helpers::structural_unfulfilled_signal`] +
+//! [`detect_pending_steps_report`] + task_complete (ADR 0034) lo sostituiscono.
 //!   - `detect_pending_steps_report`       -> [`detect_pending_steps_report`]
 //!   - `has_productive_action_in_history`  -> [`has_productive_action_in_history`]
 //!   - `has_filesystem_mutation_in_history`-> [`has_filesystem_mutation_in_history`]
@@ -108,9 +111,9 @@ pub fn has_productive_action_in_history(messages: &[Message]) -> bool {
 /// e ora gira a vuoto". Usata dal gate G1 loop-conclamato per NON abortire un run che
 /// ha appena eseguito azioni concrete (anti falso-negativo, regola H): un run reale
 /// aveva installato i browser Playwright + system-deps e fatto passare il test E2E,
-/// ma il gate lessicale "non compiuto" (su detect_unfulfilled_intent della NARRAZIONE)
-/// lo abortiva ignorando i 16 tool riusciti, sostituendo il successo con un messaggio
-/// di resa. Il segnale STRUTTURALE (tool produttivi recenti) prevale sul lessicale.
+/// ma il vecchio gate lessicale "non compiuto" (blacklist NARRAZIONE, rimossa con
+/// ADR 0018 fase 3) lo abortiva ignorando i 16 tool riusciti, sostituendo il
+/// successo con un messaggio di resa. Il segnale STRUTTURALE prevale sempre.
 pub fn has_recent_productive_action(messages: &[Message], lookback: usize) -> bool {
     let start = messages.len().saturating_sub(lookback);
     has_productive_action_in_history(&messages[start..])
@@ -795,268 +798,6 @@ fn pick_top(list: &[(String, i64)], last: Option<&str>) -> Option<(String, i64)>
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-//  Segnale lessicale "intenzione imminente non compiuta"
-//  (_detect_unfulfilled_intent)
-// ──────────────────────────────────────────────────────────────────────────
-
-/// `_INTENT_NARRATION_PATTERNS` Python (1:1). Frasi precise IT/EN che annunciano
-/// un'azione imminente non eseguita. Match come substring sulla CODA del testo.
-const INTENT_NARRATION_PATTERNS: &[&str] = &[
-    // Italiano — intenzione futura imminente.
-    "inizio verificando",
-    "inizio controllando",
-    "inizio analizzando",
-    "inizio leggendo",
-    "inizio esaminando",
-    "inizio con ",
-    "inizio a ",
-    "inizio dal",
-    "inizio dalla",
-    "comincio con",
-    "comincio a ",
-    "comincio verificando",
-    "comincio dal",
-    "iniziamo verificando",
-    "iniziamo con",
-    "iniziamo dal",
-    "cominciamo con",
-    "partiamo da",
-    "procedo a ",
-    "procedo con",
-    "procedo alla",
-    "procedo nel",
-    "procedo ora",
-    "procedo subito",
-    "procediamo con",
-    "vado a ",
-    "ora vado",
-    "adesso vado",
-    "ora verifico",
-    "ora controllo",
-    "ora leggo",
-    "ora analizzo",
-    "ora eseguo",
-    "ora apro",
-    "ora esamino",
-    "adesso verifico",
-    "adesso controllo",
-    "adesso leggo",
-    "verifico la presenza",
-    "verifico se",
-    "verifico il",
-    "verifico la config",
-    "verifico ora",
-    "controllo la presenza",
-    "controllo se",
-    "controllo il",
-    "controllo la config",
-    "esamino il",
-    "esamino la",
-    "leggo il",
-    "leggo la config",
-    "fammi verificare",
-    "fammi controllare",
-    "fammi leggere",
-    "fammi dare un",
-    "fammi guardare",
-    "il prossimo passo",
-    "prossimo step",
-    "passo successivo",
-    "passo a ",
-    "proseguo con",
-    "proseguo a ",
-    // Italiano — gerundio "sto + gerundio".
-    "sto procedendo",
-    "procedendo con",
-    "procedendo a ",
-    "procedendo alla",
-    "sto creando",
-    "sto implementando",
-    "sto scrivendo",
-    "sto aggiungendo",
-    "sto generando",
-    "sto preparando",
-    "sto sviluppando",
-    "stiamo procedendo",
-    "stiamo creando",
-    "stiamo implementando",
-    // Italiano — futuro semplice.
-    "creerò ",
-    "creero ",
-    "implementerò ",
-    "implementero ",
-    "scriverò ",
-    "scrivero ",
-    "aggiungerò ",
-    "aggiungero ",
-    "genererò ",
-    "generero ",
-    "preparerò ",
-    "preparero ",
-    "continuerò ",
-    "continuero ",
-    "proseguirò ",
-    "proseguiro ",
-    "il prossimo file",
-    "i prossimi file",
-    "i prossimi test",
-    // Italiano — perifrasi "continuo con" / "passo al".
-    "continuo con",
-    "continuo a ",
-    "passo al",
-    "passo alla",
-    "passo ai",
-    "ora creo",
-    "ora implemento",
-    "ora scrivo",
-    "ora aggiungo",
-    "adesso creo",
-    "adesso implemento",
-    "adesso scrivo",
-    // Inglese — intenzione futura imminente.
-    "let me check",
-    "let me verify",
-    "let me start",
-    "let me read",
-    "let me look",
-    "let me inspect",
-    "let me examine",
-    "let me first",
-    "let me begin",
-    "i'll check",
-    "i'll verify",
-    "i'll start",
-    "i'll read",
-    "i'll look",
-    "i'll first",
-    "i'll begin",
-    "i'll inspect",
-    "i'll examine",
-    "i will check",
-    "i will verify",
-    "i will start",
-    "i will read",
-    "i'm going to",
-    "i am going to",
-    "let's check",
-    "let's verify",
-    "let's start",
-    "let's look",
-    "next, i",
-    "now i'll",
-    "now i will",
-    "first, i'll",
-    "first i'll",
-    "first, let me",
-    // Inglese — present progressive + future complementari.
-    "i'm proceeding",
-    "i am proceeding",
-    "i'll proceed",
-    "i will proceed",
-    "i'm creating",
-    "i'm implementing",
-    "i'm writing",
-    "i'm adding",
-    "moving on to",
-    "continuing with",
-    "next i will create",
-    "i'll create",
-    "i'll implement",
-    "i'll write",
-    "i'll add",
-    "i will create",
-    "i will implement",
-    "i will write",
-    "i will add",
-    "the next step is",
-    "the next file",
-    // Italiano — POLLING/ATTESA.
-    "attendo ",
-    "attendo qualche",
-    "attendo ancora",
-    "attendo che",
-    "attendo il",
-    "attendo un",
-    "aspetto ",
-    "aspetto che",
-    "aspetto qualche",
-    "aspetto ancora",
-    "ricontrollo",
-    "ricontrollare",
-    "verifico di nuovo",
-    "controllo di nuovo",
-    "verifico nuovamente",
-    "controllo nuovamente",
-    "riprovo tra",
-    "riprovo a ",
-    "riprovo subito",
-    "riprovo ora",
-    "provo di nuovo",
-    "provo ancora",
-    // Inglese — polling/attesa.
-    "i'll check again",
-    "let me check again",
-    "i'll wait",
-    "let me wait",
-    "waiting for",
-    "i'll retry",
-    "let me retry",
-    "checking again",
-    "i'll verify again",
-    "i'll re-check",
-    "let me re-check",
-    "i'll try again",
-];
-
-// Rilevamento MORFOLOGICO (`_FUTURE_1P_RE` / `_START_GERUND_RE`).
-//
-// `_FUTURE_1P_RE = r"\b(?!però\b)\w{2,}rò\b"`: la crate `regex` Rust NON supporta
-// il lookahead negativo. Lo emuliamo in due passi: matchiamo `\b\w{2,}rò\b` e
-// scartiamo l'unico caso escluso ("però"). Comportamento identico al Python:
-// "però" finisce in "rò" (p-e-r-ò) e verrebbe altrimenti catturato.
-static FUTURE_1P_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\w{2,}rò\b").expect("regex future 1p valida"));
-
-static START_GERUND_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\b(inizio|comincio|sto|stiamo|iniziamo|cominciamo|ora|adesso|poi|quindi|prima|dopo)\s+\w*ndo\b",
-    )
-    .expect("regex start gerund valida")
-});
-
-/// Ultimi `n` caratteri di una stringa (per CODEPOINT, come lo slice Python
-/// `text[-n:]`). Necessario perche' i pattern contengono accenti multibyte.
-fn tail_chars(s: &str, n: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let start = chars.len().saturating_sub(n);
-    chars[start..].iter().collect()
-}
-
-/// True se l'OUTPUT annuncia un'azione imminente ma non l'ha eseguita.
-/// Vedi `_detect_unfulfilled_intent`. Valuta la CODA (ultimi 400 char lower-case).
-pub fn detect_unfulfilled_intent(text: Option<&str>) -> bool {
-    let Some(text) = text else {
-        return false;
-    };
-    if text.trim().is_empty() {
-        return false;
-    }
-    // text.strip().lower()[-400:] — su codepoint, come Python.
-    let tail = tail_chars(&text.trim().to_lowercase(), 400);
-    if INTENT_NARRATION_PATTERNS.iter().any(|p| tail.contains(p)) {
-        return true;
-    }
-    // _FUTURE_1P_RE con esclusione di "però" (emula il lookahead negativo).
-    if FUTURE_1P_RE
-        .find_iter(&tail)
-        .any(|m| m.as_str() != "però")
-    {
-        return true;
-    }
-    START_GERUND_RE.is_match(&tail)
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 //  Segnale STRUTTURALE "report con passi pendenti" (detect_pending_steps_report)
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -1147,16 +888,33 @@ fn window_after(text: &str, char_start: usize, len_chars: usize) -> String {
 /// True se `text` e' un REPORT con elenco esplicito di passi ancora da svolgere.
 /// Vedi `detect_pending_steps_report`. `min_items`/`enabled` arrivano dalla config.
 pub fn detect_pending_steps_report(text: Option<&str>, cfg: &RoutingConfig) -> bool {
+    detect_pending_steps_report_with(
+        text,
+        cfg.pending_steps_detection_enabled,
+        cfg.pending_steps_min_items,
+    )
+}
+
+/// PUNTO UNICO parametrico (regola L) del rilevamento "report con passi
+/// pendenti": la variante con `RoutingConfig` delega qui; l'executor (che ha
+/// una config propria, `ExecutorConfig`) chiama direttamente questa firma con
+/// le STESSE chiavi DB `agent.closure.pending_steps_*` (ADR 0018 fase 3: e' il
+/// sostituto strutturale del vecchio fallback lessicale rimosso).
+pub fn detect_pending_steps_report_with(
+    text: Option<&str>,
+    enabled: bool,
+    min_items: i64,
+) -> bool {
     let Some(text) = text else {
         return false;
     };
     if text.trim().is_empty() {
         return false;
     }
-    if !cfg.pending_steps_detection_enabled {
+    if !enabled {
         return false;
     }
-    let min_items = cfg.pending_steps_min_items.max(1) as usize;
+    let min_items = min_items.max(1) as usize;
 
     let lower = text.to_lowercase();
     // Trova la PRIMA etichetta-trigger e analizza l'elenco subito sotto.
@@ -1195,22 +953,17 @@ fn closure_verdict_fulfilled(state: &AgentState) -> Option<bool> {
     }
 }
 
-/// Segnale SEMANTICO "esito non compiuto" con gerarchia de-lessicalizzata.
-/// Vedi `_unfulfilled_signal` (routing.py). Ordine:
+/// Segnale SEMANTICO "esito non compiuto", SOLO strutturale (ADR 0018 fase 3:
+/// il fallback lessicale `detect_unfulfilled_intent` e' stato RIMOSSO — le
+/// leve 0/1/2 + task_complete ADR 0034 coprono i casi che intercettava).
+/// Ordine:
 ///   1. verdetto closure_judge (bool) -> `not fulfilled`;
-///   2. segnale strutturale `detect_pending_steps_report(result)` -> True;
-///   3. fallback lessicale `_detect_unfulfilled_intent(result)`.
+///   2. segnale strutturale `detect_pending_steps_report(result)`.
 pub fn unfulfilled_signal(state: &AgentState, cfg: &RoutingConfig) -> bool {
     if let Some(fulfilled) = closure_verdict_fulfilled(state) {
         return !fulfilled;
     }
-    let result = state.result.as_deref();
-    // (2) Segnale strutturale "report con passi pendenti".
-    if detect_pending_steps_report(result, cfg) {
-        return true;
-    }
-    // (3) Fallback lessicale.
-    detect_unfulfilled_intent(result)
+    detect_pending_steps_report(state.result.as_deref(), cfg)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1851,27 +1604,6 @@ mod tests {
     }
 
     #[test]
-    fn unfulfilled_intent_pero_escluso() {
-        // "però" finisce in "rò" ma il lookahead negativo Python lo esclude.
-        assert!(!detect_unfulfilled_intent(Some(
-            "Tutto a posto, però fammi sapere."
-        )));
-        // Un futuro 1a persona reale matcha.
-        assert!(detect_unfulfilled_intent(Some(
-            "Ottimo. Adesso creerò il file."
-        )));
-    }
-
-    #[test]
-    fn unfulfilled_intent_pattern_lista() {
-        assert!(detect_unfulfilled_intent(Some(
-            "Ho visto il problema. Ora verifico il frontend."
-        )));
-        assert!(!detect_unfulfilled_intent(Some("Fatto, ho concluso.")));
-        assert!(!detect_unfulfilled_intent(None));
-    }
-
-    #[test]
     fn pending_steps_report_min_items() {
         let cfg = RoutingConfig::default();
         let report = "Stato attuale: ok.\nProssimi passi necessari:\n1. Verificare X\n2. Eseguire Y";
@@ -1879,6 +1611,24 @@ mod tests {
         // Un solo item < min_items(2).
         let uno = "Prossimi passi:\n1. Solo questo";
         assert!(!detect_pending_steps_report(Some(uno), &cfg));
+    }
+
+    #[test]
+    fn pending_steps_report_with_parametrico() {
+        // Punto unico parametrico (ADR 0018 fase 3): stessa semantica della
+        // variante con RoutingConfig, per i call site con ExecutorConfig.
+        let report = "Prossimi passi:\n1. Verificare X\n2. Eseguire Y";
+        assert!(detect_pending_steps_report_with(Some(report), true, 2));
+        assert!(!detect_pending_steps_report_with(Some(report), false, 2));
+        assert!(!detect_pending_steps_report_with(Some(report), true, 3));
+        assert!(!detect_pending_steps_report_with(None, true, 1));
+        // La narrazione futura SENZA elenco puntato non e' piu' un segnale
+        // (blacklist lessicale rimossa): copre task_complete + iteration cap.
+        assert!(!detect_pending_steps_report_with(
+            Some("Ottimo. Adesso creerò il file."),
+            true,
+            2
+        ));
     }
 
     #[test]

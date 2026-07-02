@@ -43,7 +43,7 @@ pub struct G1Signals {
     pub has_pending: bool,
     /// La richiesta del turno corrente e' action-oriented (`turn_action_oriented`).
     pub action_oriented: bool,
-    /// L'output e' "non compiuto" (`unfulfilled_signal`: closure_judge/pending/lessicale).
+    /// L'output e' "non compiuto" (`unfulfilled_signal`: closure_judge/pending, solo strutturale — ADR 0018 fase 3).
     pub unfulfilled: bool,
     /// Gli ultimi tool_result recenti indicano errore (`detect_recent_tool_error`).
     pub recent_error: bool,

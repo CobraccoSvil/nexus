@@ -438,8 +438,8 @@ mod tests {
         }
     }
 
-    /// Risposta finale testuale (end_turn -> chiusura). Testo al passato: niente
-    /// pattern "narrazione futura/gerundio" -> `unfulfilled_signal` falso.
+    /// Risposta finale testuale (end_turn -> chiusura). Testo senza elenco di
+    /// passi pendenti -> `unfulfilled_signal` falso (solo strutturale, ADR 0018).
     fn turn_end() -> LlmResponse {
         LlmResponse {
             content: "Lavoro concluso: ho scritto il file richiesto.".to_string(),

@@ -673,6 +673,10 @@ async fn load_executor_config(
         // della porta PgSummaryStore (agent.context.rolling_summary_model).
         rolling_summary_enabled: setting_bool(db, "agent.context.rolling_summary_enabled", d.rolling_summary_enabled).await,
         rolling_keep_recent: setting_i64(db, "agent.context.rolling_keep_recent_turns", d.rolling_keep_recent).await,
+        // ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
+        // dell'executor (stesse chiavi della RoutingConfig, regola L).
+        pending_steps_detection_enabled: setting_bool(db, "agent.closure.pending_steps_detection_enabled", d.pending_steps_detection_enabled).await,
+        pending_steps_min_items: setting_i64(db, "agent.closure.pending_steps_min_items", d.pending_steps_min_items).await,
         // ── hard cap post-brake (ADR 0016 fase D2, mig 0286) ──────────────────
         // Ratio dal DB (0.95 in produzione; il Default 0.0 = gate OFF vale SOLO
         // a DB irraggiungibile) + template del messaggio overflow risolto qui
