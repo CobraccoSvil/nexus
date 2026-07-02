@@ -60,12 +60,7 @@ commit-msg:
     no-emoji:
       run: bash scripts/check-no-emoji.sh "{1}"
 
-# Post-commit: notifica mcp-core per aggiornare il meta-vault.
-# Fail-soft: se mcp-core non e' raggiungibile (dev offline), il commit passa
-# comunque e il MetaDocsRefreshWorker recupera al prossimo tick periodico.
-post-commit:
-  parallel: false
-  commands:
-    meta_docs_ingest:
-      run: bash scripts/postcommit-meta-docs.sh
-      fail_text: ""
+# Nessun hook post-commit: la notifica meta-vault per commit
+# (POST /api/meta-docs/ingest-commit) e' stata ritirata con ADR 0017 v2 —
+# l'endpoint risponde 410 Gone. Il vault e' ingerito dal watcher filesystem
+# (crates/nexus-wiki/src/watcher.rs) e dal reingest (POST /api/wiki/reingest).
