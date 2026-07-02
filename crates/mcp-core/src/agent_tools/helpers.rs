@@ -33,6 +33,28 @@ pub(crate) const PROTECTED_PATTERNS: &[&str] = &[
     "pnpm-lock.yaml",
 ];
 
+/// True se il comando e' un one-shot LUNGO che TERMINA (install/build/compile/
+/// test/migrate) — da attendere in sincrono, non da instradare a run_service.
+/// PUNTO UNICO (regola L): usato dal probe di `run_command` e dal declassamento
+/// kind service->task in `tool_run_service`.
+pub(crate) fn is_long_oneshot(command: &str) -> bool {
+    let c = command.to_lowercase();
+    c.contains("install")
+        || c.contains("npm ci")
+        || c.contains(" build")
+        || c.contains("tsc")
+        || c.contains("cargo build")
+        || c.contains("cargo check")
+        || c.contains("cargo test")
+        || c.contains("compile")
+        || c.contains("migrate")
+        || c.contains("prisma generate")
+        || c.contains("playwright test")
+        || c.contains("npm add")
+        || c.contains("pnpm add")
+        || c.contains("yarn add")
+}
+
 /// Controlla se il comando corrisponde a uno dei pattern long-running caricati dal DB.
 /// Ogni pattern è una sequenza di token (es. "npm run dev") che viene cercata
 /// come sottosequenza contigua nei token del comando.
@@ -371,6 +393,20 @@ pub(crate) fn windows_shell_hint(_command: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_long_oneshot_riconosce_install_test_add() {
+        // Regressione pannello Servizi: questi comandi venivano registrati
+        // come kind='service' e restavano per sempre nella lista servizi.
+        assert!(is_long_oneshot("pnpm install"));
+        assert!(is_long_oneshot("npx playwright test --project=chromium"));
+        assert!(is_long_oneshot("pnpm add -D @playwright/test"));
+        assert!(is_long_oneshot("npm run build"));
+        // I server long-running NON sono one-shot.
+        assert!(!is_long_oneshot("node server.js"));
+        assert!(!is_long_oneshot("npm run dev"));
+        assert!(!is_long_oneshot("npm start"));
+    }
 
     #[test]
     fn classify_tsc_build_failure_emette_guida_build() {

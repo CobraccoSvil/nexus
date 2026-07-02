@@ -131,11 +131,24 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         return "[Errore: comando vuoto]".to_string();
     }
 
-    let label = input
+    // Declassamento one-shot: install/build/test lunghi arrivano qui via
+    // auto-routing di run_command (background=true, pattern long-running,
+    // auto-probe) con kind="service", ma NON sono servizi del progetto.
+    // Registrarli con kind='service' li fa comparire per sempre nel pannello
+    // Servizi (list_services_windows). Il processo resta gestito identico
+    // (stessa tabella, stop/read_output per id): cambia solo la classificazione.
+    let kind = if kind == "service" && is_long_oneshot(&command) && !looks_like_web_service(&command)
+    {
+        "task"
+    } else {
+        kind
+    };
+
+    let explicit_label = input
         .get("label")
         .and_then(Value::as_str)
-        .unwrap_or("Service")
-        .to_string();
+        .filter(|s| !s.trim().is_empty());
+    let label = explicit_label.unwrap_or("Service").to_string();
 
     // Resolve working directory
     let work_dir = if let Some(sub) = input.get("working_dir").and_then(Value::as_str) {
@@ -179,6 +192,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         || command_lower_top.contains("gunicorn")
         || command_lower_top.contains("rails")
         || command_lower_top.contains("django")
+        || command_lower_top.contains("server.js")
         || command_lower_top.contains(" run ") && command_lower_top.contains("backend")
         || label_lower_top.contains("backend")
         || label_lower_top.contains("api")
@@ -186,6 +200,15 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         Some("backend")
     } else {
         None
+    };
+    // Label default derivata dallo scopo: senza questa, ogni avvio senza label
+    // esplicita crea la voce generica "Service" che sfugge sia alla dedup per
+    // label sia alla similarity (parola GENERIC), producendo servizi duplicati
+    // dello stesso server nel pannello (caso reale: "Service" + "backend"
+    // entrambi running sullo stesso server.js).
+    let label = match (explicit_label, kind_hint) {
+        (None, Some(hint)) if kind == "service" => hint.to_string(),
+        _ => label,
     };
     if let Some(kind) = kind_hint {
         // Anti-duplicato convergente sul PUNTO UNICO resource_resolver (regola L):

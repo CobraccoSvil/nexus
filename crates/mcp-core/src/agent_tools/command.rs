@@ -11,22 +11,6 @@ const RUN_COMMAND_PROBE_SECS: u64 = 10;
 /// muore subito). Timeout sincrono generoso.
 const LONG_ONESHOT_PROBE_SECS: u64 = 300;
 
-/// True se il comando e' un one-shot LUNGO che TERMINA (install/build/compile/
-/// test/migrate) — da attendere in sincrono, non da instradare a run_service.
-fn is_long_oneshot(command: &str) -> bool {
-    let c = command.to_lowercase();
-    c.contains("install")
-        || c.contains("npm ci")
-        || c.contains(" build")
-        || c.contains("tsc")
-        || c.contains("cargo build")
-        || c.contains("cargo check")
-        || c.contains("cargo test")
-        || c.contains("compile")
-        || c.contains("migrate")
-        || c.contains("prisma generate")
-}
-
 const RUN_TESTS_DEFAULT_TIMEOUT: u64 = 120;
 const RUN_TESTS_MAX_TIMEOUT: u64 = 300;
 

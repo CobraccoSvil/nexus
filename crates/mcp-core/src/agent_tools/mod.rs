@@ -69,7 +69,7 @@ pub(crate) use uuid::Uuid;
 pub(crate) use crate::projects::resolve_relative_path;
 
 pub(crate) use helpers::{
-    classify_command_error, extract_file_structure, format_process_output, is_protected_path,
-    looks_like_long_running_command, READ_FILE_LINES_MAX,
+    classify_command_error, extract_file_structure, format_process_output, is_long_oneshot,
+    is_protected_path, looks_like_long_running_command, READ_FILE_LINES_MAX,
     READ_FILE_STRUCTURE_HINT_LINES,
 };

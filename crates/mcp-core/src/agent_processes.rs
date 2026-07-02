@@ -7,6 +7,20 @@ use uuid::Uuid;
 
 use crate::sandbox::{self, SandboxConfig};
 
+/// PUNTO UNICO (regola L): mappa il `role` di una run configuration
+/// (frontend/backend/service/test/tool — mig 0068) sul `kind` della riga
+/// `agent_processes`. Solo i processi long-running sono servizi del progetto
+/// e compaiono nel pannello Servizi (`list_services_windows`); test e tool
+/// sono task one-shot (es. `install-dependencies`, `playwright test`) e non
+/// devono restare per sempre nella lista servizi. `None` (config antiche
+/// senza role) resta 'service' per non nascondere server custom.
+pub fn kind_for_run_config_role(role: Option<&str>) -> &'static str {
+    match role {
+        Some("test") | Some("tool") => "task",
+        _ => "service",
+    }
+}
+
 /// Spawns a background process on the server, captures output into the DB.
 /// Returns the process UUID immediately (fire-and-forget for the caller).
 ///
@@ -474,4 +488,22 @@ pub struct ProcessSummary {
     pub status: String,
     pub exit_code: Option<i32>,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kind_for_run_config_role;
+
+    #[test]
+    fn run_config_tool_e_test_sono_task_non_servizi() {
+        // Regressione pannello Servizi: 'install-dependencies' (role=tool)
+        // veniva registrato kind='service' e compariva per sempre nella lista.
+        assert_eq!(kind_for_run_config_role(Some("tool")), "task");
+        assert_eq!(kind_for_run_config_role(Some("test")), "task");
+        assert_eq!(kind_for_run_config_role(Some("backend")), "service");
+        assert_eq!(kind_for_run_config_role(Some("frontend")), "service");
+        assert_eq!(kind_for_run_config_role(Some("service")), "service");
+        // Config antiche senza role: conservativo, resta servizio.
+        assert_eq!(kind_for_run_config_role(None), "service");
+    }
 }

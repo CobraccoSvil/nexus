@@ -936,7 +936,7 @@ pub async fn launch_run_config(
     let context = load_project_context(&state.db, project_id, user_id).await?;
 
     let row = sqlx::query(
-        "SELECT label, kind, command, args, cwd, env FROM run_configurations WHERE id=$1 AND project_id=$2"
+        "SELECT label, kind, command, args, cwd, env, role FROM run_configurations WHERE id=$1 AND project_id=$2"
     )
     .bind(config_id)
     .bind(project_id)
@@ -949,6 +949,7 @@ pub async fn launch_run_config(
     let command: String = row.get("command");
     let args: Vec<String> = row.try_get::<Vec<String>, _>("args").unwrap_or_default();
     let config_cwd: Option<String> = row.try_get("cwd").unwrap_or(None);
+    let role: Option<String> = row.try_get("role").unwrap_or(None);
     let env_json: serde_json::Value = row
         .try_get::<serde_json::Value, _>("env")
         .unwrap_or(serde_json::Value::Null);
@@ -1146,7 +1147,7 @@ pub async fn launch_run_config(
         Some(context.root_path.clone()),
         Some(env_vars),
         state.sandbox_available,
-        "service",
+        crate::agent_processes::kind_for_run_config_role(role.as_deref()),
         service_image,
     )
     .await

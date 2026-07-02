@@ -317,7 +317,7 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
     };
 
     let row = sqlx::query(
-        "SELECT label, command, args, cwd FROM run_configurations WHERE id=$1 AND project_id=$2",
+        "SELECT label, command, args, cwd, role FROM run_configurations WHERE id=$1 AND project_id=$2",
     )
     .bind(config_id)
     .bind(project_id)
@@ -334,6 +334,7 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
     let command: String = row.try_get("command").unwrap_or_default();
     let run_args: Vec<String> = row.try_get::<Vec<String>, _>("args").unwrap_or_default();
     let config_cwd: Option<String> = row.try_get("cwd").ok().flatten();
+    let role: Option<String> = row.try_get("role").ok().flatten();
 
     // Risolve la directory di lavoro
     let root_path = sqlx::query("SELECT repository_root_path FROM projects WHERE id=$1")
@@ -387,7 +388,7 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
         project_root,
         None,
         crate::sandbox::sandbox_enabled(),
-        "service",
+        crate::agent_processes::kind_for_run_config_role(role.as_deref()),
         None,
     )
     .await
