@@ -507,11 +507,17 @@ pub struct PlannerNode {
     /// Store dei todo/piani (`nexus_agent_todos`/`nexus_agent_plans`): fetch_plan
     /// + list_todos. Impl concreta in mcp-core; stub nei test.
     store: Arc<dyn TodoStore>,
+    /// Persistenza del meta-step "Piano creato — N step" (narrazione live in
+    /// chat). Pattern emit+persist, punto unico [`crate::nodes::emit_phase_meta`]
+    /// (regola L). Prima il meta-step restava solo nel delta di stato: mai
+    /// emesso via SSE ne' persistito -> la fase di pianificazione era muta.
+    meta_steps: Arc<dyn crate::runtime::ports::MetaStepStore>,
 }
 
 impl PlannerNode {
     /// Costruisce il nodo con la config DB-driven gia' risolta dal chiamante
     /// (provider/model/prompt risolti a monte, regola G) e lo store dei todo.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: PlannerConfig,
         planner_provider: String,
@@ -519,6 +525,7 @@ impl PlannerNode {
         fallback_provider: String,
         fallback_model: String,
         store: Arc<dyn TodoStore>,
+        meta_steps: Arc<dyn crate::runtime::ports::MetaStepStore>,
     ) -> Self {
         Self {
             cfg,
@@ -527,6 +534,7 @@ impl PlannerNode {
             fallback_provider,
             fallback_model,
             store,
+            meta_steps,
         }
     }
 
@@ -1024,6 +1032,17 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             &used_model,
             active_id.as_deref(),
         );
+        // Narrazione live: "Piano creato — N step" arriva in chat e sopravvive
+        // al reload (prima restava solo nel delta di stato: fase muta).
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            ctx.exec_mode(),
+            &plan_meta.kind,
+            plan_meta.title.clone(),
+            plan_meta.payload.clone(),
+        )
+        .await;
 
         // Messaggi di continuita' (assistant + tool_result) cosi' il prossimo
         // turno dell'executor vede il plan (`planner_node.py:583-602`). L'AIMessage
@@ -1370,6 +1389,7 @@ mod tests {
             "openai".to_string(),
             "modello-fallback".to_string(),
             store,
+            Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
         )
     }
 
@@ -1614,6 +1634,7 @@ mod tests {
             "openai".to_string(),
             "y".to_string(),
             store,
+            Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
         );
         let llm = Arc::new(ScriptedLlm::never_tool());
         let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
@@ -1988,6 +2009,7 @@ mod golden {
                         "fp".to_string(),
                         "fm".to_string(),
                         std::sync::Arc::new(crate::runtime::test_doubles::StubTodoStore::with_todos(vec![])),
+                        std::sync::Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
                     );
                     json!(node.build_hinted_system(&st, run_id))
                 }

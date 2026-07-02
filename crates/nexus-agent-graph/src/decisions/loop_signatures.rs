@@ -325,6 +325,22 @@ mod tests {
     }
 
     #[test]
+    fn progress_aware_polling_servizio_tra_build_non_e_loop() {
+        // REGRESSIONE run 2c41b145: build fallita -> leggi i log del dev server
+        // -> correggi -> ri-builda -> rileggi i log. read_service_output e' un
+        // tool di POLLING (stesso input, output che evolve): classificato
+        // read-only, le letture scontate dal progresso non contano.
+        let poll = build_signature("read_service_output", &json!({"process_id": "svc-1"}));
+        let edit = build_signature("edit_file", &json!({"path": "x.ts"}));
+        let build = build_signature("run_command", &json!({"command": "pnpm build"}));
+        // Finestra reale del run: build, poll, edit, build, poll + nuovo poll.
+        let recent = vec![build.clone(), poll.clone(), edit, build, poll.clone()];
+        let out =
+            detect_signature_loop_progress_aware(&recent, std::slice::from_ref(&poll), read_only);
+        assert_eq!(out.loop_signature, None, "polling tra build/edit e' monitoraggio, non stallo");
+    }
+
+    #[test]
     fn progress_aware_produttiva_ripetuta_scatta_sempre() {
         // Un edit/comando IDENTICO ripetuto 3 volte e' loop anche se in mezzo
         // ci sono altre produttive: il filtro vale solo per i read-only.

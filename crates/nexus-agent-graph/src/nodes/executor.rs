@@ -655,6 +655,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                     outcome = %outcome_kind,
                     "chiusura post-dichiarazione forzata (ADR 0034): esito strutturato"
                 );
+                self.emit_phase(
+                    ctx,
+                    mode,
+                    "outcome_declared",
+                    format!("Esito dichiarato: {outcome_kind}"),
+                    json!({"outcome": outcome_kind}),
+                )
+                .await;
                 let mut extra_out = state.extra.clone();
                 extra_out.insert("outcome_declaration_closed".to_string(), json!(true));
                 return Ok(StateDelta {
@@ -947,6 +955,21 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                     to_model = %pick.model,
                     "G1 cap, ESCALATION orchestratore -> azzero reroute e ri-do il turno"
                 );
+                self.emit_phase(
+                    ctx,
+                    mode,
+                    "escalation",
+                    format!(
+                        "Passo a {}/{} (il modello descrive senza agire)",
+                        pick.provider, pick.model
+                    ),
+                    json!({
+                        "to_provider": pick.provider,
+                        "to_model": pick.model,
+                        "reason": "g1_cap",
+                    }),
+                )
+                .await;
                 let esc_nudge = human_msg(
                     "Il modello precedente ha solo descritto le azioni senza eseguirle \
 dopo i tentativi previsti. Ora rispondi tu, che sei un modello piu' capace: NON \
@@ -978,7 +1001,7 @@ descrivere, ESEGUI subito il prossimo step concreto con un tool call.",
             // ADR 0034: prima della chiusura di sistema, UN turno dichiarativo
             // forzato — l'esito del run diventa la dichiarazione strutturata
             // del modello invece del testo sintetico qui sotto.
-            if let Some(delta) = self.forced_declaration_delta(state, iters_in) {
+            if let Some(delta) = self.forced_declaration_delta(state, iters_in, ctx, mode).await {
                 return Ok(delta);
             }
             let cap_text = format!(
@@ -993,6 +1016,14 @@ la richiesta in modo piu' specifico.",
                 auto_escalations = g1_escal,
                 "G1 cap raggiunto e catena escalation esaurita, interrompo"
             );
+            self.emit_phase(
+                ctx,
+                mode,
+                "loop_break",
+                "Interrompo: il modello non agisce dopo i solleciti".to_string(),
+                json!({"reason": "g1_cap", "reroute": g1_reroute_count}),
+            )
+            .await;
             return Ok(StateDelta {
                 messages: Some(vec![Message::Ai {
                     content: MessageContent::text(cap_text.clone()),
@@ -1152,6 +1183,21 @@ la richiesta in modo piu' specifico.",
                         to_model = %pick.model,
                         "esplorazione: ESCALATION modello -> azzero contatori e ri-do il turno"
                     );
+                    self.emit_phase(
+                        ctx,
+                        mode,
+                        "escalation",
+                        format!(
+                            "Passo a {}/{} (esplorazione senza risultato)",
+                            pick.provider, pick.model
+                        ),
+                        json!({
+                            "to_provider": pick.provider,
+                            "to_model": pick.model,
+                            "reason": "exploration",
+                        }),
+                    )
+                    .await;
                     let esc_nudge = human_msg(
                         "Il modello precedente ha continuato a esplorare senza produrre \
 un risultato. Ora rispondi tu, che sei un modello piu' capace: NON esplorare oltre, \
@@ -1450,7 +1496,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         // I sottocasi con lavoro prodotto o read-only instradano
                         // gia' al final_gate (esito oggettivo): restano invariati.
                         if touched.is_empty() && !ra_read_only {
-                            if let Some(delta) = self.forced_declaration_delta(state, iters_in) {
+                            if let Some(delta) = self.forced_declaration_delta(state, iters_in, ctx, mode).await {
                                 return Ok(delta);
                             }
                         }
@@ -1514,6 +1560,14 @@ indicalo esplicitamente."
                             touched = touched.len(),
                             "ABORT/CLOSE repeated_action (recap onesto)"
                         );
+                        self.emit_phase(
+                            ctx,
+                            mode,
+                            "loop_break",
+                            format!("Interrompo: '{label}' ripetuto senza progresso"),
+                            json!({"label": label, "count": ra_count, "reason": "repeated_action"}),
+                        )
+                        .await;
                         return Ok(StateDelta {
                             messages: Some(vec![Message::Ai {
                                 content: MessageContent::text(ra_text.clone()),
@@ -1543,6 +1597,21 @@ indicalo esplicitamente."
                             to_model = %pick.model,
                             "ESCALATE repeated_action -> promuovo modello"
                         );
+                        self.emit_phase(
+                            ctx,
+                            mode,
+                            "escalation",
+                            format!(
+                                "Passo a {}/{} (stallo su '{label}')",
+                                pick.provider, pick.model
+                            ),
+                            json!({
+                                "to_provider": pick.provider,
+                                "to_model": pick.model,
+                                "reason": "repeated_action",
+                            }),
+                        )
+                        .await;
                         let esc_nudge = human_msg(
                             "Hai ripetuto la stessa azione senza progresso. Ora rispondi tu, \
 che sei un modello piu' capace: cambia approccio ed ESEGUI il prossimo step concreto; \
@@ -2277,6 +2346,22 @@ della finestra {effective_window} del modello {provider}/{model}"
                                 tried = tried.len(),
                                 "provider caduto -> FAILOVER cross-provider via routing (cascata)"
                             );
+                            self.emit_phase(
+                                ctx,
+                                mode,
+                                "escalation",
+                                format!(
+                                    "Provider {provider} non disponibile: passo a {}/{}",
+                                    pick.provider, pick.model
+                                ),
+                                json!({
+                                    "from_provider": provider,
+                                    "to_provider": pick.provider,
+                                    "to_model": pick.model,
+                                    "reason": "provider_failover",
+                                }),
+                            )
+                            .await;
                             let esc_nudge = human_msg(
                                 "Il provider precedente non e' disponibile (in cooldown). \
 Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito.",
@@ -2508,6 +2593,22 @@ riassumi lo stato."
                         from_chain = pick.from_chain,
                         "LOOP -> auto-escalation, ri-eseguo il turno col modello promosso"
                     );
+                    self.emit_phase(
+                        ctx,
+                        mode,
+                        "escalation",
+                        format!(
+                            "Passo a {}/{} (tool call ripetuta identica)",
+                            pick.provider, pick.model
+                        ),
+                        json!({
+                            "from_provider": provider,
+                            "to_provider": pick.provider,
+                            "to_model": pick.model,
+                            "reason": "signature_loop",
+                        }),
+                    )
+                    .await;
                     // Ri-esegue lo STESSO turno col provider/model promosso
                     // (py:3241-3248). Trasporto unico (regola L): passa dal gateway
                     // come gli altri agent turn.
@@ -2563,12 +2664,20 @@ riassumi lo stato."
                 // del modello (outcome/blocker/summary) invece del testo sintetico.
                 // La risposta corrente (la tool call ripetuta identica) viene
                 // scartata: non va ne' eseguita ne' persistita.
-                if let Some(delta) = self.forced_declaration_delta(state, iters_in) {
+                if let Some(delta) = self.forced_declaration_delta(state, iters_in, ctx, mode).await {
                     return Ok(delta);
                 }
                 // Chiusura secca loop_detected (py:3269-3281). Messaggio ONESTO:
                 // niente suggerimenti hardcoded di modelli (regola G) — il loop a
                 // vuoto e' uno stallo del RUN, non un verdetto sul modello.
+                self.emit_phase(
+                    ctx,
+                    mode,
+                    "loop_break",
+                    format!("Interrompo: '{tool_name}' ripetuto identico senza progresso"),
+                    json!({"tool": tool_name, "reason": "signature_loop"}),
+                )
+                .await;
                 let loop_msg = format!(
                     "[LOOP RILEVATO] Il run e' stato interrotto: il tool '{tool_name}' e' stato \
 ripetuto con lo stesso input 3+ volte senza alcun progresso in mezzo ({provider}/{model}). \
@@ -2914,6 +3023,27 @@ impl ExecutorNode {
         )
     }
 
+    /// NARRAZIONE LIVE di una FASE del run: delega al punto unico
+    /// [`crate::nodes::emit_phase_meta`] (regola L) con le porte del nodo.
+    async fn emit_phase(
+        &self,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+        kind: &str,
+        title: String,
+        payload: Value,
+    ) {
+        crate::nodes::emit_phase_meta(
+            ctx.emit.as_ref(),
+            self.meta_steps.as_ref(),
+            mode,
+            kind,
+            title,
+            payload,
+        )
+        .await;
+    }
+
     /// Turno DICHIARATIVO forzato (ADR 0034): prima di una chiusura di sistema
     /// (abort anti-loop / cap G1 a catalogo esaurito) il modello riceve UN turno
     /// col catalogo ridotto a solo `task_complete` e tool choice forzata, cosi'
@@ -2926,7 +3056,13 @@ impl ExecutorNode {
     ///   nemmeno sotto forcing, la chiusura successiva e' quella secca);
     /// - il catalogo del run NON contiene `task_complete` (senza definizione il
     ///   modello non puo' chiamarlo: niente turno a vuoto).
-    fn forced_declaration_delta(&self, state: &AgentState, iters_in: i64) -> Option<OpaqueDelta> {
+    async fn forced_declaration_delta(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> Option<OpaqueDelta> {
         let already = state
             .extra
             .get("outcome_declaration_forced")
@@ -2944,6 +3080,16 @@ impl ExecutorNode {
         if !has_tool {
             return None;
         }
+        // Narrazione live: la chat spiega perche' il prossimo turno e' "strano"
+        // (catalogo ridotto a task_complete).
+        self.emit_phase(
+            ctx,
+            mode,
+            "declaration_request",
+            "Chiedo al modello di dichiarare l'esito del lavoro".to_string(),
+            json!({}),
+        )
+        .await;
         let nudge = human_msg(
             "Il turno sta per chiudere senza un esito dichiarato. Chiama ORA il tool \
 task_complete dichiarando l'esito REALE del lavoro: outcome=done SOLO se il lavoro e' \

@@ -996,6 +996,7 @@ async fn build_native_engine(
             fallback_provider,
             fallback_model,
             todos.clone(),
+            meta_steps.clone(),
         )),
         todo_runner: Arc::new(TodoRunnerNode::new(
             load_todo_runner_config(&db).await,
@@ -1031,6 +1032,7 @@ async fn build_native_engine(
             run_control.clone(),
             todos.clone(),
             offload.clone(),
+            meta_steps.clone(),
         )),
         verifier: Arc::new(VerifierNode::new(
             verifier_cfg,
@@ -1039,11 +1041,13 @@ async fn build_native_engine(
             todos.clone(),
             criteria.clone(),
             verifier_runs,
+            meta_steps.clone(),
         )),
         final_gate: Arc::new(FinalGateNode::new(
             final_gate_cfg,
             routing_cfg.clone(),
             criteria,
+            meta_steps.clone(),
         )),
         reflection: Arc::new(ReflectionNode::new(reflection_cfg)),
         learner: Arc::new(LearnerNode::new(LearnerConfig::default())),

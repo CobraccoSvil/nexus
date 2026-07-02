@@ -181,8 +181,10 @@ export async function getProviderModels(provider: string): Promise<ProviderModel
   return fetchJsonNoAuth(`${NEURAL_BASE}/providers/${provider}/models`);
 }
 
-/** Stati terminali di un run agente (allineati al backend agent_runs.status). */
-function isAgentRunTerminal(status: string): boolean {
+/** Stati terminali di un run agente (allineati al backend agent_runs.status:
+ *  `AgentRunStatus::is_terminal`, punto unico regola L — l'omologo in
+ *  use-chat/helpers.ts delega a questa funzione). */
+export function isAgentRunTerminal(status: string): boolean {
   return (
     status === "completed" ||
     status === "failed" ||
@@ -191,10 +193,13 @@ function isAgentRunTerminal(status: string): boolean {
     status === "interrupted" ||
     status === "loop_aborted" ||
     status === "provider_unavailable" ||
-    // Esiti canonici macchina a stati (mig 0386): terminali. blocked_needs_input
-    // NO: e' in attesa di input (come awaiting_confirmation), non terminale.
+    // Esiti canonici macchina a stati (mig 0386): terminali.
     status === "completed_verified" ||
-    status === "failed_diagnosed"
+    status === "failed_diagnosed" ||
+    // ADR 0034: blocked_needs_input e' TERMINALE — run CONCLUSO con la
+    // dichiarazione "serve input umano"; il prossimo messaggio crea un nuovo
+    // run (solo awaiting_confirmation resta un run sospeso con resume).
+    status === "blocked_needs_input"
   );
 }
 
