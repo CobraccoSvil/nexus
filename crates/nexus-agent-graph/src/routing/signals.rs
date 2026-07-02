@@ -91,6 +91,18 @@ pub const EXPLORATION_ONLY_TOOLS: &[&str] = &[
     "search_in_files",
     "nexus_mcp_tool_search",
     "nexus_get_worklog",
+    // Osservazione RUNTIME di servizi/porte (letture pure, per natura da
+    // POLLING: stesso input, output che evolve nel tempo). Senza questa
+    // classificazione il signature-loop trattava tre letture identiche di log
+    // come stallo anche con edit/build in mezzo (run 2c41b145:
+    // gemini-2.5-pro interrotto mentre monitorava il dev server tra una
+    // correzione e l'altra). Da read-only ereditano: sconto post-progresso nel
+    // signature-loop, soglia repeated_action piu' alta, conteggio nel budget
+    // esplorazione (il polling infinito a vuoto resta guidato/interrotto).
+    "read_service_output",
+    "tail_service_logs",
+    "list_active_services",
+    "nexus_list_ports",
 ];
 
 /// True se il run ha gia' eseguito almeno UN'azione PRODUTTIVA (tool_use con
