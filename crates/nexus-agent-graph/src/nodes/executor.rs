@@ -1492,8 +1492,17 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
         // `edit_file`/`run_command`, riaprendo il loop (read 2 volte -> ABORT a 0 file
         // modificati). Rimuovendoli sotto force-action, l'unico tool disponibile diventa
         // PRODUTTIVO e l'agente APPLICA la correzione. ─
+        //
+        // SOLO su turno OPERATIVO (`action_oriented`): su un turno INFORMATIVO
+        // ("elenca i file e dimmi il totale") la chiusura corretta e' una risposta
+        // testuale dopo le letture — strippare i read-only lascia solo tool di
+        // scrittura e l'agente, obbligato dal `tool_choice=required`, degenera in
+        // edit_file su un task di sola lettura (loop -> ABORT hollow, incidente
+        // 2026-07-02 TEST E2E). La biforcazione per action_oriented e' la stessa
+        // del progress_controller (regola L); qui si applica al punto di strip.
         if !tools_json.is_empty()
             && (exploration_count >= exploration_threshold || force_action_hard)
+            && turn_action_oriented(state.action_oriented)
         {
             let productive: Vec<Value> = tools_json
                 .iter()
