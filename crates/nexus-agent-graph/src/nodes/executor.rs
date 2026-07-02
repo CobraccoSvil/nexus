@@ -164,7 +164,7 @@ use crate::decisions::helpers::{
     turn_action_oriented,
 };
 use crate::decisions::loop_signatures::{
-    build_signature, detect_signature_loop, exploration_counter_update,
+    build_signature, detect_signature_loop_progress_aware, exploration_counter_update,
 };
 use crate::decisions::progress_controller::{self as pc, Action, ProgressSignals};
 use crate::decisions::tool_dispatch::{
@@ -292,6 +292,16 @@ pub struct ExecutorConfig {
     /// summary, da `agent.context.rolling_keep_recent_turns`. I messaggi
     /// `hist[..len-keep_recent]` (aggiustati per il pairing) vengono riassunti.
     pub rolling_keep_recent: i64,
+    /// Hard cap del contesto (ADR 0016 D2, `agent.context.hard_cap_ratio`): se
+    /// DOPO upscale+brake la stima resta `>= ratio*window`, il run termina
+    /// fail-fast con errore strutturato invece di chiamare l'LLM. `0.0` = gate
+    /// OFF (default safe-DB-down).
+    pub hard_cap_ratio: f64,
+    /// Template del messaggio overflow risolto a monte dal DB
+    /// (`agent.context.overflow_message_key` -> `nexus_prompt_templates`).
+    /// Vuoto = messaggio deterministico coi soli numeri (il testo redazionale
+    /// vive SOLO nel DB, regola G).
+    pub overflow_message_template: String,
 }
 
 impl Default for ExecutorConfig {
@@ -346,6 +356,10 @@ impl Default for ExecutorConfig {
             rolling_summary_enabled: false,
             // Default coerente con `agent.context.rolling_keep_recent_turns` (2).
             rolling_keep_recent: 2,
+            // Default safe-DB-down: hard cap OFF (il wiring mcp-core passa
+            // `agent.context.hard_cap_ratio`, 0.95 in produzione).
+            hard_cap_ratio: 0.0,
+            overflow_message_template: String::new(),
         }
     }
 }
@@ -1926,6 +1940,11 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         // se la porta non promuove (parita' col Python: `_upscale_result is None`).
         let upscale_est_tokens = history_token_estimator(&hist);
         let upscale_window = self.upscale.context_window(&model).await.unwrap_or(0);
+        // Window effettivo del turno: quello del modello richiesto (config, regola
+        // G) finche' l'upscale non promuove; dopo la promozione, quello del modello
+        // promosso (dal catalog via porta), cosi' brake e hard-cap a valle usano il
+        // window del modello EFFETTIVO come dichiarato dall'intento di questa fase.
+        let mut effective_window = self.cfg.context_window;
         if should_upscale(self.cfg.upscale_enabled, upscale_est_tokens, upscale_window) {
             let required = upscale_required_tokens(upscale_est_tokens, self.cfg.upscale_overhead_ratio);
             if let Ok(Some(pick)) = self.upscale.select_upscale_model(&model, required).await {
@@ -1940,17 +1959,93 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                 );
                 provider = pick.provider;
                 model = pick.model;
+                if let Ok(w) = self.upscale.context_window(&model).await {
+                    if w > 0 {
+                        effective_window = w;
+                    }
+                }
             }
         }
 
         // Token brake (py:2836): cap hard sotto window (token_estimator puro qui).
-        if self.cfg.context_window > 0 {
+        if effective_window > 0 {
             hist = ctxr::apply_token_brake(
                 &hist,
-                self.cfg.context_window,
+                effective_window,
                 &self.cfg.token_brake,
                 &history_token_estimator,
             );
+        }
+
+        // ── hard cap post-brake (ADR 0016 fase D2): fail-fast strutturato ─────
+        // Se DOPO upscale+brake la stima resta oltre `hard_cap_ratio*window`, il
+        // brake non e' riuscito a rientrare (es. singolo messaggio enorme): la
+        // chiamata LLM fallirebbe comunque. Meglio terminare il run con errore
+        // STRUTTURATO (meta_step `context_overflow` + `extra.error_class`, regola
+        // M) e messaggio dal template DB (`system.context_overflow`, regola G)
+        // che mandare una richiesta cieca destinata al 400 del provider.
+        if self.cfg.hard_cap_ratio > 0.0 {
+            let post_brake_est = history_token_estimator(&hist);
+            if ctxr::check_hard_cap(post_brake_est, effective_window, self.cfg.hard_cap_ratio) {
+                let text = if self.cfg.overflow_message_template.is_empty() {
+                    // Fallback deterministico coi soli numeri: il testo
+                    // redazionale vive SOLO nel template DB (regola G).
+                    format!(
+                        "[context_overflow] stima {post_brake_est} token oltre il limite \
+della finestra {effective_window} del modello {provider}/{model}"
+                    )
+                } else {
+                    ctxr::render_overflow_message(
+                        &self.cfg.overflow_message_template,
+                        post_brake_est,
+                        effective_window,
+                    )
+                };
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    est = post_brake_est,
+                    window = effective_window,
+                    ratio = self.cfg.hard_cap_ratio,
+                    provider = %provider,
+                    model = %model,
+                    "HARD CAP contesto raggiunto dopo brake -> fail-fast (ADR 0016 D2)"
+                );
+                let overflow_meta = json!({
+                    "kind": "context_overflow",
+                    "title": "Contesto oltre il limite del modello",
+                    "payload": {
+                        "estimated_tokens": post_brake_est,
+                        "max_window": effective_window,
+                        "hard_cap_ratio": self.cfg.hard_cap_ratio,
+                        "provider": provider,
+                        "model": model,
+                    },
+                });
+                ctx.emit.emit(SseEvent::MetaStep {
+                    kind: "context_overflow".to_string(),
+                    title: "Contesto oltre il limite del modello".to_string(),
+                    payload: overflow_meta.get("payload").cloned().unwrap_or(Value::Null),
+                });
+                let _ = self.meta_steps.persist_meta_step(overflow_meta, mode).await;
+                // `extra` nel delta e' overwrite: merge con lo stato per non
+                // perdere le chiavi esistenti.
+                let mut extra = state.extra.clone();
+                extra.insert("error_class".to_string(), json!("context_overflow"));
+                return Ok(StateDelta {
+                    messages: Some(vec![Message::Ai {
+                        content: MessageContent::text(text.clone()),
+                        tool_calls: vec![],
+                        reasoning: None,
+                    }]),
+                    result: Some(Some(text)),
+                    pending_tool_uses: Some(Some(vec![])),
+                    stop_reason: Some(Some(StopReason::Error)),
+                    iterations: Some(Some(iters_in + 1)),
+                    extra: Some(extra),
+                    ..Default::default()
+                }
+                .into_opaque());
+            }
         }
 
         // Iniezioni system_text (P3, idempotenti) nell'ordine del Python.
@@ -2294,7 +2389,13 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
             })
             .collect();
         let recent: Vec<String> = state.recent_tool_signatures.clone().unwrap_or_default();
-        let det = detect_signature_loop(&recent, &new_signatures);
+        // PROGRESS-AWARE (regola L, stessa esclusione del detector repeated_action):
+        // le riletture read-only che seguono un'azione produttiva (edit/build) sono
+        // DEBUGGING, non stallo — senza questa esclusione il loop-detector uccideva
+        // un modello capace mentre convergeva su una build rossa (run b833a83d).
+        let det = detect_signature_loop_progress_aware(&recent, &new_signatures, |n| {
+            EXPLORATION_ONLY_TOOLS.contains(&n)
+        });
         // `escalations` (auto_escalations) cresce di 1 quando il loop scala il
         // modello (py:3284); resta invariato altrimenti. Tracciato per il delta.
         let mut escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
@@ -2402,13 +2503,22 @@ riassumi lo stato."
             if tried_escalation {
                 escalations += 1; // py:3284
             } else {
-                // Catena esaurita / tutti in cooldown / ri-chiamata fallita: chiude
-                // secco con loop_detected (py:3269-3281).
+                // Catena esaurita / tutti in cooldown / ri-chiamata fallita.
+                // ADR 0034: prima della chiusura di sistema, UN turno dichiarativo
+                // forzato — l'esito del run diventa la dichiarazione strutturata
+                // del modello (outcome/blocker/summary) invece del testo sintetico.
+                // La risposta corrente (la tool call ripetuta identica) viene
+                // scartata: non va ne' eseguita ne' persistita.
+                if let Some(delta) = self.forced_declaration_delta(state, iters_in) {
+                    return Ok(delta);
+                }
+                // Chiusura secca loop_detected (py:3269-3281). Messaggio ONESTO:
+                // niente suggerimenti hardcoded di modelli (regola G) — il loop a
+                // vuoto e' uno stallo del RUN, non un verdetto sul modello.
                 let loop_msg = format!(
-                    "[LOOP RILEVATO] Il modello {provider}/{model} ha ripetuto il tool '{tool_name}' \
-con stesso input 3+ volte senza progresso. Esecuzione interrotta per evitare stallo. \
-Suggerimento: usa un modello piu' capace (es. anthropic/claude) o riformula il prompt in \
-modo piu' specifico."
+                    "[LOOP RILEVATO] Il run e' stato interrotto: il tool '{tool_name}' e' stato \
+ripetuto con lo stesso input 3+ volte senza alcun progresso in mezzo ({provider}/{model}). \
+Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza diverso."
                 );
                 assistant_msg = Message::Ai {
                     content: MessageContent::text(loop_msg.clone()),
@@ -2470,7 +2580,11 @@ modo piu' specifico."
         });
 
         // Coda aggiornata cap 12: con loop chiuso new_signatures e' [] -> recent only.
-        let updated_signatures = detect_signature_loop(&recent, &new_signatures).updated_signatures;
+        // (Solo la coda: la variante progress-aware calcola la stessa coda.)
+        let updated_signatures = detect_signature_loop_progress_aware(&recent, &new_signatures, |n| {
+            EXPLORATION_ONLY_TOOLS.contains(&n)
+        })
+        .updated_signatures;
 
         // ── exploration counter update (py:3296-3317) ─────────────────────────
         let pending_names: Vec<String> = pending_tool_uses
@@ -2496,6 +2610,11 @@ modo piu' specifico."
         }
 
         // ── Costruzione del delta finale (py:3457-3513) ───────────────────────
+        // La chiusura secca del signature-loop e' un forced-close anti-loop: il
+        // segnale STRUTTURATO (regola M) deve sopravvivere alla riscrittura di
+        // stop_reason operata dal final_gate (senza, il run chiudeva "completed"
+        // col messaggio di sistema come risposta — run b833a83d).
+        let loop_forced_close = loop_close_result.is_some();
         let mut final_result = loop_close_result.unwrap_or(result_text);
         let stop_reason_enum = stop_reason_from_str(stop_reason_final);
 
@@ -2707,6 +2826,12 @@ modo piu' specifico."
             extra_out.remove("force_outcome_declaration");
         }
         delta.extra = Some(extra_out);
+        if loop_forced_close {
+            // Segnale autoritativo di chiusura anti-loop (mig 0386): il
+            // finalizzatore mappa a FailedDiagnosed anche se il final_gate
+            // riscrive stop_reason sul ramo forced_close.
+            delta.forced_close_unverified = Some(Some(true));
+        }
 
         // next_actions.derive (py:3379-3402) + unfulfilled-report (py:3404-3429):
         // PORTATI sopra (rimozione <suggested_actions> + derivazione scelte +

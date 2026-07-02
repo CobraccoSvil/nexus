@@ -740,6 +740,10 @@ pub mod test_doubles {
         pub window: i64,
         /// Candidato ritornato da `select_upscale_model` (`None` = nessuno).
         pub pick: Option<UpscalePick>,
+        /// Window ritornata per il modello PROMOSSO (se `Some` e il modello
+        /// richiesto e' `pick.model`): simula il catalog dove il candidato di
+        /// upscale ha una finestra piu' grande del corrente.
+        pub promoted_window: Option<i64>,
         /// Chiamate di selezione registrate: (current_model, required_tokens).
         pub selected: Mutex<Vec<(String, i64)>>,
     }
@@ -754,7 +758,22 @@ pub mod test_doubles {
                     model: model.to_string(),
                     reason: "context_overflow".to_string(),
                 }),
+                promoted_window: None,
                 selected: Mutex::new(vec![]),
+            }
+        }
+
+        /// Come [`Self::promoting`], ma il modello promosso ha una window propria
+        /// (piu' grande): per i test dell'hard-cap post-upscale (ADR 0016 D2).
+        pub fn promoting_to_window(
+            window: i64,
+            provider: &str,
+            model: &str,
+            promoted_window: i64,
+        ) -> Self {
+            Self {
+                promoted_window: Some(promoted_window),
+                ..Self::promoting(window, provider, model)
             }
         }
 
@@ -763,6 +782,7 @@ pub mod test_doubles {
             Self {
                 window,
                 pick: None,
+                promoted_window: None,
                 selected: Mutex::new(vec![]),
             }
         }
@@ -770,7 +790,12 @@ pub mod test_doubles {
 
     #[async_trait]
     impl ModelUpscalePort for StubModelUpscalePort {
-        async fn context_window(&self, _model: &str) -> Result<i64, PortError> {
+        async fn context_window(&self, model: &str) -> Result<i64, PortError> {
+            if let (Some(pw), Some(pick)) = (self.promoted_window, self.pick.as_ref()) {
+                if model == pick.model {
+                    return Ok(pw);
+                }
+            }
             Ok(self.window)
         }
 

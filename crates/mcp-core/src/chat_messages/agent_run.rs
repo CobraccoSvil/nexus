@@ -1278,16 +1278,21 @@ async fn native_outcome_to_run_result(
         })
         .collect();
 
-    // Status canonico dall'esito del grafo.
-    let forced_close = matches!(
-        outcome.stop_reason,
-        Some(
-            StopReason::LoopDetected
-                | StopReason::LoopAbort
-                | StopReason::G1Escalated
-                | StopReason::G1CapReached
-        )
-    );
+    // Status canonico dall'esito del grafo. `forced_close_unverified` e' il
+    // segnale AUTORITATIVO (mig 0386): sopravvive alla riscrittura di
+    // stop_reason operata dal final_gate sul ramo forced_close (senza, un
+    // abort anti-loop ripulito dal final_gate finiva "completed" col testo di
+    // sistema come risposta — run b833a83d).
+    let forced_close = outcome.forced_close_unverified
+        || matches!(
+            outcome.stop_reason,
+            Some(
+                StopReason::LoopDetected
+                    | StopReason::LoopAbort
+                    | StopReason::G1Escalated
+                    | StopReason::G1CapReached
+            )
+        );
     // Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
     // MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
     // (regola M). Ha precedenza sul forced_close: una dichiarazione onesta
@@ -1374,7 +1379,9 @@ async fn native_outcome_to_run_result(
         // prompt_tokens col cumulativo di billing del ledger.
         last_prompt_tokens: (outcome.prompt_tokens > 0)
             .then_some(outcome.prompt_tokens as u32),
-        error_class: None,
+        // Classe d'errore STRUTTURATA dal grafo (extra.error_class, es.
+        // context_overflow — ADR 0016 D2): segnale macchina, mai dal testo.
+        error_class: outcome.error_class,
         stop_reason,
         // Intent del turno: pilota la decisione hollow/conversational del
         // finalizzatore (parita' col nexus_task_type del path Python).
@@ -4548,6 +4555,8 @@ mod tests_select_engine {
             reasoning: None,
             messages_json: Some(r#"[{"role":"user","content":"ciao"}]"#.to_string()),
             declared_outcome: None,
+            error_class: None,
+            forced_close_unverified: false,
         }
     }
 

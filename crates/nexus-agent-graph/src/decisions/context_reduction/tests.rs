@@ -462,3 +462,38 @@ fn rolling_apply_collassa_e_preserva_suffisso() {
     assert_eq!(out[1], hist[3]);
     assert_eq!(out[2], hist[4]);
 }
+
+// ── ADR 0016 D2: check_hard_cap / render_overflow_message ──────────────────
+
+#[test]
+fn hard_cap_scatta_sulla_soglia_esatta() {
+    // window 1000, ratio 0.95 -> soglia 950: sotto no, uguale si, sopra si.
+    assert!(!check_hard_cap(949, 1000, 0.95));
+    assert!(check_hard_cap(950, 1000, 0.95));
+    assert!(check_hard_cap(1200, 1000, 0.95));
+}
+
+#[test]
+fn hard_cap_inerte_con_window_o_ratio_non_positivi() {
+    // Default sicuro a config assente (DB down): gate disattivato.
+    assert!(!check_hard_cap(10_000, 0, 0.95));
+    assert!(!check_hard_cap(10_000, -1, 0.95));
+    assert!(!check_hard_cap(10_000, 1000, 0.0));
+    assert!(!check_hard_cap(10_000, 1000, -0.5));
+}
+
+#[test]
+fn overflow_message_sostituisce_i_placeholder() {
+    let template = "Stima: %ESTIMATED_TOKENS% token, finestra massima %MAX_WINDOW%.";
+    let out = render_overflow_message(template, 1_200_000, 200_000);
+    assert_eq!(out, "Stima: 1200000 token, finestra massima 200000.");
+}
+
+#[test]
+fn overflow_message_senza_placeholder_resta_invariato() {
+    let template = "Contesto oltre il limite configurato.";
+    assert_eq!(
+        render_overflow_message(template, 1, 2),
+        "Contesto oltre il limite configurato."
+    );
+}

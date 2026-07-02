@@ -906,6 +906,31 @@ where
     work
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+//  5b) hard cap post-brake (ADR 0016 fase D2)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// ADR 0016 D2: true se, DOPO upscale+brake, la stima resta oltre `ratio*window`.
+///
+/// `window <= 0` o `hard_cap_ratio <= 0` disattivano il gate (default sicuro a
+/// config assente: il run procede come oggi, nessun falso positivo da DB down).
+pub fn check_hard_cap(est_tokens: i64, window: i64, hard_cap_ratio: f64) -> bool {
+    if window <= 0 || hard_cap_ratio <= 0.0 {
+        return false;
+    }
+    est_tokens >= (window as f64 * hard_cap_ratio) as i64
+}
+
+/// Punto unico di sostituzione dei placeholder del template
+/// `system.context_overflow` (`%ESTIMATED_TOKENS%` / `%MAX_WINDOW%`).
+///
+/// Il testo redazionale vive SOLO nel DB (regola G): qui nessun default umano.
+pub fn render_overflow_message(template: &str, est_tokens: i64, window: i64) -> String {
+    template
+        .replace("%ESTIMATED_TOKENS%", &est_tokens.to_string())
+        .replace("%MAX_WINDOW%", &window.to_string())
+}
+
 /// `_compress_aggressive_token_based`: tronca TUTTI i messaggi vecchi (anche
 /// assistant) a `max_content_chars`, preservando il PRIMO human, i summary, e gli
 /// ultimi `keep_recent`. 1:1 con __init__.py:1464. Ritorna `(messages, changed)`.

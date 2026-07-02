@@ -159,6 +159,9 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   // (executor.rs kind=executor_call): la riga prende il colore del provider e il
   // nome provider/modello e' mostrato nel badge a destra.
   executor_call: { icon: "◇", label: "Modello", accent: "#64748b", defaultOpen: false },
+  // Hard cap contesto (ADR 0016 D2): il run termina fail-fast quando la stima
+  // token resta oltre il limite del modello anche dopo brake/upscale.
+  context_overflow: { icon: "!", label: "Contesto oltre il limite", accent: "#ef4444", defaultOpen: true },
 };
 
 const DEFAULT_DESC: KindDescriptor = {
