@@ -11,13 +11,14 @@ tags:
   - ux
 auto_generated: false
 created_at: 2026-06-04T20:30:00Z
-updated_at: 2026-06-04T20:30:00Z
+updated_at: 2026-07-02T00:00:00Z
 nexus_meta_version: 1
 ---
 
 # ADR 0022 — Bus systemd utente irraggiungibile vs zero servizi
 
-> **Status**: proposto (backend implementato)
+> **Status**: implementato (verificato 2026-07-02)
+> **Aggiornamento 2026-07-02 (as-built)**: backend `manager_unavailable` in `crates/mcp-core/src/project_workspace/services.rs` + frontend `systemd-services-section.tsx`; adattato a Windows (`manager_mode` = "windows").
 > **Decisori**: team Nexus
 > **Trigger**: incident del 04/06/2026 su Beauty-Book. Il pannello "Run & Debug" mostra "Nessun servizio trovato con prefisso beauty-book-" anche se il file `~/.config/systemd/user/beauty-book-dev.service` esiste con `Linger=yes`.
 

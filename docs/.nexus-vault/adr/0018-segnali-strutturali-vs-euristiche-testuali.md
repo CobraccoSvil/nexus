@@ -14,7 +14,7 @@ tags:
   - capability-gate
 auto_generated: false
 created_at: 2026-06-04T00:00:00Z
-updated_at: 2026-06-04T12:00:00Z
+updated_at: 2026-07-02T00:00:00Z
 nexus_meta_version: 1
 ---
 
@@ -22,8 +22,27 @@ nexus_meta_version: 1
 
 ## Stato
 
-Proposto (2026-06-04), rafforzato lo stesso giorno con il gate di capability
-(leva 0) dopo verifica sul catalog reale. Implementazione a fasi.
+Implementato (2026-07-02). Proposto il 2026-06-04, rafforzato lo stesso giorno
+con il gate di capability (leva 0) dopo verifica sul catalog reale.
+
+Leve 0/1/2 gia' in produzione da tempo: assorbite da
+[[0024-capability-fonte-unica-classificazione]] per il gate capability e
+`tool_choice_style`, da [[0033-routing-strict-pin-retry-e-anti-loop-onesto]]
+per la classificazione errori e da
+[[0034-esito-conversazione-strutturato-finish-task]] per l'esito dichiarato
+`task_complete`. Completate il 2026-07-02:
+
+- fase 3: `INTENT_NARRATION_PATTERNS` e `resigned_patterns` CANCELLATI;
+  sostituti strutturali `structural_unfulfilled_signal` +
+  `detect_pending_steps_report_with` + `task_complete`;
+- leva 3: 3 criteri `action_requested` / `tool_capability` /
+  `completion_confirmed` in `final_gate`/`criteria_runner`, kill-switch
+  `agent.final_gate.structural_criteria_enabled` (mig 0503);
+- A7: `WEAK_MODELS_HINT` sostituito da `performance_tier` dal catalog.
+
+Fallback lessicali RESIDUI legittimi (strutturale-prima): `TOOL_ERROR_HINTS` e
+`PENDING_STEPS_LABELS`. Residuo minore fase 2: `complexity_keyword_weights`
+come fallback del classifier (documentato, non prioritario).
 
 ## Contesto
 

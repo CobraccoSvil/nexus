@@ -12,13 +12,14 @@ tags:
   - unification
 auto_generated: false
 created_at: 2026-06-04T00:00:00Z
-updated_at: 2026-06-04T00:00:00Z
+updated_at: 2026-07-02T00:00:00Z
 nexus_meta_version: 2
 ---
 
 # ADR 0017 — Knowledge Graph unificato (v2): un solo sistema, scope come discriminante
 
-> **Status**: proposto
+> **Status**: implementato (verificato 2026-07-02)
+> **Aggiornamento 2026-07-02 (as-built)**: assorbito dal sistema wiki unificato — crate `nexus-wiki` (reingest, links_worker, triple_extractor, watcher), migrazioni 0295-0298, endpoint `/api/wiki/*`, WikiAcl come punto unico ACL. Il documento resta come razionale storico della decisione.
 > **Versione**: 2 (sostituisce v1 "parità con storage separato")
 > **Decisori**: team Nexus
 > **Estende**: [[0015-rag-strutturale-unificato]], [[0016-rag-pipeline-completion]]

@@ -11,13 +11,14 @@ tags:
   - performance
 auto_generated: false
 created_at: 2026-06-04T00:00:00Z
-updated_at: 2026-06-04T00:00:00Z
+updated_at: 2026-07-02T00:00:00Z
 nexus_meta_version: 1
 ---
 
 # ADR 0016 — Completamento pipeline RAG strutturale + safety net context overflow
 
-> **Status**: proposto
+> **Status**: implementato quasi per intero — fasi A/B/C complete in precedenza; fase D2 completata il 2026-07-02; fase D1 parziale
+> **Aggiornamento 2026-07-02 (as-built)**: fase D2 (fail-fast context overflow) implementata: funzioni pure `check_hard_cap`/`render_overflow_message` in `crates/nexus-agent-graph/src/decisions/context_reduction.rs`; gate nell'executor dopo upscale+brake con meta_step `context_overflow` + `extra.error_class`; messaggio dal template DB `system.context_overflow` (setting `agent.context.hard_cap_ratio`, mig 0286). La parte D1 resta PARZIALE: `crates/mcp-token` (tiktoken cl100k) esiste, ma lo stimatore usato dall'executor e' ancora char/4; il wiring del tokenizer reale e' un follow-up.
 > **Decisori**: team Nexus
 > **Supersede**: completa [[0015-rag-strutturale-unificato]] e [[0014-context-size-management]]
 > **Trigger**: chat 6 Beauty-Book (run `1a6e367e-…`) ha mandato **1.226.560 token** a un modello con **131.072 ctx** (936% del window) ricevendo una risposta hallucinata in cinese su una parola random ("starts") catturata dal payload troncato dal provider.

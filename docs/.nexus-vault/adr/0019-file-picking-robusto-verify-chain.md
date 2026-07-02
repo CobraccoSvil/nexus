@@ -12,13 +12,14 @@ tags:
   - error-fix
 auto_generated: false
 created_at: 2026-06-04T19:00:00Z
-updated_at: 2026-06-04T19:00:00Z
+updated_at: 2026-07-02T00:00:00Z
 nexus_meta_version: 1
 ---
 
 # ADR 0019 — Robustezza file picking + verify chain coder agent
 
-> **Status**: proposto
+> **Status**: chiuso (2026-07-02)
+> **Aggiornamento 2026-07-02 (as-built)**: L1/L2 sostituiti da [[0020-build-graph-derivato-da-config]] (build graph derivato dai config; la tabella `nexus_project_directory_policies` NON e' mai stata creata e non va creata). L3 implementato come tool `nexus_verify_change` (`crates/mcp-core/src/agent_tools/verify.rs`, mig 0503 — numeri reali 0503/0504, non 0306-0309 come previsto nel testo sotto). L4 implementato con mig 0504 (blocco `<tool_discovery>`) che si aggiunge a mig 0313 (`<file_picking_policy>`). L5 coperto in forma migliore dal progress_controller `FORCE_DIAGNOSE` (diagnosi iterativa nel turno, non sub-agent).
 > **Decisori**: team Nexus
 > **Correlato a**: [[0017-segnali-strutturali-vs-euristiche-testuali]] (ADR 0018)
 > **Trigger**: incident M44 del 04/06/2026 sul progetto Beauty-Book — 3 modelli in escalation (DeepSeek v4-pro, Gemini 2.5 Pro, DeepSeek di nuovo) hanno fallito un fix di complessità ciclomatica creando componenti in `figma_export/` (directory export Figma, NON build graph). Test "0/0 passati" reali; refactor orfano; nessuna verifica eseguita.

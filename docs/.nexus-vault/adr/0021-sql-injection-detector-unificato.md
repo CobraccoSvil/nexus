@@ -12,13 +12,14 @@ tags:
   - unification
 auto_generated: false
 created_at: 2026-06-04T20:00:00Z
-updated_at: 2026-06-04T20:00:00Z
+updated_at: 2026-07-02T00:00:00Z
 nexus_meta_version: 1
 ---
 
 # ADR 0021 — SQL injection detector unificato
 
-> **Status**: proposto
+> **Status**: implementato (verificato 2026-07-02)
+> **Aggiornamento 2026-07-02 (as-built)**: `crates/mcp-quality/src/injection.rs` e' il punto unico del detector; `mcp-db` delega; `nexus-tool-kit/sec_sql_injection_check` delega.
 > **Decisori**: team Nexus
 > **Principio cardine**: stesso dell'ADR 0017 — un sistema unico, non duplicato. Un solo detector di SQL injection, condiviso tra scanner del pannello "Ottimizzazione" e tool MCP on-demand. La injection si cerca dove davvero esiste (codice applicativo che costruisce query), non nei file `.sql` statici.
 > **Trigger**: incident del 04/06/2026 su Beauty-Book. Il pannello Ottimizzazione mostra 6 falsi positivi "Potential SQL injection (high)" su `backend/migrations/001_init_schema.sql`, un file DDL puro. Causa: un hash bcrypt `$2a$10$...` nella riga di seed viene scambiato per interpolazione di variabile.

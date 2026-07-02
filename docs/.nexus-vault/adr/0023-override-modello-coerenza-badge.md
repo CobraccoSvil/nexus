@@ -12,13 +12,14 @@ tags:
   - consistency
 auto_generated: false
 created_at: 2026-06-04T21:00:00Z
-updated_at: 2026-06-04T21:00:00Z
+updated_at: 2026-07-02T00:00:00Z
 nexus_meta_version: 1
 ---
 
 # ADR 0023 — Override modello rispettato + coerenza badge provider
 
-> **Status**: proposto
+> **Status**: implementato (verificato 2026-07-02) con l'opzione 3a
+> **Aggiornamento 2026-07-02 (as-built)**: provider/model effettivi emessi dal backend nel payload dei meta_step `executor_call` via SSE, consumati da `ProviderBadge`; nessuna logica di deduzione lato frontend.
 > **Decisori**: team Nexus + utente (decisione 04/06/2026: "entrambi i casi gestiti")
 > **Correlato**: task #27/#28 (emit provider+model nei meta-step, badge colorato)
 > **Trigger**: screenshot 04/06/2026. Header "Agente in esecuzione" mostra `mistral/mistral-large-2411`, ma i badge dei singoli meta-step e il thinking mostrano `deepseek/deepseek-v4-pro`. I provider non sono allineati.

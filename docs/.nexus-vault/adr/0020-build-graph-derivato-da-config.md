@@ -13,13 +13,14 @@ tags:
   - structural
 auto_generated: false
 created_at: 2026-06-04T19:30:00Z
-updated_at: 2026-06-04T19:30:00Z
+updated_at: 2026-07-02T00:00:00Z
 nexus_meta_version: 1
 ---
 
 # ADR 0020 — Build graph derivato automaticamente dai config di progetto
 
-> **Status**: proposto
+> **Status**: implementato (verificato 2026-07-02)
+> **Aggiornamento 2026-07-02 (as-built)**: crate `crates/nexus-build-graph` (resolver typescript/rust/python/go), cache mig 0312, preflight su write/edit, tool `nexus_build_graph_info`, hint mig 0313. Nuovo consumatore: `nexus_verify_change` (mig 0503) usa `BuildGraphInfo.language` per la matrice comandi di verifica.
 > **Decisori**: team Nexus
 > **Sostituisce**: L1 e L2 di [[0019-file-picking-robusto-verify-chain]] (preflight grep + directory policy DB-driven)
 > **Mantiene attivi**: L3 (`nexus_verify_change`), L4 (tool discovery hint), L5 (diagnostic escalation) — sono ortogonali e indipendenti da come rileviamo il build graph

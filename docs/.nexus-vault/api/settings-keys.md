@@ -89,6 +89,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.final_gate.enabled` | `true` | Abilita il final gate generale fail-closed (anti-placeholder) per i task software senza plan_phase. |
 | `agent.final_gate.max_cycles` | `2` | Numero massimo di cicli di retry del final gate prima di chiudere comunque (no loop infinito). |
 | `agent.final_gate.software_intents` | `code,debug,scaffold,implement,build,frontend,fix,refactor` | CSV degli intent considerati task software per cui il final gate si attiva. |
+| `agent.final_gate.structural_criteria_enabled` | `true` | Kill-switch dei 3 criteri strutturali del final_gate/criteria_runner (action_requested / tool_capability / completion_confirmed), sostituti delle blacklist lessicali (ADR 0018 leva 3, mig 0503). |
 | `agent.firstturn.canonical_hint` | `true` | Inietta hint canonico nel first turn per allegati strutturati (M8) |
 | `agent.firstturn.tool_choice_force` | `true` | Forza tool_choice strict al first turn quando ci sono allegati strutturati |
 | `agent.g1_nudge.default_max` | `3` | Max nudge G1 anti-narration per run (H-26 b) |
@@ -155,6 +156,10 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.upscale.enabled` | `true` | Se true, prima di chiamare il provider, se est_tokens > 0.9*model.context_window cerca un modello con window maggiore nella routing matrix. |
 | `agent.upscale.preferred_targets` | `claude-opus-4-6,gemini-2.5-pro,gpt-5.5,claude-sonnet-4-6` | CSV ordinato dei modelli con window grande preferiti per l'upscale. Il primo disponibile e abilitato in ai_price_catalog viene scelto. |
 | `agent.upscale.target_overhead_ratio` | `1.2` | Margine di sicurezza: il modello upscaled deve avere context_window >= est_tokens * target_overhead_ratio. Default 1.2 (20% margine). |
+| `agent.verify.<lang>.<step>` | vedi mig 0503 | Matrice comandi default per linguaggio (typescript/rust/python/go, dai resolver di nexus-build-graph) x step (typecheck/build/lint/test) eseguiti da nexus_verify_change; una chiave assente = step saltato con skipped_reason, mai comando inventato. |
+| `agent.verify.enabled` | `true` | Kill-switch del tool nexus_verify_change (verify chain L3, ADR 0019, mig 0503). |
+| `agent.verify.output_max_chars` | `4000` | Troncamento dell'output di ogni step di verifica nel report di nexus_verify_change. |
+| `agent.verify.step_timeout_s` | `180` | Timeout (secondi) per singolo step della catena di verifica di nexus_verify_change. |
 | `agent.verifier.fail_closed` | `true` | Se true il verifier_node, in assenza di acceptance_criteria sul todo software, esegue comunque i gate generali invece di marcare completed. |
 | `agent.vision.image_max_bytes` | `2097152` | Max byte immagine per vision describe (H-69) |
 | `agent.visual_compare.screenshot_timeout_secs` | `45` | Timeout (secondi) per la cattura dello screenshot via Playwright in nexus_visual_compare (launch + goto + wait + scatto). Default 45. |
