@@ -54,12 +54,15 @@ async fn fetch_agent_steps_json(
 /// avere `WHERE id = $1`), poi verifica esistenza (404) e ownership (403) rispetto
 /// a `user_id`. Punto unico (regola L) per la verifica esistenza+ownership di un
 /// run condivisa dagli handler `get_agent_run` / `confirm_agent_run` / `cancel_agent_run`.
+/// Ritorna ANCHE il pool del progetto risolto: le tabelle correlate del run
+/// (agent_steps, nexus_agent_meta_steps, UPDATE su agent_runs) vivono nello stesso
+/// DB del run — i chiamanti DEVONO riusare questo pool, non `state.db` (meta).
 async fn fetch_owned_run_row(
     db: &sqlx::PgPool,
     sql: &str,
     run_id: Uuid,
     user_id: Uuid,
-) -> Result<sqlx::postgres::PgRow, ApiError> {
+) -> Result<(sqlx::postgres::PgRow, sqlx::PgPool), ApiError> {
     // Separazione DB: endpoint keyed solo dal run_id. agent_runs (+ eventuale JOIN
     // chat_sessions) vive nel DB del progetto -> pool via directory di routing
     // (fallback ricerca). A flag OFF -> meta-DB.
@@ -78,7 +81,7 @@ async fn fetch_owned_run_row(
     if owner != user_id {
         return Err(api_error(StatusCode::FORBIDDEN, "Run non accessibile"));
     }
-    Ok(run)
+    Ok((run, run_pool))
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +271,11 @@ pub async fn get_active_run_for_session(
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
 
+    // Separazione DB: agent_runs/agent_steps sono tabelle migrate -> pool del
+    // progetto risolto dalla sessione (flag OFF -> meta-DB). Sul meta le tabelle
+    // sono vuote a flag ON: leggerle li' faceva sparire il run attivo al refresh.
+    let run_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
     let run_row = sqlx::query(
         "SELECT id, session_id, project_id, user_id, status, automation_mode, provider, model,
                 iteration_count, final_answer, pending_actions_json, created_at, completed_at
@@ -279,7 +287,7 @@ pub async fn get_active_run_for_session(
     )
     .bind(session_id)
     .bind(user_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&run_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -290,7 +298,7 @@ pub async fn get_active_run_for_session(
     let run_id: Uuid = run.try_get("id").unwrap_or(Uuid::nil());
 
     // Fix S85: propaga errore SQL invece di mascherarlo come "0 steps".
-    let steps = fetch_agent_steps_json(&state.db, run_id)
+    let steps = fetch_agent_steps_json(&run_pool, run_id)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -326,7 +334,7 @@ pub async fn get_agent_run(
     let run_id = Uuid::parse_str(&run_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
-    let run = fetch_owned_run_row(
+    let (run, run_pool) = fetch_owned_run_row(
         &state.db,
         "SELECT id, session_id, project_id, user_id, status, automation_mode, provider, model,
                 iteration_count, final_answer, pending_actions_json, created_at, completed_at,
@@ -338,7 +346,10 @@ pub async fn get_agent_run(
     .await?;
 
     // Fix S85: propaga errore SQL invece di mascherarlo come "0 steps".
-    let steps = fetch_agent_steps_json(&state.db, run_id)
+    // Separazione DB: agent_steps vive nello stesso DB del run (pool risolto
+    // sopra), NON nel meta — sul meta la tabella e' vuota a flag ON e il
+    // pannello mostrava "Nessuno step registrato" su run con step persistiti.
+    let steps = fetch_agent_steps_json(&run_pool, run_id)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -355,6 +366,8 @@ pub async fn get_agent_run(
     // M71: breakdown per coppia provider/model dalla ai_usage_ledger.
     // Mostriamo una riga per ogni provider/modello effettivamente usato nel run
     // (cascade fallback puo' aver coinvolto piu' provider).
+    // ai_usage_ledger e' contabilita' di PIATTAFORMA (scritta dal gateway sul
+    // meta-DB): qui `state.db` e' corretto, NON va instradata sul pool progetto.
     let breakdown_rows = sqlx::query(
         "SELECT provider, model,
                 SUM(prompt_tokens)::bigint     AS prompt_tokens,
@@ -431,7 +444,7 @@ pub async fn get_session_worklog(
     let wpool =
         crate::project_db_routes::project_data_pool_by_session_from(&state.db, context.session_id)
             .await;
-    let block = crate::session_worklog::fetch_rendered_block(&wpool, context.session_id)
+    let block = crate::session_worklog::fetch_rendered_block(&state.db, &wpool, context.session_id)
         .await
         .unwrap_or_default();
     Ok(Json(json!({ "renderedBlock": block })))
@@ -452,6 +465,9 @@ pub async fn get_agent_run_next_actions(
     let run_id = Uuid::parse_str(&run_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
+    // Separazione DB: nexus_agent_meta_steps + agent_runs vivono nel DB del
+    // progetto -> pool risolto dal run (flag OFF -> meta-DB).
+    let run_pool = crate::project_db_routes::project_data_pool_by_run_from(&state.db, run_id).await;
     // Ownership verificata via join su agent_runs.user_id: nessun leak cross-utente.
     let row = sqlx::query(
         "SELECT m.payload
@@ -463,7 +479,7 @@ pub async fn get_agent_run_next_actions(
     )
     .bind(run_id)
     .bind(user_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&run_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -497,6 +513,11 @@ pub async fn get_session_meta_steps(
     // un LIMIT globale con ORDER BY created_at ASC taglierebbe proprio l'ultimo
     // run, cioe' il caso d'uso del refresh. I meta_step tornano in ordine
     // cronologico per la ricostruzione fedele della timeline.
+    // Separazione DB: nexus_agent_meta_steps + agent_runs vivono nel DB del
+    // progetto -> pool risolto dalla sessione. Sul meta le tabelle sono vuote a
+    // flag ON: la timeline narrativa spariva al reload della chat.
+    let run_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
     let rows = sqlx::query(
         "SELECT m.run_id, m.kind, m.title, m.payload, m.correlation_id, m.created_at
          FROM nexus_agent_meta_steps m
@@ -510,7 +531,7 @@ pub async fn get_session_meta_steps(
     )
     .bind(session_id)
     .bind(user_id)
-    .fetch_all(&state.db)
+    .fetch_all(&run_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -559,9 +580,13 @@ pub async fn get_session_traces(
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
 
+    // Separazione DB: nexus_agent_traces vive nel DB del progetto (scritta dal
+    // motore nativo sul run_db) -> pool risolto dalla sessione.
+    let run_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
     // Punto unico (regola L): ownership + raggruppamento per run nel trace_store,
     // speculare a get_session_meta_steps.
-    let runs = crate::trace_store::get_session_traces(&state.db, session_id, user_id)
+    let runs = crate::trace_store::get_session_traces(&run_pool, session_id, user_id)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -579,8 +604,10 @@ pub async fn confirm_agent_run(
     let run_id = Uuid::parse_str(&run_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
-    // Verifica ownership e stato atteso
-    let run = fetch_owned_run_row(
+    // Verifica ownership e stato atteso. Il pool del progetto e' quello risolto
+    // dal punto unico fetch_owned_run_row: riusato per tutti gli UPDATE sotto
+    // (separazione DB: agent_runs e' migrata sul pool del progetto).
+    let (run, run_pool) = fetch_owned_run_row(
         &state.db,
         "SELECT user_id, status, session_id, project_id, provider, model,
                 pending_actions_json, run_message_id, automation_mode, engine
@@ -597,12 +624,6 @@ pub async fn confirm_agent_run(
             "Il run non e' in attesa di conferma",
         ));
     }
-
-    // Separazione DB: agent_runs e' migrata sul pool del progetto. Risolvo una
-    // volta il pool dalla session_id del run e lo riuso per tutti gli UPDATE sotto.
-    let run_session_id: Uuid = run.get::<Uuid, _>("session_id");
-    let run_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, run_session_id).await;
 
     if !body.approved {
         // Cancella il run
@@ -729,7 +750,7 @@ pub async fn cancel_agent_run(
     let run_id = Uuid::parse_str(&run_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
-    let run = fetch_owned_run_row(
+    let (run, _run_pool) = fetch_owned_run_row(
         &state.db,
         "SELECT user_id, session_id, status FROM agent_runs WHERE id = $1",
         run_id,

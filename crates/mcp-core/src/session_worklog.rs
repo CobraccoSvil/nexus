@@ -73,7 +73,10 @@ const SETTINGS_CACHE_TTL: Duration = Duration::from_secs(60);
 static SETTINGS_CACHE: once_cell::sync::Lazy<RwLock<Option<(WorklogSettings, Instant)>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(None));
 
-pub async fn current_settings(db: &PgPool) -> WorklogSettings {
+/// `meta_db` DEVE essere il pool del meta-DB: la tabella `settings` e' config
+/// di piattaforma e non esiste nei DB-progetto (chiamarla col pool progetto
+/// falliva in silenzio e avvelenava la cache globale coi default).
+pub async fn current_settings(meta_db: &PgPool) -> WorklogSettings {
     {
         let guard = SETTINGS_CACHE.read().await;
         if let Some((v, exp)) = *guard {
@@ -82,11 +85,15 @@ pub async fn current_settings(db: &PgPool) -> WorklogSettings {
             }
         }
     }
-    let value = match load_settings(db).await {
+    let value = match load_settings(meta_db).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(error = %e, "session_worklog: lettura settings fallita, uso safe_defaults");
-            WorklogSettings::safe_defaults()
+            // Errore di lettura: degrado ai default per QUESTA chiamata, senza
+            // scrivere la cache — un fallimento transitorio (o un pool
+            // sbagliato) non deve imporre i default a tutto il processo per
+            // 60s. Il prossimo chiamante ritenta la lettura.
+            tracing::warn!(error = %e, "session_worklog: lettura settings fallita, uso safe_defaults (non cacheati)");
+            return WorklogSettings::safe_defaults();
         }
     };
     let mut guard = SETTINGS_CACHE.write().await;
@@ -426,7 +433,10 @@ fn facts_to_events(facts: &StepFacts, run_id: Uuid, status_label: &str) -> Vec<(
 
 /// Inserisce gli eventi derivati dai fatti e rinfresca il digest materializzato.
 /// Best-effort by-design: i chiamanti ignorano l'errore (mai bloccare la chat).
+/// `meta_db` = meta (settings di piattaforma); `db` = pool del DB dove vivono le
+/// righe worklog (progetto a flag separazione ON).
 pub async fn ingest_facts(
+    meta_db: &PgPool,
     db: &PgPool,
     session_id: Uuid,
     project_id: Option<Uuid>,
@@ -434,7 +444,7 @@ pub async fn ingest_facts(
     status_label: &str,
     facts: &StepFacts,
 ) -> Result<usize> {
-    let settings = current_settings(db).await;
+    let settings = current_settings(meta_db).await;
     if !settings.enabled {
         return Ok(0);
     }
@@ -478,7 +488,9 @@ pub async fn ingest_facts(
 }
 
 /// Wrapper per i call-site che hanno gli step in memoria (fine run spawn/resume).
+/// `meta_db` = meta (settings); `db` = pool dati worklog (progetto).
 pub async fn ingest_steps_for_run(
+    meta_db: &PgPool,
     db: &PgPool,
     session_id: Uuid,
     project_id: Option<Uuid>,
@@ -489,20 +501,27 @@ pub async fn ingest_steps_for_run(
     if steps.is_empty() {
         return Ok(0);
     }
-    let settings = current_settings(db).await;
+    let settings = current_settings(meta_db).await;
     if !settings.enabled {
         return Ok(0);
     }
     let facts = collect_step_facts(steps, settings.error_excerpt_max_chars);
-    ingest_facts(db, session_id, project_id, run_id, status_label, &facts).await
+    ingest_facts(meta_db, db, session_id, project_id, run_id, status_label, &facts).await
 }
 
 /// Ingest dagli `agent_steps` persistiti (supersede last-wins, run reapati
 /// 'interrupted'): gli step sono GIA' in DB grazie alla persistenza
 /// incrementale del brain (M68), quindi questo e' affidabile anche per i run
 /// interrotti a meta'.
-pub async fn ingest_from_db_steps(db: &PgPool, run_id: Uuid, status_label: &str) -> Result<usize> {
-    let settings = current_settings(db).await;
+/// `meta_db` = meta (settings); `db` = pool dati (progetto: agent_runs,
+/// agent_steps e worklog vivono tutti nello stesso DB del run).
+pub async fn ingest_from_db_steps(
+    meta_db: &PgPool,
+    db: &PgPool,
+    run_id: Uuid,
+    status_label: &str,
+) -> Result<usize> {
+    let settings = current_settings(meta_db).await;
     if !settings.enabled {
         return Ok(0);
     }
@@ -570,7 +589,7 @@ pub async fn ingest_from_db_steps(db: &PgPool, run_id: Uuid, status_label: &str)
         .collect();
 
     let facts = collect_step_facts(&steps, settings.error_excerpt_max_chars);
-    ingest_facts(db, session_id, project_id, run_id, status_label, &facts).await
+    ingest_facts(meta_db, db, session_id, project_id, run_id, status_label, &facts).await
 }
 
 /// Pruning oltre soglia: rimuove gli eventi piu' VECCHI dei kind non critici
@@ -817,13 +836,15 @@ pub async fn refresh_rendered(
 /// SESSIONE (dedup_key per contenuto normalizzato, senza run_id): il render le
 /// mostra nella sezione "Decisioni:" del digest, sopravvivendo alla
 /// compattazione successiva. Best-effort: i chiamanti ignorano l'errore.
+/// `meta_db` = meta (settings); `db` = pool dati worklog (progetto).
 pub async fn ingest_decisions(
+    meta_db: &PgPool,
     db: &PgPool,
     session_id: Uuid,
     project_id: Option<Uuid>,
     decisions: &[String],
 ) -> Result<usize> {
-    let settings = current_settings(db).await;
+    let settings = current_settings(meta_db).await;
     if !settings.enabled || decisions.is_empty() {
         return Ok(0);
     }
@@ -872,8 +893,9 @@ fn normalized_hash(text: &str) -> String {
 /// Legge il digest materializzato della sessione (punto unico di lettura lato
 /// Rust, gemello di `fetch_worklog_block` lato brain). `None` se assente, vuoto
 /// o su errore (fail-open): i chiamanti degradano senza bloccare.
-pub async fn fetch_rendered_block(db: &PgPool, session_id: Uuid) -> Option<String> {
-    let settings = current_settings(db).await;
+/// `meta_db` = meta (settings); `db` = pool dati worklog (progetto).
+pub async fn fetch_rendered_block(meta_db: &PgPool, db: &PgPool, session_id: Uuid) -> Option<String> {
+    let settings = current_settings(meta_db).await;
     if !settings.enabled {
         return None;
     }
@@ -896,8 +918,14 @@ pub async fn fetch_rendered_block(db: &PgPool, session_id: Uuid) -> Option<Strin
 
 /// Sintesi compatta per la nota supersede: stato dell'ultimo run interrotto.
 /// Stringa vuota se il worklog e' vuoto o disabilitato (fail-open).
-pub async fn supersede_summary(db: &PgPool, session_id: Uuid, superseded: &[Uuid]) -> String {
-    let settings = current_settings(db).await;
+/// `meta_db` = meta (settings); `db` = pool dati worklog (progetto).
+pub async fn supersede_summary(
+    meta_db: &PgPool,
+    db: &PgPool,
+    session_id: Uuid,
+    superseded: &[Uuid],
+) -> String {
+    let settings = current_settings(meta_db).await;
     if !settings.enabled || superseded.is_empty() {
         return String::new();
     }
@@ -939,9 +967,10 @@ pub async fn tool_nexus_get_worklog(
     };
     let db: &PgPool = ctx.db.as_ref();
     // settings: config GLOBALE -> meta. Le righe worklog vivono nel DB del
-    // progetto (separazione DB): risolvo il pool dalla sessione.
+    // progetto: pool gia' risolto alla costruzione del contesto (ctx.run_db),
+    // nessuna seconda risoluzione qui (regola L).
     let settings = current_settings(db).await;
-    let wpool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
+    let wpool: &PgPool = ctx.run_db.as_ref();
     let kind = input.get("kind").and_then(Value::as_str);
     let run_id = input
         .get("run_id")
@@ -969,7 +998,7 @@ pub async fn tool_nexus_get_worklog(
     .bind(run_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(&wpool)
+    .fetch_all(wpool)
     .await;
 
     let rows = match rows {

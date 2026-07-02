@@ -170,7 +170,9 @@ pub(crate) async fn maybe_trigger_debugger(
         content,
         // Eredita la modalita' della sessione (mig 0371) invece di hardcodare
         // Confirm, cosi' l'auto-debug rispetta la scelta dell'utente.
-        automation_mode: crate::chat_messages::read_session_automation_mode(&state.db, session)
+        // chat_sessions e' migrata: lettura dal pool progetto gia' risolto,
+        // non dal meta (dove la riga non esiste e tornava sempre il default).
+        automation_mode: crate::chat_messages::read_session_automation_mode(&proj_pool, session)
             .await,
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),

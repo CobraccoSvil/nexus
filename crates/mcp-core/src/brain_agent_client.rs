@@ -1067,9 +1067,17 @@ pub async fn run_via_brain(
                         cache_read_tokens: 0,
                     };
                     // Persistenza best-effort (punto unico trace_store, regola L).
+                    // Separazione DB: nexus_agent_traces vive nel DB del progetto;
+                    // qui `db` e' il meta -> risolvi by_session (directory O(1)),
+                    // trace_store NON ri-risolve (convenzione: pool gia' risolto).
                     if let Ok(payload) = serde_json::to_value(&trace) {
+                        let trace_pool =
+                            crate::project_db_routes::project_data_pool_by_session_from(
+                                &db, session_id,
+                            )
+                            .await;
                         crate::trace_store::persist_trace(
-                            &db,
+                            &trace_pool,
                             session_id,
                             run_id,
                             trace_seq,

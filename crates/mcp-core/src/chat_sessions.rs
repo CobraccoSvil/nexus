@@ -418,7 +418,7 @@ impl CompactError {
 async fn structured_work_state(db: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
     // Worklog di sessione nel DB del progetto (risolto da session_id via routing).
     let pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
-    let block = crate::session_worklog::fetch_rendered_block(&pool, session_id).await?;
+    let block = crate::session_worklog::fetch_rendered_block(db, &pool, session_id).await?;
     Some(format!(
         "\n\n## Stato lavori (worklog di sessione, punto unico — non perdere questi fatti)\n{block}"
     ))
@@ -787,6 +787,7 @@ pub(crate) async fn compact_session_core(
         // Worklog nel DB del progetto (separazione DB): riuso il chat_pool gia'
         // risolto in questa funzione (flag off -> meta).
         let _ = crate::session_worklog::ingest_decisions(
+            &state.db,
             &chat_pool,
             session_id,
             Some(project_id),

@@ -805,10 +805,15 @@ async fn project_data_pool_by_search_from(
             return pool;
         }
     }
-    tracing::warn!(
+    // Dalla 0507 le tabelle del dominio chat/run NON esistono piu' nel meta:
+    // questo fallback produce a valle un errore SQL esplicito ("relation does
+    // not exist"), non piu' un silenzioso "0 righe". Livello error: un'entita'
+    // introvabile in ogni DB-progetto e' sempre un'anomalia da diagnosticare
+    // (id inesistente, directory di routing incompleta o DB-progetto down).
+    tracing::error!(
         entity_kind,
         entity_id = %entity_id,
-        "routing by-id: entita' non trovata in nessun DB-progetto, fallback al meta-DB"
+        "routing by-id: entita' non trovata in nessun DB-progetto, fallback al meta-DB (dominio decommissionato dalla 0507: la query a valle fallira' in modo esplicito)"
     );
     meta.clone()
 }

@@ -180,6 +180,51 @@ const DEFAULT_DESC: KindDescriptor = {
   defaultOpen: false,
 };
 
+/** Meta-step TECNICI del canale SSE che non sono decisioni da mostrare come
+ *  card: `usage_snapshot` (token del turno, consumato dalla barra contesto) ed
+ *  `end_turn` (chiusura turno). Senza questo filtro comparivano come card
+ *  "Step" senza titolo. Punto unico: usato da MessageMetaSteps (regola L). */
+export const HIDDEN_META_KINDS: ReadonlySet<string> = new Set(["usage_snapshot", "end_turn"]);
+
+/** Traduzioni delle chiavi di payload piu' comuni per la resa tabellare dei
+ *  meta-step senza renderer dedicato. Le chiavi ignote degradano a
+ *  snake_case -> parole ("max_cycles" -> "max cycles"), MAI a JSON grezzo. */
+const PAYLOAD_KEY_LABELS: Record<string, string> = {
+  cycle: "Tentativo",
+  max_cycles: "Tentativi max",
+  phase: "Fase",
+  reason: "Motivo",
+  attempt: "Tentativo",
+  provider: "Provider",
+  model: "Modello",
+  iteration: "Iterazione",
+  forced: "Chiusura forzata",
+  outcome: "Esito",
+  blocker: "Blocco",
+  summary: "Sintesi",
+  strategy: "Strategia",
+  tools_count: "Tool disponibili",
+  intent: "Intent",
+};
+
+/** Valori del payload in forma leggibile: booleani "si'"/"no", primitivi as-is,
+ *  strutture come stringa compatta (ultimo resort, mai blocchi JSON). */
+function humanValue(v: unknown): string {
+  if (v === null || v === undefined) return "—";
+  if (typeof v === "boolean") return v ? "si'" : "no";
+  if (typeof v === "string" || typeof v === "number") return String(v);
+  return JSON.stringify(v);
+}
+
+/** Fasi note del final_gate in italiano (il title porta gia' il messaggio
+ *  principale; qui il dettaglio del corpo espanso). */
+const FINAL_GATE_PHASES: Record<string, string> = {
+  start: "verifica avviata",
+  passed: "superata",
+  failed: "non superata, nuovo tentativo",
+  forced_close: "chiusura al limite tentativi",
+};
+
 // M15.1 — Checklist todo del piano con aggiornamento LIVE via eventi TodoUpdated.
 // Lo stato iniziale viene dal payload del meta_step plan; gli aggiornamenti
 // arrivano in tempo reale (la checklist si spunta mentre l'agente lavora).
@@ -317,11 +362,37 @@ function renderPayload(
       </div>
     );
   }
-  // fallback: JSON grezzo.
+  if (kind === "final_gate") {
+    const cycle = payload.cycle as number | undefined;
+    const maxCycles = payload.max_cycles as number | undefined;
+    const phase = payload.phase as string | undefined;
+    return (
+      <div style={grid}>
+        {typeof cycle === "number" && (
+          <DefRow k="Tentativo" v={maxCycles ? `${cycle} di ${maxCycles}` : String(cycle)} tc={tc} />
+        )}
+        {phase && <DefRow k="Fase" v={FINAL_GATE_PHASES[phase] ?? phase} tc={tc} />}
+      </div>
+    );
+  }
+  // Fallback generico: coppie chiave/valore leggibili, MAI il JSON grezzo
+  // (il payload e' telemetria strutturata; all'utente servono i fatti,
+  // il dato raw resta disponibile agli sviluppatori via API/DB).
+  const entries = Object.entries(payload ?? {}).filter(([, v]) => v !== null && v !== undefined);
+  if (!entries.length) {
+    return <em style={{ fontSize: 11, opacity: 0.7 }}>Nessun dettaglio aggiuntivo</em>;
+  }
   return (
-    <pre style={{ fontSize: 10, overflowX: "auto", opacity: 0.8, margin: 0 }}>
-      {JSON.stringify(payload, null, 2)}
-    </pre>
+    <div style={grid}>
+      {entries.map(([k, v]) => (
+        <DefRow
+          key={k}
+          k={PAYLOAD_KEY_LABELS[k] ?? k.replace(/_/g, " ")}
+          v={humanValue(v)}
+          tc={tc}
+        />
+      ))}
+    </div>
   );
 }
 

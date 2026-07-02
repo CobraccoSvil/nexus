@@ -436,7 +436,10 @@ pub async fn send_chat_message(
             .filter(|s| !s.is_empty())
         {
             Some(v) => parse_automation_mode(Some(v)),
-            None => read_session_automation_mode(&state.db, context.session_id).await,
+            // chat_sessions e' migrata: la modalita' persistita (mig 0371) va
+            // letta dal pool del progetto gia' risolto sopra, non dal meta
+            // (dove la riga sessione non esiste e tornava sempre il default).
+            None => read_session_automation_mode(&session_pool, context.session_id).await,
         }
     };
     let supervisor_mode =
@@ -838,6 +841,12 @@ async fn try_resume_interrupted_run(
         &prev_messages_json,
     );
     tokio::spawn(async move {
+        // Separazione DB: chat_messages/agent_runs sono migrate -> pool del
+        // progetto risolto UNA volta e riusato per history, UPDATE, INSERT,
+        // finalize e worklog. db_clone2 resta il meta SOLO per template,
+        // ledger e catalogo tool (domini di piattaforma).
+        let proj_pool =
+            crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await;
         let resume_tpl = crate::prompt_templates::get_template_or_default(
             &db_clone2,
             &template_cache_r,
@@ -847,8 +856,10 @@ async fn try_resume_interrupted_run(
         let resume_prompt =
             resume_tpl.replace("{{prev_iterations}}", &prev_iterations.to_string());
 
+        // History dal DB del progetto: sul meta chat_messages e' vuota a flag
+        // ON e il run ripreso ripartiva senza contesto conversazionale.
         let resume_history =
-            build_recent_conversation_history(&db_clone2, session_id_r, 8).await;
+            build_recent_conversation_history(&proj_pool, session_id_r, 8).await;
 
         let tools_for_resume = crate::brain_agent_client::build_tools_json_for_agent(
             &db_clone2,
@@ -912,9 +923,7 @@ async fn try_resume_interrupted_run(
             .bind(new_run_id)
             .bind(result.total_cost)
             .bind(result.total_tokens as i32)
-            .execute(
-                &crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await,
-            )
+            .execute(&proj_pool)
             .await;
         }
 
@@ -976,16 +985,16 @@ async fn try_resume_interrupted_run(
             .bind(&answer)
             .bind(meta)
             .bind(msg_id_r)
-            .execute(
-                &crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await,
-            )
+            .execute(&proj_pool)
             .await;
         }
 
         let _run_completed = resume_status.is_success();
         let resume_status_str = resume_status.as_str();
+        // Finalize sul DB del progetto: sul meta l'UPDATE non trovava il run e
+        // il run resumed restava 'running' bloccando la sessione (gate 409).
         crate::agent_types::finalize_agent_run(
-            &db_clone2,
+            &proj_pool,
             new_run_id,
             resume_status,
             resume_answer.as_deref().or(result.final_answer.as_deref()),
@@ -997,10 +1006,9 @@ async fn try_resume_interrupted_run(
         // percorso spawn principale — anche il resume di
         // conferma alimenta la storia di lavoro. Best-effort.
         // Worklog nel DB del progetto (separazione DB), pool per-progetto.
-        let wlpool =
-            crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await;
         if let Err(e) = crate::session_worklog::ingest_steps_for_run(
-            &wlpool,
+            &db_clone2,
+            &proj_pool,
             session_id_r,
             Some(project_id_r),
             new_run_id,
@@ -2023,6 +2031,11 @@ pub async fn legacy_chat(
     let project_id = parse_project_id(&body.project_id)?;
     ensure_project_access(&state.db, user_id, project_id).await?;
 
+    // Separazione DB: chat_sessions e' migrata -> pool del progetto risolto una
+    // volta per ricerca E creazione. Sul meta la ricerca rispondeva sempre
+    // vuoto e ogni chiamata legacy creava una NUOVA sessione.
+    let session_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     let existing_session = sqlx::query_scalar::<_, Uuid>(
         r#"
         SELECT id
@@ -2035,17 +2048,13 @@ pub async fn legacy_chat(
     )
     .bind(project_id)
     .bind(user_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&session_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let session_id = if let Some(session_id) = existing_session {
         session_id
     } else {
-        // Separazione DB: la nuova chat_sessions va nel DB del progetto (routing
-        // per project_id, il session_id non esiste ancora).
-        let session_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
         let new_session_id = Uuid::new_v4();
         sqlx::query(
             r#"

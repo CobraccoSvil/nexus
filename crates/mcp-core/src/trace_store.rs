@@ -23,16 +23,20 @@ use uuid::Uuid;
 /// errore DB e' loggato e ignorato (gli eventi SSE arrivano comunque, il run non
 /// si interrompe per una persistenza di telemetria). `seq` e' l'indice
 /// progressivo della traccia nel run (di norma l'iteration dell'AITraceEvent).
+///
+/// `run_pool` DEVE essere il pool del DB dove vive il run (progetto a flag
+/// separazione ON): la risoluzione e' responsabilita' del chiamante, UNA volta
+/// (regola L). Risolvere QUI con il pool ricevuto era una doppia risoluzione:
+/// event_sink/chat_agent passano gia' il pool progetto e la ri-risoluzione
+/// interrogava settings/directory sul DB progetto, dove non esistono, con
+/// rischio di avvelenare per 30s il flag globale di separazione.
 pub async fn persist_trace(
-    db: &PgPool,
+    run_pool: &PgPool,
     session_id: Uuid,
     run_id: Uuid,
     seq: i32,
     payload: &Value,
 ) {
-    // Separazione DB per-progetto: nexus_agent_traces e' migrata, instrada sul
-    // pool del progetto risolto per-sessione (a flag OFF ritorna il meta-pool).
-    let proj_pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
     let res = sqlx::query(
         "INSERT INTO nexus_agent_traces (session_id, run_id, seq, payload) \
          VALUES ($1, $2, $3, $4)",
@@ -41,7 +45,7 @@ pub async fn persist_trace(
     .bind(run_id)
     .bind(seq)
     .bind(payload)
-    .execute(&proj_pool)
+    .execute(run_pool)
     .await;
     if let Err(e) = res {
         tracing::warn!(
@@ -59,15 +63,14 @@ pub async fn persist_trace(
 /// cross-utente), limite agli ultimi 30 run includendo SEMPRE i piu' recenti
 /// (il caso d'uso del refresh), ordine cronologico (`seq` poi `created_at`) per
 /// la ricostruzione fedele del pannello. Ritorna `{ "<run_id>": [payload...] }`.
+/// `run_pool` DEVE essere il pool del DB dove vivono i run della sessione
+/// (progetto a flag separazione ON), risolto dal chiamante — stessa convenzione
+/// di [`persist_trace`] (regola L: la risoluzione vive su UN solo lato).
 pub async fn get_session_traces(
-    db: &PgPool,
+    run_pool: &PgPool,
     session_id: Uuid,
     user_id: Uuid,
 ) -> Result<std::collections::HashMap<String, Vec<Value>>, sqlx::Error> {
-    // Separazione DB per-progetto: nexus_agent_traces e agent_runs sono entrambe
-    // migrate, quindi la SELECT con subquery IN gira tutta sul pool del progetto
-    // risolto per-sessione (a flag OFF ritorna il meta-pool).
-    let proj_pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
     let rows = sqlx::query(
         "SELECT t.run_id, t.payload \
          FROM nexus_agent_traces t \
@@ -81,7 +84,7 @@ pub async fn get_session_traces(
     )
     .bind(session_id)
     .bind(user_id)
-    .fetch_all(&proj_pool)
+    .fetch_all(run_pool)
     .await?;
 
     let mut runs: std::collections::HashMap<String, Vec<Value>> =

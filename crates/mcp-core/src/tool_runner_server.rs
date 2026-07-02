@@ -143,6 +143,13 @@ impl ToolRunnerService {
     pub(crate) async fn build_ctx(&self, session_id: Uuid) -> Result<AgentToolContext, Status> {
         let info = self.resolve_session(session_id).await?;
         let long_running_patterns = crate::long_running::load_enabled_patterns(&self.deps.db).await;
+        // Separazione DB: run_db = pool del progetto per i tool che toccano il
+        // dominio run (plans/todos/worklog); `db` resta il meta per la config.
+        let run_db = crate::project_db_routes::project_data_pool_by_session_from(
+            &self.deps.db,
+            session_id,
+        )
+        .await;
         Ok(AgentToolContext {
             core: nexus_agent_tools::ToolContextCore {
                 root_path: info.root_path,
@@ -152,6 +159,7 @@ impl ToolRunnerService {
                 project_id: info.project_id,
                 session_id: Some(session_id),
                 db: Arc::new(self.deps.db.clone()),
+                run_db: Arc::new(run_db),
                 parent_run_id: None,
                 long_running_patterns,
                 user_role: info.user_role.clone(),

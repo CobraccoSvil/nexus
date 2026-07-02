@@ -20,16 +20,13 @@ async fn tabelle_plan_act_verify_esistono() {
         eprintln!("skip: DATABASE_URL non impostata");
         return;
     };
-    let attese = [
-        "nexus_agent_plans",
-        "nexus_agent_todos",
-        "nexus_agent_verifier_runs",
+    // Tabelle di PIATTAFORMA: vivono nel meta-DB (DATABASE_URL).
+    let attese_meta = [
         "nexus_subagent_definitions",
-        "nexus_subagent_runs",
         "nexus_project_instructions",
         "nexus_security_audit",
     ];
-    for t in attese {
+    for t in attese_meta {
         let row = sqlx::query("SELECT 1 AS x FROM information_schema.tables WHERE table_name = $1")
             .bind(t)
             .fetch_optional(&pool)
@@ -38,6 +35,31 @@ async fn tabelle_plan_act_verify_esistono() {
         assert!(
             row.is_some(),
             "tabella '{t}' NON ESISTE - applicare migration"
+        );
+    }
+    // Tabelle del dominio run: migrate ai DB-progetto (decommissionate nel
+    // meta dalla 0507) — la fonte di verita' e' il set db/migrations/project.
+    // Verifica sui file del set: un DB-progetto effimero richiederebbe
+    // credenziali del cluster app non garantite in CI.
+    let project_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../db/migrations/project");
+    let mut project_sql = String::new();
+    for entry in std::fs::read_dir(project_dir).expect("dir db/migrations/project") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sql") {
+            project_sql.push_str(&std::fs::read_to_string(&path).expect("read sql"));
+        }
+    }
+    let attese_project = [
+        "nexus_agent_plans",
+        "nexus_agent_todos",
+        "nexus_agent_verifier_runs",
+        "nexus_subagent_runs",
+    ];
+    for t in attese_project {
+        assert!(
+            project_sql.contains(&format!("CREATE TABLE IF NOT EXISTS {t}"))
+                || project_sql.contains(&format!("CREATE TABLE {t}")),
+            "tabella '{t}' non definita nel set db/migrations/project - dominio run incompleto"
         );
     }
 }

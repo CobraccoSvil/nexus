@@ -6,7 +6,7 @@ import type { ChatMessage, AgentRunInfo, AgentStep, SavedChatAttachment } from "
 import { getAgentRun, getAgentRunNextActions, getAttachmentRawUrl } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { MarkdownBlock } from "./markdown-renderer";
-import { AgentMetaStepCard, NextActionsButtons, type NextActionChoice } from "./agent-meta-step-card";
+import { AgentMetaStepCard, HIDDEN_META_KINDS, NextActionsButtons, type NextActionChoice } from "./agent-meta-step-card";
 import type { MetaStepEntry } from "../../lib/use-chat/types";
 import { toolLabel } from "./tool-labels";
 
@@ -477,7 +477,11 @@ function MessageNextActions({
  * ci sono decisioni non rende nulla.
  */
 function MessageMetaSteps({ steps, tc }: { steps: MetaStepEntry[]; tc: ThemeColors }) {
-  const decisionSteps = steps.filter((m) => m.kind !== "next_actions");
+  // Esclusi i next_actions (resi come pulsanti) e i kind TECNICI del canale
+  // SSE (usage_snapshot/end_turn): comparivano come card "Step" senza titolo.
+  const decisionSteps = steps.filter(
+    (m) => m.kind !== "next_actions" && !HIDDEN_META_KINDS.has(m.kind),
+  );
   if (!decisionSteps.length) return null;
   return (
     <div

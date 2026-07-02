@@ -324,7 +324,9 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         project_id,
         user_message_id,
         content,
-        automation_mode: crate::chat_messages::read_session_automation_mode(&state.db, session)
+        // chat_sessions e' migrata: la modalita' della sessione va letta dal
+        // pool progetto gia' risolto sopra, non dal meta (sempre default).
+        automation_mode: crate::chat_messages::read_session_automation_mode(&proj_pool, session)
             .await,
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),

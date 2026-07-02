@@ -88,7 +88,7 @@ pub async fn reap_stale_runs(db: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid>
             reaped.len(),
             stale_seconds
         );
-        all_reaped.extend(finalize_reaped(&pool, reaped).await);
+        all_reaped.extend(finalize_reaped(db, &pool, reaped).await);
     }
     all_reaped
 }
@@ -137,7 +137,7 @@ pub async fn reap_orphaned_runs_at_boot(db: &PgPool) -> Vec<uuid::Uuid> {
             "run_reaper: bootstrap, marcati {} run 'running' orfani come 'interrupted' (no time-gate)",
             reaped.len()
         );
-        all_reaped.extend(finalize_reaped(&pool, reaped).await);
+        all_reaped.extend(finalize_reaped(db, &pool, reaped).await);
     }
     all_reaped
 }
@@ -160,7 +160,8 @@ async fn reap_all_at_boot_enabled(db: &PgPool) -> bool {
 /// Corpo comune (regola L) dei due reaper: per i run appena marcati 'interrupted'
 /// registra il worklog di sessione e inserisce il messaggio assistente. Ritorna
 /// gli id reapati cosi' il chiamante puo' sbloccare gli EventSource in ascolto.
-async fn finalize_reaped(db: &PgPool, reaped: Vec<uuid::Uuid>) -> Vec<uuid::Uuid> {
+/// `meta` = meta-DB (settings worklog); `db` = pool del DB progetto reapato.
+async fn finalize_reaped(meta: &PgPool, db: &PgPool, reaped: Vec<uuid::Uuid>) -> Vec<uuid::Uuid> {
     // Worklog di sessione (mig 0411): anche il lavoro dei run interrotti
     // (crash/stallo) entra nella storia di lavoro — gli agent_steps sono gia'
     // in DB grazie alla persistenza incrementale del brain (M68). Il run
@@ -168,6 +169,7 @@ async fn finalize_reaped(db: &PgPool, reaped: Vec<uuid::Uuid>) -> Vec<uuid::Uuid
     // di ripartire da zero. Best-effort per singolo run.
     for rid in &reaped {
         if let Err(e) = crate::session_worklog::ingest_from_db_steps(
+            meta,
             db,
             *rid,
             "interrotto (crash o stallo del servizio)",

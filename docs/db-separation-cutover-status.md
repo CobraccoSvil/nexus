@@ -233,12 +233,26 @@ split-brain), routing auto-aggiornato, migrator pulito, health ok.
   bug del cutover: credito esaurito sugli account. Fix = ricaricare credito, oppure
   attivare in `nexus_routing_matrix` un provider con credito (google/deepseek/mistral
   hanno API key ma sono is_active=false). Decisione operativa.
-- **RISCHIO read-path non instradati (aperto)**: dopo il cleanup il meta non ha piu' i
-  dati di beaty, quindi ogni read-path che legge una tabella MIGRATA dal meta a flag ON
-  ora mostra VUOTO (prima vedeva le copie stale). Trovato+corretto
-  `monitor_seed.rs::recent_active_projects` (pannello Monitor). DA FARE: audit esaustivo
-  degli altri call-site read che usano `state.db`/meta su tabelle migrate invece del
-  pool per-progetto, poi rebuild.
+- **RISCHIO read-path non instradati: CHIUSO (sessione 2026-07-02 sera).** Audit
+  esaustivo multi-agente su crates/mcp-core: 17 call-site confermati e corretti
+  (pannello step run, timeline meta-step, tracce, active-run al refresh, history
+  del turno in spawn/resume, disambiguation reply, automation_mode ereditata,
+  legacy_chat, enforcement porte, worklog settings + cache avvelenabile,
+  finalizzatore nativo). Punto unico consolidato: `trace_store` e le funzioni
+  worklog NON ri-risolvono piu' il pool (convenzione "il chiamante risolve");
+  `ToolContextCore` espone `run_db` per i tool del dominio run.
+- **Decommissioning meta Fase 1: mig `0507`.** Le 21 tabelle del dominio chat/run
+  migrate (vuote nel meta dopo il cleanup) sono RINOMINATE `zz_decommissioned_*`
+  nel meta con guardia fail-fast (righe>0 -> la migrazione fallisce) + drop delle
+  FK esterne (project_runtime_issues, terminal_commands). Ogni call-site residuo
+  col pool meta ora fallisce con "relation does not exist" (regole H/M) invece di
+  degenerare in silenzio su una tabella vuota. Esclusa `project_open_sessions`
+  (1 riga viva nel meta, scrittore da chiarire). Fase 2 (dopo osservazione):
+  DROP definitivo + rimozione flag `db.project_separation.enabled` e dei rami OFF.
+  DA FARE (task spawnato): bonifica crate secondari (nexus-wiki workers,
+  prompt_optimizer, quotas, admin-service, billing session-usage) che dopo la
+  0507 loggano errori espliciti; contract test m71 da rifare su DB progetto
+  (oggi skippa: seed chat_sessions non piu' nel meta).
 
 ### Nota: rischio flip accidentale — RISOLTO
 Vedi guard mig 0499 sopra. Sostituisce la vecchia mitigazione (beaty popolato).
@@ -246,4 +260,5 @@ Vedi guard mig 0499 sopra. Sostituisce la vecchia mitigazione (beaty popolato).
 ## Migrazioni introdotte
 `0494` connection_role, `0495` seed flag, `0496` nexus_data_routing,
 `0497` drop tabelle morte, `0498` seed retention, `0499` settings protetti (guard flip),
+`0507` decommissioning meta Fase 1 (rename fail-fast tabelle migrate),
 `db/migrations/project/0001_chat.sql`, `0002_run.sql`, `0003` drop dead.

@@ -67,7 +67,7 @@ pub async fn tool_nexus_todo_write(ctx: &ToolContextCore, input: &Value) -> Stri
     let run_check: Option<(Uuid,)> =
         sqlx::query_as("SELECT project_id FROM agent_runs WHERE id = $1 LIMIT 1")
             .bind(run_id)
-            .fetch_optional(&*ctx.db)
+            .fetch_optional(&*ctx.run_db)
             .await
             .ok()
             .flatten();
@@ -134,7 +134,7 @@ async fn create_plan(
     let plan_user_intent = input.get("user_intent").and_then(|v| v.as_str());
     let plan_behavior_mode = input.get("behavior_mode").and_then(|v| v.as_str());
 
-    let mut tx = match ctx.db.begin().await {
+    let mut tx = match ctx.run_db.begin().await {
         Ok(t) => t,
         Err(e) => return err(&format!("begin tx fallita: {e}")),
     };
@@ -286,7 +286,7 @@ async fn add_todos(
     let plan_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM nexus_agent_plans WHERE run_id = $1)")
             .bind(run_id)
-            .fetch_one(&*ctx.db)
+            .fetch_one(&*ctx.run_db)
             .await
             .unwrap_or(false);
     if !plan_exists {
@@ -298,12 +298,12 @@ async fn add_todos(
     let max_seq: Option<i32> =
         sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM nexus_agent_todos WHERE run_id = $1")
             .bind(run_id)
-            .fetch_one(&*ctx.db)
+            .fetch_one(&*ctx.run_db)
             .await
             .ok();
     let base = max_seq.unwrap_or(0);
 
-    let mut tx = match ctx.db.begin().await {
+    let mut tx = match ctx.run_db.begin().await {
         Ok(t) => t,
         Err(e) => return err(&format!("begin tx fallita: {e}")),
     };
@@ -370,7 +370,7 @@ async fn update_status(
     todos_in: &[Value],
     check_mode: bool,
 ) -> String {
-    let mut tx = match ctx.db.begin().await {
+    let mut tx = match ctx.run_db.begin().await {
         Ok(t) => t,
         Err(e) => return err(&format!("begin tx fallita: {e}")),
     };
@@ -434,7 +434,7 @@ async fn update_status(
     let live_events = sqlx::query_scalar::<_, String>(
         "SELECT value FROM settings WHERE key = 'agent.todos.live_events' LIMIT 1",
     )
-    .fetch_optional(&*ctx.db)
+    .fetch_optional(&*ctx.run_db)
     .await
     .ok()
     .flatten()
@@ -464,7 +464,7 @@ async fn update_status(
              FROM nexus_agent_todos WHERE run_id = $1",
         )
         .bind(run_id)
-        .fetch_one(&*ctx.db)
+        .fetch_one(&*ctx.run_db)
         .await
         {
             nexus_events::dispatcher::emit_global(

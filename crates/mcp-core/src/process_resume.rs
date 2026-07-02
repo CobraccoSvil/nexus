@@ -488,9 +488,11 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
             content,
             // Eredita la modalita' scelta dall'utente per la sessione (mig 0371)
             // invece di hardcodare Confirm: un run risvegliato in Automatico non
-            // deve tornare a chiedere conferme.
+            // deve tornare a chiedere conferme. chat_sessions e' migrata: la
+            // lettura va sul pool progetto gia' risolto, non sul meta (dove la
+            // riga non esiste e la modalita' tornava sempre al default).
             automation_mode: crate::chat_messages::read_session_automation_mode(
-                &state.db, session_id,
+                &proj_pool, session_id,
             )
             .await,
             supervisor_mode: SupervisorMode::None,

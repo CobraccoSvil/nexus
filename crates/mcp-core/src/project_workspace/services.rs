@@ -2387,14 +2387,32 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
         return Ok(Vec::new());
     }
 
-    // 2. Costruisci mappa pid -> project_id da agent_processes
-    let pid_rows: Vec<(Option<i32>, uuid::Uuid)> = sqlx::query_as(
-        "SELECT pid, project_id FROM agent_processes \
-         WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
-    )
-    .fetch_all(db)
-    .await
-    .map_err(|e| format!("query agent_processes: {}", e))?;
+    // 2. Costruisci mappa pid -> project_id da agent_processes.
+    //    Separazione DB: agent_processes e' migrata per-progetto -> la vista
+    //    globale si ottiene aggregando i DB progetto (stesso pattern delle
+    //    viste admin globali, regola L). `db` resta il META: serve per
+    //    l'elenco progetti e la risoluzione dei pool. Sul meta la tabella e'
+    //    vuota a flag ON: la mappa usciva vuota e l'enforcement porte e il
+    //    kill dal pannello Porte non scattavano MAI. Un DB progetto
+    //    irraggiungibile degrada con WARN senza azzerare gli altri.
+    let mut pid_rows: Vec<(Option<i32>, uuid::Uuid)> = Vec::new();
+    for proj in crate::project_db_routes::list_all_project_ids(db).await {
+        let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
+        match sqlx::query_as::<_, (Option<i32>, uuid::Uuid)>(
+            "SELECT pid, project_id FROM agent_processes \
+             WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
+        )
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(mut rows) => pid_rows.append(&mut rows),
+            Err(e) => tracing::warn!(
+                project_id = %proj,
+                error = %e,
+                "detect_all_port_bindings: query agent_processes fallita per il progetto"
+            ),
+        }
+    }
 
     let mut pid_to_project: std::collections::HashMap<u32, uuid::Uuid> =
         std::collections::HashMap::new();

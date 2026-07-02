@@ -311,6 +311,7 @@ mod tests {
                 project_id: Uuid::nil(),
                 session_id: None,
                 db: Arc::new(db.clone()),
+                run_db: Arc::new(db.clone()),
                 parent_run_id: None,
                 long_running_patterns: Vec::new(),
                 user_role: "admin".to_string(),

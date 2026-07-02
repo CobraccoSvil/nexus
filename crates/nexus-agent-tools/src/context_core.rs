@@ -48,7 +48,13 @@ pub struct ToolContextCore {
     pub can_write: bool,
     pub project_id: Uuid,
     pub session_id: Option<Uuid>,
+    /// Pool del META-DB (settings, catalogo, template — config di piattaforma).
     pub db: Arc<PgPool>,
+    /// Pool del DB dove vivono i dati per-progetto del run (agent_runs,
+    /// nexus_agent_plans/todos, worklog). Risolto dal costruttore del contesto
+    /// (separazione DB: a flag OFF coincide col meta). I tool che toccano il
+    /// dominio run DEVONO usare questo, non `db`.
+    pub run_db: Arc<PgPool>,
     /// ID del run padre (per agenti figlio lanciati da dispatch_subtask).
     pub parent_run_id: Option<Uuid>,
     /// Pattern long-running caricati dal DB (pre-fetched all'inizio del run).

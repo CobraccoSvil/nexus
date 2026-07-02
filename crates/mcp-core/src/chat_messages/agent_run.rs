@@ -1123,7 +1123,7 @@ pub(crate) async fn supersede_active_runs(
         // gia' risolto sopra dalla sessione (flag off -> meta).
         for cid in &cancelled_ids {
             if let Err(e) =
-                crate::session_worklog::ingest_from_db_steps(&wpool, *cid, label).await
+                crate::session_worklog::ingest_from_db_steps(&state.db, &wpool, *cid, label).await
             {
                 tracing::warn!(error = %e, run_id = %cid, "session_worklog: ingest al supersede fallito");
             }
@@ -1650,8 +1650,16 @@ pub(crate) async fn spawn_agent_run(
     // intent_hint: il router_node ri-classificherebbe la lettera secca come
     // 'chat' (prompt_len=1), vanificando la scelta dell'utente.
     let mut resolved_intent_hint: Option<String> = None;
+    // Separazione DB: chat_messages e' migrata -> pool del progetto risolto UNA
+    // volta e riusato per le letture conversazionali di questo spawn (metadata
+    // di disambiguazione, count messaggi, history, hint auto-referenziale).
+    // Sul meta rispondevano sempre vuoto a flag ON: disambiguazione in loop,
+    // routing mai calibrato, history vuota anche per il motore nativo.
+    let msgs_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, params.session_id)
+            .await;
     if let Some(chosen) =
-        resolve_disambiguation_reply(&state.db, params.session_id, &params.content).await
+        resolve_disambiguation_reply(&msgs_pool, params.session_id, &params.content).await
     {
         if let Some(static_intent) = crate::orchestrator::intent_str_to_static(&chosen) {
             tracing::info!(
@@ -1825,7 +1833,7 @@ pub(crate) async fn spawn_agent_run(
     let context_message_count =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chat_messages WHERE session_id = $1")
             .bind(params.session_id)
-            .fetch_one(&state.db)
+            .fetch_one(&msgs_pool)
             .await
             .unwrap_or(0) as usize;
 
@@ -2005,7 +2013,7 @@ pub(crate) async fn spawn_agent_run(
             .load(std::sync::atomic::Ordering::Relaxed);
     let recent_history = if vec_deps_ok {
         build_vectorized_conversation_history(
-            &state.db,
+            &msgs_pool,
             &state.orchestrator.neural,
             params.session_id,
             &params.content,
@@ -2015,10 +2023,10 @@ pub(crate) async fn spawn_agent_run(
         .await
     } else {
         // Dipendenze vettoriali down: usa solo gli ultimi messaggi raw
-        build_recent_conversation_history(&state.db, params.session_id, 8).await
+        build_recent_conversation_history(&msgs_pool, params.session_id, 8).await
     };
     // Versione testuale compatta solo per logging
-    let recent_context = build_recent_conversation_context(&state.db, params.session_id, 4).await;
+    let recent_context = build_recent_conversation_context(&msgs_pool, params.session_id, 4).await;
     // Legge analysis_json + custom_instructions in un'unica query
     let (analysis_json_opt, custom_instructions_opt): (Option<serde_json::Value>, Option<String>) =
         sqlx::query_as::<_, (Option<serde_json::Value>, Option<String>)>(
@@ -2232,7 +2240,7 @@ pub(crate) async fn spawn_agent_run(
     // l'ultimo messaggio (la domanda stessa) invece di scalare al precedente
     // messaggio utente significativo. L'hint e' auto-aggiornato: include un
     // few-shot example tratto dalla cronologia reale di questa sessione.
-    let self_ref_hint = build_self_referential_hint(&state.db, params.session_id, &params.content)
+    let self_ref_hint = build_self_referential_hint(&msgs_pool, params.session_id, &params.content)
         .await
         .unwrap_or_default();
 
@@ -2314,6 +2322,7 @@ pub(crate) async fn spawn_agent_run(
         )
         .await;
         let worklog_note = crate::session_worklog::supersede_summary(
+            &state.db,
             &wpool,
             params.session_id,
             &superseded_runs,
@@ -2615,8 +2624,19 @@ pub(crate) async fn spawn_agent_run(
                         // gli step sono gia' su agent_steps (PgAgentStepStore) ->
                         // native_steps_persisted=true. Il run termina QUI (no loop
                         // Python): il finalizzatore sotto opera su questo result.
+                        // Separazione DB: agent_steps vive nel DB del progetto
+                        // (PgAgentStepStore scrive sul run_db) -> la rilettura per
+                        // costruire result.steps DEVE usare lo stesso pool, non il
+                        // meta (dove la tabella e' vuota a flag ON: il worklog
+                        // perderebbe tutti i fatti del run).
+                        let steps_pool =
+                            crate::project_db_routes::project_data_pool_by_session_from(
+                                &db_clone,
+                                session_id_cp,
+                            )
+                            .await;
                         native_result =
-                            Some(native_outcome_to_run_result(&db_clone, run_id, outcome).await);
+                            Some(native_outcome_to_run_result(&steps_pool, run_id, outcome).await);
                         native_steps_persisted = true;
                     }
                     Err(e) => {
@@ -3856,6 +3876,7 @@ pub(crate) async fn spawn_agent_run(
                 // Worklog nel DB del progetto (separazione DB): riuso run_pool,
                 // gia' risolto in cima al task per lo stesso project_id_cp.
                 if let Err(e) = crate::session_worklog::ingest_steps_for_run(
+                    &db_clone,
                     &run_pool,
                     session_id_cp,
                     Some(project_id_cp),
@@ -4301,7 +4322,9 @@ pub(crate) async fn confirm_native_run(
     let status = match outcome {
         Ok(outcome) => {
             // Mapping unico esito->AgentRunResult (regola L), poi finalize essenziale.
-            let mut result = native_outcome_to_run_result(&state.db, run_id, outcome).await;
+            // Separazione DB: gli step del run vivono nel DB del progetto ->
+            // rilettura sul cn_pool risolto sopra, non su state.db (meta).
+            let mut result = native_outcome_to_run_result(&cn_pool, run_id, outcome).await;
             // Riconciliazione costo/token dal ledger (stesso punto unico dello
             // spawn principale): il path nativo non aggrega costo nel grafo, senza
             // questo l'UPDATE azzererebbe agent_runs.total_cost/total_tokens a 0
