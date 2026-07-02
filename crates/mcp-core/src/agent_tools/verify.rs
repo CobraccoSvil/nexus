@@ -1,41 +1,38 @@
-//! Tool `nexus_verify_change` (ADR 0019 L3): catena di verifica post-modifica
-//! typecheck -> build -> lint -> test con fail-fast al primo step rosso.
+//! Tool `nexus_verify_change` (ADR 0019 L3 + ADR 0036): catena di verifica
+//! post-modifica con fail-fast al primo step rosso.
+//!
+//! Gli step NON sono un vocabolario fisso: vengono dal PROFILO PER-AMBIENTE
+//! inferito da un LLM che osserva il progetto (`verify_profile`, mig 0508).
+//! Nessuna matrice statica linguaggio->comando (decisione utente): se il
+//! profilo non e' disponibile il tool lo dichiara con esito strutturato,
+//! senza comandi generici di ripiego.
 //!
 //! Esito STRUTTURATO (regola M): ogni step riporta `exit_code` (punto unico
 //! `tool_runner_server::extract_exit_code`) + `build_errors` (punto unico
-//! `nexus_agent_graph::count_build_errors`, stessa coppia del criterio build
-//! del final_gate); il consumatore legge `passed`/`first_failure`, mai la prosa.
+//! `nexus_agent_graph::count_build_errors`, stessa coppia dei criteri del
+//! final_gate); il consumatore legge `passed`/`first_failure`, mai la prosa.
 //!
-//! Risoluzione comando per step (punto unico `resolve_verify_command`, regola
-//! G/L): run_configurations del progetto (role = nome step) > settings
-//! `agent.verify.<lang>.<step>` > nessuno = step SKIPPATO con motivo
-//! strutturato. MAI un comando hardcoded di fallback.
-//!
-//! Linguaggio dal build graph (ADR 0020): `BuildGraphCache::get_or_compute`.
+//! Precedenza comando per step (regola G/L): override locale in
+//! `run_configurations` (role = nome step) > comando dello step nel profilo.
 
 use super::*;
 
-/// Ordine canonico della catena completa (fail-fast al primo rosso).
-const STEPS_FULL: &[&str] = &["typecheck", "build", "lint", "test"];
-/// Scope rapido: solo i check statici (niente build/test).
-const STEPS_QUICK: &[&str] = &["typecheck", "lint"];
+use crate::verify_profile::VerifyProfileStep;
 
 /// Comando risolto per uno step, con la provenienza (per il report).
 struct ResolvedCmd {
     command: String,
-    source: &'static str, // "run_configuration" | "settings"
+    source: &'static str, // "run_configuration" | "verify_profile"
 }
 
-/// Punto unico (regola L) della risoluzione comando per (progetto, linguaggio,
-/// step). Precedenza: override locale in `run_configurations` (role = step) >
-/// default globale `agent.verify.<lang>.<step>` > `None` (step saltato).
-async fn resolve_verify_command(
+/// Override locale per-progetto: run_configuration col role omonimo dello
+/// step (vince SEMPRE sul comando del profilo: e' la scelta esplicita
+/// dell'utente). `None` = nessun override, si usa il profilo.
+async fn resolve_step_override(
     db: &sqlx::PgPool,
     project_id: uuid::Uuid,
-    lang: &str,
     step: &str,
-) -> Option<ResolvedCmd> {
-    // 1. Override per-progetto: run_configuration col role omonimo dello step.
+) -> Option<String> {
     let row: Option<(String, Vec<String>)> = sqlx::query_as(
         "SELECT command, args FROM run_configurations \
          WHERE project_id = $1 AND role = $2 \
@@ -47,28 +44,13 @@ async fn resolve_verify_command(
     .await
     .ok()
     .flatten();
-    if let Some((command, args)) = row {
-        let full = if args.is_empty() {
-            command
-        } else {
-            format!("{} {}", command, args.join(" "))
-        };
-        if !full.trim().is_empty() {
-            return Some(ResolvedCmd {
-                command: full,
-                source: "run_configuration",
-            });
-        }
-    }
-    // 2. Default globale dal DB (regola G: nessun fallback hardcoded).
-    let key = format!("agent.verify.{lang}.{step}");
-    nexus_auth::get_setting(db, &key)
-        .await
-        .filter(|v| !v.trim().is_empty())
-        .map(|command| ResolvedCmd {
-            command,
-            source: "settings",
-        })
+    let (command, args) = row?;
+    let full = if args.is_empty() {
+        command
+    } else {
+        format!("{} {}", command, args.join(" "))
+    };
+    (!full.trim().is_empty()).then_some(full)
 }
 
 /// Estratto head+tail non distruttivo dell'output per il report (i totali dei
@@ -108,28 +90,47 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
         .and_then(Value::as_str)
         .unwrap_or("full")
         .to_ascii_lowercase();
-    let steps: Vec<&str> = match scope.as_str() {
-        "full" => STEPS_FULL.to_vec(),
-        "quick" => STEPS_QUICK.to_vec(),
-        s if STEPS_FULL.contains(&s) => vec![STEPS_FULL[STEPS_FULL.iter().position(|x| *x == s).unwrap()]],
-        other => {
-            return serde_json::json!({
-                "error": "invalid_scope",
-                "detail": format!("scope '{other}' non valido: usa quick|full|typecheck|build|lint|test"),
-            })
-            .to_string();
-        }
-    };
 
-    // Linguaggio dal build graph (ADR 0020). Cache non inizializzata o resolver
-    // in errore -> "unknown": nessuno step eseguibile, motivo strutturato.
-    let language = match nexus_build_graph::BuildGraphCache::global() {
-        Some(cache) => cache
-            .get_or_compute(ctx.project_id)
-            .await
-            .map(|info| info.language)
-            .unwrap_or_else(|_| "unknown".to_string()),
-        None => "unknown".to_string(),
+    // Profilo per-ambiente (ADR 0036): inferito da LLM alla prima richiesta,
+    // poi cache su tabella con invalidazione deterministica. Il tool puo'
+    // triggerare l'inferenza (ha meta-db, neural e root nel contesto).
+    let profile: Vec<VerifyProfileStep> = crate::verify_profile::ensure_profile(
+        &ctx.db,
+        &ctx.neural,
+        ctx.project_id,
+        &ctx.root_path,
+    )
+    .await;
+    if profile.is_empty() {
+        // NESSUN comando generico di ripiego (decisione utente): esito
+        // strutturato onesto, il chiamante sa che la verifica non e' partita.
+        return serde_json::json!({
+            "error": "profile_unavailable",
+            "detail": "Profilo di verifica dell'ambiente non disponibile: inferenza LLM non riuscita e nessun profilo salvato. Riprova quando il modello e' raggiungibile, oppure definisci run_configurations con role di verifica.",
+        })
+        .to_string();
+    }
+    let available: Vec<&str> = profile.iter().map(|s| s.step.as_str()).collect();
+    let steps: Vec<&VerifyProfileStep> = match scope.as_str() {
+        // Catena completa: tutti gli step del profilo, nell'ordine del profilo.
+        "full" => profile.iter().collect(),
+        // Rapido: solo gli step che l'LLM ha marcato per il gate di chiusura.
+        "quick" => profile.iter().filter(|s| s.gate).collect(),
+        name => {
+            let hit: Vec<&VerifyProfileStep> =
+                profile.iter().filter(|s| s.step == name).collect();
+            if hit.is_empty() {
+                return serde_json::json!({
+                    "error": "invalid_scope",
+                    "detail": format!(
+                        "scope '{name}' non presente nel profilo: usa quick|full oppure uno step del profilo"
+                    ),
+                    "available_steps": available,
+                })
+                .to_string();
+            }
+            hit
+        }
     };
 
     let step_timeout_s = nexus_auth::get_setting(&ctx.db, "agent.verify.step_timeout_s")
@@ -149,7 +150,8 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
     let mut passed = true;
     let mut first_failure: Option<&str> = None;
 
-    for step in &steps {
+    for profile_step in &steps {
+        let step = profile_step.step.as_str();
         // Fail-fast: gli step dopo il primo rosso sono marcati skipped.
         if first_failure.is_some() {
             report_steps.push(serde_json::json!({
@@ -158,28 +160,34 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
             }));
             continue;
         }
-        let Some(resolved) = resolve_verify_command(&ctx.db, ctx.project_id, &language, step).await
-        else {
-            report_steps.push(serde_json::json!({
-                "step": step,
-                "skipped_reason": "no_command_configured",
-                "detail": format!(
-                    "nessuna run_configuration role='{step}' e nessun setting agent.verify.{language}.{step}"
-                ),
-            }));
-            continue;
+        // Precedenza: override esplicito dell'utente (run_configuration col
+        // role omonimo) > comando dello step nel profilo inferito.
+        let resolved = match resolve_step_override(&ctx.db, ctx.project_id, step).await {
+            Some(command) => ResolvedCmd {
+                command,
+                source: "run_configuration",
+            },
+            None => ResolvedCmd {
+                command: profile_step.command.clone(),
+                source: "verify_profile",
+            },
         };
 
         let mut tool_input = serde_json::json!({ "command": resolved.command });
-        if let Some(wd) = working_dir {
+        // working_dir: input esplicito del chiamante > working_dir dello step.
+        if let Some(wd) = working_dir.or(profile_step.working_dir.as_deref()) {
             tool_input["working_dir"] = serde_json::json!(wd);
         }
         let started = std::time::Instant::now();
-        // Timeout per-step DB-driven come bound esterno (il run_command ha i suoi
-        // probe interni 10s/300s): allo scadere lo step fallisce con motivo
-        // strutturato; il processo figlio residuo termina da solo.
+        // Timeout per-step: quello proposto dal profilo per QUESTO step, col
+        // bound globale DB-driven come default (il run_command ha i suoi probe
+        // interni): allo scadere lo step fallisce con motivo strutturato.
+        let effective_timeout_s = profile_step
+            .timeout_s
+            .map(|t| t.max(1.0) as u64)
+            .unwrap_or(step_timeout_s);
         let raw = match tokio::time::timeout(
-            std::time::Duration::from_secs(step_timeout_s),
+            std::time::Duration::from_secs(effective_timeout_s),
             super::command::tool_run_command(ctx, &tool_input),
         )
         .await
@@ -196,7 +204,7 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
                     "skipped_reason": null,
                     "timeout": true,
                     "duration_ms": started.elapsed().as_millis() as u64,
-                    "detail": format!("step oltre agent.verify.step_timeout_s ({step_timeout_s}s)"),
+                    "detail": format!("step oltre il timeout ({effective_timeout_s}s)"),
                 }));
                 continue;
             }
@@ -227,11 +235,11 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
     }
 
     serde_json::json!({
-        "language": language,
         "scope": scope,
         "passed": passed,
         "first_failure": first_failure,
         "steps": report_steps,
+        "profile_steps_available": available,
     })
     .to_string()
 }
@@ -258,12 +266,10 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn resolve_verify_command_run_config_vince_su_setting(pool: sqlx::PgPool) {
-        // Precedenza: run_configurations (role=step) > settings > None.
-        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
-            .execute(&pool)
-            .await
-            .expect("create settings");
+    async fn resolve_step_override_vince_sul_profilo(pool: sqlx::PgPool) {
+        // L'override utente (run_configurations, role = nome step) vince sul
+        // comando del profilo inferito; senza override -> None (si usa il
+        // profilo). NESSUN terzo livello statico (ADR 0036).
         sqlx::query(
             "CREATE TABLE run_configurations ( \
                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
@@ -281,13 +287,6 @@ mod tests {
         .expect("create run_configurations");
         let pid = uuid::Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES \
-             ('agent.verify.rust.test', 'cargo test --workspace')",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed setting");
-        sqlx::query(
             "INSERT INTO run_configurations (project_id, command, args, role) VALUES \
              ($1, 'cargo', ARRAY['nextest','run'], 'test')",
         )
@@ -296,19 +295,13 @@ mod tests {
         .await
         .expect("seed run_config");
 
-        // Override locale vince.
-        let r = resolve_verify_command(&pool, pid, "rust", "test").await.expect("risolto");
-        assert_eq!(r.command, "cargo nextest run");
-        assert_eq!(r.source, "run_configuration");
+        // Override locale presente.
+        let r = resolve_step_override(&pool, pid, "test").await.expect("override");
+        assert_eq!(r, "cargo nextest run");
 
-        // Altro progetto senza run_config -> setting globale.
-        let r2 = resolve_verify_command(&pool, uuid::Uuid::new_v4(), "rust", "test")
-            .await
-            .expect("risolto da settings");
-        assert_eq!(r2.command, "cargo test --workspace");
-        assert_eq!(r2.source, "settings");
-
-        // Step senza chiave -> None (skip, mai hardcode).
-        assert!(resolve_verify_command(&pool, pid, "rust", "lint").await.is_none());
+        // Altro progetto senza run_config -> None (si usa il profilo).
+        assert!(resolve_step_override(&pool, uuid::Uuid::new_v4(), "test").await.is_none());
+        // Step senza role corrispondente -> None.
+        assert!(resolve_step_override(&pool, pid, "lint").await.is_none());
     }
 }

@@ -124,15 +124,8 @@ pub struct FinalGateConfig {
     /// (`final_gate_runtime_check_enabled`, default ON). Aggiunge il criterio
     /// `service_logs_clean` (`final_gate.py:342`).
     pub runtime_check_enabled: bool,
-    /// Comando build risolto per-progetto (`_resolve_build_command`). `None` =
-    /// build-check disabilitato o nessun comando risolvibile (N/A: niente
-    /// criterio build, non blocca i progetti senza build).
-    pub build_command: Option<String>,
-    /// Working dir del comando build (`build_cwd`, `final_gate.py:361`). `None`
-    /// = cwd di default del runner.
-    pub build_working_dir: Option<String>,
-    /// Timeout (s) del criterio build (`_build_timeout_s`, default 180: i build
-    /// sono lenti). Risolto a monte.
+    /// Timeout (s) dei criteri comando della catena di verifica (default 180:
+    /// i build sono lenti). Risolto a monte.
     pub build_timeout_s: f64,
     /// Limite caratteri dell'output_excerpt del criterio build esposto
     /// all'agente quando fallisce (`_build_output_max_chars`, default 4000,
@@ -175,6 +168,30 @@ pub struct FinalGateConfig {
     /// `tool_capability` / `completion_confirmed`
     /// (`agent.final_gate.structural_criteria_enabled`, default true, mig 0503).
     pub structural_criteria_enabled: bool,
+    /// ADR 0036: catena di verifica PER-AMBIENTE risolta a monte (profilo
+    /// inferito da LLM in `project_verify_profiles`, step marcati gate=true).
+    /// Un criterio `run_command` per step, nell'ordine del profilo (es.
+    /// typecheck poi build — per un progetto Vite la sola build non
+    /// type-checka e chiudeva "verificato" codice rotto a runtime). NESSUN
+    /// comando generico di ripiego (decisione utente): vuota = nessun
+    /// criterio comando.
+    pub verify_steps: Vec<VerifyStepCmd>,
+    /// `true` quando il profilo di verifica NON e' disponibile (mai inferito
+    /// e LLM irraggiungibile): il gate lo DICHIARA nella narrazione live
+    /// invece di verificare con comandi generici (esito onesto, regola M).
+    pub verify_profile_missing: bool,
+}
+
+/// Comando di UNO step della catena di verifica per-ambiente (ADR 0036),
+/// gia' risolto e validato a monte (regola G: il nodo non legge DB/LLM).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerifyStepCmd {
+    /// Etichetta canonica: typecheck | build | lint | test.
+    pub step: String,
+    /// Comando completo, gia' passato dalla safety dei comandi.
+    pub command: String,
+    /// Working dir relativa alla root del progetto (monorepo). `None` = root.
+    pub working_dir: Option<String>,
 }
 
 impl Default for FinalGateConfig {
@@ -186,8 +203,6 @@ impl Default for FinalGateConfig {
             enabled: true,
             max_cycles: 2,
             runtime_check_enabled: true,
-            build_command: None,
-            build_working_dir: None,
             build_timeout_s: 180.0,
             build_output_max_chars: 4000,
             log_command: String::new(),
@@ -199,6 +214,8 @@ impl Default for FinalGateConfig {
             design_verify_enabled: true,
             design_verify_min_score: 70,
             structural_criteria_enabled: true,
+            verify_steps: Vec::new(),
+            verify_profile_missing: false,
         }
     }
 }
@@ -338,17 +355,24 @@ impl FinalGateNode {
             });
         }
 
-        // (4) run_command-build (il codice deve COMPILARE), se c'e' un build
-        //     command risolto. max_output_chars dedicato (mig 0426) + timeout
-        //     build dedicato.
-        if let Some(build_cmd) = &self.cfg.build_command {
+        // (4) Verifica che il codice sia SANO per il SUO ambiente (ADR 0036):
+        //     un criterio run_command per ogni step gate=true del profilo
+        //     inferito dall'LLM, nell'ordine del profilo. Il fallimento di uno
+        //     step espone all'agente comando e output di QUELLO step. NESSUN
+        //     comando generico di ripiego (decisione utente): senza profilo
+        //     nessun criterio comando, con dichiarazione onesta nel run()
+        //     (l'incidente Beaty-Book nasceva dal "npm run build" cieco che
+        //     per Vite non type-checka). max_output_chars dedicato (mig 0426)
+        //     + timeout build per ciascun comando.
+        for vs in &self.cfg.verify_steps {
             let mut spec = serde_json::Map::new();
-            spec.insert("command".to_string(), json!(build_cmd));
+            spec.insert("command".to_string(), json!(vs.command));
+            spec.insert("label".to_string(), json!(vs.step));
             spec.insert(
                 "max_output_chars".to_string(),
                 json!(self.cfg.build_output_max_chars),
             );
-            if let Some(cwd) = &self.cfg.build_working_dir {
+            if let Some(cwd) = &vs.working_dir {
                 spec.insert("working_dir".to_string(), json!(cwd));
             }
             criteria.push(CriterionSpec {
@@ -633,10 +657,26 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             self.meta_steps.as_ref(),
             ctx.exec_mode(),
             "final_gate",
-            format!("Verifico il risultato (build/test, tentativo {cycle}/{max_cycles})"),
+            format!("Verifico il risultato (tentativo {cycle}/{max_cycles})"),
             serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "start"}),
         )
         .await;
+        // ADR 0036, esito ONESTO (regola M): se il profilo di verifica
+        // dell'ambiente non e' disponibile (mai inferito e LLM irraggiungibile)
+        // il gate NON esegue comandi generici di ripiego e lo DICHIARA in
+        // chat, una sola volta (primo ciclo): l'utente sa che la chiusura non
+        // include la verifica tecnica dell'ambiente.
+        if self.cfg.verify_profile_missing && cycle <= 1 {
+            crate::nodes::emit_phase_meta(
+                ctx.emit.as_ref(),
+                self.meta_steps.as_ref(),
+                ctx.exec_mode(),
+                "final_gate",
+                "Verifica tecnica dell'ambiente NON eseguita: profilo non disponibile (inferenza LLM non riuscita)".to_string(),
+                serde_json::json!({"phase": "profile_missing"}),
+            )
+            .await;
+        }
 
         // ── Esecuzione criteri (sotto-sistema delegato) ───────────────────────
         // GATING SHADOW: ExecMode::Replay in shadow (zero side-effect), punto
@@ -1004,8 +1044,9 @@ mod tests {
             structural_criteria_enabled: false,
             ..Default::default()
         };
-        // Senza build_command e con runtime_check ON ma log_command vuoto:
-        // solo no_orphan + outputs_exist.
+        // Senza verify_steps e con runtime_check ON ma log_command vuoto:
+        // solo no_orphan + outputs_exist (NESSUN comando generico di ripiego,
+        // ADR 0036: senza profilo, nessun criterio comando).
         let node = node_with(
             base_cfg.clone(),
             Arc::new(StubCriteriaRunner::with_results(vec![])),
@@ -1015,11 +1056,23 @@ mod tests {
         let types: Vec<&str> = crits.iter().map(|c| c.criterion_type.as_str()).collect();
         assert_eq!(types, vec!["no_orphan_imported", "outputs_exist"]);
 
-        // Con log_command + build_command: 4 criteri nell'ordine canonico.
+        // Con log_command + profilo per-ambiente (ADR 0036): un run_command
+        // PER STEP nell'ordine del profilo (qui typecheck poi build).
+        let profile_steps = vec![
+            VerifyStepCmd {
+                step: "typecheck".to_string(),
+                command: "npx tsc --noEmit".to_string(),
+                working_dir: None,
+            },
+            VerifyStepCmd {
+                step: "build".to_string(),
+                command: "pnpm build".to_string(),
+                working_dir: Some("app".to_string()),
+            },
+        ];
         let cfg = FinalGateConfig {
             log_command: "docker compose logs".to_string(),
-            build_command: Some("pnpm build".to_string()),
-            build_working_dir: Some("app".to_string()),
+            verify_steps: profile_steps.clone(),
             ..base_cfg.clone()
         };
         let node2 = node_with(cfg, Arc::new(StubCriteriaRunner::with_results(vec![])));
@@ -1031,12 +1084,19 @@ mod tests {
                 "no_orphan_imported",
                 "outputs_exist",
                 "service_logs_clean",
+                "run_command",
                 "run_command"
             ]
         );
-        // Il criterio build porta max_output_chars + working_dir + timeout.
+        // Ogni step porta comando, etichetta, max_output_chars, working_dir e
+        // timeout; l'ordine e' quello del profilo (typecheck PRIMA della build:
+        // per Vite la sola build non type-checka).
+        let tc = &crits2[3];
+        assert_eq!(tc.spec["command"], json!("npx tsc --noEmit"));
+        assert_eq!(tc.spec["label"], json!("typecheck"));
         let build = crits2.last().expect("build criterion");
         assert_eq!(build.spec["command"], json!("pnpm build"));
+        assert_eq!(build.spec["label"], json!("build"));
         assert_eq!(build.spec["max_output_chars"], json!(4000));
         assert_eq!(build.spec["working_dir"], json!("app"));
         assert_eq!(build.timeout_s, Some(180.0));
@@ -1053,8 +1113,7 @@ mod tests {
         };
         let cfg3 = FinalGateConfig {
             log_command: "docker compose logs".to_string(),
-            build_command: Some("pnpm build".to_string()),
-            build_working_dir: Some("app".to_string()),
+            verify_steps: profile_steps.clone(),
             endpoint_criterion: Some(endpoint.clone()),
             ..base_cfg.clone()
         };
@@ -1067,6 +1126,7 @@ mod tests {
                 "no_orphan_imported",
                 "outputs_exist",
                 "service_logs_clean",
+                "run_command",
                 "run_command",
                 "http"
             ]

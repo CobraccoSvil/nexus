@@ -1434,11 +1434,25 @@ pub async fn admin_list_prompt_corrections(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut rows = Vec::new();
+    // Query RUNTIME (non macro compile-time): prompt_corrections e' migrata e
+    // dalla 0507 non esiste piu' nel meta contro cui sqlx::query! si prepara a
+    // compile time (DATABASE_URL). Stesso pattern della bonifica post-0507.
+    type CorrRow = (
+        Uuid,
+        Uuid,
+        String,
+        String,
+        Option<String>,
+        bool,
+        String,
+        i32,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let mut rows: Vec<CorrRow> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
         let pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
-        let batch = sqlx::query!(
+        let batch: Vec<CorrRow> = sqlx::query_as(
             r#"
             SELECT id, project_id, intent, correction_text, qdrant_point_id,
                    active, status, retrieved_count, created_at
@@ -1446,29 +1460,29 @@ pub async fn admin_list_prompt_corrections(
             WHERE deleted_at IS NULL
             ORDER BY created_at DESC
             LIMIT 100
-            "#
+            "#,
         )
         .fetch_all(&pool)
         .await
         .unwrap_or_default();
         for r in batch {
-            if seen.insert(r.id) {
+            if seen.insert(r.0) {
                 rows.push(r);
             }
         }
     }
-    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    rows.sort_by(|a, b| b.8.cmp(&a.8));
     rows.truncate(100);
 
     let corrections: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.id.to_string(), "projectId": r.project_id.to_string(),
-                "intent": r.intent, "text": r.correction_text,
-                "qdrantPointId": r.qdrant_point_id, "active": r.active,
-                "status": r.status, "retrievedCount": r.retrieved_count,
-                "createdAt": r.created_at.to_rfc3339(),
+                "id": r.0.to_string(), "projectId": r.1.to_string(),
+                "intent": r.2, "text": r.3,
+                "qdrantPointId": r.4, "active": r.5,
+                "status": r.6, "retrievedCount": r.7,
+                "createdAt": r.8.to_rfc3339(),
             })
         })
         .collect();

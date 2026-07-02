@@ -111,6 +111,7 @@ mod tool_capability;
 mod tool_runner_server;
 mod trace_store;
 mod vector_memory;
+mod verify_profile;
 mod wiki;
 
 use std::net::SocketAddr;

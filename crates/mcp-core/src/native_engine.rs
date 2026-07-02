@@ -520,20 +520,13 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
 /// quando `build_command` e' risolto: si leggono comunque per fedelta'.
 async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
     let d = FinalGateConfig::default();
-    // Criterio BUILD (mig 0423 + 0465): il codice deve COMPILARE prima della
-    // chiusura. Portato dal brain Python (era REGREDITO al cutover Rust, che
-    // lasciava build_command=None -> criterio build mai costruito -> app con
-    // import non risolti / errori TS chiusa "completed"). Lo script auto-detect
-    // (npm/cargo, no-op se nessun target) e' nel setting globale, eseguito nel
-    // project_root dal tool run_command (working_dir None = cwd del progetto).
-    // Gate dal flag build_check_enabled (default true): OFF o comando vuoto ->
-    // None (niente criterio, non blocca i progetti senza build).
-    let build_command = if setting_bool(db, "agent.final_gate.build_check_enabled", true).await {
-        let cmd = setting_string(db, "agent.final_gate.build_command", "").await;
-        (!cmd.trim().is_empty()).then_some(cmd)
-    } else {
-        None
-    };
+    // Criteri COMANDO (ADR 0036): la catena per-ambiente arriva dal profilo
+    // inferito da LLM (`verify_profile::ensure_profile`), risolta in
+    // `run_engine` e innestata in `verify_steps` DOPO questo loader (serve
+    // project/root della sessione, che qui non ci sono). Il vecchio
+    // `agent.final_gate.build_command` generico e' stato RIMOSSO (mig 0508,
+    // decisione utente: nessuna conoscenza d'ambiente fissa — era proprio il
+    // "npm run build" cieco che per Vite non type-checka).
     FinalGateConfig {
         enabled: setting_bool(db, "agent.final_gate.enabled", d.enabled).await,
         max_cycles: setting_i64(db, "agent.final_gate.max_cycles", d.max_cycles).await,
@@ -544,12 +537,12 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
         no_orphan_min_ratio: setting_f64(db, "agent.no_orphan.min_ratio", d.no_orphan_min_ratio).await,
         import_staging_dirs: setting_csv(db, "agent.import_staging_dirs", d.import_staging_dirs).await,
         criteria_timeout_s: setting_f64(db, "orchestrator.verifier_timeout_s", d.criteria_timeout_s).await,
-        // Criterio build cablato sopra (mig 0423/0465). working_dir None: lo
-        // script auto-detect gestisce le sottodir (cd app/frontend). log_command
-        // / endpoint_criterion restano risolti per-progetto a monte (non ancora
-        // portati): default vuoto/None (niente criterio, non blocca).
-        build_command,
-        build_working_dir: d.build_working_dir,
+        // verify_steps/verify_profile_missing innestati in run_engine (profilo
+        // per-ambiente, ADR 0036). log_command / endpoint_criterion restano
+        // risolti per-progetto a monte (non ancora portati): default
+        // vuoto/None (niente criterio, non blocca).
+        verify_steps: d.verify_steps,
+        verify_profile_missing: d.verify_profile_missing,
         log_command: d.log_command,
         endpoint_criterion: d.endpoint_criterion,
         design_verify_enabled: setting_bool(db, "agent.final_gate.design_verify_enabled", d.design_verify_enabled).await,
@@ -972,8 +965,62 @@ async fn build_native_engine(
     // come magic fallback (regola G). Copre SIA il primario nativo (run_native) SIA
     // lo shadow (run_shadow): entrambi passano di qui (punto unico).
     let planner_cfg = load_planner_config(&db).await;
-    let final_gate_cfg = load_final_gate_config(&db).await;
+    let mut final_gate_cfg = load_final_gate_config(&db).await;
     let verifier_cfg = load_verifier_config(&db).await;
+
+    // ── Catena di verifica per-AMBIENTE (ADR 0036) ───────────────────────────
+    // Il profilo del progetto e' INFERITO da un LLM che osserva l'ambiente
+    // reale (verify_profile::ensure_profile: sceglie lui i file da leggere e
+    // definisce step liberi con flag gate). Qui, risolto a monte del grafo
+    // (regola G), si innestano nel final_gate gli step gate=true. In SHADOW
+    // niente inferenza (zero side-effect/costo): sola lettura del persistito.
+    if final_gate_cfg.enabled {
+        let project_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT project_id FROM chat_sessions WHERE id = $1")
+                .bind(input.session_id)
+                .fetch_optional(&run_db)
+                .await
+                .ok()
+                .flatten();
+        let root: Option<String> = match project_id {
+            Some(pid) => sqlx::query_scalar(
+                "SELECT repository_root_path FROM projects WHERE id = $1",
+            )
+            .bind(pid)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten(),
+            None => None,
+        };
+        if let (Some(pid), Some(root)) = (project_id, root.filter(|r| !r.trim().is_empty())) {
+            let steps = if role.is_shadow() {
+                crate::verify_profile::profile_steps(&db, pid).await
+            } else {
+                crate::verify_profile::ensure_profile(
+                    &db,
+                    &deps.tool_runner_deps.neural,
+                    pid,
+                    std::path::Path::new(&root),
+                )
+                .await
+            };
+            final_gate_cfg.verify_profile_missing = steps.is_empty();
+            final_gate_cfg.verify_steps = steps
+                .into_iter()
+                .filter(|s| s.gate)
+                .map(|s| nexus_agent_graph::nodes::final_gate::VerifyStepCmd {
+                    step: s.step,
+                    command: s.command,
+                    working_dir: s.working_dir,
+                })
+                .collect();
+        } else {
+            // Sessione senza progetto/root (es. run di servizio): niente
+            // catena, dichiarazione onesta come per il profilo mancante.
+            final_gate_cfg.verify_profile_missing = true;
+        }
+    }
 
     let exec_cfg = load_executor_config(&db, &input.provider, &input.model, context_window).await;
 
@@ -2656,29 +2703,22 @@ mod tests {
             "ECONNREFUSED,Traceback",
         )
         .await;
-        // Criterio build (mig 0423/0465): build_check_enabled + build_command dal DB.
-        set_setting(&pool, "agent.final_gate.build_check_enabled", "true").await;
-        set_setting(&pool, "agent.final_gate.build_command", "npm run build").await;
-
         let cfg = load_final_gate_config(&pool).await;
         assert!(!cfg.enabled, "enabled=false dal DB");
-        assert_eq!(
-            cfg.build_command.as_deref(),
-            Some("npm run build"),
-            "build_command letto dal DB col criterio build attivo (mig 0465)"
-        );
         assert_eq!(cfg.max_cycles, 4);
         assert!(!cfg.runtime_check_enabled);
         assert!((cfg.no_orphan_min_ratio - 0.7).abs() < f64::EPSILON);
         assert_eq!(cfg.import_staging_dirs, vec!["figma_export", "staging"]);
         assert!((cfg.criteria_timeout_s - 45.0).abs() < f64::EPSILON);
         assert_eq!(cfg.runtime_error_patterns, vec!["ECONNREFUSED", "Traceback"]);
-        // log_command / endpoint_criterion sono risolti per-progetto a monte: non
-        // ancora portati al config DB, restano vuoto/None. build_command INVECE e'
-        // ora letto dal DB col criterio build (mig 0465): vedi assert sopra. Il
-        // vecchio assert build_command.is_none() era un residuo pre-0465 rimasto
-        // contraddittorio nel cutover (mai eseguito a freddo finora).
+        // log_command / endpoint_criterion sono risolti per-progetto a monte:
+        // restano vuoto/None dal loader. La catena comandi (ADR 0036) NON e'
+        // del loader: verify_steps/verify_profile_missing sono innestati da
+        // run_engine col profilo per-ambiente (nessun build_command generico,
+        // mig 0508).
         assert!(cfg.log_command.is_empty());
         assert!(cfg.endpoint_criterion.is_none());
+        assert!(cfg.verify_steps.is_empty(), "loader non popola la catena");
+        assert!(!cfg.verify_profile_missing);
     }
 }
