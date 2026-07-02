@@ -119,6 +119,11 @@ impl FinalGateCriteriaRunnerAdapter {
         let (passed, mut evidence) = match c.criterion_type.as_str() {
             "run_command" => self.check_run_command(&c.spec, &c.expected, mode, timeout_s).await,
             "design_verify" => Self::check_design_verify(&c.spec),
+            // Criteri STRUTTURALI (ADR 0018 leva 3): PURI, i fatti sono gia'
+            // nella spec (estratti dallo stato in FinalGateNode::build_criteria).
+            "action_requested" => Self::check_action_requested(&c.spec),
+            "tool_capability" => Self::check_tool_capability(&c.spec),
+            "completion_confirmed" => Self::check_completion_confirmed(&c.spec),
             "service_logs_clean" => {
                 self.check_service_logs_clean(&c.spec, mode, timeout_s).await
             }
@@ -166,6 +171,65 @@ al figma ed esegui di nuovo nexus_visual_compare finche similarity_score >= {min
             )
         };
         (passed, json!({ "similarity_score": score, "min_score": min, "verdict": verdict }))
+    }
+
+    // ── Criteri STRUTTURALI (ADR 0018 leva 3): puri, fatti nella spec ────────
+
+    /// action_requested: una richiesta d'AZIONE chiusa senza alcuna azione
+    /// produttiva in history non passa. Non-action-oriented -> passa sempre.
+    fn check_action_requested(spec: &Value) -> (bool, Value) {
+        let action_oriented = spec
+            .get("action_oriented")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let acted = spec
+            .get("has_productive_action")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let passed = !action_oriented || acted;
+        let verdict = if passed {
+            "nessuna azione richiesta o azione produttiva presente".to_string()
+        } else {
+            "richiesta d'azione chiusa SENZA alcuna azione produttiva: esegui \
+il lavoro con i tool prima di chiudere"
+                .to_string()
+        };
+        (
+            passed,
+            json!({ "action_oriented": action_oriented, "has_productive_action": acted, "verdict": verdict }),
+        )
+    }
+
+    /// tool_capability: un task software con ZERO tool esposti e' una
+    /// misconfigurazione del catalogo/whitelist (non colpa del task).
+    fn check_tool_capability(spec: &Value) -> (bool, Value) {
+        let tools_count = spec.get("tools_count").and_then(Value::as_i64).unwrap_or(0);
+        let passed = tools_count > 0;
+        let verdict = if passed {
+            format!("{tools_count} tool esposti al modello")
+        } else {
+            "ZERO tool esposti su un task software: misconfigurazione modello/\
+whitelist (verificare supports_tool_use e le whitelist agent.tools.*)"
+                .to_string()
+        };
+        (passed, json!({ "tools_count": tools_count, "verdict": verdict }))
+    }
+
+    /// completion_confirmed: la chiusura va CONFERMATA da una dichiarazione
+    /// strutturata task_complete (ADR 0034). Qualunque outcome onesto passa.
+    fn check_completion_confirmed(spec: &Value) -> (bool, Value) {
+        let declared = spec
+            .get("declared_outcome")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty());
+        let passed = declared.is_some();
+        let verdict = match declared {
+            Some(o) => format!("esito dichiarato: {o}"),
+            None => "nessuna dichiarazione strutturata: chiudi con il tool \
+task_complete (outcome + summary)"
+                .to_string(),
+        };
+        (passed, json!({ "declared_outcome": declared, "verdict": verdict }))
     }
 
     async fn check_run_command(
@@ -924,5 +988,60 @@ mod tests {
         assert_eq!(truncate_chars("abcdef", 3), "abc");
         // caratteri multibyte: taglio per char, non per byte.
         assert_eq!(truncate_chars("àèìòù", 2), "àè");
+    }
+
+    // ── criteri strutturali (ADR 0018 leva 3): tabella pass/fail ─────────────
+
+    #[test]
+    fn check_action_requested_tabella() {
+        use serde_json::json;
+        // (action_oriented, has_productive_action) -> passed
+        let cases = [
+            (false, false, true), // nessuna azione richiesta -> passa
+            (false, true, true),
+            (true, true, true),   // azione richiesta ED eseguita -> passa
+            (true, false, false), // azione richiesta MAI eseguita -> fallisce
+        ];
+        for (ao, acted, want) in cases {
+            let (passed, ev) = FinalGateCriteriaRunnerAdapter::check_action_requested(&json!({
+                "action_oriented": ao, "has_productive_action": acted,
+            }));
+            assert_eq!(passed, want, "ao={ao} acted={acted}");
+            assert!(ev.get("verdict").is_some());
+        }
+        // Fatti assenti -> default conservativo (non action_oriented): passa.
+        let (passed, _) = FinalGateCriteriaRunnerAdapter::check_action_requested(&json!({}));
+        assert!(passed);
+    }
+
+    #[test]
+    fn check_tool_capability_tabella() {
+        use serde_json::json;
+        let (ok, _) = FinalGateCriteriaRunnerAdapter::check_tool_capability(&json!({"tools_count": 12}));
+        assert!(ok);
+        let (ko, ev) = FinalGateCriteriaRunnerAdapter::check_tool_capability(&json!({"tools_count": 0}));
+        assert!(!ko);
+        assert!(ev["verdict"].as_str().unwrap().contains("misconfigurazione"));
+        // Fatto assente -> 0 -> fallisce (fail-closed: e' il gate a decidere).
+        let (ko2, _) = FinalGateCriteriaRunnerAdapter::check_tool_capability(&json!({}));
+        assert!(!ko2);
+    }
+
+    #[test]
+    fn check_completion_confirmed_tabella() {
+        use serde_json::json;
+        // Qualunque outcome DICHIARATO passa (anche blocked: e' onesto).
+        for o in ["done", "blocked", "partial", "needs_input"] {
+            let (ok, _) = FinalGateCriteriaRunnerAdapter::check_completion_confirmed(
+                &json!({"declared_outcome": o}),
+            );
+            assert!(ok, "outcome {o} dichiarato deve passare");
+        }
+        // Assente o vuoto -> fallisce con invito a task_complete.
+        for spec in [json!({}), json!({"declared_outcome": null}), json!({"declared_outcome": "  "})] {
+            let (ko, ev) = FinalGateCriteriaRunnerAdapter::check_completion_confirmed(&spec);
+            assert!(!ko, "spec {spec} deve fallire");
+            assert!(ev["verdict"].as_str().unwrap().contains("task_complete"));
+        }
     }
 }

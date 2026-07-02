@@ -171,6 +171,10 @@ pub struct FinalGateConfig {
     /// P5: soglia minima di similarity_score (0-100) per chiudere un task figma
     /// (agent.final_gate.design_verify_min_score, default 70).
     pub design_verify_min_score: i64,
+    /// ADR 0018 leva 3: criteri STRUTTURALI `action_requested` /
+    /// `tool_capability` / `completion_confirmed`
+    /// (`agent.final_gate.structural_criteria_enabled`, default true, mig 0503).
+    pub structural_criteria_enabled: bool,
 }
 
 impl Default for FinalGateConfig {
@@ -194,6 +198,7 @@ impl Default for FinalGateConfig {
             endpoint_criterion: None,
             design_verify_enabled: true,
             design_verify_min_score: 70,
+            structural_criteria_enabled: true,
         }
     }
 }
@@ -386,6 +391,56 @@ impl FinalGateNode {
                     timeout_s: None,
                 });
             }
+        }
+
+        // (7) Criteri STRUTTURALI (ADR 0018 leva 3): i FATTI macchina vengono
+        //     dallo stato QUI (come design_verify), i check restano PURI nel
+        //     criteria_runner (regola M: mai dedotti dalla prosa). Kill-switch
+        //     DB-driven `agent.final_gate.structural_criteria_enabled` (mig 0503).
+        if self.cfg.structural_criteria_enabled {
+            let action_oriented = state.action_oriented.unwrap_or(false);
+            // action_requested: una richiesta d'azione chiusa senza NESSUNA
+            // azione produttiva in history non puo' passare il gate.
+            criteria.push(CriterionSpec {
+                criterion_type: "action_requested".to_string(),
+                spec: json!({
+                    "action_oriented": action_oriented,
+                    "has_productive_action":
+                        signals::has_productive_action_in_history(&state.messages),
+                }),
+                expected: json!({ "acted": true }),
+                timeout_s: None,
+            });
+            // tool_capability: un task software con ZERO tool esposti e' una
+            // misconfigurazione (catalogo/whitelist), non colpa del task.
+            let tools_count = state
+                .tools_json
+                .as_ref()
+                .map(|t| t.len())
+                .unwrap_or(0);
+            criteria.push(CriterionSpec {
+                criterion_type: "tool_capability".to_string(),
+                spec: json!({
+                    "tools_count": tools_count,
+                    "action_oriented": action_oriented,
+                }),
+                expected: json!({ "capable": true }),
+                timeout_s: None,
+            });
+            // completion_confirmed: la chiusura di un task software va
+            // CONFERMATA da una dichiarazione strutturata (task_complete,
+            // ADR 0034) — qualunque outcome onesto passa, l'assenza no.
+            let declared = state
+                .declared_outcome
+                .as_ref()
+                .and_then(|v| v.get("outcome"))
+                .and_then(Value::as_str);
+            criteria.push(CriterionSpec {
+                criterion_type: "completion_confirmed".to_string(),
+                spec: json!({ "declared_outcome": declared }),
+                expected: json!({ "confirmed": true }),
+                timeout_s: None,
+            });
         }
 
         criteria
@@ -898,10 +953,17 @@ mod tests {
 
     #[test]
     fn build_criteria_ordine_e_opzionali() {
+        // Questo test fissa l'ORDINE storico dei criteri 1-6: i criteri
+        // strutturali (ADR 0018 leva 3, blocco 7) sono spenti qui e coperti
+        // dal test dedicato build_criteria_strutturali.
+        let base_cfg = FinalGateConfig {
+            structural_criteria_enabled: false,
+            ..Default::default()
+        };
         // Senza build_command e con runtime_check ON ma log_command vuoto:
         // solo no_orphan + outputs_exist.
         let node = node_with(
-            FinalGateConfig::default(),
+            base_cfg.clone(),
             Arc::new(StubCriteriaRunner::with_results(vec![])),
         );
         let st = software_state();
@@ -914,7 +976,7 @@ mod tests {
             log_command: "docker compose logs".to_string(),
             build_command: Some("pnpm build".to_string()),
             build_working_dir: Some("app".to_string()),
-            ..Default::default()
+            ..base_cfg.clone()
         };
         let node2 = node_with(cfg, Arc::new(StubCriteriaRunner::with_results(vec![])));
         let crits2 = node2.build_criteria(&st);
@@ -950,7 +1012,7 @@ mod tests {
             build_command: Some("pnpm build".to_string()),
             build_working_dir: Some("app".to_string()),
             endpoint_criterion: Some(endpoint.clone()),
-            ..Default::default()
+            ..base_cfg.clone()
         };
         let node3 = node_with(cfg3, Arc::new(StubCriteriaRunner::with_results(vec![])));
         let crits3 = node3.build_criteria(&st);
@@ -971,12 +1033,81 @@ mod tests {
         // Endpoint risolto SENZA build/log: comunque accodato dopo i 2 sempre-on.
         let cfg4 = FinalGateConfig {
             endpoint_criterion: Some(endpoint.clone()),
-            ..Default::default()
+            ..base_cfg.clone()
         };
         let node4 = node_with(cfg4, Arc::new(StubCriteriaRunner::with_results(vec![])));
         let crits4 = node4.build_criteria(&st);
         let types4: Vec<&str> = crits4.iter().map(|c| c.criterion_type.as_str()).collect();
         assert_eq!(types4, vec!["no_orphan_imported", "outputs_exist", "http"]);
+    }
+
+    // ── criteri strutturali (ADR 0018 leva 3) ─────────────────────────────────────
+
+    #[test]
+    fn build_criteria_strutturali() {
+        // Col flag ON (default) i 3 criteri strutturali sono accodati in coda
+        // coi FATTI estratti dallo stato: action_oriented, azione produttiva in
+        // history, tools_count, declared_outcome.
+        let node = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![])),
+        );
+        let mut st = software_state();
+        st.action_oriented = Some(true);
+        st.tools_json = Some(vec![json!({"name": "write_file"})]);
+        st.declared_outcome = Some(json!({"outcome": "done", "summary": "fatto"}));
+        let crits = node.build_criteria(&st);
+        let types: Vec<&str> = crits.iter().map(|c| c.criterion_type.as_str()).collect();
+        assert!(types.contains(&"action_requested"));
+        assert!(types.contains(&"tool_capability"));
+        assert!(types.contains(&"completion_confirmed"));
+
+        let ar = crits
+            .iter()
+            .find(|c| c.criterion_type == "action_requested")
+            .expect("action_requested");
+        assert_eq!(ar.spec["action_oriented"], json!(true));
+        assert_eq!(ar.expected, json!({ "acted": true }));
+
+        let tc = crits
+            .iter()
+            .find(|c| c.criterion_type == "tool_capability")
+            .expect("tool_capability");
+        assert_eq!(tc.spec["tools_count"], json!(1));
+
+        let cc = crits
+            .iter()
+            .find(|c| c.criterion_type == "completion_confirmed")
+            .expect("completion_confirmed");
+        assert_eq!(cc.spec["declared_outcome"], json!("done"));
+
+        // Stato senza dichiarazione: il fatto e' null (il check fallira' nel
+        // runner con l'invito a chiudere con task_complete).
+        let mut st2 = software_state();
+        st2.declared_outcome = None;
+        let crits2 = node.build_criteria(&st2);
+        let cc2 = crits2
+            .iter()
+            .find(|c| c.criterion_type == "completion_confirmed")
+            .expect("completion_confirmed");
+        assert_eq!(cc2.spec["declared_outcome"], json!(null));
+
+        // Kill-switch OFF: nessun criterio strutturale.
+        let node_off = node_with(
+            FinalGateConfig {
+                structural_criteria_enabled: false,
+                ..Default::default()
+            },
+            Arc::new(StubCriteriaRunner::with_results(vec![])),
+        );
+        let types_off: Vec<String> = node_off
+            .build_criteria(&software_state())
+            .iter()
+            .map(|c| c.criterion_type.clone())
+            .collect();
+        assert!(!types_off.iter().any(|t| t == "action_requested"
+            || t == "tool_capability"
+            || t == "completion_confirmed"));
     }
 
     // ── count_build_errors ────────────────────────────────────────────────────────
