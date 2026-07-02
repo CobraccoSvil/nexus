@@ -18,6 +18,7 @@ dependencies = [
  "dotenvy",
  "nexus-auth",
  "nexus-http",
+ "nexus-project-pools",
  "nexus-types",
  "regex",
  "serde",
@@ -269,6 +270,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "nexus-auth",
+ "nexus-project-pools",
  "serde",
  "serde_json",
  "sqlx",
@@ -2446,6 +2448,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-project-pools"
+version = "0.1.0"
+dependencies = [
+ "nexus-auth",
+ "nexus-cache",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "nexus-sudo-runner"
 version = "0.1.0"
 dependencies = [
@@ -2467,6 +2482,7 @@ dependencies = [
  "mcp-quality",
  "nexus-events",
  "nexus-project-db",
+ "nexus-project-pools",
  "rand 0.8.5",
  "regex",
  "reqwest",

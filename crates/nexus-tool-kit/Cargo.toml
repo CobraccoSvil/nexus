@@ -12,6 +12,7 @@ mcp-ast = { path = "../mcp-ast" }
 mcp-quality = { path = "../mcp-quality" }
 nexus-events = { path = "../nexus-events" }
 nexus-project-db = { path = "../nexus-project-db" }
+nexus-project-pools = { path = "../nexus-project-pools" }
 rand = "0.8"
 regex.workspace = true
 reqwest.workspace = true

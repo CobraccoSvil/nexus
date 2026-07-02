@@ -287,8 +287,13 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
     // Solo per kind="service": i tool agente short-lived non contano contro
     // la quota container del progetto.
     if kind == "service" {
+        // Separazione DB: agent_processes (conteggi container/RAM) vive nel DB
+        // del progetto; le quote restano nel meta. Punto unico project_db_routes.
+        let run_pool =
+            crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await;
         if let Err(reason) =
-            crate::security::quotas::check_can_start_container(&ctx.db, ctx.project_id).await
+            crate::security::quotas::check_can_start_container(&ctx.db, &run_pool, ctx.project_id)
+                .await
         {
             crate::security::record_audit(
                 crate::security::AuditEntry::blocked(
@@ -308,7 +313,8 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             .enabled
         {
             if let Err(reason) =
-                crate::security::quotas::check_can_use_memory(&ctx.db, ctx.project_id).await
+                crate::security::quotas::check_can_use_memory(&ctx.db, &run_pool, ctx.project_id)
+                    .await
             {
                 crate::security::record_audit(
                     crate::security::AuditEntry::blocked(
