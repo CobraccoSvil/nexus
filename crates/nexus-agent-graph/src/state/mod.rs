@@ -154,6 +154,13 @@ pub struct AgentState {
     pub intent_hint: Option<String>,
     /// Punto unico: il turno corrente richiede azione con tool?
     pub action_oriented: Option<bool>,
+    /// Punto unico: il turno e' di sola lettura/verifica (nessuna modifica
+    /// autorizzata)? Derivato FEDELE dal classifier (`derive_report_only`,
+    /// `authorizes_changes=false`). Distinto da `action_oriented`: un listing
+    /// richiede tool (action=true) ma NON autorizza modifiche (report=true).
+    /// I guard che spingono verso tool "produttivi" (strip dei read-only)
+    /// devono restare inerti quando e' `Some(true)`.
+    pub report_only: Option<bool>,
 
     // ── Esito dichiarato / governance chiusura ───────────────────────────────
     /// Esito dichiarato dal modello via tool task_complete.

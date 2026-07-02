@@ -254,6 +254,14 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
     let mut rows = Vec::new();
     for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
         let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
+        // kind <> 'service' (fix strutturale, 2026-07-02): un SERVIZIO fermato e'
+        // un crash/restart gia' osservato da service_observer / run-panel, NON un
+        // batch concluso da riferire. Senza questo filtro ogni risveglio che
+        // riavviava i servizi generava nuovi stopped -> nuovi risvegli: catena
+        // auto-alimentata che monopolizzava la sessione (i messaggi utente
+        // accodati aspettavano decine di minuti). Il filtro lessicale
+        // is_long_running_service resta come difesa per i dev server lanciati
+        // via run_command (kind batch ma comando long-running).
         let project_rows = sqlx::query(
             "SELECT id, project_id, session_id, label, command, status, exit_code, output, error_output \
                FROM agent_processes \
@@ -261,6 +269,7 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
                 AND session_id IS NOT NULL \
                 AND resume_dispatched_at IS NULL \
                 AND stopped_at > NOW() - INTERVAL '1 hour' \
+                AND kind <> 'service' \
               ORDER BY stopped_at ASC \
               LIMIT 5",
         )

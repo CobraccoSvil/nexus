@@ -117,6 +117,9 @@ pub struct StateDelta {
     /// Vedi `AgentState::action_oriented`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub action_oriented: Option<Option<bool>>,
+    /// Vedi `AgentState::report_only`.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub report_only: Option<Option<bool>>,
 
     // ── Esito dichiarato / governance chiusura ───────────────────────────────
     /// Vedi `AgentState::declared_outcome`.

@@ -1104,13 +1104,14 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
             (None, None)
         };
 
-    // report_only FEDELE (porting `__init__.py:736-739`). Lo stato del grafo Rust
-    // non ha (ancora) un campo `report_only` consumato dai nodi: lo deriviamo per
-    // PARITA' di telemetria/diagnosi e lo logghiamo. Il cablaggio nel grafo
-    // (rimozione tool di modifica in report_only) e' un passo separato. Vale per
-    // ENTRAMBI Shadow e Primary-Rust quando i dati del classifier sono presenti;
-    // nessun impatto sul primario Python.
-    if derive_from_classifier {
+    // report_only FEDELE (porting `__init__.py:736-739`), CABLATO nello stato del
+    // grafo: l'executor lo consuma per NON strippare i tool read-only sui turni
+    // di sola lettura (incidente 2026-07-02: "elenca i file" ha requires_tools=true
+    // -> action_oriented=true, ma authorizes_changes=false -> report_only=true; lo
+    // strip lasciava solo tool di scrittura e il run degenerava in edit-loop).
+    // Vale per ENTRAMBI Shadow e Primary-Rust quando i dati del classifier sono
+    // presenti; senza dati resta None (guard inerti solo su Some(true)).
+    let initial_report_only: Option<bool> = if derive_from_classifier {
         let report_only = crate::intent_classifier::derive_report_only(
             input.classifier_resolved,
             intent_hint,
@@ -1123,7 +1124,10 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
             action_oriented = ?initial_action_oriented,
             "native: derivazione fedele action_oriented/report_only dal classifier"
         );
-    }
+        Some(report_only)
+    } else {
+        None
+    };
 
     AgentState {
         messages,
@@ -1133,6 +1137,7 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         intent_hint: input.intent_hint.clone(),
         user_intent: initial_intent,
         action_oriented: initial_action_oriented,
+        report_only: initial_report_only,
         provider_override: Some(input.provider.clone()),
         model_override: Some(input.model.clone()),
         tools_json: tools,

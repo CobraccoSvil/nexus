@@ -1500,9 +1500,13 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
         // edit_file su un task di sola lettura (loop -> ABORT hollow, incidente
         // 2026-07-02 TEST E2E). La biforcazione per action_oriented e' la stessa
         // del progress_controller (regola L); qui si applica al punto di strip.
+        // `report_only == Some(true)` (classifier: nessuna modifica autorizzata)
+        // disattiva lo strip anche quando action_oriented=true: un listing
+        // richiede tool (action=true) ma resta di sola lettura (report=true).
         if !tools_json.is_empty()
             && (exploration_count >= exploration_threshold || force_action_hard)
             && turn_action_oriented(state.action_oriented)
+            && state.report_only != Some(true)
         {
             let productive: Vec<Value> = tools_json
                 .iter()
