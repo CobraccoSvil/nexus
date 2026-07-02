@@ -637,7 +637,10 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     tracing::info!(command = %command_str, root = %root.display(), "run_playwright_tests: avvio comando");
 
     // ── 7. Esegui con env BASE_URL ────────────────────────────────────────────
-    let mut child_builder = tokio::process::Command::new(crate::sandbox::agent_shell());
+    // isolated_command (punto unico, regola L): env_clear + host env filtrato —
+    // Playwright non eredita i segreti Nexus; BASE_URL/CI/LD_LIBRARY_PATH sono
+    // iniettate esplicitamente sotto, sopra l'env gia' pulito.
+    let mut child_builder = crate::sandbox::isolated_command(&crate::sandbox::agent_shell());
     child_builder
         .arg("-c")
         .arg(&command_str)
@@ -1342,14 +1345,14 @@ async fn run_test_command(
 ) -> String {
     use tokio::io::AsyncReadExt;
 
-    let mut child = match tokio::process::Command::new(crate::sandbox::agent_shell())
+    // L'isolamento env (env_clear + host env filtrato) e' dentro
+    // isolated_command, punto unico (regola L).
+    let mut child = match crate::sandbox::isolated_command(&crate::sandbox::agent_shell())
         .arg("-c")
         .arg(command)
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env_clear()
-        .envs(crate::sandbox::safe_env_for_direct_spawn())
         .spawn()
     {
         Ok(c) => c,
