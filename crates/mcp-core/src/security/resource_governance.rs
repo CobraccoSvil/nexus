@@ -124,6 +124,18 @@ pub async fn enforce_on_write(
     path: &str,
     content: &str,
 ) -> Option<String> {
+    // Placeholder di redazione copiati come valori (incidente Beaty-Book
+    // 2026-07-02): un `[REDACTED:...]` / `__NEXUS_..._N__` persistito in un
+    // file e' sempre un segnaposto, mai un valore. Punto unico:
+    // security::redaction_guard (regola L).
+    if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
+        ctx, tool_name, "content", content,
+    )
+    .await
+    {
+        return Some(msg);
+    }
+
     // Porte (ADR 0010): il sub-scanner contiene gia' il gate legacy
     // `agent.enforce_port_allocation` + audit. Le due regole del catalogo
     // (enforce_hardcode, require_allocation) sono valutate insieme: il

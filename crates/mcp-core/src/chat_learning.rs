@@ -1434,19 +1434,32 @@ pub async fn admin_list_prompt_corrections(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut rows = Vec::new();
+    // Query runtime (non macro compile-time): prompt_corrections e' migrata ai
+    // DB-progetto e la mig 0507 la rinomina nel meta (fail-fast), quindi la
+    // validazione compile-time di sqlx::query! contro il meta fallirebbe.
+    #[derive(sqlx::FromRow)]
+    struct PromptCorrectionRow {
+        id: Uuid,
+        project_id: Uuid,
+        intent: Option<String>,
+        correction_text: String,
+        qdrant_point_id: String,
+        active: bool,
+        status: String,
+        retrieved_count: i64,
+        created_at: chrono::DateTime<chrono::Utc>,
+    }
+    let mut rows: Vec<PromptCorrectionRow> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
         let pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
-        let batch = sqlx::query!(
-            r#"
-            SELECT id, project_id, intent, correction_text, qdrant_point_id,
-                   active, status, retrieved_count, created_at
-            FROM prompt_corrections
-            WHERE deleted_at IS NULL
-            ORDER BY created_at DESC
-            LIMIT 100
-            "#
+        let batch = sqlx::query_as::<_, PromptCorrectionRow>(
+            "SELECT id, project_id, intent, correction_text, qdrant_point_id, \
+                    active, status, retrieved_count, created_at \
+             FROM prompt_corrections \
+             WHERE deleted_at IS NULL \
+             ORDER BY created_at DESC \
+             LIMIT 100",
         )
         .fetch_all(&pool)
         .await
