@@ -745,11 +745,14 @@ async fn project_data_pool_by_entity_from(
 }
 
 /// Pool del progetto risolto dal `session_id` (directory di routing).
+/// Self-healing come [`project_data_pool_by_session`]: sessione non mappata ->
+/// ricerca nei DB-progetto + auto-registrazione, MAI fallback silenzioso al
+/// meta (a flag ON le tabelle chat sono vuote e la sessione "sparisce").
 pub async fn project_data_pool_by_session_from(
     meta: &sqlx::PgPool,
     session_id: Uuid,
 ) -> sqlx::PgPool {
-    project_data_pool_by_entity_from(meta, "session", session_id).await
+    project_data_pool_by_search_from(meta, "session", "chat_sessions", session_id).await
 }
 
 /// Elenco dei `project_id` (tabella globale `projects`, meta-DB). Serve al
