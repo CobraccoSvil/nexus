@@ -16,6 +16,11 @@ pub(crate) struct ChatMessageView {
     pub(crate) intent: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) prompt_tokens: Option<i64>,
+    /// Prompt token dell'ULTIMA chiamata LLM del run (riempimento contesto).
+    /// `prompt_tokens` nel path agentico e' il CUMULATIVO delle iterazioni
+    /// (billing): il context ratio della UI deve usare SOLO questo campo.
+    /// None per i messaggi persistiti prima della sua introduzione.
+    pub(crate) last_prompt_tokens: Option<i64>,
     pub(crate) completion_tokens: Option<i64>,
     pub(crate) total_tokens: Option<i64>,
     pub(crate) total_cost: Option<f64>,
@@ -87,6 +92,7 @@ pub(crate) fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessage
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         prompt_tokens: metadata.get("promptTokens").and_then(Value::as_i64),
+        last_prompt_tokens: metadata.get("lastPromptTokens").and_then(Value::as_i64),
         completion_tokens: metadata.get("completionTokens").and_then(Value::as_i64),
         total_tokens: metadata.get("totalTokens").and_then(Value::as_i64),
         total_cost: metadata.get("totalCost").and_then(Value::as_f64),

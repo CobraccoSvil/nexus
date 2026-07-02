@@ -10,7 +10,8 @@ import {
 import { useChat } from "../lib/use-chat";
 import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, indexAttachmentsToKb, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig, type SimilarHit } from "../lib/api-client";
 import { SimilarRequestBanner } from "./knowledge/similar-request-banner";
-import { fallbackContextWindow } from "../lib/context-window";
+import { computeContextFill } from "../lib/context-fill";
+import { isStatusTerminal } from "../lib/use-chat/helpers";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { useGlobalDialog } from "./global-dialog-provider";
@@ -199,6 +200,11 @@ export function ChatPanel({
     send, resend, remove, feedbackError, feedbackPositive, positiveFeedback,
     confirmAgent, cancelRun,
   } = useChat(projectId, profileId, { sessionId });
+  // Run realmente in esecuzione: agentRuns conserva i run terminati per ~30s
+  // (grace per i pannelli step), quindi la size grezza non indica parallelismo.
+  const activeParallelRuns = [...agentRuns.values()].filter(
+    (r) => !isStatusTerminal(r.status),
+  ).length;
   const prevAgentActiveRef = useRef(false);
   useEffect(() => {
     const isActive = agentRun?.status === "running";
@@ -210,39 +216,20 @@ export function ChatPanel({
 
   // Notifica al parent (ide-shell) il ratio % di riempimento context_window
   // dell'ultimo turno: usato per mostrare il valore sul bottone "Compatta chat".
-  // Calcoliamo gli stessi input di TokenUsageBar (vedi piu' sotto nel JSX).
+  // Punto unico computeContextFill, lo stesso della TokenUsageBar (regola L).
   useEffect(() => {
     if (!onCtxRatioChange) return;
-    const lastAssistantWithTokens = [...messages]
-      .reverse()
-      .find(
-        (m) =>
-          m.role === "assistant" &&
-          !m.deletedAt &&
-          (m.promptTokens ?? 0) > 0,
-      );
-    const activeModel =
-      agentRun?.model ||
-      lastAssistantWithTokens?.model ||
-      (selectedModel !== "auto" ? selectedModel : null);
-    const catalogEntry = activeModel
-      ? modelCatalog.find((m) => m.model === activeModel)
-      : null;
-    const ctxWindow =
-      catalogEntry?.contextWindow ?? fallbackContextWindow(activeModel);
-    const lastInputTokens =
-      agentRun?.usage?.totalPromptTokens ??
-      lastAssistantWithTokens?.promptTokens ??
-      null;
-    const ratio =
-      ctxWindow && ctxWindow > 0 && lastInputTokens && lastInputTokens > 0
-        ? lastInputTokens / ctxWindow
-        : null;
-    onCtxRatioChange(ratio);
+    onCtxRatioChange(
+      computeContextFill(messages, agentRun ?? null, selectedModel, modelCatalog).ratio,
+    );
+    // Trigger volutamente su model + usage.lastPromptTokens: sono le SOLE
+    // proprieta' di agentRun lette da computeContextFill. L'oggetto intero
+    // muta a ogni step del run e rilancerebbe l'effect senza cambiare il ratio.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     messages,
     agentRun?.model,
-    agentRun?.usage?.totalPromptTokens,
+    agentRun?.usage?.lastPromptTokens,
     selectedModel,
     modelCatalog,
     onCtxRatioChange,
@@ -1004,8 +991,11 @@ export function ChatPanel({
           </div>
         )}
 
-        {/* Parallel agents indicator */}
-        {agentRuns.size > 1 && (
+        {/* Parallel agents indicator: conta SOLO i run non terminali. agentRuns
+            tiene i run conclusi per ~30s (grace per i pannelli step), quindi
+            size includerebbe anche i terminati e sui run accodati apparirebbe
+            un transitorio "2 agenti in esecuzione parallela" fasullo. */}
+        {activeParallelRuns > 1 && (
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
             <div
               style={{
@@ -1023,7 +1013,7 @@ export function ChatPanel({
               }}
             >
               <span>⚡</span>
-              <span>{agentRuns.size} agenti in esecuzione parallela</span>
+              <span>{activeParallelRuns} agenti in esecuzione parallela</span>
               <span
                 style={{
                   width: 7,
@@ -1325,38 +1315,23 @@ export function ChatPanel({
 
       {/* Token usage bar */}
       {(() => {
-        // Ultimo messaggio assistant ATTIVO con metriche. Esclude i soft-deleted
-        // perche' dopo un compact i vecchi assistant restano nel DB con
-        // deletedAt valorizzato — se li contassimo, la TokenUsageBar resterebbe
-        // bloccata sulla %ctx del messaggio gigante pre-compact.
-        const lastAssistantWithTokens = [...messages]
-          .reverse()
-          .find(
-            (m) =>
-              m.role === "assistant" &&
-              !m.deletedAt &&
-              (m.promptTokens ?? 0) > 0,
-          );
-        const activeModel =
-          agentRun?.model ||
-          lastAssistantWithTokens?.model ||
-          (selectedModel !== "auto" ? selectedModel : null);
-        const catalogEntry = activeModel
-          ? modelCatalog.find((m) => m.model === activeModel)
-          : null;
-        const ctxWindow =
-          catalogEntry?.contextWindow ?? fallbackContextWindow(activeModel);
-        const lastInputTokens =
-          agentRun?.usage?.totalPromptTokens ??
-          lastAssistantWithTokens?.promptTokens ??
-          null;
+        // Riempimento contesto dal punto unico computeContextFill (regola L):
+        // numeratore = prompt dell'ULTIMA chiamata LLM (lastPromptTokens), mai
+        // il promptTokens cumulativo di billing del run (causa del bug
+        // "5046% ctx" post-compact).
+        const fill = computeContextFill(
+          messages,
+          agentRun ?? null,
+          selectedModel,
+          modelCatalog,
+        );
         return (
           <TokenUsageBar
             totalTokens={tokenUsage.totalTokens}
             totalCostUsd={tokenUsage.totalCostUsd}
-            contextWindow={ctxWindow}
-            lastInputTokens={lastInputTokens}
-            modelLabel={activeModel}
+            contextWindow={fill.ctxWindow}
+            lastInputTokens={fill.lastInputTokens}
+            modelLabel={fill.activeModel}
           />
         );
       })()}

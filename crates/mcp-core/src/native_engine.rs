@@ -310,11 +310,15 @@ pub struct NativeRunOutcome {
     pub resume_at: Option<String>,
     /// Numero di iterazioni dell'executor (campo `iterations` dello stato finale).
     pub iterations: i64,
-    /// Token di prompt cumulativi (per il billing/usage in agent_runs).
+    /// Token di prompt dell'ULTIMA iterazione: lo stato del grafo e' last-write
+    /// per-turno (reducer overwrite in executor.rs), NON cumulativo. Il valore
+    /// cumulativo per il billing viene riconciliato a valle dal ledger
+    /// (`reconcile_run_cost_from_ledger`). Questo valore alimenta
+    /// `last_prompt_tokens` (context ratio della UI).
     pub prompt_tokens: i64,
-    /// Token di completion cumulativi.
+    /// Token di completion dell'ultima iterazione (stesso reducer last-write).
     pub completion_tokens: i64,
-    /// Token totali cumulativi.
+    /// Token totali dell'ultima iterazione (stesso reducer last-write).
     pub total_tokens: i64,
     /// Costo totale stimato in USD (0.0 se non calcolato a monte).
     pub total_cost: f64,
