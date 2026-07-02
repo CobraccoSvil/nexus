@@ -117,7 +117,11 @@ pub(crate) async fn maybe_trigger_debugger(
     // firma diversa, quindi il cooldown-per-firma non frena). Si lascia finire il
     // run attivo; al prossimo crash, se il servizio e' ancora giu', si potra'
     // ri-triggerare quando la sessione e' di nuovo libera.
-    if session_has_active_run(&state.db, session).await {
+    //
+    // POOL DEL PROGETTO, non meta: agent_runs e' tabella migrata per-progetto
+    // (separazione DB). Sul meta la tabella e' vuota a flag ON -> il guard non
+    // scattava mai (stesso gap di process_resume, fix 2026-07-02).
+    if session_has_active_run(&proj_pool, session).await {
         tracing::debug!(
             "service_observer: run gia' attivo sulla sessione {}, skip auto-debug per {} ({})",
             session,

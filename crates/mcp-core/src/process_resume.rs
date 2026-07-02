@@ -336,7 +336,13 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
         // entro la finestra stopped_at < 1h (clausola della SELECT sopra). Cosi'
         // l'esito del comando viene comunque consegnato, ma senza interrompere il
         // lavoro in corso ne' innescare il loop di run che si superano a vicenda.
-        if session_has_active_run(&state.db, session_id).await {
+        //
+        // POOL DEL PROGETTO, non meta: agent_runs e' tabella migrata per-progetto
+        // (separazione DB). Interrogare il meta faceva sempre rispondere "nessun
+        // run attivo" (tabella vuota a flag ON) -> il guard non scattava mai e il
+        // resume uccideva il run che aveva lanciato il comando (incidente
+        // 2026-07-02: turno agentico soppiantato dal proprio avvio servizio).
+        if session_has_active_run(&proj_pool, session_id).await {
             tracing::debug!(
                 "process_resume: run attivo sulla sessione {}, rimando il resume del processo {} (label='{}')",
                 session_id,
