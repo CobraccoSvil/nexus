@@ -48,6 +48,9 @@ use crate::nexus_gateway::{
 pub struct GatewayLlmAdapter {
     /// Client del gateway LLM concreto a cui la `complete` delega.
     gateway: NexusGatewayClient,
+    /// Pool del meta-DB per la risoluzione purpose->modello (`nexus_purpose_model`)
+    /// delle chiamate ausiliarie che arrivano con `model` vuoto (regola G).
+    db: sqlx::PgPool,
     /// Project id (UUID stringa) del run -> `GwMetadata.tenant_id`. Senza, il
     /// gateway NON registra l'usage nel ledger (record_usage_to_ledger esce se
     /// tenant_id e' vuoto): era la causa del "costo sempre a 0" post-cutover.
@@ -57,20 +60,68 @@ pub struct GatewayLlmAdapter {
 }
 
 impl GatewayLlmAdapter {
-    /// Costruisce l'adapter sul client gateway concreto con l'identita' del run
-    /// (project_id/user_id) necessaria al ledger di billing.
-    pub fn new(gateway: NexusGatewayClient, project_id: String, user_id: String) -> Self {
+    /// Costruisce l'adapter sul client gateway concreto con il meta-DB (purpose
+    /// resolver) e l'identita' del run (project_id/user_id) per il ledger billing.
+    pub fn new(
+        gateway: NexusGatewayClient,
+        db: sqlx::PgPool,
+        project_id: String,
+        user_id: String,
+    ) -> Self {
         Self {
             gateway,
+            db,
             project_id,
             user_id,
         }
     }
 }
 
+/// Se la richiesta arriva con `model` vuoto, ritorna il purpose da risolvere via
+/// `nexus_purpose_model`; errore chiaro se manca anche il purpose. I nodi
+/// ausiliari del grafo (es. clarify_or_expand) inviano deliberatamente
+/// provider/model vuoti + `purpose` contando su questa risoluzione (regola G:
+/// modello dal DB, mai hardcoded). Prima di questo guard la richiesta vuota
+/// arrivava al gateway as-is e la cascata falliva su TUTTI i provider con
+/// 400/404 fuorvianti ("you must provide a model parameter", incidente
+/// 2026-07-02). MAI inoltrare un modello vuoto.
+fn purpose_for_empty_model(req: &LlmRequest) -> Result<Option<String>, PortError> {
+    if !req.model.trim().is_empty() {
+        return Ok(None);
+    }
+    match req.purpose.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => Ok(Some(p.to_string())),
+        None => Err(PortError::Llm(
+            "richiesta LLM senza modello ne' purpose: il chiamante deve risolvere \
+             provider/modello a monte (routing matrix) o indicare un purpose \
+             (nexus_purpose_model, regola G)"
+                .to_string(),
+        )),
+    }
+}
+
 #[async_trait]
 impl LlmGateway for GatewayLlmAdapter {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
+        let mut req = req;
+        if let Some(purpose) = purpose_for_empty_model(&req)? {
+            // Punto unico della risoluzione purpose->(provider, model): regola L,
+            // `into_model` mappa gli esiti non risolvibili in errore leggibile
+            // (niente fallback hardcoded, regola G).
+            let (provider, model) =
+                crate::internal_routing::resolve_purpose_model_db(&self.db, &purpose)
+                    .await
+                    .into_model(&purpose)
+                    .map_err(PortError::Llm)?;
+            tracing::debug!(
+                purpose = %purpose,
+                provider = %provider,
+                model = %model,
+                "llm adapter: modello risolto dal purpose (richiesta ausiliaria)"
+            );
+            req.provider = provider;
+            req.model = model;
+        }
         let mut gw_req = build_gw_request(&req);
         // Identita' del run per il ledger di billing. `build_gw_request` e' una fn
         // pura (testata) che lascia tenant_id/user_id vuoti; li popoliamo qui dal
@@ -692,6 +743,55 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    // ── purpose_for_empty_model: guard sul modello vuoto (regola G) ───────────
+
+    #[test]
+    fn modello_valorizzato_non_tocca_il_purpose() {
+        // Path executor: provider/model gia' risolti a monte -> nessuna risoluzione.
+        let req = base_req();
+        assert!(matches!(purpose_for_empty_model(&req), Ok(None)));
+    }
+
+    #[test]
+    fn modello_vuoto_con_purpose_richiede_risoluzione() {
+        // Path ausiliario (clarify_expand): model vuoto + purpose -> da risolvere.
+        let req = LlmRequest {
+            provider: String::new(),
+            model: String::new(),
+            purpose: Some("clarify_expand".to_string()),
+            ..base_req()
+        };
+        assert_eq!(
+            purpose_for_empty_model(&req).unwrap(),
+            Some("clarify_expand".to_string())
+        );
+    }
+
+    #[test]
+    fn modello_vuoto_senza_purpose_e_errore_chiaro() {
+        // MAI inoltrare un modello vuoto al gateway: prima del guard la cascata
+        // falliva su tutti i provider con 400 fuorvianti (incidente 2026-07-02).
+        let req = LlmRequest {
+            provider: String::new(),
+            model: "  ".to_string(),
+            purpose: None,
+            ..base_req()
+        };
+        let err = purpose_for_empty_model(&req).unwrap_err();
+        assert!(matches!(err, PortError::Llm(_)));
+        assert!(err.to_string().contains("senza modello ne' purpose"));
+    }
+
+    #[test]
+    fn purpose_solo_spazi_equivale_ad_assente() {
+        let req = LlmRequest {
+            model: String::new(),
+            purpose: Some("   ".to_string()),
+            ..base_req()
+        };
+        assert!(purpose_for_empty_model(&req).is_err());
     }
 
     // ── classify_gateway_error: segnale strutturato cooldown/provider ─────────

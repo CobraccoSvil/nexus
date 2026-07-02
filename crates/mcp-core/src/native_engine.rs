@@ -785,6 +785,7 @@ async fn build_native_engine(
             .unwrap_or_default();
             Arc::new(GatewayLlmAdapter::new(
                 deps.gateway.clone(),
+                deps.db.clone(),
                 proj_id,
                 usr_id,
             ))
@@ -2087,11 +2088,16 @@ mod tests {
         let _ = known; // la repr e' coperta dai test dello stato; qui basta no-panic
     }
 
-    #[test]
-    fn gateway_client_costruibile() {
+    #[tokio::test]
+    async fn gateway_client_costruibile() {
         // Sanity: il client gateway e' costruibile (l'adapter lo avvolge senza I/O).
         let gw = NexusGatewayClient::new("http://127.0.0.1:1".to_string(), "tok".to_string());
-        let _adapter = GatewayLlmAdapter::new(gw, String::new(), String::new());
+        // Pool lazy: nessuna connessione al DB, ma la costruzione del pool sqlx
+        // spawna un task di manutenzione -> serve il runtime tokio del test.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nexus@localhost:1/na")
+            .expect("connect_lazy non fa I/O");
+        let _adapter = GatewayLlmAdapter::new(gw, pool, String::new(), String::new());
     }
 
     // ── SHADOW (F4): proiezione canonica + persistenza telemetria ─────────────

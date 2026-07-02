@@ -82,6 +82,35 @@ impl PipelineError {
             message: message.into(),
         }
     }
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "INVALID_REQUEST".to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Guardia d'ingresso della pipeline (punto unico, regola L): una richiesta con
+/// modello vuoto — `""` oppure `"provider/"` col segmento modello vuoto — e'
+/// sempre un bug del chiamante (es. purpose non risolto a monte). Senza guardia
+/// il resolver alias la propaga "as-is" a TUTTI i provider della chain e la
+/// cascata fallisce con 400/404 fuorvianti su ogni provider ("you must provide
+/// a model parameter", incidente 2026-07-02 con clarify_expand). Errore 400
+/// chiaro subito, nessuna chiamata provider a vuoto.
+fn validate_logical_model(model: &str) -> Result<(), PipelineError> {
+    let logical = model.trim();
+    let effective = match logical.split_once('/') {
+        Some((_, rest)) => rest.trim(),
+        None => logical,
+    };
+    if effective.is_empty() {
+        return Err(PipelineError::invalid_request(format!(
+            "modello mancante nella richiesta (model=\"{model}\"): il chiamante deve \
+             risolvere provider/modello a monte (routing matrix o nexus_purpose_model)"
+        )));
+    }
+    Ok(())
 }
 
 impl IntoResponse for PipelineError {
@@ -104,6 +133,7 @@ struct ResolvedProvider {
 /// Esegue la pipeline completa di completion (classify -> route -> fallback ->
 /// rehydrate -> ledger). Ritorna la risposta o un errore tradotto in HTTP.
 async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse, PipelineError> {
+    validate_logical_model(&req.model)?;
     let runtime = state.runtime_snapshot().await;
 
     // Classify + decide.
@@ -584,6 +614,11 @@ pub async fn stream(
             Json(json!({ "error": "messages required" })),
         )
             .into_response();
+    }
+    // Stessa guardia del path non-streaming (punto unico validate_logical_model):
+    // un modello vuoto non deve mai aprire uno stream verso i provider.
+    if let Err(e) = validate_logical_model(&body.model) {
+        return e.into_response();
     }
 
     let sse_stream = build_sse_stream(state, body).await;
@@ -1963,6 +1998,35 @@ mod tests {
         let resp = run_fallback(&resolved, &cooldown, &req(), false).await.unwrap();
         assert_eq!(resp.provider_used, "openai");
         assert_eq!(resp.model_used, "gpt-x");
+    }
+
+    // ── validate_logical_model: guardia d'ingresso sul modello vuoto ──────────
+
+    #[test]
+    fn modello_vuoto_rifiutato_con_400() {
+        // "" e whitespace: mai propagare ai provider (incidente 2026-07-02:
+        // cascata fallita su tutti i provider con "you must provide a model").
+        for m in ["", "   "] {
+            let err = validate_logical_model(m).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert_eq!(err.code, "INVALID_REQUEST");
+        }
+    }
+
+    #[test]
+    fn prefisso_provider_senza_modello_rifiutato() {
+        // "openai/" (segmento modello vuoto dopo lo strip): stesso bug, stessa
+        // guardia. Era la forma prodotta da format!("{provider}/{model}") con
+        // model vuoto nell'adapter mcp-core.
+        let err = validate_logical_model("openai/").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn modelli_validi_passano() {
+        for m in ["gpt-x", "openai/gpt-x", "google/gemini-2.5-pro", "a/b/c"] {
+            assert!(validate_logical_model(m).is_ok(), "atteso ok per {m}");
+        }
     }
 
     #[tokio::test]
