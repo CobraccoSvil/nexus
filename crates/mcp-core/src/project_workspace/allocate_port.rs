@@ -28,7 +28,34 @@ pub struct AllocatePortBody {
 /// Risultato di una chiamata a `find_or_allocate`.
 pub struct AllocatedPort {
     pub port: u16,
-    pub mode: &'static str, // "existing" | "dynamic"
+    pub mode: &'static str, // "existing" | "dynamic" | "adopted" | "reallocated"
+}
+
+/// Decisione PURA (testabile, regola L) su cosa fare quando la porta di una
+/// allocazione esistente risponde al probe TCP: la porta e' DAVVERO occupata,
+/// e la scelta dipende solo da chi la occupa e dalla liberabilita'.
+#[derive(Debug, PartialEq, Eq)]
+enum ActivePortAction {
+    /// Occupante tracciato in `agent_processes` (running/starting): e' il
+    /// servizio legittimo del progetto, la porta si riusa (existing).
+    ReuseTracked,
+    /// Occupante NON tracciato ma la porta e' stata liberata (try_free_port):
+    /// si riusa la stessa porta, ora libera.
+    ReuseFreed,
+    /// Occupante NON tracciato e porta NON liberabile: mai ritornare una porta
+    /// occupata (EADDRINUSE garantito al bind del nuovo processo) — si alloca
+    /// una porta nuova segnalando l'occupante.
+    ReallocateNew,
+}
+
+fn active_port_action(occupant_tracked: bool, freed: bool) -> ActivePortAction {
+    if occupant_tracked {
+        ActivePortAction::ReuseTracked
+    } else if freed {
+        ActivePortAction::ReuseFreed
+    } else {
+        ActivePortAction::ReallocateNew
+    }
 }
 
 /// Funzione internamente riusabile: trova una porta gia' allocata con la stessa
@@ -63,10 +90,107 @@ pub async fn find_or_allocate(
     {
         let p = existing_port as u16;
         if super::port_recovery::tcp_probe(p, 300).await {
-            return Ok(AllocatedPort {
-                port: p,
-                mode: "existing",
-            });
+            // La porta risponde: qualcuno ascolta DAVVERO. Storicamente questo
+            // ramo ritornava 'existing' senza chiedersi CHI: se l'occupante era
+            // un processo non tracciato (orfano di uno stop non verificato,
+            // avvio manuale con .env stantio), run_service iniettava una porta
+            // occupata al nuovo processo -> EADDRINUSE garantito (incidente
+            // Beaty-Book 2026-07-02). Ora la decisione passa dal punto unico
+            // `active_port_action`.
+            let occupant = super::port_recovery::port_occupant(p).await;
+            let tracked = match &occupant {
+                Some((pid, _)) => {
+                    super::port_recovery::is_tracked_pid(db, project_id, *pid).await
+                }
+                None => false,
+            };
+            // try_free_port ha side effect (kill dell'albero occupante): si
+            // invoca SOLO per occupanti non tracciati. Rifiuta da se' PID 0 e
+            // mcp-core stesso, e ritorna false se la porta resta occupata.
+            let freed = if tracked {
+                false
+            } else {
+                super::port_recovery::try_free_port(p).await
+            };
+            let occupant_pid = occupant.as_ref().map(|(pid, _)| *pid);
+            let occupant_program = occupant
+                .as_ref()
+                .map(|(_, prog)| prog.clone())
+                .unwrap_or_default();
+            match active_port_action(tracked, freed) {
+                ActivePortAction::ReuseTracked => {
+                    return Ok(AllocatedPort {
+                        port: p,
+                        mode: "existing",
+                    });
+                }
+                ActivePortAction::ReuseFreed => {
+                    tracing::warn!(
+                        label = %label, port = p, occupant_pid = ?occupant_pid,
+                        occupant_program = %occupant_program,
+                        "find_or_allocate: porta occupata da processo NON tracciato, liberata prima del riuso"
+                    );
+                    record_audit(
+                        AuditEntry::allowed(project_id, "port_freed", "port")
+                            .with_resource(p.to_string())
+                            .with_details(serde_json::json!({
+                                "label": label,
+                                "occupant_pid": occupant_pid,
+                                "occupant_program": occupant_program,
+                            })),
+                    );
+                    return Ok(AllocatedPort {
+                        port: p,
+                        mode: "existing",
+                    });
+                }
+                ActivePortAction::ReallocateNew => {
+                    // Porta non liberabile: si rialloca nel bucket (la funzione
+                    // deterministica salta le porte gia' allocate in DB e quelle
+                    // che non superano il bind di prova) e si aggiorna la riga
+                    // della label. L'occupante viene SEGNALATO, mai ignorato.
+                    let new_port =
+                        deterministic_project_port_for_key(&project_id, label, registry).await;
+                    tracing::warn!(
+                        label = %label, busy_port = p, new_port,
+                        occupant_pid = ?occupant_pid, occupant_program = %occupant_program,
+                        "find_or_allocate: porta occupata da processo NON tracciato e non liberabile, rialloco su porta nuova"
+                    );
+                    if let Err(e) = sqlx::query(
+                        "UPDATE nexus_port_allocations \
+                         SET port = $1, allocation_mode = 'dynamic', updated_at = NOW() \
+                         WHERE project_id = $2 AND label = $3",
+                    )
+                    .bind(new_port as i32)
+                    .bind(project_id)
+                    .bind(label)
+                    .execute(db)
+                    .await
+                    {
+                        tracing::warn!(
+                            "find_or_allocate: UPDATE riallocazione fallito (porta {} label {}): {}",
+                            new_port,
+                            label,
+                            e
+                        );
+                    }
+                    record_audit(
+                        AuditEntry::allowed(project_id, "port_realloc", "port")
+                            .with_resource(new_port.to_string())
+                            .with_details(serde_json::json!({
+                                "label": label,
+                                "busy_port": p,
+                                "occupant_pid": occupant_pid,
+                                "occupant_program": occupant_program,
+                                "reason": "occupied_by_untracked_unkillable",
+                            })),
+                    );
+                    return Ok(AllocatedPort {
+                        port: new_port,
+                        mode: "reallocated",
+                    });
+                }
+            }
         }
         // Allocazione "stale": nessuno in ascolto. Cerca processi orfani del
         // bucket (utente li ha lanciati manualmente con .env hardcoded, oppure
@@ -369,6 +493,24 @@ mod tests {
     //! autoritativa in isolamento.
     use sqlx::Row;
     use uuid::Uuid;
+
+    use super::{active_port_action, ActivePortAction};
+
+    /// Regressione EADDRINUSE (incidente Beaty-Book 2026-07-02): con la porta
+    /// dell'allocazione in LISTEN la decisione dipende dall'occupante. Il
+    /// vecchio comportamento (sempre 'existing') iniettava porte occupate da
+    /// orfani non tracciati nel nuovo processo.
+    #[test]
+    fn porta_attiva_decisione_per_occupante() {
+        // Occupante tracciato (servizio legittimo): riusa, mai killare.
+        assert_eq!(active_port_action(true, false), ActivePortAction::ReuseTracked);
+        // `freed` e' irrilevante se tracciato (try_free_port non viene invocato).
+        assert_eq!(active_port_action(true, true), ActivePortAction::ReuseTracked);
+        // Orfano non tracciato liberato: riusa la stessa porta.
+        assert_eq!(active_port_action(false, true), ActivePortAction::ReuseFreed);
+        // Orfano non liberabile: MAI ritornare la porta occupata, rialloca.
+        assert_eq!(active_port_action(false, false), ActivePortAction::ReallocateNew);
+    }
 
     /// Crea uno schema minimo: solo le colonne usate dall'upsert + i due vincoli
     /// rilevanti (UNIQUE(port) di mig 0114 e UNIQUE(project_id,label) di mig 0434).

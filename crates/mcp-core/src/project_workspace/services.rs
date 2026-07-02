@@ -1523,7 +1523,7 @@ async fn detect_project_ports_windows(
 
     let mut ports: Vec<serde_json::Value> = Vec::new();
     let mut seen: HashSet<u16> = HashSet::new();
-    for (port, pid) in listening {
+    for (port, pid, _program) in listening {
         let Some(service) = resolve_service_ancestor(pid, &svc_pid_label, &child_to_parent) else {
             continue;
         };
@@ -1563,29 +1563,46 @@ fn resolve_service_ancestor(
     None
 }
 
-/// Socket TCP in ascolto via `Get-NetTCPConnection` → righe "porta,pid".
+/// Socket TCP in ascolto via `Get-NetTCPConnection` → (porta, pid, programma).
+///
+/// PUNTO UNICO Windows (regola L) per "chi ascolta su quale porta": usato sia
+/// dal pannello Servizi sia da `port_recovery::listening_ports` (che prima del
+/// dispatch #[cfg(windows)] ritornava SEMPRE vuoto su Windows, lasciando ciechi
+/// try_free_port / scan_bucket_orphans / guardia RefuseActive — incidente
+/// Beaty-Book 2026-07-02, node orfani + EADDRINUSE ricorrente). Il nome
+/// programma (Get-Process, una sola enumerazione) serve alle euristiche
+/// `looks_like_server_process` per adozione/cleanup orfani.
 #[cfg(windows)]
-async fn windows_listening_ports() -> Vec<(u16, u32)> {
+pub(crate) async fn windows_listening_ports() -> Vec<(u16, u32, String)> {
     let out = tokio::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
-            "Get-NetTCPConnection -State Listen | ForEach-Object { '{0},{1}' -f $_.LocalPort, $_.OwningProcess }",
+            "$m=@{};Get-Process|ForEach-Object{$m[$_.Id]=$_.ProcessName};Get-NetTCPConnection -State Listen|ForEach-Object{'{0},{1},{2}' -f $_.LocalPort,$_.OwningProcess,$m[[int]$_.OwningProcess]}",
         ])
         .output()
         .await;
     let Ok(out) = out else {
         return Vec::new();
     };
-    let text = String::from_utf8_lossy(&out.stdout);
+    parse_port_pid_program_lines(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parsa le righe "porta,pid,programma" (programma opzionale, puo' contenere
+/// virgole) emesse dal comando PowerShell di `windows_listening_ports`. Pura e
+/// senza cfg: testabile su qualunque piattaforma.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_port_pid_program_lines(text: &str) -> Vec<(u16, u32, String)> {
     let mut res = Vec::new();
     for line in text.lines() {
-        let Some((port_s, pid_s)) = line.trim().split_once(',') else {
+        let mut fields = line.trim().splitn(3, ',');
+        let (Some(port_s), Some(pid_s)) = (fields.next(), fields.next()) else {
             continue;
         };
+        let program = fields.next().unwrap_or("").trim().to_string();
         if let (Ok(port), Ok(pid)) = (port_s.trim().parse::<u16>(), pid_s.trim().parse::<u32>()) {
             if port > 0 && pid > 0 {
-                res.push((port, pid));
+                res.push((port, pid, program));
             }
         }
     }
@@ -2638,6 +2655,36 @@ pub async fn port_allocated_to_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_port_pid_program_estrae_terne_valide() {
+        // Output tipico di Get-NetTCPConnection + mappa Get-Process: la stessa
+        // porta puo' comparire per IPv4 e IPv6 (dedup a valle, non qui).
+        let text = "31776,33052,node\r\n31776,33052,node\r\n3000,4120,node\r\n";
+        assert_eq!(
+            parse_port_pid_program_lines(text),
+            vec![
+                (31776, 33052, "node".to_string()),
+                (31776, 33052, "node".to_string()),
+                (3000, 4120, "node".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_port_pid_program_tollera_righe_sporche() {
+        // Programma assente (processo morto tra le due enumerazioni), righe
+        // vuote, garbage, pid/porta zero o non numerici: scartati senza panico.
+        let text = "\n8080,0,\n0,999,x\nnon,numerico,y\n31755,5044,\n  31787,6100,node dev,extra  \n";
+        assert_eq!(
+            parse_port_pid_program_lines(text),
+            vec![
+                (31755, 5044, String::new()),
+                // il programma e' il resto della riga (splitn 3): virgole incluse
+                (31787, 6100, "node dev,extra".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn is_project_unit_file_riconosce_solo_le_unit_del_progetto() {

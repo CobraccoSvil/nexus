@@ -16,10 +16,9 @@ use std::time::Duration;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::services::{
-    project_bucket_start, read_listening_ports_proc, read_listening_ports_ss,
-    PROJECT_PORT_BUCKET_SIZE,
-};
+use super::services::{project_bucket_start, PROJECT_PORT_BUCKET_SIZE};
+#[cfg(not(windows))]
+use super::services::{read_listening_ports_proc, read_listening_ports_ss};
 
 /// True se la porta accetta una connessione TCP entro `timeout_ms`.
 pub async fn tcp_probe(port: u16, timeout_ms: u64) -> bool {
@@ -288,16 +287,109 @@ pub(crate) async fn kill_process_tree(pid: u32) {
         .await;
 }
 
-/// Lista (port, pid, program) in ascolto. Usa `ss` se disponibile, fallback /proc.
+/// Lista (port, pid, program) in ascolto. PUNTO UNICO cross-platform (regola L):
+/// Unix usa `ss` con fallback /proc; Windows delega a `windows_listening_ports`
+/// (Get-NetTCPConnection). Prima del dispatch #[cfg(windows)] questa funzione
+/// ritornava SEMPRE vuoto su Windows: try_free_port non risolveva mai il PID
+/// occupante, scan_bucket_orphans era cieco e la guardia RefuseActive mai
+/// attiva (incidente Beaty-Book 2026-07-02: 6 node orfani, EADDRINUSE ricorrente).
 pub async fn listening_ports() -> Vec<(u16, u32, String)> {
-    if let Ok(v) = read_listening_ports_ss().await {
-        if !v.is_empty() {
-            return v;
-        }
+    #[cfg(windows)]
+    {
+        super::services::windows_listening_ports().await
     }
-    tokio::task::spawn_blocking(read_listening_ports_proc)
+    #[cfg(not(windows))]
+    {
+        if let Ok(v) = read_listening_ports_ss().await {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        tokio::task::spawn_blocking(read_listening_ports_proc)
+            .await
+            .unwrap_or_default()
+    }
+}
+
+/// `(pid, program)` del processo in LISTEN su `port`, se risolvibile. Delega a
+/// `listening_ports` (punto unico): nessun call site deve ri-implementare la
+/// domanda "chi occupa questa porta".
+pub async fn port_occupant(port: u16) -> Option<(u32, String)> {
+    listening_ports()
         .await
-        .unwrap_or_default()
+        .into_iter()
+        .find(|(p, _, _)| *p == port)
+        .map(|(_, pid, program)| (pid, program))
+}
+
+/// True se `pid` e' un processo GOVERNATO dal progetto: presente in
+/// `agent_processes` con status running/starting. Un occupante tracciato non va
+/// mai killato per liberare una porta (e' il servizio legittimo); uno non
+/// tracciato e' un orfano/avvio manuale.
+pub async fn is_tracked_pid(db: &PgPool, project_id: Uuid, pid: u32) -> bool {
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM agent_processes WHERE project_id = $1 AND pid = $2 \
+         AND status IN ('running','starting')",
+    )
+    .bind(project_id)
+    .bind(pid as i64)
+    .fetch_one(&proj_pool)
+    .await
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// Predicato PURO (testabile senza processi reali): un processo e' davvero
+/// fermo quando il PID (wrapper) non e' piu' vivo E la porta associata — se
+/// nota — non e' piu' in LISTEN. `port_listening = None` significa "nessuna
+/// porta governata da verificare".
+pub(crate) fn process_fully_stopped(wrapper_alive: bool, port_listening: Option<bool>) -> bool {
+    !wrapper_alive && port_listening != Some(true)
+}
+
+/// Verifica POST-KILL con retry breve che un processo sia davvero terminato:
+/// PID morto e porta della label libera. Ritorna true solo a verifica riuscita.
+///
+/// Causa radice coperta (incidente Beaty-Book 2026-07-02): su Windows il PID
+/// registrato e' il wrapper bash e `taskkill /T` risolve i discendenti dalla
+/// catena dei parent AL MOMENTO del kill; se un intermedio (npm/cmd) e' gia'
+/// uscito, il node col listener resta orfano e sopravvive con la porta occupata
+/// mentre il DB dichiarava gia' 'stopped' (EADDRINUSE al riavvio successivo).
+/// Qui, se la porta resta in LISTEN dopo una breve grazia, si risale al VERO
+/// occupante via `try_free_port` (lookup per porta, non per albero) e si
+/// continua a verificare fino al timeout (~3s).
+pub async fn ensure_process_stopped(pid: Option<u32>, port: Option<u16>) -> bool {
+    const ATTEMPTS: u32 = 10;
+    const STEP_MS: u64 = 300;
+    // Tentativo (0-based) dopo il quale, a porta ancora occupata, si prova UNA
+    // volta a liberare la porta risalendo al PID reale dell'occupante.
+    const FREE_PORT_AFTER_ATTEMPT: u32 = 2;
+
+    let mut free_attempted = false;
+    for attempt in 0..ATTEMPTS {
+        let wrapper_alive = pid.map(crate::process_util::process_alive).unwrap_or(false);
+        let port_listening = match port {
+            Some(p) => Some(tcp_probe(p, 200).await),
+            None => None,
+        };
+        if process_fully_stopped(wrapper_alive, port_listening) {
+            return true;
+        }
+        if let (Some(true), Some(p)) = (port_listening, port) {
+            if !free_attempted && attempt >= FREE_PORT_AFTER_ATTEMPT {
+                free_attempted = true;
+                tracing::warn!(
+                    port = p,
+                    pid = ?pid,
+                    "ensure_process_stopped: porta ancora in LISTEN dopo il kill, risalgo all'occupante reale via try_free_port"
+                );
+                let _ = try_free_port(p).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(STEP_MS)).await;
+    }
+    false
 }
 
 /// Tenta di liberare `port` terminando il processo in ascolto (SIGTERM, poi
@@ -424,6 +516,60 @@ pub async fn kill_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<u32> {
         killed.push(pid);
     }
     killed
+}
+
+#[cfg(test)]
+mod stop_verification_tests {
+    use super::process_fully_stopped;
+
+    /// La verifica post-kill richiede ENTRAMBE le condizioni: PID morto E porta
+    /// libera. Il vecchio flusso (marca 'stopped' e taskkill fire-and-forget)
+    /// dichiarava fermo un servizio il cui figlio node era ancora in LISTEN.
+    #[test]
+    fn fermo_solo_se_pid_morto_e_porta_libera() {
+        // Wrapper morto, porta libera: fermo.
+        assert!(process_fully_stopped(false, Some(false)));
+        // Wrapper morto ma nessuna porta da verificare: fermo.
+        assert!(process_fully_stopped(false, None));
+        // Wrapper morto ma porta ANCORA in LISTEN (discendente orfano): NON fermo.
+        assert!(!process_fully_stopped(false, Some(true)));
+        // Wrapper ancora vivo: NON fermo, qualunque sia la porta.
+        assert!(!process_fully_stopped(true, None));
+        assert!(!process_fully_stopped(true, Some(false)));
+        assert!(!process_fully_stopped(true, Some(true)));
+    }
+
+    #[tokio::test]
+    async fn senza_pid_ne_porta_e_gia_fermo() {
+        // Processo mai partito (pid NULL) e nessuna porta governata: la verifica
+        // riesce subito, senza attese.
+        assert!(super::ensure_process_stopped(None, None).await);
+    }
+
+    #[tokio::test]
+    async fn processo_reale_terminato_supera_la_verifica() {
+        // Spawn di un processo inerte di lunga durata, kill via punto unico
+        // process_util::kill_pid, poi verifica. Idempotente: il processo e'
+        // creato e distrutto interamente dal test.
+        #[cfg(windows)]
+        let child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+            .spawn();
+        #[cfg(unix)]
+        let child = std::process::Command::new("sleep").arg("30").spawn();
+        let mut child = child.expect("spawn del processo di test");
+        let pid = child.id();
+        assert!(crate::process_util::process_alive(pid));
+
+        crate::process_util::kill_pid(pid).await;
+        // Reap + rilascio dell'handle: in produzione lo fa il task monitor con
+        // child.wait().await. Senza, su Unix il PID resta zombie in /proc e su
+        // Windows l'oggetto processo resta apribile finche' l'handle e' vivo.
+        let _ = child.wait();
+        drop(child);
+
+        assert!(super::ensure_process_stopped(Some(pid), None).await);
+    }
 }
 
 // `is_nexus_process` esiste solo su Unix: i test relativi vanno compilati solo li'.
