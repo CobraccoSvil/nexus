@@ -113,6 +113,16 @@ pub struct ProgressSignals {
     /// (come per l'edit fallito) finche' la diagnosi non e' stata sfruttata: l'agente
     /// NON deve arrendersi su un servizio che non parte, deve capire perche'.
     pub repeated_action_service_failed: bool,
+    /// `true` se l'azione ripetuta e' FALLITA per SEGNALE STRUTTURATO (exit_code
+    /// != 0 / `is_error` del tool_result), a prescindere dal tipo di tool (regola
+    /// M: lo stato tecnico si legge dal segnale, non dal testo). Generalizza
+    /// `edit_failed`/`service_failed` a QUALSIASI azione ripetuta che fallisce
+    /// davvero (es. un `run_command` di health-check `curl` con exit 7): un
+    /// fallimento reale ripetuto NON e' un loop da abortire, e' una causa radice
+    /// da diagnosticare. Instrada a FORCE_DIAGNOSE (guida alla causa), mai
+    /// all'ABORT "il modello non riesce". Se `edit_failed`/`service_failed` sono
+    /// gia' true, i loro nudge SPECIFICI hanno precedenza; questo copre il resto.
+    pub repeated_action_failed: bool,
     /// `true` se il turno corrente e' ACTION-ORIENTED (task di modifica/fix), come
     /// derivato da `turn_action_oriented(state.action_oriented)`. Biforca il nudge
     /// del ramo read-only: su un task di fix una lettura ripetuta NON va chiusa con
@@ -154,6 +164,7 @@ impl Default for ProgressSignals {
             repeated_action_edit_failed: false,
             repeated_action_read_only: false,
             repeated_action_service_failed: false,
+            repeated_action_failed: false,
             // Conservativo: identico a `turn_action_oriented(None) == true`.
             action_oriented: true,
             reallocation_count: 0,
@@ -545,11 +556,16 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
     // credenziale / permesso), e' un old_string da correggere. Quindi non serve un
     // modello piu' capace ne' una chiusura: serve copiare l'estratto. Per le altre
     // ripetizioni resta il comportamento storico (governato dal flag).
+    // Un'azione ripetuta che FALLISCE per segnale STRUTTURATO (exit_code/is_error,
+    // regola M) e' una causa radice da diagnosticare, non un loop da abortire: la
+    // diagnosi forzata e' SEMPRE preferita a escalation/ABORT (come per
+    // edit/service falliti). Copre es. una `curl` di health-check con exit 7.
     let want_force_diagnose = matches!(axis, Axis::RepeatedAction)
         && !already_diagnosed
         && (signals.force_diagnose_enabled
             || signals.repeated_action_edit_failed
-            || signals.repeated_action_service_failed);
+            || signals.repeated_action_service_failed
+            || signals.repeated_action_failed);
     if want_force_diagnose {
         let (label, count) = signals
             .repeated_action
@@ -738,6 +754,38 @@ mod tests {
         assert!(!d.force_action, "i log del servizio devono restare leggibili");
         let nudge = d.nudge_text.as_deref().unwrap();
         assert!(nudge.contains("read_service_output"));
+    }
+
+    #[test]
+    fn repeated_action_fallito_strutturale_forza_diagnosi_non_abort() {
+        // Regola M generalizzata: un'azione ripetuta che FALLISCE per segnale
+        // STRUTTURATO (es. `run_command: curl` con exit 7 = server non in ascolto),
+        // gia' guidata e senza stadio force_diagnose abilitato globalmente, NON deve
+        // abortire ("il modello non riesce") ma restare in FORCE_DIAGNOSE (guida
+        // alla causa radice). Prima del fix cadeva in ESCALATE/ABORT.
+        let mut guided = HashSet::new();
+        guided.insert(Axis::RepeatedAction.as_str().to_string());
+        let signals = ProgressSignals {
+            repeated_action: Some((
+                "run_command: curl -sS http://localhost:31788/".to_string(),
+                2,
+            )),
+            repeated_action_failed: true,
+            already_guided: guided,
+            // Nessun candidato escalation: senza il ramo failed, cadrebbe in ABORT.
+            has_escalation_candidate: false,
+            force_diagnose_enabled: false,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(
+            d.action,
+            Action::ForceDiagnose,
+            "fallimento strutturale ripetuto: diagnosi forzata, non abort"
+        );
+        // Nudge diagnostico generico: causa radice + eventuale blocco esplicito.
+        let nudge = d.nudge_text.as_deref().unwrap();
+        assert!(nudge.contains("CAUSA RADICE") || nudge.contains("causa radice"));
     }
 
     #[test]

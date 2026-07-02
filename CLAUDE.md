@@ -318,6 +318,13 @@ classificarci sopra e' fragile per definizione ed e' una toppa (regola H).
   modello o da una verifica oggettiva.
 - **Ri-derivare informazione strutturata da una stringa gia' appiattita** (es.
   formattare `"HTTP {status}: {body}"` e poi ri-parsarne lo status con una regex).
+- **Dedurre l'esito di un tool/comando dal parsing dell'output** invece che dal
+  segnale strutturato (`exit_code`/`is_error` del tool_result): es. cercare
+  `"error"`/`"❌"` nell'stdout per decidere se e' fallito.
+- **Trattare una ripetizione come "loop/stallo da abortire" senza guardare il
+  segnale di esito**: un'azione ripetuta che FALLISCE per segnale strutturato
+  (exit_code!=0 / is_error) e' una CAUSA RADICE da diagnosticare, non un loop a
+  vuoto. Solo una ripetizione che RIESCE senza progresso e' uno stallo vero.
 
 ### Cosa e' richiesto
 
@@ -339,6 +346,13 @@ classificarci sopra e' fragile per definizione ed e' una toppa (regola H).
    schema strict / structured outputs, enum `outcome`/`blocker`/`refusal`) e
    verifica oggettiva (`final_gate`), mai il pattern-matching della prosa. Vedi
    ADR 0034.
+6. **Esito tool/comando: `exit_code` + `is_error` STRUTTURATI del tool_result**
+   (0 = successo), mai il parsing dell'output. L'anti-loop decide su questo
+   segnale: un'azione ripetuta che fallisce davvero (es. `curl` health-check con
+   exit 7 = servizio non in ascolto) viene instradata a diagnosi della causa
+   radice, mai chiusa come "il modello non riesce". Punto unico:
+   `tool_result_outcome_after` / `RepeatedActionHit.failed` +
+   `repeated_action_failed` in `crates/nexus-agent-graph`.
 
 ### Punto unico e riferimenti
 

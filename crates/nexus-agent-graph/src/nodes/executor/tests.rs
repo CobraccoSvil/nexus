@@ -324,9 +324,12 @@ async fn nudge_comando_fallito_a_tre() {
 async fn repeated_action_abort_chiude() {
     let rc = Arc::new(StubRunControlStore::default());
     // progress_controller ON, soglia repeated_action 2, asse gia' guidato E
-    // gia' diagnosticato -> ABORT (niente escalation candidate). Per un write
-    // FALLITO l'ABORT scatta solo DOPO che l'estratto e' stato sfruttato (GUIDE
-    // + FORCE_DIAGNOSE gia' emessi): qui simuliamo entrambi gia' passati.
+    // gia' diagnosticato -> chiusura (niente escalation candidate). Per un write
+    // FALLITO cio' avviene solo DOPO che l'estratto e' stato sfruttato (GUIDE +
+    // FORCE_DIAGNOSE gia' emessi): qui simuliamo entrambi gia' passati.
+    // Regola M: il write FALLISCE per segnale STRUTTURATO (is_error), quindi la
+    // chiusura e' ONESTA (nomina il fallimento reale, EndTurn -> final_gate), NON
+    // il vecchio "ESITO: non completato / loop a vuoto".
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
     let ctx = ctx_with(llm.clone(), false);
@@ -362,10 +365,17 @@ async fn repeated_action_abort_chiude() {
     };
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    assert_eq!(out.stop_reason, Some(StopReason::LoopAbort));
+    // Chiusura ONESTA su fallimento REALE (regola M): EndTurn verso il final_gate,
+    // messaggio che nomina il fallimento reale, non "ESITO: non completato".
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
     assert_eq!(out.forced_close_unverified, Some(true));
-    assert!(out.result.as_deref().unwrap().contains("ESITO: non completato"));
-    // LLM non chiamato (abort prima del modello).
+    let result = out.result.as_deref().unwrap();
+    assert!(
+        result.contains("continua a fallire con un errore REALE"),
+        "atteso messaggio onesto di fallimento reale, ottenuto: {result}"
+    );
+    assert!(!result.contains("ESITO: non completato"));
+    // LLM non chiamato (chiusura prima del modello).
     assert!(llm.seen.lock().unwrap().is_empty());
 }
 

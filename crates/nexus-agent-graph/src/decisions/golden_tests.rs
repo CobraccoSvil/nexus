@@ -98,6 +98,9 @@ impl From<DecideInput> for ProgressSignals {
             // Segnale Rust-only (run_service fallito): non presente nei golden Python,
             // resta false -> non altera i casi di parita' esistenti.
             repeated_action_service_failed: false,
+            // Segnale Rust-only (fallimento strutturale generico, regola M): non nei
+            // golden Python, resta false -> non altera i casi di parita' esistenti.
+            repeated_action_failed: false,
             action_oriented: i.action_oriented,
             reallocation_count: i.reallocation_count,
             reallocation_threshold: i.reallocation_threshold,

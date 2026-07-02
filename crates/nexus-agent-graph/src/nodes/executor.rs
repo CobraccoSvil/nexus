@@ -1167,6 +1167,13 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 .as_ref()
                 .map(|h| h.failed && matches!(h.tool_name.as_str(), "run_service" | "service_restart"))
                 .unwrap_or(false);
+            // Fallimento STRUTTURATO generico (exit_code/is_error, regola M): una
+            // qualsiasi azione ripetuta che fallisce DAVVERO (es. `run_command:
+            // curl` con exit 7 = server non in ascolto) e' una causa radice da
+            // diagnosticare, non un loop da abortire. Instrada a FORCE_DIAGNOSE
+            // invece che a escalation/ABORT "il modello non riesce". I casi
+            // specifici (edit/service falliti) mantengono i loro nudge dedicati.
+            let ra_failed = ra_hit.as_ref().map(|h| h.failed).unwrap_or(false);
             // Soglia dedicata per le LETTURE idempotenti (piu' alta): una
             // rilettura accidentale non deve innescare subito GUIDE->ABORT su un
             // modello capace. Le azioni produttive (build/test/edit) mantengono la
@@ -1217,6 +1224,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                     repeated_action_edit_failed: ra_edit_failed,
                     repeated_action_read_only: ra_read_only,
                     repeated_action_service_failed: ra_service_failed,
+                    repeated_action_failed: ra_failed,
                     // Biforca il nudge read-only: su un task di fix orienta all'EDIT
                     // (no rinuncia), su una domanda concludi con testo (punto unico).
                     action_oriented: turn_action_oriented(state.action_oriented),
@@ -1270,6 +1278,23 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
 perche' '{label}' si ripeteva senza ulteriore progresso; verifica i risultati (build/test) \
 per confermare la correzione.",
                                     touched.join(", ")
+                                ),
+                                StopReason::EndTurn,
+                            )
+                        } else if ra_failed {
+                            // Azione che FALLISCE per segnale STRUTTURATO
+                            // (exit_code/is_error, regola M), non un loop a vuoto:
+                            // dopo diagnosi/escalation la causa reale non e' stata
+                            // risolta. NON e' incapacita' del modello: chiudi
+                            // ONESTAMENTE nominando il fallimento reale e il blocker,
+                            // instradando al final_gate (esito reale).
+                            (
+                                format!(
+                                    "L'azione '{label}' continua a fallire con un errore REALE \
+(vedi exit code / output qui sopra), non e' una ripetizione a vuoto. La causa radice non e' \
+stata risolta: se e' codice/configurazione va corretta (es. bind/porta del servizio, \
+dipendenza, variabile d'ambiente); se dipende da qualcosa di esterno \
+(credenziale/permesso/servizio non disponibile), dichiaralo come blocco esplicito."
                                 ),
                                 StopReason::EndTurn,
                             )
