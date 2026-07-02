@@ -360,6 +360,56 @@ fn block_string_values_chars(block: &Value) -> i64 {
         .sum()
 }
 
+/// Appiattisce nel buffer ESATTAMENTE le stringhe che
+/// [`current_context_token_estimate`] conta (stesso perimetro, punto unico —
+/// ADR 0016 D1): serve al conteggio token REALE via `TokenCounter`, dove il
+/// testo concreto e' necessario (una BPE non lavora su conteggi di char).
+/// Separatore '\n' tra i frammenti: innocuo per la stima, evita che due
+/// frammenti si saldino in un token spurio.
+pub fn flatten_context_text(messages: &[ContextMessage], system_text: &str) -> String {
+    let mut out = String::with_capacity(4096);
+    let mut push = |s: &str| {
+        if !s.is_empty() {
+            out.push_str(s);
+            out.push('\n');
+        }
+    };
+    push(system_text);
+    for m in messages {
+        match &m.content {
+            Value::String(s) => push(s),
+            Value::Array(blocks) => {
+                for b in blocks {
+                    if let Some(obj) = b.as_object() {
+                        for v in obj.values() {
+                            if let Some(s) = v.as_str() {
+                                push(s);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        match &m.anthropic_content {
+            Value::Array(blocks) => {
+                for b in blocks {
+                    if let Some(obj) = b.as_object() {
+                        for v in obj.values() {
+                            if let Some(s) = v.as_str() {
+                                push(s);
+                            }
+                        }
+                    }
+                }
+            }
+            Value::String(s) => push(s),
+            _ => {}
+        }
+    }
+    out
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 //  append_reminder_block
 // ──────────────────────────────────────────────────────────────────────────

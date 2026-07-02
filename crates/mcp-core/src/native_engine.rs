@@ -695,6 +695,34 @@ async fn load_executor_config(
     }
 }
 
+/// Tokenizer selezionato per le stime contesto (ADR 0016 D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenizerKind {
+    /// tiktoken cl100k_base via `mcp-token` (BPE cacheata).
+    Cl100k,
+    /// Stima char-based storica (chars/3.5): fallback deterministico.
+    Chars,
+}
+
+/// Legge `agent.context.tokenizer` (mig 0286). Solo `cl100k_base` attiva la BPE
+/// reale; qualunque altro valore o chiave assente -> char-based (safe-DB-down).
+async fn resolve_tokenizer_kind(db: &PgPool) -> TokenizerKind {
+    match nexus_auth::get_setting(db, "agent.context.tokenizer").await.as_deref() {
+        Some("cl100k_base") => TokenizerKind::Cl100k,
+        _ => TokenizerKind::Chars,
+    }
+}
+
+/// Adapter [`nexus_agent_graph::runtime::ports::TokenCounter`] -> `mcp-token`
+/// (tiktoken cl100k, BPE cacheata in-process). CPU-only, nessun I/O.
+struct TiktokenCounter;
+
+impl nexus_agent_graph::runtime::ports::TokenCounter for TiktokenCounter {
+    fn count(&self, text: &str) -> i64 {
+        mcp_token::count_tokens(text) as i64
+    }
+}
+
 /// Risolve un template attivo da `nexus_prompt_templates` per chiave (stesso SQL
 /// di `summary_store::system_prompt`, qui parametrico: punto unico locale del
 /// lookup template per le config del motore nativo). `None` se assente/vuoto.
@@ -974,17 +1002,28 @@ async fn build_native_engine(
             todos.clone(),
             tools.clone(),
         )),
-        executor: Arc::new(ExecutorNode::new(
-            exec_cfg,
-            run_control.clone(),
-            meta_steps.clone(),
-            steps.clone(),
-            escalation.clone(),
-            next_actions.clone(),
-            billing.clone(),
-            upscale.clone(),
-            summary_store.clone(),
-        )),
+        executor: {
+            let mut executor = ExecutorNode::new(
+                exec_cfg,
+                run_control.clone(),
+                meta_steps.clone(),
+                steps.clone(),
+                escalation.clone(),
+                next_actions.clone(),
+                billing.clone(),
+                upscale.clone(),
+                summary_store.clone(),
+            );
+            // ADR 0016 D1: tokenizer REALE per le stime contesto dell'executor
+            // (upscale/brake/hard-cap/forced-RAG), selezionato dal DB
+            // (`agent.context.tokenizer`, mig 0286, default seed cl100k_base).
+            // Qualunque altro valore o chiave assente -> stima char-based
+            // storica (fallback deterministico, regola G: niente magic default).
+            if resolve_tokenizer_kind(&db).await == TokenizerKind::Cl100k {
+                executor = executor.with_token_counter(Arc::new(TiktokenCounter));
+            }
+            Arc::new(executor)
+        },
         tool_dispatch: Arc::new(ToolDispatchNode::new(
             tool_dispatch_cfg,
             tools.clone(),
@@ -2524,6 +2563,21 @@ mod tests {
             cfg.overflow_message_template,
             "Stima %ESTIMATED_TOKENS% su %MAX_WINDOW%."
         );
+    }
+
+    #[sqlx::test]
+    async fn tokenizer_kind_cl100k_solo_con_setting_esplicito(pool: sqlx::PgPool) {
+        // ADR 0016 D1: solo il valore 'cl100k_base' attiva la BPE reale;
+        // chiave assente o valore diverso -> char-based (safe-DB-down).
+        create_settings_table(&pool).await;
+        assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Chars);
+        set_setting(&pool, "agent.context.tokenizer", "cl100k_base").await;
+        assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Cl100k);
+        sqlx::query("UPDATE settings SET value = 'chars' WHERE key = 'agent.context.tokenizer'")
+            .execute(&pool)
+            .await
+            .expect("update setting");
+        assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Chars);
     }
 
     #[sqlx::test]

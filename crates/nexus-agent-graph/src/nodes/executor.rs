@@ -169,7 +169,8 @@ use crate::decisions::loop_signatures::{
 };
 use crate::decisions::progress_controller::{self as pc, Action, ProgressSignals};
 use crate::decisions::tool_dispatch::{
-    current_context_token_estimate, estimate_context_chars, ContextMessage,
+    current_context_token_estimate, estimate_context_chars, flatten_context_text,
+    ContextMessage,
 };
 use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::routing::signals::{
@@ -179,7 +180,7 @@ use crate::routing::signals::{
 };
 use crate::runtime::ports::{
     AgentStepStore, BillingCooldownPort, EscalationPort, LlmMessage, LlmRequest, MetaStepStore,
-    ModelUpscalePort, NextActionsDeriver, RunControlStore, SseEvent, SummaryStore,
+    ModelUpscalePort, NextActionsDeriver, RunControlStore, SseEvent, SummaryStore, TokenCounter,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
@@ -409,6 +410,10 @@ pub struct ExecutorNode {
     /// La DECISIONE (`should_upscale` + `required`) e' del modulo puro (regola L).
     /// Best-effort: errore -> nessun upscale.
     upscale: Arc<dyn ModelUpscalePort>,
+    /// Contatore token REALE opzionale (ADR 0016 D1, porta CPU-only): `None` =
+    /// stima char-based storica. Iniettato dal wiring col builder
+    /// [`Self::with_token_counter`] in base a `agent.context.tokenizer`.
+    token_counter: Option<Arc<dyn TokenCounter>>,
     /// Porta I/O del rolling-summary (chiamata LLM al modello economico). La
     /// DECISIONE (`select_rolling_summary_cutoff` + serializzazione + applicazione)
     /// e' del modulo puro [`crate::decisions::context_reduction`] (regola L).
@@ -440,6 +445,30 @@ impl ExecutorNode {
             billing,
             upscale,
             summary_store,
+            token_counter: None,
+        }
+    }
+
+    /// Inietta il contatore token REALE (ADR 0016 D1, es. tiktoken cl100k via
+    /// mcp-token). Senza iniezione lo stimatore resta il char-based storico:
+    /// stesso comportamento dei test e del fallback DB-down (mai un panico).
+    pub fn with_token_counter(mut self, counter: Arc<dyn TokenCounter>) -> Self {
+        self.token_counter = Some(counter);
+        self
+    }
+
+    /// PUNTO UNICO (regola L) della stima token della history nell'executor:
+    /// upscale, brake, hard-cap e forced-RAG leggono TUTTI da qui. Con la porta
+    /// iniettata conta i token REALI sul testo appiattito (stesso perimetro del
+    /// char-based: `flatten_context_text`); senza, delega alla stima char/3.5
+    /// storica (`current_context_token_estimate`).
+    fn estimate_history_tokens(&self, hist: &[HistoryMessage]) -> i64 {
+        match &self.token_counter {
+            Some(counter) => {
+                let msgs: Vec<ContextMessage> = hist.iter().map(history_to_context).collect();
+                counter.count(&flatten_context_text(&msgs, ""))
+            }
+            None => history_token_estimator(hist),
         }
     }
 }
@@ -1963,7 +1992,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         // [`ModelUpscalePort`] (best-effort, fail-open). Riassegna provider/model
         // del turno (la risoluzione provider e' gia' avvenuta sopra). Niente switch
         // se la porta non promuove (parita' col Python: `_upscale_result is None`).
-        let upscale_est_tokens = history_token_estimator(&hist);
+        let upscale_est_tokens = self.estimate_history_tokens(&hist);
         let upscale_window = self.upscale.context_window(&model).await.unwrap_or(0);
         // Window effettivo del turno: quello del modello richiesto (config, regola
         // G) finche' l'upscale non promuove; dopo la promozione, quello del modello
@@ -1998,7 +2027,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                 &hist,
                 effective_window,
                 &self.cfg.token_brake,
-                &history_token_estimator,
+                &|h: &[HistoryMessage]| self.estimate_history_tokens(h),
             );
         }
 
@@ -2010,7 +2039,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         // M) e messaggio dal template DB (`system.context_overflow`, regola G)
         // che mandare una richiesta cieca destinata al 400 del provider.
         if self.cfg.hard_cap_ratio > 0.0 {
-            let post_brake_est = history_token_estimator(&hist);
+            let post_brake_est = self.estimate_history_tokens(&hist);
             if ctxr::check_hard_cap(post_brake_est, effective_window, self.cfg.hard_cap_ratio) {
                 let text = if self.cfg.overflow_message_template.is_empty() {
                     // Fallback deterministico coi soli numeri: il testo
@@ -2092,7 +2121,7 @@ della finestra {effective_window} del modello {provider}/{model}"
             &self.cfg.verification_directive_text,
         );
         // forced_rag_reminder (py:2907-2911): appende un HumanMessage se sopra ratio.
-        let rag_est = history_token_estimator(&hist);
+        let rag_est = self.estimate_history_tokens(&hist);
         let (hist_rag, _) = ctxr::inject_forced_rag_reminder(
             &hist,
             &system_text,

@@ -396,6 +396,16 @@ pub trait VerifierRunStore: Send + Sync {
     async fn record(&self, run: VerifierRunRecord, mode: ExecMode) -> Result<(), PortError>;
 }
 
+/// Conteggio token del contesto (ADR 0016 D1). Porta SINCRONA e CPU-only
+/// (nessun I/O: una BPE in-process, es. tiktoken cl100k in `mcp-token`).
+/// Iniettata nell'executor dal wiring in base al setting
+/// `agent.context.tokenizer`; assente -> stima char-based storica (fallback
+/// deterministico, mai un panico).
+pub trait TokenCounter: Send + Sync {
+    /// Numero di token del testo.
+    fn count(&self, text: &str) -> i64;
+}
+
 /// Evento pubblicato verso il frontend chat (sottoinsieme del contratto SSE).
 ///
 /// Solo le varianti che servono ai nodi di questo PR + quelle del contratto

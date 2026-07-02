@@ -1,5 +1,13 @@
+use std::sync::LazyLock;
+
 use serde::{Deserialize, Serialize};
-use tiktoken_rs::cl100k_base;
+use tiktoken_rs::{cl100k_base, CoreBPE};
+
+/// BPE cl100k costruita UNA volta (ADR 0016 D1: lo stimatore gira su ogni
+/// history a ogni turno — ricostruire la BPE per chiamata era proibitivo).
+/// `None` se la costruzione fallisce (mai in pratica: dati embedded): i
+/// chiamanti degradano al conteggio char/4 invece di panicare (regola F/H).
+static CL100K: LazyLock<Option<CoreBPE>> = LazyLock::new(|| cl100k_base().ok());
 
 /// Sezione con priorità per l'assembly dichiarativo del context window.
 /// P0 = sempre presente; P5 = droppata per prima se il budget è stretto.
@@ -40,9 +48,12 @@ pub struct TokenOptimizationResult {
 }
 
 /// Count tokens using the cl100k_base tokenizer (GPT-4 / Claude compatible).
+/// Fallback deterministico char/4 se la BPE non e' disponibile (niente panico).
 pub fn count_tokens(text: &str) -> usize {
-    let bpe = cl100k_base().expect("failed to load tokenizer");
-    bpe.encode_with_special_tokens(text).len()
+    match CL100K.as_ref() {
+        Some(bpe) => bpe.encode_with_special_tokens(text).len(),
+        None => text.chars().count() / 4,
+    }
 }
 
 /// Optimize context by trimming to fit within token budget.
@@ -81,11 +92,16 @@ pub fn optimize_context(prompt: &str, token_budget: usize) -> TokenOptimizationR
 
     if kept.is_empty() {
         // Budget too small even for one sentence - truncate by tokens
-        let bpe = cl100k_base().expect("failed to load tokenizer");
-        let token_ids = bpe.encode_with_special_tokens(prompt);
-        let truncated_ids = &token_ids[..token_budget.min(token_ids.len())];
-        kept = bpe.decode(truncated_ids.to_vec()).unwrap_or_default();
-        optimized_tokens = truncated_ids.len();
+        if let Some(bpe) = CL100K.as_ref() {
+            let token_ids = bpe.encode_with_special_tokens(prompt);
+            let truncated_ids = &token_ids[..token_budget.min(token_ids.len())];
+            kept = bpe.decode(truncated_ids.to_vec()).unwrap_or_default();
+            optimized_tokens = truncated_ids.len();
+        } else {
+            // BPE assente: troncamento per char (~4 char/token), stesso contratto.
+            kept = prompt.chars().take(token_budget.saturating_mul(4)).collect();
+            optimized_tokens = count_tokens(&kept);
+        }
     }
 
     let tokens_saved = original_tokens.saturating_sub(optimized_tokens);
@@ -246,5 +262,18 @@ mod tests {
         let result = optimize_context(long_text, 5);
         assert!(result.tokens_saved > 0);
         assert!(result.optimized_tokens <= 5);
+    }
+
+    #[test]
+    fn count_tokens_bpe_cacheata_stabile() {
+        // ADR 0016 D1: la BPE e' costruita una volta (LazyLock) — due chiamate
+        // consecutive devono dare lo stesso conteggio e un valore sensato
+        // (molto meno dei char, piu' di zero su testo reale).
+        let text = "Il gate hard-cap usa il tokenizer reale per la stima del contesto.";
+        let a = count_tokens(text);
+        let b = count_tokens(text);
+        assert_eq!(a, b);
+        assert!(a > 0);
+        assert!(a < text.chars().count(), "token < char su testo naturale");
     }
 }

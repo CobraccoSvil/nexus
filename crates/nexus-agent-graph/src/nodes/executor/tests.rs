@@ -2493,6 +2493,72 @@ async fn hard_cap_non_scatta_dopo_upscale_a_window_grande() {
     assert_eq!(req.model, "gemini-2.5-pro");
 }
 
+// ── tokenizer reale iniettato (ADR 0016 D1) ───────────────────────────────────
+
+/// Contatore stub: valore fisso, registra le chiamate.
+struct FixedTokenCounter {
+    tokens: i64,
+    calls: std::sync::Mutex<usize>,
+}
+
+impl crate::runtime::ports::TokenCounter for FixedTokenCounter {
+    fn count(&self, _text: &str) -> i64 {
+        *self.calls.lock().unwrap() += 1;
+        self.tokens
+    }
+}
+
+#[tokio::test]
+async fn token_counter_iniettato_pilota_l_hard_cap() {
+    // Con la porta iniettata la stima viene dal CONTATORE, non dai char: un
+    // counter che dichiara 1M token fa scattare l'hard cap anche su una
+    // history minuscola (e viceversa il default char-based non scatterebbe).
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let cfg = ExecutorConfig {
+        routing_provider: "anthropic".to_string(),
+        routing_model: "claude-x".to_string(),
+        context_window: 200_000,
+        hard_cap_ratio: 0.95,
+        ..ExecutorConfig::default()
+    };
+    let meta = Arc::new(StubMetaStepStore::default());
+    let steps = Arc::new(StubAgentStepStore::default());
+    let counter = Arc::new(FixedTokenCounter { tokens: 1_000_000, calls: std::sync::Mutex::new(0) });
+    let n = ExecutorNode::new(
+        cfg,
+        rc,
+        meta,
+        steps,
+        Arc::new(StubEscalationPort::default()),
+        next_actions,
+        billing,
+        upscale,
+        Arc::new(StubSummaryStore::default()),
+    )
+    .with_token_counter(counter.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("MAI CHIAMATO"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("ciao")], // ~1 token reale: e' il counter a dire 1M
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::Error));
+    assert_eq!(
+        out.extra.get("error_class").and_then(|v| v.as_str()),
+        Some("context_overflow")
+    );
+    assert!(llm.seen.lock().unwrap().is_empty(), "LLM non chiamato");
+    assert!(*counter.calls.lock().unwrap() > 0, "il contatore iniettato e' stato usato");
+}
+
 // ── rolling-summary (intervento 3): aggancio al cambio-fase ───────────────────
 
 /// Messaggio assistant testuale (helper locale per i test rolling-summary).
