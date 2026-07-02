@@ -373,6 +373,9 @@ pub struct AgentState {
     pub progress_guided_axes: Option<Vec<String>>,
     /// Assi gia' passati per la diagnosi forzata.
     pub progress_diagnosed_axes: Option<Vec<String>>,
+    /// Assi gia' passati per il CAMBIO DI STRATEGIA forzato (livello 1.9 del
+    /// progress_controller: prima si cambia strada, poi il modello).
+    pub progress_strategy_axes: Option<Vec<String>>,
     /// `true` quando un abort coordinato ha chiuso senza verifica.
     pub forced_close_unverified: Option<bool>,
 

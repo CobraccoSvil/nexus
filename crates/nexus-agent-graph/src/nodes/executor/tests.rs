@@ -360,6 +360,7 @@ async fn repeated_action_abort_chiude() {
         messages,
         progress_guided_axes: Some(vec!["repeated_action".into()]),
         progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
         tools_json: Some(vec![json!({"name": "write_file"})]),
         ..Default::default()
     };
@@ -482,6 +483,7 @@ async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
         messages,
         progress_guided_axes: Some(vec!["repeated_action".into()]),
         progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
         tools_json: Some(vec![json!({"name": "edit_file"})]),
         ..Default::default()
     };
@@ -538,6 +540,7 @@ un modello piu' capace: cambia approccio ed ESEGUI il prossimo step concreto.",
         model_used: Some("claude-x".into()),
         progress_guided_axes: Some(vec!["repeated_action".into()]),
         progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
         tools_json: Some(vec![json!({"name": "edit_file"})]),
         extra,
         ..Default::default()
@@ -569,6 +572,7 @@ async fn abort_con_task_complete_forza_turno_dichiarativo() {
         messages: edit_fallito_x2(),
         progress_guided_axes: Some(vec!["repeated_action".into()]),
         progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
         tools_json: Some(vec![
             json!({"name": "edit_file"}),
             json!({"name": "task_complete"}),
@@ -604,6 +608,7 @@ async fn abort_senza_task_complete_chiusura_storica() {
         messages: edit_fallito_x2(),
         progress_guided_axes: Some(vec!["repeated_action".into()]),
         progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
         tools_json: Some(vec![json!({"name": "edit_file"})]),
         ..Default::default()
     };
@@ -634,6 +639,7 @@ async fn turno_dichiarativo_riduce_catalogo_a_task_complete() {
         messages,
         progress_guided_axes: Some(vec!["repeated_action".into()]),
         progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
         tools_json: Some(vec![
             json!({"name": "edit_file"}),
             json!({"name": "task_complete"}),
@@ -743,6 +749,7 @@ async fn escalation_current_pair_ancora_a_model_used_senza_sticky() {
         model_used: Some("claude-upscalato-1m".into()),
         progress_guided_axes: Some(vec!["repeated_action".into()]),
         progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
         tools_json: Some(vec![json!({"name": "edit_file"})]),
         ..Default::default()
     };
@@ -1303,6 +1310,7 @@ async fn lettura_ripetuta_esaurita_chiude_onestamente_non_fallimento() {
         // candidato escalation dallo stub) -> chiusura onesta per read-only.
         progress_guided_axes: Some(vec!["repeated_action".into()]),
         progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
         ..Default::default()
     };
     let delta = n.run(&state, &ctx).await.expect("run");
@@ -2701,6 +2709,7 @@ mod golden {
             Action::Proceed => "proceed",
             Action::Guide => "guide",
             Action::ForceDiagnose => "force_diagnose",
+            Action::ChangeStrategy => "change_strategy",
             Action::Escalate => "escalate",
             Action::Abort => "abort",
         }

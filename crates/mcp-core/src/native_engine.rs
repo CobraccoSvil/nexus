@@ -624,6 +624,11 @@ async fn load_executor_config(
         routing_provider: provider.to_string(),
         routing_model: model.to_string(),
         g1_max_nudges: setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await,
+        // Safety net finale del run: il doc di ExecutorConfig la dichiarava
+        // DB-driven ma il loader NON la leggeva (restava la costante 60).
+        // Chiave seminata dalla mig 0506 (regola G, incoerenza rilevata dal
+        // censimento anti-loop / ADR 0035).
+        iteration_cap: setting_i64(db, "agent.executor.iteration_cap", d.iteration_cap).await,
         progress_controller_enabled: setting_bool(db, "agent.progress_controller_enabled", d.progress_controller_enabled).await,
         repeated_action_threshold: setting_i64(db, "agent.repeated_action_threshold", d.repeated_action_threshold).await,
         repeated_action_threshold_read_only: setting_i64(db, "agent.repeated_action_threshold.read_only", d.repeated_action_threshold_read_only).await,
@@ -1669,7 +1674,13 @@ pub async fn run_shadow(
     };
 
     // Proiezioni canoniche: primario dal DB, shadow dallo stato finale.
-    let primary = primary_canonical(&deps.db, primary_run_id).await?;
+    // Separazione DB: agent_runs/agent_steps del primario vivono nel DB del
+    // progetto -> stesso pool risolto dalla sessione usato da run_engine, non il
+    // meta (dove la proiezione uscirebbe vuota: 0 tool calls, completed=false).
+    let primary_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(&deps.db, input.session_id)
+            .await;
+    let primary = primary_canonical(&primary_pool, primary_run_id).await?;
     let shadow = shadow_canonical(shadow_state, completed);
 
     // Persiste UN record "__final_state__" col diff (punto unico shadow, regola L:

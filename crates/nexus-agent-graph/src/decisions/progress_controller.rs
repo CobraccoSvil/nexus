@@ -59,6 +59,13 @@ pub enum Action {
     Proceed,
     #[serde(rename = "guide")]
     Guide,
+    /// Cambio di STRATEGIA forzato (solo asse repeated_action, dopo
+    /// guide+diagnose e PRIMA dell'escalation di modello): il modello corrente
+    /// riceve l'ordine di abbandonare l'approccio che si ripete e provarne uno
+    /// ALTERNATIVO (strumento diverso / piu' contesto / passo piu' piccolo).
+    /// E' il comportamento standard di un agente capace: davanti a uno stallo
+    /// prima si cambia strada, poi — solo se serve — si cambia cavallo.
+    ChangeStrategy,
     #[serde(rename = "force_diagnose")]
     ForceDiagnose,
     #[serde(rename = "escalate")]
@@ -148,6 +155,8 @@ pub struct ProgressSignals {
     pub already_guided: HashSet<String>,
     /// Assi per cui la DIAGNOSI FORZATA (force_diagnose) e' GIA' stata applicata.
     pub already_diagnosed: HashSet<String>,
+    /// Assi per cui il CAMBIO DI STRATEGIA forzato e' GIA' stato applicato.
+    pub already_strategy_shifted: HashSet<String>,
     /// `true` abilita lo stadio intermedio force_diagnose per repeated_action.
     pub force_diagnose_enabled: bool,
 }
@@ -175,6 +184,7 @@ impl Default for ProgressSignals {
             has_escalation_candidate: false,
             already_guided: HashSet::new(),
             already_diagnosed: HashSet::new(),
+            already_strategy_shifted: HashSet::new(),
             force_diagnose_enabled: false,
         }
     }
@@ -287,6 +297,24 @@ fn is_build_or_test_label(label: &str) -> bool {
 }
 
 /// Nudge per la ripetizione identica di una azione produttiva (build/test-aware).
+/// Nudge del CAMBIO DI STRATEGIA (livello 1.9, solo repeated_action): impone
+/// al modello CORRENTE di abbandonare l'approccio che si ripete e provarne uno
+/// alternativo, restando sul task. Ordinato per efficacia: strumento diverso,
+/// piu' contesto, decomposizione. E' l'equivalente runtime della direttiva
+/// permanente `<anti_loop>` dei system prompt (mig 0506).
+fn strategy_shift_nudge(label: &str, count: i64) -> String {
+    format!(
+        "Hai gia' provato '{label}' {count} volte senza che l'esito cambiasse: correggere \
+non basta piu', CAMBIA STRATEGIA restando su questo task. Scegli ORA una strada DIVERSA: \
+(a) strumento alternativo — es. write_file col contenuto completo invece di edit_file, un \
+comando diverso che ottiene lo stesso effetto; (b) piu' contesto — leggi il file completo, \
+i log o l'errore per intero prima di riprovare; (c) decomposizione — fai UN passo piu' \
+piccolo e verificabile del problema. NON ripetere '{label}' identico. Se ogni strada e' \
+davvero impedita da una causa esterna (credenziale, permesso, servizio, dipendenza), \
+dichiara l'esito con task_complete (outcome=blocked + blocker)."
+    )
+}
+
 /// Vedi `_repeated_action_nudge` Python.
 fn repeated_action_nudge(label: &str, count: i64) -> String {
     if is_build_or_test_label(label) {
@@ -606,6 +634,32 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
         };
     }
 
+    // Livello 1.9 — CAMBIO DI STRATEGIA (solo repeated_action): guida e diagnosi
+    // gia' spese, PRIMA di cambiare modello si ordina al modello CORRENTE di
+    // cambiare STRADA (strumento alternativo / piu' contesto / passo piu'
+    // piccolo). E' il comportamento standard di un agente capace davanti a uno
+    // stallo: prima si cambia approccio, poi — solo se serve — il modello.
+    // L'escalation resta il livello successivo, non viene consumata qui.
+    let want_strategy_shift = matches!(axis, Axis::RepeatedAction)
+        && !signals.already_strategy_shifted.contains(axis.as_str());
+    if want_strategy_shift {
+        let (label, count) = signals
+            .repeated_action
+            .clone()
+            .unwrap_or_else(|| (String::new(), 0));
+        return ProgressDecision {
+            action: Action::ChangeStrategy,
+            axis: Some(axis),
+            // Il cambio di strategia deve produrre un'AZIONE nuova, non testo.
+            force_action: true,
+            nudge_text: Some(strategy_shift_nudge(&label, count)),
+            stop_reason: None,
+            reason: "stallo repeated_action: cambio di strategia forzato prima dell'escalation \
+                di modello"
+                .to_string(),
+        };
+    }
+
     // Livello 2 — ESCALATE: gia' guidato ma ancora bloccato, c'e' budget.
     if can_escalate {
         return ProgressDecision {
@@ -889,23 +943,52 @@ mod tests {
 
     #[test]
     fn repeated_action_edit_fallito_abort_solo_dopo_diagnosi() {
-        // Gia' guidato E gia' diagnosticato, niente escalation: solo allora
-        // l'edit fallito puo' chiudere con ABORT (estratto ormai sfruttato).
+        // Gia' guidato, diagnosticato E strategia gia' cambiata, niente
+        // escalation: solo allora l'edit fallito puo' chiudere con ABORT.
         let mut guided = HashSet::new();
         guided.insert("repeated_action".to_string());
         let mut diagnosed = HashSet::new();
         diagnosed.insert("repeated_action".to_string());
+        let mut strategy = HashSet::new();
+        strategy.insert("repeated_action".to_string());
         let signals = ProgressSignals {
             repeated_action: Some(("edit_file: src/lib.rs".to_string(), 2)),
             repeated_action_edit_failed: true,
             already_guided: guided,
             already_diagnosed: diagnosed,
+            already_strategy_shifted: strategy,
             has_escalation_candidate: false,
             ..Default::default()
         };
         let d = decide(&signals);
         assert_eq!(d.action, Action::Abort);
         assert_eq!(d.stop_reason.as_deref(), Some(ABORT_STOP_REASON));
+    }
+
+    #[test]
+    fn repeated_action_cambio_strategia_prima_di_escalation() {
+        // NUOVO livello 1.9: guida e diagnosi spese, strategia NON ancora
+        // cambiata -> ChangeStrategy (force-action, nudge con alternative),
+        // ANCHE con un candidato di escalation disponibile: prima si cambia
+        // strada, poi il modello.
+        let mut guided = HashSet::new();
+        guided.insert("repeated_action".to_string());
+        let mut diagnosed = HashSet::new();
+        diagnosed.insert("repeated_action".to_string());
+        let signals = ProgressSignals {
+            repeated_action: Some(("edit_file: src/lib.rs".to_string(), 3)),
+            repeated_action_edit_failed: true,
+            already_guided: guided,
+            already_diagnosed: diagnosed,
+            has_escalation_candidate: true,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::ChangeStrategy);
+        assert!(d.force_action);
+        let nudge = d.nudge_text.as_deref().unwrap();
+        assert!(nudge.contains("CAMBIA STRATEGIA"));
+        assert!(nudge.contains("task_complete"));
     }
 
     #[test]

@@ -1053,6 +1053,8 @@ la richiesta in modo piu' specifico.",
             state.progress_guided_axes.clone().unwrap_or_default().into_iter().collect();
         let mut progress_diagnosed: HashSet<String> =
             state.progress_diagnosed_axes.clone().unwrap_or_default().into_iter().collect();
+        let mut progress_strategy: HashSet<String> =
+            state.progress_strategy_axes.clone().unwrap_or_default().into_iter().collect();
         let progress_on = self.cfg.progress_controller_enabled;
 
         // ── fail-fast billing-exhausted (py:2072-2092) ────────────────────────
@@ -1407,6 +1409,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
             if !matched {
                 progress_guided.remove("repeated_action");
                 progress_diagnosed.remove("repeated_action");
+                progress_strategy.remove("repeated_action");
             } else if let Some(label) = ra_label {
                 // Candidato escalation (stesso pattern di esplorazione/G1 cap):
                 // prima di abortire su azione ripetuta, promuovi a un modello piu'
@@ -1448,6 +1451,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                     action_oriented: turn_action_oriented(state.action_oriented),
                     already_guided: progress_guided.clone(),
                     already_diagnosed: progress_diagnosed.clone(),
+                    already_strategy_shifted: progress_strategy.clone(),
                     force_diagnose_enabled: self.cfg.repeated_action_force_diagnose_enabled,
                     has_escalation_candidate: ra_picked.is_some(),
                     escalations: ra_escal,
@@ -1478,6 +1482,27 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                             messages.push(human_msg(t));
                         }
                         tracing::warn!(target: "nexus_agent_graph::executor", "FORCE_DIAGNOSE repeated_action (force-action)");
+                    }
+                    Action::ChangeStrategy => {
+                        // Livello 1.9: prima di cambiare MODELLO, il modello
+                        // CORRENTE cambia STRADA (strumento alternativo / piu'
+                        // contesto / passo piu' piccolo). Una tantum per asse.
+                        progress_strategy.insert("repeated_action".to_string());
+                        if dec.force_action {
+                            force_action_hard = true;
+                        }
+                        if let Some(t) = &dec.nudge_text {
+                            messages.push(human_msg(t));
+                        }
+                        self.emit_phase(
+                            ctx,
+                            mode,
+                            "strategy_shift",
+                            format!("Cambio strategia su '{label}'"),
+                            json!({"label": label, "count": ra_count}),
+                        )
+                        .await;
+                        tracing::warn!(target: "nexus_agent_graph::executor", "CHANGE_STRATEGY repeated_action (force-action)");
                     }
                     Action::Abort => {
                         // Recap ONESTO (regola H): elenca i file REALMENTE modificati
@@ -1580,6 +1605,7 @@ indicalo esplicitamente."
                             iterations: Some(Some(iters_in + 1)),
                             progress_guided_axes: Some(Some(sorted(&progress_guided))),
                             progress_diagnosed_axes: Some(Some(sorted(&progress_diagnosed))),
+                            progress_strategy_axes: Some(Some(sorted(&progress_strategy))),
                             forced_close_unverified: Some(Some(true)),
                             ..Default::default()
                         }
@@ -1638,6 +1664,7 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                             iterations: Some(Some(iters_in + 1)),
                             progress_guided_axes: Some(Some(sorted(&progress_guided))),
                             progress_diagnosed_axes: Some(Some(sorted(&progress_diagnosed))),
+                            progress_strategy_axes: Some(Some(sorted(&progress_strategy))),
                             extra: Some(extra_out),
                             ..Default::default()
                         }
@@ -1728,6 +1755,7 @@ tool/le richieste a quella porta, senza allocarne di nuove."
                             iterations: Some(Some(iters_in + 1)),
                             progress_guided_axes: Some(Some(sorted(&progress_guided))),
                             progress_diagnosed_axes: Some(Some(sorted(&progress_diagnosed))),
+                            progress_strategy_axes: Some(Some(sorted(&progress_strategy))),
                             forced_close_unverified: Some(Some(true)),
                             ..Default::default()
                         }
@@ -1769,7 +1797,9 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                         }
                         .into_opaque());
                     }
-                    Action::ForceDiagnose | Action::Proceed => {}
+                    // ChangeStrategy non si applica all'asse reallocation (il
+                    // livello 1.9 e' emesso solo per repeated_action).
+                    Action::ForceDiagnose | Action::ChangeStrategy | Action::Proceed => {}
                 }
             }
         }
@@ -2959,6 +2989,7 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
             exploration_nudge_sent: Some(Some(expl.exploration_nudge_sent)),
             progress_guided_axes: Some(Some(sorted(&progress_guided))),
             progress_diagnosed_axes: Some(Some(sorted(&progress_diagnosed))),
+            progress_strategy_axes: Some(Some(sorted(&progress_strategy))),
             repeated_cmd_nudge_sent: Some(Some(repeated_cmd_nudge_sent)),
             iterations: Some(Some(iters_in + 1)),
             action_nudge_count: Some(Some(nudge_count)),

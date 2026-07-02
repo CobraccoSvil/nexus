@@ -93,6 +93,8 @@ impl From<DecideInput> for ProgressSignals {
             signature_loop_tool: i.signature_loop_tool,
             g1_over_cap: i.g1_over_cap,
             repeated_action: i.repeated_action,
+            // Livello 1.9 (post-Python): il golden di parita' non lo esercita.
+            already_strategy_shifted: Default::default(),
             repeated_action_edit_failed: i.repeated_action_edit_failed,
             repeated_action_read_only: i.repeated_action_read_only,
             // Segnale Rust-only (run_service fallito): non presente nei golden Python,

@@ -404,6 +404,9 @@ pub struct StateDelta {
     /// Vedi `AgentState::progress_diagnosed_axes`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub progress_diagnosed_axes: Option<Option<Vec<String>>>,
+    /// Vedi `AgentState::progress_strategy_axes`.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub progress_strategy_axes: Option<Option<Vec<String>>>,
     /// Vedi `AgentState::forced_close_unverified`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub forced_close_unverified: Option<Option<bool>>,

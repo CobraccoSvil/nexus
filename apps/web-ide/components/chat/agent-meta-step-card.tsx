@@ -166,6 +166,7 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   // promozione di modello (escalation/failover), interruzione anti-loop,
   // verifica oggettiva del final_gate, ciclo dichiarativo ADR 0034.
   escalation: { icon: "▲", label: "Cambio modello", accent: "#0ea5e9", defaultOpen: true },
+  strategy_shift: { icon: "↷", label: "Cambio strategia", accent: "#8b5cf6", defaultOpen: true },
   loop_break: { icon: "◼", label: "Interruzione", accent: "#ef4444", defaultOpen: true },
   final_gate: { icon: "✓", label: "Verifica", accent: "#22c55e", defaultOpen: false },
   declaration_request: { icon: "…", label: "Richiesta esito", accent: "#f59e0b", defaultOpen: false },
