@@ -157,9 +157,15 @@ function ThinkingPanel({ thinking }: { thinking: string }) {
   );
 }
 
+// Riconosce SOLO i messaggi-riepilogo sintetici legacy (formato "---" +
+// "**Riepilogo run**"). Il vecchio criterio aggiuntivo `totalTokens > 0`
+// marcava come riepilogo QUALSIASI risposta assistant con usage persistito
+// (cioe' tutte, da quando i metadata token sono sempre scritti): appena due
+// risposte erano consecutive nella lista visibile (run accodati/superseded,
+// con gli user sintetici "Continua" filtrati), venivano collassate in
+// "N run completati" e i loro contenuti diventavano inaccessibili in UI.
 function isRunSummaryMessage(msg: ChatMessage): boolean {
   if (msg.role !== "assistant") return false;
-  if (msg.totalTokens && msg.totalTokens > 0) return true;
   const trimmed = (msg.content ?? "").trim();
   return trimmed.startsWith("---") && trimmed.includes("**Riepilogo run**");
 }
@@ -258,17 +264,30 @@ function RunSummaryGroup({ messages, tc }: { messages: ChatMessage[]; tc: ThemeC
             padding: "6px 10px",
             display: "flex",
             flexDirection: "column",
-            gap: 4,
-            maxHeight: 220,
+            gap: 8,
+            maxHeight: 400,
             overflowY: "auto",
           }}
         >
-          {messages.map((m) => {
+          {messages.map((m, i) => {
             const { tokens, model } = getRunInfo(m);
             return (
-              <div key={m.id} style={{ fontSize: 11, color: tc.textMuted, display: "flex", gap: 6 }}>
-                <span style={{ color: tc.textSecondary }}>{tokens.toLocaleString("it-IT")} tok</span>
-                {model && <span>· {model}</span>}
+              <div
+                key={m.id}
+                style={{
+                  borderTop: i > 0 ? `1px solid ${tc.border}` : "none",
+                  paddingTop: i > 0 ? 8 : 0,
+                }}
+              >
+                <div style={{ fontSize: 11, color: tc.textMuted, display: "flex", gap: 6 }}>
+                  <span style={{ color: tc.textSecondary }}>{tokens.toLocaleString("it-IT")} tok</span>
+                  {model && <span>· {model}</span>}
+                </div>
+                {/* Contenuto integrale: prima l'espansione mostrava solo le
+                    metriche e le risposte raggruppate restavano illeggibili. */}
+                <div style={{ fontSize: 12, wordBreak: "break-word", overflowWrap: "anywhere" }}>
+                  <MarkdownBlock content={m.content ?? ""} />
+                </div>
               </div>
             );
           })}
