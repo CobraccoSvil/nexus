@@ -16,7 +16,7 @@ $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 $order = @(
   'nexus-qdrant', 'nexus-garnet',
   'nexus-mcp-core',
-  'nexus-gateway', 'nexus-admin', 'nexus-billing', 'nexus-doc', 'nexus-plugin', 'nexus-chat',
+  'nexus-gateway', 'nexus-admin', 'nexus-billing', 'nexus-doc', 'nexus-plugin',
   'nexus-web-ide'
 )
 
