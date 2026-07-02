@@ -2341,6 +2341,7 @@ dependencies = [
  "jsonwebtoken",
  "nexus-auth",
  "nexus-cache",
+ "nexus-tool-kit",
  "regex",
  "reqwest",
  "serde",

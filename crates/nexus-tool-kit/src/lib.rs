@@ -322,6 +322,7 @@ pub mod sec_tls_check;
 pub mod sec_unwrap_count;
 pub mod sec_workflow_perms_check;
 pub mod secret_scan;
+pub mod secret_text_scanner;
 pub mod service_healthcheck;
 pub mod shell_exec;
 pub mod test_assert_count;

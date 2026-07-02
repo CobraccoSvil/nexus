@@ -703,7 +703,11 @@ async fn flush_output_to_db(
     };
 
     let decoded = String::from_utf8_lossy(raw_output);
-    let clean = strip_ansi(&decoded);
+    // Redazione dei segreti (punto unico, vedi agent_processes) PRIMA del
+    // clipping: il taglio agli ultimi 8000 caratteri potrebbe spezzare una
+    // connection string e lasciar passare la credenziale.
+    let clean =
+        crate::agent_processes::redact_secrets_for_persistence(&strip_ansi(&decoded));
     let clipped: String = {
         let chars: Vec<char> = clean.chars().collect();
         if chars.len() > DB_OUTPUT_MAX_CHARS {
