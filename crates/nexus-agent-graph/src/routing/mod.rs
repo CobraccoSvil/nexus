@@ -118,8 +118,13 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
         }
         return NodeTarget::Learner;
     }
-    // (4) Cap iterazioni adattivo -> learner.
-    if iters >= cap {
+    // (4) Cap iterazioni adattivo -> learner. ECCEZIONE (ADR 0034): una
+    // dichiarazione task_complete PENDENTE viene sempre dispatchata (e' la
+    // CHIUSURA strutturata del run, un giro di dispatch senza chiamate LLM):
+    // altrimenti il turno dichiarativo emesso a ridosso del cap perdeva la
+    // dichiarazione (tool_use senza tool_result) e l'esito ricadeva sulle
+    // euristiche.
+    if iters >= cap && !pending_is_task_complete(state) {
         return NodeTarget::Learner;
     }
     // (5) tool_use + pending -> tool_dispatch.
@@ -186,6 +191,17 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
     }
     // (9) Default.
     NodeTarget::Learner
+}
+
+/// `true` se tra i tool_use pendenti c'e' una dichiarazione `task_complete`
+/// (ADR 0034): la chiusura strutturata va sempre dispatchata, anche al cap.
+fn pending_is_task_complete(state: &AgentState) -> bool {
+    state
+        .pending_tool_uses
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|t| t.get("name").and_then(|v| v.as_str()) == Some("task_complete"))
 }
 
 /// Estrae `declared_outcome["outcome"]` (string) se lo stato lo dichiara.
@@ -333,6 +349,32 @@ mod tests {
         s.action_oriented = Some(true); // anche action: declared vince.
         s.declared_outcome = Some(json!({"outcome": "done", "summary": "fatto"}));
         s.user_intent = Some("chat".into()); // non software -> learner.
+        assert_eq!(
+            route_after_executor(&s, &RoutingConfig::default()),
+            NodeTarget::Learner
+        );
+    }
+
+    #[test]
+    fn cap_iterazioni_lascia_passare_dispatch_task_complete() {
+        // ADR 0034 (fix review): una dichiarazione task_complete PENDENTE va
+        // dispatchata anche a cap raggiunto (e' la chiusura strutturata del
+        // run); qualunque altro pending al cap va a Learner come prima.
+        let mut s = base();
+        s.iterations = Some(99);
+        s.stop_reason = Some(StopReason::ToolUse);
+        s.pending_tool_uses = Some(vec![json!({
+            "type": "tool_use", "id": "c1", "name": "task_complete",
+            "input": {"outcome": "blocked", "summary": "fermo"}
+        })]);
+        assert_eq!(
+            route_after_executor(&s, &RoutingConfig::default()),
+            NodeTarget::ToolDispatch
+        );
+        // Contro-prova: pending NON dichiarativo al cap -> Learner.
+        s.pending_tool_uses = Some(vec![json!({
+            "type": "tool_use", "id": "c1", "name": "read_file", "input": {}
+        })]);
         assert_eq!(
             route_after_executor(&s, &RoutingConfig::default()),
             NodeTarget::Learner

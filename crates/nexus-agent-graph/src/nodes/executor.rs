@@ -572,7 +572,16 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
             .get("force_outcome_declaration")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if declaration_was_forced && !declaration_pending {
+        let declaration_closed = state
+            .extra
+            .get("outcome_declaration_closed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // `!declaration_closed`: la chiusura d'autorita' scatta UNA SOLA VOLTA.
+        // Senza il guard, il rientro dal final_gate FAILED (che chiede di
+        // applicare un fix) veniva ri-chiuso subito col summary stantio,
+        // neutralizzando il ciclo di correzione oggettiva.
+        if declaration_was_forced && !declaration_pending && !declaration_closed {
             if let Some(decl) = &state.declared_outcome {
                 let outcome_kind = decl
                     .get("outcome")
@@ -591,6 +600,8 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                     outcome = %outcome_kind,
                     "chiusura post-dichiarazione forzata (ADR 0034): esito strutturato"
                 );
+                let mut extra_out = state.extra.clone();
+                extra_out.insert("outcome_declaration_closed".to_string(), json!(true));
                 return Ok(StateDelta {
                     messages: Some(vec![Message::Ai {
                         content: MessageContent::text(close_text.clone()),
@@ -601,6 +612,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                     pending_tool_uses: Some(Some(vec![])),
                     stop_reason: Some(Some(StopReason::EndTurn)),
                     iterations: Some(Some(iters_in + 1)),
+                    extra: Some(extra_out),
                     ..Default::default()
                 }
                 .into_opaque());
@@ -811,8 +823,14 @@ piu' specifico, oppure riprova con un modello piu' capace.",
         const G1_LOOP_PRODUCTIVE_LOOKBACK: usize = 16;
         let g1_recent_productive =
             has_recent_productive_action(&messages, G1_LOOP_PRODUCTIVE_LOOKBACK);
-        let g1_cap_effective = g1.cap_reached
-            || (unfulfilled_for_g1 && iters_in >= g1_loop_threshold && !g1_recent_productive);
+        // `!declaration_pending` (ADR 0034): con un turno dichiarativo PENDENTE
+        // i gate di chiusura pre-LLM lasciano passare — al rientro dal delta
+        // dichiarativo la clausola "loop conclamato" si ri-soddisfaceva sugli
+        // stessi segnali immutati e consumava la finestra una-tantum SENZA che
+        // il modello ricevesse mai la chiamata dichiarativa.
+        let g1_cap_effective = (g1.cap_reached
+            || (unfulfilled_for_g1 && iters_in >= g1_loop_threshold && !g1_recent_productive))
+            && !declaration_pending;
         if matches!(head_gate(false, false, 0, g1_cap_effective), HeadGate::G1Cap) {
             // ESCALATION orchestratore (py:1962-1993): prima di arrenderci, l'
             // orchestratore PROMUOVE il turno a un modello piu' capace (catena DB
@@ -1003,7 +1021,9 @@ la richiesta in modo piu' specifico.",
         // pattern del cap G1 (punto unico pick_escalation_model + progress_controller
         // Action::Escalate). Cosi' la discovery ripetuta non chiude piu' secca senza
         // mai cambiare modello.
-        if exploration_count >= 2 * exploration_threshold && progress_on {
+        // `!declaration_pending`: il turno dichiarativo non va corto-circuitato
+        // dai gate di stallo (ADR 0034, vedi guard sul G1 cap).
+        if exploration_count >= 2 * exploration_threshold && progress_on && !declaration_pending {
             // Candidato di escalation: provider/model correnti + escalation gia'
             // fatte; gated a < 3 esattamente come il cap G1.
             let expl_escal = state
@@ -1214,8 +1234,9 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
             }
         }
 
-        // (6c) repeated_action (py:2230-2309).
-        if progress_on {
+        // (6c) repeated_action (py:2230-2309). `!declaration_pending`: il turno
+        // dichiarativo non va corto-circuitato dai gate di stallo (ADR 0034).
+        if progress_on && !declaration_pending {
             // Punto unico (regola L): la rilevazione e' sensibile al CONTENUTO
             // (signature = name+path+hash(old_string)), cosi' due edit_file sullo
             // stesso file con old_string DIVERSI sono azioni distinte (count 1) e
@@ -1497,8 +1518,9 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
             }
         }
 
-        // (6d) resource_reallocation (py:2321-2383).
-        if progress_on {
+        // (6d) resource_reallocation (py:2321-2383). `!declaration_pending`:
+        // vedi guard 6c (ADR 0034).
+        if progress_on && !declaration_pending {
             // Grazia post-escalation ANCHE su questo asse: senza il floor, al
             // rientro da un Escalate i request_port pre-promozione erano ancora
             // nella finestra e l'asse ri-decideva subito (stessa classe
@@ -2753,18 +2775,22 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         extra_out.insert("outcome_declaration_forced".to_string(), json!(true));
         // Grazia sui detector di stallo: il turno dichiarativo non deve essere
         // corto-circuitato dalle azioni pre-chiusura (stesso floor del fix
-        // escalation, punto unico repeat_scan_floor).
+        // escalation, punto unico repeat_scan_floor). I gate di chiusura pre-LLM
+        // hanno inoltre il guard `!declaration_pending` (testa del run).
         extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
         tracing::warn!(
             target: "nexus_agent_graph::executor",
             "chiusura di sistema -> turno dichiarativo forzato (ADR 0034): il modello dichiara l'esito"
         );
+        // NB: g1_reroute_count/action_nudge_count NON vengono azzerati (a
+        // differenza dei rami Escalate): il turno dichiarativo non e' un nuovo
+        // budget di lavoro — se il modello non dichiara, il gate 7 del routing
+        // trova i contatori al cap e si chiude secco senza un nuovo ciclo di
+        // nudge G1.
         Some(
             StateDelta {
                 messages: Some(vec![nudge]),
                 recent_tool_signatures: Some(Some(vec![])),
-                g1_reroute_count: Some(Some(0)),
-                action_nudge_count: Some(Some(0)),
                 pending_tool_uses: Some(Some(vec![])),
                 stop_reason: Some(Some(StopReason::G1Escalated)),
                 iterations: Some(Some(iters_in + 1)),

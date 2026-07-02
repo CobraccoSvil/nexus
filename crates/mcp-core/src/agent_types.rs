@@ -200,10 +200,14 @@ impl AgentRunStatus {
     /// concluso, attende un'azione dell'utente, quindi il client deve restare in
     /// ascolto / mostrare la richiesta, non considerarlo finito.
     pub fn is_terminal(&self) -> bool {
-        !matches!(
-            self,
-            Self::Running | Self::AwaitingConfirmation | Self::BlockedNeedsInput
-        )
+        // BlockedNeedsInput e' TERMINALE (ADR 0034): il run e' CONCLUSO con la
+        // dichiarazione onesta "serve input umano"; il prossimo messaggio utente
+        // crea un NUOVO run (nessun meccanismo di resume esiste per questo stato,
+        // a differenza di AwaitingConfirmation che e' un run SOSPESO con resume
+        // HITL). Da non-terminale produceva run appesi per sempre: mai purgati
+        // dalla retention, replay senza agent_final, frontend che forzava
+        // "failed" dopo timeout con warning fuorviante.
+        !matches!(self, Self::Running | Self::AwaitingConfirmation)
     }
 }
 
@@ -899,9 +903,11 @@ mod tests {
 
     #[test]
     fn is_terminal_esclude_in_corso_e_in_pausa() {
-        // Running = in corso; Awaiting/Blocked = in pausa che attende input.
+        // Running = in corso; Awaiting = run SOSPESO con resume HITL.
         assert!(!AgentRunStatus::Running.is_terminal());
         assert!(!AgentRunStatus::AwaitingConfirmation.is_terminal());
-        assert!(!AgentRunStatus::BlockedNeedsInput.is_terminal());
+        // BlockedNeedsInput e' TERMINALE (ADR 0034): run concluso con
+        // dichiarazione "serve input"; il prossimo input crea un nuovo run.
+        assert!(AgentRunStatus::BlockedNeedsInput.is_terminal());
     }
 }

@@ -73,3 +73,49 @@ pub(crate) use helpers::{
     is_protected_path, looks_like_long_running_command, READ_FILE_LINES_MAX,
     READ_FILE_STRUCTURE_HINT_LINES,
 };
+
+#[cfg(test)]
+mod adr0034_contract_tests {
+    /// COERENZA CROSS-CRATE (regola L): gli enum dello schema esposto al
+    /// modello (nexus-agent-tools, AGENT_TOOLS_JSON) e quelli della
+    /// validazione (nexus-agent-graph, VALID_OUTCOMES/VALID_BLOCKERS) sono
+    /// duplicati per necessita' (il grafo non dipende dal crate dei tool):
+    /// questo test li lega — un drift (es. outcome aggiunto solo allo schema:
+    /// il modello lo dichiara, normalize lo scarta in silenzio) diventa un
+    /// test rosso.
+    #[test]
+    fn enum_schema_coerenti_con_normalize() {
+        let v: serde_json::Value =
+            serde_json::from_str(super::AGENT_TOOLS_JSON).expect("catalogo parsa");
+        let tc = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("task_complete"))
+            .expect("task_complete nel catalogo");
+        let schema = &tc["input_schema"]["properties"];
+        // Confronto come INSIEMI: l'ordine di presentazione nello schema non
+        // e' contrattuale, conta che i valori accettati coincidano.
+        let set = |vals: &serde_json::Value| -> std::collections::BTreeSet<String> {
+            vals.as_array()
+                .expect("enum array")
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(str::to_string)
+                .collect()
+        };
+        let valid = |vals: &[&str]| -> std::collections::BTreeSet<String> {
+            vals.iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            set(&schema["outcome"]["enum"]),
+            valid(nexus_agent_graph::decisions::tool_dispatch::VALID_OUTCOMES),
+            "enum outcome dello schema divergente da VALID_OUTCOMES"
+        );
+        assert_eq!(
+            set(&schema["blocker"]["enum"]),
+            valid(nexus_agent_graph::decisions::tool_dispatch::VALID_BLOCKERS),
+            "enum blocker dello schema divergente da VALID_BLOCKERS"
+        );
+    }
+}

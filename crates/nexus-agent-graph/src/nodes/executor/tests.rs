@@ -696,6 +696,34 @@ async fn dichiarazione_avvenuta_chiude_con_summary() {
 }
 
 #[tokio::test]
+async fn chiusura_dichiarativa_una_tantum_non_ricattura_rientro_final_gate() {
+    // ADR 0034 (fix review): dopo la chiusura d'autorita' col summary
+    // (outcome_declaration_closed=true), un RIENTRO nell'executor (es. dal
+    // final_gate FAILED che chiede di applicare un fix) NON deve ri-chiudere
+    // col summary stantio: il turno prosegue normale (chiamata LLM).
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("applico il fix richiesto"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut extra = serde_json::Map::new();
+    extra.insert("outcome_declaration_forced".into(), json!(true));
+    extra.insert("outcome_declaration_closed".into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("sistema il file"), human("<final_gate_failed> build rotta")],
+        declared_outcome: Some(json!({"outcome": "done", "summary": "stantio"})),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // NON la chiusura d'autorita' col summary stantio: il modello ha lavorato.
+    assert_ne!(out.result.as_deref(), Some("stantio"));
+    assert_eq!(llm.seen.lock().unwrap().len(), 1, "il turno normale prosegue");
+}
+
+#[tokio::test]
 async fn escalation_current_pair_ancora_a_model_used_senza_sticky() {
     // Senza sticky, la coppia corrente per l'escalation e' (provider_used,
     // model_used) — l'ultima chiamata REALE, smart-upscale incluso — NON il

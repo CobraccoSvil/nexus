@@ -89,9 +89,13 @@ export function isStatusTerminal(status: string): boolean {
     status === "interrupted" ||
     status === "loop_aborted" ||
     status === "provider_unavailable" ||
-    // Esiti canonici macchina a stati (mig 0386): terminali. blocked_needs_input
-    // NO: e' in attesa di input (come awaiting_confirmation), non terminale.
+    // Esiti canonici macchina a stati (mig 0386): terminali.
     status === "completed_verified" ||
-    status === "failed_diagnosed"
+    status === "failed_diagnosed" ||
+    // ADR 0034: blocked_needs_input e' TERMINALE — il run e' concluso con la
+    // dichiarazione onesta "serve input umano"; il prossimo messaggio crea un
+    // nuovo run (nessun resume esiste per questo stato, a differenza di
+    // awaiting_confirmation che resta un run sospeso).
+    status === "blocked_needs_input"
   );
 }

@@ -161,8 +161,10 @@ pub async fn agent_stream(
             // (failed_diagnosed, completed_verified) che il match inline
             // precedente dimenticava -> un run chiuso con la "determinazione
             // certa" ora viene riconosciuto come terminato nel replay/recovery.
-            // awaiting_confirmation/blocked_needs_input restano NON terminali
-            // (run in pausa che attende input): non si emette agent_final.
+            // awaiting_confirmation resta NON terminale (run sospeso con resume
+            // HITL): non si emette agent_final. blocked_needs_input e' TERMINALE
+            // (ADR 0034: run concluso con dichiarazione "serve input") -> il
+            // replay emette agent_final e la UI mostra l'esito onesto.
             let is_terminal =
                 crate::agent_types::AgentRunStatus::from_db_str(&status).is_terminal();
             if is_terminal {

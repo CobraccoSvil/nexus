@@ -64,9 +64,11 @@ async fn run_cycle(db: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 /// Pota i checkpoint dei run TERMINALI oltre il grace period, iterando i progetti
-/// (separazione DB). Tiene i run resumibili (running / awaiting_confirmation /
-/// blocked_needs_input) e quelli recenti. A flag OFF tutti i pool sono il meta:
-/// la prima iterazione pota, le successive sono no-op (idempotente).
+/// (separazione DB). Tiene i run resumibili (running / awaiting_confirmation)
+/// e quelli recenti. `blocked_needs_input` e' TERMINALE (ADR 0034: run concluso
+/// con dichiarazione "serve input", nessun resume) -> potabile. A flag OFF tutti
+/// i pool sono il meta: la prima iterazione pota, le successive sono no-op
+/// (idempotente).
 async fn prune_checkpoints(db: &PgPool) {
     let grace_hours = setting_i64(db, "db.retention.checkpoint_grace_hours", 168, 1).await; // 7 giorni
     let mut total: u64 = 0;
@@ -77,7 +79,7 @@ async fn prune_checkpoints(db: &PgPool) {
             DELETE FROM nexus_graph_checkpoints
             WHERE run_id IN (
                 SELECT id FROM agent_runs
-                WHERE status NOT IN ('running', 'awaiting_confirmation', 'blocked_needs_input')
+                WHERE status NOT IN ('running', 'awaiting_confirmation')
                   AND COALESCE(completed_at, updated_at, created_at) < NOW() - make_interval(hours => $1)
             )
             "#,

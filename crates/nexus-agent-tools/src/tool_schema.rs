@@ -1573,7 +1573,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   ,
   {
     "name": "task_complete",
-    "description": "Dichiara l'esito FINALE del task in forma strutturata (ADR 0034). Chiamalo come ULTIMA azione del turno, sempre: outcome=done SOLO a lavoro completato e verificato; blocked se una causa ESTERNA impedisce di proseguire (valorizza blocker); partial se hai completato solo una parte del lavoro (indica in next_step cosa resta); needs_input se serve una decisione o un'informazione dall'utente. Il summary e' il resoconto umano finale mostrato all'utente: scrivilo completo. Non dichiarare done se non hai verificato il risultato.",
+    "description": "Dichiara l'esito FINALE del run in forma strutturata (ADR 0034). Chiamalo UNA SOLA VOLTA, come ULTIMISSIMA azione, quando il lavoro e' concluso o non puoi proseguire — NON e' un aggiornamento di stato per turno: se dopo la dichiarazione esegui altri tool, la dichiarazione viene invalidata. outcome=done SOLO a lavoro completato e verificato; blocked se una causa ESTERNA impedisce di proseguire (valorizza blocker); partial se hai completato solo una parte e non puoi continuare (indica in next_step cosa resta); needs_input se serve una decisione o un'informazione dall'utente. Il summary e' il resoconto umano finale mostrato all'utente: scrivilo completo. Non dichiarare done se non hai verificato il risultato.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1589,3 +1589,58 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   }
 ]"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Il catalogo DEVE parsare: il consumatore del path primario
+    /// (`build_tools_json_for_agent`) fa fallback SILENZIOSO a `[]` su errore
+    /// di parse — un refuso nella raw string azzererebbe TUTTI i tool di ogni
+    /// run senza alcun segnale (regola M/H). Questo test lo rende un errore
+    /// di build visibile.
+    #[test]
+    fn catalogo_parsa_e_contiene_task_complete() {
+        let v: serde_json::Value =
+            serde_json::from_str(AGENT_TOOLS_JSON).expect("AGENT_TOOLS_JSON deve parsare");
+        let tools = v.as_array().expect("array di tool");
+        assert!(tools.len() > 50, "catalogo sospettosamente piccolo");
+        let tc = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("task_complete"))
+            .expect("task_complete deve essere nel catalogo (ADR 0034)");
+        // Schema strict: required outcome+summary; enum outcome/blocker presenti.
+        let schema = tc.get("input_schema").expect("input_schema");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["outcome", "summary"]);
+        let outcomes: Vec<&str> = schema["properties"]["outcome"]["enum"]
+            .as_array()
+            .expect("enum outcome")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(outcomes, vec!["done", "blocked", "partial", "needs_input"]);
+        let blockers: Vec<&str> = schema["properties"]["blocker"]["enum"]
+            .as_array()
+            .expect("enum blocker")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            blockers,
+            vec![
+                "dependency",
+                "credential",
+                "permission",
+                "service",
+                "request_ambiguity",
+                "safety"
+            ]
+        );
+    }
+}

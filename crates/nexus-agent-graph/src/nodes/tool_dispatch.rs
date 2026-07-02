@@ -823,6 +823,15 @@ dell'utente.";
                 let prev = state.declared_done_count.unwrap_or(0);
                 delta.declared_done_count = Some(Some(prev + done_now));
             }
+        } else if state.declared_outcome.is_some() {
+            // INVALIDAZIONE dichiarazione STANTIA (ADR 0034): il run PROSEGUE
+            // con altri tool DOPO una dichiarazione precedente -> quella
+            // dichiarazione era intermedia, non l'esito finale. Senza questo
+            // azzeramento, un "partial"/"blocked" dichiarato a meta' run
+            // falsava lo status canonico FINALE anche a lavoro poi completato
+            // (il finalizzatore legge l'ULTIMA dichiarazione dallo stato).
+            // `declared_done_count` resta cumulativo (gate done>=3 in testa).
+            delta.declared_outcome = Some(None);
         }
 
         // WAVE 2.2: errore infrastruttura tool (mcp-core NON scala i provider).
@@ -1543,6 +1552,22 @@ mod tests {
         assert_eq!(out.declared_done_count, Some(1));
         // Nessun tool eseguito via ToolExecutor (entrambi brain-only).
         assert!(tools.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dichiarazione_stantia_invalidata_da_lavoro_successivo() {
+        // ADR 0034: se il run PROSEGUE con altri tool dopo una dichiarazione
+        // precedente, quella dichiarazione era intermedia -> azzerata. Senza,
+        // un "partial"/"blocked" dichiarato a meta' run falsava lo status
+        // canonico finale anche a lavoro poi completato.
+        let (n, _steps, _rc) = node(ToolDispatchConfig::default(), Arc::new(MapToolExecutor::new()));
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
+        st.declared_outcome = Some(json!({"outcome": "partial", "summary": "meta'"}));
+        st.declared_done_count = Some(0);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        // Dichiarazione stantia azzerata; il contatore done resta cumulativo.
+        assert!(out.declared_outcome.is_none());
     }
 
     // ── (5) errore infrastruttura -> tool_result d'errore, niente NodeError ──────
