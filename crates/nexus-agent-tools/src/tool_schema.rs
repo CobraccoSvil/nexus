@@ -1588,6 +1588,18 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       "required": ["outcome", "summary"]
     }
   }
+  ,
+  {
+    "name": "nexus_verify_change",
+    "description": "Verifica le modifiche appena fatte eseguendo la catena typecheck -> build -> lint -> test del progetto (fail-fast al primo step rosso). Usalo PRIMA di dichiarare completato un task di codice: e' la prova oggettiva che la modifica compila e non rompe i test. Ritorna un VerifyReport JSON strutturato: passed complessivo, first_failure, e per ogni step exit_code, build_errors, durata e un estratto dell'output. I comandi vengono dalle run_configurations del progetto o dai default per linguaggio configurati dall'admin: se uno step non ha comando configurato viene saltato con motivo esplicito, non inventato.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "scope": {"type": "string", "enum": ["quick", "full", "typecheck", "build", "lint", "test"], "description": "quick = typecheck+lint (rapido, dopo ogni modifica); full = catena completa typecheck+build+lint+test (prima di dichiarare done); oppure un singolo step."},
+        "working_dir": {"type": "string", "description": "Sottocartella del progetto in cui eseguire i comandi (default: root del progetto). Utile nei monorepo."}
+      }
+    }
+  }
 ]"#;
 
 #[cfg(test)]
@@ -1641,6 +1653,30 @@ mod tests {
                 "request_ambiguity",
                 "safety"
             ]
+        );
+    }
+
+    /// nexus_verify_change (ADR 0019 L3) deve essere nel catalogo con lo scope
+    /// enumerato: stesso razionale del test task_complete (un refuso nella raw
+    /// string azzererebbe il catalogo in silenzio).
+    #[test]
+    fn catalogo_parsa_e_contiene_nexus_verify_change() {
+        let v: serde_json::Value =
+            serde_json::from_str(AGENT_TOOLS_JSON).expect("AGENT_TOOLS_JSON deve parsare");
+        let tools = v.as_array().expect("array di tool");
+        let vc = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("nexus_verify_change"))
+            .expect("nexus_verify_change deve essere nel catalogo (ADR 0019 L3)");
+        let scopes: Vec<&str> = vc["input_schema"]["properties"]["scope"]["enum"]
+            .as_array()
+            .expect("enum scope")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            scopes,
+            vec!["quick", "full", "typecheck", "build", "lint", "test"]
         );
     }
 }

@@ -14,8 +14,8 @@ use super::{
     archive_tools, attachment_inspector, attachments, audio_tools, command, dev_diagnostics,
     dispatcher, document_tools, figma_tools, files, git, image_tools, knowledge, ports,
     project_db_query, rag_search, sandbox, scaffold_verifier, service, shadcn_setup,
-    subagent_native, testing, todos, tool_not_found, video_tools, vision_tools, visual_compare,
-    AgentToolContext,
+    subagent_native, testing, todos, tool_not_found, verify, video_tools, vision_tools,
+    visual_compare, AgentToolContext,
 };
 
 /// Esegue un tool per conto dell'agente.
@@ -68,6 +68,9 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "rename_file" => files::tool_rename_file(ctx, input).await,
         "edit_file" => files::tool_edit_file(ctx, input).await,
         "run_command" => command::tool_run_command(ctx, input).await,
+        // Catena di verifica post-modifica (ADR 0019 L3): typecheck -> build ->
+        // lint -> test con fail-fast e VerifyReport strutturato.
+        "nexus_verify_change" => verify::tool_nexus_verify_change(ctx, input).await,
         // Tool dedicato ai cicli test-fix-test: esecuzione sincrona con
         // timeout esteso (raccomandato dai prompt al posto di run_command).
         "run_tests" => command::tool_run_tests(ctx, input).await,
