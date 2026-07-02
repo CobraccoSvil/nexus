@@ -2,7 +2,6 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt;
-use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::sandbox::{self, SandboxConfig};
@@ -209,49 +208,38 @@ pub async fn spawn_agent_process(
             .spawn()
             .map_err(|e| format!("Docker sandbox spawn error: {e}"))?
     } else {
-        // Fallback: processo diretto con env Nexus filtrato
-        #[cfg(unix)]
-        {
-            let mut sh = Command::new("/bin/sh");
-            sh.args(["-c", command])
-                .current_dir(working_dir)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .process_group(0)
-                // env_clear() + solo whitelist: rimuove DATABASE_URL, REDIS_URL, ecc.
-                .env_clear();
-            // Ripropaga le variabili sicure dell'host
-            for (k, v) in sandbox::safe_env_for_direct_spawn() {
-                sh.env(&k, &v);
-            }
-            // Aggiunge le override esplicite del progetto (non bloccate)
-            for (k, v) in &env_vars {
-                if !sandbox::is_blocked_env(k) {
-                    sh.env(k, v);
-                }
-            }
-            sh.spawn().map_err(|e| format!("Spawn error: {e}"))?
-        }
-
-        #[cfg(not(unix))]
-        {
-            // Windows: esegui via agent_shell (Git Bash) cosi' i comandi in sintassi
-            // Unix (`a && b`, `... | tail`, `grep`) funzionano. NIENTE env_clear su
-            // Windows: il processo eredita PATH/SystemRoot/TEMP necessari; sopra
-            // aggiungiamo solo le override del progetto (es. PORT) non bloccate.
-            let shell = sandbox::agent_shell();
-            let mut sh = Command::new(&shell);
-            sh.args(["-c", command])
-                .current_dir(working_dir)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            for (k, v) in &env_vars {
-                if !sandbox::is_blocked_env(k) {
-                    sh.env(k, v);
-                }
-            }
-            sh.spawn().map_err(|e| format!("Spawn error: {e}"))?
-        }
+        // Fallback: processo diretto con env ISOLATO, ramo UNICO cross-platform
+        // (regola L). Prima di questo fix il ramo Windows NON faceva env_clear e
+        // il servizio ereditava l'INTERO env di mcp-core, DATABASE_URL del
+        // meta-DB inclusa; dotenv non sovrascrive variabili gia' presenti,
+        // quindi i .env scritti dall'agente venivano ignorati e il backend del
+        // progetto si connetteva al meta-DB (incidente Beaty-Book 2026-07-02).
+        //
+        // Semantica identica su unix e Windows:
+        // - env_clear() + host env filtrato dalla blacklist Nexus (PATH,
+        //   SYSTEMROOT, COMSPEC, TEMP/TMP, USERPROFILE, HOME, APPDATA...
+        //   passano; DATABASE_URL/REDIS_URL/segreti del meta MAI)
+        // - DATABASE_URL del DB applicativo del progetto (stesso punto unico
+        //   ensure_project_db_url di run_command)
+        // - override agente gia' validate (PORT/HOST...)
+        // Shell dal punto unico agent_shell (bash / Git Bash: sintassi `a && b`,
+        // pipe, brace expansion); process group Unix / CREATE_NO_WINDOW Windows
+        // dal punto unico isolated_command.
+        let (project_db_url, project_db_name) =
+            crate::agent_tools::command::ensure_project_db_url(db, project_id).await;
+        let mut sh = sandbox::isolated_command(&sandbox::agent_shell());
+        sh.args(["-c", command])
+            .current_dir(working_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env_clear()
+            .envs(direct_spawn_env(
+                std::env::vars(),
+                &project_db_url,
+                &project_db_name,
+                &env_vars,
+            ));
+        sh.spawn().map_err(|e| format!("Spawn error: {e}"))?
     };
 
     let pid = child.id().unwrap_or(0) as i32;
@@ -367,6 +355,44 @@ pub async fn spawn_agent_process(
     });
 
     Ok(process_id)
+}
+
+/// PUNTO UNICO (regola L) dell'env di un processo di progetto spawnato
+/// direttamente (no Docker), identico su unix e Windows. Composizione:
+/// 1. host env FILTRATO dalla blacklist Nexus (`sandbox::is_blocked_env`):
+///    DATABASE_URL/REDIS_URL/API key del meta non passano MAI al servizio;
+///    le variabili di sistema necessarie a bash/npm (PATH, SYSTEMROOT,
+///    COMSPEC, TEMP/TMP, USERPROFILE, HOME, APPDATA...) si.
+/// 2. DATABASE_URL + NEXUS_PROJECT_DB_* del DB applicativo del progetto
+///    (fidate: generate da `ensure_project_db_url`, mai dall'agente).
+/// 3. override agente gia' validate (PORT/HOST...) — il filtro blacklist si
+///    riapplica, quindi una override non puo' reintrodurre variabili bloccate:
+///    la DATABASE_URL vista dal servizio e' SEMPRE quella del progetto.
+///
+/// `host_env` e' un parametro (non `std::env::vars()` inline) per testare la
+/// proprieta' di isolamento senza mutare l'env del processo di test.
+fn direct_spawn_env(
+    host_env: impl IntoIterator<Item = (String, String)>,
+    project_db_url: &str,
+    project_db_name: &str,
+    overrides: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = host_env
+        .into_iter()
+        .filter(|(k, _)| !sandbox::is_blocked_env(k))
+        .collect();
+    env.insert("NEXUS_PROJECT_DB_URL".to_string(), project_db_url.to_string());
+    env.insert(
+        "NEXUS_PROJECT_DB_NAME".to_string(),
+        project_db_name.to_string(),
+    );
+    env.insert("DATABASE_URL".to_string(), project_db_url.to_string());
+    for (k, v) in overrides {
+        if !sandbox::is_blocked_env(k) {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+    env
 }
 
 /// Flush buffered output to DB (append-only, cap at 50KB per field)
@@ -563,7 +589,100 @@ pub struct ProcessSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_generic_service_label, kind_for_run_config_role, similar_service_labels};
+    use super::{
+        direct_spawn_env, is_generic_service_label, kind_for_run_config_role,
+        similar_service_labels,
+    };
+    use std::collections::HashMap;
+
+    /// Env host come lo vede mcp-core in produzione: variabili di sistema
+    /// necessarie ai figli + i segreti Nexus che NON devono mai propagarsi.
+    fn host_env_meta() -> Vec<(String, String)> {
+        vec![
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://nexus:nexus@localhost:5433/nexus".to_string(),
+            ),
+            ("REDIS_URL".to_string(), "redis://localhost:6379".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-xyz".to_string()),
+            ("JWT_SECRET".to_string(), "supersegreto".to_string()),
+            (
+                "PATH".to_string(),
+                r"C:\Windows\system32;C:\Program Files\Git\bin".to_string(),
+            ),
+            ("SYSTEMROOT".to_string(), r"C:\Windows".to_string()),
+            ("COMSPEC".to_string(), r"C:\Windows\system32\cmd.exe".to_string()),
+            ("TEMP".to_string(), r"C:\Users\x\AppData\Local\Temp".to_string()),
+            ("TMP".to_string(), r"C:\Users\x\AppData\Local\Temp".to_string()),
+            ("USERPROFILE".to_string(), r"C:\Users\x".to_string()),
+            ("HOME".to_string(), r"C:\Users\x".to_string()),
+            ("APPDATA".to_string(), r"C:\Users\x\AppData\Roaming".to_string()),
+        ]
+    }
+
+    #[test]
+    fn servizio_spawnato_non_vede_database_url_del_meta() {
+        // Regressione incidente Beaty-Book 2026-07-02: su Windows il servizio
+        // ereditava l'intero env di mcp-core (DATABASE_URL nexus@5433 inclusa)
+        // e il backend del progetto si connetteva al meta-DB.
+        let env = direct_spawn_env(
+            host_env_meta(),
+            "postgresql://nexus_app:pwd@localhost:5434/beaty_book_app",
+            "beaty_book_app",
+            &HashMap::new(),
+        );
+        // DATABASE_URL e' quella del DB applicativo del progetto, mai del meta.
+        assert_eq!(
+            env.get("DATABASE_URL").map(String::as_str),
+            Some("postgresql://nexus_app:pwd@localhost:5434/beaty_book_app"),
+        );
+        assert_eq!(
+            env.get("NEXUS_PROJECT_DB_NAME").map(String::as_str),
+            Some("beaty_book_app"),
+        );
+        // Nessun altro segreto Nexus passa al servizio.
+        assert!(!env.contains_key("REDIS_URL"));
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!env.contains_key("JWT_SECRET"));
+        // Le variabili di sistema per bash/npm restano disponibili.
+        for k in [
+            "PATH",
+            "SYSTEMROOT",
+            "COMSPEC",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+        ] {
+            assert!(env.contains_key(k), "variabile di sistema '{k}' mancante");
+        }
+    }
+
+    #[test]
+    fn override_agente_applicate_ma_blacklist_non_reintroducibile() {
+        // Le override validate (PORT/HOST) passano; una override su variabile
+        // in blacklist (DATABASE_URL) NON puo' scavalcare quella del progetto.
+        let mut overrides = HashMap::new();
+        overrides.insert("PORT".to_string(), "23001".to_string());
+        overrides.insert("HOST".to_string(), "0.0.0.0".to_string());
+        overrides.insert(
+            "DATABASE_URL".to_string(),
+            "postgresql://evil@altrove/nexus".to_string(),
+        );
+        let env = direct_spawn_env(
+            host_env_meta(),
+            "postgresql://nexus_app:pwd@localhost:5434/proj_app",
+            "proj_app",
+            &overrides,
+        );
+        assert_eq!(env.get("PORT").map(String::as_str), Some("23001"));
+        assert_eq!(env.get("HOST").map(String::as_str), Some("0.0.0.0"));
+        assert_eq!(
+            env.get("DATABASE_URL").map(String::as_str),
+            Some("postgresql://nexus_app:pwd@localhost:5434/proj_app"),
+        );
+    }
 
     #[test]
     fn run_config_tool_e_test_sono_task_non_servizi() {

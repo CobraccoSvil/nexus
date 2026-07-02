@@ -237,7 +237,7 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // L'agente NON deve mai usare il DB 'nexus' (infrastruttura). Il DB
     // applicativo si chiama <slug>_app (con `-` → `_` per validita' Postgres).
     // Idempotente: CREATE DATABASE solo se non esiste.
-    let (project_db_url, project_db_name) = ensure_project_db_url(ctx).await;
+    let (project_db_url, project_db_name) = ensure_project_db_url(&ctx.db, ctx.project_id).await;
 
     // Shell cross-platform (punto unico crate::sandbox::agent_shell): bash su Unix,
     // Git Bash su Windows. Gli agenti generano comandi in sintassi bash (brace
@@ -684,16 +684,24 @@ async fn persist_security_audit(
 /// Se il container postgres-app non risponde, ritorna comunque un URL valido
 /// così l'env injection avviene — l'agente vedra' un errore di connessione
 /// che NON contaminera' il DB Nexus.
-async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
+///
+/// PUNTO UNICO (regola L) dell'injection DB progetto: chiamata sia da
+/// `run_command` (one-shot) sia da `agent_processes::spawn_agent_process`
+/// (servizi long-running) — per questo prende (pool meta, project_id) e non
+/// l'intero AgentToolContext.
+pub(crate) async fn ensure_project_db_url(
+    db: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+) -> (String, String) {
     let slug: Option<String> =
         sqlx::query_scalar("SELECT slug FROM projects WHERE id = $1 LIMIT 1")
-            .bind(ctx.project_id)
-            .fetch_optional(&*ctx.db)
+            .bind(project_id)
+            .fetch_optional(db)
             .await
             .ok()
             .flatten();
 
-    let base = slug.unwrap_or_else(|| ctx.project_id.simple().to_string());
+    let base = slug.unwrap_or_else(|| project_id.simple().to_string());
     let mut sanitized: String = base
         .chars()
         .map(|c| match c {
@@ -703,7 +711,7 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
         })
         .collect();
     if sanitized.is_empty() {
-        sanitized = ctx.project_id.simple().to_string();
+        sanitized = project_id.simple().to_string();
     }
     if sanitized
         .chars()
@@ -718,13 +726,12 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
     let db_name = format!("{sanitized}_app");
 
     // Lettura settings DB-driven (single batch, default conservativi).
-    let host = load_setting_or(&ctx.db, "nexus_app_db_host", "localhost").await;
-    let port = load_setting_or(&ctx.db, "nexus_app_db_port", "5434").await;
-    let user = load_setting_or(&ctx.db, "nexus_app_db_user", "nexus_app").await;
-    let pwd = load_setting_or(&ctx.db, "nexus_app_db_password", "nexus_app_dev_secret").await;
-    let admin_user = load_setting_or(&ctx.db, "nexus_app_admin_user", "nexus_admin").await;
-    let admin_pwd =
-        load_setting_or(&ctx.db, "nexus_app_admin_password", "nexus_admin_secret").await;
+    let host = load_setting_or(db, "nexus_app_db_host", "localhost").await;
+    let port = load_setting_or(db, "nexus_app_db_port", "5434").await;
+    let user = load_setting_or(db, "nexus_app_db_user", "nexus_app").await;
+    let pwd = load_setting_or(db, "nexus_app_db_password", "nexus_app_dev_secret").await;
+    let admin_user = load_setting_or(db, "nexus_app_admin_user", "nexus_admin").await;
+    let admin_pwd = load_setting_or(db, "nexus_app_admin_password", "nexus_admin_secret").await;
 
     // CREATE DATABASE idempotente sul container postgres-app via admin role.
     let admin_url = format!("postgresql://{admin_user}:{admin_pwd}@{host}:{port}/postgres");
@@ -753,7 +760,7 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
                         "ensure_project_db_url: provisioned db=\"{}\" owner=\"{}\" project_id={}",
                         db_name,
                         user,
-                        ctx.project_id
+                        project_id
                     );
                 }
             }
@@ -799,9 +806,9 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
              hosting_mode = EXCLUDED.hosting_mode,
              updated_at = NOW()"#,
     )
-    .bind(ctx.project_id)
+    .bind(project_id)
     .bind(url.as_bytes())
-    .execute(&*ctx.db)
+    .execute(db)
     .await;
 
     match upsert_res {
@@ -815,13 +822,13 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
                 tracing::info!(
                     "ensure_project_db_url: project_database_config registered \
                      project_id={} db_name={} action={}",
-                    ctx.project_id,
+                    project_id,
                     db_name,
                     action
                 );
                 // Notifica il pannello DB frontend via dispatcher SSE.
                 nexus_events::dispatcher::emit_global(
-                    ctx.project_id,
+                    project_id,
                     nexus_events::event::ProjectEvent::DbConfigUpdated {
                         name: "primary".to_string(),
                         engine: Some("postgres".to_string()),
