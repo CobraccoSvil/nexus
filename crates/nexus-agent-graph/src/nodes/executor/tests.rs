@@ -667,6 +667,159 @@ async fn turno_dichiarativo_riduce_catalogo_a_task_complete() {
     );
 }
 
+/// History plausibile di un run a ridosso del cap: richiesta d'azione + un
+/// round di tool completato (stop_reason del turno precedente = ToolUse).
+fn history_pre_forced_text() -> Vec<Message> {
+    vec![
+        human("aggiorna il modulo di login"),
+        ai_tool("read_file", json!({"path": "src/login.rs"})),
+        Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: Value::String("contenuto file".into()),
+                is_error: false,
+                exit_code: None,
+            }]),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn forced_text_risposta_vuota_rientra_turno_dichiarativo() {
+    // REGRESSIONE incidente run b07c7e78: alla finestra forced-text (tool
+    // rimossi, iters >= cap-5) il modello risponde con testo VUOTO
+    // (outputTokens=0, stopReason=end_turn). L'esito NON e' verificato: con
+    // task_complete nel catalogo il nodo NON chiude il run, rientra col turno
+    // dichiarativo ADR 0034 (l'esito sara' la dichiarazione strutturata).
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text(""));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: history_pre_forced_text(),
+        iterations: Some(55), // cap default 60 -> soglia forced-text = 55
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![
+            json!({"name": "edit_file"}),
+            json!({"name": "task_complete"}),
+        ]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Il turno forced-text HA chiamato l'LLM, col catalogo svuotato.
+    {
+        let calls = llm.seen.lock().unwrap();
+        assert_eq!(calls.len(), 1, "una chiamata LLM (finestra forced-text)");
+        assert!(
+            calls[0].tools.as_deref().unwrap_or_default().is_empty(),
+            "forced-text: nessun tool nel catalogo della chiamata"
+        );
+    }
+    // Risposta vuota -> turno dichiarativo richiesto, NESSUNA chiusura.
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(
+        out.extra.get("force_outcome_declaration").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(out.result.is_none());
+    assert_ne!(out.forced_close_unverified, Some(true));
+}
+
+#[tokio::test]
+async fn forced_text_risposta_vuota_senza_task_complete_forced_close() {
+    // Rete di sicurezza: risposta VUOTA al forced-text e turno dichiarativo
+    // NON disponibile (task_complete assente dal catalogo) -> il delta e'
+    // marcato forced_close_unverified: il finalizzatore mappa FailedDiagnosed
+    // e produce il recap deterministico (mai un 'completed' muto).
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text(""));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: history_pre_forced_text(),
+        iterations: Some(55),
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(
+        out.forced_close_unverified,
+        Some(true),
+        "esito non verificato: il segnale autoritativo deve essere nel delta"
+    );
+    // Il testo del turno resta vuoto: il recap e' compito del finalizzatore.
+    assert_eq!(out.result.as_deref(), Some(""));
+}
+
+#[tokio::test]
+async fn turno_dichiarativo_risposta_vuota_forced_close() {
+    // Rete FINALE: anche il turno dichiarativo (una tantum, gia' consumato)
+    // torna VUOTO -> chiusura con forced_close_unverified, nessun retry
+    // infinito della finestra dichiarativa.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text(""));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut messages = history_pre_forced_text();
+    messages.push(human("Chiama ORA il tool task_complete dichiarando l'esito."));
+    let mut extra = serde_json::Map::new();
+    extra.insert("force_outcome_declaration".into(), json!(true));
+    extra.insert("outcome_declaration_forced".into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages,
+        tools_json: Some(vec![
+            json!({"name": "edit_file"}),
+            json!({"name": "task_complete"}),
+        ]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(
+        out.forced_close_unverified,
+        Some(true),
+        "dichiarativo vuoto -> forced_close (mai 'completed')"
+    );
+    // Finestra dichiarativa consumata: nessun secondo giro.
+    assert!(out.extra.get("force_outcome_declaration").is_none());
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+}
+
+#[tokio::test]
+async fn forced_text_risposta_testuale_chiude_senza_forced_close() {
+    // Contro-prova: il forced-text che produce il RESOCONTO atteso chiude
+    // normalmente (nessun forced_close, nessun turno dichiarativo).
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("resoconto finale del lavoro"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: history_pre_forced_text(),
+        iterations: Some(55),
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![
+            json!({"name": "edit_file"}),
+            json!({"name": "task_complete"}),
+        ]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_ne!(out.forced_close_unverified, Some(true));
+    assert_eq!(out.result.as_deref(), Some("resoconto finale del lavoro"));
+    assert!(out.extra.get("force_outcome_declaration").is_none());
+}
+
 #[tokio::test]
 async fn dichiarazione_avvenuta_chiude_con_summary() {
     // ADR 0034: dopo il turno dichiarativo forzato (flag consumato) con

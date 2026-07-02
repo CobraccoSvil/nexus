@@ -1352,18 +1352,37 @@ async fn native_outcome_to_run_result(
     let provider = outcome.provider_used.clone().unwrap_or_default();
     let model = outcome.model_used.clone().unwrap_or_default();
 
+    // Il summary DICHIARATO fa da risposta quando il modello ha chiuso con
+    // task_complete senza produrre testo (parita' WAVE 3.2): mai un
+    // "completed" muto se il modello ha comunque dichiarato l'esito.
+    let final_answer = outcome
+        .final_answer
+        .filter(|s| !s.trim().is_empty())
+        .or(declared_summary);
+
+    // Hollow sul path NATIVO (prima: false hardcoded, "detection del client
+    // SSE" che il grafo non ha): un run TERMINATO senza risposta ne' step
+    // eseguiti restava MUTO in chat con status 'completed' (incidente run
+    // b07c7e78 / gap 0-step). Perimetro stretto: solo run conclusi
+    // (`completed`, mai AwaitingConfirmation) e mai su StopReason::Error (i
+    // Failed hanno il proprio percorso retry/diagnosi). Tassonomia kind
+    // identica al path brain ("EMPTY_ANSWER+NO_TOOLS"): e' quella che
+    // is_report_hollow/canonical_run_status e la diagnostica gia' consumano.
+    // `hollow_no_tools` resta false: il segnale tool-forcing (MALFORMED)
+    // e' una detection del client SSE che qui non esiste; il contatore
+    // generico consecutive_failures e' la semantica corretta per l'empty
+    // answer.
+    let hollow_completion = outcome.completed
+        && !matches!(outcome.stop_reason, Some(StopReason::Error))
+        && final_answer.is_none()
+        && steps.is_empty();
+
     crate::agent_types::AgentRunResult {
         run_id: run_id.to_string(),
         status,
         steps,
         pending_actions: Vec::new(),
-        // Il summary DICHIARATO fa da risposta quando il modello ha chiuso con
-        // task_complete senza produrre testo (parita' WAVE 3.2): mai un
-        // "completed" muto se il modello ha comunque dichiarato l'esito.
-        final_answer: outcome
-            .final_answer
-            .filter(|s| !s.trim().is_empty())
-            .or(declared_summary),
+        final_answer,
         provider,
         model,
         iteration_count: outcome.iterations.max(0) as u32,
@@ -1388,12 +1407,13 @@ async fn native_outcome_to_run_result(
         // Intent del turno: pilota la decisione hollow/conversational del
         // finalizzatore (parita' col nexus_task_type del path Python).
         nexus_task_type: outcome.user_intent,
-        // Il grafo nativo non emette i segnali hollow del path Python (sono una
-        // detection del client SSE): default false. Un completamento vuoto resta
-        // gestito dal finalizzatore (final_answer assente -> placeholder/recap).
-        hollow_completion: false,
+        hollow_completion,
         hollow_no_tools: false,
-        hollow_completion_kind: String::new(),
+        hollow_completion_kind: if hollow_completion {
+            "EMPTY_ANSWER+NO_TOOLS".to_string()
+        } else {
+            String::new()
+        },
         // FIX D4: reasoning accumulato dal grafo nativo (reasoning_acc dello stato).
         reasoning: outcome.reasoning,
         // Conversazione finale del grafo per agent_runs.messages_json (resume +
@@ -3114,7 +3134,15 @@ pub(crate) async fn spawn_agent_run(
                         kw || classified_intent_for_loop != "chat"
                     }
                 };
-                let hollow_retry = result.hollow_completion && action_intent;
+                // Guardia is_success: il retry hollow esiste per dare una
+                // risposta a un run "finito bene ma vuoto". Un run gia'
+                // DIAGNOSTICATO (FailedDiagnosed da forced_close/anti-loop,
+                // BlockedNeedsInput da dichiarazione) non va ri-eseguito da
+                // capo su un altro provider: brucerebbe budget ripetendo un
+                // esito gia' classificato (i Failed retriable passano da
+                // failed_retry con la loro error_class strutturata).
+                let hollow_retry =
+                    result.hollow_completion && action_intent && result.status.is_success();
                 let should_retry = failed_retry || hollow_retry;
 
                 if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
@@ -4727,6 +4755,98 @@ mod tests_select_engine {
             "abort anti-loop -> failed_diagnosed (esito certo)"
         );
         assert_eq!(r.stop_reason.as_deref(), Some("loop_abort"));
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_risposta_vuota_zero_step_hollow_e_recap(pool: sqlx::PgPool) {
+        // REGRESSIONE incidente run b07c7e78 (gap 2): run nativo TERMINATO con
+        // risposta vuota e ZERO step non deve restare un 'completed' MUTO. Il
+        // mapping calcola hollow (prima: false hardcoded), il canonico declassa
+        // a FailedDiagnosed e il compositore del messaggio produce comunque un
+        // testo per la chat (placeholder/recap deterministico).
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        let mut o = outcome_base();
+        o.final_answer = Some("   ".to_string()); // whitespace-only = vuota
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert!(r.final_answer.is_none());
+        assert!(r.hollow_completion, "risposta vuota + 0 step -> hollow");
+        assert_eq!(r.hollow_completion_kind, "EMPTY_ANSWER+NO_TOOLS");
+        assert_eq!(
+            canonical_run_status(&r),
+            AgentRunStatus::FailedDiagnosed,
+            "mai 'completed' su un run muto senza lavoro"
+        );
+        assert!(
+            compose_turn_answer(&r).is_some(),
+            "la chat non deve restare muta: placeholder/recap garantito"
+        );
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_hollow_non_scatta_su_risposta_o_step_presenti(
+        pool: sqlx::PgPool,
+    ) {
+        // Contro-prova del calcolo hollow nativo: risposta presente (o run
+        // HITL non concluso) -> hollow false, status invariato.
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        // Risposta presente -> non hollow.
+        let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
+        assert!(!r.hollow_completion);
+        assert_eq!(r.hollow_completion_kind, "");
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
+        // Interrupt HITL (final_answer assente ma run NON concluso) -> non hollow.
+        let mut o = outcome_base();
+        o.completed = false;
+        o.resume_at = Some("executor".to_string());
+        o.final_answer = None;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert!(!r.hollow_completion, "un interrupt HITL non e' un run muto");
+        // Errore del grafo -> non hollow (percorso Failed dedicato).
+        let mut o = outcome_base();
+        o.stop_reason = Some(StopReason::Error);
+        o.final_answer = None;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert!(!r.hollow_completion);
+        assert_eq!(r.status, AgentRunStatus::Failed);
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_forced_close_risposta_vuota_mai_completed(pool: sqlx::PgPool) {
+        // REGRESSIONE incidente run b07c7e78 (gap 1, lato mapping): risposta
+        // VUOTA al turno forzato -> l'executor marca forced_close_unverified;
+        // il mapping non deve MAI produrre 'completed' e la chat non resta muta.
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        let mut o = outcome_base();
+        o.final_answer = None;
+        o.forced_close_unverified = true; // segnale autoritativo dell'executor
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(
+            r.status,
+            AgentRunStatus::FailedDiagnosed,
+            "esito non verificato: mai 'completed' con risposta vuota"
+        );
+        assert!(
+            compose_turn_answer(&r).is_some(),
+            "recap/placeholder garantito anche a 0 step"
+        );
     }
 
     #[test]

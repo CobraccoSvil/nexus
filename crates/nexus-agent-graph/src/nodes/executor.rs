@@ -1851,7 +1851,12 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
         }
 
         // ── Forced text response: svuota i tool nell'ultima finestra (py:2438-2453) ─
+        // `forced_text_turn` marca il turno come FORZATO: una risposta VUOTA a
+        // un turno forzato e' un esito NON verificato e non puo' chiudere il run
+        // come 'completed' (incidente run b07c7e78: Gemini rispose con stringa
+        // vuota alla finestra forced-text -> final_answer NULL, chat muta).
         let forced_text_threshold = self.cfg.iteration_cap - 5;
+        let mut forced_text_turn = false;
         if !tools_json.is_empty()
             && iters_in >= forced_text_threshold
             && state.stop_reason == Some(StopReason::ToolUse)
@@ -1863,6 +1868,7 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                 "forced text response: rimozione tool per forzare risposta testuale"
             );
             tools_json.clear();
+            forced_text_turn = true;
         }
 
         // ── Turno DICHIARATIVO forzato (ADR 0034): catalogo = solo task_complete ─
@@ -2836,6 +2842,34 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
         let turn_concluded = stop_reason_enum == StopReason::EndTurn
             && pending_tool_uses.is_empty()
             && !final_result.trim().is_empty();
+
+        // ── Risposta VUOTA a un turno FORZATO (incidente run b07c7e78) ────────
+        // Alla finestra forced-text (tool rimossi per imporre il resoconto) o al
+        // turno dichiarativo ADR 0034 il modello puo' chiudere con testo VUOTO
+        // (Gemini: outputTokens=0, stopReason=end_turn). Quell'esito NON e'
+        // verificato: senza questo ramo il run finiva status='completed' con
+        // final_answer NULL e ZERO messaggi assistant in chat. Rimedio a due
+        // livelli: (a) se il turno dichiarativo e' ancora disponibile si rientra
+        // chiedendo la dichiarazione strutturata (regola M: l'esito dal segnale
+        // macchina, non da un testo che non c'e'); (b) altrimenti il delta viene
+        // marcato `forced_close_unverified` (stesso segnale autoritativo di
+        // 9ece276) -> il finalizzatore mappa FailedDiagnosed e produce il recap
+        // deterministico, mai un 'completed' muto.
+        let empty_forced_reply = (forced_text_turn || declaring_turn)
+            && matches!(stop_reason_enum, StopReason::EndTurn | StopReason::Stop)
+            && pending_tool_uses.is_empty()
+            && final_result.trim().is_empty();
+        if empty_forced_reply {
+            if let Some(d) = self.forced_declaration_delta(state, iters_in, ctx, mode).await {
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    forced_text = forced_text_turn,
+                    "risposta VUOTA al turno forzato -> retry col turno dichiarativo (ADR 0034)"
+                );
+                return Ok(d);
+            }
+        }
+
         if turn_concluded {
             // (1) next_actions (py:3379-3402): RIMOZIONE deterministica del blocco
             // <suggested_actions> dal testo visibile (punto unico puro, SEMPRE
@@ -3043,6 +3077,18 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
             // Segnale autoritativo di chiusura anti-loop (mig 0386): il
             // finalizzatore mappa a FailedDiagnosed anche se il final_gate
             // riscrive stop_reason sul ramo forced_close.
+            delta.forced_close_unverified = Some(Some(true));
+        }
+        if empty_forced_reply {
+            // Risposta vuota al turno forzato e turno dichiarativo NON
+            // disponibile (gia' consumato o task_complete assente dal catalogo):
+            // esito non verificato -> mai 'completed' (incidente run b07c7e78).
+            tracing::warn!(
+                target: "nexus_agent_graph::executor",
+                forced_text = forced_text_turn,
+                declaring = declaring_turn,
+                "risposta VUOTA al turno forzato senza turno dichiarativo -> forced_close_unverified"
+            );
             delta.forced_close_unverified = Some(Some(true));
         }
 
