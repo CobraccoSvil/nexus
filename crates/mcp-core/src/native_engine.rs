@@ -99,7 +99,6 @@ use nexus_agent_graph::nodes::{
     ExecutorConfig, ExecutorNode, VerifierConfig, VerifierNode,
 };
 use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
-use nexus_agent_graph::decisions::LoopThresholds;
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
     LlmGateway, MetaStepStore, ModelUpscalePort, NextActionsDeriver, RunControlStore, SummaryStore,
@@ -632,14 +631,6 @@ async fn load_executor_config(
         // Chiave seminata dalla mig 0506 (regola G, incoerenza rilevata dal
         // censimento anti-loop / ADR 0035).
         iteration_cap: setting_i64(db, "agent.executor.iteration_cap", d.iteration_cap).await,
-        // Ex costanti hardcoded portate in DB (regola G): offset forced-text,
-        // budget escalation unico, soglie loop-by-signature.
-        forced_text_offset: setting_i64(db, "agent.executor.forced_text_offset", d.forced_text_offset).await,
-        max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
-        loop_thresholds: LoopThresholds {
-            signature: setting_i64(db, "agent.loop.signature_threshold", d.loop_thresholds.signature as i64).await.max(1) as usize,
-            cap: setting_i64(db, "agent.loop.recent_signatures_cap", d.loop_thresholds.cap as i64).await.max(1) as usize,
-        },
         progress_controller_enabled: setting_bool(db, "agent.progress_controller_enabled", d.progress_controller_enabled).await,
         repeated_action_threshold: setting_i64(db, "agent.repeated_action_threshold", d.repeated_action_threshold).await,
         repeated_action_threshold_read_only: setting_i64(db, "agent.repeated_action_threshold.read_only", d.repeated_action_threshold_read_only).await,
