@@ -45,6 +45,9 @@ fn node_label(n: NodeTarget) -> &'static str {
         // golden phase2b, mai atteso come output della parita' 1:1). Mappato per
         // esaustivita' del match, coerente con NodeId::as_label.
         NodeTarget::StallRecovery => "stall_recovery",
+        // Scale-controller (gemello di StallRecovery, nessuna controparte Python:
+        // assente dal golden phase2b, mai atteso 1:1). Mappato per esaustivita'.
+        NodeTarget::ScaleControl => "scale_control",
     }
 }
 

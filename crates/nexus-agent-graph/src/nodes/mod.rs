@@ -18,6 +18,7 @@ pub mod learner;
 pub mod planner;
 pub mod reflection;
 pub mod router;
+pub mod scale_control;
 pub mod stall_recovery;
 pub mod todo_runner;
 pub mod tool_dispatch;
@@ -36,6 +37,7 @@ pub use planner::{
 };
 pub use reflection::{ReflectionConfig, ReflectionData, ReflectionNode};
 pub use router::RouterNode;
+pub use scale_control::{ScaleControlNode, SCALE_CONTEXT_KEY, SCALE_MOVE_CACHE_KEY_KEY};
 pub use stall_recovery::{stall_move_key, StallRecoveryNode, STALL_CONTEXT_KEY};
 pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};
 pub use tool_dispatch::{ToolDispatchConfig, ToolDispatchNode};

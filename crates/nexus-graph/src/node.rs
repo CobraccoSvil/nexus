@@ -42,6 +42,13 @@ pub enum NodeId {
     /// consulta la porta `MetaReasonerPort` (UNA sola LLM-call via `ctx.llm`,
     /// replay-safe) e rientra nell'executor via self-loop (`StopReason::StallResolved`).
     StallRecovery,
+    /// Nodo dello SCALE-CONTROLLER (superstep dedicato, gemello di `StallRecovery`).
+    /// Raggiunto dall'executor quando un detector strutturato segnala di valutare la
+    /// scala-tier del modello (`StopReason::ScaleReason`); consulta la porta
+    /// `MetaReasonerPort::assess_scale` (UNA sola LLM-call via `ctx.llm`, replay-safe)
+    /// e rientra nell'executor via self-loop (`StopReason::ScaleResolved`). Inerte
+    /// finche' nessun detector emette `ScaleReason` (flag `agent.scale.enabled` OFF).
+    ScaleControl,
     Verifier,
     FinalGate,
     Reflection,
@@ -63,6 +70,7 @@ impl NodeId {
             NodeId::Executor => "executor",
             NodeId::ToolDispatch => "tool_dispatch",
             NodeId::StallRecovery => "stall_recovery",
+            NodeId::ScaleControl => "scale_control",
             NodeId::Verifier => "verifier",
             NodeId::FinalGate => "final_gate",
             NodeId::Reflection => "reflection",
@@ -84,6 +92,7 @@ impl NodeId {
             "executor" => NodeId::Executor,
             "tool_dispatch" => NodeId::ToolDispatch,
             "stall_recovery" => NodeId::StallRecovery,
+            "scale_control" => NodeId::ScaleControl,
             "verifier" => NodeId::Verifier,
             "final_gate" => NodeId::FinalGate,
             "reflection" => NodeId::Reflection,

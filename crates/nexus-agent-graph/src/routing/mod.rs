@@ -46,6 +46,10 @@ pub enum NodeTarget {
     /// Nodo del meta-reasoner di recovery-da-stallo (superstep dedicato).
     /// Raggiunto quando `route_after_executor` osserva `StopReason::StallReason`.
     StallRecovery,
+    /// Nodo dello SCALE-CONTROLLER (superstep dedicato, gemello di StallRecovery).
+    /// Raggiunto quando `route_after_executor` osserva `StopReason::ScaleReason`.
+    /// INERTE finche' nessun detector emette ScaleReason (flag OFF di default).
+    ScaleControl,
 }
 
 /// `MAX_AGENT_ITERATIONS` Python: cap conservativo di fallback quando lo state
@@ -119,6 +123,17 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
     // INERTE finche' nessun detector emette StallReason (flag OFF di default).
     if stop_reason == Some(StopReason::StallReason) {
         return NodeTarget::StallRecovery;
+    }
+    // (2-ter) Valutazione di SCALA-TIER (up/down del modello, pre-crisi) -> nodo
+    // dedicato ScaleControl (superstep isolato, gemello di StallRecovery). L'executor
+    // emette questo stop_reason (detector-emissione, PR-B3) quando il break-even e i
+    // trigger strutturali autorizzano la valutazione; il nodo consulta la porta
+    // MetaReasonerPort::assess_scale (UNA LLM-call via ctx.llm, replay-safe) e rientra
+    // nell'executor via self-loop (ScaleResolved). Segue subito il ramo StallReason
+    // perche' lo stallo REATTIVO ha precedenza sulla scala PRE-EMPTIVA (FIX-E). INERTE
+    // finche' nessun detector emette ScaleReason (flag agent.scale.enabled OFF).
+    if stop_reason == Some(StopReason::ScaleReason) {
+        return NodeTarget::ScaleControl;
     }
     // (3) Abort coordinato / legacy: final_gate se eleggibile, altrimenti learner.
     if matches!(
@@ -351,6 +366,30 @@ mod tests {
         assert_eq!(
             route_after_executor(&s, &RoutingConfig::default()),
             NodeTarget::ToolDispatch
+        );
+    }
+
+    #[test]
+    fn stall_reason_va_a_stall_recovery() {
+        // Il detector (PR successivo) emette StallReason -> nodo dedicato.
+        let mut s = base();
+        s.stop_reason = Some(StopReason::StallReason);
+        assert_eq!(
+            route_after_executor(&s, &RoutingConfig::default()),
+            NodeTarget::StallRecovery
+        );
+    }
+
+    #[test]
+    fn scale_reason_va_a_scale_control() {
+        // Il detector (PR-B3) emette ScaleReason -> nodo dedicato ScaleControl
+        // (gemello di StallRecovery). INERTE oggi: nessun detector lo emette, ma il
+        // ramo di routing e' verde e testato per quando PR-B3 lo attivera'.
+        let mut s = base();
+        s.stop_reason = Some(StopReason::ScaleReason);
+        assert_eq!(
+            route_after_executor(&s, &RoutingConfig::default()),
+            NodeTarget::ScaleControl
         );
     }
 

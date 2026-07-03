@@ -96,7 +96,8 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use nexus_agent_graph::nodes::{
-    ExecutorConfig, ExecutorNode, StallRecoveryNode, VerifierConfig, VerifierNode,
+    ExecutorConfig, ExecutorNode, ScaleControlNode, StallRecoveryNode, VerifierConfig,
+    VerifierNode,
 };
 use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
 use nexus_agent_graph::decisions::LoopThresholds;
@@ -1188,6 +1189,13 @@ async fn build_native_engine(
         // `Ok(None)` -> il nodo ricade sulla gerarchia fissa
         // `progress_controller::decide` -> comportamento BIT-IDENTICO a oggi.
         stall_recovery: Arc::new(StallRecoveryNode::new(reasoner.clone())),
+        // Scale-controller (gemello di stall_recovery). Riusa la STESSA istanza
+        // `PgMetaReasonerPort` (regola L: UNA sola porta, tre scope disgiunti; il
+        // nodo consuma SOLO `assess_scale`). OPT-IN via `agent.scale.enabled`
+        // (default false): con OFF la porta ritorna `Ok(None)` e, poiche' nessun
+        // detector emette ancora `ScaleReason` (PR-B3), il nodo non e' mai raggiunto
+        // -> comportamento BIT-IDENTICO a oggi.
+        scale_control: Arc::new(ScaleControlNode::new(reasoner.clone())),
         verifier: Arc::new(VerifierNode::new(
             verifier_cfg,
             final_gate_cfg.clone(),
