@@ -488,6 +488,34 @@ impl FinalGateNode {
     /// Riproduce 1:1 il corpo `<final_gate_failed>`, il ramo speciale build
     /// (header + count + nota troncamento), le direttive fail-closed e il
     /// prefisso `<autonomy_hint>` per le modalita' autonome.
+    /// Sunto STRUTTURATO dei criteri FALLITI per il payload del meta_step della
+    /// timeline "Decisioni del turno" (regola M/osservabilita'). Il resoconto
+    /// finale rimanda l'utente a "controlla i criteri falliti nella timeline", ma
+    /// il payload del meta_step non li conteneva (solo cycle/phase): il messaggio
+    /// era percio' a vuoto. Qui esponiamo, per ogni criterio non passato, il tipo
+    /// + il comando (se run_command) + un excerpt breve dell'output/verdict, dalla
+    /// stessa evidence gia' usata da [`render_failed_block`] (nessuna prosa nuova).
+    fn failed_criteria_meta(results: &[CriterionResult]) -> Value {
+        let items: Vec<Value> = results
+            .iter()
+            .filter(|r| !r.passed)
+            .map(|r| {
+                let ev = &r.evidence;
+                let excerpt = str_truthy(ev.get("output_excerpt"))
+                    .or_else(|| str_truthy(ev.get("verdict")))
+                    .or_else(|| str_truthy(ev.get("error")))
+                    .unwrap_or("");
+                let excerpt: String = excerpt.chars().take(500).collect();
+                serde_json::json!({
+                    "type": r.criterion_type,
+                    "command": ev.get("command").and_then(Value::as_str),
+                    "excerpt": excerpt,
+                })
+            })
+            .collect();
+        Value::Array(items)
+    }
+
     pub fn render_failed_block(
         state: &AgentState,
         cycle: i64,
@@ -747,7 +775,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 ctx.exec_mode(),
                 "final_gate",
                 "Verifica non superata: chiudo (limite tentativi)".to_string(),
-                serde_json::json!({"cycle": cycle, "phase": "forced_close", "forced": forced_close}),
+                serde_json::json!({"cycle": cycle, "phase": "forced_close", "forced": forced_close, "failed_criteria": Self::failed_criteria_meta(&results)}),
             )
             .await;
             return Ok(StateDelta {
@@ -773,7 +801,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             ctx.exec_mode(),
             "final_gate",
             format!("Verifica fallita: rimando in correzione ({cycle}/{max_cycles})"),
-            serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "failed"}),
+            serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "failed", "failed_criteria": Self::failed_criteria_meta(&results)}),
         )
         .await;
         let block = Self::render_failed_block(state, cycle, max_cycles, &results);
