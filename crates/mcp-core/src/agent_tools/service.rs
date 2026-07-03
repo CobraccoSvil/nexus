@@ -66,6 +66,10 @@ pub(crate) fn looks_like_web_service(command: &str) -> bool {
         // Make/script wrapper noti
         "npm run dev",
         "npm run start",
+        // `npm start` nudo e' l'alias built-in di `npm run start`: senza questo
+        // token il servizio partiva SENZA PORT injection e leggeva la porta
+        // stantia dal .env (incidente Beaty-Book 2026-07-02, EADDRINUSE).
+        "npm start",
         "npm run serve",
         "pnpm dev",
         "pnpm start",
@@ -636,16 +640,24 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
         _ => ctx.root_path.to_string_lossy().to_string(),
     };
 
-    // Ferma tutti i processi attivi con questa label
+    // Ferma tutti i processi attivi con questa label. stop_process ora VERIFICA
+    // l'esito (PID morto + porta della label libera, con retry) prima di marcare
+    // 'stopped': a verifica fallita si abortisce il restart invece di rilanciare
+    // un processo destinato a EADDRINUSE. Lo sleep cieco post-stop non serve
+    // piu': l'attesa della porta libera e' dentro la verifica.
     for proc in matching
         .iter()
         .filter(|p| p.status == "running" || p.status == "starting")
     {
-        let _ = crate::agent_processes::stop_process(&ctx.db, ctx.project_id, proc.id).await;
+        if let Err(e) =
+            crate::agent_processes::stop_process(&ctx.db, ctx.project_id, proc.id).await
+        {
+            return format!(
+                "[Errore restart '{}': stop del processo esistente non verificato: {}]",
+                label, e
+            );
+        }
     }
-
-    // Breve pausa per garantire che le porte siano liberate
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Riavvia con lo stesso comando
     let restart_input = serde_json::json!({
@@ -818,8 +830,14 @@ mod tests {
         assert!(looks_like_web_service("npm run dev"));
         assert!(looks_like_web_service("pnpm dev"));
         assert!(looks_like_web_service("next dev"));
+        // `npm start` nudo (alias di `npm run start`): prima del fix NON veniva
+        // riconosciuto, il server partiva senza PORT injection e leggeva la
+        // porta stantia dal .env (incidente Beaty-Book 2026-07-02).
+        assert!(looks_like_web_service("npm start"));
+        assert!(looks_like_web_service("cd backend && npm start"));
         assert!(!looks_like_web_service("ls -la"));
         assert!(!looks_like_web_service("cargo build"));
+        assert!(!looks_like_web_service("npm install"));
     }
 
 

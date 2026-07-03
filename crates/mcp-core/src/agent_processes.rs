@@ -84,8 +84,21 @@ pub async fn stop_similar_running_services(
                 process_id = %id,
                 "servizio duplicato dello stesso scopo fermato prima del nuovo avvio"
             );
-            let _ = stop_process(db, project_id, id).await;
-            stopped.push(other);
+            match stop_process(db, project_id, id).await {
+                Ok(_) => stopped.push(other),
+                Err(e) => {
+                    // Stop NON verificato (regola M): la label non viene
+                    // dichiarata fermata. L'occupante residuo verra' comunque
+                    // intercettato da find_or_allocate (porta occupata da PID
+                    // tracciato/non tracciato) invece di produrre EADDRINUSE.
+                    tracing::warn!(
+                        process_id = %id,
+                        old_label = %other,
+                        error = %e,
+                        "stop del servizio duplicato NON verificato: porta potenzialmente ancora occupata"
+                    );
+                }
+            }
         }
     }
     stopped
@@ -514,6 +527,18 @@ pub struct ProcessOutput {
 }
 
 /// Stop a running process by PID (e Docker container, se applicabile).
+///
+/// L'esito e' VERIFICATO prima di toccare lo status (regola H, incidente
+/// Beaty-Book 2026-07-02): il vecchio flusso marcava 'stopped' PRIMA del kill e
+/// il kill era fire-and-forget sul PID del wrapper shell; se un discendente
+/// (node) sopravviveva — su Windows `taskkill /T` non vede i figli con catena
+/// dei parent spezzata — il DB dichiarava 'stopped' con la porta ancora in
+/// LISTEN e il riavvio successivo moriva in EADDRINUSE. Ora: kill via punto
+/// unico `kill_process_tree`, verifica con retry che il PID sia morto E la
+/// porta della label libera (`ensure_process_stopped`, che se serve risale al
+/// VERO occupante per porta), e solo a verifica riuscita si marca 'stopped'.
+/// A verifica fallita si ritorna `Err` (segnale strutturato, regola M) e lo
+/// status resta quello reale.
 pub async fn stop_process(
     db: &PgPool,
     project_id: Uuid,
@@ -522,7 +547,7 @@ pub async fn stop_process(
     // Separazione DB: agent_processes vive nel pool del progetto (flag ON),
     // risolto dal project_id passato dal chiamante. A flag OFF -> meta-DB.
     let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-    let row = sqlx::query("SELECT pid, status FROM agent_processes WHERE id=$1")
+    let row = sqlx::query("SELECT pid, status, label FROM agent_processes WHERE id=$1")
         .bind(process_id)
         .fetch_optional(&proj_pool)
         .await
@@ -534,43 +559,50 @@ pub async fn stop_process(
         return Ok(format!("Process already {status}"));
     }
 
-    // Marca subito come 'stopped' PRIMA di inviare il segnale (evita race condition).
-    let _ = sqlx::query(
-        "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1 AND status IN ('running','starting')",
+    let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
+    let label: String = row.try_get("label").unwrap_or_default();
+
+    // Porta governata dalla label (se il servizio ne ha una): e' il segnale
+    // primario della verifica post-kill. `nexus_port_allocations` non e' una
+    // tabella migrata: vive nel meta-DB, si legge da `db`.
+    let port: Option<u16> = sqlx::query_scalar::<_, i32>(
+        "SELECT port FROM nexus_port_allocations WHERE project_id = $1 AND label = $2 LIMIT 1",
     )
-    .bind(process_id)
-    .execute(&proj_pool)
-    .await;
+    .bind(project_id)
+    .bind(&label)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|p| u16::try_from(p).ok());
 
     // 1. Ferma il container Docker (se esiste) — va fatto PRIMA di killare il docker CLI
     sandbox::stop_sandbox_container(process_id).await;
 
-    // 2. Kill del process group (docker CLI o processo diretto)
-    let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
-    if let Some(pid) = pid {
-        #[cfg(unix)]
-        {
-            // kill dell'intero process group (-{pid}): graceful (TERM) poi forzato (9).
-            let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &format!("-{pid}")])
-                .output()
-                .await;
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = tokio::process::Command::new("kill")
-                .args(["-9", &format!("-{pid}")])
-                .output()
-                .await;
-        }
-        #[cfg(windows)]
-        {
-            // taskkill /T termina l'intero albero processi (equivalente del process
-            // group Unix), /F forzato. Niente `kill` su Windows.
-            let _ = tokio::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .output()
-                .await;
-        }
+    // 2. Kill dell'albero processi: PUNTO UNICO kill_process_tree (regola L) —
+    //    Unix: TERM del process group poi KILL, con i check anti-suicidio;
+    //    Windows: taskkill /PID /T /F.
+    let clean_pid = pid.and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 0);
+    if let Some(pid) = clean_pid {
+        crate::project_workspace::port_recovery::kill_process_tree(pid).await;
     }
+
+    // 3. Verifica post-kill PRIMA di marcare 'stopped': PID morto e porta della
+    //    label libera, con retry breve. Nel frattempo il task monitor puo' aver
+    //    scritto 'failed' (exit non-zero causato dal NOSTRO kill): lo si
+    //    sovrascrive al passo 4 solo a verifica riuscita.
+    if !crate::project_workspace::port_recovery::ensure_process_stopped(clean_pid, port).await {
+        return Err(format!(
+            "stop NON verificato per il processo {process_id} (pid {clean_pid:?}, porta {port:?}): \
+             il processo o un suo discendente e' ancora attivo; status lasciato invariato"
+        ));
+    }
+
+    // 4. Solo ora lo stato dichiarato coincide con quello reale.
+    let _ = sqlx::query("UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1")
+        .bind(process_id)
+        .execute(&proj_pool)
+        .await;
 
     Ok("Process stopped".to_string())
 }
