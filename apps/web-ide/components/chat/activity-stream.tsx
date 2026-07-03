@@ -24,6 +24,8 @@ import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { PlanChecklist } from "./agent-meta-step-card";
 import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
+import { InlineTruncated, formatStepInput } from "./step-detail";
+import { capStreamToRecent } from "../../lib/use-chat/activity-stream";
 import type {
   ActivityStream,
   ActivitySegment,
@@ -297,6 +299,111 @@ function EventRow({
   );
 }
 
+/** Riga tool: nome + target + esito, cliccabile per espandere Parametri
+ *  (input) + Risultato/Errore (troncati). Ripristina il dettaglio per-step nel
+ *  nastro (vale sia live sia storico). Espandibile solo se ha input o result. */
+function ToolEventBody({
+  event,
+  segColor,
+  tc,
+}: {
+  event: ToolEvent;
+  segColor: string;
+  tc: ThemeColors;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const hasInput = event.input != null && Object.keys(event.input).length > 0;
+  const hasResult = typeof event.result === "string" && event.result.length > 0;
+  const expandable = hasInput || hasResult;
+  const isErr = event.outcome === "err";
+
+  return (
+    <div style={{ minWidth: 0 }}>
+      <div style={rowStyle}>
+        <span className="nx-as-kind-label" style={kindLabelStyle(segColor)}>
+          {EVENT_KIND_LABEL.tool}
+        </span>
+        {typeof event.iteration === "number" && (
+          <span style={metaStyle(tc)}>iter. {event.iteration + 1}</span>
+        )}
+      </div>
+      <div
+        onClick={() => expandable && setExpanded((v) => !v)}
+        style={{
+          marginTop: 4,
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          flexWrap: "wrap",
+          fontSize: 12,
+          minWidth: 0,
+          cursor: expandable ? "pointer" : "default",
+        }}
+      >
+        {expandable && (
+          <span aria-hidden style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: tc.textMuted, flexShrink: 0 }}>
+            {expanded ? "▾" : "▸"}
+          </span>
+        )}
+        <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: tc.text, flexShrink: 0 }}>
+          {toolLabel(event.name)}
+        </span>
+        {event.target && (
+          <span
+            className="nx-as-tool-target"
+            title={event.target}
+            style={{ fontFamily: "var(--font-mono)", color: tc.textMuted, fontSize: 11 }}
+          >
+            {event.target}
+          </span>
+        )}
+        <ToolOutcomeTag tool={event} tc={tc} />
+      </div>
+      {expanded && expandable && (
+        <div
+          style={{
+            marginTop: 6,
+            marginLeft: 8,
+            paddingLeft: 8,
+            borderLeft: `2px solid ${withAlpha(isErr ? tc.error : "#22c55e", 0.4)}`,
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+            minWidth: 0,
+          }}
+        >
+          {hasInput && (
+            <div>
+              <div style={detailLabelStyle(tc)}>Parametri</div>
+              <InlineTruncated text={formatStepInput(event.input!)} maxLen={400} tc={tc} mono />
+            </div>
+          )}
+          {hasResult && (
+            <div>
+              <div style={{ ...detailLabelStyle(tc), color: isErr ? tc.error : undefined }}>
+                {isErr ? "Errore" : "Risultato"}
+              </div>
+              <InlineTruncated text={event.result!} maxLen={500} tc={tc} mono />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function detailLabelStyle(tc: ThemeColors): React.CSSProperties {
+  return {
+    fontWeight: 600,
+    fontSize: 10,
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    opacity: 0.6,
+    marginBottom: 3,
+    color: tc.textMuted,
+  };
+}
+
 function EventBody({
   event,
   segColor,
@@ -339,43 +446,7 @@ function EventBody({
     case "thought":
       return <ThoughtBlock text={event.text} tc={tc} />;
     case "tool":
-      return (
-        <div style={{ minWidth: 0 }}>
-          <div style={rowStyle}>
-            <span className="nx-as-kind-label" style={kindLabelStyle(segColor)}>
-              {EVENT_KIND_LABEL.tool}
-            </span>
-            {typeof event.iteration === "number" && (
-              <span style={metaStyle(tc)}>iter. {event.iteration + 1}</span>
-            )}
-          </div>
-          <div
-            style={{
-              marginTop: 4,
-              display: "flex",
-              alignItems: "center",
-              gap: 7,
-              flexWrap: "wrap",
-              fontSize: 12,
-              minWidth: 0,
-            }}
-          >
-            <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: tc.text, flexShrink: 0 }}>
-              {toolLabel(event.name)}
-            </span>
-            {event.target && (
-              <span
-                className="nx-as-tool-target"
-                title={event.target}
-                style={{ fontFamily: "var(--font-mono)", color: tc.textMuted, fontSize: 11 }}
-              >
-                {event.target}
-              </span>
-            )}
-            <ToolOutcomeTag tool={event} tc={tc} />
-          </div>
-        </div>
-      );
+      return <ToolEventBody event={event} segColor={segColor} tc={tc} />;
     case "folded_tools":
       return (
         <div style={rowStyle}>
@@ -465,16 +536,31 @@ function SegmentView({ segment, tc }: { segment: ActivitySegment; tc: ThemeColor
  * @param stream modello prodotto da composeActivityStream
  * @param tc     tema
  * @param foldThreshold soglia densita' gia' applicata a monte (informativa)
+ * @param liveCap se valorizzato (>0), CAPPA il nastro agli ultimi `liveCap`
+ *   eventi non-switch con un toggle "Mostra tutto" (usato SOLO nel rendering
+ *   LIVE per non esplodere sui run lunghi). Lo storico non lo passa -> mostra
+ *   tutto. Le bande "Cambio provider" restano sempre visibili.
  */
 export function ActivityStreamView({
   stream,
   tc,
+  liveCap,
 }: {
   stream: ActivityStream;
   tc: ThemeColors;
   foldThreshold?: FoldThreshold;
+  liveCap?: number;
 }) {
+  const [showAll, setShowAll] = useState(false);
   if (stream.empty) return null;
+
+  // Cap solo se liveCap valorizzato e l'utente non ha chiesto "Mostra tutto".
+  const capped =
+    liveCap && liveCap > 0 && !showAll ? capStreamToRecent(stream, liveCap) : null;
+  const renderStream = capped ? capped.stream : stream;
+  const hiddenCount = capped?.hiddenCount ?? 0;
+  const totalEvents = capped?.totalEvents ?? 0;
+
   return (
     <div
       data-testid="activity-stream"
@@ -487,7 +573,34 @@ export function ActivityStreamView({
         minWidth: 0,
       }}
     >
-      {stream.segments.map((seg, i) => (
+      {/* Toggle cap live: appare solo se ci sono eventi nascosti o se
+          l'espansione e' attiva (per poter tornare al recente). */}
+      {liveCap && liveCap > 0 && (hiddenCount > 0 || showAll) && (
+        <button
+          type="button"
+          onClick={() => setShowAll((v) => !v)}
+          aria-expanded={showAll}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            background: "transparent",
+            border: "none",
+            color: tc.textMuted,
+            cursor: "pointer",
+            fontSize: 11,
+            padding: "6px 10px 2px",
+          }}
+        >
+          <span aria-hidden style={{ fontFamily: "var(--font-mono)" }}>
+            {showAll ? "▾" : "▸"}
+          </span>
+          {showAll
+            ? "Mostra solo i recenti"
+            : `Mostra tutti gli ${totalEvents} eventi (${hiddenCount} nascosti)`}
+        </button>
+      )}
+      {renderStream.segments.map((seg, i) => (
         <SegmentView key={`seg-${i}`} segment={seg} tc={tc} />
       ))}
     </div>

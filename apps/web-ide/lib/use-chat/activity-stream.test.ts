@@ -16,6 +16,7 @@ import {
   foldConsecutiveOkTools,
   aggregateTokensByProvider,
   tracesForRun,
+  capStreamToRecent,
   type ActivityEvent,
   type ToolEvent,
 } from "./activity-stream.ts";
@@ -261,4 +262,88 @@ test("stream vuoto: nessun segnale -> empty true", () => {
   const stream = composeActivityStream([], [], [], 3);
   assert.equal(stream.empty, true);
   assert.equal(stream.segments.length, 0);
+});
+
+// ── ToolEvent porta input/result dallo step (espansione riga tool) ──────────
+
+test("ToolEvent espone input e result dallo step", () => {
+  beforeEach();
+  const steps: AgentStep[] = [
+    step("edit_file", "completed", 0, {
+      toolInput: { path: "src/main.rs", content: "fn main() {}" },
+      toolResult: "file scritto (12 righe)",
+    }),
+  ];
+  const s = composeActivityStream([], steps, [], 3);
+  const tool = s.segments[0].events.find((e): e is ToolEvent => e.type === "tool");
+  assert.ok(tool);
+  assert.deepEqual(tool.input, { path: "src/main.rs", content: "fn main() {}" });
+  assert.equal(tool.result, "file scritto (12 righe)");
+});
+
+// ── Cap live (capStreamToRecent) ────────────────────────────────────────────
+
+test("cap: sotto soglia -> stream invariato, hiddenCount 0", () => {
+  beforeEach();
+  const steps: AgentStep[] = [
+    step("read_file", "failed", 0), // failed rompe il folding -> resta tool singolo
+    step("edit_file", "failed", 1),
+  ];
+  const s = composeActivityStream([], steps, [], 3);
+  const capped = capStreamToRecent(s, 5);
+  assert.equal(capped.hiddenCount, 0);
+  assert.equal(capped.totalEvents, 2);
+  assert.strictEqual(capped.stream, s, "stream identico quando sotto soglia");
+});
+
+test("cap: sopra soglia -> tiene ultimi K, hiddenCount corretto, piu' recente in fondo", () => {
+  beforeEach();
+  // 5 tool tutti FALLITI (evita il folding) -> 5 eventi non-switch.
+  const steps: AgentStep[] = [
+    step("run", "failed", 0, { toolResult: "err0" }),
+    step("run", "failed", 1, { toolResult: "err1" }),
+    step("run", "failed", 2, { toolResult: "err2" }),
+    step("run", "failed", 3, { toolResult: "err3" }),
+    step("run", "failed", 4, { toolResult: "err4" }),
+  ];
+  const s = composeActivityStream([], steps, [], 3);
+  const capped = capStreamToRecent(s, 2);
+  assert.equal(capped.totalEvents, 5);
+  assert.equal(capped.hiddenCount, 3, "5 - 2 = 3 nascosti");
+  const kept = capped.stream.segments.flatMap((seg) =>
+    seg.events.filter((e): e is ToolEvent => e.type === "tool"),
+  );
+  assert.equal(kept.length, 2);
+  // L'evento piu' recente (iter 4) e' l'ultimo tenuto.
+  assert.equal(kept[kept.length - 1].iteration, 4);
+  assert.equal(kept[0].iteration, 3);
+});
+
+test("cap: le bande switch restano SEMPRE visibili anche se cappate", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta("executor_call", { iteration: 0, provider: "google", model: "gemini" }),
+    // molti tool sul primo provider (falliti per evitare folding)
+    ...([] as MetaStepEntry[]),
+    meta("escalation", {
+      from_provider: "google",
+      to_provider: "anthropic",
+      to_model: "claude",
+      reason: "loop",
+    }),
+    meta("executor_call", { iteration: 10, provider: "anthropic", model: "claude" }),
+  ];
+  const steps: AgentStep[] = [
+    step("run", "failed", 0, { toolResult: "e" }),
+    step("run", "failed", 1, { toolResult: "e" }),
+    step("run", "failed", 2, { toolResult: "e" }),
+    step("run", "failed", 10, { toolResult: "e" }),
+  ];
+  const s = composeActivityStream(metaSteps, steps, [], 3);
+  // cap molto stretto: 1 evento. La banda switch (segmento anthropic) resta.
+  const capped = capStreamToRecent(s, 1);
+  const switchSeg = capped.stream.segments.find((seg) => seg.openedBySwitch);
+  assert.ok(switchSeg, "il segmento aperto da switch e' preservato");
+  assert.ok(switchSeg.switch, "la banda switch e' preservata");
+  assert.equal(switchSeg.switch?.toProvider, "anthropic");
 });

@@ -801,6 +801,7 @@ export function AgentStepsPanel({
               foldThreshold ?? 3,
             )}
             tc={tc}
+            liveCap={7}
           />
         </div>
       ) : (

@@ -68,6 +68,12 @@ export interface ToolEvent {
   exitCode?: number;
   /** iterazione dell'agent loop, se nota. */
   iteration?: number;
+  /** input strutturato del tool (toolInput dello step): per l'espansione
+   *  "Parametri" della riga tool nel nastro. */
+  input?: Record<string, unknown>;
+  /** risultato/errore del tool (toolResult dello step): per l'espansione
+   *  "Risultato/Errore" della riga tool (troncato in UI). */
+  result?: string;
 }
 
 export interface SwitchEvent {
@@ -404,6 +410,9 @@ export function composeActivityStream(
         outcome: stepOutcome(s.status),
         exitCode: extractExitCode(s),
         iteration: s.stepIndex,
+        // Dettaglio per l'espansione della riga tool (parametri + risultato).
+        input: s.toolInput,
+        result: s.toolResult,
       });
     }
   }
@@ -471,6 +480,66 @@ export function foldConsecutiveOkTools(
 /** Filtra le trace di un singolo run (le trace in useChat sono per-sessione). */
 export function tracesForRun(traces: AITraceEvent[], runId: string): AITraceEvent[] {
   return traces.filter((t) => t.runId === runId);
+}
+
+// ── Cap live (anti-verbosita') ──────────────────────────────────────────────
+// Sui run lunghi il nastro LIVE diventa troppo lungo. Questa funzione pura
+// restituisce una versione "cappata" dello stream che mostra solo gli ultimi
+// `cap` eventi NON-switch, PRESERVANDO sempre tutte le bande "Cambio provider"
+// (segmenti openedBySwitch: sono pochi e sono il segnale multi-provider chiave).
+// L'evento piu' recente resta sempre visibile (in fondo). `hiddenCount` = numero
+// di eventi non-switch nascosti (per il testo del toggle "Mostra tutti").
+//
+// Usato SOLO nel rendering live (AgentStepsPanel); lo storico mostra tutto.
+
+export interface CappedStream {
+  stream: ActivityStream;
+  hiddenCount: number;
+  /** totale eventi non-switch nello stream originale (per il testo "N eventi"). */
+  totalEvents: number;
+}
+
+export function capStreamToRecent(stream: ActivityStream, cap: number): CappedStream {
+  // Conta gli eventi non-switch totali (le bande switch non contano nel cap).
+  const totalEvents = stream.segments.reduce(
+    (n, seg) => n + seg.events.filter((e) => e.type !== "switch").length,
+    0,
+  );
+  if (cap <= 0 || totalEvents <= cap) {
+    return { stream, hiddenCount: 0, totalEvents };
+  }
+
+  // Soglia: teniamo solo gli ultimi `cap` eventi non-switch in ordine GLOBALE.
+  // Calcoliamo l'indice globale del primo evento da tenere.
+  const keepFromGlobalIndex = totalEvents - cap;
+
+  let globalIndex = 0;
+  const cappedSegments: ActivitySegment[] = [];
+  for (const seg of stream.segments) {
+    const keptEvents: ActivityEvent[] = [];
+    for (const ev of seg.events) {
+      if (ev.type === "switch") {
+        // le bande switch vivono nel campo `seg.switch`, non negli events resi;
+        // qui non incrementiamo il contatore (coerente con il conteggio sopra).
+        keptEvents.push(ev);
+        continue;
+      }
+      if (globalIndex >= keepFromGlobalIndex) keptEvents.push(ev);
+      globalIndex += 1;
+    }
+    const hasVisibleEvent = keptEvents.some((e) => e.type !== "switch");
+    // Un segmento resta se: e' aperto da switch (banda sempre visibile) OPPURE
+    // ha almeno un evento non nascosto.
+    if (seg.openedBySwitch || hasVisibleEvent) {
+      cappedSegments.push({ ...seg, events: keptEvents });
+    }
+  }
+
+  return {
+    stream: { segments: cappedSegments, empty: cappedSegments.length === 0 },
+    hiddenCount: keepFromGlobalIndex,
+    totalEvents,
+  };
 }
 
 // ── Aggregazione costo-per-provider (regola G: prezzi dal catalogo) ──────────

@@ -17,6 +17,7 @@ import {
 import { ActivityStreamView } from "./activity-stream";
 import { ActivityCostFooter } from "./activity-cost-footer";
 import { ActivityHistoryRow } from "./activity-history-row";
+import { InlineTruncated, formatStepInput } from "./step-detail";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -371,54 +372,6 @@ function RunStatusBadge({ status, tc }: { status: string; tc: ThemeColors }) {
   );
 }
 
-function InlineTruncated({ text, maxLen = 400, tc, mono = true }: { text: string; maxLen?: number; tc: ThemeColors; mono?: boolean }) {
-  const [full, setFull] = useState(false);
-  const truncated = text.length > maxLen;
-  const display = full || !truncated ? text : text.slice(0, maxLen) + "...";
-  return (
-    <div>
-      <pre style={{
-        fontFamily: mono ? "var(--font-mono)" : "inherit",
-        fontSize: 11,
-        whiteSpace: "pre-wrap",
-        wordBreak: "break-word",
-        margin: 0,
-        maxHeight: full ? 500 : 160,
-        overflowY: "auto",
-        color: tc.text,
-        background: `${tc.bgInput ?? tc.border}40`,
-        borderRadius: 4,
-        padding: "4px 6px",
-      }}>
-        {display}
-      </pre>
-      {truncated && (
-        <button
-          type="button"
-          onClick={() => setFull(v => !v)}
-          style={{ fontSize: 10, color: tc.accent, background: "none", border: "none", cursor: "pointer", padding: "2px 0", fontWeight: 600 }}
-        >
-          {full ? "Comprimi" : `Mostra tutto (${text.length.toLocaleString()} car.)`}
-        </button>
-      )}
-    </div>
-  );
-}
-
-function formatStepInput(input: Record<string, unknown>): string {
-  const lines: string[] = [];
-  for (const [key, val] of Object.entries(input)) {
-    if (typeof val === "string" && val.length > 300) {
-      lines.push(`${key}: [${val.length} car.]`);
-    } else if (typeof val === "object" && val !== null) {
-      const j = JSON.stringify(val);
-      lines.push(j.length > 300 ? `${key}: [oggetto, ${j.length} car.]` : `${key}: ${j}`);
-    } else {
-      lines.push(`${key}: ${String(val)}`);
-    }
-  }
-  return lines.join("\n");
-}
 
 /**
  * Pulsanti delle scelte di proseguimento (next_actions) per un singolo messaggio
