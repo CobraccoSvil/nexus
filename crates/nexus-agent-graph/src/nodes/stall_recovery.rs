@@ -275,6 +275,7 @@ mod tests {
     use crate::routing::config::RoutingConfig;
     use crate::runtime::ports::{ExecMode, PortError};
     use crate::runtime::ports::{OrchestrationContext, OrchestrationMove};
+    use crate::runtime::ports::{ScaleContext, ScaleMove};
     use crate::runtime::{AgentNodeCtx, NullEventSink, StubMetaReasonerPort};
     use crate::state::AgentState;
     use sqlx::postgres::PgPoolOptions;
@@ -301,10 +302,18 @@ mod tests {
         ) -> Result<Option<OrchestrationMove>, PortError> {
             Ok(None)
         }
+
+        async fn assess_scale(
+            &self,
+            _ctx: ScaleContext,
+            _mode: ExecMode,
+        ) -> Result<Option<ScaleMove>, PortError> {
+            Ok(None)
+        }
     }
 
-    /// Porta reasoner che ritorna sempre errore (ramo degrado). `orchestrate`
-    /// inerte (il nodo StallRecovery non lo consulta).
+    /// Porta reasoner che ritorna sempre errore (ramo degrado). `orchestrate` e
+    /// `assess_scale` inerti (il nodo StallRecovery non li consulta).
     struct FailingReasoner;
 
     #[async_trait]
@@ -322,6 +331,14 @@ mod tests {
             _ctx: OrchestrationContext,
             _mode: ExecMode,
         ) -> Result<Option<OrchestrationMove>, PortError> {
+            Ok(None)
+        }
+
+        async fn assess_scale(
+            &self,
+            _ctx: ScaleContext,
+            _mode: ExecMode,
+        ) -> Result<Option<ScaleMove>, PortError> {
             Ok(None)
         }
     }

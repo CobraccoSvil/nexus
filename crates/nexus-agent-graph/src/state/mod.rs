@@ -97,6 +97,24 @@ pub enum StopReason {
     /// `StallRecovery`, il cui edge instrada direttamente all'executor): la
     /// variante e' il segnale che il superstep di recovery e' concluso.
     StallResolved,
+    /// L'executor ha rilevato che e' il momento di VALUTARE la scala-tier del
+    /// modello (up/down PRE-CRISI) e instrada al nodo dedicato `ScaleControl`
+    /// (superstep isolato, SCALE-CONTROLLER). Gemello di [`StopReason::StallReason`]:
+    /// e' un segnale di ROUTING interno; il `ScaleContext` serializzato viaggia in
+    /// `extra`.
+    ///
+    /// INERTE in PR-A: nessun detector lo emette ancora (il nodo `ScaleControl` e
+    /// l'innesto nell'executor sono PR-B). La variante esiste per il futuro wiring;
+    /// con `agent.scale.enabled=false` (default) nulla la produce -> bit-identico.
+    /// `route_after_executor` la instradera' in PR-B (in PR-A cade sul ramo default
+    /// come qualunque stop non gestito, ma non e' mai prodotta).
+    ScaleReason,
+    /// Il nodo `ScaleControl` ha risolto la scala (mossa scelta o `KeepTier`) e
+    /// rientra nell'executor (self-loop, come `StallResolved`). Gemello di
+    /// [`StopReason::StallResolved`].
+    ///
+    /// INERTE in PR-A: nessun nodo la produce (il nodo `ScaleControl` e' PR-B).
+    ScaleResolved,
     /// Errore provider durante l'executor (`__init__.py:3104-3107`): l'executor
     /// scrive `result="[Errore provider ...]"` (NON vuoto) e `stop_reason="error"`.
     /// Serializza in `"error"` (snake_case): e' il SOLO valore che fa entrare il
@@ -418,6 +436,23 @@ pub struct AgentState {
     pub planner_sticky_provider: Option<String>,
     /// Modello sticky specifico del planner.
     pub planner_sticky_model: Option<String>,
+
+    // ── Scale-controller (FIX-A: tier autoritativo checkpointato) ────────────────
+    /// Tier di scala CORRENTE del run (`light`/`medium`/`heavy`), stato
+    /// AUTORITATIVO checkpointato dello SCALE-CONTROLLER (FIX-A, regola H): scritto
+    /// dal ramo che risolve il modello (routing iniziale / smart-upscale /
+    /// escalation) col `performance_tier` gia' noto al pick, MAI ricalcolato via DB
+    /// a volo (romperebbe il determinismo di replay). Il modulo puro
+    /// [`crate::decisions::scale_reason::build_scale_context`] lo legge come segnale
+    /// (fallback deterministico `medium` se assente, default catalog mig 0032).
+    ///
+    /// INERTE in PR-A (SCALE-CONTROLLER fondamenta): questo campo NON e' ancora
+    /// scritto dai call-site sticky (la propagazione del tier richiede di estendere
+    /// le porte `EscalationPort`/`ModelUpscalePort` per trasportare il tier, che e'
+    /// PR-B) NE' letto da alcun decisore (il routing usa `sticky_provider/model`,
+    /// non `current_tier`). Presente per il futuro wiring: `None` -> ogni consumatore
+    /// (PR-B) ricade sul default `medium` -> comportamento invariato -> bit-identico.
+    pub current_tier: Option<String>,
 
     // ── Automazione ─────────────────────────────────────────────────────────────
     /// Modalita' automazione del turno chat propagata da mcp-core.

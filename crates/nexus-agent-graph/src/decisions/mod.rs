@@ -68,6 +68,7 @@ pub mod orchestration_reason;
 pub mod predictive_cap;
 pub mod progress_controller;
 pub mod reward;
+pub mod scale_reason;
 pub mod tool_dispatch;
 pub mod turn_focus;
 
@@ -109,6 +110,10 @@ pub use tool_dispatch::{
 pub use reward::{
     aggregate_score, final_reward, heuristic_reward, prelim_reward, round_half_even,
     MAX_AGENT_ITERATIONS,
+};
+pub use scale_reason::{
+    apply_hysteresis, build_scale_context, context_window_ok, scale_cache_key, scale_trigger,
+    validate_scale_move, ScaleHysteresisConfig, ScaleTriggerConfig,
 };
 pub use helpers::{
     action_oriented_for_intent, compute_iteration_budget, estimate_prompt_complexity,

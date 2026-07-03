@@ -1255,15 +1255,195 @@ pub enum OrchestrationMove {
     Fallback,
 }
 
-/// Porta UNICA del meta-reasoner LLM (opt-in DB, ADR 0036-style). Espone DUE
+/// Tier di scala del modello (`light`/`medium`/`heavy`): valore opaco che riflette
+/// la tassonomia `ai_price_catalog.performance_tier` (CHECK light/medium/heavy, mig
+/// 0032, default `medium`). Qui e' un dominio STRUTTURATO (regola M): lo scale-controller
+/// ragiona sul TIER astratto, non su un nome modello (regola G). Il tier->modello sano
+/// e' risolto A VALLE (PR-B) via `best_model_for_tier`/`select_agentic_model`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleTier {
+    /// Modelli piccoli/economici (bassa potenza, bassa latenza/costo).
+    Light,
+    /// Tier intermedio (default catalog, mig 0032).
+    #[default]
+    Medium,
+    /// Modelli grandi/potenti (alta potenza, alto costo).
+    Heavy,
+}
+
+impl ScaleTier {
+    /// Etichetta canonica del tier (`light`/`medium`/`heavy`), 1:1 con
+    /// `ai_price_catalog.performance_tier`. Usata per serializzare/chiave-cache.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScaleTier::Light => "light",
+            ScaleTier::Medium => "medium",
+            ScaleTier::Heavy => "heavy",
+        }
+    }
+
+    /// Parsa un tier dal catalog (`light`/`medium`/`heavy`, case-insensitive,
+    /// trimmed). Valore fuori vocabolario -> `None` (il chiamante decide il
+    /// fallback DETERMINISTICO, tipicamente [`ScaleTier::Medium`], default catalog):
+    /// niente magic-fallback nascosto qui (regola G), solo parsing puro.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(ScaleTier::Light),
+            "medium" => Some(ScaleTier::Medium),
+            "heavy" => Some(ScaleTier::Heavy),
+            _ => None,
+        }
+    }
+
+    /// Ordinale del tier per il clamp "1 gradino per epoca" (light=0/medium=1/heavy=2).
+    pub fn rank(&self) -> i64 {
+        match self {
+            ScaleTier::Light => 0,
+            ScaleTier::Medium => 1,
+            ScaleTier::Heavy => 2,
+        }
+    }
+}
+
+/// Contesto STRUTTURATO passato allo SCALE-CONTROLLER (TERZO scope disgiunto della
+/// [`MetaReasonerPort`], gemello di [`StallContext`]/[`OrchestrationContext`]: tipi
+/// DISGIUNTI, nessun campo condiviso, nessun enum wrapper — regola L). Regola M:
+/// SOLO segnali strutturati (tier, contatori, pressione-contesto, streak, cost,
+/// capability, guard deterministiche), MAI prosa da cui dedurre stato. Costruito
+/// deterministicamente dal modulo puro
+/// [`crate::decisions::scale_reason::build_scale_context`] dai segnali gia' risolti
+/// dall'executor (nessun I/O al build, FIX-A: `current_tier` letto dallo stato
+/// checkpointato, non ricalcolato via DB), serializzato in JSON e passato all'LLM
+/// (non l'intera history: budget/costo).
+///
+/// L'LLM sceglie SOLO il tier astratto + confidence; i 5 gate deterministici di
+/// [`crate::decisions::scale_reason::apply_hysteresis`] (l'LLM NON li scavalca) e il
+/// tier->modello a valle (PR-B) restano fuori dal suo controllo.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScaleContext {
+    /// Tier corrente del run (da `AgentState.current_tier` checkpointato, FIX-A):
+    /// il decisore ragiona da qui, non da un lookup a volo.
+    pub current_tier: ScaleTier,
+    /// Pavimento di tier per l'intent corrente (FIX-D, regola G): il downscale non
+    /// scende MAI sotto questo tier. Risolto a monte (I/O nel call site mcp-core),
+    /// qui e' un segnale gia' pronto.
+    pub intent_tier_floor: ScaleTier,
+    /// Intento utente del run (testo utente per orientare la scala; NON prosa di
+    /// sistema da cui dedurre stato). `None` se non classificato.
+    pub user_intent: Option<String>,
+    /// Behavior_mode del run (`study`/`confirm`/`automatic`/...): valore opaco
+    /// risolto a monte.
+    pub behavior_mode: String,
+    /// Iterazioni gia' consumate dal run.
+    pub iterations: i64,
+    /// Cap di iterazioni del run (`agent.*` risolto a monte, regola G).
+    pub iteration_cap: i64,
+    /// Coda residua (`iteration_cap - iterations`): gate BREAK-EVEN (FIX costo).
+    /// Sotto `min_tail_iters` il controller non si attiva (costo netto zero su run
+    /// corti).
+    pub tail_headroom: i64,
+    /// Complessita' stimata del task (segnale numerico del classifier, non da prosa).
+    pub task_complexity_est: i64,
+    /// Il task e' CRITICO (derivato da intent/behavior_mode a monte, FIX-D): rafforza
+    /// il floor e disincentiva il downscale a prescindere dai segnali di superficie.
+    pub task_critical: bool,
+    /// Pressione del contesto (RIUSO [`ContextPressure`]): banda stretta `Low`
+    /// richiesta per il downscale.
+    pub context_pressure: ContextPressure,
+    /// Token stimati del contesto corrente (FIX-B): per il vincolo finestra nel
+    /// downscale (predicato puro qui, risoluzione reale con `min_context_window`
+    /// a valle in PR-B).
+    pub est_tokens: i64,
+    /// Rapporto headroom finestra (`est_tokens / window_limit`): segnale di
+    /// pressione finestra, guard aggiuntiva al downscale.
+    pub token_headroom_ratio: f64,
+    /// File modificati NEL run rispetto all'ultimo checkpoint (progresso reale
+    /// osservato = segnale esplicito, FIX-D): condizione per il downscale pulito.
+    pub files_modified_delta: i64,
+    /// Todo chiusi nel run (progresso macroscopico, monotono): segnale-trigger e
+    /// condizione di downscale.
+    pub todos_closed: i64,
+    /// Errori accumulati nel run (segnale strutturato exit_code/is_error, regola M).
+    pub error_count: i64,
+    /// Streak di iterazioni SENZA errori (condizione di downscale pulito, FIX-D).
+    pub error_free_streak: i64,
+    /// L'azione ripetuta e' un FALLIMENTO strutturato (regola M): vieta il downscale.
+    pub repeated_action_failed: bool,
+    /// Escalation gia' effettuate nel run: segnale-trigger e guard anti-downscale.
+    pub escalations_done: i64,
+    /// Un'escalation reattiva ha PINNATO il tier verso l'alto (FIX-E): finche' attivo
+    /// il controller puo' solo mantenere o salire, MAI scendere (precedenza stallo).
+    pub escalation_lock_active: bool,
+    /// Costo gia' speso dal run in USD (guard di scala deterministica).
+    pub cost_spent_usd: f64,
+    /// Cap di costo del run in USD (`agent.*` risolto a monte, regola G). `0` =
+    /// nessun cap configurato.
+    pub cost_cap_usd: f64,
+    /// Capability richiesta dal run (es. `vision`): propagata al selettore a valle
+    /// (mai persa in un downscale). `None` = nessun requisito speciale.
+    pub required_capability: Option<String>,
+    /// Il run richiede tool-use (sempre `true` per un run agentico): propagato al
+    /// selettore a valle.
+    pub requires_tool_use: bool,
+    /// Turni dall'ultimo cambio-tier (cooldown cambio-tier, gate 3): sotto
+    /// `change_cooldown_turns` il controller non cambia tier.
+    pub turns_since_change: i64,
+    /// Numero di INVERSIONI di direzione sulla stessa coppia di tier (FIX-D
+    /// reversal-pin): oltre `max_reversals` si pinna al tier PIU' ALTO e si smette di
+    /// consultare l'LLM su quell'asse (anti-oscillazione, gemello di `already_guided`).
+    pub reversal_count: i64,
+}
+
+/// Mossa dello SCALE-CONTROLLER prodotta dal meta-reasoner (gemello di
+/// [`RecoveryMove`]/[`OrchestrationMove`], tipi DISGIUNTI — regola L). Enum CHIUSO,
+/// `#[serde(tag="move")]`: il modulo puro
+/// [`crate::decisions::scale_reason::validate_scale_move`] deserializza e valida
+/// (tier fuori vocabolario / confidence fuori `[0,1]` / enum sconosciuto ->
+/// [`ScaleMove::KeepTier`]); i 5 gate di
+/// [`crate::decisions::scale_reason::apply_hysteresis`] applicano l'anti-oscillazione
+/// DOPO la validazione (l'LLM NON scavalca il gate). `KeepTier` = nessun cambio
+/// (rete di sicurezza: il routing usa comunque sticky, il tier resta).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "move", rename_all = "snake_case")]
+pub enum ScaleMove {
+    /// Mantieni il tier corrente (nessun cambio-modello). Rete di sicurezza: ogni
+    /// forma malformata o gate non superato degrada qui.
+    KeepTier,
+    /// Sali al tier indicato (upscale) con la `confidence` dichiarata dall'LLM.
+    UpscaleTo {
+        /// Tier target (deve essere > current per essere un upscale valido).
+        tier: ScaleTier,
+        /// Confidenza LLM `[0,1]`: sotto `min_confidence` degrada a `KeepTier`.
+        confidence: f64,
+    },
+    /// Scendi al tier indicato (downscale) con la `confidence` dichiarata dall'LLM.
+    /// Applicabile SOLO in banda-morta stretta e mai sotto `intent_tier_floor` /
+    /// `escalation_lock_active` (gate 2, FIX-D/FIX-E).
+    DownscaleTo {
+        /// Tier target (deve essere < current e >= floor per essere valido).
+        tier: ScaleTier,
+        /// Confidenza LLM `[0,1]`: sotto `min_confidence` degrada a `KeepTier`.
+        confidence: f64,
+    },
+}
+
+/// Porta UNICA del meta-reasoner LLM (opt-in DB, ADR 0036-style). Espone TRE
 /// metodi a TIPI DISGIUNTI (regola L: un solo adapter mcp-core, nessun enum
-/// wrapper `MetaMove` che reintrodurrebbe cross-scope leak tra i due scope):
+/// wrapper `MetaMove` che reintrodurrebbe cross-scope leak tra gli scope):
 ///   - [`MetaReasonerPort::recover`] — recovery-da-stallo:
 ///     [`StallContext`] -> [`RecoveryMove`] (purpose `stall_recovery`,
 ///     template `system.stall_recovery.decide`);
 ///   - [`MetaReasonerPort::orchestrate`] — orchestrazione (plan-phase / decompose
 ///     / delega): [`OrchestrationContext`] -> [`OrchestrationMove`] (purpose
-///     `orchestration_decide`, template `system.orchestration.decide`).
+///     `orchestration_decide`, template `system.orchestration.decide`);
+///   - [`MetaReasonerPort::assess_scale`] — scala-tier PRE-CRISI (up/down del tier
+///     modello sull'andamento del run): [`ScaleContext`] -> [`ScaleMove`] (purpose
+///     `scale_assess`, template `system.scale.assess`). Terzo dominio disgiunto:
+///     non recovery-da-stallo, non orchestrazione-di-superstep, ma la POTENZA del
+///     modello in modo continuo durante l'esecuzione (PR-A: fondamenta inerti; con
+///     `agent.scale.enabled=false` default e nessun nodo/detector non e' mai
+///     chiamato -> bit-identico).
 ///
 /// CONFINE (regola L): qui c'e' SOLO l'I/O che consulta l'LLM; la DECISIONE
 /// (validazione + traduzione) e' dei moduli puri [`crate::decisions::meta_reason`]
@@ -1299,4 +1479,25 @@ pub trait MetaReasonerPort: Send + Sync {
         ctx: OrchestrationContext,
         mode: ExecMode,
     ) -> Result<Option<OrchestrationMove>, PortError>;
+
+    /// Consulta lo SCALE-CONTROLLER per la scala-tier del modello (up/down
+    /// PRE-CRISI) sul contesto `ctx` secondo `mode`. TERZO scope disgiunto (regola
+    /// L): [`ScaleContext`] -> [`ScaleMove`], STESSO contratto `mode`/degrado di
+    /// [`MetaReasonerPort::recover`]/[`MetaReasonerPort::orchestrate`].
+    ///
+    /// - `Real` -> consulta l'LLM (kill-switch `agent.scale.enabled` OFF di default
+    ///   / purpose `scale_assess` NotFound -> `Ok(None)` = degrado legittimo; DB-down
+    ///   / provider indisponibile -> `Err(PortError::ProviderUnavailable)`, MAI
+    ///   `Ok(None)` mascherante — regola G).
+    /// - `Replay` -> `Ok(None)` IMMEDIATO senza I/O (opzione A): la mossa e' gia'
+    ///   rigiocata/riletta dallo stato checkpointato; il rientro usa sticky (parita'
+    ///   shadow col Python, che non ha il controller).
+    ///
+    /// PR-A: nessun nodo/detector consuma ancora questo metodo (quello e' PR-B).
+    /// Con `agent.scale.enabled=false` (default) l'adapter e' inerte -> `Ok(None)`.
+    async fn assess_scale(
+        &self,
+        ctx: ScaleContext,
+        mode: ExecMode,
+    ) -> Result<Option<ScaleMove>, PortError>;
 }

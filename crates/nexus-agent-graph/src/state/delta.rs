@@ -428,6 +428,13 @@ pub struct StateDelta {
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub planner_sticky_model: Option<Option<String>>,
 
+    // ── Scale-controller (FIX-A) ─────────────────────────────────────────────────
+    /// Vedi `AgentState::current_tier`. Semantica coerente con `sticky_provider`:
+    /// `None` no-op, `Some(Some(t))` set, `Some(None)` azzera. INERTE in PR-A
+    /// (nessun call-site lo scrive ancora, nessun decisore lo legge).
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub current_tier: Option<Option<String>>,
+
     // ── Automazione ─────────────────────────────────────────────────────────────
     /// Vedi `AgentState::automation_mode`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]

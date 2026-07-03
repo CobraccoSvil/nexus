@@ -84,9 +84,10 @@ use sqlx::PgPool;
 
 use nexus_agent_graph::decisions::meta_reason::validate_move;
 use nexus_agent_graph::decisions::orchestration_reason::validate_orch_move;
+use nexus_agent_graph::decisions::scale_reason::validate_scale_move;
 use nexus_agent_graph::runtime::ports::{
     ExecMode, MetaReasonerPort, OrchestrationContext, OrchestrationMove, PortError, RecoveryMove,
-    StallContext,
+    ScaleContext, ScaleMove, StallContext,
 };
 
 use crate::internal_routing::{resolve_purpose_model_db, PurposeResolution};
@@ -141,6 +142,32 @@ const ORCH_TIMEOUT_DEFAULT: u64 = 20;
 /// piccolo oggetto JSON (enum + eventuali blocchi/task brevi). Basso di proposito
 /// (budget/costo: la decisione e' all'ingresso del run, non deve esplodere).
 const ORCH_MAX_TOKENS: u32 = 512;
+
+/// Purpose (regola G) dello SCALE-CONTROLLER: risolve `(provider, model)`
+/// tier-aware da `nexus_purpose_model` (mig 0516). Unica fonte DB, nessun nome
+/// modello qui. Terzo scope disgiunto (regola L) su [`STALL_PURPOSE`]/[`ORCH_PURPOSE`].
+const SCALE_PURPOSE: &str = "scale_assess";
+
+/// Chiave del template dello scale-controller (mig 0516, schema XML fuori-chat
+/// regola D). Gemello di [`STALL_TEMPLATE_KEY`]/[`ORCH_TEMPLATE_KEY`].
+const SCALE_TEMPLATE_KEY: &str = "system.scale.assess";
+
+/// Setting kill-switch (opt-in, default OFF): con `false` la porta e' inerte per la
+/// scala (`Ok(None)`). PR-A: nessun nodo/detector la chiama comunque -> bit-identico.
+const SCALE_ENABLED_SETTING: &str = "agent.scale.enabled";
+
+/// Setting del timeout (s) della chiamata LLM di scala. Clamp `[5, 300]`.
+const SCALE_TIMEOUT_SETTING: &str = "agent.scale.timeout_s";
+
+/// Timeout di default (s) della scala se il setting manca / e' malformato.
+/// Safe-default numerico (stesso pattern di stall/orch/verify). Basso: la decisione
+/// e' pre-crisi, non deve bloccare il run.
+const SCALE_TIMEOUT_DEFAULT: u64 = 15;
+
+/// Tetto di token in output della decisione di scala: la mossa e' un piccolo
+/// oggetto JSON (`{"move","tier","confidence"}`). Basso di proposito (budget/costo:
+/// il controller gira di frequente, non deve esplodere in token).
+const SCALE_MAX_TOKENS: u32 = 256;
 
 /// Adapter [`MetaReasonerPort`] -> LLM via [`NeuralCoreClient`] (paradigma
 /// ADR 0036 di `verify_profile`). Legge config/purpose/template dal `db`.
@@ -536,6 +563,174 @@ impl PgMetaReasonerPort {
         );
         Ok(Some(mv))
     }
+
+    /// `true` se il kill-switch della scala e' attivo (`agent.scale.enabled`).
+    /// Default OFF (opt-in): setting assente / malformato -> `false` (regola G:
+    /// nessun fallback che accenda una feature). Con `false` la porta e' inerte.
+    async fn scale_enabled(&self) -> bool {
+        nexus_auth::get_setting(&self.db, SCALE_ENABLED_SETTING)
+            .await
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// Timeout (s) della scala clampato in `[5, 300]`. Setting assente / malformato
+    /// -> [`SCALE_TIMEOUT_DEFAULT`] (safe-default numerico, mig 0516).
+    async fn scale_timeout_s(&self) -> u64 {
+        nexus_auth::get_setting(&self.db, SCALE_TIMEOUT_SETTING)
+            .await
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(SCALE_TIMEOUT_DEFAULT)
+            .clamp(5, 300)
+    }
+
+    /// Consulta l'LLM per la SCALA-TIER (Real). PARADIGMA IDENTICO a
+    /// [`Self::consult_llm`]/[`Self::consult_orch_llm`] (regola L, scope disgiunto):
+    /// kill-switch -> purpose (`scale_assess`, regola G) -> template
+    /// (`system.scale.assess`) -> LLM one-shot (SOLO lo [`ScaleContext`]
+    /// serializzato, regola M) -> `extract_json_block` + [`validate_scale_move`]
+    /// (punto unico, enum CHIUSO; malformato -> `KeepTier`). Degrado safe su ogni
+    /// guasto NON infrastrutturale (`Ok(None)`); `Err` solo su DB down / provider
+    /// non risolto (regola G: mai OFF mascherante).
+    async fn consult_scale_llm(&self, ctx: &ScaleContext) -> Result<Option<ScaleMove>, PortError> {
+        // (1) Kill-switch: opt-in, default OFF -> inerte (regola G).
+        if !self.scale_enabled().await {
+            return Ok(None);
+        }
+
+        // (2) Modello dal purpose (regola G). STESSA distinzione delle cause di
+        // recover/orchestrate (niente OFF mascherante).
+        let (provider, model) = match resolve_purpose_model_db(&self.db, SCALE_PURPOSE).await {
+            PurposeResolution::Resolved {
+                provider, model, ..
+            } => (provider, model),
+            PurposeResolution::NotFound => {
+                tracing::error!(
+                    target: "nexus_scale_controller",
+                    purpose = SCALE_PURPOSE,
+                    metric = "scale_controller_misconfig",
+                    "scale: flag ON ma purpose '{}' assente in nexus_purpose_model \
+                     (applicare la migrazione 0516); degrado (nessuna scala)",
+                    SCALE_PURPOSE
+                );
+                return Ok(None);
+            }
+            PurposeResolution::NoCapableModel { tier } => {
+                return Err(PortError::ProviderUnavailable(format!(
+                    "scale: nessun modello del tier '{tier}' per purpose '{SCALE_PURPOSE}'"
+                )));
+            }
+            PurposeResolution::MatrixUnavailable(e) => {
+                return Err(PortError::ProviderUnavailable(format!(
+                    "scale: routing non disponibile: {e}"
+                )));
+            }
+        };
+
+        // (3) Template (punto unico loader, regola L).
+        let tpl_cache = crate::prompt_templates::TemplateCache::new();
+        let system_text = crate::prompt_templates::get_template_or_default(
+            &self.db,
+            &tpl_cache,
+            SCALE_TEMPLATE_KEY,
+        )
+        .await;
+        if system_text.trim().is_empty() {
+            tracing::error!(
+                target: "nexus_scale_controller",
+                key = SCALE_TEMPLATE_KEY,
+                metric = "scale_controller_misconfig",
+                "scale: template '{}' assente/vuoto (applicare la migrazione 0516); \
+                 degrado (nessuna scala)",
+                SCALE_TEMPLATE_KEY
+            );
+            return Ok(None);
+        }
+
+        // (4) Payload: SOLO lo ScaleContext serializzato (regola M: segnali
+        // strutturati, non l'intera history -> budget/costo).
+        let ctx_json = match serde_json::to_string(ctx) {
+            Ok(j) => j,
+            Err(err) => {
+                tracing::warn!(
+                    target: "nexus_scale_controller",
+                    error = %err,
+                    "scale: serializzazione ScaleContext fallita, degrado"
+                );
+                return Ok(None);
+            }
+        };
+        let user_text = format!("Andamento del run strutturato (JSON):\n{ctx_json}");
+        let messages =
+            serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
+        let timeout_s = self.scale_timeout_s().await;
+
+        // (5) Chiamata LLM one-shot (paradigma verify_profile; nessun tool). Timeout
+        // + degrado safe: ogni esito non utile -> Ok(None).
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_s),
+            self.neural.generate_agent_turn(
+                &provider,
+                &model,
+                &messages,
+                "[]",
+                SCALE_MAX_TOKENS,
+                &system_text,
+            ),
+        )
+        .await;
+        let value = match resp {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "nexus_scale_controller",
+                    error = %e,
+                    "scale: chiamata LLM fallita, degrado (nessuna scala)"
+                );
+                return Ok(None);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "nexus_scale_controller",
+                    timeout_s,
+                    "scale: chiamata LLM oltre il timeout, degrado (nessuna scala)"
+                );
+                return Ok(None);
+            }
+        };
+
+        // (6) Estrai il testo e parsa il blocco JSON; valida col punto unico
+        // scale_reason::validate_scale_move (enum CHIUSO; tier fuori vocabolario /
+        // confidence fuori [0,1] -> KeepTier). Testo/JSON assente -> KeepTier.
+        let text = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.get("text").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let parsed = match nexus_types::llm_json::extract_json_block(text) {
+            Some(v) => v,
+            None => {
+                tracing::debug!(
+                    target: "nexus_scale_controller",
+                    "scale: risposta senza JSON parsabile, degrado (KeepTier)"
+                );
+                return Ok(Some(ScaleMove::KeepTier));
+            }
+        };
+        let mv = validate_scale_move(&parsed);
+        tracing::info!(
+            target: "nexus_scale_controller",
+            current_tier = ctx.current_tier.as_str(),
+            iterations = ctx.iterations,
+            "scale: mossa decisa dallo scale-controller"
+        );
+        Ok(Some(mv))
+    }
 }
 
 #[async_trait]
@@ -585,6 +780,32 @@ impl MetaReasonerPort for PgMetaReasonerPort {
             return Ok(None);
         }
         self.consult_orch_llm(&ctx).await
+    }
+
+    /// Consulta lo SCALE-CONTROLLER (scala-tier up/down) secondo `mode`. GEMELLO di
+    /// [`Self::recover`]/[`Self::orchestrate`] su scope disgiunto (regola L: STESSO
+    /// flusso).
+    ///
+    /// - `Replay` -> `Ok(None)` IMMEDIATO senza I/O (GATE REPLAY opzione A): la
+    ///   scala-move e' persistita in `extra`/`sticky` dal primario; il rientro
+    ///   rilegge sticky -> stesso modello per costruzione (parita' shadow col
+    ///   Python, che non ha il controller).
+    /// - `Real` -> consulta l'LLM (kill-switch `agent.scale.enabled` OFF di default,
+    ///   purpose `scale_assess`, template `system.scale.assess`, parse +
+    ///   `validate_scale_move`; i 5 gate deterministici sono a valle nel nodo PR-B).
+    ///
+    /// PR-A: nessun nodo/detector chiama questo metodo (quello e' PR-B) e il flag e'
+    /// OFF di default -> BIT-IDENTICO a oggi (vincolo primario).
+    async fn assess_scale(
+        &self,
+        ctx: ScaleContext,
+        mode: ExecMode,
+    ) -> Result<Option<ScaleMove>, PortError> {
+        if mode != ExecMode::Real {
+            // GATE REPLAY (opzione A, vedi doc-metodo): niente LLM in Replay.
+            return Ok(None);
+        }
+        self.consult_scale_llm(&ctx).await
     }
 }
 
@@ -715,5 +936,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── assess_scale (SCALE-CONTROLLER PR-A) ────────────────────────────────────
+
+    fn scale_ctx() -> ScaleContext {
+        ScaleContext {
+            behavior_mode: "automatic".to_string(),
+            iterations: 8,
+            iteration_cap: 20,
+            requires_tool_use: true,
+            ..Default::default()
+        }
+    }
+
+    /// In `Replay` la porta di scala ritorna `Ok(None)` SENZA toccare DB/gateway
+    /// (GATE REPLAY opzione A: gata prima di qualunque I/O, il pool lazy non
+    /// connesso non e' mai usato).
+    #[tokio::test]
+    async fn assess_scale_replay_ritorna_none_senza_llm() {
+        let res = port().assess_scale(scale_ctx(), ExecMode::Replay).await;
+        assert_eq!(
+            res.expect("ok"),
+            None,
+            "Replay -> Ok(None) senza consultare l'LLM"
+        );
+    }
+
+    /// Il gate `Replay` della scala precede ogni accesso al DB: anche con un pool
+    /// non connesso non c'e' errore (nessuna query). Robustezza del gate.
+    #[tokio::test]
+    async fn assess_scale_replay_non_dipende_dal_db() {
+        for _ in 0..3 {
+            assert_eq!(
+                port()
+                    .assess_scale(scale_ctx(), ExecMode::Replay)
+                    .await
+                    .expect("ok"),
+                None
+            );
+        }
+    }
+
+    /// Con risposta malformata `validate_scale_move` degrada a `KeepTier` (il nodo
+    /// lo tratta come "nessuna scala"). Verifica del punto unico di validazione
+    /// riusato dall'impl (regola L): il parse+validate NON re-implementa la logica.
+    #[test]
+    fn validate_scale_move_su_risposta_malformata_e_keep() {
+        // Enum sconosciuto -> KeepTier (non deserializza in ScaleMove).
+        let parsed = nexus_types::llm_json::extract_json_block(r#"{"move":"boh"}"#)
+            .expect("json parsabile");
+        assert_eq!(validate_scale_move(&parsed), ScaleMove::KeepTier);
+        // Testo senza JSON -> extract_json_block None (l'impl mappa a KeepTier).
+        assert!(nexus_types::llm_json::extract_json_block("nessun json qui").is_none());
     }
 }

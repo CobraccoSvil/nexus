@@ -15,8 +15,9 @@ pub use ports::{
     ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage, MetaReasonerPort,
     MetaStepStore, ModelUpscalePort, NextActionChoice, NextActionsDeriver, OrchPhase,
     OrchestrationContext, OrchestrationMove, PlanBlock, PlanRow, PortError, RecoveryMove,
-    RunControlStore, SseEvent, StallBudgetPort, StallContext, SubTask, SummaryStore, TodoStore,
-    ToolCall, ToolExecutor, ToolOutcome, UpscalePick, VerifierRunRecord, VerifierRunStore,
+    RunControlStore, ScaleContext, ScaleMove, ScaleTier, SseEvent, StallBudgetPort, StallContext,
+    SubTask, SummaryStore, TodoStore, ToolCall, ToolExecutor, ToolOutcome, UpscalePick,
+    VerifierRunRecord, VerifierRunStore,
 };
 
 use async_trait::async_trait;
@@ -34,9 +35,10 @@ impl EventSink for NullEventSink {
     fn emit(&self, _ev: SseEvent) {}
 }
 
-/// Meta-reasoner INERTE (kill-switch OFF): entrambi i metodi
+/// Meta-reasoner INERTE (kill-switch OFF): tutti e tre i metodi
 /// ([`MetaReasonerPort::recover`] recovery, [`MetaReasonerPort::orchestrate`]
-/// orchestrazione) ritornano sempre `Ok(None)` (nessuna mossa) in ogni modalita'.
+/// orchestrazione, [`MetaReasonerPort::assess_scale`] scala-tier) ritornano sempre
+/// `Ok(None)` (nessuna mossa) in ogni modalita'.
 ///
 /// E' un'implementazione legittima in PRODUZIONE, non un doppio di test (come
 /// [`NullEventSink`]): finche' i flag `agent.stall_recovery.enabled` /
@@ -69,6 +71,14 @@ impl MetaReasonerPort for StubMetaReasonerPort {
         _ctx: OrchestrationContext,
         _mode: ExecMode,
     ) -> Result<Option<OrchestrationMove>, PortError> {
+        Ok(None)
+    }
+
+    async fn assess_scale(
+        &self,
+        _ctx: ScaleContext,
+        _mode: ExecMode,
+    ) -> Result<Option<ScaleMove>, PortError> {
         Ok(None)
     }
 }

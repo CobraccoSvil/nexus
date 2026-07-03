@@ -1767,6 +1767,14 @@ mod tests {
             *self.orchestrate_calls.lock().unwrap() += 1;
             Ok(self.move_out.clone())
         }
+
+        async fn assess_scale(
+            &self,
+            _ctx: crate::runtime::ports::ScaleContext,
+            _mode: ExecMode,
+        ) -> Result<Option<crate::runtime::ports::ScaleMove>, PortError> {
+            Ok(None)
+        }
     }
 
     /// Ctx con LLM/tool dati. PgPool lazy (il planner non interroga il DB
