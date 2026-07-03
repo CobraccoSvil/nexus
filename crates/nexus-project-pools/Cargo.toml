@@ -1,0 +1,18 @@
+[package]
+name = "nexus-project-pools"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+nexus-auth = { path = "../nexus-auth" }
+nexus-cache = { path = "../nexus-cache" }
+sqlx.workspace = true
+thiserror = "1.0"
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

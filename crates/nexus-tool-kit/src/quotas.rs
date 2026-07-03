@@ -135,15 +135,27 @@ async fn count_allocated_ports(db: &PgPool, project_id: Uuid) -> i64 {
 
 /// Conta container Docker attivi (kind=service in `agent_processes` con status running/starting,
 /// che gireranno in container quando sandbox_enabled o hanno project_image).
-async fn count_active_containers(db: &PgPool, project_id: Uuid) -> i64 {
+///
+/// `run_pool`: pool del DOMINIO RUN del progetto — `agent_processes` e' migrata
+/// nei DB-progetto (nel meta e' decommissionata, mig 0507). Best-effort: su
+/// errore conta 0 (non blocca), ma il fallimento e' loggato (regola M: mai
+/// degradare in silenzio).
+async fn count_active_containers(run_pool: &PgPool, project_id: Uuid) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM agent_processes \
          WHERE project_id = $1 AND status IN ('running', 'starting') AND sandboxed = true",
     )
     .bind(project_id)
-    .fetch_one(db)
+    .fetch_one(run_pool)
     .await
-    .unwrap_or(0)
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            project_id = %project_id,
+            error = %e,
+            "quotas: conteggio container da agent_processes fallito, quota non applicata"
+        );
+        0
+    })
 }
 
 /// Verifica se il progetto puo' allocare un'altra porta. Ritorna `Err` con messaggio
@@ -161,9 +173,16 @@ pub async fn check_can_allocate_port(db: &PgPool, project_id: Uuid) -> Result<()
 }
 
 /// Verifica se il progetto puo' avviare un altro container. Ritorna `Err` se quota raggiunta.
-pub async fn check_can_start_container(db: &PgPool, project_id: Uuid) -> Result<(), String> {
-    let quota = load_quota(db, project_id).await;
-    let used = count_active_containers(db, project_id).await;
+///
+/// `meta_db`: pool meta (quote in `nexus_resource_quotas`); `run_pool`: pool del
+/// dominio run del progetto (`agent_processes` migrata, separazione DB).
+pub async fn check_can_start_container(
+    meta_db: &PgPool,
+    run_pool: &PgPool,
+    project_id: Uuid,
+) -> Result<(), String> {
+    let quota = load_quota(meta_db, project_id).await;
+    let used = count_active_containers(run_pool, project_id).await;
     if used >= quota.max_containers as i64 {
         return Err(format!(
             "quota container raggiunta ({used}/{}); ferma servizi inattivi con stop_service",
@@ -275,15 +294,25 @@ pub async fn invalidate_disk_cache(project_id: Uuid) {
 /// Somma RSS (MB) dei processi attivi del progetto, letti da
 /// `/proc/<pid>/statm` (pagine * 4KB). Best-effort: PID morti o /proc
 /// inaccessibile contano 0.
-async fn project_memory_usage_mb(db: &PgPool, project_id: Uuid) -> i64 {
+///
+/// `run_pool`: pool del DOMINIO RUN del progetto — `agent_processes` e' migrata
+/// nei DB-progetto (mig 0507 nel meta). Errore query loggato (regola M).
+async fn project_memory_usage_mb(run_pool: &PgPool, project_id: Uuid) -> i64 {
     let pids: Vec<i32> = sqlx::query_scalar::<_, Option<i32>>(
         "SELECT pid FROM agent_processes \
          WHERE project_id = $1 AND status IN ('running', 'starting') AND pid IS NOT NULL",
     )
     .bind(project_id)
-    .fetch_all(db)
+    .fetch_all(run_pool)
     .await
-    .unwrap_or_default()
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            project_id = %project_id,
+            error = %e,
+            "quotas: lettura PID da agent_processes fallita, quota memoria non applicata"
+        );
+        Vec::new()
+    })
     .into_iter()
     .flatten()
     .collect();
@@ -312,9 +341,16 @@ async fn project_memory_usage_mb(db: &PgPool, project_id: Uuid) -> i64 {
 /// Verifica RAM pre-avvio: la somma RSS dei processi attivi del progetto deve
 /// stare sotto `max_memory_mb`. Best-effort (se non misurabile, non blocca).
 /// Ritorna `Err` se oltre quota.
-pub async fn check_can_use_memory(db: &PgPool, project_id: Uuid) -> Result<(), String> {
-    let quota = load_quota(db, project_id).await;
-    let used_mb = project_memory_usage_mb(db, project_id).await;
+///
+/// `meta_db`: pool meta (quote); `run_pool`: pool del dominio run del progetto
+/// (`agent_processes` migrata, separazione DB).
+pub async fn check_can_use_memory(
+    meta_db: &PgPool,
+    run_pool: &PgPool,
+    project_id: Uuid,
+) -> Result<(), String> {
+    let quota = load_quota(meta_db, project_id).await;
+    let used_mb = project_memory_usage_mb(run_pool, project_id).await;
     if used_mb >= quota.max_memory_mb as i64 {
         return Err(format!(
             "quota memoria raggiunta ({used_mb}/{} MB): ferma un servizio attivo prima di avviarne un altro",
