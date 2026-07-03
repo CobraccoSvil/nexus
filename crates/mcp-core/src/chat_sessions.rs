@@ -258,17 +258,9 @@ pub async fn create_chat_session(
 
     // Directory di routing (sempre sul meta-DB, mig 0496): session -> project,
     // cosi' gli handler con solo session_id risolvono il pool del progetto anche
-    // a flag on. Ausiliario: un errore non deve far fallire la creazione.
-    if let Err(e) = sqlx::query(
-        "INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id) VALUES ('session', $1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(session_id)
-    .bind(project_id)
-    .execute(&state.db)
-    .await
-    {
-        tracing::warn!(error = %e, "routing directory: insert sessione fallito");
-    }
+    // a flag on. Best-effort: il punto unico logga WARN, mai errore propagato.
+    crate::project_db_routes::register_entity_routing(&state.db, "session", session_id, project_id)
+        .await;
 
     update_user_active_project(&state, user_id, project_id).await;
 

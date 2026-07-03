@@ -94,6 +94,7 @@ condividere codice (fragile base class, accoppiamento al genitore).
 | Estensioni file di codice (CODE_EXTENSIONS) | `crates/nexus-types/src/code_files.rs` (re-export in `mcp-core::projects`) | esistente |
 | Servizi AI del wiki (embed/completion/purpose) | trait `WikiAiServices` in `nexus-wiki::deps` (impl `AppStateWikiAi` in `mcp-core::wiki`, delega a NeuralCoreClient + internal_routing) | esistente |
 | Identita' e dedup servizi di progetto (label generiche, similarity con split trattini, stop duplicati pre-spawn) | `mcp-core/src/agent_processes.rs` (`is_generic_service_label`, `similar_service_labels`, `stop_similar_running_services`); delegano: tool `run_service`, wizard install Windows, start/restart pannello, launch run config; visibilita' voci pannello Windows in `project_workspace/services.rs::visible_windows_services` | esistente |
+| Risoluzione pool DB metadati per-progetto (flag separazione con cache, registry `project_database_config`, elenco progetti, directory `nexus_data_routing`) | crate `nexus-project-pools` (`separation_enabled`, `resolve_meta_db_url`, `list_project_ids`, `project_id_for_entity`, `register_entity_routing`); delegano: `mcp-core::project_db_routes` (che vi aggiunge il layer provisioning+migrazione con lock per-progetto, NON replicabile fuori processo: il migrator sqlx non e' concurrency-safe), `WikiDeps::list_project_ids`, admin-service, billing-service, nexus-tool-kit | esistente |
 
 ### Enforcement
 

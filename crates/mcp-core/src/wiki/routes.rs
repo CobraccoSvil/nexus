@@ -1344,13 +1344,9 @@ fn spawn_extract_triples_batch_bg(
             let pids: Vec<Uuid> = if let Some(pid) = project_id {
                 vec![pid]
             } else {
-                sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
-                    .fetch_all(&state.db)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(run_id=%run_id, "SELECT projects fallita: {e}");
-                        Vec::new()
-                    })
+                // Punto unico dell'elenco progetti (regola L): degrada a vuoto
+                // con WARN, coerente col best-effort di questo task background.
+                crate::project_db_routes::list_all_project_ids(&state.db).await
             };
             for pid in pids {
                 if let Err(e) = triple_extractor::extract_triples_for_scope(

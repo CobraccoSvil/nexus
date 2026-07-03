@@ -13,6 +13,12 @@
 //! registrato la risoluzione fallisce con errore tipizzato (regola M) e il
 //! chiamante degrada esplicitamente (WARN + skip progetto), mai in silenzio.
 //!
+//! I mattoni comuni ai due contratti — lettura flag con cache, lettura del
+//! registry `project_database_config`, elenco progetti, directory
+//! `nexus_data_routing` — vivono SOLO qui: `mcp-core::project_db_routes`
+//! delega a queste funzioni e vi aggiunge il layer provisioning+migrazione
+//! (lock per-progetto) e la propria cache pool condivisa con AppState.
+//!
 //! A flag `db.project_separation.enabled` OFF tutte le funzioni ritornano il
 //! pool meta ricevuto: comportamento storico pre-cutover, zero regressioni.
 
@@ -60,8 +66,9 @@ fn pool_cache() -> &'static TtlCache<Uuid, PgPool> {
 }
 
 /// `true` se la separazione DB per-progetto e' abilitata (setting
-/// `db.project_separation.enabled`, mig 0495). Cache TTL 30s, stesso valore e
-/// stessa chiave letti da `mcp-core::project_db_routes::project_separation_enabled`.
+/// `db.project_separation.enabled`, mig 0495). Cache TTL 30s. Fonte unica
+/// (regola L): `mcp-core::project_db_routes::project_separation_enabled` e' un
+/// wrapper che delega qui (stessa cache di processo, un solo punto di lettura).
 pub async fn separation_enabled(meta: &PgPool) -> bool {
     if let Some(v) = separation_flag_cache().get(&()) {
         return v;
@@ -87,9 +94,10 @@ pub async fn list_project_ids(meta: &PgPool) -> Vec<Uuid> {
 }
 
 /// URL del DB metadati Nexus del progetto dal registry
-/// `project_database_config` (`connection_role='nexus_metadata'`). Stessa
-/// lettura di `mcp-core::project_db_routes::resolve_meta_db_url`.
-async fn resolve_meta_db_url(
+/// `project_database_config` (`connection_role='nexus_metadata'`). Fonte unica
+/// (regola L) della lettura del registry: anche
+/// `mcp-core::project_db_routes` vi delega prima del suo layer provisioning.
+pub async fn resolve_meta_db_url(
     meta: &PgPool,
     project_id: Uuid,
 ) -> Result<Option<String>, ProjectPoolError> {
@@ -171,10 +179,11 @@ pub async fn project_id_for_entity(
 }
 
 /// Registra la mappa entita' -> progetto nella directory (idempotente,
-/// best-effort). Stesso contratto di
-/// `mcp-core::project_db_routes::register_entity_routing`.
-async fn register_entity_routing(meta: &PgPool, entity_kind: &str, entity_id: Uuid, pid: Uuid) {
-    let _ = sqlx::query(
+/// best-effort: un fallimento e' loggato WARN, mai propagato — la creazione
+/// dell'entita' non deve fallire per la directory). Fonte unica (regola L): il
+/// wrapper omonimo di `mcp-core::project_db_routes` vi delega.
+pub async fn register_entity_routing(meta: &PgPool, entity_kind: &str, entity_id: Uuid, pid: Uuid) {
+    if let Err(e) = sqlx::query(
         "INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id) \
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
@@ -182,7 +191,16 @@ async fn register_entity_routing(meta: &PgPool, entity_kind: &str, entity_id: Uu
     .bind(entity_id)
     .bind(pid)
     .execute(meta)
-    .await;
+    .await
+    {
+        tracing::warn!(
+            entity_kind,
+            entity_id = %entity_id,
+            project_id = %pid,
+            error = %e,
+            "nexus-project-pools: insert in nexus_data_routing fallito"
+        );
+    }
 }
 
 /// Pool del progetto risolto dal `session_id`: directory di routing (O(1));
