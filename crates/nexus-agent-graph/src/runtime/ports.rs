@@ -807,6 +807,12 @@ pub struct UpscalePick {
     pub model: String,
     /// Reason diagnostica (`context_overflow:est=...:from_window=...:tier=...`).
     pub reason: String,
+    /// Performance tier del modello promosso (il `agent.upscale.target_tier`
+    /// configurato, entro cui la selezione ha scelto). Campo STRUTTURATO (regola M):
+    /// il chiamante lo scrive in `StateDelta::current_tier` (FIX-A scale-controller)
+    /// senza parsare la stringa `reason`. Sempre valorizzato dall'impl (il tier e' il
+    /// vincolo di selezione, quindi noto per costruzione).
+    pub tier: String,
 }
 
 /// Astrazione dell'I/O dello smart-upscale del modello (`_smart_upscale_model`,

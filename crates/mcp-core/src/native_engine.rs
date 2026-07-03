@@ -396,6 +396,30 @@ async fn resolve_context_window(db: &PgPool, provider: &str, model: &str) -> i64
     row.map(|(w,)| w).unwrap_or(0)
 }
 
+/// Performance tier del modello del turno INIZIALE dal catalog (`ai_price_catalog`,
+/// colonna `performance_tier`). PUNTO UNICO (regola L/H) della risoluzione del tier
+/// iniziale dello scale-controller (FIX-A): il DB e' interrogato UNA volta all'avvio
+/// del run (percorso Real, fuori dal loop del grafo), quindi il replay del grafo NON
+/// vede questa query (il tier viaggia nello stato checkpointato). Fallback
+/// deterministico `"medium"` (default catalog, mig 0032) se il modello non e' nel
+/// catalog o su errore: NON e' un magic value (regola G) ma il default della colonna
+/// `performance_tier`, coerente con il fallback di `build_scale_context`.
+async fn resolve_initial_tier(db: &PgPool, provider: &str, model: &str) -> String {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT performance_tier FROM ai_price_catalog \
+         WHERE provider = $1 AND model = $2 LIMIT 1",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    row.and_then(|(t,)| t)
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "medium".to_string())
+}
+
 /// Risolve (provider, model) di un purpose interno (tier-aware) dal DB. Punto
 /// unico [`crate::internal_routing::resolve_purpose_model_db`] (regola G/L). In
 /// caso di purpose non risolvibile ritorna `("", "")`: i nodi trattano provider
@@ -1497,6 +1521,19 @@ async fn run_engine(
     match mode {
         RunMode::New => {
             let mut init_state = build_initial_state(input, role);
+            // ── ROUTING INIZIALE tier (FIX-A scale-controller) ───────────────────
+            // Il primo modello del run e' `(input.provider, input.model)` risolto dal
+            // routing a monte (il primo turno dell'executor lo usa via
+            // provider_override/model_override, sticky ancora assente). La
+            // RoutingMatrix::lookup non porta il tier; lo risolviamo qui dal catalog
+            // (punto unico `resolve_initial_tier`, percorso Real all'avvio) e lo
+            // scriviamo nel checkpoint iniziale. Cosi' `current_tier` e' popolato dal
+            // primo turno, non solo dopo un'escalation/upscale. INERTE (PR-A): nessun
+            // decisore lo legge ancora -> bit-identico. Determinismo: la query e'
+            // FUORI dal loop del grafo (non nel path di Replay); il tier vive poi
+            // nello stato checkpointato, condiviso da Primary e Shadow (convergono).
+            init_state.current_tier =
+                Some(resolve_initial_tier(&deps.db, &input.provider, &input.model).await);
             // Playbook matcher (punto unico, regola L): popola i passi del playbook
             // che matcha il task, cosi' il planner genera i todo deterministici
             // (es. nexus_visual_compare per la verifica figma) e il final_gate puo'
@@ -2712,6 +2749,37 @@ mod tests {
         // token_brake dal DB (0.55 < 0.70 default).
         assert!((cfg.token_brake.max_context_ratio - 0.55).abs() < 1e-9);
         assert!((cfg.forced_rag_ratio - 0.30).abs() < 1e-9);
+    }
+
+    /// FIX-A (scale-controller): il tier del modello iniziale e' letto dal catalog e
+    /// scritto in `current_tier` al checkpoint iniziale (routing iniziale).
+    #[sqlx::test]
+    async fn resolve_initial_tier_dal_catalog(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier) \
+             VALUES ('anthropic', 'claude-heavy', 'heavy')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert catalog");
+        assert_eq!(
+            resolve_initial_tier(&pool, "anthropic", "claude-heavy").await,
+            "heavy",
+            "tier del modello iniziale letto dalla colonna performance_tier"
+        );
+    }
+
+    /// FIX-A: modello iniziale NON nel catalog -> fallback deterministico `medium`
+    /// (default della colonna `performance_tier`, mig 0032; NON un magic value).
+    #[sqlx::test]
+    async fn resolve_initial_tier_fallback_medium_se_ignoto(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        assert_eq!(
+            resolve_initial_tier(&pool, "ignoto", "modello-fantasma").await,
+            "medium",
+            "modello non in catalog -> fallback medium (default catalog)"
+        );
     }
 
     #[sqlx::test]

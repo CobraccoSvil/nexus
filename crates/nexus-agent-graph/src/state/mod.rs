@@ -446,12 +446,16 @@ pub struct AgentState {
     /// [`crate::decisions::scale_reason::build_scale_context`] lo legge come segnale
     /// (fallback deterministico `medium` se assente, default catalog mig 0032).
     ///
-    /// INERTE in PR-A (SCALE-CONTROLLER fondamenta): questo campo NON e' ancora
-    /// scritto dai call-site sticky (la propagazione del tier richiede di estendere
-    /// le porte `EscalationPort`/`ModelUpscalePort` per trasportare il tier, che e'
-    /// PR-B) NE' letto da alcun decisore (il routing usa `sticky_provider/model`,
-    /// non `current_tier`). Presente per il futuro wiring: `None` -> ogni consumatore
-    /// (PR-B) ricade sul default `medium` -> comportamento invariato -> bit-identico.
+    /// SCRITTO in PR-B1 (FIX-A): il routing iniziale (`native_engine`) lo popola col
+    /// tier del primo modello dal catalog; i call-site che cambiano modello
+    /// (escalation/failover in `executor`, upscale via `UpscalePick::tier`) lo
+    /// aggiornano col `performance_tier` gia' noto al pick — le porte
+    /// `EscalationPort`/`ModelUpscalePort` trasportano il tier (`ChainEntry::tier`,
+    /// `CrossProviderCandidate::tier`, `UpscalePick::tier`). NESSUN decisore lo legge
+    /// ancora (detector/nodo scale = PR-B2/B3): il routing usa `sticky_provider/model`,
+    /// non `current_tier` -> comportamento invariato -> bit-identico. `None` (es.
+    /// cascade fallback, dove il tier non e' disponibile senza I/O nel path del turno)
+    /// -> ogni consumatore (PR-B) ricade sul default `medium`.
     pub current_tier: Option<String>,
 
     // ── Automazione ─────────────────────────────────────────────────────────────

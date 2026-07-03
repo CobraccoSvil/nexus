@@ -430,8 +430,11 @@ pub struct StateDelta {
 
     // ── Scale-controller (FIX-A) ─────────────────────────────────────────────────
     /// Vedi `AgentState::current_tier`. Semantica coerente con `sticky_provider`:
-    /// `None` no-op, `Some(Some(t))` set, `Some(None)` azzera. INERTE in PR-A
-    /// (nessun call-site lo scrive ancora, nessun decisore lo legge).
+    /// `None` no-op, `Some(Some(t))` set, `Some(None)` azzera. SCRITTO in PR-B1 dai
+    /// call-site che cambiano modello (routing iniziale in `native_engine`, escalation
+    /// e failover in `executor` col `tier` del pick, upscale via `UpscalePick::tier`)
+    /// col `performance_tier` gia' noto al pick (regola M: campo strutturato). NESSUN
+    /// decisore lo legge ancora (detector/nodo scale = PR-B2/B3) -> bit-identico.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub current_tier: Option<Option<String>>,
 

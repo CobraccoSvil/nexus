@@ -472,7 +472,9 @@ async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
     // (repeat_scan_floor = lunghezza del prefisso messaggi persistito), invece
     // di chiudere con la diagnosi come risposta finale.
     let rc = Arc::new(StubRunControlStore::default());
-    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
+    // FIX-A (scale-controller): la catena porta il tier 'heavy' -> il pick lo
+    // propaga e il call-site scrive `current_tier` nel delta.
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(&["claude-piu-capace"], "heavy"));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
     let ctx = ctx_with(llm.clone(), false);
@@ -492,6 +494,8 @@ async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(out.sticky_provider.as_deref(), Some("anthropic"));
     assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
+    // FIX-A: current_tier scritto col performance_tier del modello promosso.
+    assert_eq!(out.current_tier.as_deref(), Some("heavy"));
     assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
     assert_eq!(
         out.extra.get("repeat_scan_floor").and_then(Value::as_i64),
@@ -1586,7 +1590,11 @@ async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
     let rc = Arc::new(StubRunControlStore::default());
     // Esito di failover configurato (il routing avrebbe scelto questo provider sano
     // escludendo quello caduto).
-    let esc = Arc::new(StubEscalationPort::with_failover("mistral", "mistral-large-2411"));
+    let esc = Arc::new(StubEscalationPort::with_failover_tier(
+        "mistral",
+        "mistral-large-2411",
+        "medium",
+    ));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_provider_unavailable(
         "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> anthropic \
@@ -1607,6 +1615,8 @@ async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(out.sticky_provider.as_deref(), Some("mistral"));
     assert_eq!(out.sticky_model.as_deref(), Some("mistral-large-2411"));
+    // FIX-A: current_tier scritto col tier del modello di failover.
+    assert_eq!(out.current_tier.as_deref(), Some("medium"));
     assert_eq!(out.g1_reroute_count, Some(0));
     assert_eq!(out.action_nudge_count, Some(0));
     assert!(out.pending_tool_uses.unwrap().is_empty());
@@ -1756,8 +1766,8 @@ async fn signature_loop_escalation_riesegue() {
         }
     }
     let rc = Arc::new(StubRunControlStore::default());
-    // Catena intra-provider: anthropic/claude-x -> claude-piu-capace.
-    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
+    // Catena intra-provider: anthropic/claude-x -> claude-piu-capace (tier heavy).
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(&["claude-piu-capace"], "heavy"));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let same_input = json!({"path": "x"});
     let sig = build_signature("read_file", &same_input);
@@ -1796,6 +1806,9 @@ async fn signature_loop_escalation_riesegue() {
     // pre-turno, qui il solo messaggio human).
     assert_eq!(out.sticky_provider.as_deref(), Some("anthropic"));
     assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
+    // FIX-A: la promozione del signature-loop scrive anche current_tier col tier
+    // del modello promosso (catturato dal pick, delta finale del turno).
+    assert_eq!(out.current_tier.as_deref(), Some("heavy"));
     assert_eq!(out.extra.get("repeat_scan_floor").and_then(Value::as_i64), Some(1));
 }
 

@@ -1073,6 +1073,10 @@ descrivere, ESEGUI subito il prossimo step concreto con un tool call.",
                     messages: Some(vec![esc_nudge]),
                     sticky_provider: Some(Some(pick.provider)),
                     sticky_model: Some(Some(pick.model)),
+                    // FIX-A (scale-controller): tier del modello promosso propagato
+                    // dal pick (regola M: campo strutturato, non parsing). INERTE
+                    // finche' nessun decisore lo legge (PR-B2/B3) -> bit-identico.
+                    current_tier: Some(pick.tier),
                     // Finestra pulita anche per il signature-loop: le firme del
                     // modello precedente non pesano sul promosso.
                     recent_tool_signatures: Some(Some(vec![])),
@@ -1364,6 +1368,8 @@ esecuzione/verifica), oppure rispondi a parole se era una domanda.",
                         messages: Some(vec![esc_nudge]),
                         sticky_provider: Some(Some(pick.provider)),
                         sticky_model: Some(Some(pick.model)),
+                        // FIX-A (scale-controller): tier del modello promosso dal pick.
+                        current_tier: Some(pick.tier),
                         // Finestra pulita anche per il signature-loop.
                         recent_tool_signatures: Some(Some(vec![])),
                         g1_reroute_count: Some(Some(0)),
@@ -1828,6 +1834,8 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                             messages: Some(vec![esc_nudge]),
                             sticky_provider: Some(Some(pick.provider)),
                             sticky_model: Some(Some(pick.model)),
+                            // FIX-A (scale-controller): tier del modello promosso dal pick.
+                            current_tier: Some(pick.tier),
                             // Finestra pulita anche per il signature-loop.
                             recent_tool_signatures: Some(Some(vec![])),
                             g1_reroute_count: Some(Some(0)),
@@ -1977,6 +1985,8 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                             messages: Some(vec![esc_nudge]),
                             sticky_provider: Some(Some(pick.provider)),
                             sticky_model: Some(Some(pick.model)),
+                            // FIX-A (scale-controller): tier del modello promosso dal pick.
+                            current_tier: Some(pick.tier),
                             // Finestra pulita anche per il signature-loop.
                             recent_tool_signatures: Some(Some(vec![])),
                             g1_reroute_count: Some(Some(0)),
@@ -2624,6 +2634,11 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                                 messages: Some(vec![esc_nudge]),
                                 sticky_provider: Some(Some(pick.provider)),
                                 sticky_model: Some(Some(pick.model)),
+                                // FIX-A (scale-controller): tier del modello di
+                                // failover, risolto dal catalog nell'adapter
+                                // (`failover_provider`); `None` se ignoto -> default a
+                                // valle (bit-identico, nessun decisore legge ancora).
+                                current_tier: Some(pick.tier),
                                 // Finestra pulita anche per il signature-loop.
                                 recent_tool_signatures: Some(Some(vec![])),
                                 g1_reroute_count: Some(Some(0)),
@@ -2788,6 +2803,10 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
         // rientrava subito in loop — incidente run c4fa064b) e fa partire la grazia
         // post-escalation (floor repeated_action).
         let mut signature_loop_promoted = false;
+        // FIX-A (scale-controller): tier del modello promosso dal signature-loop,
+        // catturato dal pick (regola M) per scriverlo in `current_tier` insieme allo
+        // sticky nel delta finale del turno. `None` finche' non c'e' promozione.
+        let mut signature_loop_tier: Option<String> = None;
         let mut loop_close_result: Option<String> = None;
         // OUTPUT-PROGRESSO (regola M/H): una firma ripetuta i cui ULTIMI due
         // esiti TESTUALI differiscono sta PROGREDENDO (es. build rilanciata dopo
@@ -2916,6 +2935,9 @@ riassumi lo stato."
                         assistant_msg = build_assistant_message(&resp, &result_text);
                         provider = pick.provider;
                         model = pick.model;
+                        // FIX-A: cattura il tier del promosso prima che il pick esca
+                        // di scope; scritto in `current_tier` col delta finale.
+                        signature_loop_tier = pick.tier;
                         new_signatures = vec![]; // reset accumulator dopo escalation (py:3265)
                         tried_escalation = true;
                         signature_loop_promoted = true;
@@ -3176,6 +3198,25 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
         } else {
             state.sticky_model.clone()
         };
+        // FIX-A (scale-controller): `current_tier` deve descrivere il modello STICKY
+        // EFFETTIVO di questo delta (regola M/H), mai un tier disallineato. Il tier e'
+        // noto SENZA lookup solo se il signature-loop ha promosso E nessun cascade
+        // interno del gateway ha poi cambiato il modello (eff_model == model del pick):
+        // li' vale il tier del pick. Se lo sticky cambia (cascade fallback, con o senza
+        // promozione) verso un modello di cui non conosciamo il tier senza I/O (vietato
+        // nel path turno/replay, regola H), si AZZERA (`Some(None)`) invece di affermare
+        // il tier di un modello diverso da quello sticky: il consumatore (PR-B) ricade
+        // sul default. Se lo sticky NON cambia, no-op (`None`): `current_tier` resta
+        // quello valido (routing iniziale o turni precedenti).
+        let current_tier_delta: Option<Option<String>> = if sticky_promote {
+            if signature_loop_promoted && eff_model == model {
+                Some(signature_loop_tier.clone())
+            } else {
+                Some(None)
+            }
+        } else {
+            None
+        };
 
         // action_nudge_count: +1 se il nudge G1 e' stato iniettato e non ha
         // prodotto tool call ancora (py:3494-3501).
@@ -3247,6 +3288,7 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
             g1_reroute_count: Some(Some(g1_reroute_count)),
             sticky_provider: Some(sticky_provider),
             sticky_model: Some(sticky_model),
+            current_tier: current_tier_delta,
             // Usage del turno (py:3476-3480), overwrite last-write come il Python.
             prompt_tokens: Some(Some(turn_prompt_tokens)),
             completion_tokens: Some(Some(turn_completion_tokens)),
@@ -3749,6 +3791,8 @@ con un tool call.",
                         messages: Some(vec![esc_nudge]),
                         sticky_provider: Some(Some(pick.provider)),
                         sticky_model: Some(Some(pick.model)),
+                        // FIX-A (scale-controller): tier del modello promosso dal pick.
+                        current_tier: Some(pick.tier),
                         recent_tool_signatures: Some(Some(vec![])),
                         g1_reroute_count: Some(Some(0)),
                         action_nudge_count: Some(Some(0)),

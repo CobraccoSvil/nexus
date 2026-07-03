@@ -110,8 +110,12 @@ impl PgEscalationPort {
         }
         // Window del modello corrente (0 se non in catalog -> filtro inattivo).
         let current_window = self.model_window(provider, base_model).await;
-        match sqlx::query_scalar::<_, String>(
-            "SELECT model FROM v_model_escalation_chain \
+        // FIX-A (scale-controller): la vista espone gia' `performance_tier`; lo
+        // selezioniamo insieme al modello cosi' il tier del modello promosso viaggia
+        // nella `ChainEntry` fino al pick, SENZA lookup extra (regola L/H: il DB e'
+        // gia' interrogato qui per derivare la catena).
+        match sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT model, performance_tier FROM v_model_escalation_chain \
              WHERE provider = $1 \
                AND supports_tool_use = TRUE \
                AND escalation_rank > COALESCE( \
@@ -128,7 +132,10 @@ impl PgEscalationPort {
         {
             Ok(rows) => rows
                 .into_iter()
-                .map(|escalation_model| ChainEntry { escalation_model })
+                .map(|(escalation_model, tier)| ChainEntry {
+                    escalation_model,
+                    tier: tier.filter(|t| !t.trim().is_empty()),
+                })
                 .collect(),
             Err(e) => {
                 tracing::warn!(
@@ -139,6 +146,32 @@ impl PgEscalationPort {
                 Vec::new()
             }
         }
+    }
+
+    /// Performance tier di `(provider, model)` dal catalog (vista
+    /// `v_model_escalation_chain`, colonna `performance_tier`). `None` se il modello
+    /// non e' nel catalog o su errore (fail-open: il chiamante ricade sul default
+    /// `medium` a valle, comportamento invariato). Punto unico (regola L/H) della
+    /// lettura del tier per il candidato cross-provider dell'escalation, che — a
+    /// differenza della catena intra-provider — arriva dal router purpose e NON porta
+    /// il tier con se' (FIX-A scale-controller). Il DB e' gia' interrogato in questo
+    /// ramo (`cross_provider` legge anche la finestra), quindi non e' un lookup sparso.
+    async fn model_tier(&self, provider: &str, model: &str) -> Option<String> {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return None;
+        }
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT performance_tier FROM v_model_escalation_chain \
+             WHERE provider = $1 AND model = $2 LIMIT 1",
+        )
+        .bind(provider)
+        .bind(model)
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .filter(|t| !t.trim().is_empty())
     }
 
     /// Context window (token) di `(provider, model)` dal catalog (vista
@@ -211,7 +244,15 @@ impl PgEscalationPort {
                 }
             }
         }
-        Some(CrossProviderCandidate { provider, model })
+        // FIX-A (scale-controller): risolvi il tier del candidato dal catalog cosi'
+        // viaggia nel pick fino a `current_tier` (regola L/H: DB gia' interrogato in
+        // questo ramo per la finestra). `None` -> default `medium` a valle.
+        let tier = self.model_tier(&provider, &model).await;
+        Some(CrossProviderCandidate {
+            provider,
+            model,
+            tier,
+        })
     }
 }
 
@@ -271,12 +312,23 @@ impl EscalationPort for PgEscalationPort {
         &self,
         exclude: &[String],
     ) -> Result<Option<CrossProviderCandidate>, PortError> {
-        let pick = crate::orchestrator::model_routing::best_agentic_failover(&self.db, exclude)
-            .await
-            .map(|d| CrossProviderCandidate {
-                provider: d.provider,
-                model: d.model,
-            });
+        let decision =
+            crate::orchestrator::model_routing::best_agentic_failover(&self.db, exclude).await;
+        // FIX-A (scale-controller): il selettore agentico ritorna (provider, model)
+        // (firma INVARIATA, regola L); il tier del modello scelto lo risolviamo qui
+        // dal catalog (punto unico `model_tier`, DB gia' interrogato in questo ramo)
+        // cosi' il pick di failover porta `current_tier` come gli altri.
+        let pick = match decision {
+            Some(d) => {
+                let tier = self.model_tier(&d.provider, &d.model).await;
+                Some(CrossProviderCandidate {
+                    provider: d.provider,
+                    model: d.model,
+                    tier,
+                })
+            }
+            None => None,
+        };
         if let Some(ref c) = pick {
             tracing::info!(
                 target: "nexus_mcp_core::escalation_port",
@@ -464,6 +516,57 @@ mod tests {
         );
         // nexus_purpose_model vuota -> cross_provider None.
         assert!(inputs.cross_provider.is_none());
+    }
+
+    /// FIX-A (scale-controller): la `ChainEntry` porta il `performance_tier` del
+    /// modello di destinazione, letto dalla vista insieme al modello (nessun lookup
+    /// extra). Il pick a valle scrivera' `current_tier` con questo valore.
+    #[sqlx::test]
+    async fn catena_propaga_il_performance_tier(pool: PgPool) {
+        create_schema(&pool).await;
+        set_api_key(&pool, "anthropic", "sk-live").await;
+        seed_catalog(
+            &pool,
+            &[
+                ("anthropic", "claude-haiku-4-5", "medium", 0.25, true, true),
+                ("anthropic", "claude-sonnet-4-6", "medium", 3.0, true, true),
+                ("anthropic", "claude-opus-4-6", "heavy", 15.0, true, true),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let inputs = port
+            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"))
+            .await
+            .expect("fail-open");
+        let tiers: Vec<(&str, Option<&str>)> = inputs
+            .chain
+            .iter()
+            .map(|c| (c.escalation_model.as_str(), c.tier.as_deref()))
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![
+                ("claude-sonnet-4-6", Some("medium")),
+                ("claude-opus-4-6", Some("heavy")),
+            ],
+            "ogni ChainEntry porta il performance_tier del catalog"
+        );
+    }
+
+    /// FIX-A: `model_tier` legge il tier dalla vista; `None` se il modello non e' in
+    /// catalog (fail-open) o su argomenti vuoti. Punto unico per il cross-provider e
+    /// il failover (che arrivano dal router senza tier).
+    #[sqlx::test]
+    async fn model_tier_legge_il_tier(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(&pool, &[("openai", "gpt-x", "heavy", 1.0, true, true)]).await;
+        let port = PgEscalationPort::new(pool.clone());
+        assert_eq!(port.model_tier("openai", "gpt-x").await.as_deref(), Some("heavy"));
+        // Non in catalog -> None (default a valle).
+        assert_eq!(port.model_tier("openai", "ignoto").await, None);
+        // Argomenti vuoti -> None.
+        assert_eq!(port.model_tier("", "x").await, None);
     }
 
     /// FINESTRA-AWARE (NON-convergenza, regola H): la catena intra-provider esclude

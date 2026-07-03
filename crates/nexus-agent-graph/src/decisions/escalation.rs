@@ -41,6 +41,14 @@ use serde::{Deserialize, Serialize};
 pub struct ChainEntry {
     /// Modello di destinazione dell'escalation (`escalation_model`).
     pub escalation_model: String,
+    /// Performance tier del modello di destinazione (`performance_tier` dalla vista
+    /// `v_model_escalation_chain`, che gia' espone la colonna del catalog). Trasporta
+    /// il tier del modello promosso fino al pick SENZA lookup extra (FIX-A
+    /// scale-controller, regola L/H: il DB e' gia' interrogato per derivare la
+    /// catena). `None` se la porta non ha risolto il tier (fail-open: il chiamante
+    /// ricade sul default `medium` di `build_scale_context`, comportamento invariato).
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 /// Candidato cross-provider (`loop_fallback_default`) risolto a monte dal router
@@ -53,6 +61,12 @@ pub struct CrossProviderCandidate {
     pub provider: String,
     /// Modello del candidato cross-provider.
     pub model: String,
+    /// Performance tier del modello cross-provider (dal catalog, risolto dall'impl
+    /// della porta insieme al modello). Trasporta il tier del modello promosso fino
+    /// al pick SENZA lookup extra (FIX-A scale-controller, regola L/H). `None` se non
+    /// risolto (fail-open: default `medium` a valle, comportamento invariato).
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 /// Modello promosso dall'escalation: provider + model con cui RI-ESEGUIRE il
@@ -67,6 +81,13 @@ pub struct EscalationPick {
     /// se dal candidato cross-provider (Tier 2). Eco diagnostica (il chiamante
     /// non cambia comportamento in base a questo): utile a log/golden.
     pub from_chain: bool,
+    /// Performance tier del modello promosso (`ChainEntry::tier` per Tier 1,
+    /// `CrossProviderCandidate::tier` per Tier 2), propagato dalla scelta SENZA
+    /// lookup extra. Il chiamante lo scrive in `StateDelta::current_tier` (FIX-A
+    /// scale-controller). `None` se la porta non l'ha risolto: eco diagnostica, NON
+    /// influenza la SELEZIONE (bit-identico al comportamento pre-FIX-A).
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 /// Punto unico (regola L): data la fotografia (catena + corrente + escalation gia'
@@ -111,6 +132,7 @@ pub fn pick_escalation_model(
                             provider: provider.to_string(),
                             model: entry.escalation_model.clone(),
                             from_chain: true,
+                            tier: entry.tier.clone(),
                         });
                     }
                 }
@@ -130,6 +152,7 @@ pub fn pick_escalation_model(
                 provider: cand.provider.clone(),
                 model: cand.model.clone(),
                 from_chain: false,
+                tier: cand.tier.clone(),
             });
         }
     }
@@ -146,6 +169,18 @@ mod tests {
             .iter()
             .map(|m| ChainEntry {
                 escalation_model: (*m).to_string(),
+                tier: None,
+            })
+            .collect()
+    }
+
+    /// Catena con tier esplicito per-entry (FIX-A: verifica propagazione tier).
+    fn chain_tier(entries: &[(&str, &str)]) -> Vec<ChainEntry> {
+        entries
+            .iter()
+            .map(|(m, t)| ChainEntry {
+                escalation_model: (*m).to_string(),
+                tier: Some((*t).to_string()),
             })
             .collect()
     }
@@ -154,6 +189,7 @@ mod tests {
         CrossProviderCandidate {
             provider: p.to_string(),
             model: m.to_string(),
+            tier: None,
         }
     }
 
@@ -167,6 +203,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "claude-sonnet-4-6".into(),
                 from_chain: true,
+                tier: None,
             })
         );
     }
@@ -207,6 +244,7 @@ mod tests {
                 provider: "google".into(),
                 model: "gemini-2.5-pro".into(),
                 from_chain: false,
+                tier: None,
             })
         );
     }
@@ -272,6 +310,49 @@ mod tests {
         let r = pick_escalation_model(&[], Some("openai"), Some("gpt-4o-mini"), 0, false, None);
         assert_eq!(r, None);
     }
+
+    /// FIX-A: il tier del modello scelto in Tier 1 e' propagato dalla `ChainEntry`
+    /// selezionata (quella all'indice `escalations`), NON dalla prima della catena.
+    #[test]
+    fn tier1_propaga_tier_della_entry_scelta() {
+        let c = chain_tier(&[("claude-sonnet-4-6", "medium"), ("claude-opus-4-6", "heavy")]);
+        // escalations=0 -> prima entry (medium).
+        let r0 = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 0, false, None)
+            .expect("Tier 1");
+        assert_eq!(r0.tier.as_deref(), Some("medium"));
+        assert!(r0.from_chain);
+        // escalations=1 -> seconda entry (heavy).
+        let r1 = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 1, false, None)
+            .expect("Tier 1");
+        assert_eq!(r1.tier.as_deref(), Some("heavy"));
+    }
+
+    /// FIX-A: il tier del modello scelto in Tier 2 e' propagato dal
+    /// `CrossProviderCandidate` (cross-provider), non dalla catena intra-provider.
+    #[test]
+    fn tier2_propaga_tier_del_cross_provider() {
+        let cand = CrossProviderCandidate {
+            provider: "google".into(),
+            model: "gemini-2.5-pro".into(),
+            tier: Some("heavy".into()),
+        };
+        // Catena vuota -> cade al cross-provider (Tier 2).
+        let r = pick_escalation_model(&[], Some("openai"), Some("gpt-4o-mini"), 0, false, Some(&cand))
+            .expect("Tier 2");
+        assert!(!r.from_chain);
+        assert_eq!(r.tier.as_deref(), Some("heavy"));
+    }
+
+    /// FIX-A: tier assente nella entry -> pick con `tier: None` (fail-open, il
+    /// chiamante ricade sul default a valle). La SELEZIONE resta invariata.
+    #[test]
+    fn tier_assente_resta_none_senza_alterare_la_selezione() {
+        let c = chain(&["claude-sonnet-4-6"]);
+        let r = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 0, false, None)
+            .expect("Tier 1");
+        assert_eq!(r.model, "claude-sonnet-4-6");
+        assert_eq!(r.tier, None);
+    }
 }
 
 /// Golden di parita' 1:1 vs Python per `pick_escalation_model`. Carica
@@ -318,11 +399,13 @@ mod golden {
                 .iter()
                 .map(|m| ChainEntry {
                     escalation_model: m.clone(),
+                    tier: None,
                 })
                 .collect();
             let cand = c.input.cross_provider.as_ref().map(|pm| CrossProviderCandidate {
                 provider: pm[0].clone(),
                 model: pm[1].clone(),
+                tier: None,
             });
             let r = pick_escalation_model(
                 &chain,

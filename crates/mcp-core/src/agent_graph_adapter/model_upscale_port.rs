@@ -128,6 +128,10 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
             reason: format!(
                 "context_overflow:required={required_tokens}:tier={tier}:from={current_model}"
             ),
+            // Tier come CAMPO strutturato (regola M): il chiamante lo legge da qui,
+            // non parsando `reason`. E' il vincolo di selezione (target_tier), quindi
+            // il modello scelto e' garantito di quel tier.
+            tier,
         }))
     }
 }
@@ -197,6 +201,9 @@ mod tests {
         assert_eq!(pick.model, "grande");
         assert_eq!(pick.provider, "anthropic");
         assert!(pick.reason.contains("required=200000"));
+        // FIX-A: il tier e' esposto come CAMPO strutturato (regola M), pari al
+        // target_tier configurato ('heavy'), non ricavato dal parsing di `reason`.
+        assert_eq!(pick.tier, "heavy");
     }
 
     #[sqlx::test]

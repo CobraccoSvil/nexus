@@ -627,6 +627,9 @@ pub mod test_doubles {
     pub struct StubEscalationPort {
         /// Modelli della catena intra-provider (in ordine di posizione).
         pub chain: Vec<String>,
+        /// Tier applicato a OGNI entry della catena (FIX-A: verifica che il pick
+        /// propaghi `current_tier`). `None` = tier non risolto dalla porta.
+        pub chain_tier: Option<String>,
         /// `true` se il provider corrente e' in cooldown (salta Tier 1).
         pub provider_in_cooldown: bool,
         /// Candidato cross-provider `(provider, model)`, o `None`.
@@ -635,6 +638,9 @@ pub mod test_doubles {
         /// provider sano -> chiusura Error). Default `None`: i test che non
         /// esercitano il failover su provider caduto non lo configurano.
         pub failover: Option<(String, String)>,
+        /// Tier del modello di failover (FIX-A): il call-site lo scrive in
+        /// `current_tier`. `None` = tier non risolto dall'adapter.
+        pub failover_tier: Option<String>,
         /// `exclude` ricevuti dalle chiamate a `failover_provider` (per asserire
         /// che la cascata accumula i provider gia' provati).
         pub failover_seen: Mutex<Vec<Vec<String>>>,
@@ -654,6 +660,16 @@ pub mod test_doubles {
             }
         }
 
+        /// Come [`with_chain`](Self::with_chain) ma con un tier per la catena
+        /// (FIX-A): il pick propaghera' questo tier in `current_tier`.
+        pub fn with_chain_tier(models: &[&str], tier: &str) -> Self {
+            Self {
+                chain: models.iter().map(|s| s.to_string()).collect(),
+                chain_tier: Some(tier.to_string()),
+                ..Default::default()
+            }
+        }
+
         /// Stub con SOLO un candidato cross-provider (catena vuota).
         pub fn with_cross(provider: &str, model: &str) -> Self {
             Self {
@@ -667,6 +683,16 @@ pub mod test_doubles {
         pub fn with_failover(provider: &str, model: &str) -> Self {
             Self {
                 failover: Some((provider.to_string(), model.to_string())),
+                ..Default::default()
+            }
+        }
+
+        /// Come [`with_failover`](Self::with_failover) ma col tier del modello di
+        /// failover (FIX-A): il call-site lo scrive in `current_tier`.
+        pub fn with_failover_tier(provider: &str, model: &str, tier: &str) -> Self {
+            Self {
+                failover: Some((provider.to_string(), model.to_string())),
+                failover_tier: Some(tier.to_string()),
                 ..Default::default()
             }
         }
@@ -694,6 +720,7 @@ pub mod test_doubles {
                     .iter()
                     .map(|m| ChainEntry {
                         escalation_model: m.clone(),
+                        tier: self.chain_tier.clone(),
                     })
                     .collect(),
                 provider_in_cooldown: self.provider_in_cooldown,
@@ -703,6 +730,7 @@ pub mod test_doubles {
                     .map(|(p, m)| CrossProviderCandidate {
                         provider: p.clone(),
                         model: m.clone(),
+                        tier: None,
                     }),
             })
         }
@@ -724,6 +752,7 @@ pub mod test_doubles {
                 .map(|(p, m)| CrossProviderCandidate {
                     provider: p.clone(),
                     model: m.clone(),
+                    tier: self.failover_tier.clone(),
                 }))
         }
     }
@@ -838,6 +867,7 @@ pub mod test_doubles {
                     provider: provider.to_string(),
                     model: model.to_string(),
                     reason: "context_overflow".to_string(),
+                    tier: "heavy".to_string(),
                 }),
                 promoted_window: None,
                 selected: Mutex::new(vec![]),
