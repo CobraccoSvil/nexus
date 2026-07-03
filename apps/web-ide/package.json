@@ -8,7 +8,7 @@
     "start": "node server.js",
     "lint": "eslint . --ext .ts,.tsx --ignore-pattern .next --ignore-pattern next-env.d.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test \"lib/**/*.test.ts\"",
+    "test": "node --test \"lib/**/*.test.ts\" \"components/**/*.test.ts\"",
     "test:typecheck": "tsc -p tsconfig.test.json --noEmit"
   },
   "devDependencies": {

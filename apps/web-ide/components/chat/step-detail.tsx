@@ -66,20 +66,12 @@ export function InlineTruncated({
   );
 }
 
-/** Formatta l'input strutturato di un tool in testo leggibile, comprimendo i
- *  valori enormi (stringhe/oggetti > 300 char) a un placeholder con la lunghezza,
- *  MAI il JSON grezzo integrale. */
-export function formatStepInput(input: Record<string, unknown>): string {
-  const lines: string[] = [];
-  for (const [key, val] of Object.entries(input)) {
-    if (typeof val === "string" && val.length > 300) {
-      lines.push(`${key}: [${val.length} car.]`);
-    } else if (typeof val === "object" && val !== null) {
-      const j = JSON.stringify(val);
-      lines.push(j.length > 300 ? `${key}: [oggetto, ${j.length} car.]` : `${key}: ${j}`);
-    } else {
-      lines.push(`${key}: ${String(val)}`);
-    }
-  }
-  return lines.join("\n");
-}
+// Le funzioni pure (formatStepInput/formatValue/humanizeToolResult) vivono in
+// step-detail-logic.ts (senza React) per essere testabili; qui le riesportiamo
+// cosi' i renderer continuano a importarle da questo modulo (punto unico).
+export {
+  formatStepInput,
+  formatValue,
+  humanizeToolResult,
+  type HumanToolResult,
+} from "./step-detail-logic";

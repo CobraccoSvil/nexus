@@ -24,7 +24,7 @@ import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { PlanChecklist } from "./agent-meta-step-card";
 import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
-import { InlineTruncated, formatStepInput } from "./step-detail";
+import { InlineTruncated, formatStepInput, humanizeToolResult } from "./step-detail";
 import { capStreamToRecent } from "../../lib/use-chat/activity-stream";
 import type {
   ActivityStream,
@@ -316,7 +316,11 @@ function ToolEventBody({
   const hasInput = event.input != null && Object.keys(event.input).length > 0;
   const hasResult = typeof event.result === "string" && event.result.length > 0;
   const expandable = hasInput || hasResult;
-  const isErr = event.outcome === "err";
+  // Risultato umanizzato: JSON {content,status} -> testo leggibile con newline
+  // reali; l'errore si legge dai campi strutturati (status/error), non dal testo.
+  const humanResult = hasResult ? humanizeToolResult(event.result!) : null;
+  // Errore = esito strutturato dello step OPPURE errore segnalato nel risultato.
+  const isErr = event.outcome === "err" || Boolean(humanResult?.isError);
 
   return (
     <div style={{ minWidth: 0 }}>
@@ -379,12 +383,12 @@ function ToolEventBody({
               <InlineTruncated text={formatStepInput(event.input!)} maxLen={400} tc={tc} mono />
             </div>
           )}
-          {hasResult && (
+          {hasResult && humanResult && (
             <div>
               <div style={{ ...detailLabelStyle(tc), color: isErr ? tc.error : undefined }}>
                 {isErr ? "Errore" : "Risultato"}
               </div>
-              <InlineTruncated text={event.result!} maxLen={500} tc={tc} mono />
+              <InlineTruncated text={humanResult.text} maxLen={500} tc={tc} mono />
             </div>
           )}
         </div>

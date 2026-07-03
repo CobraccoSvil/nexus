@@ -288,6 +288,35 @@ test("ToolEvent espone input e result dallo step", () => {
   assert.equal(tool.result, "file scritto (12 righe)");
 });
 
+test("unwrap: step storico con toolName vuoto e { tool_name, tool_input } annidato", () => {
+  beforeEach();
+  // Forma DB (getAgentRun): toolName VUOTO, nome e parametri annidati.
+  const steps: AgentStep[] = [
+    step("", "completed", 0, {
+      toolInput: { tool_name: "read_file", tool_input: { path: "src/x.ts" } },
+      toolResult: '{"content":"riga1\\nriga2","status":"completed"}',
+    }),
+  ];
+  const s = composeActivityStream([], steps, [], 3);
+  const tool = s.segments[0].events.find((e): e is ToolEvent => e.type === "tool");
+  assert.ok(tool, "il tool e' presente nonostante toolName vuoto");
+  assert.equal(tool.name, "read_file", "nome ripristinato dal wrapper");
+  assert.deepEqual(tool.input, { path: "src/x.ts" }, "parametri veri, senza wrapper");
+  assert.equal(tool.target, "src/x.ts", "target dal parametro path reale");
+});
+
+test("unwrap: step SSE con toolName presente non viene alterato", () => {
+  beforeEach();
+  const steps: AgentStep[] = [
+    step("edit_file", "completed", 0, { toolInput: { path: "a.ts", content: "x" } }),
+  ];
+  const s = composeActivityStream([], steps, [], 3);
+  const tool = s.segments[0].events.find((e): e is ToolEvent => e.type === "tool");
+  assert.ok(tool);
+  assert.equal(tool.name, "edit_file");
+  assert.deepEqual(tool.input, { path: "a.ts", content: "x" });
+});
+
 test("folded: i tool conservati mantengono input/result (espandibili singolarmente)", () => {
   beforeEach();
   const steps: AgentStep[] = [

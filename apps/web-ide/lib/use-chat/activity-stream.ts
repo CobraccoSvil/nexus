@@ -193,6 +193,25 @@ function stepTarget(input: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+/** Estrae nome + input REALI di uno step gestendo DUE forme:
+ *  - SSE: `toolName` valorizzato, `toolInput` = parametri diretti;
+ *  - DB (getAgentRun): `toolName` VUOTO, nome e parametri annidati in
+ *    `toolInput = { tool_name, tool_input: {...} }`.
+ *  Il `||`/`??` copre entrambe senza rompere il caso SSE. */
+function unwrapStep(step: AgentStep): { name: string; input: Record<string, unknown> } {
+  const rawInput = (step.toolInput ?? {}) as Record<string, unknown>;
+  const nested = rawInput.tool_input;
+  const name =
+    (step.toolName && step.toolName.length > 0 ? step.toolName : undefined) ??
+    (typeof rawInput.tool_name === "string" ? rawInput.tool_name : undefined) ??
+    "";
+  const input =
+    nested && typeof nested === "object" && !Array.isArray(nested)
+      ? (nested as Record<string, unknown>)
+      : rawInput;
+  return { name, input };
+}
+
 // ── Sorgente unificata degli eventi grezzi ──────────────────────────────────
 // Uniamo meta-step e step in una sequenza ordinata per createdAt. Le trace non
 // generano eventi propri (evitano doppioni col meta-step executor_call), ma
@@ -404,19 +423,23 @@ export function composeActivityStream(
       }
     } else if (item.kind === "step" && item.step) {
       const s = item.step;
+      // Unwrap nome + input REALI: gli step storici (DB) annidano nome e
+      // parametri in toolInput = { tool_name, tool_input }, con toolName vuoto.
+      const { name, input: realInput } = unwrapStep(s);
       // Gli step "supervisor_check" sono meta-verifiche interne, non tool utente.
-      if (s.toolName === "supervisor_check") continue;
+      if (name === "supervisor_check") continue;
       const tr = traceIter.get(s.stepIndex);
       const seg = ensureSegment(tr?.provider, tr?.model);
       seg.events.push({
         type: "tool",
-        name: s.toolName,
-        target: stepTarget(s.toolInput),
+        name,
+        target: stepTarget(realInput),
         outcome: stepOutcome(s.status),
         exitCode: extractExitCode(s),
         iteration: s.stepIndex,
-        // Dettaglio per l'espansione della riga tool (parametri + risultato).
-        input: s.toolInput,
+        // Dettaglio per l'espansione della riga tool: parametri VERI (senza
+        // wrapper) + risultato grezzo (umanizzato nel renderer).
+        input: realInput,
         result: s.toolResult,
       });
     }
