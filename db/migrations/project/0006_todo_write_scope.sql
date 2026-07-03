@@ -1,0 +1,25 @@
+-- FASE 2 orchestrazione (PR5): persistenza dello scope di scrittura per-todo.
+--
+-- `nexus_agent_todos` e' una tabella MIGRATA: vive nei DB-PROGETTO (set
+-- db/migrations/project). Nel meta e' stata decommissionata (rename fail-fast,
+-- mig 0507): l'ALTER va qui, nel set project, mai nel meta.
+--
+-- `write_scope` (TEXT[] NOT NULL DEFAULT '{}'): aree file (path/prefissi
+-- relativi alla project_root) che il todo DICHIARA di voler scrivere. E' il
+-- segnale strutturato (regola M) che alimenta la verifica statica di
+-- DISGIUNZIONE a valle: `dispatch_wave` (todo_runner) lo passa a
+-- `dispatch_subagents`, dove il punto unico `subtasks_are_disjoint`
+-- (orchestration_reason) ammette il parallelismo isolato SOLO se ogni todo
+-- dichiara almeno un path e gli scope sono a due a due disgiunti.
+--
+-- Retrocompat/bit-identica: DEFAULT '{}' (vuoto) per lo storico e per i todo
+-- prodotti dalla plan-phase LLM che non dichiarano lo scope -> il gating a valle
+-- degrada a sequenziale (comportamento invariato).
+--
+-- Nessun indice: `write_scope` NON e' un predicato di query (i todo si leggono
+-- per run_id, ORDER BY seq); e' letto in blocco e valutato in memoria dalle
+-- funzioni pure. Un indice GIN sarebbe peso morto.
+--
+-- Idempotente (ADD COLUMN IF NOT EXISTS): ri-applicabile senza effetti.
+ALTER TABLE public.nexus_agent_todos
+    ADD COLUMN IF NOT EXISTS write_scope TEXT[] NOT NULL DEFAULT '{}';

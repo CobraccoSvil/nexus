@@ -69,8 +69,9 @@ impl TodoStore for PgTodoStore {
     async fn list_todos(&self, run_id: &str) -> Result<Vec<Todo>, PortError> {
         let run_uuid = Uuid::parse_str(run_id)
             .map_err(|e| PortError::Tool(format!("list_todos: run_id non UUID: {e}")))?;
-        let rows = sqlx::query_as::<_, (String, Option<i64>, String, Vec<String>)>(
-            "SELECT id::text, seq::bigint, status, depends_on::text[] AS depends_on \
+        let rows = sqlx::query_as::<_, (String, Option<i64>, String, Vec<String>, Vec<String>)>(
+            "SELECT id::text, seq::bigint, status, depends_on::text[] AS depends_on, \
+                    write_scope::text[] AS write_scope \
              FROM nexus_agent_todos \
              WHERE run_id = $1 \
              ORDER BY seq ASC",
@@ -81,15 +82,17 @@ impl TodoStore for PgTodoStore {
         .map_err(|e| PortError::Tool(format!("list_todos: query fallita: {e}")))?;
         Ok(rows
             .into_iter()
-            .map(|(id, seq, status, depends_on)| Todo {
+            .map(|(id, seq, status, depends_on, write_scope)| Todo {
                 id,
                 status: status_from_db(&status),
                 depends_on,
                 seq,
-                // PR1: la colonna write_scope su nexus_agent_todos non esiste ancora
-                // (persistenza in un PR successivo, quando dispatch_wave la consuma).
-                // Finche' non c'e', nessuno scope dichiarato -> comportamento invariato.
-                write_scope: Vec::new(),
+                // PR5 (mig project 0006): scope di scrittura dichiarato dal todo,
+                // letto dalla colonna `write_scope` (TEXT[] NOT NULL DEFAULT '{}').
+                // Retrocompat: i todo senza scope hanno '{}' -> Vec vuoto -> il
+                // gating dell'isolamento a valle (dispatch_wave -> subtasks_are_disjoint)
+                // degrada a sequenziale (comportamento invariato).
+                write_scope,
             })
             .collect())
     }
@@ -309,6 +312,7 @@ mod tests {
                  verify_failures INTEGER NOT NULL DEFAULT 0, \
                  iteration_seen INTEGER NOT NULL DEFAULT 0, \
                  depends_on UUID[] NOT NULL DEFAULT '{}', \
+                 write_scope TEXT[] NOT NULL DEFAULT '{}', \
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
              )",
         )
@@ -371,6 +375,42 @@ mod tests {
         // INVARIANTE depends_on: Vec di UN elemento (id di a), MAI stringa "{...}".
         assert_eq!(todos[1].depends_on, vec![a.to_string()]);
         assert!(todos[0].depends_on.is_empty());
+        // PR5: nessun write_scope inserito -> DEFAULT '{}' -> Vec vuoto (retrocompat).
+        assert!(todos[0].write_scope.is_empty());
+        assert!(todos[1].write_scope.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn list_todos_round_trip_write_scope(pool: PgPool) {
+        // PR5 (mig project 0006): write_scope persistito e riletto da list_todos.
+        // Un todo con scope -> Vec non vuoto; uno senza -> Vec vuoto (DEFAULT '{}').
+        create_schema(&pool).await;
+        let run_id = Uuid::new_v4();
+        // Todo con scope dichiarato.
+        let scoped = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nexus_agent_todos (id, run_id, seq, content, status, write_scope) \
+             VALUES ($1, $2, 1, 'con scope', 'pending', $3)",
+        )
+        .bind(scoped)
+        .bind(run_id)
+        .bind(&vec!["crates/api/".to_string(), "db/".to_string()])
+        .execute(&pool)
+        .await
+        .expect("insert scoped");
+        // Todo senza scope (colonna omessa -> DEFAULT '{}').
+        insert_todo(&pool, run_id, 2, "senza scope", "pending", &[]).await;
+
+        let store = PgTodoStore::new(pool.clone(), pool.clone());
+        let todos = store.list_todos(&run_id.to_string()).await.expect("ok");
+        assert_eq!(todos.len(), 2);
+        // seq 1: scope riletto 1:1 (ordine preservato).
+        assert_eq!(
+            todos[0].write_scope,
+            vec!["crates/api/".to_string(), "db/".to_string()]
+        );
+        // seq 2: nessuno scope -> Vec vuoto (retrocompat bit-identica).
+        assert!(todos[1].write_scope.is_empty());
     }
 
     #[sqlx::test]

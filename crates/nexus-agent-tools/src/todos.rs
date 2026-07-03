@@ -15,7 +15,11 @@
 //!       "content": "string",
 //!       "status": "pending"|"in_progress"|"completed"|"blocked"|"skipped",
 //!       "priority": "high"|"normal"|"low",
-//!       "acceptance_criteria": [...]   // opzionale, array di check spec JSON
+//!       "acceptance_criteria": [...],  // opzionale, array di check spec JSON
+//!       "node_key": "string",          // opzionale, chiave logica DAG del todo
+//!       "dep_keys": ["string"],        // opzionale, node_key delle dipendenze
+//!       "write_scope": ["string"]      // opzionale (mig project 0006), aree file
+//!                                      //   dichiarate: alimenta l'isolamento parallelo
 //!     }
 //!   ],
 //!   "planner_model": "string"          // opzionale, per action=create (default 'unknown')
@@ -224,11 +228,24 @@ async fn create_plan(
                     .collect()
             })
             .unwrap_or_default();
+        // PR5 (mig project 0006): aree file dichiarate dal todo. Segnale
+        // strutturato (regola M) letto a valle da `dispatch_wave` e valutato dal
+        // punto unico `subtasks_are_disjoint`. Opzionale: assente/malformato -> []
+        // (colonna NOT NULL DEFAULT '{}', retrocompat bit-identica).
+        let write_scope: Vec<String> = t
+            .get("write_scope")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let row = sqlx::query(
             r#"INSERT INTO nexus_agent_todos
-               (run_id, project_id, seq, content, status, priority, acceptance_criteria, node_key, dep_keys)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               (run_id, project_id, seq, content, status, priority, acceptance_criteria, node_key, dep_keys, write_scope)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                RETURNING id"#,
         )
         .bind(run_id)
@@ -240,6 +257,7 @@ async fn create_plan(
         .bind(&acceptance)
         .bind(node_key)
         .bind(&dep_keys)
+        .bind(&write_scope)
         .fetch_one(&mut *tx)
         .await;
         match row {

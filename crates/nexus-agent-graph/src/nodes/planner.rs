@@ -100,7 +100,8 @@ use nexus_graph::StateDelta as OpaqueDelta;
 use crate::decisions::orchestration_reason::build_orchestration_context;
 use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::runtime::ports::{
-    ExecMode, LlmMessage, LlmRequest, OrchPhase, OrchestrationMove, PlanRow, TodoStore,
+    Coordination, ExecMode, LlmMessage, LlmRequest, OrchPhase, OrchestrationMove, PlanRow, SubTask,
+    TodoStore,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, TaskComplexity, ToolUse};
@@ -391,6 +392,11 @@ pub fn tool_catalog() -> Vec<Value> {
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": "Comp.3a (DAG): node_key dei todo che devono COMPLETARSI prima di questo (dipendenze di esecuzione). Vuoto se indipendente."
+                            },
+                            "write_scope": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Aree file (path/prefissi relativi alla root) che questo todo dichiara di voler scrivere. Segnale per l'isolamento parallelo dei sub-agenti: due todo con scope disgiunti possono girare in parallelo. Vuoto = non parallelizzabile."
                             }
                         },
                         "required": ["content"]
@@ -441,6 +447,67 @@ pub fn playbook_fallback_block(playbook_steps: &[String]) -> Option<Value> {
     }))
 }
 
+/// PONTE PR5: MATERIALIZZA la mossa [`OrchestrationMove::DelegateSubagents`] in un
+/// `nexus_todo_write` block della STESSA forma del canale LLM
+/// (`{name, input:{action:"create", todos:[...]}}`), cosi' il planner lo esegue
+/// col PUNTO UNICO `nexus_todo_write` (regola L: nessuna INSERT parallela, nessuna
+/// logica di dipendenze re-implementata — `dep_keys` -> `depends_on` resta a carico
+/// di `resolve_and_persist_deps`).
+///
+/// Mappatura (regola M: dal segnale strutturato, mai da prosa):
+///   - `content` = `task_description`, PREFISSATO con `[kind]` quando il `kind` e'
+///     valorizzato. Motivazione: il canale `todo -> dispatch_wave` NON trasporta un
+///     kind per-todo (usa `TodoRunnerConfig::todo_kind()` UNIFORME per l'intera
+///     wave; la colonna `kind` non esiste in `nexus_agent_todos`). Aggiungere un
+///     canale kind per-todo toccherebbe PR4 (dispatch_wave/dispatch_subagents),
+///     fuori scope PR5. Il prefisso preserva l'informazione nel content (visibile
+///     al sub-agente nel blob di contesto) senza duplicare logica ne' schema.
+///   - `write_scope` = `task.write_scope` (persistito dalla colonna mig 0006, letto
+///     a valle da `dispatch_wave` per il gating dell'isolamento — PR4).
+///   - `acceptance_criteria` = `[]` (MVP: il `SubTask` non porta criteri).
+///   - `node_key` = `"deleg_{i}"` (chiave logica stabile e univoca per-task).
+///   - `dep_keys` dalla `coordination` (regola M, enum -> dipendenze):
+///       * `Sequential`       -> catena lineare (`task_i` dipende da `task_{i-1}`);
+///       * `ParallelIsolated` -> nessuna dipendenza (i task girano in parallelo,
+///         gia' garantiti disgiunti da `validate_orch_move`/`subtasks_are_disjoint`).
+///
+/// PURA: nessun I/O. `seq` = indice 1-based (parita' con `create_plan`).
+pub fn materialize_delegation_block(tasks: &[SubTask], coordination: Coordination) -> Value {
+    let sequential = matches!(coordination, Coordination::Sequential);
+    let todos: Vec<Value> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let content = if t.kind.trim().is_empty() {
+                t.task_description.clone()
+            } else {
+                format!("[{}] {}", t.kind.trim(), t.task_description)
+            };
+            let node_key = format!("deleg_{i}");
+            // Sequential: catena lineare (dipende dal precedente). ParallelIsolated
+            // (o primo task): nessuna dipendenza.
+            let dep_keys: Vec<String> = if sequential && i > 0 {
+                vec![format!("deleg_{}", i - 1)]
+            } else {
+                Vec::new()
+            };
+            json!({
+                "content": content,
+                "status": "pending",
+                "priority": "normal",
+                "acceptance_criteria": [],
+                "node_key": node_key,
+                "dep_keys": dep_keys,
+                "write_scope": t.write_scope,
+            })
+        })
+        .collect();
+    json!({
+        "name": "nexus_todo_write",
+        "input": { "action": "create", "todos": todos }
+    })
+}
+
 /// Costruisce il `tool_input` finale di `nexus_todo_write` (`planner_node.py:495-503`):
 /// parte dall'input del todo_block, FORZA `run_id`, `setdefault planner_model` =
 /// `provider/model`, persiste `user_intent`/`behavior_mode` (mig 0328,
@@ -471,6 +538,38 @@ pub fn build_tool_input(
         map.insert("behavior_mode".to_string(), json!(bm));
     }
     Value::Object(map)
+}
+
+/// Esito del gate di orchestrazione ([`PlannerNode::orchestration_gate`]).
+///
+/// PROPAGA la mossa strutturata del meta-reasoner (regola M: la decisione viaggia
+/// come tipo, non ricostruita dal testo) fino al `run`, che la consuma PRIMA di
+/// ricadere sull'euristica `is_eligible`. Sostituisce il vecchio `Option<bool>`:
+/// il `bool` non poteva trasportare i `tasks`/`coordination` della delega (TODO
+/// storico "esecuzione decompose/delega", PR5 lo chiude).
+///
+/// Con `orchestration_enabled=false` (default) / Replay / Fallback il gate
+/// ritorna [`PlanGateOutcome::Heuristic`] -> comportamento bit-identico a oggi.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanGateOutcome {
+    /// Il gate NON decide: ricadi su `is_eligible` (euristica, rete di sicurezza).
+    /// Flag OFF (default), Replay, `Fallback`, `Ok(None)`, errore di porta.
+    Heuristic,
+    /// Procedi alla plan-phase (generazione LLM dei todo): `PlanPhase`/`Decompose`.
+    ProceedPlanPhase,
+    /// Salta la plan-phase (`RunInline`): il task e' abbastanza semplice inline.
+    SkipPlanPhase,
+    /// MATERIALIZZA la delega: costruisci i todo direttamente dai `tasks` validati
+    /// (regola L: via il punto unico `nexus_todo_write`, non una INSERT parallela),
+    /// SALTANDO la generazione LLM della plan-phase. `coordination` mappa la catena
+    /// `depends_on` (Sequential -> lineare; ParallelIsolated -> nessuna dipendenza).
+    MaterializeDelegation {
+        /// Sotto-task da materializzare (uno per todo). Gia' validati a monte
+        /// (`validate_orch_move`): mai vuoti, mai `delegation_forbidden`.
+        tasks: Vec<SubTask>,
+        /// Coordinamento -> mapping su `dep_keys` in fase di materializzazione.
+        coordination: Coordination,
+    },
 }
 
 /// Esito del parse del `result_json` del tool `nexus_todo_write`
@@ -592,33 +691,30 @@ impl PlannerNode {
         .into_opaque()
     }
 
-    /// GATE ORCHESTRAZIONE LLM-driven della plan-phase (Fase 1, piano design v2).
-    /// Consulta [`crate::runtime::ports::MetaReasonerPort::orchestrate`] e mappa
-    /// l'esito su una decisione TERNARIA che il chiamante consuma PRIMA di ricadere
-    /// su [`PlannerConfig::is_eligible`]:
-    ///   - `Some(true)`  -> procedi alla plan-phase (come `is_eligible=true`);
-    ///   - `Some(false)` -> salta la plan-phase (come `is_eligible=false`);
-    ///   - `None`        -> il gate NON decide: ricadi su `is_eligible` (euristica
-    ///     esistente, invariata — RETE DI SICUREZZA).
+    /// GATE ORCHESTRAZIONE LLM-driven della plan-phase (Fase 2, piano design v2).
+    /// Consulta [`crate::runtime::ports::MetaReasonerPort::orchestrate`] e PROPAGA
+    /// la mossa strutturata come [`PlanGateOutcome`] che il chiamante consuma PRIMA
+    /// di ricadere su [`PlannerConfig::is_eligible`] (regola M: la decisione viaggia
+    /// come tipo, non ricostruita dal testo).
     ///
     /// Mappa degli esiti [`OrchestrationMove`] (regola L: la validazione e' del
     /// punto unico `validate_orch_move` dentro l'impl della porta; qui si consuma
     /// il risultato gia' validato):
-    ///   - `PlanPhase{..}` -> `Some(true)` (procedi alla plan-phase);
-    ///   - `RunInline`     -> `Some(false)` (salta la plan-phase);
-    ///   - `Decompose{..}` / `DelegateSubagents{..}` -> `Some(true)` in FASE 1:
-    ///     la decomposizione/delega VERA e' una fase successiva; per ora queste
-    ///     mosse si trattano come `PlanPhase` (si procede alla plan-phase). TODO
-    ///     esecuzione decompose/delega: fase successiva (worktree + sub-run).
-    ///   - `Fallback`      -> `None` (ricadi su `is_eligible`).
+    ///   - `PlanPhase{..}` / `Decompose{..}` -> [`PlanGateOutcome::ProceedPlanPhase`]
+    ///     (procedi alla generazione LLM dei todo);
+    ///   - `RunInline`     -> [`PlanGateOutcome::SkipPlanPhase`] (salta la plan-phase);
+    ///   - `DelegateSubagents{tasks, coordination}` -> [`PlanGateOutcome::MaterializeDelegation`]
+    ///     (PR5: MATERIALIZZA i tasks come todo saltando la generazione LLM; il
+    ///     todo-runner li esegue a valle con l'isolamento deciso da PR4);
+    ///   - `Fallback`      -> [`PlanGateOutcome::Heuristic`] (ricadi su `is_eligible`).
     ///
     /// REPLAY (opzione A, come per il recovery): in [`ExecMode::Replay`] il gate
     /// NON consulta `orchestrate` (il `ReplayLlmGateway` non rigioca il purpose
     /// orchestrazione: darebbe una risposta vuota che divergerebbe) -> ritorna
-    /// SEMPRE `None`, forzando il ramo euristico `is_eligible`. Cosi' lo shadow
-    /// resta bit-identico al Python (che non ha l'orchestratore). REGOLA G: con
-    /// `orchestration_enabled=false` (default) ritorna `None` senza consultare
-    /// nulla (comportamento bit-identico a oggi).
+    /// SEMPRE [`PlanGateOutcome::Heuristic`], forzando il ramo euristico
+    /// `is_eligible`. Cosi' lo shadow resta bit-identico al Python (che non ha
+    /// l'orchestratore). REGOLA G: con `orchestration_enabled=false` (default)
+    /// ritorna `Heuristic` senza consultare nulla (comportamento bit-identico a oggi).
     ///
     /// I segnali per [`build_orchestration_context`] sono raccolti dai campi
     /// STRUTTURATI di [`AgentState`] (regola M): user_intent, behavior_mode,
@@ -630,10 +726,14 @@ impl PlannerNode {
     /// non un magic fallback (regola G), ma l'assenza esplicita del vincolo. La
     /// guard `delegation_forbidden` non gata la plan-phase (Fase 1 e' sequenziale,
     /// niente delega eseguita); e' passata per completezza del contesto LLM.
-    async fn orchestration_gate(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Option<bool> {
+    async fn orchestration_gate(
+        &self,
+        state: &AgentState,
+        ctx: &AgentNodeCtx,
+    ) -> PlanGateOutcome {
         // Regola G: gate OFF di default -> ricadi su is_eligible (bit-identico).
         if !self.cfg.orchestration_enabled {
-            return None;
+            return PlanGateOutcome::Heuristic;
         }
         // Replay (opzione A): non consultare l'LLM (divergerebbe dallo shadow) ->
         // forza il ramo euristico. Vale anche per il run shadow read-only.
@@ -642,7 +742,7 @@ impl PlannerNode {
                 target: "nexus_agent_graph::planner",
                 "orchestration gate: Replay -> ricado su is_eligible (opzione A)"
             );
-            return None;
+            return PlanGateOutcome::Heuristic;
         }
 
         // Segnali strutturati (regola M): tutti gia' risolti a monte nello stato.
@@ -684,19 +784,28 @@ impl PlannerNode {
         );
 
         match self.reasoner.orchestrate(orch_ctx, ctx.exec_mode()).await {
-            // PlanPhase / Decompose / DelegateSubagents -> procedi alla plan-phase.
-            // FASE 1: decompose/delega sono trattate come PlanPhase (l'esecuzione
-            // vera e' una fase successiva). TODO: esecuzione decompose/delega.
-            Ok(Some(
-                OrchestrationMove::PlanPhase { .. }
-                | OrchestrationMove::Decompose { .. }
-                | OrchestrationMove::DelegateSubagents { .. },
-            )) => {
+            // PlanPhase / Decompose -> procedi alla generazione LLM dei todo.
+            // Decompose e' trattata come PlanPhase (la scomposizione in blocchi
+            // multipli non e' ancora materializzata; la delega si', sotto).
+            Ok(Some(OrchestrationMove::PlanPhase { .. } | OrchestrationMove::Decompose { .. })) => {
                 tracing::info!(
                     target: "nexus_agent_graph::planner",
                     "orchestration gate: procedi alla plan-phase (LLM-driven)"
                 );
-                Some(true)
+                PlanGateOutcome::ProceedPlanPhase
+            }
+            // DelegateSubagents -> MATERIALIZZA i tasks come todo (PR5): il gate
+            // GOVERNA l'esecuzione, non solo la scelta di pianificare. I tasks sono
+            // gia' validati (validate_orch_move: mai vuoti, mai delegation_forbidden;
+            // la coordination e' gia' degradata a Sequential se l'isolamento manca).
+            Ok(Some(OrchestrationMove::DelegateSubagents { tasks, coordination })) => {
+                tracing::info!(
+                    target: "nexus_agent_graph::planner",
+                    tasks = tasks.len(),
+                    coordination = ?coordination,
+                    "orchestration gate: materializza delega sub-agenti (LLM-driven)"
+                );
+                PlanGateOutcome::MaterializeDelegation { tasks, coordination }
             }
             // RunInline -> salta la plan-phase.
             Ok(Some(OrchestrationMove::RunInline)) => {
@@ -704,7 +813,7 @@ impl PlannerNode {
                     target: "nexus_agent_graph::planner",
                     "orchestration gate: run inline, salta la plan-phase (LLM-driven)"
                 );
-                Some(false)
+                PlanGateOutcome::SkipPlanPhase
             }
             // Fallback: nessuna mossa valida -> ricadi su is_eligible.
             Ok(Some(OrchestrationMove::Fallback)) => {
@@ -712,7 +821,7 @@ impl PlannerNode {
                     target: "nexus_agent_graph::planner",
                     "orchestration gate: Fallback -> ricado su is_eligible"
                 );
-                None
+                PlanGateOutcome::Heuristic
             }
             // Ok(None): kill-switch OFF / purpose NotFound / stub inerte -> degrado
             // LEGITTIMO all'euristica (opt-in, regola G: NON e' un errore).
@@ -721,7 +830,7 @@ impl PlannerNode {
                     target: "nexus_agent_graph::planner",
                     "orchestration gate: reasoner Ok(None) (inerte/OFF) -> ricado su is_eligible"
                 );
-                None
+                PlanGateOutcome::Heuristic
             }
             // Errore di porta (provider indisponibile / DB-down): NON blocca il run
             // (il gate e' best-effort, l'euristica copre la decisione). WARN.
@@ -731,7 +840,7 @@ impl PlannerNode {
                     error = %err,
                     "orchestration gate: porta reasoner in errore -> ricado su is_eligible"
                 );
-                None
+                PlanGateOutcome::Heuristic
             }
         }
     }
@@ -920,11 +1029,26 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         // Replay / Fallback / Ok(None) / errore) ricade su di essa INVARIATA (rete
         // di sicurezza). Con `orchestration_enabled=false` (default) e in Replay
         // ritorna sempre None -> comportamento bit-identico a oggi.
+        // `delegation` non-None -> il gate ha deciso di MATERIALIZZARE la delega:
+        // il todo_block e' costruito DAI TASK (non generato dall'LLM), riusando il
+        // punto unico nexus_todo_write (regola L). Propagato fino al ramo di
+        // generazione todo_block sotto.
+        let mut delegation: Option<(Vec<SubTask>, Coordination)> = None;
         let enter_plan_phase = match self.orchestration_gate(state, ctx).await {
-            // Decisione LLM esplicita: procedi / salta la plan-phase.
-            Some(decision) => decision,
+            // Decisione LLM esplicita: procedi alla plan-phase (generazione LLM).
+            PlanGateOutcome::ProceedPlanPhase => true,
+            // Decisione LLM esplicita: salta la plan-phase.
+            PlanGateOutcome::SkipPlanPhase => false,
+            // Decisione LLM esplicita: materializza la delega (PR5). Si ENTRA nella
+            // plan-phase ma la generazione todo_block e' bypassata (todo dai task).
+            PlanGateOutcome::MaterializeDelegation { tasks, coordination } => {
+                delegation = Some((tasks, coordination));
+                true
+            }
             // Il gate non decide: euristica esistente (planner_node.py:64-74).
-            None => self.cfg.is_eligible(behavior_mode, intent, token_budget),
+            PlanGateOutcome::Heuristic => {
+                self.cfg.is_eligible(behavior_mode, intent, token_budget)
+            }
         };
         if !enter_plan_phase {
             tracing::debug!(
@@ -1044,98 +1168,117 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             }
         };
 
-        // ── Prompt (planner_node.py:211-216) ───────────────────────────────────
-        // Il TESTO e' risolto a monte (regola G): vuoto -> skip prompt_missing.
-        if self.cfg.planner_system_text.is_empty() {
-            tracing::warn!(
-                target: "nexus_agent_graph::planner",
-                key = %self.cfg.planner_prompt_key,
-                "planner: prompt non trovato -> skip"
-            );
-            return Ok(Self::skip(Some(&format!(
-                "prompt_missing:{}",
-                self.cfg.planner_prompt_key
-            ))));
-        }
+        // ── PONTE PR5: materializzazione delega (bypassa la generazione LLM) ───
+        // Se il gate ha deciso DelegateSubagents, i todo si costruiscono DAI TASK
+        // (segnale strutturato, regola M) e non dalla plan-phase LLM. Il todo_block
+        // ha la STESSA forma del canale LLM ({name, input:{action, todos}}) cosi'
+        // il resto del flusso (esecuzione tool, ricarica, popolamento stato) e' 1:1
+        // e riusa il PUNTO UNICO nexus_todo_write (regola L). Le colonne prompt/LLM
+        // (prompt_missing / hinted_system / fallback tool-robust / playbook) sono
+        // saltate: non serve consultare l'LLM per una decisione gia' presa.
+        let mut todo_block: Option<Value> = delegation
+            .as_ref()
+            .map(|(tasks, coordination)| materialize_delegation_block(tasks, *coordination));
 
-        // ── hinted_system (rami ON) + chiamata LLM (planner_node.py:292-391) ───
-        let hinted_system = self.build_hinted_system(state, &run_id);
-        let llm_messages = Self::build_llm_messages(&state.messages);
-
-        let req = Self::build_request(&used_provider, &used_model, llm_messages.clone(), &hinted_system);
-        let mut todo_block = match ctx.llm.complete(req).await {
-            // NOTA parita': la `LlmResponse` minimale NON espone provider/model
-            // (il gateway concreto puo' aver fatto un cascade interno usando un
-            // provider diverso, ma quel dettaglio non arriva ai nodi — forma
-            // minimale del crate). Manteniamo used_provider/used_model che ABBIAMO
-            // passato, come il fallback Python `prov_result.provider or planner_provider`
-            // quando il provider effettivo non e' disponibile.
-            Ok(resp) => Self::extract_todo_block(&resp.tool_calls),
-            Err(err) => {
-                tracing::error!(
-                    target: "nexus_agent_graph::planner",
-                    error = %err,
-                    "planner: LLM call fallita -> skip"
-                );
-                return Ok(Self::skip(Some("llm_error")));
-            }
-        };
-
-        // ── FALLBACK tool-robust (planner_node.py:401-459, mig 0267) ───────────
-        // Se il primario NON ha emesso la tool call, UN tentativo con un modello
-        // fallback risolto a monte (planner_fallback), escluse sentinelle e diverso
-        // dal (provider,model) gia' usato.
+        // Canale LLM: eseguito SOLO se la delega non ha gia' materializzato il
+        // block. Con delega il prompt/LLM/fallback tool-robust/playbook sono saltati
+        // (decisione gia' presa, regola M) e todo_block resta quello dai task.
         if todo_block.is_none() {
-            let fb_provider = self.fallback_provider.clone();
-            let fb_model = self.fallback_model.clone();
-            if !is_sentinel_provider(&fb_provider)
-                && !is_sentinel_provider(&fb_model)
-                && (fb_provider.as_str(), fb_model.as_str()) != (used_provider.as_str(), used_model.as_str())
-            {
+            // ── Prompt (planner_node.py:211-216) ───────────────────────────────
+            // Il TESTO e' risolto a monte (regola G): vuoto -> skip prompt_missing.
+            if self.cfg.planner_system_text.is_empty() {
                 tracing::warn!(
                     target: "nexus_agent_graph::planner",
-                    primario = %format!("{used_provider}/{used_model}"),
-                    fallback = %format!("{fb_provider}/{fb_model}"),
-                    "planner: nessuna tool call dal primario -> fallback tool-robust"
+                    key = %self.cfg.planner_prompt_key,
+                    "planner: prompt non trovato -> skip"
                 );
-                let fb_req =
-                    Self::build_request(&fb_provider, &fb_model, llm_messages, &hinted_system);
-                match ctx.llm.complete(fb_req).await {
-                    Ok(resp) => {
-                        used_provider = fb_provider;
-                        used_model = fb_model;
-                        todo_block = Self::extract_todo_block(&resp.tool_calls);
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            target: "nexus_agent_graph::planner",
-                            error = %err,
-                            "planner: LLM call fallback fallita -> skip"
-                        );
-                        return Ok(Self::skip(Some("llm_error")));
+                return Ok(Self::skip(Some(&format!(
+                    "prompt_missing:{}",
+                    self.cfg.planner_prompt_key
+                ))));
+            }
+
+            // ── hinted_system (rami ON) + chiamata LLM (planner_node.py:292-391) ─
+            let hinted_system = self.build_hinted_system(state, &run_id);
+            let llm_messages = Self::build_llm_messages(&state.messages);
+
+            let req =
+                Self::build_request(&used_provider, &used_model, llm_messages.clone(), &hinted_system);
+            todo_block = match ctx.llm.complete(req).await {
+                // NOTA parita': la `LlmResponse` minimale NON espone provider/model
+                // (il gateway concreto puo' aver fatto un cascade interno usando un
+                // provider diverso, ma quel dettaglio non arriva ai nodi — forma
+                // minimale del crate). Manteniamo used_provider/used_model che ABBIAMO
+                // passato, come il fallback Python `prov_result.provider or planner_provider`
+                // quando il provider effettivo non e' disponibile.
+                Ok(resp) => Self::extract_todo_block(&resp.tool_calls),
+                Err(err) => {
+                    tracing::error!(
+                        target: "nexus_agent_graph::planner",
+                        error = %err,
+                        "planner: LLM call fallita -> skip"
+                    );
+                    return Ok(Self::skip(Some("llm_error")));
+                }
+            };
+
+            // ── FALLBACK tool-robust (planner_node.py:401-459, mig 0267) ───────
+            // Se il primario NON ha emesso la tool call, UN tentativo con un modello
+            // fallback risolto a monte (planner_fallback), escluse sentinelle e
+            // diverso dal (provider,model) gia' usato.
+            if todo_block.is_none() {
+                let fb_provider = self.fallback_provider.clone();
+                let fb_model = self.fallback_model.clone();
+                if !is_sentinel_provider(&fb_provider)
+                    && !is_sentinel_provider(&fb_model)
+                    && (fb_provider.as_str(), fb_model.as_str())
+                        != (used_provider.as_str(), used_model.as_str())
+                {
+                    tracing::warn!(
+                        target: "nexus_agent_graph::planner",
+                        primario = %format!("{used_provider}/{used_model}"),
+                        fallback = %format!("{fb_provider}/{fb_model}"),
+                        "planner: nessuna tool call dal primario -> fallback tool-robust"
+                    );
+                    let fb_req =
+                        Self::build_request(&fb_provider, &fb_model, llm_messages, &hinted_system);
+                    match ctx.llm.complete(fb_req).await {
+                        Ok(resp) => {
+                            used_provider = fb_provider;
+                            used_model = fb_model;
+                            todo_block = Self::extract_todo_block(&resp.tool_calls);
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                target: "nexus_agent_graph::planner",
+                                error = %err,
+                                "planner: LLM call fallback fallita -> skip"
+                            );
+                            return Ok(Self::skip(Some("llm_error")));
+                        }
                     }
                 }
             }
-        }
 
-        // ── Fallback DETERMINISTICO da playbook_steps (planner_node.py:461-492) ─
-        if todo_block.is_none() {
-            let steps = state.playbook_steps.clone().unwrap_or_default();
-            match playbook_fallback_block(&steps) {
-                Some(block) => {
-                    tracing::info!(
-                        target: "nexus_agent_graph::planner",
-                        steps = steps.len(),
-                        "planner: todos deterministici dai passi del playbook"
-                    );
-                    todo_block = Some(block);
-                }
-                None => {
-                    tracing::warn!(
-                        target: "nexus_agent_graph::planner",
-                        "planner: nessuna nexus_todo_write emessa -> skip"
-                    );
-                    return Ok(Self::skip(Some("no_tool_use_emitted")));
+            // ── Fallback DETERMINISTICO da playbook_steps (planner_node.py:461-492) ─
+            if todo_block.is_none() {
+                let steps = state.playbook_steps.clone().unwrap_or_default();
+                match playbook_fallback_block(&steps) {
+                    Some(block) => {
+                        tracing::info!(
+                            target: "nexus_agent_graph::planner",
+                            steps = steps.len(),
+                            "planner: todos deterministici dai passi del playbook"
+                        );
+                        todo_block = Some(block);
+                    }
+                    None => {
+                        tracing::warn!(
+                            target: "nexus_agent_graph::planner",
+                            "planner: nessuna nexus_todo_write emessa -> skip"
+                        );
+                        return Ok(Self::skip(Some("no_tool_use_emitted")));
+                    }
                 }
             }
         }
@@ -1842,6 +1985,178 @@ mod tests {
         assert_eq!(out.plan_phase_active, Some(false));
         // Nessuno skip_reason (path pass-through, come is_eligible=false).
         assert_eq!(out.plan_phase_skip_reason, None);
+    }
+
+    // ── Ponte PR5: materializzazione delega ─────────────────────────────────
+
+    fn subtask(desc: &str, kind: &str, scope: &[&str]) -> SubTask {
+        SubTask {
+            task_description: desc.to_string(),
+            kind: kind.to_string(),
+            write_scope: scope.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// `materialize_delegation_block` PURO: Sequential -> catena lineare dep_keys,
+    /// write_scope propagato, kind nel content, node_key stabili.
+    #[test]
+    fn materialize_delegation_sequential_catena() {
+        let tasks = vec![
+            subtask("schema DB", "db_architect", &["db/"]),
+            subtask("API REST", "backend_implementer", &["crates/api/"]),
+            subtask("frontend", "", &["apps/web/"]),
+        ];
+        let block = materialize_delegation_block(&tasks, Coordination::Sequential);
+        let todos = block["input"]["todos"].as_array().expect("todos");
+        assert_eq!(todos.len(), 3);
+        // content prefissato col kind quando presente, grezzo quando vuoto.
+        assert_eq!(todos[0]["content"], json!("[db_architect] schema DB"));
+        assert_eq!(todos[1]["content"], json!("[backend_implementer] API REST"));
+        assert_eq!(todos[2]["content"], json!("frontend")); // kind vuoto -> no prefisso
+        // write_scope propagato 1:1.
+        assert_eq!(todos[0]["write_scope"], json!(["db/"]));
+        assert_eq!(todos[2]["write_scope"], json!(["apps/web/"]));
+        // node_key stabili.
+        assert_eq!(todos[0]["node_key"], json!("deleg_0"));
+        assert_eq!(todos[2]["node_key"], json!("deleg_2"));
+        // Sequential: catena lineare. Il primo non ha dipendenze.
+        assert_eq!(todos[0]["dep_keys"], json!([]));
+        assert_eq!(todos[1]["dep_keys"], json!(["deleg_0"]));
+        assert_eq!(todos[2]["dep_keys"], json!(["deleg_1"]));
+        // acceptance_criteria MVP vuoto.
+        assert_eq!(todos[0]["acceptance_criteria"], json!([]));
+    }
+
+    /// `materialize_delegation_block` PURO: ParallelIsolated -> nessuna dipendenza
+    /// (i task girano in parallelo, gia' garantiti disgiunti a monte).
+    #[test]
+    fn materialize_delegation_parallel_nessuna_dipendenza() {
+        let tasks = vec![
+            subtask("modulo A", "impl", &["a/"]),
+            subtask("modulo B", "impl", &["b/"]),
+        ];
+        let block = materialize_delegation_block(&tasks, Coordination::ParallelIsolated);
+        let todos = block["input"]["todos"].as_array().expect("todos");
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0]["dep_keys"], json!([]));
+        assert_eq!(todos[1]["dep_keys"], json!([]));
+    }
+
+    /// Cattura la `ToolCall` `nexus_todo_write` emessa dal planner (ultima seen).
+    fn last_todo_write_input(tools: &ScriptedTools) -> Value {
+        let seen = tools.seen.lock().unwrap();
+        let (call, _mode) = seen
+            .iter()
+            .rev()
+            .find(|(c, _)| c.name == "nexus_todo_write")
+            .expect("nexus_todo_write chiamato");
+        call.input.clone()
+    }
+
+    #[tokio::test]
+    async fn ponte_delega_sequential_materializza_senza_llm() {
+        // Flag ON + Real + DelegateSubagents{Sequential}: il gate MATERIALIZZA i
+        // todo dai task SENZA consultare l'LLM del planner (decisione gia' presa).
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::DelegateSubagents {
+            tasks: vec![
+                subtask("crea schema", "db_architect", &["db/"]),
+                subtask("crea API", "backend", &["crates/api/"]),
+            ],
+            coordination: Coordination::Sequential,
+        })));
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let cfg = PlannerConfig {
+            orchestration_enabled: true,
+            // clarifying OFF per isolare il canale di GENERAZIONE: cosi' l'unica
+            // eventuale chiamata LLM sarebbe la generazione del todo_block, che il
+            // ponte deve bypassare.
+            clarifying_questions_enabled: false,
+            // planner_system_text vuoto: se il ponte NON bypassasse l'LLM, il
+            // planner farebbe skip prompt_missing. Il fatto che proceda dimostra
+            // il bypass.
+            ..Default::default()
+        };
+        let node = node_with_reasoner(cfg, store, spy.clone());
+        let llm = Arc::new(ScriptedLlm::never_tool());
+        let tools = Arc::new(ScriptedTools::ok(r#"{"ok":true}"#));
+        let ctx = ctx_with(llm.clone(), tools.clone(), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
+        // L'LLM del planner NON e' consultato per la GENERAZIONE del todo_block: la
+        // materializzazione bypassa il canale LLM (clarifying OFF -> 0 chiamate).
+        assert_eq!(*llm.calls.lock().unwrap(), 0, "delega bypassa la generazione LLM");
+        // La plan-phase e' attiva (il todo_write e' andato a buon fine).
+        assert_eq!(out.plan_phase_active, Some(true));
+        // Il tool nexus_todo_write ha ricevuto i todo materializzati dai task.
+        let input = last_todo_write_input(&tools);
+        let todos = input["todos"].as_array().expect("todos");
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0]["content"], json!("[db_architect] crea schema"));
+        assert_eq!(todos[0]["write_scope"], json!(["db/"]));
+        // Sequential -> catena depends_on via dep_keys logici.
+        assert_eq!(todos[0]["dep_keys"], json!([]));
+        assert_eq!(todos[1]["dep_keys"], json!(["deleg_0"]));
+    }
+
+    #[tokio::test]
+    async fn ponte_delega_parallel_dep_keys_vuoti() {
+        // DelegateSubagents{ParallelIsolated}: i todo materializzati non hanno
+        // dipendenze (parallelismo; disgiunzione gia' garantita a monte).
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::DelegateSubagents {
+            tasks: vec![
+                subtask("A", "impl", &["a/"]),
+                subtask("B", "impl", &["b/"]),
+            ],
+            coordination: Coordination::ParallelIsolated,
+        })));
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let cfg = PlannerConfig {
+            orchestration_enabled: true,
+            clarifying_questions_enabled: false,
+            ..Default::default()
+        };
+        let node = node_with_reasoner(cfg, store, spy.clone());
+        let llm = Arc::new(ScriptedLlm::never_tool());
+        let tools = Arc::new(ScriptedTools::ok(r#"{"ok":true}"#));
+        let ctx = ctx_with(llm.clone(), tools.clone(), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(*llm.calls.lock().unwrap(), 0);
+        assert_eq!(out.plan_phase_active, Some(true));
+        let input = last_todo_write_input(&tools);
+        let todos = input["todos"].as_array().expect("todos");
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0]["dep_keys"], json!([]));
+        assert_eq!(todos[1]["dep_keys"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn ponte_bit_identico_flag_off_non_materializza() {
+        // BIT-IDENTICO: con orchestration_enabled=false (default) il gate NON
+        // consulta la porta e il ponte NON scatta anche se la mossa dello spy
+        // sarebbe DelegateSubagents. Governa is_eligible -> plan-phase LLM normale.
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::DelegateSubagents {
+            tasks: vec![subtask("X", "impl", &["x/"])],
+            coordination: Coordination::Sequential,
+        })));
+        // cfg_active: plan_phase ON, orchestration OFF (default). Stato eligible +
+        // piano riusabile -> riuso, senza chiamare LLM ne materializzare.
+        let node = node_with_reasoner(cfg_active(), store_reusable(), spy.clone());
+        let llm = Arc::new(ScriptedLlm::never_tool());
+        let tools = Arc::new(ScriptedTools::ok(r#"{"ok":true}"#));
+        let ctx = ctx_with(llm.clone(), tools.clone(), false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        // Flag OFF: orchestrate MAI consultato (bit-identico).
+        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 0);
+        // Riuso del piano esistente: nessuna materializzazione (nessun tool write).
+        let seen = tools.seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|(c, _)| c.name == "nexus_todo_write"),
+            "flag OFF: nessun todo_write materializzato (riuso)"
+        );
+        assert_eq!(out.plan_phase_active, Some(true));
     }
 
     // ── Riuso piano ─────────────────────────────────────────────────────────
