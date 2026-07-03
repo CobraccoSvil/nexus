@@ -998,6 +998,7 @@ piu' specifico, oppure riprova con un modello piu' capace.",
             let (g1_cur_provider, g1_cur_model) = self.escalation_current_pair(state);
             let g1_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
             // `_g1_picked = _pick(...) if _g1_escal < 3 else None` (py:1962-1966).
+            let mut g1_cooldown_flag = false;
             let g1_picked = if g1_escal < 3 {
                 let inputs = self
                     .escalation
@@ -1008,6 +1009,7 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                     )
                     .await
                     .unwrap_or_default();
+                g1_cooldown_flag = inputs.provider_in_cooldown;
                 // Indice catena 0 (non g1_escal): la catena della porta e'
                 // RELATIVA al corrente (chain_for filtra rank > corrente) e il
                 // corrente AVANZA via sticky a ogni promozione; l'indice storico
@@ -1050,6 +1052,10 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                         "to_provider": pick.provider,
                         "to_model": pick.model,
                         "reason": "g1_cap",
+                        // Stato STRUTTURATO del provider di partenza (ADR 0037 B):
+                        // la causa dello switch e' "descrive senza agire", il flag
+                        // aggiunge se il provider era anche in cooldown (ADR 0020).
+                        "cooldown": g1_cooldown_flag,
                     }),
                 )
                 .await;
@@ -1249,6 +1255,7 @@ la richiesta in modo piu' specifico.",
                 .unwrap_or(0);
             // Coppia corrente = risoluzione del turno (punto unico, regola L).
             let (expl_cur_provider, expl_cur_model) = self.escalation_current_pair(state);
+            let mut expl_cooldown_flag = false;
             let expl_picked = if expl_escal < 3 {
                 let inputs = self
                     .escalation
@@ -1259,6 +1266,7 @@ la richiesta in modo piu' specifico.",
                     )
                     .await
                     .unwrap_or_default();
+                expl_cooldown_flag = inputs.provider_in_cooldown;
                 // Indice catena 0: catena RELATIVA al corrente, che avanza via
                 // sticky (vedi ramo G1); il cap resta su auto_escalations < 3.
                 pick_escalation_model(
@@ -1334,6 +1342,10 @@ la richiesta in modo piu' specifico.",
                             "to_provider": pick.provider,
                             "to_model": pick.model,
                             "reason": "exploration",
+                            // Stato STRUTTURATO del provider di partenza (ADR 0037 B):
+                            // causa dello switch = esplorazione senza risultato; il
+                            // flag aggiunge se era anche in cooldown (ADR 0020).
+                            "cooldown": expl_cooldown_flag,
                         }),
                     )
                     .await;
@@ -1554,6 +1566,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 let ra_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
                 // Coppia corrente = risoluzione del turno (punto unico, regola L).
                 let (ra_cur_provider, ra_cur_model) = self.escalation_current_pair(state);
+                let mut ra_cooldown_flag = false;
                 let ra_picked = if ra_escal < 3 {
                     let inputs = self
                         .escalation
@@ -1564,6 +1577,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         )
                         .await
                         .unwrap_or_default();
+                    ra_cooldown_flag = inputs.provider_in_cooldown;
                     // Indice catena 0: catena RELATIVA al corrente, che avanza
                     // via sticky (vedi ramo G1); cap su auto_escalations < 3.
                     pick_escalation_model(
@@ -1790,6 +1804,10 @@ indicalo esplicitamente."
                                 "to_provider": pick.provider,
                                 "to_model": pick.model,
                                 "reason": "repeated_action",
+                                // Stato STRUTTURATO del provider di partenza (ADR
+                                // 0037 B): causa dello switch = stallo su una stessa
+                                // azione; il flag aggiunge se era anche in cooldown.
+                                "cooldown": ra_cooldown_flag,
                             }),
                         )
                         .await;
@@ -2573,6 +2591,15 @@ della finestra {effective_window} del modello {provider}/{model}"
                                     "to_provider": pick.provider,
                                     "to_model": pick.model,
                                     "reason": "provider_failover",
+                                    // Causa STRUTTURATA (ADR 0037 arricchimento B):
+                                    // questo ramo entra SOLO su ProviderUnavailable,
+                                    // derivato dal CODICE errore del gateway
+                                    // (PROVIDER_ERROR), non dal testo (regola M). Lo
+                                    // switch e' dovuto a cooldown/quota del provider
+                                    // di partenza: il frontend puo' colorare la banda
+                                    // "Cambio provider" come cooldown senza euristiche.
+                                    "cooldown": true,
+                                    "cause": "cooldown",
                                 }),
                             )
                             .await;
@@ -2840,6 +2867,12 @@ riassumi lo stato."
                             "to_provider": pick.provider,
                             "to_model": pick.model,
                             "reason": "signature_loop",
+                            // Stato STRUTTURATO del provider di partenza (ADR 0037
+                            // arricchimento B): gia' risolto in `inputs` senza query
+                            // extra. La causa dello switch e' il loop di firma, ma il
+                            // flag segnala se il provider era anche in cooldown
+                            // (billing/quota, gate ADR 0020) — segnale, non testo.
+                            "cooldown": inputs.provider_in_cooldown,
                         }),
                     )
                     .await;
@@ -3655,6 +3688,10 @@ impl ExecutorNode {
             Action::Escalate => {
                 let escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
                 let (cur_provider, cur_model) = self.escalation_current_pair(state);
+                // `cooldown_flag` sollevato fuori dal blocco cosi' e' disponibile al
+                // payload dell'escalation (ADR 0037 arricchimento B): nessuna query
+                // extra, e' lo stesso `inputs` gia' letto per la selezione.
+                let mut cooldown_flag = false;
                 let picked = if escal < self.cfg.max_escalations {
                     let inputs = self
                         .escalation
@@ -3665,6 +3702,7 @@ impl ExecutorNode {
                         )
                         .await
                         .unwrap_or_default();
+                    cooldown_flag = inputs.provider_in_cooldown;
                     pick_escalation_model(
                         &inputs.chain,
                         cur_provider.as_deref(),
@@ -3686,6 +3724,10 @@ impl ExecutorNode {
                         "to_provider": pick.provider,
                         "to_model": pick.model,
                         "reason": "stall_recovery",
+                        // Stato STRUTTURATO del provider di partenza (segnale, non
+                        // testo): la causa dello switch e' lo stallo, il flag dice se
+                        // il provider era anche in cooldown billing/quota (ADR 0020).
+                        "cooldown": cooldown_flag,
                     }),
                 )
                 .await;
