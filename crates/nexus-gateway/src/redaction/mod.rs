@@ -3,8 +3,9 @@
 //! Porting fedele del sotto-modulo `packages/llm-gateway/src/redaction/` + il
 //! ramo classificazione di `packages/llm-gateway/src/router/`. Componenti:
 //!
-//! - [`secret_scanner`]: scanner regex su STRINGA (primo punto Rust dei pattern
-//!   del gateway, portati da `@nexus/shared`; vedi nota nel modulo e ADR 0026).
+//! - [`secret_scanner`]: re-export del punto unico
+//!   `nexus_tool_kit::secret_text_scanner` (scanner regex su STRINGA, pattern
+//!   portati da `@nexus/shared`; vedi nota nel modulo e ADR 0026).
 //! - [`presidio_client`]: client HTTP al PII detector, config da settings
 //!   (regola G), fallback graceful se il servizio e' down (regola F: no leak).
 //! - [`sensitivity_classifier`]: combina scanner + Presidio, eleva il tier.

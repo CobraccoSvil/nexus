@@ -395,7 +395,31 @@ fn direct_spawn_env(
     env
 }
 
-/// Flush buffered output to DB (append-only, cap at 50KB per field)
+/// Redazione dei segreti tecnici prima della persistenza/esposizione degli
+/// output di processo (difesa in profondita', incidente Beaty-Book 2026-07-02:
+/// connection string Postgres in chiaro in `agent_processes` -> tool_result).
+/// Delega al punto unico `nexus_tool_kit::secret_text_scanner` (regola L):
+/// nelle connection URL maschera la sola password (host/porta/db name restano
+/// leggibili per il debugging), per API key/token maschera il valore.
+/// Idempotente: applicarla sia al flush sia alla lettura non altera testo gia'
+/// redatto.
+pub(crate) fn redact_secrets_for_persistence(text: &str) -> String {
+    let (redacted, kinds) = nexus_tool_kit::secret_text_scanner::SecretScanner
+        .redact_secrets_preserving_context(text);
+    if kinds > 0 {
+        // Regola F: solo il conteggio dei tipi, mai il contenuto.
+        tracing::debug!(
+            kinds_redacted = kinds,
+            "output di processo: segreti redatti prima della persistenza"
+        );
+    }
+    redacted
+}
+
+/// Flush buffered output to DB (append-only, cap at 50KB per field).
+/// I buffer contengono solo righe complete (lettura per-riga a monte), quindi
+/// un segreto non viene mai spezzato tra due flush e la redazione per-chunk
+/// e' affidabile.
 async fn flush_output(
     db: &PgPool,
     process_id: Uuid,
@@ -406,8 +430,8 @@ async fn flush_output(
         return;
     }
 
-    let stdout_chunk = std::mem::take(stdout_buf);
-    let stderr_chunk = std::mem::take(stderr_buf);
+    let stdout_chunk = redact_secrets_for_persistence(&std::mem::take(stdout_buf));
+    let stderr_chunk = redact_secrets_for_persistence(&std::mem::take(stderr_buf));
 
     let _ = sqlx::query(
         r#"UPDATE agent_processes
@@ -443,8 +467,15 @@ pub async fn read_process_output(
 
     let status: String = row.try_get("status").unwrap_or_else(|_| "unknown".into());
     let exit_code: Option<i32> = row.try_get("exit_code").unwrap_or(None);
-    let output: String = row.try_get("output").unwrap_or_default();
-    let error_output: String = row.try_get("error_output").unwrap_or_default();
+    // Difesa in profondita' anche in lettura: copre le righe persistite in
+    // chiaro PRIMA dell'introduzione della redazione al flush (dati storici nel
+    // DB). Redazione sull'output completo, PRIMA del tail: il taglio potrebbe
+    // spezzare il pattern e lasciar passare la credenziale.
+    let output =
+        redact_secrets_for_persistence(&row.try_get::<String, _>("output").unwrap_or_default());
+    let error_output = redact_secrets_for_persistence(
+        &row.try_get::<String, _>("error_output").unwrap_or_default(),
+    );
     let command: String = row.try_get("command").unwrap_or_default();
     let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
 

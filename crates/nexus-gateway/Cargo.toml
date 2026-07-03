@@ -47,3 +47,5 @@ thiserror = "1.0"
 base64.workspace = true
 nexus-cache = { path = "../nexus-cache" }
 nexus-auth = { path = "../nexus-auth" }
+# Punto unico del secret scanner su stringa (redazione prompt/output, regola L).
+nexus-tool-kit = { path = "../nexus-tool-kit" }
