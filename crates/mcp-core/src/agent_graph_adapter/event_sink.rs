@@ -312,19 +312,42 @@ impl EventSink for SseEventSinkAdapter {
                 total_tokens,
             } => {
                 // Token del turno corrente nella traccia gateway in costruzione.
+                // Nella STESSA presa del lock leggo provider/model del turno
+                // (aperti dall'executor_call precedente) per attribuire i token al
+                // provider corrente nel payload usage_snapshot: cosi' il frontend
+                // ripartisce token/costo per provider SENZA aggregare le trace
+                // (ADR 0037 arricchimento C, additivo). Segnale STRUTTURATO dalla
+                // PendingTrace, mai dedotto dal testo (regola M).
+                let mut provider_model: Option<(String, String)> = None;
                 if let Some(pt) = self.pending_trace.lock().as_mut() {
                     pt.input_tokens = prompt_tokens.clamp(0, u32::MAX as i64) as u32;
                     pt.output_tokens = completion_tokens.clamp(0, u32::MAX as i64) as u32;
+                    if !pt.provider.is_empty() || !pt.model.is_empty() {
+                        provider_model = Some((pt.provider.clone(), pt.model.clone()));
+                    }
+                }
+                let mut payload = serde_json::json!({
+                    "totalTokens": total_tokens,
+                    "promptTokens": prompt_tokens,
+                    "completionTokens": completion_tokens,
+                });
+                // Campi extra additivi: presenti solo se il turno-traccia porta il
+                // provider/model (executor_call aperto). Assenti = degrado pulito.
+                if let (Some((provider, model)), Some(obj)) =
+                    (provider_model, payload.as_object_mut())
+                {
+                    if !provider.is_empty() {
+                        obj.insert("provider".to_string(), serde_json::Value::String(provider));
+                    }
+                    if !model.is_empty() {
+                        obj.insert("model".to_string(), serde_json::Value::String(model));
+                    }
                 }
                 let mut e = self.base();
                 e.meta_step = Some(AgentMetaStep {
                     kind: "usage_snapshot".to_string(),
                     title: String::new(),
-                    payload: serde_json::json!({
-                        "totalTokens": total_tokens,
-                        "promptTokens": prompt_tokens,
-                        "completionTokens": completion_tokens,
-                    }),
+                    payload,
                     correlation_id: None,
                     created_at: chrono::Utc::now().to_rfc3339(),
                 });
@@ -712,5 +735,77 @@ mod tests {
         let (sink, mut rx, _) = setup();
         sink.emit(SseEvent::EndTurn);
         assert!(next_trace(&mut rx).is_none(), "nessuna traccia senza turno");
+    }
+
+    /// Drena il canale e ritorna il payload del PRIMO meta_step col `kind` dato.
+    fn next_meta_step_payload(
+        rx: &mut broadcast::Receiver<AgentStepEvent>,
+        kind: &str,
+    ) -> Option<serde_json::Value> {
+        while let Ok(ev) = rx.try_recv() {
+            if let Some(ms) = ev.meta_step {
+                if ms.kind == kind {
+                    return Some(ms.payload);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn usage_snapshot_arricchito_con_provider_model_del_turno() {
+        // ADR 0037 arricchimento C: dopo un executor_call(provider,model) il
+        // meta_step usage_snapshot deve portare provider/model del turno corrente
+        // (letti dalla PendingTrace, segnale strutturato), oltre ai token.
+        let (sink, mut rx, _) = setup();
+        sink.emit(SseEvent::MetaStep {
+            kind: "executor_call".to_string(),
+            title: "Sto interrogando".to_string(),
+            payload: json!({
+                "provider": "anthropic",
+                "model": "claude-x",
+                "iteration": 0,
+                "tools_count": 4,
+            }),
+        });
+        sink.emit(SseEvent::Usage {
+            prompt_tokens: 120,
+            completion_tokens: 40,
+            total_tokens: 160,
+        });
+
+        let payload =
+            next_meta_step_payload(&mut rx, "usage_snapshot").expect("usage_snapshot emesso");
+        // Campi token invariati (retro-compatibilita').
+        assert_eq!(payload["totalTokens"], json!(160));
+        assert_eq!(payload["promptTokens"], json!(120));
+        assert_eq!(payload["completionTokens"], json!(40));
+        // Campi extra additivi dal turno-traccia corrente.
+        assert_eq!(payload["provider"], json!("anthropic"));
+        assert_eq!(payload["model"], json!("claude-x"));
+    }
+
+    #[test]
+    fn usage_snapshot_senza_turno_non_ha_provider_model() {
+        // Additivo e a degrado pulito: senza executor_call (nessuna PendingTrace)
+        // il payload usage_snapshot NON deve inventare provider/model.
+        let (sink, mut rx, _) = setup();
+        sink.emit(SseEvent::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        });
+
+        let payload =
+            next_meta_step_payload(&mut rx, "usage_snapshot").expect("usage_snapshot emesso");
+        assert_eq!(payload["totalTokens"], json!(15));
+        assert!(
+            payload.get("provider").is_none(),
+            "senza turno-traccia niente provider"
+        );
+        assert!(
+            payload.get("model").is_none(),
+            "senza turno-traccia niente model"
+        );
     }
 }
