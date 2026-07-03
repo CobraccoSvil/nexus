@@ -99,6 +99,7 @@ use nexus_agent_graph::nodes::{
     ExecutorConfig, ExecutorNode, VerifierConfig, VerifierNode,
 };
 use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
+use nexus_agent_graph::decisions::LoopThresholds;
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
     LlmGateway, MetaStepStore, ModelUpscalePort, NextActionsDeriver, RunControlStore, SummaryStore,
@@ -357,6 +358,15 @@ pub struct NativeRunOutcome {
     /// dal final_gate finiva "completed" col testo di sistema come risposta
     /// (run b833a83d).
     pub forced_close_unverified: bool,
+    /// Verdetto del final_gate (`AgentState::final_gate_passed`): `Some(true)`
+    /// verifica superata, `Some(false)` verifica NON superata (gate eseguito, i
+    /// criteri non passano al cap/forced), `None` gate non eseguito (task
+    /// non-software o run interrotto prima). Segnale strutturato (regola M) letto
+    /// dal finalizzatore per (a) mappare FailedDiagnosed anche su una
+    /// dichiarazione "done" ottimista del modello e (b) annotare il resoconto con
+    /// l'esito reale della verifica (run e91d4892: resoconto "completato" ma
+    /// status failed_diagnosed).
+    pub final_gate_passed: Option<bool>,
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -622,6 +632,14 @@ async fn load_executor_config(
         // Chiave seminata dalla mig 0506 (regola G, incoerenza rilevata dal
         // censimento anti-loop / ADR 0035).
         iteration_cap: setting_i64(db, "agent.executor.iteration_cap", d.iteration_cap).await,
+        // Ex costanti hardcoded portate in DB (regola G): offset forced-text,
+        // budget escalation unico, soglie loop-by-signature.
+        forced_text_offset: setting_i64(db, "agent.executor.forced_text_offset", d.forced_text_offset).await,
+        max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
+        loop_thresholds: LoopThresholds {
+            signature: setting_i64(db, "agent.loop.signature_threshold", d.loop_thresholds.signature as i64).await.max(1) as usize,
+            cap: setting_i64(db, "agent.loop.recent_signatures_cap", d.loop_thresholds.cap as i64).await.max(1) as usize,
+        },
         progress_controller_enabled: setting_bool(db, "agent.progress_controller_enabled", d.progress_controller_enabled).await,
         repeated_action_threshold: setting_i64(db, "agent.repeated_action_threshold", d.repeated_action_threshold).await,
         repeated_action_threshold_read_only: setting_i64(db, "agent.repeated_action_threshold.read_only", d.repeated_action_threshold_read_only).await,
@@ -1501,6 +1519,7 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
+        final_gate_passed: state.final_gate_passed,
     }
 }
 

@@ -1336,6 +1336,13 @@ async fn native_outcome_to_run_result(
         AgentRunStatus::FailedDiagnosed
     } else if forced_close {
         AgentRunStatus::FailedDiagnosed
+    } else if outcome.final_gate_passed == Some(false) {
+        // Verifica oggettiva pre-chiusura NON superata (final_gate al cap/forced):
+        // il verdetto STRUTTURATO del gate (regola M) prevale su una dichiarazione
+        // "done" ottimista del modello -> mai "completed" su un task la cui
+        // verifica e' fallita. Difesa in profondita' rispetto a `forced_close`:
+        // il cap del final_gate NON imposta forced_close_unverified.
+        AgentRunStatus::FailedDiagnosed
     } else {
         AgentRunStatus::Completed
     };
@@ -1359,6 +1366,25 @@ async fn native_outcome_to_run_result(
         .final_answer
         .filter(|s| !s.trim().is_empty())
         .or(declared_summary);
+
+    // Annotazione di esito ONESTO (regola M): se la verifica oggettiva
+    // pre-chiusura NON e' passata (final_gate al cap/forced), il resoconto e' la
+    // AUTO-VALUTAZIONE ottimista del modello e NON riflette il verdetto del gate.
+    // Riconciliamo i due qui, al punto unico dell'esito, appendendo l'avviso al
+    // testo mostrato/persistito. Senza questo l'utente vedeva un resoconto
+    // "completato" mentre lo status era failed_diagnosed (run e91d4892). Non si
+    // applica alle dichiarazioni oneste (blocked/needs_input/partial: il modello
+    // stesso ha gia' descritto l'incompletezza nel summary).
+    let final_answer = match (final_answer, outcome.final_gate_passed) {
+        (Some(ans), Some(false)) => Some(format!(
+            "{ans}\n\n---\n**Verifica automatica non superata** (limite tentativi \
+             raggiunto): i criteri di verifica del progetto non sono passati, quindi \
+             il task potrebbe non essere completo. Controlla i criteri falliti nella \
+             timeline \"Decisioni del turno\" e riverifica il flusso reale prima di \
+             considerarlo concluso."
+        )),
+        (other, _) => other,
+    };
 
     // Hollow sul path NATIVO (prima: false hardcoded, "detection del client
     // SSE" che il grafo non ha): un run TERMINATO senza risposta ne' step
@@ -4609,6 +4635,7 @@ mod tests_select_engine {
             declared_outcome: None,
             error_class: None,
             forced_close_unverified: false,
+            final_gate_passed: None,
         }
     }
 
@@ -4715,6 +4742,49 @@ mod tests_select_engine {
             Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::Completed);
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_final_gate_non_superato(pool: sqlx::PgPool) {
+        // Verifica oggettiva pre-chiusura NON superata (final_gate al cap/forced):
+        // il verdetto strutturato final_gate_passed=false (regola M) prevale su una
+        // dichiarazione "done" ottimista e annota il resoconto (run e91d4892).
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+
+        // done dichiarato + gate NON passato -> FailedDiagnosed, mai Completed.
+        let mut o = outcome_base();
+        o.final_answer = Some("Task completato con successo.".to_string());
+        o.declared_outcome =
+            Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
+        o.final_gate_passed = Some(false);
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
+        let ans = r.final_answer.expect("resoconto presente");
+        assert!(ans.starts_with("Task completato con successo."));
+        assert!(
+            ans.contains("Verifica automatica non superata"),
+            "il resoconto deve essere annotato col verdetto del gate: {ans}"
+        );
+
+        // gate PASSATO -> Completed, nessuna annotazione.
+        let mut o = outcome_base();
+        o.final_gate_passed = Some(true);
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
+
+        // gate NON eseguito (None) -> comportamento invariato.
+        let mut o = outcome_base();
+        o.final_gate_passed = None;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
     }
 
     #[sqlx::test]

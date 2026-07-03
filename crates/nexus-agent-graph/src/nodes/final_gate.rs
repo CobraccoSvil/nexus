@@ -15,8 +15,9 @@
 //!   gate `enabled`/`is_software_task` -> pass-through `{}`; ramo PASSED ->
 //!   `{final_gate_cycle:0, stop_reason:end_turn, final_gate_passed:true}`; ramo
 //!   FORCED (`forced_close_unverified` OR `cycle>=max_cycles`) ->
-//!   `{final_gate_cycle:0, stop_reason:end_turn}` (NO `final_gate_passed`: resta
-//!   FailedDiagnosed); ramo FAIL -> inietta `HumanMessage(_render_failed_block)`
+//!   `{final_gate_cycle:0, stop_reason:end_turn, final_gate_passed:false}`
+//!   (verdetto NEGATIVO esplicito: il finalizzatore mappa FailedDiagnosed e
+//!   annota il resoconto); ramo FAIL -> inietta `HumanMessage(_render_failed_block)`
 //!   + `{messages:append, final_gate_cycle:cycle, stop_reason:tool_use,
 //!   pending_tool_uses:[]}`.
 //! - **`is_software_task`**: DELEGATO al PUNTO UNICO `signals::is_software_task`
@@ -724,8 +725,13 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
 
         // ── Ramo FORCED / CAP (final_gate.py:524-537) ─────────────────────────
         // Chiusura SENZA re-executor su forced_close_unverified (abort anti-loop:
-        // re-eseguire duplicherebbe il messaggio finale) o cap raggiunto. NON
-        // imposta final_gate_passed -> resta FailedDiagnosed.
+        // re-eseguire duplicherebbe il messaggio finale) o cap raggiunto. I
+        // criteri sono gia' stati eseguiti e NON sono passati (siamo dopo il ramo
+        // PASSED): registriamo il verdetto NEGATIVO esplicito
+        // `final_gate_passed=false` (segnale strutturato, regola M). Serve al
+        // finalizzatore per mappare FailedDiagnosed anche su una dichiarazione
+        // "done" ottimista del modello e per annotare il resoconto con l'esito
+        // reale, invece di lasciarlo passare per "completed".
         let forced_close = state.forced_close_unverified.unwrap_or(false);
         if forced_close || cycle >= max_cycles {
             tracing::warn!(
@@ -747,6 +753,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             return Ok(StateDelta {
                 final_gate_cycle: Some(Some(0)),
                 stop_reason: Some(Some(StopReason::EndTurn)),
+                final_gate_passed: Some(Some(false)),
                 ..Default::default()
             }
             .into_opaque());
@@ -950,7 +957,7 @@ mod tests {
     // ── Ramo FORCED / CAP ───────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn forced_close_chiude_senza_final_gate_passed() {
+    async fn forced_close_chiude_con_final_gate_passed_false() {
         let runner = Arc::new(StubCriteriaRunner::with_results(vec![fail_result(
             "no_orphan_imported",
             json!({"verdict": "placeholder rilevato"}),
@@ -960,9 +967,10 @@ mod tests {
         let mut st = software_state();
         st.forced_close_unverified = Some(true);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
-        // Chiude (end_turn) ma NON imposta final_gate_passed (resta FailedDiagnosed).
+        // Chiude (end_turn) col verdetto NEGATIVO esplicito final_gate_passed=false
+        // (il finalizzatore mappa FailedDiagnosed e annota il resoconto).
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
-        assert_eq!(out.final_gate_passed, None);
+        assert_eq!(out.final_gate_passed, Some(false));
         assert_eq!(out.final_gate_cycle, Some(0));
         // Nessun messaggio iniettato (chiusura, non re-executor).
         assert_eq!(out.messages.len(), 1, "solo il messaggio AI preesistente");
@@ -981,7 +989,7 @@ mod tests {
         st.final_gate_cycle = Some(1);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
-        assert_eq!(out.final_gate_passed, None);
+        assert_eq!(out.final_gate_passed, Some(false));
         assert_eq!(out.final_gate_cycle, Some(0));
     }
 
@@ -1492,7 +1500,7 @@ mod golden {
         }
         let forced = st.forced_close_unverified.unwrap_or(false);
         if forced || cycle >= max_cycles {
-            return json!({"final_gate_cycle": 0, "stop_reason": "end_turn"});
+            return json!({"final_gate_cycle": 0, "stop_reason": "end_turn", "final_gate_passed": false});
         }
         let block = FinalGateNode::render_failed_block(st, cycle, max_cycles, results);
         json!({
