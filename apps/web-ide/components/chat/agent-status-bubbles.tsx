@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { AgentStep } from "../../lib/api-client";
 import { toolLabel } from "./tool-labels";
+import { MarkdownBlock } from "./markdown-renderer";
 
 /* ------------------------------------------------------------------ */
 /* AgentPreparingBubble  (P1)                                          */
@@ -57,15 +58,14 @@ export function ThinkingBlock({ text, tc }: { text: string; tc: Record<string, s
   // Scroll automatico a fondo quando arriva una nuova riga di thinking.
   // Garantisce che il pannello mostri sempre l-ultimo pensiero, sia con il
   // blocco collassato (preview limitato) sia espanso.
-  const preRef = useRef<HTMLPreElement | null>(null);
+  const preRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const el = preRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [text, expanded]);
 
-  /* Mostra solo le ultime 4 righe se collassato */
+  /* Numero di righe grezze: soglia di collasso + footer "Mostra tutto". */
   const lines = text.split("\n");
-  const preview = lines.length > 4 ? lines.slice(-4).join("\n") : text;
 
   return (
     <div
@@ -110,23 +110,25 @@ export function ThinkingBlock({ text, tc }: { text: string; tc: Record<string, s
         </span>
       </div>
 
-      {/* Contenuto */}
-      <pre
+      {/* Contenuto: stesso renderer Markdown del resto della chat (punto unico
+          MarkdownBlock, regola L), cosi' il ragionamento LIVE e' formattato come
+          quello COMPLETATO (ThinkingPanel) invece di mostrare i caratteri
+          Markdown grezzi. Collassato: altezza limitata + auto-scroll a fondo per
+          tenere in vista l'ultimo pensiero, senza troncare le righe (che
+          spezzerebbe il Markdown). */}
+      <div
         ref={preRef}
         style={{
-          margin: 0,
-          whiteSpace: "pre-wrap",
-          wordBreak: "break-word",
           color: tc.textMuted,
           fontSize: 12,
-          fontFamily: "inherit",
+          opacity: 0.85,
+          wordBreak: "break-word",
           maxHeight: expanded ? "none" : 100,
           overflow: expanded ? "visible" : "hidden",
-          opacity: 0.85,
         }}
       >
-        {expanded ? text : preview}
-      </pre>
+        <MarkdownBlock content={text} />
+      </div>
 
       {!expanded && lines.length > 4 && (
         <span
