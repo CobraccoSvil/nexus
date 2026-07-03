@@ -555,47 +555,25 @@ pub async fn project_meta_pool(
 
 /// Risolve la URL del DB metadati Nexus del progetto dal registry
 /// `project_database_config` (connection_role='nexus_metadata'). `None` se non
-/// ancora provisionato. La URL e' salvata in chiaro nel `connection_secret`
-/// (vedi nota sicurezza in cleanup.rs); la lettura e' coerente con
-/// `resolve_project_conn`.
+/// ancora provisionato. Delega al punto unico
+/// `nexus_project_pools::resolve_meta_db_url` (regola L); l'errore tipizzato e'
+/// reso String al bordo del layer provisioning.
 async fn resolve_meta_db_url(
     meta_db: &sqlx::PgPool,
     project_id: Uuid,
 ) -> Result<Option<String>, String> {
-    let secret: Option<Vec<u8>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(
-        "SELECT connection_secret FROM project_database_config \
-         WHERE project_id = $1 AND connection_role = 'nexus_metadata' \
-         ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(meta_db)
-    .await
-    .map_err(|e| e.to_string())?
-    .flatten();
-    Ok(secret
-        .and_then(|b| String::from_utf8(b).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty()))
+    nexus_project_pools::resolve_meta_db_url(meta_db, project_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
-/// Cache TTL (30s) del flag globale di separazione DB, per non interrogare i
-/// settings a ogni call-site dei domini migrati (regola L: lettura centralizzata).
-static PROJECT_SEPARATION_FLAG: once_cell::sync::Lazy<nexus_cache::TtlCache<(), bool>> =
-    once_cell::sync::Lazy::new(|| nexus_cache::TtlCache::new(std::time::Duration::from_secs(30)));
-
 /// `true` se la separazione DB per-progetto e' abilitata (setting
-/// `db.project_separation.enabled`, mig 0495). Cachato 30s. Pubblica: usata anche dal
-/// boot-recovery per-progetto in main.rs per saltare l'iterazione a flag OFF.
+/// `db.project_separation.enabled`, mig 0495). Delega al punto unico
+/// `nexus_project_pools::separation_enabled` (regola L), che cacha 30s.
+/// Pubblica: usata anche dal boot-recovery per-progetto in main.rs per saltare
+/// l'iterazione a flag OFF.
 pub async fn project_separation_enabled(meta_db: &sqlx::PgPool) -> bool {
-    if let Some(v) = PROJECT_SEPARATION_FLAG.get(&()) {
-        return v;
-    }
-    let v = nexus_auth::get_setting(meta_db, "db.project_separation.enabled")
-        .await
-        .map(|s| s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    PROJECT_SEPARATION_FLAG.insert((), v);
-    v
+    nexus_project_pools::separation_enabled(meta_db).await
 }
 
 /// Punto unico (regola L) per il pool DOVE risiedono i dati per-progetto di un
@@ -630,43 +608,28 @@ pub async fn project_data_pool(state: &AppState, project_id: Uuid) -> sqlx::PgPo
 }
 
 /// Risolve il `project_id` di un'entita' (session/message/run) dalla directory di
-/// routing (`nexus_data_routing` nel meta-DB, mig 0496). Punto unico (regola L)
-/// per gli handler keyed solo dall'id dell'entita'. `None` se non mappata.
+/// routing (`nexus_data_routing` nel meta-DB, mig 0496). Delega al punto unico
+/// `nexus_project_pools::project_id_for_entity` (regola L). `None` se non mappata.
 async fn resolve_project_for_entity(
     meta_db: &sqlx::PgPool,
     entity_kind: &str,
     entity_id: Uuid,
 ) -> Option<Uuid> {
-    sqlx::query_scalar::<_, Uuid>(
-        "SELECT project_id FROM nexus_data_routing WHERE entity_kind = $1 AND entity_id = $2",
-    )
-    .bind(entity_kind)
-    .bind(entity_id)
-    .fetch_optional(meta_db)
-    .await
-    .ok()
-    .flatten()
+    nexus_project_pools::project_id_for_entity(meta_db, entity_kind, entity_id).await
 }
 
 /// Registra la mappa `entita' -> progetto` nella directory di routing (meta),
 /// idempotente. Chiamata ai punti di CREAZIONE dell'entita' (insert_message,
 /// spawn_agent_run, ...) cosi' gli endpoint keyed solo dall'id (feedback,
-/// delete, confirm/cancel run) possono risolvere il pool del progetto. Best-effort.
+/// delete, confirm/cancel run) possono risolvere il pool del progetto.
+/// Best-effort. Delega al punto unico omonimo di nexus-project-pools (regola L).
 pub async fn register_entity_routing(
     meta: &sqlx::PgPool,
     entity_kind: &str,
     entity_id: Uuid,
     project_id: Uuid,
 ) {
-    let _ = sqlx::query(
-        "INSERT INTO nexus_data_routing (entity_kind, entity_id, project_id) \
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-    )
-    .bind(entity_kind)
-    .bind(entity_id)
-    .bind(project_id)
-    .execute(meta)
-    .await;
+    nexus_project_pools::register_entity_routing(meta, entity_kind, entity_id, project_id).await
 }
 
 /// Come [`project_data_pool`] ma a partire dall'id di un'entita' (handler senza
@@ -758,12 +721,10 @@ pub async fn project_data_pool_by_session_from(
 /// Elenco dei `project_id` (tabella globale `projects`, meta-DB). Serve al
 /// fallback di ricerca per gli endpoint keyed solo dall'id di un'entita' non
 /// ancora in directory, e alle viste admin GLOBALI che aggregano i domini migrati
-/// iterando i DB-progetto (regola L, punto unico dell'elenco progetti).
+/// iterando i DB-progetto. Delega al punto unico
+/// `nexus_project_pools::list_project_ids` (regola L).
 pub async fn list_all_project_ids(meta: &sqlx::PgPool) -> Vec<Uuid> {
-    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
-        .fetch_all(meta)
-        .await
-        .unwrap_or_default()
+    nexus_project_pools::list_project_ids(meta).await
 }
 
 /// Risolve il pool del progetto per un'entita' keyed solo dall'id: prima la

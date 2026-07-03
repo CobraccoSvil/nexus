@@ -37,6 +37,7 @@ nexus-mcp-client = { path = "../nexus-mcp-client" }
 nexus-types = { path = "../nexus-types" }
 nexus-cache = { path = "../nexus-cache" }
 nexus-project-db = { path = "../nexus-project-db" }
+nexus-project-pools = { path = "../nexus-project-pools" }
 nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-tool-kit = { path = "../nexus-tool-kit" }
 nexus-agent-tools = { path = "../nexus-agent-tools" }

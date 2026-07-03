@@ -47,20 +47,13 @@ pub async fn stale_seconds_from_settings(db: &PgPool) -> i64 {
 /// NON tocca 'awaiting_confirmation' (resumibile via checkpoint + /agent/approve).
 /// Ritorna gli id dei run reapati, cosi' il chiamante puo' sbloccare gli
 /// EventSource ancora in ascolto (emissione `is_final` sul broadcast channel).
-/// Elenco dei project_id (tabella globale `projects`, meta-DB). Il reaper itera
-/// i progetti per girare la chiusura sul DB di ciascuno (separazione DB): a flag
-/// off `project_data_pool_from` ritorna il meta-DB e la prima iterazione reapa
+/// Il reaper itera i progetti (punto unico `list_all_project_ids`) per girare la
+/// chiusura sul DB di ciascuno (separazione DB): a flag off
+/// `project_data_pool_from` ritorna il meta-DB e la prima iterazione reapa
 /// tutto, le successive trovano vuoto; a flag on ogni pool e' gia' scoped.
-async fn list_project_ids(meta: &PgPool) -> Vec<uuid::Uuid> {
-    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM projects")
-        .fetch_all(meta)
-        .await
-        .unwrap_or_default()
-}
-
 pub async fn reap_stale_runs(db: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid> {
     let mut all_reaped = Vec::new();
-    for project_id in list_project_ids(db).await {
+    for project_id in crate::project_db_routes::list_all_project_ids(db).await {
         let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
         let reaped: Vec<uuid::Uuid> = sqlx::query_scalar::<_, uuid::Uuid>(
             r#"
@@ -112,7 +105,7 @@ pub async fn reap_orphaned_runs_at_boot(db: &PgPool) -> Vec<uuid::Uuid> {
         return reap_stale_runs(db, stale).await;
     }
     let mut all_reaped = Vec::new();
-    for project_id in list_project_ids(db).await {
+    for project_id in crate::project_db_routes::list_all_project_ids(db).await {
         let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
         let reaped: Vec<uuid::Uuid> = sqlx::query_scalar::<_, uuid::Uuid>(
             r#"

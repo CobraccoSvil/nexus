@@ -86,6 +86,15 @@ assert_single "redaction_guard" 'fn (find_redacted_placeholder|enforce_no_redact
 # non catturato dal pattern che richiede "fontFamily:" con i due punti.
 assert_single "font web-ide" "ui-monospace|['\"]JetBrains Mono|fontFamily:[[:space:]]*['\"]monospace" 'apps/web-ide/app/layout.tsx' apps/web-ide
 
+# Convergenza pool DB per-progetto (2026-07-03): i mattoni comuni della
+# risoluzione (flag separazione, registry project_database_config role
+# nexus_metadata, directory nexus_data_routing) vivono SOLO in
+# crates/nexus-project-pools; mcp-core::project_db_routes e i servizi delegano.
+# I glob ammettono anche i test del crate stesso.
+assert_single "flag separazione DB" 'get_setting\(.*"db\.project_separation\.enabled"' 'crates/nexus-project-pools/*' crates
+assert_single "registry DB metadati progetto" "connection_role = 'nexus_metadata'" 'crates/nexus-project-pools/*' crates
+assert_single "directory nexus_data_routing" '(FROM|INTO) nexus_data_routing' 'crates/nexus-project-pools/*' crates
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

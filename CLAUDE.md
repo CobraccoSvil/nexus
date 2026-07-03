@@ -278,6 +278,7 @@ condividere codice (fragile base class).
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` (`parse_user_id`, ...) |
 | Lettura settings | `nexus-auth::settings` (`get_setting`) |
 | Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
+| Pool DB metadati per-progetto (flag, registry, elenco progetti, directory routing) | crate `nexus-project-pools`; `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
 
 ### Enforcement automatico (la regola e' duratura, non una-tantum)

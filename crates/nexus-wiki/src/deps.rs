@@ -75,11 +75,9 @@ impl WikiDeps {
     /// Elenco dei `project_id` (tabella globale `projects`, sempre sul meta-DB).
     /// I worker cross-progetto iterano questo elenco e instradano le letture del
     /// dominio run/chat sul pool di ciascun progetto via [`Self::run_pool`].
+    /// Delega al punto unico `nexus_project_pools::list_project_ids` (regola L).
     pub async fn list_project_ids(&self) -> Vec<uuid::Uuid> {
-        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM projects")
-            .fetch_all(&self.db)
-            .await
-            .unwrap_or_default()
+        nexus_project_pools::list_project_ids(&self.db).await
     }
 }
 
