@@ -73,4 +73,15 @@ pub struct ToolContextCore {
     pub monitor_registry: MonitorRegistry,
     /// Reindicizzazione vettoriale post-mutazione (vedi `FileReindexer`).
     pub reindexer: Arc<dyn FileReindexer>,
+    /// `true` se questo ctx appartiene a un SUB-RUN ISOLATO (scrive in un git
+    /// worktree effimero proprio, non nella project_root condivisa). Leva della
+    /// FASE 2 orchestrazione (isolamento fisico sub-agenti): quando `true` gli
+    /// hook fire-and-forget keyed su session/project condivisi vanno SOPPRESSI —
+    /// autocommit di sessione (index temp + branch ref condivisi) e reindex
+    /// per-scrittura (indice del progetto + race col cleanup del worktree). Per i
+    /// sub-run isolati l'UNICA fonte di verita' del commit e' l'apply atomico
+    /// serializzato post-run (PR4), e il reindex avviene UNA volta sui soli file
+    /// realmente promossi alla root. Default `false` -> comportamento invariato
+    /// (ogni ctx non isolato mantiene autocommit + reindex come oggi).
+    pub isolated_subrun: bool,
 }

@@ -507,11 +507,15 @@ fn spawn_autocommit_snapshot(ctx: &AgentToolContext, op: &str, path_str: &str) {
     let ac_root = ctx.root_path.clone();
     let ac_is_git = ctx.is_git_repo;
     let ac_sid = ctx.session_id;
+    // Soppressione FASE 2 (buco B2): per un sub-run isolato l'autocommit e' no-op
+    // (il flag e' passato alla funzione, che early-return). L'unica fonte del
+    // commit e' l'apply atomico post-run (PR4).
+    let ac_isolated = ctx.isolated_subrun;
     let ac_path = path_str.to_string();
     let ac_op = op.to_string();
     tokio::spawn(async move {
         crate::session_autocommit::snapshot_after_mutation(
-            &ac_db, &ac_root, ac_is_git, ac_sid, &ac_op, &ac_path,
+            &ac_db, &ac_root, ac_is_git, ac_sid, ac_isolated, &ac_op, &ac_path,
         )
         .await;
     });
@@ -523,6 +527,15 @@ fn spawn_autocommit_snapshot(ctx: &AgentToolContext, op: &str, path_str: &str) {
 /// documentazione (`upsert_project_document_if_doc`). Estratto da
 /// `tool_write_file`.
 fn spawn_write_reindex(ctx: &AgentToolContext, target: &Path, path_str: &str, content: &str) {
+    // Soppressione FASE 2 (buco B2): per un sub-run ISOLATO il reindex
+    // fire-and-forget e' un no-op. Indicizzerebbe path del worktree effimero
+    // nell'indice neurale del PROGETTO (contenuti mai promossi alla root) e,
+    // non atteso, correrebbe col cleanup del worktree (lettura di file gia'
+    // rimossi, lock su Windows). Il reindex avviene UNA volta post-apply sui
+    // soli file realmente promossi alla project_root (PR4).
+    if ctx.isolated_subrun {
+        return;
+    }
     let db_bg = ctx.db.clone();
     let neural_bg = ctx.neural.clone();
     let project_id_bg = ctx.project_id;
@@ -1571,6 +1584,12 @@ async fn apply_edit_and_persist(
 /// nel pannello Problemi). Variante di `spawn_write_reindex` senza l'hook M2 sui
 /// documenti (edit non ricrea il .md da zero). Estratto da `tool_edit_file`.
 fn spawn_edit_reindex(ctx: &AgentToolContext, target: &Path) {
+    // Soppressione FASE 2 (buco B2): sub-run isolato -> reindex no-op (stesso
+    // razionale di `spawn_write_reindex`: worktree effimero, race col cleanup).
+    // Reindex-once post-apply sui file promossi alla root (PR4).
+    if ctx.isolated_subrun {
+        return;
+    }
     let db_bg = ctx.db.clone();
     let neural_bg = ctx.neural.clone();
     let project_id_bg = ctx.project_id;

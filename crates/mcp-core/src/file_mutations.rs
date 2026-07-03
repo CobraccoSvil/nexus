@@ -415,11 +415,14 @@ pub async fn revert_mutation(
     // dell'agente, va congelato nel branch nexus/session/<short>. Verifica
     // is_git_repo on-the-fly (per il revert non passiamo per ctx).
     let is_git = project_root.join(".git").exists();
+    // Il revert opera SEMPRE sulla root reale del progetto (mai un sub-run
+    // isolato): `isolated_subrun=false` -> autocommit attivo come oggi.
     crate::session_autocommit::snapshot_after_mutation(
         db,
         project_root,
         is_git,
         session_id,
+        false,
         "revert",
         &file_path,
     )

@@ -125,15 +125,30 @@ async fn git_with_stdin(
 /// Snapshotta la working tree su un commit del branch `nexus/session/<short>`
 /// senza toccare l'index dell'utente ne' HEAD. `relative_path_hint` finisce
 /// nel messaggio di commit; il contenuto e' l'INTERA working tree.
+///
+/// SOPPRESSIONE FASE 2 (buco B2): quando `isolated_subrun` e' `true` (il ctx e'
+/// un sub-run in git worktree effimero) l'autocommit e' un NO-OP immediato. L'index
+/// temp (`nexus-autocommit-{short}.idx`) e il branch ref (`nexus/session/{short}`)
+/// sono keyed sulla SESSIONE, condivisi da tutti i sub-run del batch (stessa
+/// session_id) e residenti nell'object store `.git` condiviso dai worktree: N
+/// sub-run paralleli si corromperebbero index e ref a vicenda. Per i sub-run
+/// isolati l'UNICA fonte di verita' del commit e' l'apply atomico serializzato
+/// post-run (PR4), quindi l'autocommit intra-worktree e' ridondante e dannoso.
 pub async fn snapshot_after_mutation(
     db: &PgPool,
     project_root: &Path,
     is_git_repo: bool,
     session_id: Option<Uuid>,
+    isolated_subrun: bool,
     op: &str,
     relative_path_hint: &str,
 ) {
     if !is_git_repo {
+        return;
+    }
+    // Sub-run isolato: autocommit soppresso (buco B2). L'apply atomico post-run
+    // (PR4) e' l'unica fonte del commit; niente contesa su index/ref di sessione.
+    if isolated_subrun {
         return;
     }
     let Some(sid) = session_id else {
@@ -257,4 +272,40 @@ pub async fn snapshot_after_mutation(
         file = %relative_path_hint, op = %op,
         "session_autocommit: snapshot creato"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Soppressione FASE 2 (buco B2): con `isolated_subrun=true` la funzione e' un
+    /// NO-OP immediato — esce PRIMA di `load_config(db)` e di qualunque comando git.
+    /// Lo verifichiamo con un pool lazy verso una porta chiusa e `is_git_repo=true`
+    /// (cosi' NON si esce dal ramo `!is_git_repo`): se la guardia isolated non
+    /// mordesse, `load_config` tenterebbe la connessione al DB irraggiungibile e la
+    /// chiamata NON ritornerebbe entro il timeout stretto. La root inesistente
+    /// prova in aggiunta che nessun comando git viene lanciato.
+    #[tokio::test]
+    async fn isolated_subrun_sopprime_autocommit_noop() {
+        let db = PgPool::connect_lazy("postgres://x:x@127.0.0.1:1/x").expect("pool lazy");
+        let fake_root = Path::new("/percorso/che/non/esiste/nexus-test");
+        let sid = Uuid::new_v4();
+
+        let fut = snapshot_after_mutation(
+            &db,
+            fake_root,
+            /* is_git_repo */ true,
+            Some(sid),
+            /* isolated_subrun */ true,
+            "create",
+            "src/lib.rs",
+        );
+        // No-op: ritorna subito (nessun connect DB, nessun spawn git).
+        let res = tokio::time::timeout(Duration::from_secs(3), fut).await;
+        assert!(
+            res.is_ok(),
+            "isolated_subrun=true deve essere no-op immediato (nessun I/O DB/git)"
+        );
+    }
 }

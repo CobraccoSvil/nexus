@@ -44,6 +44,7 @@
 //!   contratto per i piani Replay/F3 che potranno marcarlo.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -79,6 +80,13 @@ pub struct ToolRunnerExecutorAdapter {
     /// mutability: `execute` prende `&self`). La N-esima chiamata a un tool legge
     /// la N-esima riga `agent_steps` con quel `tool_name` (ordine `step_index`).
     replay_cursor: Mutex<HashMap<String, i64>>,
+    /// Override della root di lavoro per un SUB-RUN ISOLATO (FASE 2 orchestrazione:
+    /// git worktree effimero proprio del sub-run). Campo IMMUTABILE del run,
+    /// passato a `execute_real` -> `build_ctx_with_root`. `None` (default) -> il
+    /// ctx usa la root del progetto risolta dalla sessione: comportamento
+    /// invariato. In PR3 NESSUN call site passa `Some` (l'accensione e' PR4); il
+    /// canale esiste per essere acceso senza toccare di nuovo l'adapter.
+    working_root: Option<PathBuf>,
 }
 
 impl ToolRunnerExecutorAdapter {
@@ -86,14 +94,23 @@ impl ToolRunnerExecutorAdapter {
     ///
     /// - `session_id`: sessione chat (risolve il ctx in Real);
     /// - `primary_run_id`: run primario da cui rileggere i tool_result in Replay
-    ///   (lo shadow lo riceve dall'orchestratore; in Real non serve).
-    pub fn new(deps: ToolRunnerDeps, session_id: Uuid, primary_run_id: Option<Uuid>) -> Self {
+    ///   (lo shadow lo riceve dall'orchestratore; in Real non serve);
+    /// - `working_root`: override root del sub-run ISOLATO (FASE 2). `None`
+    ///   (default per ogni run non isolato) -> ctx sulla root del progetto,
+    ///   comportamento invariato. In PR3 tutti i call site passano `None`.
+    pub fn new(
+        deps: ToolRunnerDeps,
+        session_id: Uuid,
+        primary_run_id: Option<Uuid>,
+        working_root: Option<PathBuf>,
+    ) -> Self {
         Self {
             db: deps.db.clone(),
             deps: Some(deps),
             session_id,
             primary_run_id,
             replay_cursor: Mutex::new(HashMap::new()),
+            working_root,
         }
     }
 
@@ -114,6 +131,9 @@ impl ToolRunnerExecutorAdapter {
             session_id: Uuid::nil(),
             primary_run_id,
             replay_cursor: Mutex::new(HashMap::new()),
+            // Replay-only: nessun path Real -> nessun ctx costruito -> l'override
+            // root e' irrilevante (execute_real fallisce prima, deps assente).
+            working_root: None,
         }
     }
 
@@ -136,9 +156,14 @@ impl ToolRunnerExecutorAdapter {
         // il ToolRunner non e' operativo -> is_infrastructure (degrada a executor,
         // niente scalata provider).
         let svc = ToolRunnerService::new(deps.clone());
-        let ctx = svc.build_ctx(self.session_id).await.map_err(|status| {
-            PortError::Tool(format!("build_ctx fallita: {status}"))
-        })?;
+        // PUNTO UNICO di costruzione ctx (regola L): con `working_root=None`
+        // (default PR3) e' identico a `build_ctx(session_id)` — stessa root del
+        // progetto, `isolated_subrun=false`. Con un override (PR4) il ctx punta al
+        // worktree effimero del sub-run e sopprime autocommit/reindex.
+        let ctx = svc
+            .build_ctx_with_root(self.session_id, self.working_root.as_deref())
+            .await
+            .map_err(|status| PortError::Tool(format!("build_ctx fallita: {status}")))?;
 
         // Esecuzione IN-PROCESS: la STESSA funzione del dispatch gRPC, non una
         // chiamata di rete a se' stessi (regola: mcp-core E' il ToolRunner).

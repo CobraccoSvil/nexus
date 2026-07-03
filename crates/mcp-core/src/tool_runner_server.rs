@@ -5,7 +5,7 @@
 // Contratto: vedi proto/tool_runner.proto.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -134,13 +134,36 @@ impl ToolRunnerService {
         })
     }
 
-    /// Costruisce l'`AgentToolContext` per una sessione chat.
+    /// Costruisce l'`AgentToolContext` per una sessione chat (root del progetto
+    /// risolta dalla sessione). Delega al PUNTO UNICO
+    /// [`ToolRunnerService::build_ctx_with_root`] con `override_root=None`.
     ///
     /// `pub(crate)`: riusato dall'adapter `ToolExecutor` del grafo Rust
     /// (`agent_graph_adapter::tool_executor`) per eseguire i tool IN-PROCESS sullo
     /// STESSO contesto (root_path/permessi/canali) del path gRPC — un solo punto di
     /// costruzione del ctx (regola L), nessuna divergenza di permessi o reindex.
     pub(crate) async fn build_ctx(&self, session_id: Uuid) -> Result<AgentToolContext, Status> {
+        self.build_ctx_with_root(session_id, None).await
+    }
+
+    /// PUNTO UNICO (regola L) della costruzione dell'`AgentToolContext`: risolve la
+    /// sessione in project/root/permessi/canali. Se `override_root` e' `Some`,
+    /// SOVRASCRIVE la sola `root_path` con quel valore (FASE 2 orchestrazione: un
+    /// sub-run isolato scrive in un git worktree effimero, non nella project_root
+    /// condivisa) e imposta `isolated_subrun=true` nel ctx — la leva che SOPPRIME
+    /// autocommit di sessione e reindex per-scrittura (hook keyed su
+    /// session/project condivisi, race con l'isolamento). Con `override_root=None`
+    /// il ctx e' IDENTICO a quello di `build_ctx` (root della sessione,
+    /// `isolated_subrun=false`) -> comportamento invariato: nessun call site di PR3
+    /// passa un override (l'accensione e' PR4).
+    ///
+    /// Tutto il resto (project_id, permessi, pool, canali, reindexer) e' risolto
+    /// UNA volta qui: `build_ctx` vi delega, nessuna logica duplicata.
+    pub(crate) async fn build_ctx_with_root(
+        &self,
+        session_id: Uuid,
+        override_root: Option<&Path>,
+    ) -> Result<AgentToolContext, Status> {
         let info = self.resolve_session(session_id).await?;
         let long_running_patterns = crate::long_running::load_enabled_patterns(&self.deps.db).await;
         // Separazione DB: run_db = pool del progetto per i tool che toccano il
@@ -150,9 +173,13 @@ impl ToolRunnerService {
             session_id,
         )
         .await;
+        // Root effettiva del ctx + flag isolamento: decisi dal PUNTO UNICO puro
+        // `resolve_ctx_root` (testabile senza DB) — override del sub-run isolato
+        // quando presente, altrimenti la root del progetto (path invariato).
+        let (root_path, isolated_subrun) = resolve_ctx_root(info.root_path, override_root);
         Ok(AgentToolContext {
             core: nexus_agent_tools::ToolContextCore {
-                root_path: info.root_path,
+                root_path,
                 user_id: info.user_id,
                 is_git_repo: info.is_git_repo,
                 can_write: info.can_write,
@@ -170,6 +197,7 @@ impl ToolRunnerService {
                     db: Arc::new(self.deps.db.clone()),
                     neural: self.deps.neural.clone(),
                 }),
+                isolated_subrun,
             },
             playwright_channels: self.deps.playwright_channels.clone(),
             neural: self.deps.neural.clone(),
@@ -186,6 +214,23 @@ struct SessionInfo {
     is_git_repo: bool,
     can_write: bool,
     user_role: String,
+}
+
+/// PUNTO UNICO (regola L) della decisione root + isolamento del ctx tool.
+///
+/// - `override_root=Some(p)` (sub-run ISOLATO, FASE 2): la root del ctx e' `p`
+///   (git worktree effimero) e `isolated_subrun=true` -> autocommit/reindex
+///   soppressi (buco B2).
+/// - `override_root=None` (default): la root e' `session_root` (la project_root
+///   risolta dalla sessione) e `isolated_subrun=false` -> comportamento invariato.
+///
+/// Funzione pura (nessun I/O): la regola di override e' definita in un solo posto
+/// e coperta da unit test senza DB.
+fn resolve_ctx_root(session_root: PathBuf, override_root: Option<&Path>) -> (PathBuf, bool) {
+    match override_root {
+        Some(p) => (p.to_path_buf(), true),
+        None => (session_root, false),
+    }
 }
 
 /// Estrae l'exit code dal testo "EXIT CODE: N" emesso da run_command &c.
@@ -455,6 +500,33 @@ pub async fn spawn_tool_runner_server(
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_ctx_root {
+    use super::resolve_ctx_root;
+    use std::path::{Path, PathBuf};
+
+    // Override presente (sub-run isolato): la root del ctx e' quella del worktree
+    // e isolated_subrun=true (leva soppressione autocommit/reindex, buco B2).
+    #[test]
+    fn override_root_impone_worktree_e_isolamento() {
+        let session_root = PathBuf::from("/progetti/beaty");
+        let worktree = Path::new("/tmp/.nexus-worktrees/beaty/run-1");
+        let (root, isolated) = resolve_ctx_root(session_root, Some(worktree));
+        assert_eq!(root, worktree, "root sovrascritta col worktree");
+        assert!(isolated, "override presente -> isolated_subrun=true");
+    }
+
+    // Nessun override (default PR3): root invariata (project_root della sessione)
+    // e isolated_subrun=false -> comportamento BIT-IDENTICO a oggi.
+    #[test]
+    fn nessun_override_root_invariata_e_non_isolato() {
+        let session_root = PathBuf::from("/progetti/beaty");
+        let (root, isolated) = resolve_ctx_root(session_root.clone(), None);
+        assert_eq!(root, session_root, "root invariata (sessione)");
+        assert!(!isolated, "nessun override -> isolated_subrun=false");
+    }
 }
 
 #[cfg(test)]

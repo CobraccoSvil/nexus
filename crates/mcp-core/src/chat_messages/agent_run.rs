@@ -2651,6 +2651,9 @@ pub(crate) async fn spawn_agent_run(
                     // `dispatch_subagent` (subagent_native) popola questi campi.
                     parent_run_id: None,
                     subagent_depth: None,
+                    // Run principale sulla root del progetto: nessun isolamento
+                    // (l'override worktree e' riservato ai sub-run isolati, PR4).
+                    working_root: None,
                 };
                 match run_via_native(&state_for_finalize, &native_input).await {
                     Ok(outcome) => {
@@ -4003,6 +4006,8 @@ pub(crate) async fn spawn_agent_run(
                     // Shadow del run PRINCIPALE: nessun parent/depth sub-agente.
                     parent_run_id: None,
                     subagent_depth: None,
+                    // Shadow Replay-only (nessun side-effect): nessun override root.
+                    working_root: None,
                 };
                 let primary_run_id = run_id;
                 tokio::spawn(async move {
@@ -4364,6 +4369,8 @@ pub(crate) async fn confirm_native_run(
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
+        // Resume del run principale sulla root del progetto: nessun isolamento.
+        working_root: None,
     };
 
     let outcome = resume_via_native(state, &input, resume_message).await;

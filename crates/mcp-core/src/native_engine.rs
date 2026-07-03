@@ -218,6 +218,14 @@ pub struct NativeRunInput {
     /// grafo nativo lo usa per il guard anti-esplosione del fan-out explore
     /// (`UnderstandingNode`, `subagent_depth >= 1 -> skip`) e per l'anti-ricorsione.
     pub subagent_depth: Option<i64>,
+    /// Override della root di lavoro per un SUB-RUN ISOLATO (FASE 2 orchestrazione:
+    /// git worktree effimero). Threadato fino al `ToolRunnerExecutorAdapter` ->
+    /// `build_ctx_with_root`, che quando presente sovrascrive `root_path` e imposta
+    /// `isolated_subrun=true` (soppressione autocommit/reindex). `None` (default per
+    /// il run principale, il resume, lo shadow e i sub-run non isolati) ->
+    /// comportamento invariato: il ctx usa la root del progetto. In PR3 TUTTI i
+    /// call site lasciano `None`; l'accensione (passare `Some`) e' PR4.
+    pub working_root: Option<std::path::PathBuf>,
 }
 
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
@@ -922,6 +930,10 @@ async fn build_native_engine(
             deps.tool_runner_deps.clone(),
             input.session_id,
             None,
+            // Override root del sub-run isolato (FASE 2). `None` per default (run
+            // principale/sub-run non isolato) -> ctx sulla root del progetto,
+            // comportamento invariato. In PR3 e' sempre `None` (accensione in PR4).
+            input.working_root.clone(),
         )),
         RunRole::Shadow { primary_run_id } => Arc::new(
             ToolRunnerExecutorAdapter::from_db_for_replay(run_db.clone(), Some(primary_run_id)),
@@ -1910,6 +1922,8 @@ mod tests {
             // Run principale di test: nessun annidamento sub-agente.
             parent_run_id: None,
             subagent_depth: None,
+            // Test del run principale: nessun isolamento (root del progetto).
+            working_root: None,
         }
     }
 

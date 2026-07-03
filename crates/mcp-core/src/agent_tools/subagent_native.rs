@@ -509,6 +509,11 @@ async fn run_single_subagent(
         step_tx: sub_tx,
         parent_run_id: Some(anchor),
         subagent_depth: Some(current_depth),
+        // FASE 2: sub-run ANCORA su root condivisa (isolamento fisico spento in
+        // PR3). L'accensione (worktree effimero per-sub + apply atomico) e' PR4,
+        // al punto unico `tool_dispatch_subagents`: solo lì `working_root` diventa
+        // `Some(worktree)`. Qui resta `None` -> comportamento invariato.
+        working_root: None,
     };
 
     // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).

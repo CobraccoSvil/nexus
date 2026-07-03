@@ -321,6 +321,7 @@ mod tests {
                     std::collections::HashMap::new(),
                 )),
                 reindexer: Arc::new(nexus_agent_tools::context_core::NoopReindexer),
+                isolated_subrun: false,
             },
             playwright_channels: crate::playwright_live::new_channels(),
             neural: crate::orchestrator::NeuralCoreClient::disconnected_for_tests(),
