@@ -22,6 +22,7 @@ mod prompt_templates;
 mod protected;
 mod public;
 mod security_quota;
+mod ui_flags;
 
 /// Prelude condiviso dai sottomoduli route: tipi e helper di routing axum
 /// usati ripetutamente. `AppState`, i moduli handler e `middleware` arrivano
@@ -66,6 +67,7 @@ pub fn build_app_router(state: AppState, cors: CorsLayer) -> Router {
     let router = mutations::merge(router, &state);
     let router = chat_commands::merge(router, &state);
     let router = security_quota::merge(router, &state);
+    let router = ui_flags::merge(router, &state);
     let router = dispatcher::merge(router, &state);
     let router = admin::merge(router, &state);
     let router = prompt_templates::merge(router, &state);
