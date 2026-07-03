@@ -84,6 +84,15 @@ pub struct Todo {
     /// Ordine del piano (`seq` ascendente). Opzionale per i golden minimali.
     #[serde(default)]
     pub seq: Option<i64>,
+    /// Aree file (path/prefissi relativi alla root) che il todo DICHIARA di voler
+    /// scrivere. Popolato in un PR successivo dalla colonna `nexus_agent_todos`
+    /// quando `dispatch_wave` la consuma per verificare la DISGIUNZIONE della wave
+    /// parallela via [`crate::decisions::orchestration_reason::subtasks_are_disjoint`]
+    /// (punto unico, regola L). In PR1 e' solo il campo Rust (nessuna persistenza):
+    /// resta vuoto -> il comportamento e' invariato. `#[serde(default)]` per
+    /// retrocompat (golden/checkpoint pre-esistenti non hanno il campo).
+    #[serde(default)]
+    pub write_scope: Vec<String>,
 }
 
 /// Config del DAG parallelo (PARAMETRO esplicito, no lettura DB: regola G).
@@ -230,6 +239,7 @@ mod tests {
             status,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             seq: None,
+            write_scope: Vec::new(),
         }
     }
 

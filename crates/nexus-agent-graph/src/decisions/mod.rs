@@ -97,7 +97,7 @@ pub use m16::{
 pub use meta_reason::{build_stall_context, translate, validate_move, work_epoch, VALID_BLOCKERS};
 pub use orchestration_reason::{
     build_orchestration_context, context_pressure_from_tokens, delegation_forbidden, orch_epoch,
-    validate_orch_move,
+    subtasks_are_disjoint, validate_orch_move,
 };
 pub use predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
 pub use tool_dispatch::{

@@ -1195,6 +1195,7 @@ mod tests {
             status,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             seq: Some(seq),
+            write_scope: Vec::new(),
         }
     }
 

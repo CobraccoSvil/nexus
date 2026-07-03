@@ -676,6 +676,11 @@ impl PlannerNode {
             state.subagent_cost_cumulative_usd.unwrap_or(0.0),
             0.0,
             false,
+            // FASE 1: isolamento fisico dei sub-run non disponibile (worktree e' una
+            // fase infra successiva). Hardwired false -> ParallelIsolated degrada a
+            // Sequential in validate_orch_move (comportamento invariato). Il call site
+            // che conosce project_root/is_git_repo lo calcolera' nei PR successivi.
+            false,
         );
 
         match self.reasoner.orchestrate(orch_ctx, ctx.exec_mode()).await {
@@ -1651,6 +1656,7 @@ mod tests {
             status,
             depends_on: vec![],
             seq: Some(seq),
+            write_scope: Vec::new(),
         }
     }
 

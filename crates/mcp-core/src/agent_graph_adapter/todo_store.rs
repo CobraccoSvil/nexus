@@ -86,6 +86,10 @@ impl TodoStore for PgTodoStore {
                 status: status_from_db(&status),
                 depends_on,
                 seq,
+                // PR1: la colonna write_scope su nexus_agent_todos non esiste ancora
+                // (persistenza in un PR successivo, quando dispatch_wave la consuma).
+                // Finche' non c'e', nessuno scope dichiarato -> comportamento invariato.
+                write_scope: Vec::new(),
             })
             .collect())
     }

@@ -142,13 +142,6 @@ const ORCH_TIMEOUT_DEFAULT: u64 = 20;
 /// (budget/costo: la decisione e' all'ingresso del run, non deve esplodere).
 const ORCH_MAX_TOKENS: u32 = 512;
 
-/// FASE 1: nessun isolamento fisico dei sub-run (worktree per-sub-run e' una fase
-/// infra successiva). Passato ESPLICITAMENTE a [`validate_orch_move`]: con `false`
-/// la coordinazione [`nexus_agent_graph::runtime::ports::Coordination::ParallelIsolated`]
-/// e' SEMPRE rifiutata (anti-race fisico, verificato su `dag_scheduler`). Non e' un
-/// magic fallback (regola G): e' l'assenza esplicita del vincolo infra in Fase 1.
-const ORCH_ISOLATION_AVAILABLE: bool = false;
-
 /// Adapter [`MetaReasonerPort`] -> LLM via [`NeuralCoreClient`] (paradigma
 /// ADR 0036 di `verify_profile`). Legge config/purpose/template dal `db`.
 /// `recover` (recovery-da-stallo) e' implementato; `orchestrate` e' STUB (#11c).
@@ -510,8 +503,10 @@ impl PgMetaReasonerPort {
         // (6) Estrai il testo (forma neural_service: `content`/`text`) e parsa il
         // blocco JSON col punto unico; valida con orchestration_reason::validate_orch_move
         // (enum CHIUSO OrchestrationMove). Testo/JSON assente -> Fallback (il gate lo
-        // tratta come "usa euristica", identico a Ok(None)). isolation_available =
-        // false in Fase 1 -> ParallelIsolated rifiutata; delegation_forbidden dal ctx.
+        // tratta come "usa euristica", identico a Ok(None)). isolation_available e
+        // delegation_forbidden arrivano dal ctx (segnali strutturati risolti a monte,
+        // regola M): in Fase 1 ctx.isolation_available e' sempre false ->
+        // ParallelIsolated degrada a Sequential dentro validate_orch_move.
         let text = value
             .get("content")
             .and_then(|v| v.as_str())
@@ -532,7 +527,7 @@ impl PgMetaReasonerPort {
         // non applicabile per una guard deterministica (delegation_forbidden /
         // ParallelIsolated senza isolamento) -> OrchestrationMove::Fallback (il gate
         // lo tratta come "usa euristica"). Il nodo/gate ri-valida (idempotente).
-        let mv = validate_orch_move(&parsed, ORCH_ISOLATION_AVAILABLE, ctx.delegation_forbidden);
+        let mv = validate_orch_move(&parsed, ctx.isolation_available, ctx.delegation_forbidden);
         tracing::info!(
             target: "nexus_orchestration",
             phase = ?ctx.phase,
@@ -693,27 +688,32 @@ mod tests {
 
     /// Con risposta malformata `validate_orch_move` degrada a `Fallback` (il gate
     /// lo tratta come "usa euristica"). Verifica del punto unico di validazione
-    /// riusato dall'impl (regola L). In Fase 1 `isolation_available=false`:
-    /// `parallel_isolated` e' sempre rifiutata anche con task validi.
+    /// riusato dall'impl (regola L). In Fase 1 `isolation_available=false`: una
+    /// delega `parallel_isolated` con task validi NON e' `Fallback` ma DEGRADA a
+    /// `Sequential` (la delega resta, cade solo il parallelismo).
     #[test]
     fn validate_orch_move_su_risposta_malformata_e_fallback() {
         // Enum sconosciuto -> Fallback (non deserializza in OrchestrationMove).
         let parsed = nexus_types::llm_json::extract_json_block(r#"{"move":"boh"}"#)
             .expect("json parsabile");
         assert_eq!(
-            validate_orch_move(&parsed, ORCH_ISOLATION_AVAILABLE, false),
+            validate_orch_move(&parsed, false, false),
             OrchestrationMove::Fallback
         );
         // Testo senza JSON -> extract_json_block None (l'impl mappa a Fallback).
         assert!(nexus_types::llm_json::extract_json_block("nessun json qui").is_none());
-        // Delega parallela senza isolamento fisico (Fase 1) -> Fallback.
+        // Delega parallela senza isolamento fisico (Fase 1): la delega resta valida,
+        // cade solo il parallelismo -> Sequential (NON Fallback).
         let par = nexus_types::llm_json::extract_json_block(
-            r#"{"move":"delegate_subagents","tasks":[{"task_description":"x","kind":"coder"}],"coordination":"parallel_isolated"}"#,
+            r#"{"move":"delegate_subagents","tasks":[{"task_description":"x","kind":"coder","write_scope":["src/a"]}],"coordination":"parallel_isolated"}"#,
         )
         .expect("json parsabile");
-        assert_eq!(
-            validate_orch_move(&par, ORCH_ISOLATION_AVAILABLE, false),
-            OrchestrationMove::Fallback
-        );
+        assert!(matches!(
+            validate_orch_move(&par, false, false),
+            OrchestrationMove::DelegateSubagents {
+                coordination: nexus_agent_graph::runtime::ports::Coordination::Sequential,
+                ..
+            }
+        ));
     }
 }

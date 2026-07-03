@@ -1149,6 +1149,16 @@ pub struct OrchestrationContext {
     /// [`crate::decisions::orchestration_reason::validate_orch_move`] rifiuta
     /// [`OrchestrationMove::DelegateSubagents`] -> [`OrchestrationMove::Fallback`].
     pub delegation_forbidden: bool,
+    /// L'isolamento fisico dei sub-run paralleli e' DISPONIBILE per questo run
+    /// (worktree effimero per-sub-run: fase infra successiva). Guard fisica
+    /// anti-race per [`Coordination::ParallelIsolated`]. `#[serde(default)]` per
+    /// retrocompat (contesti/checkpoint pre-esistenti non hanno il campo -> `false`,
+    /// comportamento invariato). Il valore e' calcolato al call site mcp-core (che
+    /// conosce project_root/is_git_repo, non la porta), MAI dedotto qui. In Fase 1
+    /// e' hardwired `false` -> [`Coordination::ParallelIsolated`] sempre degradata a
+    /// [`Coordination::Sequential`] da `validate_orch_move`.
+    #[serde(default)]
+    pub isolation_available: bool,
 }
 
 /// Blocco di piano proposto dal meta-reasoner di orchestrazione (forma MINIMALE:
@@ -1174,6 +1184,15 @@ pub struct SubTask {
     pub task_description: String,
     /// Tipo di sub-agente a cui delegare (valore opaco risolto a monte).
     pub kind: String,
+    /// Aree file (path/prefissi relativi alla root) che il sotto-task DICHIARA di
+    /// voler scrivere. Segnale strutturato per la verifica statica di DISGIUNZIONE
+    /// (regola M): [`crate::decisions::orchestration_reason::subtasks_are_disjoint`]
+    /// ammette [`Coordination::ParallelIsolated`] SOLO se ogni task dichiara almeno
+    /// un path e gli scope sono a due a due disgiunti (nessuno che tocca lock/generati
+    /// condivisi). Vuoto = scope non dichiarato -> non parallelizzabile. `#[serde(default)]`
+    /// per retrocompat (mosse LLM/checkpoint pre-esistenti non hanno il campo).
+    #[serde(default)]
+    pub write_scope: Vec<String>,
 }
 
 /// Modalita' di coordinamento dei sub-task delegati. Enum CHIUSO: in Fase 1 SOLO

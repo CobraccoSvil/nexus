@@ -73,7 +73,10 @@ pub fn orch_epoch(phase: OrchPhase) -> i64 {
 /// dedotto qui da prosa: e' l'aggregazione DETERMINISTICA delle guard di delega
 /// (depth oltre soglia / cost oltre cap / policy esplicita), calcolata dal punto
 /// unico [`delegation_forbidden`]. La [`ContextPressure`] deriva da used/limit col
-/// punto unico [`context_pressure_from_tokens`].
+/// punto unico [`context_pressure_from_tokens`]. `isolation_available` e' un
+/// segnale strutturato in ingresso (regola M): il call site che conosce
+/// project_root/is_git_repo lo calcola; qui viene solo trasportato nel contesto (in
+/// Fase 1 e' sempre `false`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_orchestration_context(
     phase: OrchPhase,
@@ -92,6 +95,7 @@ pub fn build_orchestration_context(
     cost_spent_usd: f64,
     cost_cap_usd: f64,
     policy_forbids_delegation: bool,
+    isolation_available: bool,
 ) -> OrchestrationContext {
     let context_pressure = context_pressure_from_tokens(context_tokens_used, context_window_limit);
     let delegation_forbidden = delegation_forbidden(
@@ -118,6 +122,10 @@ pub fn build_orchestration_context(
         cost_spent_usd,
         cost_cap_usd,
         delegation_forbidden,
+        // Segnale strutturato in ingresso (regola M): calcolato al call site che
+        // conosce project_root/is_git_repo, MAI dedotto qui. In Fase 1 il planner
+        // passa sempre `false` -> ParallelIsolated degradata a Sequential.
+        isolation_available,
     }
 }
 
@@ -144,6 +152,140 @@ pub fn delegation_forbidden(
     policy_forbids_delegation || depth_exceeded || cost_exceeded
 }
 
+/// DENYLIST di path scritti IMPLICITAMENTE da build/install o condivisi/generati:
+/// se un `write_scope` li tocca, la wave NON e' parallelizzabile (li' scrivono N
+/// sub-run in modo invisibile alla dichiarazione, rompendo l'isolamento). E' un
+/// INVARIANTE DI SICUREZZA documentato (non config di business, regola G): questi
+/// file/dir sono un fatto del toolchain (lockfile, artefatti, VCS, dipendenze), non
+/// una scelta configurabile. Il match e' su segmento di path normalizzato (regola
+/// M: struttura, non prosa): un elemento con `/` finale e' un PREFISSO di directory,
+/// gli altri sono nomi-file esatti confrontati su qualunque segmento del path.
+const WRITE_SCOPE_DENYLIST: &[&str] = &[
+    // Lockfile di dipendenze (rigenerati da install/build, condivisi).
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "cargo.lock",
+    "poetry.lock",
+    "composer.lock",
+    "gemfile.lock",
+    "go.sum",
+    // Directory di dipendenze/artefatti/build (scritte implicitamente).
+    "node_modules/",
+    "target/",
+    "dist/",
+    "build/",
+    "out/",
+    ".next/",
+    "__pycache__/",
+    ".venv/",
+    "vendor/",
+    "coverage/",
+    // Metadati VCS: mai in scope di un sub-run (condiviso, corrompe l'isolamento).
+    ".git/",
+];
+
+/// Normalizza un path dichiarato in `write_scope` in modo DETERMINISTICO (regola M):
+/// trim, separatori `\` -> `/`, rimozione di `./` iniziale e di `/` iniziali/finali
+/// ridondanti, minuscolo (il match di disgiunzione/denylist e' case-insensitive:
+/// su Windows/macOS il filesystem lo e', e un LLM puo' variare il case). Preserva un
+/// eventuale `/` finale significativo? No: il confronto di prefisso lo tratta a
+/// livello di SEGMENTO (vedi [`scopes_overlap`]), quindi il trailing `/` non serve.
+/// Ritorna `None` se, dopo la normalizzazione, il path e' vuoto (scope non valido).
+fn normalize_scope_path(raw: &str) -> Option<String> {
+    let cleaned: String = raw.trim().replace('\\', "/");
+    let cleaned = cleaned.trim_matches('/').trim();
+    let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
+    let cleaned = cleaned.trim_matches('/');
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.to_ascii_lowercase())
+}
+
+/// `true` se il path normalizzato tocca un elemento della [`WRITE_SCOPE_DENYLIST`].
+/// Un'entry con `/` finale matcha se e' un SEGMENTO qualsiasi del path (prefisso di
+/// directory); un'entry senza `/` matcha un SEGMENTO esatto (nome file) in qualunque
+/// posizione. Deterministico, nessun IO.
+fn scope_hits_denylist(norm_path: &str) -> bool {
+    let segments: Vec<&str> = norm_path.split('/').filter(|s| !s.is_empty()).collect();
+    for entry in WRITE_SCOPE_DENYLIST {
+        if let Some(dir) = entry.strip_suffix('/') {
+            // Directory: matcha se compare come segmento (qualunque livello).
+            if segments.contains(&dir) {
+                return true;
+            }
+        } else if segments.contains(entry) {
+            // Nome file esatto: matcha come segmento (di solito ultimo).
+            return true;
+        }
+    }
+    false
+}
+
+/// `true` se due path normalizzati (a livello di SEGMENTO) si sovrappongono: uguali
+/// o uno prefisso-di-directory dell'altro (`src/a` sovrappone `src/a/b`, ma NON
+/// `src/ab`). Il confronto e' su confine di segmento per evitare falsi overlap tra
+/// nomi con prefisso comune. Simmetrico, deterministico, nessun IO.
+fn scopes_overlap(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    // `longer` inizia con `shorter` seguito da un confine di segmento `/`.
+    longer.starts_with(shorter) && longer.as_bytes().get(shorter.len()) == Some(&b'/')
+}
+
+/// PUNTO UNICO (regola L) della verifica STATICA di DISGIUNZIONE degli scope di
+/// scrittura dichiarati dai sub-task. Funzione PURA (nessun IO, regola M: decide su
+/// segnali strutturati, mai su prosa). Ritorna `true` (parallelizzabile in
+/// isolamento) SOLO se TUTTE queste condizioni valgono:
+///   (a) ogni task dichiara ALMENO un path in `write_scope` (uno scope vuoto ->
+///       non parallelizzabile: non sappiamo cosa scrivera' -> `false`);
+///   (b) nessuno scope tocca un path della [`WRITE_SCOPE_DENYLIST`] (lock/generati/
+///       VCS scritti implicitamente da build/install: romperebbero l'isolamento);
+///   (c) gli scope sono a due a due DISGIUNTI (nessuna sovrapposizione di path o
+///       prefisso di directory, vedi [`scopes_overlap`]).
+/// Un path che dopo la normalizzazione risulta vuoto invalida lo scope (`false`):
+/// una dichiarazione non normalizzabile non e' una dichiarazione valida.
+///
+/// USATO SIA da [`validate_orch_move`] (decisione) SIA (in un PR successivo) dal
+/// coordinatore di dispatch (esecuzione): una sola verifica, nessuna divergenza.
+pub fn subtasks_are_disjoint(scopes: &[Vec<String>]) -> bool {
+    // Normalizza tutti gli scope di tutti i task. (a) scope vuoto -> non disgiunto.
+    let mut per_task: Vec<Vec<String>> = Vec::with_capacity(scopes.len());
+    for task_scope in scopes {
+        if task_scope.is_empty() {
+            return false;
+        }
+        let mut norm_task: Vec<String> = Vec::with_capacity(task_scope.len());
+        for raw in task_scope {
+            match normalize_scope_path(raw) {
+                // (b) tocca la denylist -> non parallelizzabile.
+                Some(p) if scope_hits_denylist(&p) => return false,
+                Some(p) => norm_task.push(p),
+                // Path non normalizzabile (vuoto dopo trim) -> scope non valido.
+                None => return false,
+            }
+        }
+        per_task.push(norm_task);
+    }
+    // (c) disgiunzione a coppie tra path di task DIVERSI. (Overlap DENTRO lo stesso
+    // task e' irrilevante: un task scrive tutto nel proprio scope.)
+    for i in 0..per_task.len() {
+        for j in (i + 1)..per_task.len() {
+            for pa in &per_task[i] {
+                for pb in &per_task[j] {
+                    if scopes_overlap(pa, pb) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Valida l'output JSON dell'LLM contro l'enum CHIUSO [`OrchestrationMove`]. Punto
 /// unico (regola L): il nodo/gate di orchestrazione e l'impl della porta chiamano
 /// SOLO questa funzione. Qualunque forma malformata / con collezione vuota dove
@@ -153,11 +295,14 @@ pub fn delegation_forbidden(
 ///
 /// `isolation_available` e' la guard fisica anti-race (regola verificata sul
 /// codice: `dag_scheduler` non ha campi file, i sub-run condividono la root
-/// per-sessione -> due paralleli che scrivono si pesterebbero). In Fase 1
-/// `isolation_available` e' SEMPRE `false` -> [`Coordination::ParallelIsolated`]
-/// e' SEMPRE rifiutata (l'isolamento fisico via worktree e' una fase infra
-/// successiva). L'anti-race NON si basa su file predetti dall'LLM ma su questa
-/// guard fisica.
+/// per-sessione -> due paralleli che scrivono si pesterebbero). La delega
+/// [`Coordination::ParallelIsolated`] e' ammessa SOLO se `isolation_available ==
+/// true` E gli scope di scrittura dichiarati sono DISGIUNTI (punto unico
+/// [`subtasks_are_disjoint`]); altrimenti la coordinazione DEGRADA a
+/// [`Coordination::Sequential`] (la delega resta valida, cade solo il parallelismo —
+/// NON `Fallback`). In Fase 1 `isolation_available` e' sempre `false` -> ogni
+/// `ParallelIsolated` degrada a `Sequential` (comportamento invariato: la delega
+/// sequenziale era gia' l'unica ammessa).
 ///
 /// `delegation_forbidden` (aggregato deterministico di depth/cost/policy dal
 /// [`OrchestrationContext`]) e' passato ESPLICITAMENTE: se `true`, qualunque
@@ -172,11 +317,13 @@ pub fn validate_orch_move(
         Ok(m) => m,
         Err(_) => return OrchestrationMove::Fallback,
     };
-    match &mv {
+    match mv {
         // Decompose senza blocchi: mossa vuota, inutile -> euristica.
-        OrchestrationMove::Decompose { blocks } if blocks.is_empty() => OrchestrationMove::Fallback,
+        OrchestrationMove::Decompose { ref blocks } if blocks.is_empty() => {
+            OrchestrationMove::Fallback
+        }
         // Delega senza task: mossa vuota -> euristica.
-        OrchestrationMove::DelegateSubagents { tasks, .. } if tasks.is_empty() => {
+        OrchestrationMove::DelegateSubagents { ref tasks, .. } if tasks.is_empty() => {
             OrchestrationMove::Fallback
         }
         // Delega vietata da guard deterministica (depth/cost/policy): la decisione
@@ -184,13 +331,28 @@ pub fn validate_orch_move(
         OrchestrationMove::DelegateSubagents { .. } if delegation_forbidden => {
             OrchestrationMove::Fallback
         }
-        // Delega parallela senza isolamento fisico (Fase 1: isolation_available
-        // sempre false): anti-race, rifiutata -> euristica.
+        // Delega parallela isolata: ammessa SOLO se l'isolamento fisico e'
+        // disponibile E gli scope dichiarati sono disgiunti (punto unico
+        // subtasks_are_disjoint). Altrimenti DEGRADA a Sequential (la delega resta,
+        // cade solo il parallelismo — non Fallback). In Fase 1 isolation_available
+        // e' sempre false -> degrado sistematico a Sequential (invariato).
         OrchestrationMove::DelegateSubagents {
+            tasks,
             coordination: Coordination::ParallelIsolated,
-            ..
-        } if !isolation_available => OrchestrationMove::Fallback,
-        _ => mv,
+        } => {
+            let scopes: Vec<Vec<String>> =
+                tasks.iter().map(|t| t.write_scope.clone()).collect();
+            let coordination = if isolation_available && subtasks_are_disjoint(&scopes) {
+                Coordination::ParallelIsolated
+            } else {
+                Coordination::Sequential
+            };
+            OrchestrationMove::DelegateSubagents {
+                tasks,
+                coordination,
+            }
+        }
+        other => other,
     }
 }
 
@@ -262,6 +424,7 @@ mod tests {
             0.5,
             10.0,
             false,
+            false,
         );
         assert_eq!(ctx.phase, OrchPhase::PlanEntry);
         assert_eq!(ctx.user_intent.as_deref(), Some("aggiungi endpoint REST"));
@@ -281,6 +444,8 @@ mod tests {
         assert_eq!(ctx.cost_cap_usd, 10.0);
         // depth 1 < 3, cost 0.5 < 10.0, policy false -> delega permessa.
         assert!(!ctx.delegation_forbidden);
+        // Fase 1: isolamento fisico non disponibile (hardwired false al call site).
+        assert!(!ctx.isolation_available);
     }
 
     #[test]
@@ -302,6 +467,7 @@ mod tests {
             3,
             0.0,
             0.0,
+            false,
             false,
         );
         assert!(ctx.delegation_forbidden);
@@ -352,7 +518,8 @@ mod tests {
             OrchestrationMove::DelegateSubagents {
                 tasks: vec![SubTask {
                     task_description: "scrivi i test".into(),
-                    kind: "coder".into()
+                    kind: "coder".into(),
+                    write_scope: vec![]
                 }],
                 coordination: Coordination::Sequential
             }
@@ -388,28 +555,116 @@ mod tests {
     }
 
     #[test]
-    fn validate_orch_move_parallel_isolated_rifiutata_senza_isolamento() {
+    fn validate_orch_move_parallel_isolated_senza_isolamento_degrada_a_sequential() {
+        // Scope disgiunti dichiarati, ma isolation_available=false (Fase 1): la
+        // delega resta valida, cade solo il parallelismo -> Sequential (NON Fallback).
         let raw = json!({
             "move": "delegate_subagents",
-            "tasks": [{"task_description": "compila", "kind": "coder"}],
+            "tasks": [
+                {"task_description": "crate a", "kind": "coder", "write_scope": ["crates/a"]},
+                {"task_description": "crate b", "kind": "coder", "write_scope": ["crates/b"]}
+            ],
             "coordination": "parallel_isolated"
         });
-        // Fase 1: isolation_available = false -> Fallback (anti-race fisico).
-        assert_eq!(
-            validate_orch_move(&raw, false, false),
-            OrchestrationMove::Fallback
-        );
-        // Con isolamento fisico disponibile (fase infra successiva) -> ammessa.
+        // isolation_available = false -> degrado a Sequential.
+        match validate_orch_move(&raw, false, false) {
+            OrchestrationMove::DelegateSubagents {
+                coordination: Coordination::Sequential,
+                tasks,
+            } => assert_eq!(tasks.len(), 2),
+            other => panic!("atteso DelegateSubagents/Sequential, ottenuto {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_orch_move_parallel_isolated_ammessa_con_isolamento_e_scope_disgiunti() {
+        let raw = json!({
+            "move": "delegate_subagents",
+            "tasks": [
+                {"task_description": "crate a", "kind": "coder", "write_scope": ["crates/a"]},
+                {"task_description": "crate b", "kind": "coder", "write_scope": ["crates/b"]}
+            ],
+            "coordination": "parallel_isolated"
+        });
+        // isolation_available=true E scope disgiunti -> ParallelIsolated ammessa.
         assert_eq!(
             validate_orch_move(&raw, true, false),
             OrchestrationMove::DelegateSubagents {
-                tasks: vec![SubTask {
-                    task_description: "compila".into(),
-                    kind: "coder".into()
-                }],
+                tasks: vec![
+                    SubTask {
+                        task_description: "crate a".into(),
+                        kind: "coder".into(),
+                        write_scope: vec!["crates/a".into()]
+                    },
+                    SubTask {
+                        task_description: "crate b".into(),
+                        kind: "coder".into(),
+                        write_scope: vec!["crates/b".into()]
+                    }
+                ],
                 coordination: Coordination::ParallelIsolated
             }
         );
+    }
+
+    #[test]
+    fn validate_orch_move_parallel_isolated_scope_sovrapposti_degrada_a_sequential() {
+        // isolation_available=true ma scope sovrapposti (src/a vs src/a/b) -> Sequential.
+        let raw = json!({
+            "move": "delegate_subagents",
+            "tasks": [
+                {"task_description": "t1", "kind": "coder", "write_scope": ["src/a"]},
+                {"task_description": "t2", "kind": "coder", "write_scope": ["src/a/b"]}
+            ],
+            "coordination": "parallel_isolated"
+        });
+        assert!(matches!(
+            validate_orch_move(&raw, true, false),
+            OrchestrationMove::DelegateSubagents {
+                coordination: Coordination::Sequential,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_orch_move_parallel_isolated_scope_vuoto_degrada_a_sequential() {
+        // isolation_available=true ma un task senza write_scope -> Sequential.
+        let raw = json!({
+            "move": "delegate_subagents",
+            "tasks": [
+                {"task_description": "t1", "kind": "coder", "write_scope": ["src/a"]},
+                {"task_description": "t2", "kind": "coder"}
+            ],
+            "coordination": "parallel_isolated"
+        });
+        assert!(matches!(
+            validate_orch_move(&raw, true, false),
+            OrchestrationMove::DelegateSubagents {
+                coordination: Coordination::Sequential,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_orch_move_parallel_isolated_scope_lockfile_degrada_a_sequential() {
+        // isolation_available=true ma uno scope tocca un lockfile (denylist) -> Sequential.
+        let raw = json!({
+            "move": "delegate_subagents",
+            "tasks": [
+                {"task_description": "t1", "kind": "coder", "write_scope": ["Cargo.lock"]},
+                {"task_description": "t2", "kind": "coder", "write_scope": ["crates/b"]}
+            ],
+            "coordination": "parallel_isolated"
+        });
+        assert!(matches!(
+            validate_orch_move(&raw, true, false),
+            OrchestrationMove::DelegateSubagents {
+                coordination: Coordination::Sequential,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -430,5 +685,86 @@ mod tests {
             validate_orch_move(&raw, false, false),
             OrchestrationMove::DelegateSubagents { .. }
         ));
+    }
+
+    // ── subtasks_are_disjoint (funzione pura, punto unico regola L) ──────────
+
+    fn sc(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn subtasks_are_disjoint_scope_disgiunti_true() {
+        assert!(subtasks_are_disjoint(&[sc(&["crates/a"]), sc(&["crates/b"])]));
+        // Multi-path per task, tutti disgiunti tra task.
+        assert!(subtasks_are_disjoint(&[
+            sc(&["src/api", "docs/api.md"]),
+            sc(&["src/db", "docs/db.md"]),
+        ]));
+        // Un solo task: banalmente disgiunto (nessuna coppia).
+        assert!(subtasks_are_disjoint(&[sc(&["src/only"])]));
+        // Nessun task: vacuamente disgiunto (nessuna coppia, nessuno scope vuoto).
+        assert!(subtasks_are_disjoint(&[]));
+    }
+
+    #[test]
+    fn subtasks_are_disjoint_scope_sovrapposti_false() {
+        // Path identico tra due task.
+        assert!(!subtasks_are_disjoint(&[sc(&["src/a"]), sc(&["src/a"])]));
+        // Overlap su un path pur avendone altri disgiunti.
+        assert!(!subtasks_are_disjoint(&[
+            sc(&["src/a", "src/shared"]),
+            sc(&["src/b", "src/shared"]),
+        ]));
+    }
+
+    #[test]
+    fn subtasks_are_disjoint_prefisso_sovrapposto_false() {
+        // src/a e' prefisso-di-directory di src/a/b -> sovrapposti.
+        assert!(!subtasks_are_disjoint(&[sc(&["src/a"]), sc(&["src/a/b"])]));
+        // Ordine inverso: stessa decisione (simmetrico).
+        assert!(!subtasks_are_disjoint(&[sc(&["src/a/b"]), sc(&["src/a"])]));
+        // Prefisso NON di directory (src/a vs src/ab) -> NON sovrapposti.
+        assert!(subtasks_are_disjoint(&[sc(&["src/a"]), sc(&["src/ab"])]));
+    }
+
+    #[test]
+    fn subtasks_are_disjoint_scope_vuoto_false() {
+        // Un task con write_scope vuoto -> non parallelizzabile.
+        assert!(!subtasks_are_disjoint(&[sc(&["src/a"]), sc(&[])]));
+        // Tutti vuoti -> false.
+        assert!(!subtasks_are_disjoint(&[sc(&[]), sc(&[])]));
+        // Path che si normalizza a vuoto (solo separatori) -> scope non valido.
+        assert!(!subtasks_are_disjoint(&[sc(&["src/a"]), sc(&["  ///  "])]));
+    }
+
+    #[test]
+    fn subtasks_are_disjoint_lockfile_e_generati_false() {
+        // Lockfile: rigenerato implicitamente, condiviso.
+        assert!(!subtasks_are_disjoint(&[
+            sc(&["Cargo.lock"]),
+            sc(&["crates/b"]),
+        ]));
+        assert!(!subtasks_are_disjoint(&[
+            sc(&["package-lock.json"]),
+            sc(&["src/b"]),
+        ]));
+        // Directory generata come segmento.
+        assert!(!subtasks_are_disjoint(&[
+            sc(&["node_modules/foo"]),
+            sc(&["src/b"]),
+        ]));
+        assert!(!subtasks_are_disjoint(&[sc(&["target/debug"]), sc(&["src/b"])]));
+        // .git non deve mai stare in scope.
+        assert!(!subtasks_are_disjoint(&[sc(&[".git/config"]), sc(&["src/b"])]));
+    }
+
+    #[test]
+    fn subtasks_are_disjoint_normalizza_separatori_e_case() {
+        // Separatori Windows, ./ iniziale, / finale, case misto: normalizzati.
+        // "./Src/A/" e "src\\a" collidono dopo normalizzazione -> non disgiunti.
+        assert!(!subtasks_are_disjoint(&[sc(&["./Src/A/"]), sc(&["src\\a"])]));
+        // Stessi separatori misti ma path diversi -> disgiunti.
+        assert!(subtasks_are_disjoint(&[sc(&["src\\a"]), sc(&["src\\b"])]));
     }
 }
