@@ -699,6 +699,10 @@ export function AgentStepsPanel({
   narrationWarnAfterChars,
 }: AgentStepsPanelProps) {
   const [activeTab, setActiveTab] = useState<string>(agentRun.runId);
+  // Lista "Decisioni del turno" collassata: durante un run la sequenza esplode a
+  // decine di voci. Di default mostriamo solo le ultime META_COLLAPSE_COUNT (le
+  // piu' recenti = cosa sta facendo ORA); il resto resta a un click.
+  const [showAllMeta, setShowAllMeta] = useState(false);
 
   // Costruisce la lista dei run da mostrare
   const allRuns: Array<{ run: AgentRunInfo; steps: AgentStep[]; label: string }> = [];
@@ -758,15 +762,55 @@ export function AgentStepsPanel({
       {/* Meta-step semantici (plan/routing/clarify/fallback/reflection). I
           next_actions sono esclusi: vengono resi come pulsanti a fine risposta
           in chat, non come card nella lista step. */}
-      {metaSteps && metaSteps.filter((m) => m.kind !== "next_actions").length > 0 && (
-        <div style={{ marginBottom: 8 }} data-testid="agent-meta-steps">
-          {metaSteps
-            .filter((m) => m.kind !== "next_actions")
-            .map((m, idx) => (
-              <AgentMetaStepCard key={`${m.kind}-${m.createdAt}-${idx}`} data={m} />
-            ))}
-        </div>
-      )}
+      {/* Decisioni del turno: durante un run la sequenza puo' arrivare a decine
+          di voci. Di default mostriamo solo le ultime META_COLLAPSE_COUNT (le
+          piu' recenti = cosa sta facendo ORA); il toggle apre l'intera lista per
+          riesaminare il ragionamento. */}
+      {(() => {
+        const META_COLLAPSE_COUNT = 3;
+        const visibleMeta = (metaSteps ?? []).filter((m) => m.kind !== "next_actions");
+        if (visibleMeta.length === 0) return null;
+        const canToggle = visibleMeta.length > META_COLLAPSE_COUNT;
+        const collapsed = !showAllMeta && canToggle;
+        const startIdx = collapsed ? visibleMeta.length - META_COLLAPSE_COUNT : 0;
+        const shown = visibleMeta.slice(startIdx);
+        return (
+          <div style={{ marginBottom: 8 }} data-testid="agent-meta-steps">
+            {canToggle && (
+              <button
+                type="button"
+                onClick={() => setShowAllMeta((v) => !v)}
+                aria-expanded={showAllMeta}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  background: "transparent",
+                  border: "none",
+                  color: tc.textMuted,
+                  cursor: "pointer",
+                  fontSize: 11,
+                  padding: "2px 0",
+                  marginBottom: 4,
+                }}
+              >
+                <span aria-hidden style={{ fontFamily: "var(--font-mono)" }}>
+                  {collapsed ? "▸" : "▾"}
+                </span>
+                {collapsed
+                  ? `Mostra tutte le decisioni (${startIdx} precedenti)`
+                  : `Mostra solo le ultime ${META_COLLAPSE_COUNT}`}
+              </button>
+            )}
+            {shown.map((m, i) => {
+              const idx = startIdx + i;
+              return (
+                <AgentMetaStepCard key={`${m.kind}-${m.createdAt}-${idx}`} data={m} />
+              );
+            })}
+          </div>
+        );
+      })()}
 
       {/* Tabs — solo se ci sono più run */}
       {isMulti && (
