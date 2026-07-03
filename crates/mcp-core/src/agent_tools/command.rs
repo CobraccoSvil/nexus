@@ -256,6 +256,9 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     // Shell cross-platform (punto unico crate::sandbox::agent_shell): bash su Unix,
     // Git Bash su Windows. Gli agenti generano comandi in sintassi bash (brace
     // expansion, &&, pipe, pnpm/npm); su Windows /bin/bash non esiste -> os error 3.
+    // isolated_command fornisce anche l'env isolato (env_clear + host filtrato):
+    // il comando one-shot NON vede i segreti Nexus; le .env() sotto iniettano il
+    // DB del progetto sopra l'env gia' pulito.
     let shell_path = crate::sandbox::agent_shell();
 
     let child = crate::sandbox::isolated_command(&shell_path)

@@ -19,7 +19,6 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
-use crate::sandbox;
 
 /// Output uniforme di un subprocess lanciato tramite `run_cmd`.
 #[derive(Debug, Clone)]
@@ -102,17 +101,14 @@ pub async fn run_cmd_owned(
     );
 
     let start = std::time::Instant::now();
-    // env_clear() + whitelist: il processo figlio non eredita le credenziali
-    // di sistema Nexus (DATABASE_URL, REDIS_URL, ecc.) dal processo padre.
-    let safe_env = sandbox::safe_env_for_direct_spawn();
+    // L'isolamento env (env_clear + host env filtrato: il figlio non eredita le
+    // credenziali Nexus) e' dentro isolated_command, punto unico (regola L).
     let child = crate::sandbox::isolated_command(bin)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_clear()
-        .envs(safe_env)
         .spawn()
         .map_err(NexusToolError::Io)?;
 

@@ -619,27 +619,45 @@ pub fn is_blocked_env(key: &str) -> bool {
     BLOCKED_ENV.iter().any(|&b| key.eq_ignore_ascii_case(b))
 }
 
-/// Restituisce le variabili d'ambiente dell'host filtrate dalla blacklist.
-/// Usato da `exec.rs` per i processi diretti (non Docker).
-pub fn safe_env_for_direct_spawn() -> HashMap<String, String> {
-    std::env::vars()
+/// Filtra un env arbitrario con la blacklist `BLOCKED_ENV` Nexus. Estratto da
+/// `safe_env_for_direct_spawn` per testare la proprieta' di isolamento con un
+/// env sintetico, senza mutare l'env del processo di test (regola F).
+pub fn filtered_safe_env(
+    host_env: impl IntoIterator<Item = (String, String)>,
+) -> HashMap<String, String> {
+    host_env
+        .into_iter()
         .filter(|(k, _)| !is_blocked_env(k))
         .collect()
 }
 
-/// Crea un `tokio::process::Command` gia' isolato in un process group dedicato
-/// (`process_group(0)`). PUNTO UNICO (regola L) per spawnare comandi di progetto:
-/// mettendo ogni comando nel proprio process group, un `kill -<pgid>` su quel
-/// comando (es. cleanup di un dev-server duplicato) non puo' MAI risalire a
-/// mcp-core. E' la difesa universale anti-suicidio, complementare alle safety-net
-/// di `kill_process_tree`: invece di sperare che il killer riconosca mcp-core,
-/// rendiamo strutturalmente impossibile che il padre finisca nel gruppo killato.
+/// Restituisce le variabili d'ambiente dell'host filtrate dalla blacklist.
+pub fn safe_env_for_direct_spawn() -> HashMap<String, String> {
+    filtered_safe_env(std::env::vars())
+}
+
+/// Crea un `tokio::process::Command` gia' isolato. PUNTO UNICO (regola L) per
+/// spawnare comandi di progetto (one-shot e servizi diretti, no Docker). Due
+/// proprieta' di isolamento, entrambe qui e mai nei call site:
+///
+/// 1. **Process group dedicato** (`process_group(0)` su Unix): un `kill -<pgid>`
+///    su quel comando (es. cleanup di un dev-server duplicato) non puo' MAI
+///    risalire a mcp-core. Difesa universale anti-suicidio, complementare alle
+///    safety-net di `kill_process_tree`: invece di sperare che il killer
+///    riconosca mcp-core, rendiamo strutturalmente impossibile che il padre
+///    finisca nel gruppo killato.
+/// 2. **Env isolato** (`env_clear` + host env filtrato da `BLOCKED_ENV`): il
+///    figlio NON eredita i segreti di mcp-core (DATABASE_URL del meta,
+///    JWT_SECRET, API key provider...) — incidente Beaty-Book 2026-07-02, dove
+///    i one-shot ereditavano l'intero env e qualunque `env | grep` li esponeva.
+///    Blacklist e NON whitelist: le variabili host legittime (PATH, HOME,
+///    SYSTEMROOT, TEMP, npm_config_*...) passano. Le injection esplicite del
+///    chiamante (`.env(...)`, es. DATABASE_URL del DB progetto) si applicano
+///    sopra l'env gia' pulito.
 pub fn isolated_command(program: &str) -> tokio::process::Command {
-    // `mut` serve solo su Unix, dove `process_group` prende `&mut self`. Su
-    // Windows (MSVC) il binding resta immutato: sopprimiamo il warning solo li'
-    // invece di rimuovere `mut` (che romperebbe la build Unix/WSL).
-    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut cmd = tokio::process::Command::new(program);
+    cmd.env_clear();
+    cmd.envs(safe_env_for_direct_spawn());
     #[cfg(unix)]
     cmd.process_group(0);
     #[cfg(windows)]
@@ -832,5 +850,86 @@ mod tests_validate_env {
         assert!(is_blocked_env("ANTHROPIC_API_KEY"));
         assert!(!is_blocked_env("PORT"));
         assert!(!is_blocked_env("HOST"));
+    }
+}
+
+#[cfg(test)]
+mod tests_isolated_env {
+    use super::*;
+
+    /// Env host come lo vede mcp-core in produzione: variabili di sistema
+    /// necessarie ai figli + segreti Nexus che NON devono mai propagarsi.
+    fn host_env_meta() -> Vec<(String, String)> {
+        [
+            ("DATABASE_URL", "postgresql://nexus:nexus@localhost:5433/nexus"),
+            ("REDIS_URL", "redis://localhost:6379"),
+            ("JWT_SECRET", "supersegreto"),
+            ("ANTHROPIC_API_KEY", "sk-ant-xyz"),
+            ("pgpassword", "case-insensitive-bypass"),
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/nexus"),
+            ("SYSTEMROOT", r"C:\Windows"),
+            ("TEMP", r"C:\Temp"),
+            ("npm_config_registry", "https://registry.npmjs.org"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn filtered_safe_env_rimuove_i_segreti_e_tiene_le_var_di_sistema() {
+        let env = filtered_safe_env(host_env_meta());
+        // Blacklist fuori, anche con case diverso (pgpassword vs PGPASSWORD)
+        for blocked in ["DATABASE_URL", "REDIS_URL", "JWT_SECRET", "ANTHROPIC_API_KEY", "pgpassword"]
+        {
+            assert!(!env.contains_key(blocked), "'{blocked}' non filtrata");
+        }
+        // Variabili host legittime dentro (blacklist, non whitelist)
+        for kept in ["PATH", "HOME", "SYSTEMROOT", "TEMP", "npm_config_registry"] {
+            assert!(env.contains_key(kept), "'{kept}' filtrata per errore");
+        }
+    }
+
+    #[test]
+    fn injection_esplicita_sopravvive_al_filtro() {
+        // Il contratto dei call site (run_command, spawn_agent_process): l'env
+        // pulito dal punto unico + .env("DATABASE_URL", <url progetto>) sopra.
+        let mut cmd = isolated_command("echo");
+        cmd.env("DATABASE_URL", "postgresql://app:app@localhost:5434/beaty_book_app");
+        let injected = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_string_lossy() == "DATABASE_URL")
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(
+            injected.as_deref(),
+            Some("postgresql://app:app@localhost:5434/beaty_book_app")
+        );
+    }
+
+    #[test]
+    fn isolated_command_imposta_esattamente_l_env_filtrato() {
+        // env_clear() non e' ispezionabile via API std: verifichiamo il wiring
+        // osservabile — le variabili impostate esplicitamente sul Command sono
+        // ESATTAMENTE l'host env filtrato, nessuna chiave bloccata inclusa.
+        let cmd = isolated_command("echo");
+        let expected = safe_env_for_direct_spawn();
+        let got: HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(got, expected);
+        for k in got.keys() {
+            assert!(!is_blocked_env(k), "variabile bloccata '{k}' propagata");
+        }
     }
 }

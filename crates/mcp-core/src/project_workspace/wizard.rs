@@ -144,7 +144,10 @@ async fn indicatore_presente(cwd: &str, indicator: &str) -> bool {
 /// la voce di log JSON con l'esito (stdout/stderr troncati alle ultime 15 righe).
 async fn esegui_setup_step(cwd: &str, unit_name: &str, step: &SetupStep) -> serde_json::Value {
     tracing::info!(unit = %unit_name, cwd = %cwd, step = %step.label, "eseguo setup ambiente");
-    let result = tokio::process::Command::new(step.cmd)
+    // isolated_command (punto unico, regola L): gli step di setup eseguono
+    // codice del progetto (postinstall npm, build script) — niente segreti
+    // Nexus nell'env ereditato.
+    let result = crate::sandbox::isolated_command(step.cmd)
         .args(step.args)
         .current_dir(cwd)
         .output()
@@ -334,7 +337,10 @@ pub(super) async fn spawn_detached_service(
         logfile,
     );
 
-    match tokio::process::Command::new("/bin/sh")
+    // isolated_command (punto unico, regola L): il servizio detached eredita
+    // l'env pulito (filtrato dalla blacklist Nexus); `env K=V` nella stringa
+    // shell aggiunge sopra solo le variabili del progetto.
+    match crate::sandbox::isolated_command("/bin/sh")
         .args(["-c", &shell])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

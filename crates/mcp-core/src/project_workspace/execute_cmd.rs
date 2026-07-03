@@ -63,14 +63,15 @@ pub async fn execute_command(
     let timeout = Duration::from_secs(timeout_secs);
     let start = std::time::Instant::now();
 
-    // Esegui il comando nella root del progetto via bash
+    // Esegui il comando nella root del progetto via bash. isolated_command
+    // (punto unico, regola L) fornisce env_clear + host env filtrato: HOME e
+    // PATH passano dal filtro, i segreti Nexus (DATABASE_URL meta, JWT_SECRET,
+    // API key) no.
     let result = tokio::time::timeout(
         timeout,
         crate::sandbox::isolated_command(&crate::sandbox::agent_shell())
             .args(["-c", &command])
             .current_dir(&context.root_path)
-            .env("HOME", std::env::var("HOME").unwrap_or_default())
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("TERM", "dumb")
             .output(),
     )
