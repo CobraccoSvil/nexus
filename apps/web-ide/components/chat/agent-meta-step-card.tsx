@@ -229,7 +229,10 @@ const FINAL_GATE_PHASES: Record<string, string> = {
 // Lo stato iniziale viene dal payload del meta_step plan; gli aggiornamenti
 // arrivano in tempo reale (la checklist si spunta mentre l'agente lavora).
 type PlanTodo = { id?: string; seq?: number; content?: string; status?: string; priority?: string };
-function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
+// Esportata come punto unico della checklist plan live (regola L): riusata dal
+// nastro attivita' (activity-stream.tsx) per non duplicare la logica di
+// aggiornamento TodoUpdated via SSE.
+export function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
   // overrides[todo_id] = status piu' recente ricevuto via SSE.
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   useEventOfKind(

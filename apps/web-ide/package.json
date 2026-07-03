@@ -8,7 +8,8 @@
     "start": "node server.js",
     "lint": "eslint . --ext .ts,.tsx --ignore-pattern .next --ignore-pattern next-env.d.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node -e \"console.log('no tests yet')\""
+    "test": "node --test \"lib/**/*.test.ts\"",
+    "test:typecheck": "tsc -p tsconfig.test.json --noEmit"
   },
   "devDependencies": {
     "@types/cytoscape": "^3.31.0",

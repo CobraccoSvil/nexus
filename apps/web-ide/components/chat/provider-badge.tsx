@@ -71,6 +71,26 @@ async function fetchPricing(): Promise<ModelPricingEntry[]> {
   }
 }
 
+/** Hook che restituisce l'INTERO catalogo pricing (cache 5 min condivisa con
+ *  useModelPricing). Punto unico per prezzare piu' modelli in un colpo senza
+ *  chiamare useModelPricing in un loop dinamico (violerebbe le regole hooks).
+ *  Usato dal footer costo-per-provider del nastro attivita' (ADR 0037). */
+export function usePricingCatalog(): ModelPricingEntry[] {
+  const [entries, setEntries] = useState<ModelPricingEntry[]>(
+    _pricingCache?.entries ?? [],
+  );
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPricing().then((e) => {
+      if (!cancelled) setEntries(e);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return entries;
+}
+
 /** Hook che restituisce la entry del catalogo per il (provider, model) dato. */
 export function useModelPricing(
   provider: string | null | undefined,

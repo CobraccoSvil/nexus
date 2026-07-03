@@ -1,0 +1,12 @@
+{
+  "//": "Typecheck dei file *.test.ts (runner: node --test). Abilita l'import di moduli con estensione .ts esplicita (richiesta dal loader ESM di Node con type-stripping). Il tsconfig principale li ESCLUDE dal build Next.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": ["**/*.test.ts"],
+  "exclude": ["node_modules", ".next"]
+}

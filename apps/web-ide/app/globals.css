@@ -317,3 +317,56 @@ optgroup {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ============================================================================
+   4. Nastro attivita' chat (ADR 0037) — densita' adattiva via @container.
+   Attivo solo col flag chat.activity_stream_enabled. Il contenitore della
+   lista messaggi porta `container-type: inline-size` + `container-name: chat`
+   (classe .nx-chat-container); le query reagiscono alla LARGHEZZA REALE del
+   pannello chat, non al viewport (il pannello e' ridimensionabile).
+
+   Gerarchia di sacrificio (dal mockup v3): quando lo spazio cala cedono per
+   prime le etichette ridondanti col glifo, il nome-modello nel badge (resta la
+   sigla provider), il testo dei turni storici, i nomi provider nei costi; il
+   ragionamento si clampa. NON cedono MAI le tre invarianti:
+     1. nodo colorato per provider su ogni evento;
+     2. banda "Cambio provider" a colore pieno;
+     3. esito tool strutturato (ok/errore + exit code).
+   ============================================================================ */
+.nx-chat-container {
+  container-type: inline-size;
+  container-name: chat;
+}
+
+/* Elementi che si comprimono/nascondono alle densita' strette. Default = tier
+   medio (nessuna regola: piena densita' salvo le due soglie sotto). */
+.nx-as-thought-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.nx-as-tool-target {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* STRETTO <=380px: massima compressione verticale. */
+@container chat (max-width: 380px) {
+  .nx-as-kind-label { display: none; }        /* etichetta ridondante col glifo */
+  .nx-as-badge-model { display: none; }        /* solo sigla provider nel badge */
+  .nx-as-hist-query { display: none; }         /* testo del turno storico */
+  .nx-as-hist-tokens { display: none; }        /* solo il costo, non i token */
+  .nx-as-cost-provider-name { display: none; } /* barra + numeri, senza nome */
+  .nx-as-thought-body { -webkit-line-clamp: 1; }
+  .nx-as-tool-target { max-width: 150px; }
+  .nx-as-status-text { display: none; }        /* solo l'icona di esito */
+}
+
+/* ESTESO >=600px: piena ricchezza, nessun troncamento. */
+@container chat (min-width: 600px) {
+  .nx-as-thought-body { -webkit-line-clamp: none; }
+  .nx-as-tool-target { max-width: none; white-space: normal; }
+}

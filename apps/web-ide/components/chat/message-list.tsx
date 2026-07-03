@@ -2,13 +2,21 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { RefObject } from "react";
-import type { ChatMessage, AgentRunInfo, AgentStep, SavedChatAttachment } from "../../lib/api-client";
+import type { ChatMessage, AgentRunInfo, AgentStep, SavedChatAttachment, AITraceEvent } from "../../lib/api-client";
 import { getAgentRun, getAgentRunNextActions, getAttachmentRawUrl } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { MarkdownBlock } from "./markdown-renderer";
 import { AgentMetaStepCard, HIDDEN_META_KINDS, NextActionsButtons, type NextActionChoice } from "./agent-meta-step-card";
 import type { MetaStepEntry } from "../../lib/use-chat/types";
 import { toolLabel } from "./tool-labels";
+import {
+  composeActivityStream,
+  tracesForRun,
+  type FoldThreshold,
+} from "../../lib/use-chat/activity-stream";
+import { ActivityStreamView } from "./activity-stream";
+import { ActivityCostFooter } from "./activity-cost-footer";
+import { ActivityHistoryRow } from "./activity-history-row";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -504,6 +512,36 @@ function MessageMetaSteps({ steps, tc }: { steps: MetaStepEntry[]; tc: ThemeColo
   );
 }
 
+/**
+ * Nastro attivita' per UN messaggio assistant con runId (ADR 0037). Compone lo
+ * stream dal punto unico (metaSteps + steps + traces del run) e lo rende come
+ * nastro + footer costo-per-provider. Reso SOLO col flag activity_stream_enabled
+ * ON, al posto di MessageMetaSteps/AgentRunStepsInline. Best-effort: se non c'e'
+ * alcun segnale non rende nulla.
+ */
+function MessageActivityStream({
+  metaSteps,
+  steps,
+  traces,
+  foldThreshold,
+  tc,
+}: {
+  metaSteps: MetaStepEntry[];
+  steps: AgentStep[];
+  traces: AITraceEvent[];
+  foldThreshold: FoldThreshold;
+  tc: ThemeColors;
+}) {
+  const stream = composeActivityStream(metaSteps, steps, traces, foldThreshold);
+  if (stream.empty) return null;
+  return (
+    <div style={{ minWidth: 0 }}>
+      <ActivityStreamView stream={stream} tc={tc} />
+      {traces.length > 0 && <ActivityCostFooter traces={traces} tc={tc} />}
+    </div>
+  );
+}
+
 /** Raggruppa step consecutivi con stesso toolName e stesso status (esclude
  *  supervisor_check, sempre singolo). Stessa logica del pannello live
  *  (agent-steps-panel SingleRunPanel) per la parita' di rendering storico/live
@@ -929,6 +967,17 @@ export interface MessageListProps {
    *  runId (FIX D6), non piu' in un unico blocco "Decisioni del turno" per il
    *  solo ultimo run. I next_actions sono esclusi (gestiti come pulsanti). */
   metaStepsMap?: Map<string, MetaStepEntry[]>;
+  /** Step agente per runId (agentStepsMap di useChat). Sorgente del nastro
+   *  attivita' (ADR 0037) insieme a metaStepsMap e traces. */
+  agentStepsMap?: Map<string, AgentStep[]>;
+  /** Trace gateway della SESSIONE (filtrate per runId dentro il nastro). */
+  traces?: AITraceEvent[];
+  /** Flag chat.activity_stream_enabled (ADR 0037). OFF (default) = rendering
+   *  odierno bit-identico; ON = nastro attivita'. */
+  activityStreamEnabled?: boolean;
+  /** Soglia densita' del collasso tool (2 compatto / 3 medio / 4 esteso).
+   *  Deriva dalla larghezza @container; default 3 (medio). */
+  foldThreshold?: FoldThreshold;
 }
 
 type CopyFeedbackState = { messageId: string; status: "success" | "error" } | null;
@@ -984,6 +1033,10 @@ export function MessageList({
   projectId,
   nextActions,
   metaStepsMap,
+  agentStepsMap,
+  traces,
+  activityStreamEnabled = false,
+  foldThreshold = 3,
 }: MessageListProps) {
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedbackState>(null);
   const copyFeedbackTimeoutRef = useRef<number | null>(null);
@@ -1013,6 +1066,19 @@ export function MessageList({
   // fossero stati digitati dall'utente.
   const visibleMessages = messages.filter((m) => !m.synthetic);
   const grouped = groupMessages(visibleMessages);
+
+  // ADR 0037: id dell'ULTIMO messaggio assistant con runId nella lista visibile.
+  // Col flag ON e' l'unico turno reso con nastro ESPANSO; i turni assistant
+  // precedenti con runId si rendono come riga storica COMPATTA (collassata,
+  // espandibile). "Ultimo" e' l'ultimo in ordine di lista, coerente con la
+  // logica di isLastUser (che guarda i messaggi successivi).
+  const lastAssistantRunMessageId = (() => {
+    for (let i = visibleMessages.length - 1; i >= 0; i--) {
+      const m = visibleMessages[i];
+      if (m.role === "assistant" && m.runId) return m.id;
+    }
+    return null;
+  })();
 
   return (
     <>
@@ -1236,18 +1302,75 @@ export function MessageList({
             </div>
 
             {/* Badge di stato del turno (persistente, dal run canonico): rende
-                esplicito com'e' finito il run e demarca la fine del turno. */}
-            {!isUser && message.runStatus && (
-              <div style={{ marginTop: 6 }}>
-                <RunStatusBadge status={message.runStatus} tc={tc} />
-              </div>
-            )}
+                esplicito com'e' finito il run e demarca la fine del turno.
+                Per i turni STORICI compatti (flag ON, non l'ultimo run) lo stato
+                e' gia' nel badge della riga storica: lo nascondo per non
+                duplicarlo. Con flag OFF o sull'ultimo turno resta invariato. */}
+            {!isUser &&
+              message.runStatus &&
+              !(
+                activityStreamEnabled &&
+                message.runId &&
+                message.id !== lastAssistantRunMessageId
+              ) && (
+                <div style={{ marginTop: 6 }}>
+                  <RunStatusBadge status={message.runStatus} tc={tc} />
+                </div>
+              )}
+
+            {/* ADR 0037: quando il flag activity_stream_enabled e' ON, il
+                messaggio assistant con runId mostra il NASTRO ATTIVITA' al posto
+                di "Decisioni del turno" + "Mostra step agente". Sorgente:
+                metaSteps + steps + traces del run.
+                - L'ULTIMO turno assistant con runId -> nastro ESPANSO pieno
+                  (MessageActivityStream, segmenti + footer costo).
+                - I turni PRECEDENTI -> riga storica COMPATTA (ActivityHistoryRow:
+                  badge stato + trail provider colorato + token/costo),
+                  collassata ed espandibile al nastro completo.
+                Con flag OFF il rendering resta IDENTICO a oggi. */}
+            {(() => {
+              if (isUser || !message.runId || !activityStreamEnabled) return null;
+              const runId = message.runId;
+              const runMeta = metaStepsMap?.get(runId) ?? [];
+              const runSteps = agentStepsMap?.get(runId) ?? [];
+              const runTraces = traces ? tracesForRun(traces, runId) : [];
+              const hasRunData = runMeta.length > 0 || runSteps.length > 0 || runTraces.length > 0;
+              if (!hasRunData) return null;
+              const isLastAssistantRun = message.id === lastAssistantRunMessageId;
+              if (isLastAssistantRun) {
+                return (
+                  <MessageActivityStream
+                    metaSteps={runMeta}
+                    steps={runSteps}
+                    traces={runTraces}
+                    foldThreshold={foldThreshold}
+                    tc={tc}
+                  />
+                );
+              }
+              return (
+                <div style={{ marginTop: 6 }}>
+                  <ActivityHistoryRow
+                    metaSteps={runMeta}
+                    steps={runSteps}
+                    traces={runTraces}
+                    foldThreshold={foldThreshold}
+                    runStatus={message.runStatus}
+                    totalTokens={message.totalTokens}
+                    totalCostUsd={message.totalCost}
+                    defaultExpanded={false}
+                    tc={tc}
+                  />
+                </div>
+              );
+            })()}
 
             {/* Decisioni del turno (meta_step) per QUESTO messaggio (FIX D6):
                 card per-messaggio invece di un unico blocco per l'ultimo run.
                 Sorgente: metaStepsMap del run (live SSE o rilette dal DB al
-                bootstrap), cosi' restano dopo un reload e sui turni passati. */}
-            {!isUser && message.runId && metaStepsMap?.get(message.runId) && (
+                bootstrap), cosi' restano dopo un reload e sui turni passati.
+                Reso solo con flag OFF (con flag ON lo sostituisce il nastro). */}
+            {!isUser && !activityStreamEnabled && message.runId && metaStepsMap?.get(message.runId) && (
               <MessageMetaSteps
                 steps={metaStepsMap.get(message.runId)!}
                 tc={tc}
@@ -1276,8 +1399,10 @@ export function MessageList({
 
             {/* Pannello step agente (caricamento lazy dal DB): mostrato per
                 OGNI run, non solo in modalita' agent, cosi' si vede sempre cosa
-                e' stato fatto. Si auto-nasconde se il run non ha prodotto step. */}
-            {!isUser && message.runId && (
+                e' stato fatto. Si auto-nasconde se il run non ha prodotto step.
+                Con flag ON gli step sono gia' nel nastro attivita': lo nascondo
+                per non duplicare. */}
+            {!isUser && !activityStreamEnabled && message.runId && (
               <AgentRunStepsInline runId={message.runId} tc={tc} />
             )}
 

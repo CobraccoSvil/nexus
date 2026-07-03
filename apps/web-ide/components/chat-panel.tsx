@@ -18,6 +18,9 @@ import { useGlobalDialog } from "./global-dialog-provider";
 import { FeedbackErrorDialog } from "./feedback-error-dialog";
 import { IconButton } from "./icon-button";
 import { MessageList } from "./chat/message-list";
+import { useActivityStreamEnabled } from "../lib/use-chat/activity-stream-flag";
+import { composeActivityStream, tracesForRun, type FoldThreshold } from "../lib/use-chat/activity-stream";
+import { RunNotifications } from "./chat/run-notifications";
 import { SessionWorklogPanel } from "./chat/session-worklog-panel";
 import { AgentStepsPanel } from "./chat/agent-steps-panel";
 import { extractLatestNextActions } from "./chat/agent-meta-step-card";
@@ -159,6 +162,12 @@ export function ChatPanel({
   const tc = useThemeColors();
   const { t } = useI18n();
   const { confirmDialog } = useGlobalDialog();
+  // ADR 0037: flag del nastro attivita' (default OFF -> rendering odierno).
+  const activityStreamEnabled = useActivityStreamEnabled();
+  // Soglia densita' del collasso tool, derivata dalla larghezza REALE del
+  // pannello chat (stessa fonte delle @container query): compatto <=380 -> 2,
+  // esteso >=600 -> 4, medio -> 3. Osservata via ResizeObserver sullo scrollRef.
+  const [foldThreshold, setFoldThreshold] = useState<FoldThreshold>(3);
   const [feedbackDialog, setFeedbackDialog] = useState<{ messageId: string; content: string } | null>(null);
   const hasProject = UUID_RE.test(projectId);
   const [activeMemoryCount, setActiveMemoryCount] = useState(0);
@@ -314,6 +323,26 @@ export function ChatPanel({
     (action) => action === "resend" || action === "delete" || action === "feedback",
   );
   const isAgentRunning = agentRun?.status === "running";
+
+  // ADR 0037: osserva la larghezza reale della lista messaggi per derivare la
+  // soglia densita' del collasso, coerente con le @container query (che agiscono
+  // sulle CLASSI CSS; la soglia numerica del folding e' logica, non CSS, quindi
+  // la calcoliamo qui). Attivo solo col nastro abilitato.
+  useEffect(() => {
+    if (!activityStreamEnabled) return;
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const apply = (w: number) => {
+      const next: FoldThreshold = w <= 380 ? 2 : w >= 600 ? 4 : 3;
+      setFoldThreshold((prev) => (prev === next ? prev : next));
+    };
+    apply(el.clientWidth);
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) apply(e.contentRect.width);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [activityStreamEnabled]);
 
   const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
@@ -1065,7 +1094,7 @@ export function ChatPanel({
         <div
           ref={scrollRef}
           onScroll={handleScroll}
-          className="flex-1 flex-col-gap-6 text-base overflow-auto no-scrollbar"
+          className={`flex-1 flex-col-gap-6 text-base overflow-auto no-scrollbar${activityStreamEnabled ? " nx-chat-container" : ""}`}
           style={{
             minHeight: 0,
             scrollbarWidth: "thin",
@@ -1118,6 +1147,10 @@ export function ChatPanel({
             lastUserRef={lastUserRef}
             projectId={projectId}
             metaStepsMap={metaStepsMap}
+            agentStepsMap={agentStepsMap}
+            traces={traces}
+            activityStreamEnabled={activityStreamEnabled}
+            foldThreshold={foldThreshold}
             nextActions={(!agentRun && metaStepsMap.size > 0) ? (() => {
               // Scelte di proseguimento (next_actions) dell'ultimo run concluso:
               // passate a MessageList per essere rese DENTRO la bolla del
@@ -1203,7 +1236,10 @@ export function ChatPanel({
               OGNI messaggio assistant con runId: cosi' restano leggibili sui
               turni passati e convergono live/refresh (regola L). */}
 
-          {traces.length > 0 && <InlineTracePanel traces={traces} />}
+          {/* Trace AI: col flag activity_stream ON il costo-per-provider e' gia'
+              nel footer del nastro, quindi nascondo questo pannello per non
+              duplicare. Con OFF resta il rendering odierno. */}
+          {!activityStreamEnabled && traces.length > 0 && <InlineTracePanel traces={traces} />}
 
           {isLoading && !agentRun && streamingToken && (
             <div
@@ -1325,7 +1361,24 @@ export function ChatPanel({
           selectedModel,
           modelCatalog,
         );
-        return (
+        // ADR 0037: col flag ON, accanto alla barra contesto compare il centro
+        // notifiche del run attivo (campanella): eventi salienti del turno
+        // (cambio provider, step fallito, attesa conferma). Auto-apertura solo
+        // per eventi bloccanti.
+        const runNotifications =
+          activityStreamEnabled && agentRun?.runId ? (
+            <RunNotifications
+              stream={composeActivityStream(
+                metaStepsMap.get(agentRun.runId) ?? [],
+                agentStepsMap.get(agentRun.runId) ?? [],
+                tracesForRun(traces, agentRun.runId),
+                foldThreshold,
+              )}
+              runStatus={agentRun.status}
+              tc={tc}
+            />
+          ) : null;
+        const usageBar = (
           <TokenUsageBar
             totalTokens={tokenUsage.totalTokens}
             totalCostUsd={tokenUsage.totalCostUsd}
@@ -1333,6 +1386,16 @@ export function ChatPanel({
             lastInputTokens={fill.lastInputTokens}
             modelLabel={fill.activeModel}
           />
+        );
+        // Flag OFF: rendering IDENTICO a oggi (barra nuda, nessun wrapper). Flag
+        // ON: affianca il centro notifiche del run alla barra contesto.
+        return runNotifications ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>{usageBar}</div>
+            {runNotifications}
+          </div>
+        ) : (
+          usageBar
         );
       })()}
 
