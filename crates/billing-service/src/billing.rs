@@ -495,10 +495,14 @@ async fn finalize_usage_impl(
     let (input_cost, output_cost, total_cost) =
         calculate_cost(&price, usage.prompt_tokens, usage.completion_tokens);
 
+    // run_id bindato diretto: la FK verso orchestrator_runs e' stata rimossa
+    // (mig 0276, run LangGraph legittimi fuori tabella) e orchestrator_runs
+    // vive nei DB-progetto dal cutover separazione DB (mig 0507 nel meta): la
+    // vecchia subquery di validazione fallirebbe con "relation does not exist".
     sqlx::query(
         r#"
         UPDATE ai_usage_ledger
-        SET run_id = (SELECT id FROM orchestrator_runs WHERE id = $2),
+        SET run_id = $2,
             prompt_tokens = $3,
             completion_tokens = $4,
             total_tokens = $5,
@@ -865,13 +869,39 @@ pub async fn get_session_usage(
 
     let requester = claims_user_id(&claims)?;
 
+    // Separazione DB per-progetto: chat_sessions/chat_messages vivono nel DB
+    // del progetto (nel meta sono decommissionate, mig 0507). Il pool giusto si
+    // risolve dalla sessione via nexus-project-pools (punto unico, regola L);
+    // a flag OFF ritorna il meta (storico).
+    let session_pool = match nexus_project_pools::project_data_pool_by_session(
+        &state.db, session_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(nexus_project_pools::ProjectPoolError::SessionNotFound(_)) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Session not found" })),
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e,
+                "session-usage: pool del progetto non risolvibile");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "Project database unavailable" })),
+            ));
+        }
+    };
+
     if claims.role != "admin" {
         let is_owner = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE id = $1 AND user_id = $2)",
         )
         .bind(session_id)
         .bind(requester)
-        .fetch_one(&state.db)
+        .fetch_one(&session_pool)
         .await
         .unwrap_or(false);
 
@@ -896,7 +926,7 @@ pub async fn get_session_usage(
         "#,
     )
     .bind(session_id)
-    .fetch_one(&state.db)
+    .fetch_one(&session_pool)
     .await
     .map_err(|e| {
         (
@@ -921,7 +951,7 @@ pub async fn get_session_usage(
         "#,
     )
     .bind(session_id)
-    .fetch_all(&state.db)
+    .fetch_all(&session_pool)
     .await
     .map_err(|e| {
         (

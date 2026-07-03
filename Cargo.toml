@@ -16,6 +16,7 @@ members = [
   "crates/nexus-auth",
   "crates/nexus-types",
   "crates/nexus-cache",
+  "crates/nexus-project-pools",
   "crates/admin-service",
   "crates/billing-service",
   "crates/doc-service",

@@ -49,24 +49,43 @@ impl NexusToolHandler for DockerRunTool {
         // get_pool ritorna un pool short-lived verso Nexus (riusa env DATABASE_URL).
         // Best-effort: se il pool fallisce, salta il check (degrado graceful).
         if let Ok(nexus_pool) = super::db_helper::get_pool().await {
-            if let Err(reason) =
-                crate::quotas::check_can_start_container(&nexus_pool, ctx.project_id)
-                    .await
-            {
-                crate::audit::record_audit(
-                    crate::audit::AuditEntry::blocked(
-                        ctx.project_id,
-                        "container_create",
-                        "container",
-                    )
-                    .with_resource(image.clone())
-                    .with_details(json!({"reason": reason, "name": name})),
-                );
-                nexus_pool.close().await;
-                return Err(NexusToolError::BadInput(format!(
-                    "Quota container raggiunta: {}",
-                    reason
-                )));
+            // Separazione DB: agent_processes vive nel DB del progetto; il pool
+            // si risolve via nexus-project-pools (punto unico, regola L). Non
+            // risolvibile -> WARN + skip check, stesso degrado del pool meta.
+            // Il run_pool NON va chiuso: a flag ON e' condiviso dalla cache del
+            // crate, a flag OFF e' un clone di nexus_pool (chiuso sotto).
+            let run_pool =
+                match nexus_project_pools::project_data_pool(&nexus_pool, ctx.project_id).await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!(
+                            project_id = %ctx.project_id,
+                            error = %e,
+                            "docker_run: pool dominio run non risolvibile, quota container non applicata"
+                        );
+                        None
+                    }
+                };
+            if let Some(run_pool) = run_pool {
+                if let Err(reason) =
+                    crate::quotas::check_can_start_container(&nexus_pool, &run_pool, ctx.project_id)
+                        .await
+                {
+                    crate::audit::record_audit(
+                        crate::audit::AuditEntry::blocked(
+                            ctx.project_id,
+                            "container_create",
+                            "container",
+                        )
+                        .with_resource(image.clone())
+                        .with_details(json!({"reason": reason, "name": name})),
+                    );
+                    nexus_pool.close().await;
+                    return Err(NexusToolError::BadInput(format!(
+                        "Quota container raggiunta: {}",
+                        reason
+                    )));
+                }
             }
             nexus_pool.close().await;
         }
