@@ -72,6 +72,12 @@ assert_single "catalog query Postgres" 'pub fn list_catalog_rows' 'crates/nexus-
 assert_single "registrazione progetto" 'pub async fn register_project_records' 'crates/nexus-tool-kit/src/project_register_common.rs' crates
 assert_single "endpoint MCP server condivisi" 'pub async fn list_servers_core' 'crates/nexus-mcp-client/src/server_endpoints.rs' crates
 
+# Incidente Beaty-Book (2026-07-02): placeholder di redazione ([REDACTED:...],
+# __NEXUS_..._N__) copiati come valori nei tool_input. Punto unico:
+# security/redaction_guard.rs; i call site (run_command, run_service,
+# enforce_on_write, nexus_db_query) delegano.
+assert_single "redaction_guard" 'fn (find_redacted_placeholder|enforce_no_redacted_placeholder)' 'crates/mcp-core/src/security/redaction_guard.rs' crates
+
 # Font tipografico (2026-07-01): punto unico in apps/web-ide/app/layout.tsx
 # (next/font/local -> --font-mono). I componenti usano var(--font-mono); vietato
 # reintrodurre stack font hardcoded negli inline style. Ricerca confinata a

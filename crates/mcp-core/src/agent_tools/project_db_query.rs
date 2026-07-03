@@ -38,6 +38,20 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
         }
     };
 
+    // Placeholder di redazione copiati come valori (incidente Beaty-Book:
+    // [REDACTED:email_pii] persistito nel DB applicativo). Punto unico:
+    // security::redaction_guard (regola L). Copre sql e params piu' sotto.
+    if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
+        ctx,
+        "nexus_db_query",
+        "sql",
+        &sql,
+    )
+    .await
+    {
+        return json!({ "error": msg }).to_string();
+    }
+
     let params: Vec<Option<String>> = match input.get("params") {
         Some(Value::Array(arr)) => arr
             .iter()
@@ -49,6 +63,21 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
             .collect(),
         _ => Vec::new(),
     };
+
+    // Stesso guard sui valori parametrizzati: un placeholder passato come
+    // bind param bypasserebbe il check sul testo SQL.
+    for p in params.iter().flatten() {
+        if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
+            ctx,
+            "nexus_db_query",
+            "params",
+            p,
+        )
+        .await
+        {
+            return json!({ "error": msg }).to_string();
+        }
+    }
 
     let max_rows = input
         .get("max_rows")

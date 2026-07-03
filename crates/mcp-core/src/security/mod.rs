@@ -21,6 +21,7 @@ pub use nexus_tool_kit::audit;
 pub mod guardrail_metrics;
 pub mod port_enforcer;
 pub use nexus_tool_kit::quotas;
+pub mod redaction_guard;
 pub mod resource_governance;
 pub mod resource_linter;
 

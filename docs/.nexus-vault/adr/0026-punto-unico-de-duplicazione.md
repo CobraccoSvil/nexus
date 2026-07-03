@@ -94,6 +94,7 @@ condividere codice (fragile base class, accoppiamento al genitore).
 | Estensioni file di codice (CODE_EXTENSIONS) | `crates/nexus-types/src/code_files.rs` (re-export in `mcp-core::projects`) | esistente |
 | Servizi AI del wiki (embed/completion/purpose) | trait `WikiAiServices` in `nexus-wiki::deps` (impl `AppStateWikiAi` in `mcp-core::wiki`, delega a NeuralCoreClient + internal_routing) | esistente |
 | Identita' e dedup servizi di progetto (label generiche, similarity con split trattini, stop duplicati pre-spawn) | `mcp-core/src/agent_processes.rs` (`is_generic_service_label`, `similar_service_labels`, `stop_similar_running_services`); delegano: tool `run_service`, wizard install Windows, start/restart pannello, launch run config; visibilita' voci pannello Windows in `project_workspace/services.rs::visible_windows_services` | esistente |
+| Guard placeholder di redazione nei tool_input (`[REDACTED:<tipo>]`, `__NEXUS_<KIND>_<N>__` copiati come valori — incidente Beaty-Book 2026-07-02) | `mcp-core/src/security/redaction_guard.rs` (`find_redacted_placeholder`, `enforce_no_redacted_placeholder`); policy `secret/no_redacted_placeholder` (mig 0509); delegano: `enforce_on_write` (write_file/edit_file), `run_command`, `run_service`, `nexus_db_query` | esistente |
 
 ### Enforcement
 

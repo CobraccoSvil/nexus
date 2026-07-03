@@ -133,6 +133,20 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         return "[Errore: comando vuoto]".to_string();
     }
 
+    // Placeholder di redazione copiati come valori (incidente Beaty-Book):
+    // eseguire `DATABASE_URL=[REDACTED:...] node server.js` produce solo
+    // errori a runtime. Punto unico: security::redaction_guard (regola L).
+    if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
+        ctx,
+        "run_command",
+        "command",
+        &command,
+    )
+    .await
+    {
+        return msg;
+    }
+
     // ── Livello 0 GUARDRAIL: blocca comandi infrastruttura-distruttivi ──
     // Difesa in profondita': blacklist server-side che non puo' essere
     // bypassata dal prompt utente / jailbreak. Vedi safety.rs per la lista

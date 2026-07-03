@@ -131,6 +131,21 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         return "[Errore: comando vuoto]".to_string();
     }
 
+    // Placeholder di redazione copiati come valori (incidente Beaty-Book):
+    // `DATABASE_URL=[REDACTED:db_connection_string] node server.js` avviava
+    // il backend con host 'base' -> getaddrinfo ENOTFOUND. Punto unico:
+    // security::redaction_guard (regola L).
+    if let Some(msg) = crate::security::redaction_guard::enforce_no_redacted_placeholder(
+        ctx,
+        "run_service",
+        "command",
+        &command,
+    )
+    .await
+    {
+        return msg;
+    }
+
     // Declassamento one-shot: install/build/test lunghi arrivano qui via
     // auto-routing di run_command (background=true, pattern long-running,
     // auto-probe) con kind="service", ma NON sono servizi del progetto.
@@ -357,6 +372,13 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         }
     }
 
+    // Iniezione DB progetto (incidente Beaty-Book, parita' con run_command):
+    // NON via env_overrides — DATABASE_URL e' in BLOCKED_ENV e
+    // validate_env_overrides la rifiuterebbe (regola 1) prima ancora del check
+    // contenuto (regola 3). L'iniezione server-side di
+    // DATABASE_URL/NEXUS_PROJECT_DB_URL vive DENTRO spawn_agent_process
+    // (punto unico, regola L: copre anche wizard, pannello e run config),
+    // insieme a env_clear + filtro is_blocked_env sull'ambiente ereditato.
     match crate::agent_processes::spawn_agent_process(
         &ctx.db,
         ctx.project_id,
