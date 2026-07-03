@@ -144,6 +144,11 @@ test("collasso: >= soglia tool ok consecutivi comprimono in folded_tools", () =>
   assert.ok(folded, "esiste un evento folded_tools");
   assert.equal(folded.type === "folded_tools" ? folded.count : -1, 4);
   assert.equal(events3.filter((e) => e.type === "tool").length, 0, "nessun tool espanso");
+  // Il folded CONSERVA i ToolEvent originali (espandibili dal renderer):
+  // niente troncamento silenzioso.
+  assert.ok(folded.type === "folded_tools");
+  assert.equal(folded.tools.length, 4, "i 4 tool sono conservati in tools");
+  assert.ok(folded.tools.every((t) => t.type === "tool" && t.outcome === "ok"));
 });
 
 test("collasso: sequenza sotto soglia resta espansa", () => {
@@ -170,6 +175,8 @@ test("collasso: soglia 2 (compatto) e' piu' aggressiva di soglia 4 (esteso)", ()
   const compatto = foldConsecutiveOkTools(evs, 2);
   assert.equal(compatto.length, 1, "3 tool ok con soglia 2 -> tutti collassati");
   assert.equal(compatto[0].type, "folded_tools");
+  // Il folded conserva TUTTI i tool originali (espandibili singolarmente).
+  assert.equal(compatto[0].type === "folded_tools" ? compatto[0].tools.length : -1, 3);
 
   const esteso = foldConsecutiveOkTools(evs, 4);
   assert.equal(esteso.length, 3, "3 tool ok con soglia 4 -> restano espansi");
@@ -279,6 +286,21 @@ test("ToolEvent espone input e result dallo step", () => {
   assert.ok(tool);
   assert.deepEqual(tool.input, { path: "src/main.rs", content: "fn main() {}" });
   assert.equal(tool.result, "file scritto (12 righe)");
+});
+
+test("folded: i tool conservati mantengono input/result (espandibili singolarmente)", () => {
+  beforeEach();
+  const steps: AgentStep[] = [
+    step("read_file", "completed", 0, { toolInput: { path: "a.ts" }, toolResult: "contenuto a" }),
+    step("read_file", "completed", 1, { toolInput: { path: "b.ts" }, toolResult: "contenuto b" }),
+    step("read_file", "completed", 2, { toolInput: { path: "c.ts" }, toolResult: "contenuto c" }),
+  ];
+  const s = composeActivityStream([], steps, [], 3);
+  const folded = s.segments[0].events.find((e) => e.type === "folded_tools");
+  assert.ok(folded && folded.type === "folded_tools");
+  assert.equal(folded.tools.length, 3);
+  assert.deepEqual(folded.tools[0].input, { path: "a.ts" });
+  assert.equal(folded.tools[2].result, "contenuto c");
 });
 
 // ── Cap live (capStreamToRecent) ────────────────────────────────────────────

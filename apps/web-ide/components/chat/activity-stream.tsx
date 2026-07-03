@@ -31,6 +31,7 @@ import type {
   ActivitySegment,
   ActivityEvent,
   ToolEvent,
+  FoldedToolsEvent,
   SwitchEvent,
   FoldThreshold,
 } from "../../lib/use-chat/activity-stream";
@@ -404,6 +405,68 @@ function detailLabelStyle(tc: ThemeColors): React.CSSProperties {
   };
 }
 
+/** Riga di tool collassati: header cliccabile "iter. X-Y · N passi · tutti ok";
+ *  espansa mostra i singoli ToolEvent (ognuno a sua volta espandibile per
+ *  Parametri/Risultato via ToolEventBody). Niente troncamento silenzioso:
+ *  l'utente arriva sempre al dettaglio dei singoli step. */
+function FoldedToolsBody({
+  event,
+  segColor,
+  tc,
+}: {
+  event: FoldedToolsEvent;
+  segColor: string;
+  tc: ThemeColors;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const range =
+    event.firstIteration != null && event.lastIteration != null
+      ? `iter. ${event.firstIteration + 1}–${event.lastIteration + 1} · `
+      : "";
+  return (
+    <div style={{ minWidth: 0 }}>
+      <div
+        onClick={() => setExpanded((v) => !v)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          fontSize: 11.5,
+          color: tc.textMuted,
+          cursor: "pointer",
+          minWidth: 0,
+        }}
+      >
+        <span aria-hidden style={{ fontFamily: "var(--font-mono)", fontSize: 9, flexShrink: 0 }}>
+          {expanded ? "▾" : "▸"}
+        </span>
+        <span>
+          {range}
+          {event.count} passi {"·"} tutti ok
+        </span>
+      </div>
+      {expanded && (
+        <div
+          style={{
+            marginTop: 6,
+            marginLeft: 8,
+            paddingLeft: 8,
+            borderLeft: `2px solid ${withAlpha(segColor, 0.35)}`,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            minWidth: 0,
+          }}
+        >
+          {event.tools.map((tool, i) => (
+            <ToolEventBody key={`folded-tool-${i}`} event={tool} segColor={segColor} tc={tc} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function EventBody({
   event,
   segColor,
@@ -448,16 +511,7 @@ function EventBody({
     case "tool":
       return <ToolEventBody event={event} segColor={segColor} tc={tc} />;
     case "folded_tools":
-      return (
-        <div style={rowStyle}>
-          <span style={{ fontSize: 11.5, color: tc.textMuted }}>
-            {event.firstIteration != null && event.lastIteration != null
-              ? `iter. ${event.firstIteration + 1}–${event.lastIteration + 1} · `
-              : ""}
-            {event.count} passi {"·"} tutti ok
-          </span>
-        </div>
-      );
+      return <FoldedToolsBody event={event} segColor={segColor} tc={tc} />;
     case "verify":
       return (
         <div style={rowStyle}>

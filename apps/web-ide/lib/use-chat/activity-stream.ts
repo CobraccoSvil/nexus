@@ -102,12 +102,17 @@ export interface ContextOverflowEvent {
   detail?: string;
 }
 
-/** Sequenza di tool consecutivi tutti ok, compressa oltre soglia densita'. */
+/** Sequenza di tool consecutivi tutti ok, compressa oltre soglia densita'.
+ *  I ToolEvent originali sono CONSERVATI in `tools` (non scartati) cosi' il
+ *  renderer puo' espandere la riga collassata e mostrare i singoli tool (ognuno
+ *  a sua volta espandibile per Parametri/Risultato). Niente troncamento
+ *  silenzioso: il folding e' sempre reversibile con un click. */
 export interface FoldedToolsEvent {
   type: "folded_tools";
   count: number;
   firstIteration?: number;
   lastIteration?: number;
+  tools: ToolEvent[];
 }
 
 export type ActivityEvent =
@@ -458,6 +463,8 @@ export function foldConsecutiveOkTools(
         count: run.length,
         firstIteration: run[0].iteration,
         lastIteration: run[run.length - 1].iteration,
+        // Conserva i ToolEvent originali per l'espansione (niente scarto).
+        tools: run,
       });
     } else {
       out.push(...run);

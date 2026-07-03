@@ -27,6 +27,7 @@ import {
   type ActivityStream,
   type FoldThreshold,
 } from "../../lib/use-chat/activity-stream";
+import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
 import type { MetaStepEntry } from "../../lib/use-chat/types";
 import type { AgentStep, AITraceEvent } from "../../lib/api/agent";
 
@@ -60,6 +61,7 @@ function providerTrail(stream: ActivityStream): string[] {
 }
 
 export function ActivityHistoryRow({
+  runId,
   metaSteps,
   steps,
   traces,
@@ -71,6 +73,8 @@ export function ActivityHistoryRow({
   defaultExpanded = false,
   tc,
 }: {
+  /** id del run: usato per il lazy-fetch degli step storici mancanti. */
+  runId: string;
   metaSteps: MetaStepEntry[];
   steps: AgentStep[];
   /** Trace del SOLO run del turno (gia' filtrate dal parent). */
@@ -86,8 +90,13 @@ export function ActivityHistoryRow({
   tc: ThemeColors;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
+  // Lazy-fetch degli step storici SOLO quando la riga e' espansa (evita N fetch
+  // al bootstrap per ogni turno passato collassato). Se gli step sono gia'
+  // presenti, niente fetch. Il trail (dai meta_step) resta corretto anche
+  // prima del fetch.
+  const resolvedSteps = useResolvedRunSteps(runId, steps, expanded);
   // Punto unico di composizione (regola L): un solo modello per trail + nastro.
-  const stream = composeActivityStream(metaSteps, steps, traces, foldThreshold);
+  const stream = composeActivityStream(metaSteps, resolvedSteps, traces, foldThreshold);
   const tone = statusTone(runStatus);
   const trail = providerTrail(stream);
 

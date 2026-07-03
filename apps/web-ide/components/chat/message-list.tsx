@@ -18,6 +18,7 @@ import { ActivityStreamView } from "./activity-stream";
 import { ActivityCostFooter } from "./activity-cost-footer";
 import { ActivityHistoryRow } from "./activity-history-row";
 import { InlineTruncated, formatStepInput } from "./step-detail";
+import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -473,19 +474,25 @@ function MessageMetaSteps({ steps, tc }: { steps: MetaStepEntry[]; tc: ThemeColo
  * alcun segnale non rende nulla.
  */
 function MessageActivityStream({
+  runId,
   metaSteps,
   steps,
   traces,
   foldThreshold,
   tc,
 }: {
+  runId: string;
   metaSteps: MetaStepEntry[];
   steps: AgentStep[];
   traces: AITraceEvent[];
   foldThreshold: FoldThreshold;
   tc: ThemeColors;
 }) {
-  const stream = composeActivityStream(metaSteps, steps, traces, foldThreshold);
+  // Lazy-fetch degli step storici quando mancano (agentStepsMap non popolato al
+  // bootstrap per i run passati): senza, il nastro storico mostrerebbe le
+  // decisioni ma NON i tool. Se gli step sono gia' presenti, niente fetch.
+  const resolvedSteps = useResolvedRunSteps(runId, steps);
+  const stream = composeActivityStream(metaSteps, resolvedSteps, traces, foldThreshold);
   if (stream.empty) return null;
   return (
     <div style={{ minWidth: 0 }}>
@@ -1293,6 +1300,7 @@ export function MessageList({
               if (isLastAssistantRun) {
                 return (
                   <MessageActivityStream
+                    runId={runId}
                     metaSteps={runMeta}
                     steps={runSteps}
                     traces={runTraces}
@@ -1304,6 +1312,7 @@ export function MessageList({
               return (
                 <div style={{ marginTop: 6 }}>
                   <ActivityHistoryRow
+                    runId={runId}
                     metaSteps={runMeta}
                     steps={runSteps}
                     traces={runTraces}
