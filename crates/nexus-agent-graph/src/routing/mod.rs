@@ -43,6 +43,9 @@ pub enum NodeTarget {
     Executor,
     /// Esecuzione sequenziale isolata dei todo.
     TodoRunner,
+    /// Nodo del meta-reasoner di recovery-da-stallo (superstep dedicato).
+    /// Raggiunto quando `route_after_executor` osserva `StopReason::StallReason`.
+    StallRecovery,
 }
 
 /// `MAX_AGENT_ITERATIONS` Python: cap conservativo di fallback quando lo state
@@ -107,6 +110,15 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
     // (2) G1 escalation -> re-executor via g1_continue.
     if stop_reason == Some(StopReason::G1Escalated) {
         return NodeTarget::G1Continue;
+    }
+    // (2-bis) Stallo che richiede META-RAGIONAMENTO -> nodo dedicato StallRecovery
+    // (superstep isolato, ADR 0036-style). L'executor emette questo stop_reason
+    // (blocco successivo del piano) dopo il livello-1 GUIDE cheap e prima delle
+    // mosse costose; il nodo consulta la porta MetaReasonerPort (UNA LLM-call via
+    // ctx.llm, replay-safe) e rientra nell'executor via self-loop (StallResolved).
+    // INERTE finche' nessun detector emette StallReason (flag OFF di default).
+    if stop_reason == Some(StopReason::StallReason) {
+        return NodeTarget::StallRecovery;
     }
     // (3) Abort coordinato / legacy: final_gate se eleggibile, altrimenti learner.
     if matches!(

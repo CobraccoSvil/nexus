@@ -2825,6 +2825,438 @@ async fn rolling_summary_degrado_best_effort_history_invariata() {
     );
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+//  Meta-reasoner di recovery-da-stallo (blocco #6): gate emissione + consumo.
+// ──────────────────────────────────────────────────────────────────────────
+
+use crate::decisions::meta_reason::work_epoch as stall_work_epoch;
+use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
+use crate::runtime::ports::{RecoveryMove, StallContext};
+
+/// Stato che fa scattare l'asse repeated_action con mossa COSTOSA (Abort): write
+/// FALLITO ripetuto, asse GIA' guidato+diagnosed+strategy (livelli cheap spesi).
+/// A flag OFF `pc::decide` -> Abort (chiude EndTurn); a flag ON il gate emette
+/// StallReason PRIMA della chiusura.
+fn state_stallo_repeated_action() -> AgentState {
+    let tr_err = |id: &str| Message::Human {
+        content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: Value::String("permission denied".into()),
+            is_error: true,
+            exit_code: None,
+        }]),
+    };
+    AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![
+            human("scrivi"),
+            ai_tool("write_file", json!({"path": "b.rs"})),
+            tr_err("c1"),
+            ai_tool("write_file", json!({"path": "b.rs"})),
+            tr_err("c1"),
+        ],
+        progress_guided_axes: Some(vec!["repeated_action".into()]),
+        progress_diagnosed_axes: Some(vec!["repeated_action".into()]),
+        progress_strategy_axes: Some(vec!["repeated_action".into()]),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn stall_recovery_off_non_emette_stall_reason() {
+    // Flag OFF (default): il gate non scatta MAI. Lo stesso stato che a flag ON
+    // emetterebbe StallReason qui chiude con la gerarchia fissa (EndTurn onesto),
+    // BIT-IDENTICO a oggi. Nessuno StallContext scritto in extra.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: false,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_stallo_repeated_action();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::StallReason));
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert!(out.extra.get(STALL_CONTEXT_KEY).is_none());
+}
+
+#[tokio::test]
+async fn stall_recovery_on_emette_stall_reason() {
+    // Flag ON + budget: il gate emette StallReason (instrada al nodo StallRecovery)
+    // con lo StallContext strutturato in extra, invece di applicare la mossa fissa.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 6,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_stallo_repeated_action();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::StallReason));
+    // StallContext strutturato presente (regola M): asse repeated_action.
+    let ctx_val = out.extra.get(STALL_CONTEXT_KEY).expect("StallContext in extra");
+    let sc: StallContext = serde_json::from_value(ctx_val.clone()).expect("StallContext");
+    assert_eq!(sc.axis, "repeated_action");
+    // L'LLM NON e' chiamato dall'executor (lo fara' il nodo dedicato, replay-safe).
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stall_recovery_budget_esaurito_ricade_su_fissa() {
+    // Budget per-sessione esaurito: il gate NON emette StallReason (rete di
+    // sicurezza) e la gerarchia fissa chiude come a flag OFF.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 2,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut state = state_stallo_repeated_action();
+    state.extra.insert("stall_moves_used".to_string(), json!(2));
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::StallReason));
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+}
+
+/// Costruisce lo stato di RIENTRO dal nodo StallRecovery: `StallResolved` +
+/// StallContext + (opzionale) la mossa persistita alla chiave-cache.
+fn state_rientro(axis: &str, epoch: i64, mv: Option<RecoveryMove>) -> AgentState {
+    let stall = StallContext {
+        axis: axis.to_string(),
+        work_epoch: epoch,
+        ..Default::default()
+    };
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        STALL_CONTEXT_KEY.to_string(),
+        serde_json::to_value(&stall).expect("serialize StallContext"),
+    );
+    if let Some(m) = mv {
+        extra.insert(
+            stall_move_key(axis, epoch),
+            serde_json::to_value(&m).expect("serialize mossa"),
+        );
+    }
+    AgentState {
+        thread_id: Some("r1".into()),
+        stop_reason: Some(StopReason::StallResolved),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        extra,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn stall_recovery_rientro_fallback_marca_epoca_e_prosegue() {
+    // Rientro senza mossa in extra (nodo degradato: reasoner Ok(None)/Fallback):
+    // il consumo marca l'epoca come fallback e RI-DA il turno pulito. Al re-entry
+    // il gate non ri-emettera' (guardia anti meta-loop) -> gerarchia fissa.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("x"));
+    let ctx = ctx_with(llm.clone(), false);
+    let epoch = stall_work_epoch(0, 0, 0);
+    let state = state_rientro("repeated_action", epoch, None);
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Nessuna mossa applicata: budget invariato, epoca marcata fallback.
+    assert_eq!(out.extra.get("stall_moves_used"), None);
+    let epochs = out
+        .extra
+        .get("stall_fallback_epochs")
+        .and_then(Value::as_array)
+        .expect("stall_fallback_epochs presente");
+    assert!(epochs.iter().any(|v| v.as_i64() == Some(epoch)));
+}
+
+#[tokio::test]
+async fn stall_recovery_consume_ask_user_produce_needs_input() {
+    // Consumo AskUser: chiusura DIRETTA con esito strutturato needs_input (ADR 0034),
+    // la question nel summary/result. Budget incrementato (consultazione effettiva).
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("x"));
+    let ctx = ctx_with(llm.clone(), false);
+    let epoch = stall_work_epoch(0, 0, 0);
+    let mv = RecoveryMove::AskUser {
+        question: "Qual e' l'email reale da usare per il login?".into(),
+    };
+    let state = state_rientro("repeated_user_question", epoch, Some(mv));
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    // Esito STRUTTURATO needs_input (regola M): letto dal segnale, non dalla prosa.
+    let outcome = out.declared_outcome.as_ref().expect("declared_outcome");
+    assert_eq!(outcome.get("outcome").and_then(Value::as_str), Some("needs_input"));
+    assert!(out
+        .result
+        .as_deref()
+        .unwrap_or_default()
+        .contains("email reale"));
+    // Budget consumato.
+    assert_eq!(out.extra.get("stall_moves_used").and_then(Value::as_i64), Some(1));
+}
+
+#[tokio::test]
+async fn stall_recovery_consume_declare_blocked_produce_blocked() {
+    // Consumo DeclareBlocked: chiusura DIRETTA con esito strutturato blocked +
+    // blocker validato ADR 0034 (credential). Chiude il loop senza turno LLM libero.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("x"));
+    let ctx = ctx_with(llm.clone(), false);
+    let epoch = stall_work_epoch(0, 0, 0);
+    let mv = RecoveryMove::DeclareBlocked {
+        blocker: "credential".into(),
+    };
+    let state = state_rientro("repeated_user_question", epoch, Some(mv));
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    let outcome = out.declared_outcome.as_ref().expect("declared_outcome");
+    assert_eq!(outcome.get("outcome").and_then(Value::as_str), Some("blocked"));
+    assert_eq!(outcome.get("blocker").and_then(Value::as_str), Some("credential"));
+    assert_eq!(out.extra.get("stall_moves_used").and_then(Value::as_i64), Some(1));
+}
+
+// ── R1: redaction_rejected da SEGNALE STRUTTURATO nello StallContext ──────────
+
+/// Come [`state_stallo_repeated_action`] ma AGGIUNGE in coda un tool_result che
+/// porta il CODICE STRUTTURATO [REDACTION_REJECTED] (la fonte ha rifiutato un
+/// input per placeholder di redazione), SENZA alterare la sequenza write-fallito
+/// che fa scattare l'asse repeated_action. Prova che lo StallContext espone
+/// `redaction_rejected` dal segnale strutturato (regola M), non dal placeholder.
+fn state_stallo_con_redazione_rifiutata() -> AgentState {
+    let mut s = state_stallo_repeated_action();
+    s.messages.push(Message::Human {
+        content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "cr".into(),
+            content: Value::String(
+                "\u{274C} [REDACTION_REJECTED] [BLOCCATO — placeholder di redazione nell'input]"
+                    .into(),
+            ),
+            is_error: true,
+            exit_code: None,
+        }]),
+    });
+    s
+}
+
+#[tokio::test]
+async fn stall_context_redaction_rejected_da_segnale_strutturato() {
+    // R1: quando un tool_result recente porta il codice strutturato
+    // [REDACTION_REJECTED], lo StallContext emesso ha redaction_rejected=true
+    // (regola M: dal segnale, mai dal contains sul placeholder umano).
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 6,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let state = state_stallo_con_redazione_rifiutata();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::StallReason));
+    let sc: StallContext =
+        serde_json::from_value(out.extra.get(STALL_CONTEXT_KEY).expect("StallContext").clone())
+            .expect("StallContext");
+    assert!(sc.redaction_rejected, "il segnale strutturato deve alzare il flag");
+}
+
+#[tokio::test]
+async fn stall_context_redaction_rejected_false_senza_segnale() {
+    // Contro-prova: lo stesso stallo SENZA il codice strutturato ->
+    // redaction_rejected=false (nessuna deduzione dal testo).
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 6,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let state = state_stallo_repeated_action();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    let sc: StallContext =
+        serde_json::from_value(out.extra.get(STALL_CONTEXT_KEY).expect("StallContext").clone())
+            .expect("StallContext");
+    assert!(!sc.redaction_rejected, "senza segnale strutturato resta false");
+}
+
+// ── R2: budget stall CROSS-RUN (StallBudgetPort) ──────────────────────────────
+
+/// Porta budget stub configurabile: ritorna un conteggio fisso (cross-run) o un
+/// errore (per il ramo fail-open) e registra le scritture.
+struct StubStallBudget {
+    /// Conteggio cross-run ritornato da `consultations_in_session`.
+    count: i64,
+    /// Se `true`, `consultations_in_session` ritorna `Err` (test fail-open).
+    fail_read: bool,
+    /// Registra il numero di `record_consultation` in Real (per asserire l'append).
+    recorded: std::sync::Mutex<i64>,
+}
+
+impl StubStallBudget {
+    fn with_count(count: i64) -> Self {
+        Self { count, fail_read: false, recorded: std::sync::Mutex::new(0) }
+    }
+    fn failing_read() -> Self {
+        Self { count: 0, fail_read: true, recorded: std::sync::Mutex::new(0) }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::ports::StallBudgetPort for StubStallBudget {
+    async fn consultations_in_session(
+        &self,
+        _session_id: Uuid,
+    ) -> Result<i64, crate::runtime::ports::PortError> {
+        if self.fail_read {
+            return Err(crate::runtime::ports::PortError::Llm("read down".into()));
+        }
+        Ok(self.count)
+    }
+    async fn record_consultation(
+        &self,
+        _session_id: Uuid,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> Result<(), crate::runtime::ports::PortError> {
+        if mode == crate::runtime::ports::ExecMode::Real {
+            *self.recorded.lock().unwrap() += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Nodo con la porta budget stall iniettata (per i test cross-run).
+fn node_budget(
+    cfg: ExecutorConfig,
+    budget: Arc<dyn crate::runtime::ports::StallBudgetPort>,
+) -> ExecutorNode {
+    let (n, _m, _s) = node(cfg, Arc::new(StubRunControlStore::default()));
+    n.with_stall_budget(budget)
+}
+
+#[tokio::test]
+async fn stall_budget_cross_run_esaurito_ricade_su_fissa() {
+    // Il per-run e' 0 (extra vuoto) ma il CROSS-RUN letto dalla porta raggiunge il
+    // cap per-sessione: il gate NON emette StallReason (chiude il loop email
+    // cross-run che il solo cap per-run non fermava).
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 3,
+        ..cfg_resolved()
+    };
+    let n = node_budget(cfg, Arc::new(StubStallBudget::with_count(3)));
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("non chiamato")), false);
+    let state = state_stallo_repeated_action();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::StallReason));
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+}
+
+#[tokio::test]
+async fn stall_budget_cross_run_somma_al_per_run() {
+    // La somma per-run (extra) + cross-run (porta) raggiunge il cap: il gate non
+    // emette, anche se nessuno dei due da solo lo supera.
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 3,
+        ..cfg_resolved()
+    };
+    let n = node_budget(cfg, Arc::new(StubStallBudget::with_count(2)));
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let mut state = state_stallo_repeated_action();
+    state.extra.insert("stall_moves_used".to_string(), json!(1)); // 1 + 2 == cap 3
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::StallReason));
+}
+
+#[tokio::test]
+async fn stall_budget_cross_run_sotto_cap_emette() {
+    // Cross-run sotto il cap: il gate emette StallReason (comportamento invariato
+    // rispetto al solo per-run). Prova che la porta non blocca quando c'e' margine.
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 6,
+        ..cfg_resolved()
+    };
+    let n = node_budget(cfg, Arc::new(StubStallBudget::with_count(2)));
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let state = state_stallo_repeated_action();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::StallReason));
+}
+
+#[tokio::test]
+async fn stall_budget_cross_run_fail_open_non_blocca() {
+    // FAIL-OPEN: la porta budget in errore -> conteggio 0 -> il gate NON viene
+    // bloccato da un guasto di lettura (emette StallReason come se il cross-run
+    // fosse a 0). Un guasto infrastrutturale non deve impedire il recovery.
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 3,
+        ..cfg_resolved()
+    };
+    let n = node_budget(cfg, Arc::new(StubStallBudget::failing_read()));
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let state = state_stallo_repeated_action();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::StallReason));
+}
+
+#[tokio::test]
+async fn stall_budget_consumo_registra_cross_run() {
+    // Al consumo di una mossa applicata la porta registra la consultazione
+    // cross-run (append per-sessione), oltre a incrementare il per-run in extra.
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        ..cfg_resolved()
+    };
+    let budget = Arc::new(StubStallBudget::with_count(0));
+    let n = node_budget(cfg, budget.clone());
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let epoch = stall_work_epoch(0, 0, 0);
+    let mv = RecoveryMove::DeclareBlocked { blocker: "credential".into() };
+    let state = state_rientro("repeated_user_question", epoch, Some(mv));
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Per-run incrementato E cross-run registrato una volta (Real).
+    assert_eq!(out.extra.get("stall_moves_used").and_then(Value::as_i64), Some(1));
+    assert_eq!(*budget.recorded.lock().unwrap(), 1, "una consultazione cross-run registrata");
+}
+
 /// Golden di parita' 1:1 vs Python per la LOGICA DETERMINISTICA del singolo turno
 /// (gate testa, ordine nudge, risoluzione provider). Carica
 /// `/tmp/golden_executor_node.json` (vedi `gen_golden_executor_node.py`). Riusa i
@@ -2833,8 +3265,10 @@ async fn rolling_summary_degrado_best_effort_history_invariata() {
 #[cfg(test)]
 mod golden {
     use super::*;
-    use crate::decisions::progress_controller::{self as pc, Action, ProgressSignals};
-    use crate::nodes::executor::{head_gate, resolve_provider_model, HeadGate, ProviderResolution};
+    use crate::decisions::progress_controller::{self as pc, ProgressSignals};
+    use crate::nodes::executor::{
+        action_str, head_gate, resolve_provider_model, HeadGate, ProviderResolution,
+    };
     use serde::Deserialize;
     use std::collections::HashSet;
 
@@ -2853,18 +3287,6 @@ mod golden {
             HeadGate::DeclaredDone => "end_turn",
             HeadGate::G1Cap => "g1_cap_reached",
             HeadGate::Proceed => "proceed",
-        }
-    }
-
-    /// Stringa stabile dell'`Action` del progress_controller (== serde rename).
-    fn action_str(a: Action) -> &'static str {
-        match a {
-            Action::Proceed => "proceed",
-            Action::Guide => "guide",
-            Action::ForceDiagnose => "force_diagnose",
-            Action::ChangeStrategy => "change_strategy",
-            Action::Escalate => "escalate",
-            Action::Abort => "abort",
         }
     }
 

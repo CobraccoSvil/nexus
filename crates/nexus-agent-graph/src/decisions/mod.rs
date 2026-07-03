@@ -33,6 +33,12 @@
 //!   - [`loop_signatures`]: RILEVAZIONE pura del loop di tool call per signature
 //!     ripetuta + aggiornamento del contatore di esplorazione (PUNTO UNICO della
 //!     signature anti-loop dell'executor; l'auto-escalation I/O resta nel nodo).
+//!   - [`clarify_signature`]: firma PURA (sha1 della domanda normalizzata) di una
+//!     domanda-chiarimento, per la loop-detection CROSS-RUN delle domande ripetute
+//!     (asse `RepeatedUserQuestion`). PUNTO UNICO condiviso dall'impl DB della
+//!     porta `ClarifyHistoryPort` (firma le domande storiche) e dal call site
+//!     (firma la domanda corrente); l'I/O (lettura meta_step `kind='clarify'`) e'
+//!     dietro la porta.
 //!   - [`reward`]: reward euristico + fusione del reward finale (punto unico
 //!     condiviso reflection/learner, regola L).
 //!   - [`turn_focus`]: direttiva "focus del turno corrente" (anti-contaminazione
@@ -48,6 +54,7 @@
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
+pub mod clarify_signature;
 pub mod context_reduction;
 pub mod dag_scheduler;
 pub mod end_turn;
@@ -56,12 +63,15 @@ pub mod g1_accounting;
 pub mod helpers;
 pub mod loop_signatures;
 pub mod m16;
+pub mod meta_reason;
+pub mod orchestration_reason;
 pub mod predictive_cap;
 pub mod progress_controller;
 pub mod reward;
 pub mod tool_dispatch;
 pub mod turn_focus;
 
+pub use clarify_signature::{clarify_signature, normalize_question};
 pub use context_reduction::{
     apply_token_brake, compress_old_tool_results, dedup_tool_results,
     dedup_tool_results_history, degraded_marker, drop_unused_base64_payloads, first_human_index,
@@ -84,6 +94,11 @@ pub use m16::{
     build_m16_allowed, is_tool_allowed, merge_discovered_run, parse_discovered_tools,
     py_json_len_ascii, DiscoveredTool, M16_META_TOOLS,
 };
+pub use meta_reason::{build_stall_context, translate, validate_move, work_epoch, VALID_BLOCKERS};
+pub use orchestration_reason::{
+    build_orchestration_context, context_pressure_from_tokens, delegation_forbidden, orch_epoch,
+    validate_orch_move,
+};
 pub use predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
 pub use tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
@@ -101,8 +116,10 @@ pub use helpers::{
     turn_action_oriented, AdaptiveBudgetConfig,
 };
 pub use loop_signatures::{
-    build_signature, detect_signature_loop, exploration_counter_update, ExplorationCounterUpdate,
-    LoopDetection, LOOP_THRESHOLD, RECENT_SIGNATURES_CAP,
+    build_signature, detect_signature_loop, detect_signature_loop_progress_aware,
+    detect_signature_loop_progress_aware_with, detect_signature_loop_with,
+    exploration_counter_update, ExplorationCounterUpdate, LoopDetection, LoopThresholds,
+    LOOP_THRESHOLD, RECENT_SIGNATURES_CAP,
 };
 pub use progress_controller::{
     decide, Action, Axis, ProgressDecision, ProgressSignals, ABORT_STOP_REASON,

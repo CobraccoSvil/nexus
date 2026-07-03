@@ -10,12 +10,16 @@ pub mod ports;
 
 pub use ctx::AgentNodeCtx;
 pub use ports::{
-    AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
-    CriterionSpec, EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway, LlmMessage,
-    LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort, NextActionChoice,
-    NextActionsDeriver, PlanRow, PortError, RunControlStore, SseEvent, SummaryStore, TodoStore,
+    AgentStepStore, BillingCooldownPort, ContextOffload, ContextPressure, Coordination,
+    CriteriaRunner, CriterionResult, CriterionSpec, EscalationInputs, EscalationPort, EventSink,
+    ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage, MetaReasonerPort,
+    MetaStepStore, ModelUpscalePort, NextActionChoice, NextActionsDeriver, OrchPhase,
+    OrchestrationContext, OrchestrationMove, PlanBlock, PlanRow, PortError, RecoveryMove,
+    RunControlStore, SseEvent, StallBudgetPort, StallContext, SubTask, SummaryStore, TodoStore,
     ToolCall, ToolExecutor, ToolOutcome, UpscalePick, VerifierRunRecord, VerifierRunStore,
 };
+
+use async_trait::async_trait;
 
 /// Sink eventi NO-OP: scarta ogni evento, nessun output verso l'utente.
 ///
@@ -28,6 +32,73 @@ pub struct NullEventSink;
 
 impl EventSink for NullEventSink {
     fn emit(&self, _ev: SseEvent) {}
+}
+
+/// Meta-reasoner INERTE (kill-switch OFF): entrambi i metodi
+/// ([`MetaReasonerPort::recover`] recovery, [`MetaReasonerPort::orchestrate`]
+/// orchestrazione) ritornano sempre `Ok(None)` (nessuna mossa) in ogni modalita'.
+///
+/// E' un'implementazione legittima in PRODUZIONE, non un doppio di test (come
+/// [`NullEventSink`]): finche' i flag `agent.stall_recovery.enabled` /
+/// `agent.orchestration.enabled` sono `false` (default, regola G) mcp-core inietta
+/// QUESTA porta (o l'impl concreta la degrada a `Ok(None)`), e i nodi ricadono
+/// sulla gerarchia/euristica fissa (`progress_controller::decide`,
+/// `is_eligible`/`should_parallelize`) — rete di sicurezza. Cosi' il wiring compila
+/// e resta inerte SENZA la porta concreta (`PgMetaReasonerPort`). Vive fuori da
+/// `#[cfg(test)]`: e' il fallback inerte reale, riusato anche dai test (regola L,
+/// un solo no-op reasoner).
+///
+/// NB: `Ok(None)` e' il degrado LEGITTIMO opt-in (flag OFF / purpose NotFound), NON
+/// un "magic fallback" mascherante (regola G): un DB-down / provider indisponibile
+/// nell'impl CONCRETA ritorna `Err(PortError::ProviderUnavailable)`, mai `Ok(None)`.
+/// Questo stub e' inerte per COSTRUZIONE (non consulta nulla), non maschera guasti.
+pub struct StubMetaReasonerPort;
+
+#[async_trait]
+impl MetaReasonerPort for StubMetaReasonerPort {
+    async fn recover(
+        &self,
+        _ctx: StallContext,
+        _mode: ExecMode,
+    ) -> Result<Option<RecoveryMove>, PortError> {
+        Ok(None)
+    }
+
+    async fn orchestrate(
+        &self,
+        _ctx: OrchestrationContext,
+        _mode: ExecMode,
+    ) -> Result<Option<OrchestrationMove>, PortError> {
+        Ok(None)
+    }
+}
+
+/// Budget stall CROSS-RUN INERTE: [`StallBudgetPort::consultations_in_session`]
+/// ritorna sempre `Ok(0)` e [`StallBudgetPort::record_consultation`] e' un no-op.
+///
+/// E' un'implementazione legittima in PRODUZIONE (come [`NullEventSink`] /
+/// [`StubMetaReasonerPort`]): quando l'`ExecutorNode` NON riceve una porta budget
+/// concreta (`with_stall_budget` non chiamato — es. graph di scaffold, test), il
+/// cap cross-run non e' disponibile e il motore ricade sul solo cap PER-RUN
+/// (`extra["stall_moves_used"]`, comportamento storico). FAIL-OPEN per
+/// costruzione: `Ok(0)` = budget cross-run non esaurito, non blocca mai. Vive
+/// fuori da `#[cfg(test)]`: e' il fallback inerte reale, riusato anche dai test
+/// (regola L, un solo no-op budget).
+pub struct NullStallBudgetPort;
+
+#[async_trait]
+impl StallBudgetPort for NullStallBudgetPort {
+    async fn consultations_in_session(&self, _session_id: uuid::Uuid) -> Result<i64, PortError> {
+        Ok(0)
+    }
+
+    async fn record_consultation(
+        &self,
+        _session_id: uuid::Uuid,
+        _mode: ExecMode,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -97,10 +97,13 @@ use serde_json::{json, Value};
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
+use crate::decisions::orchestration_reason::build_orchestration_context;
 use crate::decisions::turn_focus::build_turn_focus_directive;
-use crate::runtime::ports::{LlmMessage, LlmRequest, PlanRow, TodoStore};
+use crate::runtime::ports::{
+    ExecMode, LlmMessage, LlmRequest, OrchPhase, OrchestrationMove, PlanRow, TodoStore,
+};
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, ToolUse};
+use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, TaskComplexity, ToolUse};
 
 /// Config DB-driven del nodo planner, PASSATA (regola G: nessuna lettura DB nel
 /// nodo, nessun fallback hardcoded dentro la logica decisionale).
@@ -152,6 +155,17 @@ pub struct PlannerConfig {
     /// DAG topologico abilitato (`dag_topological_enabled`, default false): RAMO
     /// OFF (dag_kb). Quando OFF nessuna divergenza.
     pub dag_topological_enabled: bool,
+    /// Gate ORCHESTRAZIONE LLM-driven della plan-phase abilitato
+    /// (`agent.orchestration.enabled`, **default false**, regola G). Fase 1
+    /// dell'orchestrazione (piano design v2): quando ON e NON in Replay, il gate
+    /// plan-phase consulta [`crate::runtime::ports::MetaReasonerPort::orchestrate`]
+    /// PRIMA di [`PlannerConfig::is_eligible`] e ne mappa l'esito; qualunque
+    /// degrado (`Fallback`/`Ok(None)`/errore porta) RICADE su `is_eligible`
+    /// (euristica esistente invariata, rete di sicurezza). OFF di default ->
+    /// comportamento BIT-IDENTICO a oggi (il gate ricade sempre su `is_eligible`).
+    /// Il setting sara' seminato nella migrazione del sotto-blocco successivo:
+    /// con `false` il gate NON scatta.
+    pub orchestration_enabled: bool,
 }
 
 impl Default for PlannerConfig {
@@ -188,6 +202,9 @@ impl Default for PlannerConfig {
             turn_focus_enabled: true,
             plan_rationale_enabled: false,
             dag_topological_enabled: false,
+            // Gate orchestrazione OFF di default (regola G, default safe): il gate
+            // ricade sempre su is_eligible -> comportamento bit-identico a oggi.
+            orchestration_enabled: false,
         }
     }
 }
@@ -512,6 +529,13 @@ pub struct PlannerNode {
     /// (regola L). Prima il meta-step restava solo nel delta di stato: mai
     /// emesso via SSE ne' persistito -> la fase di pianificazione era muta.
     meta_steps: Arc<dyn crate::runtime::ports::MetaStepStore>,
+    /// Meta-reasoner LLM (STESSA porta iniettata nel nodo `StallRecovery`, regola
+    /// L: mcp-core la costruisce UNA volta e la condivide tra i due nodi). Il
+    /// planner usa SOLO [`MetaReasonerPort::orchestrate`] per il gate plan-phase
+    /// (Fase 1 dell'orchestrazione); il metodo `recover` e' consumato dal nodo
+    /// `StallRecovery`. Con `orchestration_enabled=false` (default) o in Replay il
+    /// gate NON la consulta -> comportamento bit-identico a oggi.
+    reasoner: Arc<dyn crate::runtime::ports::MetaReasonerPort>,
 }
 
 impl PlannerNode {
@@ -526,6 +550,7 @@ impl PlannerNode {
         fallback_model: String,
         store: Arc<dyn TodoStore>,
         meta_steps: Arc<dyn crate::runtime::ports::MetaStepStore>,
+        reasoner: Arc<dyn crate::runtime::ports::MetaReasonerPort>,
     ) -> Self {
         Self {
             cfg,
@@ -535,6 +560,7 @@ impl PlannerNode {
             fallback_model,
             store,
             meta_steps,
+            reasoner,
         }
     }
 
@@ -564,6 +590,145 @@ impl PlannerNode {
             ..Default::default()
         }
         .into_opaque()
+    }
+
+    /// GATE ORCHESTRAZIONE LLM-driven della plan-phase (Fase 1, piano design v2).
+    /// Consulta [`crate::runtime::ports::MetaReasonerPort::orchestrate`] e mappa
+    /// l'esito su una decisione TERNARIA che il chiamante consuma PRIMA di ricadere
+    /// su [`PlannerConfig::is_eligible`]:
+    ///   - `Some(true)`  -> procedi alla plan-phase (come `is_eligible=true`);
+    ///   - `Some(false)` -> salta la plan-phase (come `is_eligible=false`);
+    ///   - `None`        -> il gate NON decide: ricadi su `is_eligible` (euristica
+    ///     esistente, invariata — RETE DI SICUREZZA).
+    ///
+    /// Mappa degli esiti [`OrchestrationMove`] (regola L: la validazione e' del
+    /// punto unico `validate_orch_move` dentro l'impl della porta; qui si consuma
+    /// il risultato gia' validato):
+    ///   - `PlanPhase{..}` -> `Some(true)` (procedi alla plan-phase);
+    ///   - `RunInline`     -> `Some(false)` (salta la plan-phase);
+    ///   - `Decompose{..}` / `DelegateSubagents{..}` -> `Some(true)` in FASE 1:
+    ///     la decomposizione/delega VERA e' una fase successiva; per ora queste
+    ///     mosse si trattano come `PlanPhase` (si procede alla plan-phase). TODO
+    ///     esecuzione decompose/delega: fase successiva (worktree + sub-run).
+    ///   - `Fallback`      -> `None` (ricadi su `is_eligible`).
+    ///
+    /// REPLAY (opzione A, come per il recovery): in [`ExecMode::Replay`] il gate
+    /// NON consulta `orchestrate` (il `ReplayLlmGateway` non rigioca il purpose
+    /// orchestrazione: darebbe una risposta vuota che divergerebbe) -> ritorna
+    /// SEMPRE `None`, forzando il ramo euristico `is_eligible`. Cosi' lo shadow
+    /// resta bit-identico al Python (che non ha l'orchestratore). REGOLA G: con
+    /// `orchestration_enabled=false` (default) ritorna `None` senza consultare
+    /// nulla (comportamento bit-identico a oggi).
+    ///
+    /// I segnali per [`build_orchestration_context`] sono raccolti dai campi
+    /// STRUTTURATI di [`AgentState`] (regola M): user_intent, behavior_mode,
+    /// token_budget, complessita' (`task_complexity`), agentic_score, is_ambiguous,
+    /// plan_exists (`plan_phase_active`), history_len (`messages.len()`), guard di
+    /// delega da `subagent_depth`/`subagent_cost_cumulative_usd`. I segnali di
+    /// contesto/finestra e i cap depth/cost NON sono ancora esposti nel planner:
+    /// default SICURI (0 = ignoto/nessun cap -> pressure Low, guard inattive) —
+    /// non un magic fallback (regola G), ma l'assenza esplicita del vincolo. La
+    /// guard `delegation_forbidden` non gata la plan-phase (Fase 1 e' sequenziale,
+    /// niente delega eseguita); e' passata per completezza del contesto LLM.
+    async fn orchestration_gate(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Option<bool> {
+        // Regola G: gate OFF di default -> ricadi su is_eligible (bit-identico).
+        if !self.cfg.orchestration_enabled {
+            return None;
+        }
+        // Replay (opzione A): non consultare l'LLM (divergerebbe dallo shadow) ->
+        // forza il ramo euristico. Vale anche per il run shadow read-only.
+        if ctx.exec_mode() == ExecMode::Replay {
+            tracing::debug!(
+                target: "nexus_agent_graph::planner",
+                "orchestration gate: Replay -> ricado su is_eligible (opzione A)"
+            );
+            return None;
+        }
+
+        // Segnali strutturati (regola M): tutti gia' risolti a monte nello stato.
+        let task_complexity = match state.task_complexity {
+            Some(TaskComplexity::Low) => 1,
+            Some(TaskComplexity::Medium) => 2,
+            Some(TaskComplexity::High) => 3,
+            None => 0,
+        };
+        // agentic_score e' un f64 0..1: scala a 0..10 intero (segnale strutturato).
+        let agentic_score = state
+            .agentic_score
+            .map(|s| (s * 10.0).round() as i64)
+            .unwrap_or(0);
+        let orch_ctx = build_orchestration_context(
+            OrchPhase::PlanEntry,
+            state.user_intent.as_deref(),
+            state.behavior_mode.as_deref().unwrap_or(""),
+            state.token_budget.unwrap_or(0),
+            task_complexity,
+            agentic_score,
+            state.is_ambiguous.unwrap_or(false),
+            state.plan_phase_active.unwrap_or(false),
+            // Contesto/finestra non esposti nel planner: 0 = ignoto -> pressure Low.
+            0,
+            0,
+            state.messages.len() as i64,
+            state.subagent_depth.unwrap_or(0),
+            // Cap depth/cost non esposti nel planner: 0 = nessun cap -> guard inattiva.
+            0,
+            state.subagent_cost_cumulative_usd.unwrap_or(0.0),
+            0.0,
+            false,
+        );
+
+        match self.reasoner.orchestrate(orch_ctx, ctx.exec_mode()).await {
+            // PlanPhase / Decompose / DelegateSubagents -> procedi alla plan-phase.
+            // FASE 1: decompose/delega sono trattate come PlanPhase (l'esecuzione
+            // vera e' una fase successiva). TODO: esecuzione decompose/delega.
+            Ok(Some(
+                OrchestrationMove::PlanPhase { .. }
+                | OrchestrationMove::Decompose { .. }
+                | OrchestrationMove::DelegateSubagents { .. },
+            )) => {
+                tracing::info!(
+                    target: "nexus_agent_graph::planner",
+                    "orchestration gate: procedi alla plan-phase (LLM-driven)"
+                );
+                Some(true)
+            }
+            // RunInline -> salta la plan-phase.
+            Ok(Some(OrchestrationMove::RunInline)) => {
+                tracing::info!(
+                    target: "nexus_agent_graph::planner",
+                    "orchestration gate: run inline, salta la plan-phase (LLM-driven)"
+                );
+                Some(false)
+            }
+            // Fallback: nessuna mossa valida -> ricadi su is_eligible.
+            Ok(Some(OrchestrationMove::Fallback)) => {
+                tracing::debug!(
+                    target: "nexus_agent_graph::planner",
+                    "orchestration gate: Fallback -> ricado su is_eligible"
+                );
+                None
+            }
+            // Ok(None): kill-switch OFF / purpose NotFound / stub inerte -> degrado
+            // LEGITTIMO all'euristica (opt-in, regola G: NON e' un errore).
+            Ok(None) => {
+                tracing::debug!(
+                    target: "nexus_agent_graph::planner",
+                    "orchestration gate: reasoner Ok(None) (inerte/OFF) -> ricado su is_eligible"
+                );
+                None
+            }
+            // Errore di porta (provider indisponibile / DB-down): NON blocca il run
+            // (il gate e' best-effort, l'euristica copre la decisione). WARN.
+            Err(err) => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::planner",
+                    error = %err,
+                    "orchestration gate: porta reasoner in errore -> ricado su is_eligible"
+                );
+                None
+            }
+        }
     }
 
     /// Costruisce `hinted_system` con i SOLI rami ON di default
@@ -743,8 +908,20 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         let intent = state.user_intent.as_deref();
         let token_budget = state.token_budget.unwrap_or(0);
 
-        // ── Guard: feature flag + eligibilita' (planner_node.py:64-74) ─────────
-        if !self.cfg.is_eligible(behavior_mode, intent, token_budget) {
+        // ── GATE ORCHESTRAZIONE LLM-driven (Fase 1) prima di is_eligible ───────
+        // Regola L: l'euristica `is_eligible` resta il PUNTO UNICO dell'ingresso
+        // plan-phase; il gate orchestrazione la SCAVALCA solo se il reasoner decide
+        // in modo esplicito (Some(true)/Some(false)), altrimenti (None: flag OFF /
+        // Replay / Fallback / Ok(None) / errore) ricade su di essa INVARIATA (rete
+        // di sicurezza). Con `orchestration_enabled=false` (default) e in Replay
+        // ritorna sempre None -> comportamento bit-identico a oggi.
+        let enter_plan_phase = match self.orchestration_gate(state, ctx).await {
+            // Decisione LLM esplicita: procedi / salta la plan-phase.
+            Some(decision) => decision,
+            // Il gate non decide: euristica esistente (planner_node.py:64-74).
+            None => self.cfg.is_eligible(behavior_mode, intent, token_budget),
+        };
+        if !enter_plan_phase {
             tracing::debug!(
                 target: "nexus_agent_graph::planner",
                 plan_enabled = self.cfg.plan_phase_enabled,
@@ -1380,8 +1557,20 @@ mod tests {
         }
     }
 
-    /// Costruisce il nodo con store dato + provider/model di test.
+    /// Costruisce il nodo con store dato + provider/model di test. Reasoner INERTE
+    /// (`StubMetaReasonerPort`, `Ok(None)`): il gate orchestrazione, se acceso,
+    /// ricade su `is_eligible`.
     fn node_with(cfg: PlannerConfig, store: Arc<dyn TodoStore>) -> PlannerNode {
+        node_with_reasoner(cfg, store, Arc::new(crate::runtime::StubMetaReasonerPort))
+    }
+
+    /// Come [`node_with`], ma con un reasoner esplicito (per esercitare il gate
+    /// orchestrazione: spia/mossa fissa).
+    fn node_with_reasoner(
+        cfg: PlannerConfig,
+        store: Arc<dyn TodoStore>,
+        reasoner: Arc<dyn crate::runtime::ports::MetaReasonerPort>,
+    ) -> PlannerNode {
         PlannerNode::new(
             cfg,
             "anthropic".to_string(),
@@ -1390,7 +1579,46 @@ mod tests {
             "modello-fallback".to_string(),
             store,
             Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
+            reasoner,
         )
+    }
+
+    /// Reasoner SPIA per il gate orchestrazione: conta le chiamate a `orchestrate`
+    /// e ne ritorna una mossa fissa. Verifica CHE il gate consulti (o NON consulti)
+    /// la porta secondo flag/modalita' (regola M: asserzione sul segnale di
+    /// chiamata, non sul testo). `recover` inerte (il planner non lo usa).
+    struct SpyReasoner {
+        move_out: Option<crate::runtime::ports::OrchestrationMove>,
+        orchestrate_calls: Mutex<usize>,
+    }
+
+    impl SpyReasoner {
+        fn new(move_out: Option<crate::runtime::ports::OrchestrationMove>) -> Self {
+            Self {
+                move_out,
+                orchestrate_calls: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runtime::ports::MetaReasonerPort for SpyReasoner {
+        async fn recover(
+            &self,
+            _ctx: crate::runtime::ports::StallContext,
+            _mode: ExecMode,
+        ) -> Result<Option<crate::runtime::ports::RecoveryMove>, PortError> {
+            Ok(None)
+        }
+
+        async fn orchestrate(
+            &self,
+            _ctx: crate::runtime::ports::OrchestrationContext,
+            _mode: ExecMode,
+        ) -> Result<Option<crate::runtime::ports::OrchestrationMove>, PortError> {
+            *self.orchestrate_calls.lock().unwrap() += 1;
+            Ok(self.move_out.clone())
+        }
     }
 
     /// Ctx con LLM/tool dati. PgPool lazy (il planner non interroga il DB
@@ -1462,6 +1690,151 @@ mod tests {
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(false));
+        assert_eq!(out.plan_phase_skip_reason, None);
+    }
+
+    // ── Gate orchestrazione LLM-driven (Fase 1) ─────────────────────────────
+
+    /// Ctx Real minimale (LLM/tool non consultati dal solo gate): il gate legge
+    /// solo `ctx.exec_mode()`.
+    fn gate_ctx(shadow: bool) -> AgentNodeCtx {
+        ctx_with(
+            Arc::new(ScriptedLlm::never_tool()),
+            Arc::new(ScriptedTools::ok("{}")),
+            shadow,
+        )
+    }
+
+    /// Store con un piano riusabile (stesso intent/mode di `eligible_state`): il
+    /// flusso pieno del planner, se eligible, RIUSA il piano (plan-phase attiva)
+    /// senza chiamare l'LLM. Rende il ramo "eligible -> plan-phase" deterministico.
+    fn store_reusable() -> Arc<StubTodoStore> {
+        Arc::new(StubTodoStore::with_plan(
+            vec![todo("t1", TodoStatus::Pending, 1)],
+            Some(PlanRow {
+                user_intent: Some("code".to_string()),
+                behavior_mode: Some("automatico".to_string()),
+            }),
+        ))
+    }
+
+    #[tokio::test]
+    async fn orchestration_off_non_consulta_e_ricade_su_is_eligible() {
+        // orchestration_enabled=false (default): il gate NON consulta la porta e
+        // ricade su is_eligible. Stato eligible + plan_phase ON -> procede (riuso).
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::RunInline)));
+        // cfg_active: plan_phase_enabled=true, orchestration_enabled=false.
+        let node = node_with_reasoner(cfg_active(), store_reusable(), spy.clone());
+        let ctx = gate_ctx(false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        // orchestrate NON chiamato (flag OFF): comportamento bit-identico a oggi.
+        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 0);
+        // is_eligible=true -> plan-phase (riuso), il gate non ha scavalcato.
+        assert_eq!(out.plan_phase_active, Some(true));
+    }
+
+    #[tokio::test]
+    async fn orchestration_off_stato_non_eligible_skip() {
+        // Flag OFF + plan_phase OFF (default) -> is_eligible=false -> skip, e la
+        // porta non e' mai consultata.
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::PlanPhase { decompose: true })));
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let node = node_with_reasoner(PlannerConfig::default(), store, spy.clone());
+        let ctx = gate_ctx(false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 0);
+        assert_eq!(out.plan_phase_active, Some(false));
+    }
+
+    #[tokio::test]
+    async fn orchestration_on_ok_none_ricade_su_is_eligible() {
+        // Flag ON + reasoner Ok(None) (inerte): orchestrate consultato UNA volta,
+        // poi degrado LEGITTIMO a is_eligible. Stato NON eligible (plan_phase OFF)
+        // -> skip: il gate non ha deciso, l'euristica governa.
+        let spy = Arc::new(SpyReasoner::new(None));
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        // plan_phase_enabled resta false (Default), orchestration ON.
+        let cfg = PlannerConfig {
+            orchestration_enabled: true,
+            ..Default::default()
+        };
+        let node = node_with_reasoner(cfg, store, spy.clone());
+        let ctx = gate_ctx(false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        // orchestrate consultato una volta (Real, flag ON).
+        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
+        // Ok(None) -> is_eligible (plan_phase OFF) -> skip.
+        assert_eq!(out.plan_phase_active, Some(false));
+    }
+
+    #[tokio::test]
+    async fn orchestration_replay_non_consulta_forza_is_eligible() {
+        // Flag ON ma REPLAY (shadow): opzione A. orchestrate NON consultato ->
+        // forza il ramo euristico is_eligible (bit-identico al Python). cfg_active
+        // (plan_phase ON) + stato eligible -> procede via is_eligible.
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::RunInline)));
+        let mut cfg = cfg_active();
+        cfg.orchestration_enabled = true;
+        let node = node_with_reasoner(cfg, store_reusable(), spy.clone());
+        // shadow=true -> ExecMode::Replay.
+        let ctx = gate_ctx(true);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        // In Replay orchestrate NON e' chiamato (opzione A): la RunInline dello spy
+        // e' ignorata, governa is_eligible.
+        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 0);
+        // is_eligible=true -> plan-phase (riuso), la RunInline dello spy NON ha effetto.
+        assert_eq!(out.plan_phase_active, Some(true));
+    }
+
+    #[tokio::test]
+    async fn orchestration_on_planphase_scavalca_is_eligible_false() {
+        // Flag ON + Real + PlanPhase: procede alla plan-phase ANCHE se is_eligible
+        // sarebbe false (plan_phase OFF). Il gate LLM scavalca l'euristica.
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::PlanPhase { decompose: false })));
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        // plan_phase OFF (Default) -> is_eligible false; orchestration ON.
+        let cfg = PlannerConfig {
+            orchestration_enabled: true,
+            planner_system_text: "Sei il planner.".to_string(),
+            ..Default::default()
+        };
+        let node = node_with_reasoner(cfg, store, spy.clone());
+        let ctx = ctx_with(
+            // LLM che emette la tool call nexus_todo_write (flusso pieno).
+            Arc::new(ScriptedLlm::always_tool(
+                "nexus_todo_write",
+                json!({"action": "create", "todos": [{"content": "step 1"}]}),
+            )),
+            Arc::new(ScriptedTools::ok(r#"{"ok":true}"#)),
+            false,
+        );
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
+        // Il gate ha scavalcato is_eligible=false -> plan-phase attiva.
+        assert_eq!(out.plan_phase_active, Some(true));
+    }
+
+    #[tokio::test]
+    async fn orchestration_on_runinline_scavalca_is_eligible_true() {
+        // Flag ON + Real + RunInline: salta la plan-phase ANCHE se is_eligible
+        // sarebbe true (cfg_active + stato eligible).
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::RunInline)));
+        let store = Arc::new(StubTodoStore::with_todos(vec![]));
+        let mut cfg = cfg_active();
+        cfg.orchestration_enabled = true;
+        let node = node_with_reasoner(cfg, store, spy.clone());
+        let ctx = gate_ctx(false);
+        let st = eligible_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
+        // RunInline -> salta la plan-phase (scavalca is_eligible=true).
+        assert_eq!(out.plan_phase_active, Some(false));
+        // Nessuno skip_reason (path pass-through, come is_eligible=false).
         assert_eq!(out.plan_phase_skip_reason, None);
     }
 
@@ -1635,6 +2008,7 @@ mod tests {
             "y".to_string(),
             store,
             Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
+            Arc::new(crate::runtime::StubMetaReasonerPort),
         );
         let llm = Arc::new(ScriptedLlm::never_tool());
         let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
@@ -2010,6 +2384,7 @@ mod golden {
                         "fm".to_string(),
                         std::sync::Arc::new(crate::runtime::test_doubles::StubTodoStore::with_todos(vec![])),
                         std::sync::Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
+                        std::sync::Arc::new(crate::runtime::StubMetaReasonerPort),
                     );
                     json!(node.build_hinted_system(&st, run_id))
                 }

@@ -70,6 +70,22 @@ pub enum PatternType {
 }
 
 impl PatternType {
+    /// `true` se il pattern e' una PII (dato personale) e non un segreto tecnico.
+    /// Punto unico della classificazione PII vs segreto (regola L): i call site
+    /// (gateway: redazione PII asimmetrica; segnale strutturato) delegano qui
+    /// invece di duplicare la mappa `kind -> classe`. La classe interna
+    /// `PatternClass` resta privata; questo booleano e' la sua proiezione
+    /// pubblica stabile.
+    pub fn is_pii(self) -> bool {
+        matches!(
+            self,
+            PatternType::ItalianCf
+                | PatternType::ItalianIban
+                | PatternType::CreditCard
+                | PatternType::EmailPii
+        )
+    }
+
     /// Etichetta stabile (snake_case, identica al `PatternType` del TS). Usata
     /// nei placeholder di redazione e nei reason di audit.
     pub fn as_str(self) -> &'static str {
@@ -341,6 +357,39 @@ impl SecretScanner {
         (redacted, count)
     }
 
+    /// Redige i SOLI segreti tecnici con placeholder TOTALE `[REDACTED:<type>]`
+    /// (stesso profilo di [`Self::redact`]), SALTANDO la classe PII. Serve alla
+    /// redazione PII asimmetrica del gateway (regola H): sui messaggi
+    /// `role=user`, i segreti restano redatti come sempre, ma le PII fornite
+    /// volontariamente dall'utente (email/CF/IBAN/carta come soggetto del task)
+    /// NON vengono oscurate. Ritorna il testo redatto e il numero di TIPI di
+    /// pattern segreto che hanno prodotto almeno una sostituzione. Idempotente.
+    ///
+    /// Differisce da [`Self::redact_secrets_preserving_context`]: quello preserva
+    /// il contesto (password-only nelle connection URL) per gli output di
+    /// processo; questo mantiene il placeholder totale del profilo prompt-uscita.
+    pub fn redact_secrets_only(&self, text: &str) -> (String, usize) {
+        let mut redacted = text.to_string();
+        let mut count = 0usize;
+
+        for def in PATTERNS.iter() {
+            if def.class == PatternClass::Pii {
+                continue;
+            }
+            let before = redacted.clone();
+            let placeholder = format!("[REDACTED:{}]", def.kind.as_str());
+            redacted = def
+                .pattern
+                .replace_all(&redacted, placeholder.as_str())
+                .into_owned();
+            if redacted != before {
+                count += 1;
+            }
+        }
+
+        (redacted, count)
+    }
+
     /// Redige i SOLI segreti tecnici preservando il contesto di debugging.
     /// Vedi la doc del modulo per il razionale (profilo persistenza output
     /// processi). Ritorna il testo redatto e il numero di TIPI di pattern che
@@ -522,6 +571,47 @@ mod tests {
         let (out, count) = s.redact_secrets_preserving_context(log);
         assert_eq!(out, log);
         assert_eq!(count, 0);
+    }
+
+    // --- redact_secrets_only (profilo redazione PII asimmetrica del gateway) ---
+
+    #[test]
+    fn secrets_only_redige_i_segreti_e_lascia_la_pii() {
+        // Regression incidente Beaty-Book (chat login 2026-07-03): l'email che
+        // l'utente scrive nel proprio messaggio NON va oscurata (loop email),
+        // ma la key sbagliata incollata resta redatta.
+        let s = SecretScanner;
+        let msg = "perche' costantino@cobracco.it non fa login? key=AKIAIOSFODNN7EXAMPLE";
+        let (out, count) = s.redact_secrets_only(msg);
+        // PII utente in chiaro (soggetto del task).
+        assert!(out.contains("costantino@cobracco.it"));
+        assert!(!out.contains("[REDACTED:email_pii]"));
+        // Segreto SEMPRE redatto (placeholder totale, profilo prompt-uscita).
+        assert!(out.contains("[REDACTED:aws_key]"));
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+        // Un solo TIPO di segreto redatto.
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn secrets_only_non_tocca_cf_iban_carta() {
+        let s = SecretScanner;
+        let msg = "cf RSSMRA80A01H501U iban IT60X0542811101000000123456 carta 4111111111111111";
+        let (out, count) = s.redact_secrets_only(msg);
+        assert_eq!(out, msg);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn is_pii_classifica_correttamente() {
+        assert!(PatternType::EmailPii.is_pii());
+        assert!(PatternType::ItalianCf.is_pii());
+        assert!(PatternType::ItalianIban.is_pii());
+        assert!(PatternType::CreditCard.is_pii());
+        assert!(!PatternType::AwsKey.is_pii());
+        assert!(!PatternType::GithubPat.is_pii());
+        assert!(!PatternType::DbConnectionString.is_pii());
+        assert!(!PatternType::Jwt.is_pii());
     }
 
     #[test]

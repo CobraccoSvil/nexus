@@ -111,6 +111,9 @@ pub struct StateDelta {
     /// Vedi `AgentState::clarify_attempts`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub clarify_attempts: Option<Option<i64>>,
+    /// Vedi `AgentState::repeated_clarify_count`.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub repeated_clarify_count: Option<Option<i64>>,
     /// Vedi `AgentState::intent_hint`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub intent_hint: Option<Option<String>>,
@@ -440,6 +443,34 @@ pub struct StateDelta {
     /// sostituisce `AgentState::extra`, `None` e' no-op. Vedi doc del modulo.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<Map<String, Value>>,
+}
+
+/// Costruisce la mappa `extra` per un delta che vuole SCRIVERE UNA chiave in
+/// `AgentState::extra` senza azzerare le altre (PUNTO UNICO, regola L).
+///
+/// `StateDelta::extra` ha semantica OVERWRITE TOTALE (vedi doc del modulo:
+/// `Some(map)` sostituisce l'intera `AgentState::extra`). Scrivere un extra
+/// PARZIALE — es. `Some(map!{"stall_move::..." => v})` — cancellerebbe TUTTE le
+/// altre chiavi dello schema aperto gia' presenti nello stato
+/// (`auto_escalations`, `repeat_scan_floor`, `iteration_budget`, `error_class`,
+/// ...): un bug subdolo. Questo helper CLONA l'intera `state.extra` corrente,
+/// vi inserisce/sostituisce `key -> value`, e ritorna la mappa completa da
+/// mettere nel delta. Cosi' un nodo che aggiunge una sola chiave preserva tutte
+/// le altre (clone-whole-map).
+///
+/// Uso tipico:
+/// ```ignore
+/// let extra = put_extra(state, "stall_move::signature::7", json!({"move": "escalate_model"}));
+/// let delta = StateDelta { extra: Some(extra), ..Default::default() };
+/// ```
+pub fn put_extra(
+    state: &super::AgentState,
+    key: impl Into<String>,
+    value: Value,
+) -> Map<String, Value> {
+    let mut map = state.extra.clone();
+    map.insert(key.into(), value);
+    map
 }
 
 impl StateDelta {

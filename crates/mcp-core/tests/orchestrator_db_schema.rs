@@ -56,9 +56,14 @@ async fn tabelle_plan_act_verify_esistono() {
         "nexus_subagent_runs",
     ];
     for t in attese_project {
+        // Il set project e' generato da pg_dump: le tabelle sono qualificate con
+        // lo schema (`public.<t>`). Il match accetta sia la forma qualificata sia
+        // quella nuda (robustezza al prefisso schema).
         assert!(
             project_sql.contains(&format!("CREATE TABLE IF NOT EXISTS {t}"))
-                || project_sql.contains(&format!("CREATE TABLE {t}")),
+                || project_sql.contains(&format!("CREATE TABLE {t}"))
+                || project_sql.contains(&format!("CREATE TABLE IF NOT EXISTS public.{t}"))
+                || project_sql.contains(&format!("CREATE TABLE public.{t}")),
             "tabella '{t}' non definita nel set db/migrations/project - dominio run incompleto"
         );
     }

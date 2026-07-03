@@ -43,6 +43,17 @@ pub mod context_offload;
 pub mod escalation_port;
 pub mod next_actions_deriver;
 
+// --- detector clarification CROSS-RUN (loop email): ClarifyHistoryPort ---
+pub mod clarify_history_store;
+
+// --- meta-reasoner LLM (ADR 0036-style): MetaReasonerPort (PgMetaReasonerPort) ---
+// recover (recovery-da-stallo) implementato; orchestrate STUB (#11c).
+pub mod stall_reasoner_port;
+
+// --- budget CROSS-RUN del meta-reasoner (per sessione): StallBudgetPort ---
+// contatore append+count su nexus_agent_meta_steps (kind='stall_budget'), zero DDL.
+pub mod stall_budget_store;
+
 // --- rolling-summary (intervento 3): SummaryStore (LLM economico) ---
 pub mod summary_store;
 

@@ -41,6 +41,10 @@ fn node_label(n: NodeTarget) -> &'static str {
         NodeTarget::Learner => "learner",
         NodeTarget::Executor => "executor",
         NodeTarget::TodoRunner => "todo_runner",
+        // Nodo dedicato del meta-reasoner (nessuna controparte Python: assente dal
+        // golden phase2b, mai atteso come output della parita' 1:1). Mappato per
+        // esaustivita' del match, coerente con NodeId::as_label.
+        NodeTarget::StallRecovery => "stall_recovery",
     }
 }
 

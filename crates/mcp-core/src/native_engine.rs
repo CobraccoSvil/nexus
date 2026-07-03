@@ -96,13 +96,14 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use nexus_agent_graph::nodes::{
-    ExecutorConfig, ExecutorNode, VerifierConfig, VerifierNode,
+    ExecutorConfig, ExecutorNode, StallRecoveryNode, VerifierConfig, VerifierNode,
 };
 use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
+use nexus_agent_graph::decisions::LoopThresholds;
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
-    LlmGateway, MetaStepStore, ModelUpscalePort, NextActionsDeriver, RunControlStore, SummaryStore,
-    TodoStore, ToolExecutor, VerifierRunStore,
+    LlmGateway, MetaReasonerPort, MetaStepStore, ModelUpscalePort, NextActionsDeriver,
+    RunControlStore, SummaryStore, TodoStore, ToolExecutor, VerifierRunStore,
 };
 use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
@@ -117,11 +118,13 @@ use nexus_graph::outcome::StepOutcome;
 use crate::agent_graph_adapter::{
     agent_step_store::PgAgentStepStore,
     billing_cooldown_port::{CooldownBillingPort, NullBillingCooldownPort},
+    clarify_history_store::PgClarifyHistoryStore,
     context_offload::RagContextOffloadAdapter, criteria_runner::FinalGateCriteriaRunnerAdapter,
     escalation_port::PgEscalationPort, event_sink::SseEventSinkAdapter,
     llm_gateway::{GatewayLlmAdapter, ReplayLlmGateway},
     meta_step_store::PgMetaStepStore, model_upscale_port::CatalogModelUpscalePort,
     next_actions_deriver::NextActionsDeriverAdapter, run_control_store::PgRunControlStore,
+    stall_budget_store::PgStallBudgetStore, stall_reasoner_port::PgMetaReasonerPort,
     summary_store::PgSummaryStore, todo_store::PgTodoStore,
     tool_executor::ToolRunnerExecutorAdapter, verifier_run_store::PgVerifierRunStore,
 };
@@ -509,6 +512,11 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
         clarifying_questions_max: setting_i64(db, "orchestrator.clarifying_questions_max", d.clarifying_questions_max).await,
         plan_rationale_enabled: setting_bool(db, "orchestrator.plan_rationale_enabled", d.plan_rationale_enabled).await,
         dag_topological_enabled: setting_bool(db, "orchestrator.dag_topological_enabled", d.dag_topological_enabled).await,
+        // Gate orchestrazione LLM-driven della plan-phase (Fase 1). DEFAULT SAFE
+        // FALSE (regola G): il setting sara' seminato dalla migrazione del
+        // sotto-blocco successivo; finche' assente o false il gate ricade sempre
+        // su is_eligible -> comportamento bit-identico a oggi.
+        orchestration_enabled: setting_bool(db, "agent.orchestration.enabled", d.orchestration_enabled).await,
         // Risolti a monte / da altra fonte (vedi doc della funzione): default.
         planner_system_text: d.planner_system_text,
         turn_focus_enabled: d.turn_focus_enabled,
@@ -631,6 +639,22 @@ async fn load_executor_config(
         // Chiave seminata dalla mig 0506 (regola G, incoerenza rilevata dal
         // censimento anti-loop / ADR 0035).
         iteration_cap: setting_i64(db, "agent.executor.iteration_cap", d.iteration_cap).await,
+        // Ex costanti hardcoded portate in DB (regola G): offset forced-text,
+        // budget escalation unico, soglie loop-by-signature.
+        forced_text_offset: setting_i64(db, "agent.executor.forced_text_offset", d.forced_text_offset).await,
+        max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
+        loop_thresholds: LoopThresholds {
+            signature: setting_i64(db, "agent.loop.signature_threshold", d.loop_thresholds.signature as i64).await.max(1) as usize,
+            cap: setting_i64(db, "agent.loop.recent_signatures_cap", d.loop_thresholds.cap as i64).await.max(1) as usize,
+        },
+        // Soglia dell'asse RepeatedUserQuestion (loop clarify cross-run, mig 0510).
+        repeated_user_question_threshold: setting_i64(db, "agent.loop.repeated_user_question_threshold", d.repeated_user_question_threshold).await,
+        // ── Meta-reasoner di recovery-da-stallo (mig 0510, opt-in DB, regola G) ─
+        // Con enabled=false (default) il gate di emissione StallReason nell'executor
+        // non scatta mai -> comportamento bit-identico a oggi. Il budget per-sessione
+        // e' il cap duro anti meta-loop/costo del gate.
+        stall_recovery_enabled: setting_bool(db, "agent.stall_recovery.enabled", d.stall_recovery_enabled).await,
+        stall_recovery_max_moves_per_session: setting_i64(db, "agent.stall_recovery.max_moves_per_session", d.stall_recovery_max_moves_per_session).await,
         progress_controller_enabled: setting_bool(db, "agent.progress_controller_enabled", d.progress_controller_enabled).await,
         repeated_action_threshold: setting_i64(db, "agent.repeated_action_threshold", d.repeated_action_threshold).await,
         repeated_action_threshold_read_only: setting_i64(db, "agent.repeated_action_threshold.read_only", d.repeated_action_threshold_read_only).await,
@@ -1045,6 +1069,20 @@ async fn build_native_engine(
         ..ReflectionConfig::default()
     };
 
+    // ── Meta-reasoner LLM CONDIVISO (regola L: UNA istanza, iniettata sia nel
+    // gate orchestrazione del planner sia nel nodo recovery StallRecovery). Impl
+    // concreta `PgMetaReasonerPort` (paradigma ADR 0036 di `verify_profile`):
+    // legge config/purpose/template dal meta-DB e consulta l'LLM via
+    // `NeuralCoreClient`. OPT-IN: con `agent.stall_recovery.enabled` /
+    // `agent.orchestration.enabled` = false (default, regola G) i due metodi
+    // ritornano `Ok(None)` -> planner ricade su `is_eligible`, StallRecovery sulla
+    // gerarchia fissa -> comportamento BIT-IDENTICO a oggi. In `Replay` la porta
+    // gatta su `mode` -> `Ok(None)` senza consultare l'LLM.
+    let reasoner: Arc<dyn MetaReasonerPort> = Arc::new(PgMetaReasonerPort::new(
+        db.clone(),
+        deps.tool_runner_deps.neural.clone(),
+    ));
+
     // ── 11 nodi (porte iniettate nei costruttori reali) ──────────────────────
     let nodes = AgentGraphNodes {
         router: Arc::new(RouterNode),
@@ -1058,6 +1096,7 @@ async fn build_native_engine(
             fallback_model,
             todos.clone(),
             meta_steps.clone(),
+            reasoner.clone(),
         )),
         todo_runner: Arc::new(TodoRunnerNode::new(
             load_todo_runner_config(&db).await,
@@ -1084,6 +1123,16 @@ async fn build_native_engine(
             if resolve_tokenizer_kind(&db).await == TokenizerKind::Cl100k {
                 executor = executor.with_token_counter(Arc::new(TiktokenCounter));
             }
+            // Budget CROSS-RUN del meta-reasoner (per SESSIONE): contatore
+            // append+count su nexus_agent_meta_steps (kind='stall_budget') sul pool
+            // del dominio run (separazione DB per-progetto). Rende il cap
+            // `agent.stall_recovery.max_moves_per_session` effettivo per-sessione
+            // (chiude il loop email cross-run). Con flag OFF il gate non e' MAI
+            // raggiunto -> la porta resta inerte (nessuna lettura/scrittura).
+            executor = executor.with_stall_budget(Arc::new(PgStallBudgetStore::new(
+                run_db.clone(),
+                input.run_id,
+            )));
             Arc::new(executor)
         },
         tool_dispatch: Arc::new(ToolDispatchNode::new(
@@ -1095,6 +1144,14 @@ async fn build_native_engine(
             offload.clone(),
             meta_steps.clone(),
         )),
+        // Meta-reasoner di recovery-da-stallo. Riusa la STESSA istanza
+        // `PgMetaReasonerPort` iniettata nel gate orchestrazione del planner
+        // (regola L: nessuna duplicazione della porta). Il nodo consuma SOLO
+        // `recover`; il planner consuma SOLO `orchestrate`. OPT-IN via
+        // `agent.stall_recovery.enabled` (default false): con OFF la porta ritorna
+        // `Ok(None)` -> il nodo ricade sulla gerarchia fissa
+        // `progress_controller::decide` -> comportamento BIT-IDENTICO a oggi.
+        stall_recovery: Arc::new(StallRecoveryNode::new(reasoner.clone())),
         verifier: Arc::new(VerifierNode::new(
             verifier_cfg,
             final_gate_cfg.clone(),
@@ -1453,6 +1510,44 @@ async fn run_engine(
                 init_state.playbook_steps = Some(pm.steps);
                 init_state.playbook_key = Some(pm.key);
             }
+
+            // ── Detector clarification CROSS-RUN (loop email, blocco #5) ─────────
+            // Calcolato UNA volta all'avvio del run PRIMARIO, FUORI dal grafo
+            // (replay-safe): il valore e' checkpointato in `AgentState`, cosi' il
+            // grafo e il replay lo rileggono dallo stato senza re-interrogare il DB
+            // (il principio guida del piano: la decisione e' presa fuori dal
+            // percorso caldo, il percorso caldo la rilegge). Solo PRIMARIO: nello
+            // shadow (Replay) NON leggiamo stato live che evolve (come
+            // `NullBillingCooldownPort`) — lo shadow rigioca lo stato del primario,
+            // che porta gia' `repeated_clarify_count` checkpointato.
+            //
+            // FONTE STRUTTURATA (regola M): i meta_step `kind='clarify'` della
+            // sessione. Il pool e' quello del DOMINIO RUN (agent_runs/meta_steps
+            // migrati al DB progetto), risolto col PUNTO UNICO per-sessione.
+            // Fail-open: guasto DB -> conteggio 0 (asse mai attivo, invariato).
+            if !role.is_shadow() {
+                let run_db =
+                    crate::project_db_routes::project_data_pool_by_session_from(
+                        &deps.db,
+                        input.session_id,
+                    )
+                    .await;
+                let clarify_history = PgClarifyHistoryStore::new(run_db);
+                let (sig, repeat_count) = clarify_history
+                    .latest_signature_and_repeat_count(input.session_id)
+                    .await;
+                if repeat_count > 0 {
+                    tracing::info!(
+                        target: "mcp_core::native_engine",
+                        session_id = %input.session_id,
+                        repeated_clarify_count = repeat_count,
+                        signature = sig.as_deref().unwrap_or(""),
+                        "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
+                    );
+                }
+                init_state.repeated_clarify_count = Some(repeat_count);
+            }
+
             let init = Some(init_state);
             engine
                 .run_until_interrupt(input.run_id, init, &ctx)

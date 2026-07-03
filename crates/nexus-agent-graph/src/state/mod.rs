@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use nexus_graph_derive::GraphState as DeriveGraphState;
 
-pub use delta::StateDelta;
+pub use delta::{put_extra, StateDelta};
 pub use message::{ContentBlock, Message, MessageContent, ToolUse};
 
 /// Modalita' di automazione del turno chat propagata da mcp-core
@@ -80,6 +80,23 @@ pub enum StopReason {
     LoopAbort,
     /// Cap G1 raggiunto.
     G1CapReached,
+    /// L'executor ha rilevato uno stallo che richiede META-RAGIONAMENTO e instrada
+    /// al nodo dedicato `StallRecovery` (superstep isolato, ADR 0036-style). E' un
+    /// segnale di ROUTING interno: `route_after_executor` lo mappa su
+    /// `NodeTarget::StallRecovery`. Il `StallContext` serializzato viaggia in
+    /// `extra` (chiave [`crate::nodes::stall_recovery::STALL_CONTEXT_KEY`]).
+    ///
+    /// INERTE a oggi: nessun nodo lo emette ancora (l'innesto nei detector
+    /// dell'executor e' un blocco successivo del piano). La variante esiste per il
+    /// wiring del nodo/routing; con `agent.stall_recovery.enabled=false` (default)
+    /// il motore resta bit-identico a oggi.
+    StallReason,
+    /// Il nodo `StallRecovery` ha risolto lo stallo (mossa scelta o fallback) e
+    /// rientra nell'executor (self-loop, come `G1Escalated -> executor`).
+    /// `route_after_executor` NON e' interessato (il nodo produttore e'
+    /// `StallRecovery`, il cui edge instrada direttamente all'executor): la
+    /// variante e' il segnale che il superstep di recovery e' concluso.
+    StallResolved,
     /// Errore provider durante l'executor (`__init__.py:3104-3107`): l'executor
     /// scrive `result="[Errore provider ...]"` (NON vuoto) e `stop_reason="error"`.
     /// Serializza in `"error"` (snake_case): e' il SOLO valore che fa entrare il
@@ -150,6 +167,19 @@ pub struct AgentState {
     pub pending_clarify: Option<bool>,
     /// Numero di chiarimenti gia' emessi nel run.
     pub clarify_attempts: Option<i64>,
+    /// Numero di domande-chiarimento IDENTICHE gia' poste all'utente nella
+    /// SESSIONE (CROSS-RUN), calcolato UNA volta all'avvio del run dal detector
+    /// `ClarifyHistoryPort` (mcp-core) e checkpointato qui cosi' sopravvive nel
+    /// run corrente e il replay lo rilegge senza re-interrogare il DB
+    /// (replay-safe). Alimenta `ProgressSignals::repeated_user_question_count`:
+    /// oltre la soglia (`agent.loop.repeated_user_question_threshold`) scatta
+    /// l'asse `Axis::RepeatedUserQuestion`. E' il segnale che il loop email
+    /// (chat Beaty-Book) attraversava senza mai essere rilevato (la loop-detection
+    /// copriva solo le firme di TOOL). `None`/0 su un run normale -> asse mai
+    /// attivo -> comportamento invariato. Regola M: la DECISIONE deriva dal
+    /// segnale strutturato (i meta_step `kind='clarify'` della sessione), la
+    /// firma-testo della domanda e' solo euristica di conteggio.
+    pub repeated_clarify_count: Option<i64>,
     /// Intent gia' risolto a monte da mcp-core (salta la ri-classificazione).
     pub intent_hint: Option<String>,
     /// Punto unico: il turno corrente richiede azione con tool?

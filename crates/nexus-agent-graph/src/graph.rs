@@ -103,6 +103,10 @@ pub struct AgentGraphNodes {
     pub executor: Arc<AgentGraphNode>,
     /// Dispatch dei tool pendenti (loop agentico).
     pub tool_dispatch: Arc<AgentGraphNode>,
+    /// Meta-reasoner di recovery-da-stallo (superstep dedicato; self-loop verso
+    /// l'executor). Inerte a flag OFF (porta `MetaReasonerPort` che ritorna
+    /// `Ok(None)`).
+    pub stall_recovery: Arc<AgentGraphNode>,
     /// Verifica plan-phase (DoD).
     pub verifier: Arc<AgentGraphNode>,
     /// Verifica E2E pre-chiusura.
@@ -126,6 +130,7 @@ pub fn node_target_to_node_id(target: NodeTarget) -> NodeId {
         NodeTarget::FinalGate => NodeId::FinalGate,
         NodeTarget::Executor => NodeId::Executor,
         NodeTarget::TodoRunner => NodeId::TodoRunner,
+        NodeTarget::StallRecovery => NodeId::StallRecovery,
         // Self-loop G1 nativo nel motore (no nodo passthrough, regola H).
         NodeTarget::G1Continue => NodeId::Executor,
         // graph.py: il target "learner" delle route_after_* va al nodo reflection
@@ -151,6 +156,12 @@ fn build_edges(
     edges.insert(NodeId::Router, Edge::Static(NodeId::ClarifyOrExpand));
     // tool_dispatch -> executor (rientro nel loop agentico).
     edges.insert(NodeId::ToolDispatch, Edge::Static(NodeId::Executor));
+    // stall_recovery -> executor (rientro nel loop agentico dopo il superstep di
+    // recovery). Il nodo emette sempre StopReason::StallResolved e torna
+    // nell'executor, che consuma la RecoveryMove eventualmente persistita in extra
+    // (self-loop, analogo a `G1Escalated -> executor`). INERTE oggi: nessun
+    // detector emette StallReason, quindi il nodo non e' mai raggiunto.
+    edges.insert(NodeId::StallRecovery, Edge::Static(NodeId::Executor));
     // reflection -> learner -> END (chiusura del run).
     edges.insert(NodeId::Reflection, Edge::Static(NodeId::Learner));
     edges.insert(NodeId::Learner, Edge::End);
@@ -253,6 +264,7 @@ fn build_node_map(
     map.insert(NodeId::TodoRunner, nodes.todo_runner);
     map.insert(NodeId::Executor, nodes.executor);
     map.insert(NodeId::ToolDispatch, nodes.tool_dispatch);
+    map.insert(NodeId::StallRecovery, nodes.stall_recovery);
     map.insert(NodeId::Verifier, nodes.verifier);
     map.insert(NodeId::FinalGate, nodes.final_gate);
     map.insert(NodeId::Reflection, nodes.reflection);
@@ -306,8 +318,8 @@ mod tests {
     use crate::nodes::{
         ClarifyConfig, ClarifyOrExpandNode, ExecutorConfig, ExecutorNode, FinalGateConfig,
         FinalGateNode, LearnerConfig, LearnerNode, PlannerNode, ReflectionConfig, ReflectionNode,
-        RouterNode, TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode,
-        UnderstandingConfig, UnderstandingNode, VerifierConfig, VerifierNode,
+        RouterNode, StallRecoveryNode, TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig,
+        ToolDispatchNode, UnderstandingConfig, UnderstandingNode, VerifierConfig, VerifierNode,
     };
     use crate::runtime::ports::{
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
@@ -321,6 +333,7 @@ mod tests {
         StubNextActionsDeriver, StubRunControlStore, StubSummaryStore, StubTodoStore,
         StubVerifierRunStore,
     };
+    use crate::runtime::StubMetaReasonerPort;
     use crate::state::{Message, MessageContent, StopReason, ToolUse};
 
     // ── Checkpointer in-memory (zero DB nel test) ─────────────────────────────
@@ -518,6 +531,11 @@ mod tests {
             ..ExecutorConfig::default()
         };
 
+        // Meta-reasoner INERTE (Ok(None)) CONDIVISO tra planner (gate orchestrazione)
+        // e stall_recovery (recovery): UNA sola istanza (regola L, non duplicata).
+        let reasoner: Arc<dyn crate::runtime::ports::MetaReasonerPort> =
+            Arc::new(StubMetaReasonerPort);
+
         AgentGraphNodes {
             router: Arc::new(RouterNode),
             clarify_or_expand: Arc::new(ClarifyOrExpandNode::new(ClarifyConfig::default())),
@@ -530,6 +548,7 @@ mod tests {
                 String::new(),
                 todos.clone(),
                 meta_steps.clone(),
+                reasoner.clone(),
             )),
             todo_runner: Arc::new(TodoRunnerNode::new(
                 TodoRunnerConfig::default(),
@@ -556,6 +575,10 @@ mod tests {
                 offload.clone(),
                 meta_steps.clone(),
             )),
+            // Reasoner INERTE (Ok(None)): il nodo, se raggiunto, degrada alla
+            // gerarchia fissa. Non e' mai raggiunto nei test del grafo (nessun
+            // detector emette StallReason). STESSA istanza del planner (regola L).
+            stall_recovery: Arc::new(StallRecoveryNode::new(reasoner.clone())),
             verifier: Arc::new(VerifierNode::new(
                 VerifierConfig::default(),
                 FinalGateConfig::default(),
@@ -642,6 +665,10 @@ mod tests {
             node_target_to_node_id(NodeTarget::TodoRunner),
             NodeId::TodoRunner
         );
+        assert_eq!(
+            node_target_to_node_id(NodeTarget::StallRecovery),
+            NodeId::StallRecovery
+        );
     }
 
     // ── Topologia: copertura edge ─────────────────────────────────────────────
@@ -658,6 +685,7 @@ mod tests {
             NodeId::TodoRunner,
             NodeId::Executor,
             NodeId::ToolDispatch,
+            NodeId::StallRecovery,
             NodeId::Verifier,
             NodeId::FinalGate,
             NodeId::Reflection,
@@ -672,6 +700,11 @@ mod tests {
         ));
         assert!(matches!(
             edges.get(&NodeId::ToolDispatch),
+            Some(Edge::Static(NodeId::Executor))
+        ));
+        // stall_recovery -> executor (self-loop di rientro dopo il superstep).
+        assert!(matches!(
+            edges.get(&NodeId::StallRecovery),
             Some(Edge::Static(NodeId::Executor))
         ));
         assert!(matches!(

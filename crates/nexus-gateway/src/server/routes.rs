@@ -180,10 +180,23 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
     // Redaction pre-flight: strict mode quando il tier e' elevato (>=2) e il
     // provider scelto e' cloud. La mappa serve per la reidratazione post-flight.
     let strict = effective_tier >= 2;
+    // Policy PII asimmetrica (regola G, opt-in): quando ON, la PII fornita
+    // volontariamente dall'utente nel proprio messaggio (soggetto del task) non
+    // viene oscurata; segreti e PII di terzi restano redatti. Default sicuro
+    // (comportamento storico) se il flag e' assente o il DB non risponde.
+    let skip_pii_in_user_messages = nexus_auth::get_bool_setting(
+        &state.db,
+        "gateway.redaction.skip_pii_in_user_messages",
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
     let pipeline = RedactionPipeline::new(
         runtime.presidio.clone(),
         RedactionOptions {
             strict_mode: strict,
+            skip_pii_in_user_messages,
             ..Default::default()
         },
     );
@@ -191,11 +204,14 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
         .redact(req)
         .await
         .map_err(|e| PipelineError::blocked(e.to_string()))?;
-    if !redaction.stats.types.is_empty() || redaction.stats.secrets_found > 0 {
+    if redaction.any_redacted() {
+        // Regola M: log dai flag strutturati, non dal placeholder testuale.
         tracing::info!(
             secrets = redaction.stats.secrets_found,
             pii = redaction.stats.pii_found,
             code = redaction.stats.code_anonymized,
+            secret_redacted = redaction.secret_redacted(),
+            pii_redacted = redaction.pii_redacted(),
             "gateway: redazione applicata"
         );
     }

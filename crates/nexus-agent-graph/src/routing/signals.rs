@@ -262,7 +262,9 @@ fn text_has_error_hint(text: &str) -> bool {
 /// Estrae i tool_use `(name, input)` di un singolo [`Message::Ai`], guardando
 /// ENTRAMBE le forme: `tool_calls` (OpenAI-compat) e `ContentBlock::ToolUse`
 /// (Anthropic, == anthropic_content Python). Ritorna vuoto per gli altri ruoli.
-fn message_tool_uses(m: &Message) -> Vec<(&str, &Value)> {
+/// Punto unico (regola L): l'executor lo usa per individuare l'ULTIMO tool_use
+/// nella coda (esito strutturato dello StallContext).
+pub fn message_tool_uses(m: &Message) -> Vec<(&str, &Value)> {
     let mut out: Vec<(&str, &Value)> = Vec::new();
     if let Message::Ai {
         content,
@@ -414,6 +416,71 @@ pub fn tool_result_outcome_after(recent: &[Message], idx: usize, max_ahead: usiz
         }
     }
     None
+}
+
+/// CODICE STRUTTURATO (regola M) che il guard anti-persistenza-redazione della
+/// fonte (`mcp-core::security::redaction_guard`) antepone al tool_result quando
+/// RIFIUTA un input contenente un placeholder di redazione (audit
+/// `redacted_placeholder_rejected`). E' un CONTRATTO MACCHINA stabile — come il
+/// marker d'errore `\u{274C}` e `EXIT CODE: N` — non prosa: la fonte lo CODIFICA,
+/// [`recent_redaction_rejected`] lo LEGGE. mcp-core importa QUESTA costante
+/// (punto unico, regola L): un solo letterale, definito nel crate a valle che i
+/// consumatori leggono, referenziato dalla fonte a monte.
+pub const REDACTION_REJECTED_CODE: &str = "[REDACTION_REJECTED]";
+
+/// Rende il testo di UN content di tool_result (stringa o blocchi) per la sola
+/// ricerca del codice sentinella [`REDACTION_REJECTED_CODE`]. Gemello di
+/// [`content_value_to_text`] applicato ai `ContentBlock::ToolResult`; NON
+/// classifica il significato del testo (regola M: cerca un codice macchina,
+/// non pattern di prosa).
+fn tool_result_text_of(m: &Message) -> Option<String> {
+    match m {
+        Message::Tool { content, .. } => Some(match content {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult { content, .. } => Some(content_value_to_text(content)),
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }),
+        Message::Human { content } => {
+            let MessageContent::Blocks(blocks) = content else {
+                return None;
+            };
+            let parts: Vec<String> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult { content, .. } => Some(content_value_to_text(content)),
+                    _ => None,
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        Message::Ai { .. } => None,
+    }
+}
+
+/// `true` se negli ultimi `lookback` messaggi c'e' un tool_result che porta il
+/// CODICE STRUTTURATO [`REDACTION_REJECTED_CODE`] (la fonte ha rifiutato un input
+/// per placeholder di redazione). E' il SEGNALE STRUTTURATO (regola M) che
+/// alimenta `StallContext.redaction_rejected`: riconosce il blocco ambientale
+/// (l'email/segreto ri-oscurato che il modello continua a copiare) SENZA
+/// pattern-matching sulla prosa del messaggio ne' `contains("[REDACTED:")` sul
+/// placeholder umano. Punto unico (regola L): l'executor delega qui, non
+/// re-implementa la scansione.
+pub fn recent_redaction_rejected(messages: &[Message], lookback: usize) -> bool {
+    tail_messages(messages, lookback)
+        .iter()
+        .filter_map(tool_result_text_of)
+        .any(|t| t.contains(REDACTION_REJECTED_CODE))
 }
 
 /// Cap del testo estratto per il confronto output-progresso (evita di
@@ -1435,6 +1502,31 @@ mod tests {
             human_tool_result(None, false, "Compilato con successo"),
         ];
         assert_eq!(tool_result_outcome_after(&msgs_ok, 0, 3), Some(false));
+    }
+
+    #[test]
+    fn redaction_rejected_da_codice_strutturato() {
+        // SEGNALE STRUTTURATO (regola M): un tool_result che porta il codice
+        // sentinella [REDACTION_REJECTED] -> true; il testo umano del placeholder
+        // ([REDACTED:...]) da solo NON basta (non e' il codice macchina).
+        let rifiutato = vec![
+            ai_tool_input("run_command", json!({"command": "x"})),
+            human_tool_result(
+                None,
+                true,
+                "\u{274C} [REDACTION_REJECTED] [BLOCCATO — placeholder di redazione nell'input]",
+            ),
+        ];
+        assert!(recent_redaction_rejected(&rifiutato, 16));
+        // Un tool_result che MENZIONA il placeholder umano ma NON porta il codice
+        // strutturato non conta (evita falsi positivi da prosa/log).
+        let solo_prosa = vec![
+            ai_tool_input("read_file", json!({"path": ".env"})),
+            human_tool_result(Some(0), false, "ADMIN_EMAIL=[REDACTED:email_pii]"),
+        ];
+        assert!(!recent_redaction_rejected(&solo_prosa, 16));
+        // Nessun tool_result -> false.
+        assert!(!recent_redaction_rejected(&[], 16));
     }
 
     #[test]

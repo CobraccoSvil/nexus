@@ -165,9 +165,11 @@ use crate::decisions::helpers::{
     turn_action_oriented,
 };
 use crate::decisions::loop_signatures::{
-    build_signature, detect_signature_loop_progress_aware, exploration_counter_update,
+    build_signature, detect_signature_loop_progress_aware_with, exploration_counter_update,
+    LoopThresholds,
 };
-use crate::decisions::progress_controller::{self as pc, Action, ProgressSignals};
+use crate::decisions::meta_reason::{build_stall_context, translate};
+use crate::decisions::progress_controller::{self as pc, Action, Axis, ProgressSignals};
 use crate::decisions::tool_dispatch::{
     current_context_token_estimate, estimate_context_chars, flatten_context_text,
     ContextMessage,
@@ -180,11 +182,14 @@ use crate::routing::signals::{
 };
 use crate::runtime::ports::{
     AgentStepStore, BillingCooldownPort, EscalationPort, LlmMessage, LlmRequest, MetaStepStore,
-    ModelUpscalePort, NextActionsDeriver, RunControlStore, SseEvent, SummaryStore, TokenCounter,
+    ModelUpscalePort, NextActionsDeriver, RunControlStore, SseEvent, StallBudgetPort, SummaryStore,
+    TokenCounter,
 };
+use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
+use crate::runtime::ports::RecoveryMove;
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
-    AgentState, ContentBlock, Message, MessageContent, StateDelta, StopReason, ToolUse,
+    put_extra, AgentState, ContentBlock, Message, MessageContent, StateDelta, StopReason, ToolUse,
 };
 
 /// Tool brain-only `task_complete` (vedi `tool_dispatch`): conta nel gate
@@ -275,8 +280,29 @@ pub struct ExecutorConfig {
     /// Modello RISOLTO A MONTE (regola G).
     pub routing_model: String,
     /// Cap globale di iterazioni del run (`iteration_budget`/`MAX_AGENT_ITERATIONS`):
-    /// soglia forced-text = `cap - 5`.
+    /// soglia forced-text = `cap - forced_text_offset`.
     pub iteration_cap: i64,
+    /// Offset sottratto a `iteration_cap` per la soglia di forced-text
+    /// (`agent.executor.forced_text_offset`, default 5): a `cap - offset`
+    /// iterazioni il turno viene marcato FORZATO (chiusura imminente). Regola G:
+    /// ex costante `iteration_cap - 5` hardcoded.
+    pub forced_text_offset: i64,
+    /// Budget massimo di escalation del run (`agent.executor.max_escalations`,
+    /// default 3): cap UNICO (regola L) condiviso dal gate ESCALATE del
+    /// progress_controller (`ProgressSignals.max_escalations`) e dall'
+    /// auto-escalation intra-turno al signature-loop (`auto_escalations`). Regola
+    /// G: ex literal `3` sparsi nei costrutti `ProgressSignals` e nel cap 2616.
+    pub max_escalations: i64,
+    /// Soglie DB-driven della rilevazione loop-by-signature
+    /// (`agent.loop.signature_threshold` / `agent.loop.recent_signatures_cap`).
+    /// Regola G: ex costanti `LOOP_THRESHOLD` / `RECENT_SIGNATURES_CAP`.
+    pub loop_thresholds: LoopThresholds,
+    /// Soglia (`agent.loop.repeated_user_question_threshold`, mig 0510, default 2)
+    /// oltre la quale (`>=`) scatta l'asse `RepeatedUserQuestion` (loop
+    /// clarification CROSS-RUN, chiude il loop email). Il conteggio arriva da
+    /// `AgentState::repeated_clarify_count` (detector `ClarifyHistoryPort`,
+    /// calcolato all'avvio del run). Regola G: DB-driven, mai hardcoded. Default 2.
+    pub repeated_user_question_threshold: i64,
     /// `true` se lo smart-upscale e' attivo (`agent.upscale.enabled`, default ON
     /// in produzione): promuove a un modello con window piu' grande se il contesto
     /// stimato supera il window del modello corrente (PRIMA della chiamata LLM).
@@ -311,6 +337,20 @@ pub struct ExecutorConfig {
     pub pending_steps_detection_enabled: bool,
     /// Item minimi dell'elenco pendenti (`agent.closure.pending_steps_min_items`).
     pub pending_steps_min_items: i64,
+    /// `true` se il meta-reasoner LLM di recovery-da-stallo e' attivo
+    /// (`agent.stall_recovery.enabled`, mig 0510, default `false`). Con OFF il
+    /// gate di EMISSIONE dello `StallReason` non scatta MAI: la gerarchia fissa
+    /// `progress_controller::decide` decide come oggi (comportamento BIT-IDENTICO,
+    /// regola G: opt-in DB, nessun fallback hardcoded). Con ON, prima delle mosse
+    /// costose (ForceDiagnose/ChangeStrategy/Escalate/Abort) l'executor instrada
+    /// al nodo dedicato `StallRecovery` (superstep isolato, replay-safe).
+    pub stall_recovery_enabled: bool,
+    /// Budget di consultazioni del meta-reasoner per-SESSIONE
+    /// (`agent.stall_recovery.max_moves_per_session`, mig 0510, default 6): cap
+    /// duro oltre cui il gate NON emette piu' `StallReason` e ricade sulla
+    /// gerarchia fissa (rete di sicurezza anti meta-loop / anti-costo). Regola G:
+    /// DB-driven, mai hardcoded. Rilevante solo a `stall_recovery_enabled=true`.
+    pub stall_recovery_max_moves_per_session: i64,
 }
 
 impl Default for ExecutorConfig {
@@ -353,6 +393,14 @@ impl Default for ExecutorConfig {
             routing_provider: String::new(),
             routing_model: String::new(),
             iteration_cap: 60,
+            // Default safe-DB-down: ex costanti hardcoded (regola G). Valgono SOLO
+            // se il DB non fornisce i setting; il wiring mcp-core passa i valori reali.
+            forced_text_offset: 5,
+            max_escalations: 3,
+            loop_thresholds: LoopThresholds::default(),
+            // Default safe-DB-down = seed mig 0510 (2). Con nessuna storia di
+            // clarify ripetuti l'asse non scatta mai -> comportamento invariato.
+            repeated_user_question_threshold: 2,
             // Default safe-DB-down: upscale OFF (il wiring mcp-core passa il valore
             // reale `agent.upscale.enabled`, ON in produzione). Coerente con la nota
             // "rami OFF coi safe-default" sopra: con questo default lo smart-upscale
@@ -373,6 +421,11 @@ impl Default for ExecutorConfig {
             // chiavi DB agent.closure.pending_steps_*).
             pending_steps_detection_enabled: true,
             pending_steps_min_items: 2,
+            // Default safe-DB-down = seed mig 0510: meta-reasoner OFF, budget 6.
+            // Con OFF il gate di emissione StallReason non scatta mai -> il motore
+            // resta bit-identico a oggi (il wiring mcp-core passa i valori reali).
+            stall_recovery_enabled: false,
+            stall_recovery_max_moves_per_session: 6,
         }
     }
 }
@@ -419,6 +472,12 @@ pub struct ExecutorNode {
     /// e' del modulo puro [`crate::decisions::context_reduction`] (regola L).
     /// Best-effort: errore -> history invariata (degrado). Gata Real.
     summary_store: Arc<dyn SummaryStore>,
+    /// Porta I/O del budget CROSS-RUN del meta-reasoner (consultazioni per
+    /// SESSIONE). OPZIONALE (`None` -> solo cap per-run via `extra`, comportamento
+    /// storico): iniettata dal wiring col builder [`Self::with_stall_budget`]. La
+    /// DECISIONE (cap raggiunto?) resta nel gate di emissione (regola L: la porta
+    /// fornisce solo il conteggio). Fail-open: guasto -> conteggio 0, non blocca.
+    stall_budget: Option<Arc<dyn StallBudgetPort>>,
 }
 
 impl ExecutorNode {
@@ -446,6 +505,7 @@ impl ExecutorNode {
             upscale,
             summary_store,
             token_counter: None,
+            stall_budget: None,
         }
     }
 
@@ -454,6 +514,16 @@ impl ExecutorNode {
     /// stesso comportamento dei test e del fallback DB-down (mai un panico).
     pub fn with_token_counter(mut self, counter: Arc<dyn TokenCounter>) -> Self {
         self.token_counter = Some(counter);
+        self
+    }
+
+    /// Inietta la porta del budget CROSS-RUN del meta-reasoner (consultazioni per
+    /// SESSIONE). Senza iniezione (default) il cap resta il solo per-run
+    /// (`extra["stall_moves_used"]`), comportamento storico bit-identico. Con la
+    /// porta iniettata il gate di emissione somma il cross-run al per-run e rispetta
+    /// il cap `agent.stall_recovery.max_moves_per_session` per-sessione.
+    pub fn with_stall_budget(mut self, budget: Arc<dyn StallBudgetPort>) -> Self {
+        self.stall_budget = Some(budget);
         self
     }
 
@@ -607,6 +677,19 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
             }
             // G1Cap qui non puo' scattare (passato false); Proceed -> prosegue.
             HeadGate::G1Cap | HeadGate::Proceed => {}
+        }
+
+        // ── CONSUMO meta-reasoner (rientro dal nodo StallRecovery) ────────────
+        // Se rientriamo con StallResolved (self-loop `StallRecovery -> executor`),
+        // la RecoveryMove e' persistita in extra: la consumiamo QUI (blocco #6
+        // punto 3). Ok(Some) -> applica la mossa (nudge/escalate/needs_input/blocked)
+        // e ritorna; None -> Fallback (mossa assente/non traducibile) -> prosegue
+        // la gerarchia fissa (rete di sicurezza). A flag OFF nessun detector emette
+        // StallReason, quindi StallResolved non arriva MAI qui -> bit-identico.
+        if state.stop_reason == Some(StopReason::StallResolved) {
+            if let Some(delta) = self.consume_recovery_move(state, iters_in, ctx, mode).await {
+                return Ok(delta);
+            }
         }
 
         // ── Chiusura del turno DICHIARATIVO forzato (ADR 0034) ────────────────
@@ -1109,6 +1192,45 @@ la richiesta in modo piu' specifico.",
             }
         }
 
+        // (6z) LOOP CLARIFICATION CROSS-RUN (asse RepeatedUserQuestion, blocco #5).
+        // La stessa domanda-chiarimento e' gia' stata posta all'utente >= soglia
+        // volte nella SESSIONE (segnale strutturato dai meta_step `kind='clarify'`,
+        // calcolato all'avvio del run dal detector `ClarifyHistoryPort` e portato in
+        // `state.repeated_clarify_count`, regola M). E' il loop che condannava
+        // l'incidente email (la loop-detection copriva solo le firme di TOOL). Con
+        // reasoner OFF: GUIDE fissa SOFT (nudge "non ri-chiedere lo stesso dato,
+        // usalo com'e' o dichiara il blocco") — Fase 1 migliorativa senza LLM. Con
+        // reasoner ON (blocco #6/#7) sara' quest'ultimo a scegliere una mossa piu'
+        // ricca. `!declaration_pending`: il turno dichiarativo non va corto-circuitato.
+        // Default (count 0 / soglia 2): l'asse non scatta -> comportamento invariato.
+        let repeated_clarify_count = state.repeated_clarify_count.unwrap_or(0);
+        if progress_on && !declaration_pending {
+            let dec = pc::decide(&ProgressSignals {
+                repeated_user_question_count: repeated_clarify_count,
+                repeated_user_question_threshold: self.cfg.repeated_user_question_threshold,
+                already_guided: progress_guided.clone(),
+                ..Default::default()
+            });
+            if matches!(dec.axis, Some(pc::Axis::RepeatedUserQuestion))
+                && matches!(dec.action, Action::Guide)
+            {
+                // GUIDE SOFT (dec.force_action=false per questo asse): NON forziamo
+                // la tool call (non setto force_action_hard), inietto solo il nudge
+                // fisso e registro l'asse (evita ripetizione del nudge nei turni
+                // successivi dello stesso run).
+                if let Some(t) = &dec.nudge_text {
+                    messages.push(human_msg(t));
+                }
+                progress_guided.insert(pc::Axis::RepeatedUserQuestion.as_str().to_string());
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    count = repeated_clarify_count,
+                    threshold = self.cfg.repeated_user_question_threshold,
+                    "progress_controller GUIDE repeated_user_question (loop clarify cross-run)"
+                );
+            }
+        }
+
         // (6a) ESPLORAZIONE a 2x soglia -> Guide / ESCALATE / abort
         // (py:2093-2159 + escalation dal loop di esplorazione). Prima di abortire,
         // se l'asse e' gia' stato guidato si tenta la PROMOZIONE del modello: stesso
@@ -1150,15 +1272,30 @@ la richiesta in modo piu' specifico.",
             } else {
                 None
             };
-            let dec = pc::decide(&ProgressSignals {
+            let expl_signals = ProgressSignals {
                 exploration_count,
                 exploration_threshold,
                 already_guided: progress_guided.clone(),
                 has_escalation_candidate: expl_picked.is_some(),
                 escalations: expl_escal,
-                max_escalations: 3,
+                max_escalations: self.cfg.max_escalations,
                 ..Default::default()
-            });
+            };
+            // GATE meta-reasoner (blocco #6): vedi ramo repeated_action.
+            if let Some(delta) = self
+                .maybe_stall_reason_delta(
+                    state,
+                    Axis::Exploration,
+                    &expl_signals,
+                    iters_in,
+                    &messages,
+                    ctx,
+                )
+                .await
+            {
+                return Ok(delta);
+            }
+            let dec = pc::decide(&expl_signals);
             match dec.action {
                 Action::Guide => {
                     force_action_hard = true;
@@ -1440,7 +1577,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 } else {
                     None
                 };
-                let dec = pc::decide(&ProgressSignals {
+                let ra_signals = ProgressSignals {
                     repeated_action: Some((label.clone(), ra_count)),
                     repeated_action_edit_failed: ra_edit_failed,
                     repeated_action_read_only: ra_read_only,
@@ -1455,9 +1592,27 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                     force_diagnose_enabled: self.cfg.repeated_action_force_diagnose_enabled,
                     has_escalation_candidate: ra_picked.is_some(),
                     escalations: ra_escal,
-                    max_escalations: 3,
+                    max_escalations: self.cfg.max_escalations,
                     ..Default::default()
-                });
+                };
+                // GATE meta-reasoner (blocco #6): PRIMA delle mosse costose (dopo il
+                // livello-1 GUIDE cheap), se abilitato + budget + l'asse richiede
+                // meta-ragionamento, instrada al nodo StallRecovery. A flag OFF -> None
+                // -> prosegue la gerarchia fissa (bit-identico).
+                if let Some(delta) = self
+                    .maybe_stall_reason_delta(
+                        state,
+                        Axis::RepeatedAction,
+                        &ra_signals,
+                        iters_in,
+                        &messages,
+                        ctx,
+                    )
+                    .await
+                {
+                    return Ok(delta);
+                }
+                let dec = pc::decide(&ra_signals);
                 match dec.action {
                     Action::Guide => {
                         progress_guided.insert("repeated_action".to_string());
@@ -1671,6 +1826,11 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                         .into_opaque());
                     }
                     Action::Proceed => {}
+                    // AskUser/DeclareBlocked sono prodotte SOLO dal meta-reasoner
+                    // (nodo StallRecovery, consumo dedicato), MAI da pc::decide in
+                    // questo ramo della gerarchia fissa: no-op qui. Arm esplicito
+                    // (niente `_`) cosi' il compilatore forza la copertura (regola L).
+                    Action::AskUser | Action::DeclareBlocked => {}
                 }
             }
         }
@@ -1715,16 +1875,31 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                 } else {
                     None
                 };
-                let dec = pc::decide(&ProgressSignals {
+                let rp_signals = ProgressSignals {
                     reallocation_count: rp_count,
                     reallocation_threshold: rp_threshold,
                     has_active_resources,
                     already_guided: progress_guided.clone(),
                     has_escalation_candidate: rp_picked.is_some(),
                     escalations: rp_escal,
-                    max_escalations: 3,
+                    max_escalations: self.cfg.max_escalations,
                     ..Default::default()
-                });
+                };
+                // GATE meta-reasoner (blocco #6): vedi ramo repeated_action.
+                if let Some(delta) = self
+                    .maybe_stall_reason_delta(
+                        state,
+                        Axis::ResourceReallocation,
+                        &rp_signals,
+                        iters_in,
+                        &messages,
+                        ctx,
+                    )
+                    .await
+                {
+                    return Ok(delta);
+                }
+                let dec = pc::decide(&rp_signals);
                 match dec.action {
                     Action::Guide => {
                         progress_guided.insert("resource_reallocation".to_string());
@@ -1800,6 +1975,9 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                     // ChangeStrategy non si applica all'asse reallocation (il
                     // livello 1.9 e' emesso solo per repeated_action).
                     Action::ForceDiagnose | Action::ChangeStrategy | Action::Proceed => {}
+                    // AskUser/DeclareBlocked: prodotte solo dal meta-reasoner
+                    // (consumo dedicato), mai da pc::decide qui -> no-op (regola L).
+                    Action::AskUser | Action::DeclareBlocked => {}
                 }
             }
         }
@@ -1855,7 +2033,7 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
         // un turno forzato e' un esito NON verificato e non puo' chiudere il run
         // come 'completed' (incidente run b07c7e78: Gemini rispose con stringa
         // vuota alla finestra forced-text -> final_answer NULL, chat muta).
-        let forced_text_threshold = self.cfg.iteration_cap - 5;
+        let forced_text_threshold = self.cfg.iteration_cap - self.cfg.forced_text_offset;
         let mut forced_text_turn = false;
         if !tools_json.is_empty()
             && iters_in >= forced_text_threshold
@@ -2568,9 +2746,12 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
         // le riletture read-only che seguono un'azione produttiva (edit/build) sono
         // DEBUGGING, non stallo — senza questa esclusione il loop-detector uccideva
         // un modello capace mentre convergeva su una build rossa (run b833a83d).
-        let det = detect_signature_loop_progress_aware(&recent, &new_signatures, |n| {
-            EXPLORATION_ONLY_TOOLS.contains(&n)
-        });
+        let det = detect_signature_loop_progress_aware_with(
+            &recent,
+            &new_signatures,
+            |n| EXPLORATION_ONLY_TOOLS.contains(&n),
+            self.cfg.loop_thresholds,
+        );
         // `escalations` (auto_escalations) cresce di 1 quando il loop scala il
         // modello (py:3284); resta invariato altrimenti. Tracciato per il delta.
         let mut escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
@@ -2613,7 +2794,7 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
             // (py:3166). Solo a escalation NON disponibile chiudiamo secco
             // loop_detected (ramo `not tried_escalation`).
             let mut tried_escalation = false;
-            if escalations < 3 && !tools_json.is_empty() {
+            if escalations < self.cfg.max_escalations && !tools_json.is_empty() {
                 let inputs = self
                     .escalation
                     .escalation_inputs(state.user_intent.as_deref(), Some(&provider), Some(&model))
@@ -2797,9 +2978,12 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
 
         // Coda aggiornata cap 12: con loop chiuso new_signatures e' [] -> recent only.
         // (Solo la coda: la variante progress-aware calcola la stessa coda.)
-        let updated_signatures = detect_signature_loop_progress_aware(&recent, &new_signatures, |n| {
-            EXPLORATION_ONLY_TOOLS.contains(&n)
-        })
+        let updated_signatures = detect_signature_loop_progress_aware_with(
+            &recent,
+            &new_signatures,
+            |n| EXPLORATION_ONLY_TOOLS.contains(&n),
+            self.cfg.loop_thresholds,
+        )
         .updated_signatures;
 
         // ── exploration counter update (py:3296-3317) ─────────────────────────
@@ -3138,6 +3322,536 @@ impl ExecutorNode {
         .await;
     }
 
+    // ──────────────────────────────────────────────────────────────────────
+    //  Meta-reasoner di recovery-da-stallo (blocco #6): gate di EMISSIONE +
+    //  CONSUMO al rientro. PUNTO UNICO (regola L): i 3 detector pre-LLM
+    //  (repeated_action / resource_reallocation / esplorazione) delegano a
+    //  `maybe_stall_reason_delta` invece di re-implementare il gate; il rientro
+    //  `StallResolved` delega a `consume_recovery_move`. La costruzione dello
+    //  StallContext e la traduzione della mossa vivono nel modulo puro
+    //  `decisions::meta_reason` (build_stall_context / translate).
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Mosse del meta-reasoner gia' consumate nel RUN corrente (gamba PER-RUN del
+    /// budget, mig 0510). Il contatore vive in `extra["stall_moves_used"]`,
+    /// checkpointato con lo stato -> REPLAY-SAFE e coerente tra i supersteps
+    /// `StallReason -> StallRecovery -> StallResolved -> executor` dello STESSO run.
+    /// `extra` si azzera tra run DIVERSI: la gamba CROSS-RUN e' fornita dalla porta
+    /// [`StallBudgetPort`] (persistita per sessione). Il gate di emissione
+    /// (`maybe_stall_reason_delta`) SOMMA le due gambe e confronta col cap
+    /// `stall_recovery_max_moves_per_session` (regola G), cosi' il budget e'
+    /// effettivo per-SESSIONE, chiudendo anche il loop email cross-run.
+    /// Complementare al cap strutturale `already_asked_user`.
+    fn stall_moves_used(state: &AgentState) -> i64 {
+        state
+            .extra
+            .get("stall_moves_used")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// `true` se una `AskUser` e' gia' stata emessa (cap anti ri-domanda per asse):
+    /// per l'asse `RepeatedUserQuestion` deriva dal segnale cross-run
+    /// `repeated_clarify_count > 0` (regola M: la ri-domanda ripetuta e' gia' un
+    /// segnale strutturato dai meta_step clarify); per gli altri assi da un flag
+    /// per-run in extra impostato al consumo di una `AskUser`. Passato true fa
+    /// scegliere al reasoner `DeclareBlocked` invece di ri-chiedere (chiude il loop).
+    fn already_asked_user(state: &AgentState, axis: Axis) -> bool {
+        if matches!(axis, Axis::RepeatedUserQuestion)
+            && state.repeated_clarify_count.unwrap_or(0) > 0
+        {
+            return true;
+        }
+        state
+            .extra
+            .get("stall_asked_user_axes")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().any(|v| v.as_str() == Some(axis.as_str())))
+            .unwrap_or(false)
+    }
+
+    /// Esito STRUTTURATO dell'ultimo tool nella coda messaggi come stringa stabile
+    /// per lo StallContext (regola M: dal segnale `tool_result_outcome_after` /
+    /// exit_code / is_error, MAI dal parsing della prosa). `Some("error")` /
+    /// `Some("ok")` / `None` (nessun tool_result nella coda). Il segnale
+    /// `redaction_rejected` dello StallContext e' cablato a parte in
+    /// `maybe_stall_reason_delta` dal codice strutturato [REDACTION_REJECTED]
+    /// (`recent_redaction_rejected`, regola M): la fonte lo codifica nel
+    /// tool_result, qui lo si legge come segnale, mai dal testo del placeholder.
+    fn last_tool_outcome(messages: &[Message]) -> Option<&'static str> {
+        // Ultimo indice con un tool_use nell'AI: cerchiamo l'esito che lo segue.
+        // Punto unico della lettura esito: `tool_result_outcome_after` (regola L).
+        for idx in (0..messages.len()).rev() {
+            if !crate::routing::signals::message_tool_uses(&messages[idx]).is_empty() {
+                return match crate::routing::signals::tool_result_outcome_after(messages, idx, 3) {
+                    Some(true) => Some("error"),
+                    Some(false) => Some("ok"),
+                    None => None,
+                };
+            }
+        }
+        None
+    }
+
+    /// Budget consultazioni CROSS-RUN del meta-reasoner per la SESSIONE, letto dalla
+    /// porta [`StallBudgetPort`] (fail-open: guasto -> 0, non blocca). `0` anche se la
+    /// porta non e' iniettata (solo cap per-run, comportamento storico). SOLA
+    /// LETTURA: nessun side-effect.
+    async fn stall_moves_cross_run(&self, ctx: &AgentNodeCtx) -> i64 {
+        let Some(budget) = &self.stall_budget else {
+            return 0;
+        };
+        budget
+            .consultations_in_session(ctx.session_id)
+            .await
+            .unwrap_or(0)
+    }
+
+    /// Gate di EMISSIONE dello `StallReason` (blocco #6, punto 2). Chiamato dai 3
+    /// detector pre-LLM DOPO aver costruito i `signals` e PRIMA di applicare la
+    /// gerarchia fissa `pc::decide`. Ritorna `Some(delta)` — che instrada al nodo
+    /// `StallRecovery` — SOLO se TUTTE le condizioni valgono:
+    ///   1. `stall_recovery_enabled` (flag OFF di default -> `None` -> bit-identico);
+    ///   2. budget per-SESSIONE non esaurito: il cap
+    ///      `stall_recovery_max_moves_per_session` (regola G) e' confrontato con la
+    ///      somma del per-run (`extra["stall_moves_used"]`, si azzera tra run) E del
+    ///      CROSS-RUN letto da [`StallBudgetPort`] (persistito per sessione, chiude il
+    ///      loop email cross-run). Fail-open: porta assente/guasta -> solo cap per-run.
+    ///   3. l'asse richiede META-ragionamento, cioe' la gerarchia fissa starebbe
+    ///      per fare una mossa COSTOSA (ForceDiagnose/ChangeStrategy/Escalate/Abort).
+    ///      Il livello-1 GUIDE cheap (e Proceed) resta gestito dalla gerarchia
+    ///      fissa: non si spreca una LLM-call per un nudge assertivo.
+    /// Costruisce lo `StallContext` (modulo puro `build_stall_context`, segnali gia'
+    /// risolti) e lo serializza in `extra[STALL_CONTEXT_KEY]` col clone-whole-map
+    /// (`put_extra`, regola L: `extra` e' OVERWRITE totale). NON chiama l'LLM (lo fa
+    /// il nodo dedicato, replay-safe).
+    async fn maybe_stall_reason_delta(
+        &self,
+        state: &AgentState,
+        axis: Axis,
+        signals: &ProgressSignals,
+        iters_in: i64,
+        messages: &[Message],
+        ctx: &AgentNodeCtx,
+    ) -> Option<OpaqueDelta> {
+        // (1) Flag OFF -> il gate non scatta MAI (comportamento bit-identico).
+        if !self.cfg.stall_recovery_enabled {
+            return None;
+        }
+        // (2) Budget per-SESSIONE esaurito -> rete di sicurezza (gerarchia fissa).
+        // Somma il per-run (extra, si azzera tra run) al CROSS-RUN (porta, persistito
+        // per sessione): il cap e' cosi' effettivo per-sessione, non solo per-run.
+        let moves_used_session = self.stall_moves_cross_run(ctx).await;
+        let moves_total = Self::stall_moves_used(state) + moves_used_session;
+        if moves_total >= self.cfg.stall_recovery_max_moves_per_session {
+            return None;
+        }
+        // (3) Solo se la gerarchia fissa farebbe una mossa COSTOSA (non GUIDE/Proceed):
+        // il meta-ragionamento subentra DOPO il livello-1 GUIDE cheap.
+        let fixed = pc::decide(signals);
+        let needs_meta = !matches!(fixed.action, Action::Guide | Action::Proceed);
+        if !needs_meta {
+            return None;
+        }
+        // work_epoch STABILE (chiave idempotenza/replay): avanza solo sui cambi
+        // macroscopici. `todo_seq` ~ iterazioni del run; escalation e floor da extra.
+        let escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+        let floor = state.extra.get("repeat_scan_floor").and_then(Value::as_i64).unwrap_or(0);
+        let epoch = crate::decisions::meta_reason::work_epoch(iters_in, escalations, floor);
+        // (4) ANTI META-LOOP (idempotenza per epoca): se per questo (axis, epoch) la
+        // mossa e' GIA' stata decisa+consumata (chiave-cache presente in extra) o e'
+        // gia' stata risolta a Fallback (marcatore), NON ri-emettere. Senza questa
+        // guardia, dopo un consumo che ri-fa il turno (nudge) o dopo un Fallback, il
+        // detector ri-scatterebbe con lo STESSO epoch e ri-consulterebbe l'LLM in
+        // loop. La chiave-cache e' il punto unico `stall_move_key` (regola L).
+        if state.extra.contains_key(&stall_move_key(axis.as_str(), epoch))
+            || state
+                .extra
+                .get("stall_fallback_epochs")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().any(|v| v.as_i64() == Some(epoch)))
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        // Segnali cross-cutting per lo StallContext (regola M: tutti strutturati).
+        let recent_tool_signatures = state.recent_tool_signatures.clone().unwrap_or_default();
+        let last_outcome = Self::last_tool_outcome(messages);
+        let modified = crate::routing::signals::modified_files_from_messages(messages, 40);
+        let already_asked = Self::already_asked_user(state, axis);
+        // redaction_rejected dal SEGNALE STRUTTURATO (regola M): la fonte
+        // (`mcp-core::security::redaction_guard`) antepone al tool_result il codice
+        // macchina [REDACTION_REJECTED] quando rifiuta un input contenente un
+        // placeholder di redazione; il punto unico `recent_redaction_rejected`
+        // (regola L) lo LEGGE, MAI un `contains("[REDACTED:")` sul placeholder
+        // umano. E' il segnale che riconosce il blocco ambientale del loop email
+        // (email ri-oscurata che il modello continua a copiare).
+        let redaction_rejected =
+            crate::routing::signals::recent_redaction_rejected(messages, 16);
+        let stall = build_stall_context(
+            axis,
+            signals,
+            &recent_tool_signatures,
+            last_outcome,
+            redaction_rejected,
+            state.repeated_clarify_count.unwrap_or(0),
+            state.user_intent.as_deref(),
+            &modified,
+            already_asked,
+            epoch,
+        );
+        let value = serde_json::to_value(&stall).ok()?;
+        let extra = put_extra(state, STALL_CONTEXT_KEY, value);
+        tracing::info!(
+            target: "nexus_agent_graph::executor",
+            axis = axis.as_str(),
+            work_epoch = epoch,
+            moves_used_run = Self::stall_moves_used(state),
+            moves_used_session,
+            "meta-reasoner: emetto StallReason -> nodo StallRecovery"
+        );
+        Some(
+            StateDelta {
+                extra: Some(extra),
+                stop_reason: Some(Some(StopReason::StallReason)),
+                iterations: Some(Some(iters_in + 1)),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
+
+    /// CONSUMO della `RecoveryMove` al rientro dal nodo `StallRecovery`
+    /// (`StopReason::StallResolved`, blocco #6 punto 3). Legge lo `StallContext`
+    /// e la mossa persistita in `extra[stall_move_key(axis, work_epoch)]`, la
+    /// traduce col punto unico `translate` e la applica riusando gli STESSI
+    /// meccanismi di `pc::decide`:
+    ///   - `Guide`/`ChangeStrategy`/`ForceDiagnose` -> nudge (human_msg) + eventuale
+    ///     force-action, poi RI-DA il turno (`G1Escalated` self-loop, come i rami
+    ///     nudge della gerarchia fissa);
+    ///   - `Escalate` -> ramo escalation esistente (`pick_escalation_model` +
+    ///     sticky), promuovendo il modello;
+    ///   - `AskUser`/`DeclareBlocked` -> chiusura DIRETTA con esito strutturato
+    ///     `needs_input`/`blocked` (ADR 0034, `normalize_declared_outcome` punto
+    ///     unico), il consumo REALE delle 2 nuove azioni;
+    ///   - `Fallback` / assenza mossa -> marca l'epoca come fallback-risolta e RI-DA
+    ///     il turno (re-entry pulito): al re-entry il gate NON ri-emette (guardia
+    ///     anti meta-loop) e la gerarchia fissa procede (rete di sicurezza). Ritorna
+    ///     `None` solo se manca del tutto lo StallContext (guasto a monte -> prosegue).
+    /// Incrementa il budget su consultazione EFFETTIVA (una mossa applicata),
+    /// preservando l'intero `extra` (clone-whole-map): il PER-RUN in
+    /// `extra["stall_moves_used"]` E il CROSS-RUN via [`StallBudgetPort`]
+    /// (`record_consultation`, gata Real, best-effort).
+    async fn consume_recovery_move(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> Option<OpaqueDelta> {
+        // Lo StallContext dice quale (axis, work_epoch) leggere: la chiave-cache e'
+        // il punto unico `stall_move_key` (stessa formula del nodo produttore).
+        // Assente -> guasto a monte: prosegui la gerarchia fissa senza marcatura.
+        let stall: crate::runtime::ports::StallContext = state
+            .extra
+            .get(STALL_CONTEXT_KEY)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+        let key = stall_move_key(&stall.axis, stall.work_epoch);
+        // Mossa assente (nodo degradato a resolved-only: reasoner Ok(None)/errore) o
+        // Fallback (mossa non traducibile): marca l'epoca come risolta a fallback per
+        // rompere il meta-loop, poi RI-DA il turno pulito -> al re-entry il gate non
+        // ri-emette e la gerarchia fissa decide (rete di sicurezza). NON incrementa
+        // il budget (nessuna mossa applicata).
+        let translated = state
+            .extra
+            .get(&key)
+            .and_then(|v| serde_json::from_value::<RecoveryMove>(v.clone()).ok())
+            .and_then(|mv| translate(&mv));
+        let Some(dec) = translated else {
+            let mut extra_out = state.extra.clone();
+            Self::mark_fallback_epoch(&mut extra_out, stall.work_epoch);
+            tracing::debug!(
+                target: "nexus_agent_graph::executor",
+                axis = %stall.axis,
+                work_epoch = stall.work_epoch,
+                "meta-reasoner: nessuna mossa valida (fallback), prosegue gerarchia fissa"
+            );
+            return Some(
+                StateDelta {
+                    recent_tool_signatures: Some(Some(vec![])),
+                    pending_tool_uses: Some(Some(vec![])),
+                    stop_reason: Some(Some(StopReason::G1Escalated)),
+                    iterations: Some(Some(iters_in + 1)),
+                    extra: Some(extra_out),
+                    ..Default::default()
+                }
+                .into_opaque(),
+            );
+        };
+
+        // Budget consumato su consultazione EFFETTIVA (mossa applicata). Due gambe:
+        //  - PER-RUN: `extra["stall_moves_used"]` (checkpointato, si azzera tra run);
+        //  - CROSS-RUN: la porta [`StallBudgetPort`] persiste la consultazione per
+        //    SESSIONE (append, gata Real via `mode`), cosi' il cap e' effettivo
+        //    per-sessione anche sul loop email cross-run. Best-effort (fail-open):
+        //    un guasto di persistenza non deve rompere il turno.
+        let moves_used = Self::stall_moves_used(state) + 1;
+        let mut extra_out = state.extra.clone();
+        extra_out.insert("stall_moves_used".to_string(), json!(moves_used));
+        if let Some(budget) = &self.stall_budget {
+            if let Err(err) = budget.record_consultation(ctx.session_id, mode).await {
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    error = %err,
+                    "meta-reasoner: registrazione budget cross-run fallita (best-effort)"
+                );
+            }
+        }
+
+        match dec.action {
+            // Nudge-based: inietta il nudge del reasoner + eventuale force-action e
+            // RI-DA il turno (self-loop G1Escalated, come i rami nudge fissi).
+            Action::Guide | Action::ChangeStrategy | Action::ForceDiagnose => {
+                let mut messages_out: Vec<Message> = vec![];
+                if let Some(t) = &dec.nudge_text {
+                    messages_out.push(human_msg(t));
+                }
+                // Il nudge del reasoner riparte con finestra pulita sui detector di
+                // ripetizione (stessa grazia dei rami Escalate: il modello promosso/
+                // ri-orientato non deve ereditare le firme che hanno causato lo stallo).
+                extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+                self.emit_phase(
+                    ctx,
+                    mode,
+                    "stall_recovery",
+                    format!("Recovery: {}", dec.reason),
+                    json!({"axis": stall.axis, "action": action_str(dec.action)}),
+                )
+                .await;
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    axis = %stall.axis,
+                    action = action_str(dec.action),
+                    "meta-reasoner: applico mossa nudge -> ri-do il turno"
+                );
+                Some(
+                    StateDelta {
+                        messages: Some(messages_out),
+                        recent_tool_signatures: Some(Some(vec![])),
+                        g1_reroute_count: Some(Some(0)),
+                        action_nudge_count: Some(Some(0)),
+                        pending_tool_uses: Some(Some(vec![])),
+                        stop_reason: Some(Some(StopReason::G1Escalated)),
+                        iterations: Some(Some(iters_in + 1)),
+                        extra: Some(extra_out),
+                        ..Default::default()
+                    }
+                    .into_opaque(),
+                )
+            }
+            // Escalate: promuovi il modello riusando il ramo escalation esistente
+            // (pick_escalation_model + sticky). Se nessun candidato -> rete di
+            // sicurezza (gerarchia fissa, che a budget escalation esaurito abortisce).
+            Action::Escalate => {
+                let escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+                let (cur_provider, cur_model) = self.escalation_current_pair(state);
+                let picked = if escal < self.cfg.max_escalations {
+                    let inputs = self
+                        .escalation
+                        .escalation_inputs(
+                            state.user_intent.as_deref(),
+                            cur_provider.as_deref(),
+                            cur_model.as_deref(),
+                        )
+                        .await
+                        .unwrap_or_default();
+                    pick_escalation_model(
+                        &inputs.chain,
+                        cur_provider.as_deref(),
+                        cur_model.as_deref(),
+                        0,
+                        inputs.provider_in_cooldown,
+                        inputs.cross_provider.as_ref(),
+                    )
+                } else {
+                    None
+                };
+                let pick = picked?;
+                self.emit_phase(
+                    ctx,
+                    mode,
+                    "escalation",
+                    format!("Passo a {}/{} (meta-reasoner)", pick.provider, pick.model),
+                    json!({
+                        "to_provider": pick.provider,
+                        "to_model": pick.model,
+                        "reason": "stall_recovery",
+                    }),
+                )
+                .await;
+                let esc_nudge = human_msg(
+                    "Il modello precedente si e' bloccato senza progresso. Ora rispondi tu, \
+che sei un modello piu' capace: cambia approccio ed ESEGUI il prossimo step concreto \
+con un tool call.",
+                );
+                extra_out.insert("auto_escalations".to_string(), json!(escal + 1));
+                extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    to_provider = %pick.provider,
+                    to_model = %pick.model,
+                    "meta-reasoner: ESCALATE -> promuovo modello"
+                );
+                Some(
+                    StateDelta {
+                        messages: Some(vec![esc_nudge]),
+                        sticky_provider: Some(Some(pick.provider)),
+                        sticky_model: Some(Some(pick.model)),
+                        recent_tool_signatures: Some(Some(vec![])),
+                        g1_reroute_count: Some(Some(0)),
+                        action_nudge_count: Some(Some(0)),
+                        pending_tool_uses: Some(Some(vec![])),
+                        stop_reason: Some(Some(StopReason::G1Escalated)),
+                        iterations: Some(Some(iters_in + 1)),
+                        extra: Some(extra_out),
+                        ..Default::default()
+                    }
+                    .into_opaque(),
+                )
+            }
+            // AskUser / DeclareBlocked: consumo REALE delle 2 nuove azioni. Chiudono
+            // il run con esito STRUTTURATO (ADR 0034), NON con un turno LLM libero:
+            // e' cio' che spezza il loop email (l'agente non ri-chiede all'infinito,
+            // dichiara needs_input/blocked una volta). L'outcome e' costruito col
+            // punto unico `normalize_declared_outcome` (regola L) e letto a valle da
+            // `route_after_executor` (gate 7: needs_input/blocked -> chiusura).
+            Action::AskUser => {
+                let question = dec.nudge_text.clone().unwrap_or_default();
+                // Marca l'asse come "gia' chiesto" (cap anti ri-domanda per-run).
+                Self::mark_asked_user(&mut extra_out, &stall.axis);
+                let outcome = crate::decisions::tool_dispatch::normalize_declared_outcome(&json!({
+                    "outcome": "needs_input",
+                    "summary": question,
+                    "next_step": question,
+                }))
+                .unwrap_or_else(|| json!({"outcome": "needs_input", "summary": question}));
+                self.emit_phase(
+                    ctx,
+                    mode,
+                    "outcome_declared",
+                    "Esito dichiarato: needs_input (meta-reasoner)".to_string(),
+                    json!({"outcome": "needs_input", "axis": stall.axis}),
+                )
+                .await;
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    axis = %stall.axis,
+                    "meta-reasoner: AskUser -> chiusura strutturata needs_input"
+                );
+                Some(
+                    StateDelta {
+                        messages: Some(vec![Message::Ai {
+                            content: MessageContent::text(question.clone()),
+                            tool_calls: vec![],
+                            reasoning: None,
+                        }]),
+                        result: Some(Some(question)),
+                        declared_outcome: Some(Some(outcome)),
+                        pending_tool_uses: Some(Some(vec![])),
+                        stop_reason: Some(Some(StopReason::EndTurn)),
+                        iterations: Some(Some(iters_in + 1)),
+                        extra: Some(extra_out),
+                        ..Default::default()
+                    }
+                    .into_opaque(),
+                )
+            }
+            Action::DeclareBlocked => {
+                // `nudge_text` porta il `blocker` (dal `translate`): validato ADR 0034.
+                let blocker = dec.nudge_text.clone().unwrap_or_default();
+                let summary = format!(
+                    "Non posso proseguire: blocco dichiarato ({blocker}). La causa e' esterna \
+al mio controllo e va risolta prima di continuare."
+                );
+                let outcome = crate::decisions::tool_dispatch::normalize_declared_outcome(&json!({
+                    "outcome": "blocked",
+                    "summary": summary,
+                    "blocker": blocker,
+                }))
+                .unwrap_or_else(|| json!({"outcome": "blocked", "summary": summary}));
+                self.emit_phase(
+                    ctx,
+                    mode,
+                    "outcome_declared",
+                    format!("Esito dichiarato: blocked ({blocker})"),
+                    json!({"outcome": "blocked", "blocker": blocker, "axis": stall.axis}),
+                )
+                .await;
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    axis = %stall.axis,
+                    blocker = %blocker,
+                    "meta-reasoner: DeclareBlocked -> chiusura strutturata blocked"
+                );
+                let close_summary = outcome
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Blocco dichiarato.")
+                    .to_string();
+                Some(
+                    StateDelta {
+                        messages: Some(vec![Message::Ai {
+                            content: MessageContent::text(close_summary.clone()),
+                            tool_calls: vec![],
+                            reasoning: None,
+                        }]),
+                        result: Some(Some(close_summary)),
+                        declared_outcome: Some(Some(outcome)),
+                        pending_tool_uses: Some(Some(vec![])),
+                        stop_reason: Some(Some(StopReason::EndTurn)),
+                        iterations: Some(Some(iters_in + 1)),
+                        extra: Some(extra_out),
+                        ..Default::default()
+                    }
+                    .into_opaque(),
+                )
+            }
+            // `translate` non produce mai Proceed/Abort (Fallback -> None gia' sopra):
+            // arm esplicito per esaustivita' (regola L, niente `_`).
+            Action::Proceed | Action::Abort => None,
+        }
+    }
+
+    /// Registra `axis` fra gli assi per cui una `AskUser` e' gia' stata emessa
+    /// (cap anti ri-domanda per-run). Muta la mappa extra gia' clonata dal chiamante.
+    fn mark_asked_user(extra_out: &mut serde_json::Map<String, Value>, axis: &str) {
+        let mut axes: Vec<Value> = extra_out
+            .get("stall_asked_user_axes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !axes.iter().any(|v| v.as_str() == Some(axis)) {
+            axes.push(Value::String(axis.to_string()));
+        }
+        extra_out.insert("stall_asked_user_axes".to_string(), Value::Array(axes));
+    }
+
+    /// Registra `epoch` fra le epoche gia' risolte a Fallback dal reasoner (guardia
+    /// anti meta-loop): il gate di emissione salta un epoch marcato, cosi' dopo un
+    /// Fallback il detector non ri-consulta l'LLM per lo stesso stallo. Muta la mappa
+    /// extra gia' clonata dal chiamante (clone-whole-map preservato).
+    fn mark_fallback_epoch(extra_out: &mut serde_json::Map<String, Value>, epoch: i64) {
+        let mut epochs: Vec<Value> = extra_out
+            .get("stall_fallback_epochs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !epochs.iter().any(|v| v.as_i64() == Some(epoch)) {
+            epochs.push(json!(epoch));
+        }
+        extra_out.insert("stall_fallback_epochs".to_string(), Value::Array(epochs));
+    }
+
     /// Turno DICHIARATIVO forzato (ADR 0034): prima di una chiusura di sistema
     /// (abort anti-loop / cap G1 a catalogo esaurito) il modello riceve UN turno
     /// col catalogo ridotto a solo `task_complete` e tool choice forzata, cosi'
@@ -3360,6 +4074,22 @@ fn stop_reason_from_str(s: Option<&str>) -> StopReason {
         Some("error") => StopReason::Error,
         // None | "end_turn" | qualunque altro -> end_turn (default Python).
         _ => StopReason::EndTurn,
+    }
+}
+
+/// Stringa stabile dell'`Action` del progress_controller (== serde rename).
+/// Punto unico (regola L): usato dal consumo meta-reasoner per i log/payload e
+/// dai test (`nudge_order`), non duplicato.
+pub(crate) fn action_str(a: Action) -> &'static str {
+    match a {
+        Action::Proceed => "proceed",
+        Action::Guide => "guide",
+        Action::ForceDiagnose => "force_diagnose",
+        Action::ChangeStrategy => "change_strategy",
+        Action::Escalate => "escalate",
+        Action::Abort => "abort",
+        Action::AskUser => "ask_user",
+        Action::DeclareBlocked => "declare_blocked",
     }
 }
 

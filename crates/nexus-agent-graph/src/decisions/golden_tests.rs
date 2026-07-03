@@ -91,6 +91,11 @@ impl From<DecideInput> for ProgressSignals {
             exploration_count: i.exploration_count,
             exploration_threshold: i.exploration_threshold,
             signature_loop_tool: i.signature_loop_tool,
+            // Asse Rust-only CROSS-RUN (loop clarification): non presente nei golden
+            // Python. Count 0 + soglia 2 (= default) -> l'asse non scatta mai sui
+            // casi di parita' esistenti (comportamento invariato).
+            repeated_user_question_count: 0,
+            repeated_user_question_threshold: 2,
             g1_over_cap: i.g1_over_cap,
             repeated_action: i.repeated_action,
             // Livello 1.9 (post-Python): il golden di parita' non lo esercita.

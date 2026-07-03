@@ -29,6 +29,32 @@ pub const LOOP_THRESHOLD: usize = 3;
 /// `updated_signatures = (recent + new)[-12:]` Python (1:1).
 pub const RECENT_SIGNATURES_CAP: usize = 12;
 
+/// Soglie DB-driven (regola G) della rilevazione loop-by-signature. I default
+/// coincidono con le costanti Python 1:1 [`LOOP_THRESHOLD`] /
+/// [`RECENT_SIGNATURES_CAP`] e valgono SOLO se il DB non fornisce i setting
+/// (`agent.loop.signature_threshold` / `agent.loop.recent_signatures_cap`) —
+/// mai come magic fallback nella logica. Passate come parametro alle varianti
+/// `_with` cosi' il modulo resta puro e golden-validabile a qualunque soglia.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopThresholds {
+    /// Occorrenze della STESSA signature (nella finestra recente) oltre cui il
+    /// turno e' in loop. Default [`LOOP_THRESHOLD`]. La finestra di conteggio e'
+    /// `signature * 2` (coerente col Python `combined[-LOOP_THRESHOLD*2:]`).
+    pub signature: usize,
+    /// Cap della coda di signature mantenute nello stato. Default
+    /// [`RECENT_SIGNATURES_CAP`].
+    pub cap: usize,
+}
+
+impl Default for LoopThresholds {
+    fn default() -> Self {
+        Self {
+            signature: LOOP_THRESHOLD,
+            cap: RECENT_SIGNATURES_CAP,
+        }
+    }
+}
+
 /// Costruisce la signature di una tool call: `f"{name}|{sha1_hex12}"` dove
 /// `sha1_hex12` sono i primi 12 char esadecimali dello SHA-1 di
 /// `json.dumps(input or {}, sort_keys=True, ensure_ascii=False)`.
@@ -97,28 +123,39 @@ pub struct LoopDetection {
 /// La finestra di conteggio e' `combined[-(LOOP_THRESHOLD*2):]` (le ultime 6
 /// signature). Ritorna la PRIMA `new_signature` in loop (ordine di emissione).
 pub fn detect_signature_loop(recent: &[String], new_signatures: &[String]) -> LoopDetection {
+    detect_signature_loop_with(recent, new_signatures, LoopThresholds::default())
+}
+
+/// Variante parametrica di [`detect_signature_loop`] con soglie DB-driven
+/// ([`LoopThresholds`], regola G). `detect_signature_loop` la chiama coi default
+/// (= costanti Python 1:1), preservando la parita' bit-per-bit.
+pub fn detect_signature_loop_with(
+    recent: &[String],
+    new_signatures: &[String],
+    thresholds: LoopThresholds,
+) -> LoopDetection {
     // combined = recent + new_signatures
     let mut combined: Vec<String> = Vec::with_capacity(recent.len() + new_signatures.len());
     combined.extend_from_slice(recent);
     combined.extend_from_slice(new_signatures);
 
     let mut loop_signature: Option<String> = None;
-    if combined.len() >= LOOP_THRESHOLD && !new_signatures.is_empty() {
-        // tail = combined[-(LOOP_THRESHOLD*2):]
-        let window_len = LOOP_THRESHOLD * 2;
+    if combined.len() >= thresholds.signature && !new_signatures.is_empty() {
+        // tail = combined[-(signature*2):]
+        let window_len = thresholds.signature * 2;
         let start = combined.len().saturating_sub(window_len);
         let window = &combined[start..];
         for sig in new_signatures {
             let count = window.iter().filter(|s| *s == sig).count();
-            if count >= LOOP_THRESHOLD {
+            if count >= thresholds.signature {
                 loop_signature = Some(sig.clone());
                 break;
             }
         }
     }
 
-    // updated_signatures = (recent + new_signatures)[-12:]
-    let cap_start = combined.len().saturating_sub(RECENT_SIGNATURES_CAP);
+    // updated_signatures = (recent + new_signatures)[-cap:]
+    let cap_start = combined.len().saturating_sub(thresholds.cap);
     let updated_signatures = combined[cap_start..].to_vec();
 
     LoopDetection {
@@ -145,6 +182,23 @@ pub fn detect_signature_loop_progress_aware(
     new_signatures: &[String],
     is_read_only: impl Fn(&str) -> bool,
 ) -> LoopDetection {
+    detect_signature_loop_progress_aware_with(
+        recent,
+        new_signatures,
+        is_read_only,
+        LoopThresholds::default(),
+    )
+}
+
+/// Variante parametrica di [`detect_signature_loop_progress_aware`] con soglie
+/// DB-driven ([`LoopThresholds`], regola G). Il wrapper senza soglie usa i
+/// default (= costanti Python 1:1), preservando la parita'.
+pub fn detect_signature_loop_progress_aware_with(
+    recent: &[String],
+    new_signatures: &[String],
+    is_read_only: impl Fn(&str) -> bool,
+    thresholds: LoopThresholds,
+) -> LoopDetection {
     let mut combined: Vec<String> = Vec::with_capacity(recent.len() + new_signatures.len());
     combined.extend_from_slice(recent);
     combined.extend_from_slice(new_signatures);
@@ -154,8 +208,8 @@ pub fn detect_signature_loop_progress_aware(
     };
 
     let mut loop_signature: Option<String> = None;
-    if combined.len() >= LOOP_THRESHOLD && !new_signatures.is_empty() {
-        let window_len = LOOP_THRESHOLD * 2;
+    if combined.len() >= thresholds.signature && !new_signatures.is_empty() {
+        let window_len = thresholds.signature * 2;
         let start = combined.len().saturating_sub(window_len);
         let window = &combined[start..];
         // Posizione dell'ULTIMA firma produttiva nella finestra: le occorrenze
@@ -169,14 +223,14 @@ pub fn detect_signature_loop_progress_aware(
             } else {
                 window.iter().filter(|s| *s == sig).count()
             };
-            if count >= LOOP_THRESHOLD {
+            if count >= thresholds.signature {
                 loop_signature = Some(sig.clone());
                 break;
             }
         }
     }
 
-    let cap_start = combined.len().saturating_sub(RECENT_SIGNATURES_CAP);
+    let cap_start = combined.len().saturating_sub(thresholds.cap);
     let updated_signatures = combined[cap_start..].to_vec();
 
     LoopDetection {
@@ -370,6 +424,27 @@ mod tests {
         assert_eq!(out.updated_signatures.len(), RECENT_SIGNATURES_CAP);
         // Tiene le ULTIME 12 (recent[4..] + new).
         assert_eq!(out.updated_signatures.last().unwrap(), "s|new");
+    }
+
+    #[test]
+    fn soglie_db_driven_non_default() {
+        // Proprieta' Rust (NON parita' Python: il riferimento Python usa la
+        // costante fissa 3/12). Con soglia signature=2 il loop scatta a 2
+        // occorrenze; con cap=4 la coda e' limitata a 4.
+        let th = LoopThresholds { signature: 2, cap: 4 };
+        let sig = build_signature("read_file", &json!({"path": "x"}));
+        // Due occorrenze: con default (3) NON e' loop; con signature=2 lo e'.
+        let recent = vec![sig.clone()];
+        let new = vec![sig.clone()];
+        assert_eq!(detect_signature_loop(&recent, &new).loop_signature, None);
+        assert_eq!(
+            detect_signature_loop_with(&recent, &new, th).loop_signature,
+            Some(sig.clone())
+        );
+        // Cap coda = 4.
+        let long: Vec<String> = (0..10).map(|i| format!("s|{i}")).collect();
+        let out = detect_signature_loop_with(&long, std::slice::from_ref(&sig), th);
+        assert_eq!(out.updated_signatures.len(), 4);
     }
 
     #[test]

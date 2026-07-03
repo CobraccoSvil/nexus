@@ -89,11 +89,32 @@ fn find_redaction_map_placeholder(text: &str) -> Option<String> {
     None
 }
 
+/// CODICE STRUTTURATO (regola M) del rifiuto per placeholder di redazione,
+/// anteposto al messaggio di `format_reject_message`. E' un CONTRATTO MACCHINA
+/// stabile (come il marker d'errore `\u{274C}` e `EXIT CODE: N`), NON prosa in
+/// linguaggio naturale: questa FONTE lo CODIFICA nel tool_result, il consumatore
+/// a valle (`nexus_agent_graph::routing::signals::recent_redaction_rejected`) lo
+/// LEGGE come segnale strutturato `redaction_rejected`, MAI facendo
+/// `contains("[REDACTED:")` sul testo del placeholder (variabile e umano).
+///
+/// PUNTO UNICO (regola L): il letterale vive nel crate a VALLE che lo consuma
+/// (`nexus_agent_graph::routing::signals::REDACTION_REJECTED_CODE`); qui lo
+/// RI-ESPORTIAMO senza duplicarlo, cosi' fonte e consumatore condividono un
+/// solo valore versionato insieme.
+pub use nexus_agent_graph::routing::signals::REDACTION_REJECTED_CODE;
+
 /// Messaggio di rifiuto per il modello: spiega cos'e' il placeholder e quale
 /// meccanismo usare al posto di copiarlo.
+///
+/// Prefisso a DUE marker macchina (contratto dati, regola M): il marker d'errore
+/// `\u{274C}` (letto dal punto unico `tool_runner_server::tool_result_is_error`
+/// -> `is_error=true`: il rifiuto e' un ERRORE applicativo, non un finto
+/// successo) e il codice strutturato [`REDACTION_REJECTED_CODE`] (letto a valle
+/// come segnale `redaction_rejected`). Seguono la prosa esplicativa per il
+/// modello (che resta SOLO per display/guida, mai per decidere).
 pub fn format_reject_message(tool_name: &str, field: &str, placeholder: &str) -> String {
     format!(
-        "[BLOCCATO — placeholder di redazione nell'input]\n\
+        "\u{274C} {REDACTION_REJECTED_CODE} [BLOCCATO — placeholder di redazione nell'input]\n\
          L'input di `{tool_name}` (campo '{field}') contiene '{placeholder}': e' un SEGNAPOSTO \
          prodotto dalla redazione dei segreti nel contesto, NON un valore reale. Copiarlo in \
          comandi, file o configurazioni produce errori a runtime (es. getaddrinfo ENOTFOUND).\n\
@@ -224,5 +245,22 @@ mod tests {
         // Il messaggio deve indirizzare ai meccanismi corretti, non solo rifiutare.
         assert!(msg.contains("NEXUS_PROJECT_DB_URL"));
         assert!(msg.contains("request_port"));
+    }
+
+    #[test]
+    fn messaggio_porta_i_due_marker_macchina() {
+        // CONTRATTO DATI (regola M): il rifiuto e' prefissato dal marker d'errore
+        // U+274C (-> is_error=true a valle) e dal codice strutturato
+        // [REDACTION_REJECTED] (-> segnale redaction_rejected). I consumatori
+        // leggono QUESTI codici, non la prosa del placeholder.
+        let msg = format_reject_message("run_command", "command", "[REDACTED:email_pii]");
+        assert!(
+            msg.trim_start().starts_with('\u{274C}'),
+            "il rifiuto deve iniziare col marker d'errore U+274C: {msg}"
+        );
+        assert!(
+            msg.contains(REDACTION_REJECTED_CODE),
+            "il rifiuto deve contenere il codice strutturato {REDACTION_REJECTED_CODE}: {msg}"
+        );
     }
 }

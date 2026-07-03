@@ -36,6 +36,12 @@ pub enum NodeId {
     TodoRunner,
     Executor,
     ToolDispatch,
+    /// Nodo del meta-reasoner di recovery-da-stallo (superstep dedicato,
+    /// ADR 0036-style). Raggiunto dall'executor quando un detector strutturato
+    /// segnala uno stallo che richiede meta-ragionamento (`StopReason::StallReason`);
+    /// consulta la porta `MetaReasonerPort` (UNA sola LLM-call via `ctx.llm`,
+    /// replay-safe) e rientra nell'executor via self-loop (`StopReason::StallResolved`).
+    StallRecovery,
     Verifier,
     FinalGate,
     Reflection,
@@ -56,6 +62,7 @@ impl NodeId {
             NodeId::TodoRunner => "todo_runner",
             NodeId::Executor => "executor",
             NodeId::ToolDispatch => "tool_dispatch",
+            NodeId::StallRecovery => "stall_recovery",
             NodeId::Verifier => "verifier",
             NodeId::FinalGate => "final_gate",
             NodeId::Reflection => "reflection",
@@ -76,6 +83,7 @@ impl NodeId {
             "todo_runner" => NodeId::TodoRunner,
             "executor" => NodeId::Executor,
             "tool_dispatch" => NodeId::ToolDispatch,
+            "stall_recovery" => NodeId::StallRecovery,
             "verifier" => NodeId::Verifier,
             "final_gate" => NodeId::FinalGate,
             "reflection" => NodeId::Reflection,

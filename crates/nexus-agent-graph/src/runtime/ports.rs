@@ -888,3 +888,396 @@ pub trait EscalationPort: Send + Sync {
         exclude: &[String],
     ) -> Result<Option<CrossProviderCandidate>, PortError>;
 }
+
+/// Astrazione della LETTURA della storia delle domande-chiarimento poste
+/// all'utente nella SESSIONE (CROSS-RUN). Chiude il loop email (chat Beaty-Book):
+/// `clarify_or_expand` imposta `pending_clarify` -> il grafo va a END -> il turno
+/// TERMINA (il run chiude `Completed`) -> il messaggio successivo dell'utente
+/// avvia un RUN NUOVO con stato ricostruito da zero. Tenere il detector in
+/// `AgentState` NON funziona (azzerato per-run): il conteggio va letto dal DB
+/// della sessione, UNA volta all'avvio del run.
+///
+/// FONTE STRUTTURATA (regola M): i `nexus_agent_meta_steps` `kind='clarify'` dei
+/// run della sessione (join `agent_runs.session_id`). L'ESISTENZA di un meta_step
+/// `kind='clarify'` E' la dichiarazione strutturata "questo turno ha posto una
+/// domanda-chiarimento all'utente" (il turno di clarify chiude `Completed` +
+/// `pending_clarify`, NON `blocked_needs_input`: il segnale d'esito dichiarato di
+/// QUESTO canale e' il meta_step stesso, non `agent_runs.status`). La DECISIONE di
+/// contare deriva da quel segnale + dal payload strutturato; la firma-testo (sha1
+/// della domanda normalizzata) e' SOLO l'euristica di loop-detection che decide se
+/// e' la STESSA domanda ripetuta (analogo di `name|sha1` per i tool).
+///
+/// CONFINE (regola L): qui c'e' SOLO la lettura DB; la costruzione della firma e
+/// la DECISIONE d'asse (soglia) restano fuori (il conteggio alimenta
+/// `AgentState::repeated_clarify_count` -> `ProgressSignals` -> `progress_controller`).
+#[async_trait]
+pub trait ClarifyHistoryPort: Send + Sync {
+    /// Conta i turni PRECEDENTI della sessione che hanno posto una
+    /// domanda-chiarimento con la STESSA firma (`current_question_signature`).
+    /// Interroga gli ultimi N meta_step `kind='clarify'` dei run della sessione
+    /// e conta quelli la cui domanda normalizzata coincide con la firma corrente.
+    ///
+    /// FAIL-OPEN (sicurezza, come [`EscalationPort`]/[`BillingCooldownPort`]): un
+    /// guasto di lettura DB NON deve bloccare l'avvio del run — l'impl ritorna
+    /// `Ok(0)` (nessuna ripetizione nota -> asse mai attivo, comportamento
+    /// invariato), MAI un `PortError`. Il `PortError` resta per un contratto rotto
+    /// (mai nel flusso normale). SOLA LETTURA: nessun gate `mode`; consultata UNA
+    /// volta all'avvio del run (fuori dal percorso caldo), il valore e'
+    /// checkpointato in stato -> replay-safe.
+    async fn repeated_clarify_count(
+        &self,
+        session_id: uuid::Uuid,
+        current_question_signature: &str,
+    ) -> Result<i64, PortError>;
+}
+
+/// Astrazione del budget CROSS-RUN delle consultazioni del meta-reasoner di
+/// recovery-da-stallo, per SESSIONE. Chiude il gap del cap per-run:
+/// `extra["stall_moves_used"]` e' checkpointato con lo stato e si AZZERA tra run
+/// diversi della stessa sessione (il loop email e' cross-run: 9 run, 6 richieste
+/// identiche). Questa porta persiste+conta le consultazioni della SESSIONE cosi'
+/// che il cap `agent.stall_recovery.max_moves_per_session` (regola G) sia
+/// veramente per-sessione, non per-run.
+///
+/// MECCANISMO (scelto: il MENO invasivo, documentato): NESSUNA DDL. Il conteggio
+/// vive come righe `nexus_agent_meta_steps` con un `kind` dedicato
+/// (`stall_budget`), append-and-count per sessione (join `agent_runs.session_id`),
+/// stesso pattern gia' usato da [`ClarifyHistoryPort`]. La tabella e' gia' nel DB
+/// per-progetto (separazione DB, regola L): il call site risolve il pool.
+///
+/// CONFINE (regola L): qui SOLO l'I/O (leggi/incrementa il contatore); la
+/// DECISIONE (cap raggiunto?) resta nel gate di emissione dell'executor, che
+/// somma il per-run (`extra`) al cross-run letto qui e confronta con la soglia DB.
+///
+/// FAIL-OPEN (sicurezza, come [`EscalationPort`]/[`ClarifyHistoryPort`]): un
+/// guasto di lettura NON deve MAI bloccare — [`consultations_in_session`] ritorna
+/// `Ok(0)` (budget non esaurito -> il meta-reasoner resta consultabile, degrado
+/// verso il comportamento a solo cap per-run), MAI un `PortError`. La scrittura
+/// [`record_consultation`] e' best-effort e gata `Real`.
+#[async_trait]
+pub trait StallBudgetPort: Send + Sync {
+    /// Numero di consultazioni del meta-reasoner gia' registrate nella SESSIONE
+    /// (cross-run). SOLA LETTURA: nessun gate `mode`; consultata all'avvio del
+    /// gate di emissione. FAIL-OPEN: guasto DB -> `Ok(0)` (mai bloccare),
+    /// MAI un `PortError` nel flusso normale.
+    async fn consultations_in_session(&self, session_id: uuid::Uuid) -> Result<i64, PortError>;
+
+    /// Registra UNA consultazione effettiva del meta-reasoner per la sessione
+    /// (append). Gata `Real` (punto unico gate shadow, regola L): NO-OP in
+    /// [`ExecMode::Replay`] (il run shadow non incrementa il budget del primario).
+    /// Best-effort: errore DB loggato, `Ok(())` ritornato (il `PortError` resta per
+    /// un contratto rotto, mai nel flusso normale).
+    async fn record_consultation(
+        &self,
+        session_id: uuid::Uuid,
+        mode: ExecMode,
+    ) -> Result<(), PortError>;
+}
+
+/// Contesto STRUTTURATO passato al meta-reasoner di recovery-da-stallo (ADR 0036
+/// applicato al recovery). Regola M: SOLO segnali strutturati (assi, contatori,
+/// esiti tipizzati), MAI prosa. Costruito deterministicamente dal modulo puro
+/// [`crate::decisions::meta_reason`] dai segnali gia' esistenti dell'executor,
+/// serializzato in JSON e passato all'LLM (non l'intera history: budget/costo).
+///
+/// La `work_epoch` (avanza solo su cambi macroscopici: nuovo todo, escalation,
+/// bump `repeat_scan_floor`) e' la chiave di idempotenza/replay: lo stesso stallo
+/// non riconsulta l'LLM anche se i `tool_result` volatili variano.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StallContext {
+    /// Asse di stallo attivo (`exploration`/`signature`/`g1_descriptive`/
+    /// `repeated_action`/`resource_reallocation`/`repeated_user_question`).
+    pub axis: String,
+    /// Etichetta dell'azione ripetuta (comando/tool + argomenti sintetici).
+    pub label: Option<String>,
+    /// Conteggio delle ripetizioni/occorrenze dell'asse.
+    pub count: i64,
+    /// L'azione ripetuta e' un edit FALLITO (segnale strutturato exit_code/is_error).
+    pub repeated_action_edit_failed: bool,
+    /// L'azione ripetuta e' un servizio FALLITO (segnale strutturato).
+    pub repeated_action_service_failed: bool,
+    /// L'azione ripetuta e' di SOLA LETTURA (idempotente).
+    pub repeated_action_read_only: bool,
+    /// Il turno e' action-oriented (dal classifier/soglia, non da prosa).
+    pub action_oriented: bool,
+    /// Escalation gia' effettuate nel run.
+    pub escalations: i64,
+    /// Budget massimo di escalation (`agent.executor.max_escalations`, regola G).
+    pub max_escalations: i64,
+    /// L'asse ha gia' ricevuto GUIDE (evita nudge ripetuti).
+    pub already_guided: bool,
+    /// L'asse ha gia' ricevuto FORCE_DIAGNOSE.
+    pub already_diagnosed: bool,
+    /// L'asse ha gia' ricevuto un cambio-strategia forzato.
+    pub already_strategy_shifted: bool,
+    /// E' gia' stata posta una domanda-chiarimento per questo asse/sessione (cap
+    /// strutturale anti ri-domanda, chiude il loop email).
+    pub already_asked_user: bool,
+    /// Intento utente del run (per orientare la strategia; testo utente, non prosa
+    /// di sistema da cui dedurre stato).
+    pub user_intent: Option<String>,
+    /// Coda (tail) delle firme di tool recenti (`name|sha1`).
+    pub recent_tool_signatures: Vec<String>,
+    /// Esito STRUTTURATO dell'ultimo tool (`tool_result_outcome_after`):
+    /// `ok`/`error`/`redaction_rejected`/... — mai il testo grezzo.
+    pub last_tool_outcome: Option<String>,
+    /// Un tool ha rifiutato l'input per placeholder di redazione (segnale
+    /// strutturato, NON `contains("[REDACTED:")`): riconosce il blocco ambientale.
+    pub redaction_rejected: bool,
+    /// Numero di domande-chiarimento ripetute nella SESSIONE (cross-run, dal
+    /// detector `ClarifyHistoryPort`): il segnale che ha condannato il loop email.
+    pub repeated_clarify_count: i64,
+    /// File modificati nel run (per capire se c'e' stato progresso reale).
+    pub modified_files: Vec<String>,
+    /// Epoca di lavoro stabile (chiave idempotenza/replay).
+    pub work_epoch: i64,
+}
+
+/// Mossa strategica prodotta dal meta-reasoner. Enum CHIUSO: il modulo puro
+/// [`crate::decisions::meta_reason`] la traduce in una
+/// [`crate::decisions::progress_controller::ProgressDecision`] (stessa struct del
+/// ramo fisso), NON un vocabolario di intenti parallelo (regola L). `blocker` e'
+/// validato contro il vocabolario ADR 0034 dal modulo puro; un valore fuori
+/// vocabolario o un enum sconosciuto degrada a [`RecoveryMove::Fallback`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "move", rename_all = "snake_case")]
+pub enum RecoveryMove {
+    /// Prosegui con una guida assertiva (nudge generato dall'LLM).
+    ContinueGuided { nudge: String },
+    /// Cambia STRATEGIA (non solo modello): nudge che riorienta l'approccio.
+    ShiftStrategy { nudge: String },
+    /// Forza la diagnosi della causa radice (leggi l'errore, dichiara la causa).
+    ForceDiagnose { nudge: String },
+    /// Promuovi il modello (ramo Escalate esistente + `pick_escalation_model`).
+    EscalateModel,
+    /// Poni all'utente UNA domanda mirata (cap strutturale per-sessione).
+    AskUser { question: String },
+    /// Dichiara il blocco in modo ONESTO e strutturato (ADR 0034 `task_complete`).
+    DeclareBlocked { blocker: String },
+    /// Nessuna mossa LLM valida: ricadi sulla gerarchia fissa `pc::decide`
+    /// (rete di sicurezza, include ABORT).
+    Fallback,
+}
+
+/// Pressione del contesto del run (finestra token quasi piena): segnale
+/// STRUTTURATO (regola M) derivato dal rapporto `context_tokens_used /
+/// context_window_limit` (soglie deterministiche nel modulo puro
+/// [`crate::decisions::orchestration_reason`]). Orienta la decisione di
+/// orchestrazione (es. decomporre invece di eseguire inline quando il contesto
+/// e' sotto pressione). `Default` = [`ContextPressure::Low`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPressure {
+    /// Contesto ampio: nessuna pressione.
+    #[default]
+    Low,
+    /// Contesto in avvicinamento al limite: pressione moderata.
+    Medium,
+    /// Contesto vicino al limite: pressione alta (favorisce la decomposizione).
+    High,
+}
+
+/// Fase di orchestrazione in cui la porta viene consultata. Enum CHIUSO: la
+/// Fase 1 (rollout, piano design v2) usa SOLO [`OrchPhase::PlanEntry`] — la
+/// decisione di SE/COME fare la plan-phase all'ingresso del run, in modalita'
+/// SEQUENZIALE (nessuna parallelizzazione-che-scrive finche' manca l'isolamento
+/// fisico dei sub-run). Le fasi successive (worktree isolati) potranno aggiungere
+/// varianti senza toccare i chiamanti esistenti. `Default` = [`OrchPhase::PlanEntry`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchPhase {
+    /// Ingresso del run: decidere SE fare la plan-phase e COME procedere
+    /// (inline / decompose / delega sequenziale). Unica fase attiva in Fase 1.
+    #[default]
+    PlanEntry,
+}
+
+/// Contesto STRUTTURATO passato al meta-reasoner di ORCHESTRAZIONE (gemello di
+/// [`StallContext`], tipi DISGIUNTI: nessun campo condiviso, nessun enum wrapper
+/// — regola L). Regola M: SOLO segnali strutturati (fase, intent, contatori,
+/// pressione-contesto, guard di delega deterministiche), MAI prosa da cui dedurre
+/// stato. Costruito deterministicamente dal modulo puro
+/// [`crate::decisions::orchestration_reason::build_orchestration_context`] dai
+/// segnali gia' risolti a monte (routing/context_reduction/depth/cost),
+/// serializzato in JSON e passato all'LLM (non l'intera history: budget/costo).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OrchestrationContext {
+    /// Fase di orchestrazione (Fase 1: sempre [`OrchPhase::PlanEntry`]).
+    pub phase: OrchPhase,
+    /// Intento utente del run (testo utente per orientare la strategia; NON prosa
+    /// di sistema da cui dedurre stato). `None` se non classificato.
+    pub user_intent: Option<String>,
+    /// Behavior_mode del run (`study`/`confirm`/`automatic`/...): valore opaco
+    /// risolto a monte, orienta l'aggressivita' della decomposizione.
+    pub behavior_mode: String,
+    /// Budget di token disponibile per il run (`agent.*` risolto a monte, regola G).
+    pub token_budget: i64,
+    /// Complessita' stimata del task (segnale numerico strutturato dal classifier,
+    /// NON dedotto da prosa): alto -> favorisce decompose/delega.
+    pub task_complexity: i64,
+    /// Punteggio agentico del turno (segnale numerico del classifier): quanto il
+    /// task richiede piu' passi/tool. Strutturato (regola M).
+    pub agentic_score: i64,
+    /// Il task e' ambiguo (segnale strutturato dal classifier/clarify): puo'
+    /// orientare verso una plan-phase piu' cauta.
+    pub is_ambiguous: bool,
+    /// Esiste gia' un piano per il run (`todo_store.fetch_plan`): evita di
+    /// ripianificare (la decisione di riuso e' del planner; qui e' solo un segnale).
+    pub plan_exists: bool,
+    /// Token gia' consumati dal contesto del run (`context_reduction`).
+    pub context_tokens_used: i64,
+    /// Limite della finestra di contesto del modello risolto (regola G, a monte).
+    pub context_window_limit: i64,
+    /// Lunghezza della history conversazionale (numero messaggi): segnale di
+    /// crescita del contesto.
+    pub history_len: i64,
+    /// Pressione del contesto derivata deterministicamente da used/limit (regola M):
+    /// alta -> favorisce la decomposizione per non saturare la finestra.
+    pub context_pressure: ContextPressure,
+    /// Profondita' di annidamento dei sub-agenti nel run corrente (guard di delega
+    /// DETERMINISTICA): oltre una soglia la delega e' vietata (evita ricorsione
+    /// incontrollata). La soglia vive nel modulo puro.
+    pub subagent_depth: i64,
+    /// Costo gia' speso dal run in USD (guard di delega deterministica): oltre il
+    /// cap la delega/decomposizione costosa e' vietata.
+    pub cost_spent_usd: f64,
+    /// Cap di costo del run in USD (`agent.*` risolto a monte, regola G). `0` =
+    /// nessun cap configurato.
+    pub cost_cap_usd: f64,
+    /// La delega a sub-agenti e' VIETATA per questo run (guard deterministica
+    /// aggregata: depth oltre soglia / cost oltre cap / policy). Se `true`,
+    /// [`crate::decisions::orchestration_reason::validate_orch_move`] rifiuta
+    /// [`OrchestrationMove::DelegateSubagents`] -> [`OrchestrationMove::Fallback`].
+    pub delegation_forbidden: bool,
+}
+
+/// Blocco di piano proposto dal meta-reasoner di orchestrazione (forma MINIMALE:
+/// titolo + descrizione). Il planner concreto lo materializza in
+/// `nexus_agent_todos` (blocco successivo del piano); qui trasporta SOLO cio' che
+/// serve alla decisione strutturata (regola M). Ordine dei blocchi = ordine di
+/// esecuzione sequenziale in Fase 1.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct PlanBlock {
+    /// Titolo breve del blocco (etichetta dell'obiettivo).
+    pub title: String,
+    /// Descrizione dell'obiettivo del blocco (cosa deve produrre, NON come).
+    pub description: String,
+}
+
+/// Sotto-task da delegare a un sub-agente (forma MINIMALE). `kind` e' il TIPO di
+/// sub-agente (segnale strutturato opaco: `coder`/`general`/...), risolto a monte
+/// dal wiring; `task_description` e' l'obiettivo del sotto-task (cosa, non come —
+/// regola D per i prompt fuori-chat, applicata a valle dal chiamante).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct SubTask {
+    /// Obiettivo del sotto-task (descrizione strutturata dell'esito atteso).
+    pub task_description: String,
+    /// Tipo di sub-agente a cui delegare (valore opaco risolto a monte).
+    pub kind: String,
+}
+
+/// Modalita' di coordinamento dei sub-task delegati. Enum CHIUSO: in Fase 1 SOLO
+/// [`Coordination::Sequential`] e' ammessa da
+/// [`crate::decisions::orchestration_reason::validate_orch_move`].
+/// [`Coordination::ParallelIsolated`] richiede l'isolamento fisico (worktree
+/// per-sub-run, fase infra successiva): finche' `isolation_available=false` la
+/// validazione la rifiuta -> [`OrchestrationMove::Fallback`] (anti-race: due
+/// sub-run paralleli sulla stessa root si pesterebbero, verificato su
+/// `dag_scheduler`). `Default` = [`Coordination::Sequential`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coordination {
+    /// Esecuzione SEQUENZIALE dei sub-task (nessun conflitto sulla root condivisa).
+    #[default]
+    Sequential,
+    /// Esecuzione PARALLELA con isolamento fisico (worktree). Ammessa SOLO quando
+    /// `isolation_available=true` (fase infra successiva); in Fase 1 sempre
+    /// rifiutata dalla validazione.
+    ParallelIsolated,
+}
+
+/// Mossa di ORCHESTRAZIONE prodotta dal meta-reasoner (gemello di
+/// [`RecoveryMove`], tipi DISGIUNTI — regola L). Enum CHIUSO,
+/// `#[serde(tag="move")]`: il modulo puro
+/// [`crate::decisions::orchestration_reason::validate_orch_move`] deserializza e
+/// valida; qualunque forma malformata / `Decompose` senza blocchi /
+/// `DelegateSubagents` senza task o vietata / `ParallelIsolated` senza isolamento
+/// degrada a [`OrchestrationMove::Fallback`] (rete di sicurezza: l'euristica
+/// esistente `is_eligible`/`should_parallelize`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "move", rename_all = "snake_case")]
+pub enum OrchestrationMove {
+    /// Attiva la plan-phase (pianificazione esplicita). `decompose=true` -> il
+    /// piano va scomposto in piu' blocchi; `false` -> plan-phase leggera.
+    PlanPhase {
+        /// Se il piano deve essere scomposto in blocchi (vs plan-phase leggera).
+        decompose: bool,
+    },
+    /// Esegui il task INLINE (nessuna plan-phase, nessuna decomposizione): il
+    /// task e' abbastanza semplice per un singolo flusso.
+    RunInline,
+    /// Decomponi il run in blocchi di piano SEQUENZIALI (Fase 1). Vuoto -> la
+    /// validazione degrada a [`OrchestrationMove::Fallback`].
+    Decompose {
+        /// Blocchi di piano nell'ordine di esecuzione (sequenziale in Fase 1).
+        blocks: Vec<PlanBlock>,
+    },
+    /// Delega a sub-agenti i sotto-task con la `coordination` indicata. Vuoto o
+    /// `delegation_forbidden` o `ParallelIsolated` senza isolamento -> la
+    /// validazione degrada a [`OrchestrationMove::Fallback`].
+    DelegateSubagents {
+        /// Sotto-task da delegare (uno per sub-agente).
+        tasks: Vec<SubTask>,
+        /// Coordinamento dei sub-task (Fase 1: solo [`Coordination::Sequential`]).
+        coordination: Coordination,
+    },
+    /// Nessuna mossa LLM valida/applicabile: ricadi sull'euristica esistente
+    /// (`is_eligible`/`should_parallelize`), rete di sicurezza.
+    Fallback,
+}
+
+/// Porta UNICA del meta-reasoner LLM (opt-in DB, ADR 0036-style). Espone DUE
+/// metodi a TIPI DISGIUNTI (regola L: un solo adapter mcp-core, nessun enum
+/// wrapper `MetaMove` che reintrodurrebbe cross-scope leak tra i due scope):
+///   - [`MetaReasonerPort::recover`] — recovery-da-stallo:
+///     [`StallContext`] -> [`RecoveryMove`] (purpose `stall_recovery`,
+///     template `system.stall_recovery.decide`);
+///   - [`MetaReasonerPort::orchestrate`] — orchestrazione (plan-phase / decompose
+///     / delega): [`OrchestrationContext`] -> [`OrchestrationMove`] (purpose
+///     `orchestration_decide`, template `system.orchestration.decide`).
+///
+/// CONFINE (regola L): qui c'e' SOLO l'I/O che consulta l'LLM; la DECISIONE
+/// (validazione + traduzione) e' dei moduli puri [`crate::decisions::meta_reason`]
+/// (recovery) e [`crate::decisions::orchestration_reason`] (orchestrazione),
+/// golden-abili in isolamento.
+///
+/// A differenza delle porte SOLA-LETTURA, entrambi i metodi consultano l'LLM e
+/// PRENDONO `mode`:
+/// - `Real` -> consulta l'LLM; kill-switch OFF / purpose `NotFound` -> `Ok(None)`
+///   (degrado legittimo alla gerarchia/euristica fissa, opt-in); DB-down /
+///   provider indisponibile -> `Err(PortError::ProviderUnavailable)` (MAI
+///   `Ok(None)` mascherante, regola G).
+/// - `Replay` -> NON consulta l'LLM: la mossa e' gia' stata rigiocata dal
+///   `ReplayLlmGateway` e riletta dal nodo dalla cache di stato; se manca ->
+///   `Err(PortError::ReplayMissing)` (mai `Ok(None)` silenzioso che divergerebbe
+///   dallo shadow).
+#[async_trait]
+pub trait MetaReasonerPort: Send + Sync {
+    /// Consulta il meta-reasoner per il contesto di stallo `ctx` secondo `mode`.
+    async fn recover(
+        &self,
+        ctx: StallContext,
+        mode: ExecMode,
+    ) -> Result<Option<RecoveryMove>, PortError>;
+
+    /// Consulta il meta-reasoner per la decisione di ORCHESTRAZIONE (plan-phase /
+    /// decompose / delega) sul contesto `ctx` secondo `mode`. Stesso contratto
+    /// `mode`/degrado di [`MetaReasonerPort::recover`] ma su tipi DISGIUNTI:
+    /// [`OrchestrationContext`] -> [`OrchestrationMove`]. `Ok(None)` = degrado
+    /// legittimo all'euristica esistente (`is_eligible`/`should_parallelize`).
+    async fn orchestrate(
+        &self,
+        ctx: OrchestrationContext,
+        mode: ExecMode,
+    ) -> Result<Option<OrchestrationMove>, PortError>;
+}

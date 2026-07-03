@@ -33,6 +33,15 @@ pub enum Axis {
     RepeatedAction,
     #[serde(rename = "resource_reallocation")]
     ResourceReallocation,
+    /// Stessa domanda-di-chiarimento ripetuta all'utente attraverso PIU' run
+    /// della sessione (cross-run, dal detector `ClarifyHistoryPort`). E' l'asse
+    /// che il loop email (chat Beaty-Book) attraversava senza mai essere
+    /// rilevato: la loop-detection copriva solo le firme di TOOL, non le domande
+    /// ripetute all'utente. Popolato all'avvio del run dai `nexus_agent_meta_steps`
+    /// kind='clarify' della sessione (regola M: la DECISIONE deriva dal segnale
+    /// strutturato `declared_outcome=needs_input`, la firma-testo e' solo euristica).
+    #[serde(rename = "repeated_user_question")]
+    RepeatedUserQuestion,
 }
 
 impl Axis {
@@ -44,6 +53,7 @@ impl Axis {
             Axis::G1Descriptive => "g1_descriptive",
             Axis::RepeatedAction => "repeated_action",
             Axis::ResourceReallocation => "resource_reallocation",
+            Axis::RepeatedUserQuestion => "repeated_user_question",
         }
     }
 }
@@ -72,6 +82,19 @@ pub enum Action {
     Escalate,
     #[serde(rename = "abort")]
     Abort,
+    /// Poni all'utente UNA domanda mirata e chiudi il turno con esito STRUTTURATO
+    /// `needs_input` (ADR 0034 `task_complete`). Prodotta SOLO dal meta-reasoner
+    /// (`RecoveryMove::AskUser`), MAI da [`decide`]: la gerarchia fissa non
+    /// interroga l'utente. Un cap strutturale per-sessione (`already_asked_user`)
+    /// a monte impedisce la ri-domanda infinita che ha condannato il loop email.
+    #[serde(rename = "ask_user")]
+    AskUser,
+    /// Dichiara il blocco in modo ONESTO e strutturato (`task_complete{blocked}`,
+    /// ADR 0034), con `blocker` dal vocabolario ADR 0034. Prodotta SOLO dal
+    /// meta-reasoner (`RecoveryMove::DeclareBlocked`): chiude il run senza lasciare
+    /// al modello un turno libero (evita la fabbricazione di dati).
+    #[serde(rename = "declare_blocked")]
+    DeclareBlocked,
 }
 
 /// stop_reason UNICO emesso da un abort coordinato. `route_after_executor` lo
@@ -91,6 +114,17 @@ pub struct ProgressSignals {
     pub exploration_threshold: i64,
     /// Signature-loop: nome del tool ripetuto identico (None = nessun loop).
     pub signature_loop_tool: Option<String>,
+    /// Domande-chiarimento IDENTICHE gia' poste all'utente nella SESSIONE
+    /// (CROSS-RUN), dal detector `ClarifyHistoryPort` (via
+    /// `AgentState::repeated_clarify_count`). Regola M: conta i turni precedenti
+    /// che hanno gia' posto la STESSA domanda (segnale strutturato: i meta_step
+    /// `kind='clarify'` della sessione). `0` su un run normale.
+    pub repeated_user_question_count: i64,
+    /// Soglia (`agent.loop.repeated_user_question_threshold`, mig 0510, default 2)
+    /// oltre la quale (`>=`) scatta l'asse `RepeatedUserQuestion`. Regola G:
+    /// arriva dal DB, mai hardcoded. Default conservativo 2: con la soglia attuale
+    /// e nessuna storia l'asse non scatta mai -> comportamento invariato.
+    pub repeated_user_question_threshold: i64,
     /// G1 descrittivo: il modello descrive senza agire (reroute_count >= max).
     pub g1_over_cap: bool,
     /// Azione produttiva ripetuta identica oltre soglia: (label, conteggio).
@@ -168,6 +202,11 @@ impl Default for ProgressSignals {
             exploration_count: 0,
             exploration_threshold: 6,
             signature_loop_tool: None,
+            // Default neutri: 0 occorrenze, soglia 2 (= seed mig 0510). Con nessuna
+            // storia l'asse RepeatedUserQuestion non scatta mai (0 < 2) ->
+            // comportamento invariato sui run normali.
+            repeated_user_question_count: 0,
+            repeated_user_question_threshold: 2,
             g1_over_cap: false,
             repeated_action: None,
             repeated_action_edit_failed: false,
@@ -262,6 +301,20 @@ fn g1_nudge() -> String {
     "STOP: hai descritto i passi senza eseguirli. I tool di sola lettura sono \
 disabilitati per questo turno: avanza eseguendo il prossimo step concreto \
 con una tool call che modifica il progetto o lancia un comando."
+        .to_string()
+}
+
+/// Nudge dell'asse `RepeatedUserQuestion` (loop clarification cross-run): la
+/// stessa domanda e' gia' stata posta all'utente in un turno precedente della
+/// sessione. Ri-chiederla e' inutile (l'incidente email: l'input veniva
+/// ri-oscurato ad ogni giro). Guida a USARE il valore gia' fornito senza
+/// ri-chiederlo, oppure a dichiarare il blocco in modo strutturato.
+fn repeated_user_question_nudge() -> String {
+    "STOP: hai gia' posto questa stessa domanda all'utente in un turno precedente \
+e hai gia' ricevuto risposta. NON ri-chiedere lo stesso dato: usa il valore gia' \
+fornito cosi' com'e' (anche se appare oscurato/placeholder, trattalo come opaco e \
+passalo al tool che lo consuma senza interpretarlo), oppure, se davvero manca un \
+dato indispensabile e diverso, dichiara il blocco con task_complete."
         .to_string()
 }
 
@@ -449,8 +502,9 @@ diagnosi e il prossimo passo, non con una ripetizione."
 ///   - altrimenti, se c'e' un candidato di escalation nel budget -> ESCALATE
 ///   - altrimenti -> ABORT (verso la verifica E2E)
 ///
-/// Priorita' tra assi: esplorazione, signature-loop, resource_reallocation,
-/// repeated_action, g1-descrittivo. Nessuno stallo -> proceed.
+/// Priorita' tra assi: esplorazione, signature-loop, repeated_user_question
+/// (cross-run), resource_reallocation, repeated_action, g1-descrittivo. Nessuno
+/// stallo -> proceed.
 pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
     // Determina l'asse di stallo prioritario (None = nessuno stallo bloccante).
     let axis: Option<Axis> = if signals.exploration_count
@@ -464,6 +518,16 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
     {
         // Python: `elif signals.signature_loop_tool:` — truthy = non vuoto/non None.
         Some(Axis::Signature)
+    } else if signals.repeated_user_question_count
+        >= signals.repeated_user_question_threshold.max(1)
+    {
+        // Loop clarification CROSS-RUN (l'incidente email Beaty-Book): la STESSA
+        // domanda-chiarimento e' gia' stata posta all'utente >= soglia volte nella
+        // sessione (segnale strutturato dai meta_step `kind='clarify'`, regola M).
+        // Priorita' TRA signature e repeated_action: un loop di TOOL o esplorazione
+        // ha precedenza (piu' locale), ma la ri-domanda ripetuta precede gli assi
+        // intra-run repeated_action/g1. `.max(1)`: soglia degenere <=0 -> almeno 1.
+        Some(Axis::RepeatedUserQuestion)
     } else if signals.reallocation_count >= signals.reallocation_threshold.max(1) {
         Some(Axis::ResourceReallocation)
     } else if signals.repeated_action.is_some() {
@@ -524,6 +588,11 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
                 }
             }
             Axis::G1Descriptive => g1_nudge(),
+            // Asse alimentato dal detector clarification cross-run (Task #5): con
+            // reasoner OFF resta la GUIDE fissa (nudge "non ri-chiedere"); con
+            // reasoner ON e' quest'ultimo a decidere la mossa. `decide` non lo
+            // assegna finche' il detector non e' innestato -> arm per esaustivita'.
+            Axis::RepeatedUserQuestion => repeated_user_question_nudge(),
         };
         // Solo resource_reallocation resta SOFT (il nudge ordina di riusare le porte,
         // non c'e' un'azione correttiva diretta). Per repeated_action PRODUTTIVA
@@ -538,6 +607,13 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
         let force = match axis {
             // resource_reallocation: SOFT (riusa-porte, nessuna azione correttiva).
             Axis::ResourceReallocation => false,
+            // repeated_user_question: SOFT. Il nudge guida a USARE il valore gia'
+            // fornito (anche se oscurato, come opaco) o a dichiarare il blocco con
+            // task_complete: NON forziamo una tool call (forzare tool_choice
+            // required rimuoverebbe i read-only e obbligherebbe un'azione-tool che
+            // qui non e' la mossa giusta -> alimenterebbe un altro loop). Con
+            // reasoner ON e' quest'ultimo a decidere una mossa piu' ricca.
+            Axis::RepeatedUserQuestion => false,
             // SERVIZIO long-running fallito: NON forzare. La forza-azione rimuove i
             // tool read-only, ma qui l'agente DEVE poterli usare (read_service_output/
             // tail_service_logs) per leggere perche' il servizio e' morto; il nudge lo
@@ -989,6 +1065,99 @@ mod tests {
         let nudge = d.nudge_text.as_deref().unwrap();
         assert!(nudge.contains("CAMBIA STRATEGIA"));
         assert!(nudge.contains("task_complete"));
+    }
+
+    #[test]
+    fn repeated_user_question_scatta_a_soglia_guida_soft() {
+        // A soglia (count >= threshold) l'asse RepeatedUserQuestion scatta: GUIDE
+        // col nudge fisso "non ri-chiedere", SENZA forzare la tool call (SOFT: il
+        // nudge guida a usare il valore gia' fornito o a dichiarare il blocco).
+        let signals = ProgressSignals {
+            repeated_user_question_count: 2,
+            repeated_user_question_threshold: 2,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::Guide);
+        assert_eq!(d.axis, Some(Axis::RepeatedUserQuestion));
+        assert!(
+            !d.force_action,
+            "repeated_user_question e' SOFT: non forza una tool call"
+        );
+        let nudge = d.nudge_text.as_deref().unwrap();
+        assert!(
+            nudge.contains("gia' posto questa stessa domanda"),
+            "atteso nudge repeated_user_question, ottenuto: {nudge}"
+        );
+        assert!(nudge.contains("task_complete"));
+    }
+
+    #[test]
+    fn repeated_user_question_sotto_soglia_non_scatta() {
+        // Comportamento invariato: con la soglia di default (2) e count 1 l'asse
+        // non scatta -> nessuno stallo -> proceed. Preserva i run normali.
+        let signals = ProgressSignals {
+            repeated_user_question_count: 1,
+            repeated_user_question_threshold: 2,
+            ..Default::default()
+        };
+        let d = decide(&signals);
+        assert_eq!(d.action, Action::Proceed);
+        assert_eq!(d.axis, None);
+    }
+
+    #[test]
+    fn repeated_user_question_default_neutro_non_scatta() {
+        // Default puri (count 0, soglia 2): l'asse non scatta MAI su un run senza
+        // storia di clarify ripetuti -> comportamento bit-invariato.
+        let d = decide(&ProgressSignals::default());
+        assert_eq!(d.action, Action::Proceed);
+        assert_eq!(d.axis, None);
+    }
+
+    #[test]
+    fn repeated_user_question_priorita_tra_signature_e_repeated_action() {
+        // Con signature-loop E ripetizione domanda entrambi attivi, vince
+        // signature (piu' locale). Con repeated_action E ripetizione domanda,
+        // vince repeated_user_question (priorita' TRA signature e repeated_action).
+        let sig_wins = ProgressSignals {
+            signature_loop_tool: Some("read_file".to_string()),
+            repeated_user_question_count: 5,
+            repeated_user_question_threshold: 2,
+            ..Default::default()
+        };
+        assert_eq!(decide(&sig_wins).axis, Some(Axis::Signature));
+
+        let ruq_over_repeated = ProgressSignals {
+            repeated_action: Some(("edit_file: x".to_string(), 3)),
+            repeated_user_question_count: 2,
+            repeated_user_question_threshold: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&ruq_over_repeated).axis,
+            Some(Axis::RepeatedUserQuestion),
+            "repeated_user_question ha priorita' su repeated_action"
+        );
+    }
+
+    #[test]
+    fn repeated_user_question_soglia_degenere_almeno_uno() {
+        // Soglia <= 0 non deve rendere l'asse sempre attivo con count 0: `.max(1)`
+        // impone almeno 1 occorrenza. Count 0, soglia 0 -> non scatta.
+        let no = ProgressSignals {
+            repeated_user_question_count: 0,
+            repeated_user_question_threshold: 0,
+            ..Default::default()
+        };
+        assert_eq!(decide(&no).axis, None);
+        // Count 1, soglia 0 -> scatta (1 >= max(1)).
+        let yes = ProgressSignals {
+            repeated_user_question_count: 1,
+            repeated_user_question_threshold: 0,
+            ..Default::default()
+        };
+        assert_eq!(decide(&yes).axis, Some(Axis::RepeatedUserQuestion));
     }
 
     #[test]
