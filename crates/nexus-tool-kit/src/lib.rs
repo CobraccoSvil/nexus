@@ -358,6 +358,7 @@ pub mod util_pid;
 pub mod util_uptime;
 pub mod uuid_generate;
 pub mod uuid_parse;
+pub mod worktree;
 
 // Nexus Tools — handler eseguibili per i tool registrati nel NexusToolCatalog.
 //
