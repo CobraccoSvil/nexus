@@ -1,11 +1,17 @@
 "use client";
 
 import React, { useState } from "react";
-import type { AgentRunInfo, AgentStep } from "../../lib/api-client";
+import type { AgentRunInfo, AgentStep, AITraceEvent } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { AgentMetaStepCard, type AgentMetaStepData } from "./agent-meta-step-card";
 import { MarkdownBlock } from "./markdown-renderer";
 import { toolLabel } from "./tool-labels";
+import {
+  composeActivityStream,
+  tracesForRun,
+  type FoldThreshold,
+} from "../../lib/use-chat/activity-stream";
+import { ActivityStreamView } from "./activity-stream";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -168,6 +174,13 @@ export interface AgentStepsPanelProps {
   // Soglie per il badge di narrazione — lette da settings DB, fallback ai default hardcoded
   narrationWarnAfterMs?: number;
   narrationWarnAfterChars?: number;
+  // ADR 0037: col flag ON il pannello live rende il NASTRO ATTIVITA' al posto
+  // delle card meta-step + lista step dettagliata. Con OFF rendering invariato.
+  activityStreamEnabled?: boolean;
+  // Trace gateway della SESSIONE (filtrate per runId nel nastro).
+  traces?: AITraceEvent[];
+  // Soglia densita' del collasso tool (derivata dalla larghezza @container).
+  foldThreshold?: FoldThreshold;
 }
 
 /** P5: Blocco collassabile per gli step piu' vecchi */
@@ -219,6 +232,7 @@ function SingleRunPanel({
   streamingToken,
   narrationWarnAfterMs,
   narrationWarnAfterChars,
+  activityStreamEnabled = false,
 }: {
   run: AgentRunInfo;
   steps: AgentStep[];
@@ -229,6 +243,11 @@ function SingleRunPanel({
   streamingToken?: string;
   narrationWarnAfterMs?: number;
   narrationWarnAfterChars?: number;
+  // ADR 0037: col flag ON i tool sono gia' nel nastro (reso da AgentStepsPanel),
+  // quindi la lista step dettagliata viene NASCOSTA per non duplicare. Restano
+  // metriche, streaming token, badge narrazione, Approva/Annulla, spinner e
+  // footer esito.
+  activityStreamEnabled?: boolean;
 }) {
   const [expandedMetrics, setExpandedMetrics] = React.useState(false);
   const [expandedStepIndex, setExpandedStepIndex] = React.useState<number | null>(null);
@@ -355,7 +374,11 @@ function SingleRunPanel({
         </div>
       )}
 
-      {steps.length > 0 && (
+      {/* Lista step dettagliata: mostrata solo col flag OFF. Col flag ON i tool
+          sono gia' nel nastro attivita' reso da AgentStepsPanel (evita
+          duplicazione). Tutto il resto del pannello (metriche, streaming,
+          Approva/Annulla, footer esito) resta invariato. */}
+      {!activityStreamEnabled && steps.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
           {/* Raggruppa step consecutivi con stesso toolName e stesso status */}
           {(() => {
@@ -697,6 +720,9 @@ export function AgentStepsPanel({
   streamingToken,
   narrationWarnAfterMs,
   narrationWarnAfterChars,
+  activityStreamEnabled = false,
+  traces,
+  foldThreshold = 3,
 }: AgentStepsPanelProps) {
   const [activeTab, setActiveTab] = useState<string>(agentRun.runId);
   // Lista "Decisioni del turno" collassata: durante un run la sequenza esplode a
@@ -759,58 +785,78 @@ export function AgentStepsPanel({
         )}
       </div>
 
-      {/* Meta-step semantici (plan/routing/clarify/fallback/reflection). I
-          next_actions sono esclusi: vengono resi come pulsanti a fine risposta
-          in chat, non come card nella lista step. */}
-      {/* Decisioni del turno: durante un run la sequenza puo' arrivare a decine
-          di voci. Di default mostriamo solo le ultime META_COLLAPSE_COUNT (le
-          piu' recenti = cosa sta facendo ORA); il toggle apre l'intera lista per
-          riesaminare il ragionamento. */}
-      {(() => {
-        const META_COLLAPSE_COUNT = 3;
-        const visibleMeta = (metaSteps ?? []).filter((m) => m.kind !== "next_actions");
-        if (visibleMeta.length === 0) return null;
-        const canToggle = visibleMeta.length > META_COLLAPSE_COUNT;
-        const collapsed = !showAllMeta && canToggle;
-        const startIdx = collapsed ? visibleMeta.length - META_COLLAPSE_COUNT : 0;
-        const shown = visibleMeta.slice(startIdx);
-        return (
-          <div style={{ marginBottom: 8 }} data-testid="agent-meta-steps">
-            {canToggle && (
-              <button
-                type="button"
-                onClick={() => setShowAllMeta((v) => !v)}
-                aria-expanded={showAllMeta}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 6,
-                  background: "transparent",
-                  border: "none",
-                  color: tc.textMuted,
-                  cursor: "pointer",
-                  fontSize: 11,
-                  padding: "2px 0",
-                  marginBottom: 4,
-                }}
-              >
-                <span aria-hidden style={{ fontFamily: "var(--font-mono)" }}>
-                  {collapsed ? "▸" : "▾"}
-                </span>
-                {collapsed
-                  ? `Mostra tutte le decisioni (${startIdx} precedenti)`
-                  : `Mostra solo le ultime ${META_COLLAPSE_COUNT}`}
-              </button>
+      {/* ADR 0037: col flag ON, il NASTRO ATTIVITA' del run attivo sostituisce
+          la lista di card meta-step. Il nastro include gia' i tool (dagli step),
+          le decisioni (meta_step) e la banda cambio-provider, quindi copre sia le
+          "decisioni del turno" sia la lista step dettagliata (nascosta in
+          SingleRunPanel). Multi-run: usa activeRunData (il run del tab attivo).
+          Con flag OFF resta ESATTAMENTE il blocco vecchio (bit-identico). */}
+      {activityStreamEnabled && activeRunData ? (
+        <div style={{ marginBottom: 8 }} data-testid="agent-activity-stream-live">
+          <ActivityStreamView
+            stream={composeActivityStream(
+              metaSteps ?? [],
+              activeRunData.steps,
+              traces ? tracesForRun(traces, activeRunData.run.runId) : [],
+              foldThreshold ?? 3,
             )}
-            {shown.map((m, i) => {
-              const idx = startIdx + i;
-              return (
-                <AgentMetaStepCard key={`${m.kind}-${m.createdAt}-${idx}`} data={m} />
-              );
-            })}
-          </div>
-        );
-      })()}
+            tc={tc}
+          />
+        </div>
+      ) : (
+        /* Meta-step semantici (plan/routing/clarify/fallback/reflection). I
+           next_actions sono esclusi: vengono resi come pulsanti a fine risposta
+           in chat, non come card nella lista step.
+           Decisioni del turno: durante un run la sequenza puo' arrivare a decine
+           di voci. Di default mostriamo solo le ultime META_COLLAPSE_COUNT (le
+           piu' recenti = cosa sta facendo ORA); il toggle apre l'intera lista per
+           riesaminare il ragionamento. */
+        (() => {
+          const META_COLLAPSE_COUNT = 3;
+          const visibleMeta = (metaSteps ?? []).filter((m) => m.kind !== "next_actions");
+          if (visibleMeta.length === 0) return null;
+          const canToggle = visibleMeta.length > META_COLLAPSE_COUNT;
+          const collapsed = !showAllMeta && canToggle;
+          const startIdx = collapsed ? visibleMeta.length - META_COLLAPSE_COUNT : 0;
+          const shown = visibleMeta.slice(startIdx);
+          return (
+            <div style={{ marginBottom: 8 }} data-testid="agent-meta-steps">
+              {canToggle && (
+                <button
+                  type="button"
+                  onClick={() => setShowAllMeta((v) => !v)}
+                  aria-expanded={showAllMeta}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    background: "transparent",
+                    border: "none",
+                    color: tc.textMuted,
+                    cursor: "pointer",
+                    fontSize: 11,
+                    padding: "2px 0",
+                    marginBottom: 4,
+                  }}
+                >
+                  <span aria-hidden style={{ fontFamily: "var(--font-mono)" }}>
+                    {collapsed ? "▸" : "▾"}
+                  </span>
+                  {collapsed
+                    ? `Mostra tutte le decisioni (${startIdx} precedenti)`
+                    : `Mostra solo le ultime ${META_COLLAPSE_COUNT}`}
+                </button>
+              )}
+              {shown.map((m, i) => {
+                const idx = startIdx + i;
+                return (
+                  <AgentMetaStepCard key={`${m.kind}-${m.createdAt}-${idx}`} data={m} />
+                );
+              })}
+            </div>
+          );
+        })()
+      )}
 
       {/* Tabs — solo se ci sono più run */}
       {isMulti && (
@@ -880,6 +926,7 @@ export function AgentStepsPanel({
           streamingToken={activeRunData.run.runId === agentRun.runId ? streamingToken : undefined}
           narrationWarnAfterMs={narrationWarnAfterMs}
           narrationWarnAfterChars={narrationWarnAfterChars}
+          activityStreamEnabled={activityStreamEnabled}
         />
       )}
     </div>

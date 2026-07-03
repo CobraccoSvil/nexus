@@ -1227,6 +1227,9 @@ export function ChatPanel({
               streamingToken={agentRun.status === "running" ? streamingToken : undefined}
               narrationWarnAfterMs={narrationWarnAfterMs}
               narrationWarnAfterChars={narrationWarnAfterChars}
+              traces={traces}
+              activityStreamEnabled={activityStreamEnabled}
+              foldThreshold={foldThreshold}
             />
           )}
 
