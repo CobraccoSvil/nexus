@@ -254,7 +254,7 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
         .unwrap_or("")
         .to_string();
 
-    run_single_subagent(ctx, &kind, &task, &context_blob, &expected_format)
+    run_single_subagent(ctx, &kind, &task, &context_blob, &expected_format, None)
         .await
         .to_string()
 }
@@ -275,7 +275,7 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         .unwrap_or(configured_max)
         .clamp(1, configured_max) as usize;
 
-    let mut parsed: Vec<(String, String, String, String)> = Vec::with_capacity(tasks.len());
+    let mut parsed: Vec<ParsedTask> = Vec::with_capacity(tasks.len());
     for (i, t) in tasks.iter().enumerate() {
         let kind = t
             .get("kind")
@@ -300,17 +300,60 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        parsed.push((kind, task, context_blob, expected));
+        // FASE 2: `write_scope` dichiarato dal task (aree file che il sub-run
+        // scrive). Assente/vuoto -> `subtasks_are_disjoint` degradera' a false ->
+        // ramo sequenziale (sicuro). Fonte: `Todo.write_scope` in `dispatch_wave`.
+        let write_scope: Vec<String> = t
+            .get("write_scope")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        parsed.push(ParsedTask {
+            kind,
+            task,
+            context_blob,
+            expected,
+            write_scope,
+        });
     }
 
+    // ── Gating isolamento (regola G + L): il ramo ISOLATO scatta SOLO se
+    //    (1) il flag DB `orchestrator.subagent_isolation_enabled` e' ON (cache 60s)
+    //        E la root del progetto e' isolabile (probe git fail-closed), E
+    //    (2) i `write_scope` dei task sono banalmente disgiunti (funzione pura di
+    //        PR1, punto unico). Altrimenti DEGRADA al ramo sequenziale/condiviso
+    //        (identico a oggi). Con flag OFF (default) -> sempre sequenziale ->
+    //        comportamento BIT-IDENTICO. ─────────────────────────────────────────
+    //
+    // DETERMINISMO/REPLAY: questo intero handler gira SOLO in `ExecMode::Real`. In
+    // Replay/Shadow il `ToolExecutorAdapter` rilegge il tool_result di
+    // `dispatch_subagents` da `agent_steps` (`execute_replay`) senza mai chiamare
+    // `execute_real`: il ramo isolato (worktree/apply, side-effect Real-only) non
+    // viene mai ricreato in shadow -> nessuna divergenza. L'apply e' l'unica fonte
+    // del commit e avviene solo qui, in Real.
+    let scopes: Vec<Vec<String>> = parsed.iter().map(|p| p.write_scope.clone()).collect();
+    // I/O (flag DB + probe git) separato dalla decisione pura: il probe scatta solo
+    // se il flag e' ON (compute_isolation_available corto-circuita), poi la
+    // disgiunzione e' pura e testabile (should_isolate_batch).
+    let isolation_available = compute_isolation_available(ctx).await;
+    if should_isolate_batch(isolation_available, &scopes) {
+        return run_batch_isolated(ctx, &parsed, max_parallel).await;
+    }
+
+    // ── Ramo sequenziale/condiviso (invariato) ────────────────────────────────
     // Esecuzione a ondate concorrenti (cap conservativo). I guard per-sub
     // (enabled/whitelist/depth/cost) sono valutati per ogni sub-run; nel batch
     // il cost cap e' best-effort (race tollerata dato il cap conservativo).
     let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
     for wave in parsed.chunks(max_parallel) {
-        let futs = wave
-            .iter()
-            .map(|(k, ta, c, e)| run_single_subagent(ctx, k, ta, c, e));
+        let futs = wave.iter().map(|p| {
+            run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None)
+        });
         let wave_res = futures::future::join_all(futs).await;
         results.extend(wave_res);
     }
@@ -323,6 +366,378 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         "results": results,
     })
     .to_string()
+}
+
+/// Un task del batch, parsato dall'input del tool. `write_scope` alimenta il gating
+/// dell'isolamento fisico (FASE 2).
+struct ParsedTask {
+    kind: String,
+    task: String,
+    context_blob: String,
+    expected: String,
+    write_scope: Vec<String>,
+}
+
+/// Chiave della setting kill-switch dell'isolamento fisico (regola G, opt-in).
+const ISOLATION_ENABLED_SETTING: &str = "orchestrator.subagent_isolation_enabled";
+
+/// TTL della cache del flag isolamento. Allineato ai 60s degli altri letti-da-DB
+/// (routing matrix, capability, orchestration): stesso orizzonte di refresh.
+const ISOLATION_FLAG_TTL_SECS: u64 = 60;
+
+/// Cache 60s a livello processo del solo flag booleano `subagent_isolation_enabled`
+/// (regola L: punto unico cache = `nexus_cache::TtlCache`; regola G: unica fonte
+/// DB). Chiave costante: il flag e' globale (non per-progetto).
+static ISOLATION_FLAG_CACHE: std::sync::OnceLock<nexus_cache::TtlCache<(), bool>> =
+    std::sync::OnceLock::new();
+
+fn isolation_flag_cache() -> &'static nexus_cache::TtlCache<(), bool> {
+    ISOLATION_FLAG_CACHE
+        .get_or_init(|| nexus_cache::TtlCache::new(std::time::Duration::from_secs(ISOLATION_FLAG_TTL_SECS)))
+}
+
+/// Legge il flag `orchestrator.subagent_isolation_enabled` (default false) con
+/// cache 60s. DB down o chiave assente -> `false` (fail-safe: nessun isolamento,
+/// ramo sequenziale come oggi).
+async fn isolation_flag_enabled(ctx: &AgentToolContext) -> bool {
+    if let Some(v) = isolation_flag_cache().get(&()) {
+        return v;
+    }
+    let enabled = nexus_auth::get_bool_setting(&ctx.core.db, ISOLATION_ENABLED_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    isolation_flag_cache().insert((), enabled);
+    enabled
+}
+
+/// Isolamento DISPONIBILE per questo batch (regola G): flag DB ON (cache 60s) AND
+/// la root del progetto e' un repo git in cui `git worktree` e' utilizzabile
+/// (probe FAIL-CLOSED, punto unico `nexus_tool_kit::worktree::probe_isolatable`).
+/// Corto-circuito: se `is_git_repo` (dalla sessione) e' false, niente probe git
+/// (nessun I/O sul path caldo su progetti non-git). Flag OFF -> `false` senza
+/// alcun probe.
+async fn compute_isolation_available(ctx: &AgentToolContext) -> bool {
+    if !isolation_flag_enabled(ctx).await {
+        return false;
+    }
+    if !ctx.core.is_git_repo {
+        return false;
+    }
+    nexus_tool_kit::worktree::probe_isolatable(&ctx.core.root_path).await
+}
+
+/// Decisione PURA del gating isolamento (regola L + M, testabile senza I/O): il
+/// ramo isolato scatta SOLO se l'isolamento e' disponibile (flag ON + root
+/// isolabile, gia' risolto a monte) E i `write_scope` dei task sono banalmente
+/// disgiunti (funzione pura di PR1, punto unico). Con `isolation_available=false`
+/// (flag OFF, default) ritorna SEMPRE false -> ramo sequenziale -> bit-identico.
+fn should_isolate_batch(isolation_available: bool, scopes: &[Vec<String>]) -> bool {
+    isolation_available && nexus_agent_graph::decisions::subtasks_are_disjoint(scopes)
+}
+
+/// Esegue il batch di sub-run in ISOLAMENTO FISICO (FASE 2). Precondizione (gia'
+/// verificata dal chiamante): flag ON, root isolabile, `write_scope` disgiunti.
+///
+/// Flusso (regola H, mai toppe):
+///  1. GC best-effort dei worktree orfani del progetto (evita accumulo su crash).
+///  2. `base = head_commit(root)` una volta per il batch (persistito per replay).
+///  3. Per ogni task: crea un worktree effimero e prenota la row sub-run.
+///  4. Esegue i sub-run IN PARALLELO (a ondate `max_parallel`), ciascuno con
+///     `working_root = Some(worktree)` -> ctx isolato (autocommit/reindex soppressi).
+///  5. Dopo che TUTTI sono terminati, APPLY SERIALIZZATO (un worktree alla volta,
+///     mai concorrente: index/refs `.git` condivisi) via `apply_worktree_atomic`.
+///     - Applied  -> raccoglie i file promossi per il reindex-once.
+///     - Conflict -> quel sub-run e' marcato fallito (root intatta), gli altri
+///                   proseguono (fail-loud, regola M: esito da `ApplyOutcome`).
+///     - NoChanges-> nulla da promuovere.
+///  6. Reindex UNA volta sui soli file realmente promossi alla root.
+///  7. CLEANUP GARANTITO: `remove_worktree` per OGNI handle in OGNI esito (il
+///     cleanup e' esplicito e async — mai Drop sincrono su runtime tokio, finding
+///     del design; teardown idempotente e tollerante ai lock Windows).
+async fn run_batch_isolated(
+    ctx: &AgentToolContext,
+    parsed: &[ParsedTask],
+    max_parallel: usize,
+) -> String {
+    let root = ctx.core.root_path.clone();
+    let project_id = ctx.core.project_id;
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&ctx.core.db, project_id).await;
+
+    // (0) LOCK PER-ROOT CROSS-BATCH (regola H + L, punto unico in worktree.rs):
+    //     serializza l'INTERA sezione che tocca l'area `.git`/worktree condivisa del
+    //     progetto (GC -> creazione worktree -> ondate -> apply -> cleanup). Due batch
+    //     isolati concorrenti sullo STESSO progetto (session distinte, stessa
+    //     project_root: la guardia 409 e' per-session, non per-progetto) vengono
+    //     serializzati qui. Chiude insieme D1 (merge/commit concorrenti sulla stessa
+    //     .git -> index corrotto) e D2 (il GC di un batch che cancella i worktree in
+    //     volo di un altro: quando il secondo batch ottiene il lock, il primo ha gia'
+    //     applicato e ripulito i suoi worktree). Il guard e' `OwnedMutexGuard<()>`
+    //     (Send, `'static`): tenerlo attraverso i `.await` delle ondate join_all e'
+    //     corretto. Rilascio naturale a fine funzione (Drop).
+    let _root_guard = nexus_tool_kit::worktree::lock_project_root(&root).await;
+
+    // (1) GC orfani: bonifica i worktree residui di batch PRECEDENTI (crash / remove
+    //     fallito). Preserva i worktree dei sub-run ancora `running` (batch
+    //     concorrente sullo stesso progetto): passiamo come "attivi" i loro run_id
+    //     dal DB, cosi' il GC non tocca risorse legittime (regola E). Best-effort.
+    let active_run_ids = running_subagent_ids(&proj_pool, project_id).await;
+    let removed = nexus_tool_kit::worktree::gc_orphan_worktrees(&root, &active_run_ids).await;
+    if removed > 0 {
+        tracing::info!(
+            target: "mcp_core::subagent_native",
+            removed,
+            "isolamento: GC ha bonificato worktree orfani prima del batch"
+        );
+    }
+
+    // (2) base commit del batch (una volta, riusato da ogni worktree e in replay).
+    let base_commit = match nexus_tool_kit::worktree::head_commit(&root).await {
+        Ok(b) => b,
+        Err(e) => {
+            // Impossibile risolvere HEAD: degrada al ramo sequenziale (mai fallire
+            // l'intero batch per un problema di setup isolamento).
+            tracing::warn!(
+                target: "mcp_core::subagent_native",
+                error = %e,
+                "isolamento: head_commit fallito, degrado a sequenziale"
+            );
+            return run_batch_sequential(ctx, parsed, max_parallel).await;
+        }
+    };
+
+    // (3) Crea un worktree per ogni task, PRIMA dell'esecuzione. Se la creazione di
+    //     uno fallisce, degrada l'intero batch a sequenziale (cleanup di quelli gia'
+    //     creati garantito) — mai un batch a isolamento parziale.
+    let mut handles: Vec<nexus_tool_kit::worktree::WorktreeHandle> =
+        Vec::with_capacity(parsed.len());
+    for _ in parsed {
+        let run_id = Uuid::new_v4();
+        match nexus_tool_kit::worktree::create_ephemeral_worktree(&root, run_id, &base_commit).await
+        {
+            Ok(h) => handles.push(h),
+            Err(e) => {
+                tracing::warn!(
+                    target: "mcp_core::subagent_native",
+                    error = %e,
+                    "isolamento: create_ephemeral_worktree fallito, degrado a sequenziale"
+                );
+                // Cleanup dei worktree gia' creati prima di degradare.
+                for h in &handles {
+                    let _ = nexus_tool_kit::worktree::remove_worktree(h).await;
+                }
+                return run_batch_sequential(ctx, parsed, max_parallel).await;
+            }
+        }
+    }
+
+    // (4) Esecuzione PARALLELA a ondate, ogni sub-run sul proprio worktree.
+    let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
+    for wave in parsed
+        .iter()
+        .zip(handles.iter())
+        .collect::<Vec<_>>()
+        .chunks(max_parallel)
+    {
+        let futs = wave.iter().map(|(p, h)| {
+            let slot = IsolationSlot {
+                run_id: h.run_id,
+                worktree_path: h.path.clone(),
+                base_commit: h.base_commit.clone(),
+            };
+            async move {
+                run_single_subagent(
+                    ctx,
+                    &p.kind,
+                    &p.task,
+                    &p.context_blob,
+                    &p.expected,
+                    Some(&slot),
+                )
+                .await
+            }
+        });
+        let wave_res = futures::future::join_all(futs).await;
+        results.extend(wave_res);
+    }
+
+    // (5) APPLY SERIALIZZATO (un worktree alla volta, mai concorrente) + raccolta
+    //     dei file promossi per il reindex-once. Solo i sub-run RIUSCITI (nessun
+    //     campo "error" nel result) vengono applicati; un sub-run fallito lascia il
+    //     suo worktree scartato = rollback naturale.
+    let mut promoted: Vec<String> = Vec::new();
+    for (idx, (result, handle)) in results.iter_mut().zip(handles.iter()).enumerate() {
+        if result.get("error").is_some() {
+            continue; // sub-run fallito: niente apply (worktree scartato).
+        }
+        match nexus_tool_kit::worktree::apply_worktree_atomic(&root, handle).await {
+            Ok(nexus_tool_kit::worktree::ApplyOutcome::Applied) => {
+                promoted.extend(nexus_tool_kit::worktree::promoted_files(handle).await);
+            }
+            Ok(nexus_tool_kit::worktree::ApplyOutcome::NoChanges) => {}
+            Ok(nexus_tool_kit::worktree::ApplyOutcome::Conflict { files }) => {
+                // Esito strutturato (regola M): il sub-run e' fallito per conflitto,
+                // la root e' intatta (merge --abort), gli altri proseguono.
+                tracing::warn!(
+                    target: "mcp_core::subagent_native",
+                    task_index = idx,
+                    conflicted_files = ?files,
+                    "isolamento: apply in CONFLITTO, root intatta, sub-run marcato fallito"
+                );
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("status".into(), json!("conflict"));
+                    obj.insert(
+                        "error".into(),
+                        json!(format!("apply in conflitto su {} file", files.len())),
+                    );
+                    obj.insert("conflicted_files".into(), json!(files));
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "mcp_core::subagent_native",
+                    task_index = idx,
+                    error = %e,
+                    "isolamento: apply fallito (errore git), sub-run marcato fallito"
+                );
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("status".into(), json!("apply_failed"));
+                    obj.insert("error".into(), json!(format!("apply fallito: {e}")));
+                }
+            }
+        }
+    }
+
+    // (6) CLEANUP GARANTITO di OGNI worktree, in OGNI esito (successo, conflitto,
+    //     errore). Esplicito e async (mai Drop sincrono). Idempotente e tollerante
+    //     ai lock Windows (remove --force nel modulo).
+    for handle in &handles {
+        if let Err(e) = nexus_tool_kit::worktree::remove_worktree(handle).await {
+            tracing::warn!(
+                target: "mcp_core::subagent_native",
+                run_id = %handle.run_id,
+                error = %e,
+                "isolamento: cleanup worktree fallito (verra' ripreso dal GC al prossimo batch)"
+            );
+        }
+    }
+
+    // (7) Reindex UNA volta sui soli file promossi alla root (dedup dei path: piu'
+    //     sub-run potrebbero aver toccato lo stesso file solo se non-disgiunti, che
+    //     qui non accade, ma il dedup e' innocuo e barato).
+    reindex_promoted_once(ctx, &promoted).await;
+
+    let ok = results.iter().filter(|r| r.get("error").is_none()).count();
+    json!({
+        "count": results.len(),
+        "ok": ok,
+        "failed": results.len() - ok,
+        "isolated": true,
+        "promoted_files": promoted.len(),
+        "results": results,
+    })
+    .to_string()
+}
+
+/// Ramo sequenziale/condiviso estratto per il degrado dall'isolamento (stessa
+/// logica del ramo principale di `tool_dispatch_subagents`, punto unico). `None`
+/// come `working_root` -> comportamento invariato.
+async fn run_batch_sequential(
+    ctx: &AgentToolContext,
+    parsed: &[ParsedTask],
+    max_parallel: usize,
+) -> String {
+    let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
+    for wave in parsed.chunks(max_parallel) {
+        let futs = wave.iter().map(|p| {
+            run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None)
+        });
+        let wave_res = futures::future::join_all(futs).await;
+        results.extend(wave_res);
+    }
+    let ok = results.iter().filter(|r| r.get("error").is_none()).count();
+    json!({
+        "count": results.len(),
+        "ok": ok,
+        "failed": results.len() - ok,
+        "results": results,
+    })
+    .to_string()
+}
+
+/// Reindex UNA volta i file effettivamente promossi alla root dopo l'apply
+/// serializzato (i sub-run isolati hanno il reindex per-scrittura SOPPRESSO in PR3).
+/// Punto unico di reindex (regola L): `crate::projects::reindex_single_file`.
+///
+/// `promoted` (da `git diff --name-only base..branch`) INCLUDE anche i file
+/// CANCELLATI dal sub-run. Per un file cancellato `reindex_single_file` farebbe
+/// `read_to_string` -> Err scartato, lasciando i chunk vettoriali STANTII nell'indice
+/// semantico. Per questo, prima di reindicizzare, si controlla l'esistenza del file
+/// sul filesystem (segnale strutturato, regola M): se NON esiste, si cancellano i suoi
+/// punti dal code index via il punto unico ESISTENTE
+/// `vector_memory::delete_code_index_file_points` (regola L, stesso path relativo con
+/// separatori '/' che usa `indexing.rs`); se esiste, comportamento invariato.
+///
+/// Best-effort: un fallimento del reindex/cleanup non e' un errore del batch.
+async fn reindex_promoted_once(ctx: &AgentToolContext, promoted: &[String]) {
+    if promoted.is_empty() {
+        return;
+    }
+    // Dedup dei path (stabile, senza ordinare per non introdurre non-determinismo).
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let root = &ctx.core.root_path;
+    for rel in promoted {
+        if !seen.insert(rel.as_str()) {
+            continue;
+        }
+        let target = root.join(rel);
+        // File cancellato dal sub-run (promosso ma non piu' sul filesystem): purga i
+        // chunk dall'indice invece di tentare un reindex che fallirebbe in read.
+        match tokio::fs::try_exists(&target).await {
+            Ok(false) => {
+                let rel_slash = rel.replace('\\', "/");
+                let _ = crate::vector_memory::delete_code_index_file_points(
+                    &ctx.core.db,
+                    ctx.core.project_id,
+                    &rel_slash,
+                )
+                .await;
+            }
+            // Esiste (Ok(true)) o esito incerto (Err su try_exists): comportamento
+            // invariato, reindex del file promosso.
+            _ => {
+                let _ = crate::projects::reindex_single_file(
+                    &ctx.core.db,
+                    &ctx.neural,
+                    ctx.core.project_id,
+                    root,
+                    &target,
+                )
+                .await;
+            }
+        }
+    }
+    tracing::info!(
+        target: "mcp_core::subagent_native",
+        promoted = seen.len(),
+        "isolamento: reindex-once dei file promossi completato"
+    );
+}
+
+/// Run-id dei sub-run ancora `running` per il progetto (worktree potenzialmente
+/// vivi di un batch concorrente). Usati come whitelist del GC filesystem: il GC
+/// preserva le dir il cui run_id e' qui, rimuove le altre (regola E: mai toccare
+/// risorse legittime di un altro batch). Best-effort: DB down -> lista vuota (il
+/// GC diventa piu' aggressivo ma resta filtrato per la root del progetto).
+async fn running_subagent_ids(pool: &sqlx::PgPool, project_id: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM nexus_subagent_runs WHERE project_id = $1 AND status = 'running'",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
 }
 
 /// Tetto di sicurezza per l'ampiezza dell'ondata concorrente di sub-agenti.
@@ -343,15 +758,38 @@ async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
         .clamp(1, MAX_PARALLEL_HARD_CAP)
 }
 
+/// Slot di isolamento fisico di un sub-run (FASE 2): il worktree effimero
+/// pre-creato dal batch e i metadati da persistire su `nexus_subagent_runs` per
+/// audit/reconcile. `run_id` E' l'identita' del sub-run (row DB) E del worktree
+/// (dir/branch): un solo id per entrambi, cosi' il GC filesystem (dir name =
+/// run_id) e la row DB restano allineati.
+struct IsolationSlot {
+    /// Identita' condivisa row sub-run + worktree.
+    run_id: Uuid,
+    /// Path del worktree effimero (override root del sub-run).
+    worktree_path: std::path::PathBuf,
+    /// Commit da cui il worktree e' stato staccato (persistito per replay/reconcile).
+    base_commit: String,
+}
+
 /// Esegue UNA sub-run sul GRAFO NATIVO. Ritorna sempre un `Value`: il sommario in
 /// caso di successo, `{"error": "..."}` su guasto. Replica le guard del brain e
 /// mappa l'esito del run nativo al tool_result atteso dal main.
+///
+/// `isolation`: `None` (default, ramo sequenziale/condiviso) -> il sub-run scrive
+/// sulla root del progetto, il `run_id` e' generato dal DB (`DEFAULT`),
+/// comportamento invariato. `Some(slot)` (ramo ISOLATO, valorizzato solo dal batch
+/// parallelo di `tool_dispatch_subagents`) -> il sub-run usa `slot.run_id` come id,
+/// scrive nel worktree `slot.worktree_path` (ctx isolato: autocommit/reindex
+/// soppressi, PR3) e persiste `worktree_path`/`base_commit`. L'apply dei
+/// cambiamenti alla root e' responsabilita' SERIALIZZATA del chiamante batch.
 async fn run_single_subagent(
     ctx: &AgentToolContext,
     kind: &str,
     task: &str,
     context_blob: &str,
     expected_format: &str,
+    isolation: Option<&IsolationSlot>,
 ) -> Value {
     let db = &*ctx.core.db;
     let project_id = ctx.core.project_id;
@@ -452,24 +890,47 @@ async fn run_single_subagent(
 
     // ── Crea row in nexus_subagent_runs (status='running' subito: la catena depth
     //    si basa sui 'running'; il sub-run e' bloccante, non c'e' fase 'pending'
-    //    osservabile) ───────────────────────────────────────────────────────────
-    let subagent_run_id: Uuid = match sqlx::query_scalar(
-        r#"INSERT INTO nexus_subagent_runs
-           (parent_run_id, project_id, kind, task_description, context_blob, expected_format,
-            status, is_background, depth, source)
-           VALUES ($1, $2, $3, $4, $5, $6, 'running', false, $7, 'db')
-           RETURNING id"#,
-    )
-    .bind(anchor)
-    .bind(project_id)
-    .bind(kind)
-    .bind(task)
-    .bind(context_blob)
-    .bind(expected_format)
-    .bind(current_depth as i32)
-    .fetch_one(&proj_pool)
-    .await
-    {
+    //    osservabile). Nel ramo ISOLATO l'id e' quello del worktree (allineamento
+    //    row DB <-> dir/branch) e persistiamo worktree_path/base_commit per
+    //    audit/reconcile; nel ramo sequenziale l'id lo genera il DB (DEFAULT). ─────
+    let insert_res = match isolation {
+        Some(slot) => sqlx::query_scalar::<_, Uuid>(
+            r#"INSERT INTO nexus_subagent_runs
+               (id, parent_run_id, project_id, kind, task_description, context_blob, expected_format,
+                status, is_background, depth, source, worktree_path, base_commit)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, 'running', false, $8, 'db', $9, $10)
+               RETURNING id"#,
+        )
+        .bind(slot.run_id)
+        .bind(anchor)
+        .bind(project_id)
+        .bind(kind)
+        .bind(task)
+        .bind(context_blob)
+        .bind(expected_format)
+        .bind(current_depth as i32)
+        .bind(slot.worktree_path.to_string_lossy().to_string())
+        .bind(&slot.base_commit)
+        .fetch_one(&proj_pool)
+        .await,
+        None => sqlx::query_scalar::<_, Uuid>(
+            r#"INSERT INTO nexus_subagent_runs
+               (parent_run_id, project_id, kind, task_description, context_blob, expected_format,
+                status, is_background, depth, source)
+               VALUES ($1, $2, $3, $4, $5, $6, 'running', false, $7, 'db')
+               RETURNING id"#,
+        )
+        .bind(anchor)
+        .bind(project_id)
+        .bind(kind)
+        .bind(task)
+        .bind(context_blob)
+        .bind(expected_format)
+        .bind(current_depth as i32)
+        .fetch_one(&proj_pool)
+        .await,
+    };
+    let subagent_run_id: Uuid = match insert_res {
         Ok(id) => id,
         Err(e) => return json!({"error": format!("INSERT nexus_subagent_runs: {e}")}),
     };
@@ -509,11 +970,12 @@ async fn run_single_subagent(
         step_tx: sub_tx,
         parent_run_id: Some(anchor),
         subagent_depth: Some(current_depth),
-        // FASE 2: sub-run ANCORA su root condivisa (isolamento fisico spento in
-        // PR3). L'accensione (worktree effimero per-sub + apply atomico) e' PR4,
-        // al punto unico `tool_dispatch_subagents`: solo lì `working_root` diventa
-        // `Some(worktree)`. Qui resta `None` -> comportamento invariato.
-        working_root: None,
+        // FASE 2: override root del sub-run. `None` (ramo sequenziale/condiviso) ->
+        // scrive sulla root del progetto, comportamento invariato. `Some(worktree)`
+        // (ramo ISOLATO, valorizzato dal batch parallelo di
+        // `tool_dispatch_subagents`) -> scrive nel worktree effimero, ctx isolato
+        // (autocommit/reindex soppressi, PR3). L'apply serializzato e' del batch.
+        working_root: isolation.map(|s| s.worktree_path.clone()),
     };
 
     // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).
@@ -767,7 +1229,9 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
 
     // Ripresa = ri-esecuzione del sub-run sul kind dato. Riusa lo stesso percorso
     // del dispatch (guard + grafo nativo): semantica onesta, niente notifica brain.
-    let res = run_single_subagent(ctx, &kind, &task, &context_blob, &expected).await;
+    // Il resume gira SEMPRE sulla root condivisa (nessun isolamento fisico): la
+    // ripresa di un singolo sub-run non e' un batch parallelo-che-scrive.
+    let res = run_single_subagent(ctx, &kind, &task, &context_blob, &expected, None).await;
     res.to_string()
 }
 
@@ -818,5 +1282,119 @@ mod tests {
         let out = compact_summary(&lungo);
         assert!(out.ends_with(TRUNC_SUFFIX));
         assert!(out.chars().count() <= 600);
+    }
+
+    fn sc(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn should_isolate_batch_flag_off_sempre_sequenziale() {
+        // Con isolamento NON disponibile (flag OFF, default) il ramo isolato non
+        // scatta MAI, qualunque siano gli scope -> bit-identico allo storico.
+        let scopes = vec![sc(&["crates/a"]), sc(&["crates/b"])];
+        assert!(
+            !should_isolate_batch(false, &scopes),
+            "flag OFF -> sempre sequenziale"
+        );
+        // Anche con scope vuoti / sovrapposti resta false (irrilevante a flag OFF).
+        assert!(!should_isolate_batch(false, &[sc(&["src/a"]), sc(&["src/a"])]));
+        assert!(!should_isolate_batch(false, &[]));
+    }
+
+    #[test]
+    fn should_isolate_batch_flag_on_solo_se_disgiunti() {
+        // Disponibile + scope disgiunti -> ISOLATO.
+        assert!(should_isolate_batch(
+            true,
+            &[sc(&["crates/a"]), sc(&["crates/b"])]
+        ));
+        // Disponibile ma scope SOVRAPPOSTI -> degrada a sequenziale.
+        assert!(!should_isolate_batch(
+            true,
+            &[sc(&["src/a"]), sc(&["src/a/b"])]
+        ));
+        // Disponibile ma uno scope VUOTO (nessun write_scope dichiarato: caso di
+        // dispatch_wave finche' la colonna DB non e' persistita) -> sequenziale.
+        assert!(!should_isolate_batch(true, &[sc(&["src/a"]), sc(&[])]));
+        // Disponibile ma scope tocca la denylist (lockfile) -> sequenziale.
+        assert!(!should_isolate_batch(
+            true,
+            &[sc(&["Cargo.lock"]), sc(&["crates/b"])]
+        ));
+    }
+
+    /// Copertura del ramo DELETE di `reindex_promoted_once` (D3): il branch e'
+    /// governato dal segnale strutturato `tokio::fs::try_exists` sul path promosso
+    /// (regola M, niente parsing). `reindex_promoted_once` non e' isolabile
+    /// (dipende da `AgentToolContext` = DB + neural), quindi si verifica qui il
+    /// predicato che seleziona il ramo: un file promosso ma CANCELLATO risulta
+    /// `try_exists == Ok(false)` (-> ramo delete via
+    /// `vector_memory::delete_code_index_file_points`); un file esistente risulta
+    /// `Ok(true)` (-> ramo reindex invariato).
+    #[tokio::test]
+    async fn reindex_promoted_delete_branch_su_file_inesistente() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+
+        // File promosso ma cancellato: NON esiste sul filesystem -> ramo delete.
+        let cancellato = root.join("src").join("rimosso.rs");
+        assert_eq!(
+            tokio::fs::try_exists(&cancellato).await.unwrap(),
+            false,
+            "un file promosso ma cancellato deve risultare inesistente -> ramo delete"
+        );
+
+        // File promosso ancora presente: esiste -> ramo reindex (invariato).
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let presente = root.join("src").join("vivo.rs");
+        std::fs::write(&presente, "// vivo\n").expect("write vivo");
+        assert_eq!(
+            tokio::fs::try_exists(&presente).await.unwrap(),
+            true,
+            "un file promosso ancora presente deve risultare esistente -> ramo reindex"
+        );
+
+        // Normalizzazione path relativo a separatori '/' (come indexing.rs), input di
+        // delete_code_index_file_points.
+        let rel = "src\\rimosso.rs";
+        assert_eq!(rel.replace('\\', "/"), "src/rimosso.rs");
+    }
+
+    /// Il parse dei task del batch estrae `write_scope` dal JSON (alimenta il
+    /// gating). Verifica la forma del Value costruito da `dispatch_wave`.
+    #[test]
+    fn write_scope_parsato_dal_task_json() {
+        let t = json!({
+            "kind": "coder",
+            "task": "x",
+            "write_scope": ["crates/a", "docs/a.md"],
+        });
+        let ws: Vec<String> = t
+            .get("write_scope")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(ws, sc(&["crates/a", "docs/a.md"]));
+
+        // Task senza write_scope -> vec vuoto -> gating degrada a sequenziale.
+        let t2 = json!({ "kind": "coder", "task": "y" });
+        let ws2: Vec<String> = t2
+            .get("write_scope")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(ws2.is_empty());
+        assert!(!should_isolate_batch(true, &[ws2]));
     }
 }

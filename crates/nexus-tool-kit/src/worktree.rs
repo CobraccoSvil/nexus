@@ -30,7 +30,9 @@
 //! worktree alla volta puo' essere applicato alla stessa root.
 
 use crate::exec::{run_cmd, CmdOutput};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
 /// Timeout (secondi) per le singole invocazioni git di questo modulo. Le
@@ -42,6 +44,61 @@ const GIT_TIMEOUT_SECS: u64 = 120;
 /// i worktree effimeri Nexus. Sta un livello sopra la project_root perche' git
 /// non consente di annidare un worktree dentro il working tree del repo stesso.
 const WORKTREE_BASE_NAME: &str = ".nexus-worktrees";
+
+/// Registry in-process dei lock per-root (punto unico di serializzazione, regola L).
+/// Mappa `project_root` CANONICALIZZATA -> `Arc<tokio::sync::Mutex<()>>`. Il `Mutex`
+/// std esterno protegge SOLO la HashMap (lock brevissimo: get/insert dell'`Arc`); la
+/// mutua esclusione vera e propria e' sull'`Arc<tokio::sync::Mutex<()>>` (async-aware,
+/// tenibile attraverso i `.await`). Il registry non viene mai svuotato: il numero di
+/// root distinte in un processo e' piccolo e limitato ai progetti attivi.
+static ROOT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+fn root_locks() -> &'static Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> {
+    ROOT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Chiave di lock per una root: la forma CANONICALIZZATA del path, cosi' che due
+/// path equivalenti (relativi/assoluti, symlink, `.`/`..`) mappino allo STESSO lock.
+/// Fallback al path pulito (`to_path_buf`) se `canonicalize` fallisce (root non ancora
+/// esistente, permessi): resta deterministico per uno stesso input.
+fn lock_key(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// Acquisisce il lock per-root CROSS-batch (punto unico, regola L + H). Soddisfa il
+/// contratto di serializzazione di [`apply_worktree_atomic`] a livello CROSS-batch:
+/// un solo chiamante alla volta puo' toccare l'area `.git`/worktree condivisa di una
+/// data `root`. Due batch isolati concorrenti sullo STESSO progetto (session distinte,
+/// stessa `project_root`) vengono serializzati qui: il secondo attende che il primo
+/// rilasci il guard.
+///
+/// Il guard va tenuto per TUTTA la sezione che tocca l'area condivisa (GC orfani ->
+/// creazione worktree -> esecuzione ondate -> apply serializzato -> cleanup). Il
+/// rilascio e' naturale a fine scope (Drop dell'[`tokio::sync::OwnedMutexGuard`]).
+///
+/// Restituisce un [`tokio::sync::OwnedMutexGuard`] (`lock_owned`, non `lock`): il
+/// guard `owned` e' `'static` e `Send` (T = `()`), quindi puo' essere tenuto attraverso
+/// i `.await` delle ondate parallele (`join_all`) senza vincoli di lifetime prestato.
+///
+/// Nessun rischio di deadlock/re-entrancy: i sub-run isolati girano in una
+/// `working_root` DIVERSA (il worktree effimero), mai sulla stessa `root` di questo
+/// lock, quindi non c'e' annidamento dello stesso lock nello stesso task.
+pub async fn lock_project_root(root: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let key = lock_key(root);
+    let arc = {
+        // Lock std brevissimo: solo per leggere/creare l'Arc nella HashMap. In caso
+        // di poison (panic di un altro thread mentre teneva questo lock std) si
+        // recupera comunque la HashMap: il dato protetto e' un registry di Arc, non
+        // uno stato che il panic possa aver lasciato incoerente.
+        let mut map = root_locks().lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    arc.lock_owned().await
+}
 
 /// Errore strutturato del modulo worktree. `thiserror` per il tipo, il chiamante
 /// propaga con `?`. Nessun `unwrap`/`expect` fuori dai test.
@@ -250,7 +307,10 @@ pub async fn create_ephemeral_worktree(
 /// # Serializzazione (contratto del chiamante)
 /// L'apply NON e' sicuro se eseguito in concorrenza su piu' worktree verso la
 /// STESSA root: index e refs `.git` sono condivisi. Il chiamante DEVE serializzare
-/// gli apply (es. un `Mutex` per-root), applicando un worktree alla volta.
+/// gli apply, applicando un worktree alla volta. Il punto unico di serializzazione
+/// per-root, valido anche CROSS-batch (batch concorrenti sullo stesso progetto), e'
+/// [`lock_project_root`]: acquisirlo prima di toccare l'area `.git`/worktree e
+/// tenerlo per l'intera sezione (GC + creazione + apply + cleanup).
 pub async fn apply_worktree_atomic(root: &Path, handle: &WorktreeHandle) -> Result<ApplyOutcome> {
     // 1. Stage di tutti i cambiamenti nel worktree.
     git("add -A", &["add", "-A"], &handle.path).await?;
@@ -384,6 +444,106 @@ pub async fn remove_worktree(handle: &WorktreeHandle) -> Result<()> {
     let _ = run_cmd("git", &["worktree", "prune"], root, GIT_TIMEOUT_SECS).await;
 
     Ok(())
+}
+
+/// Elenca i file che il branch effimero del sub-run ha modificato rispetto al
+/// `base_commit`, in path RELATIVI alla root del progetto. Serve al chiamante per
+/// il reindex-once post-apply (i sub-run isolati hanno il reindex per-scrittura
+/// SOPPRESSO in PR3: l'indice del progetto si aggiorna UNA volta qui, solo sui
+/// file realmente promossi).
+///
+/// Segnale strutturato dal `diff --name-only` (regola M): niente parsing di prosa,
+/// solo la lista file emessa da git. Va chiamata DOPO un [`ApplyOutcome::Applied`]
+/// (il branch effimero contiene gia' il commit del delta) e PRIMA del cleanup.
+/// Best-effort: su fallimento del diff ritorna lista vuota (il reindex-once sara'
+/// no-op, mai un errore bloccante del sub-run).
+pub async fn promoted_files(handle: &WorktreeHandle) -> Vec<String> {
+    match run_cmd(
+        "git",
+        &[
+            "diff",
+            "--name-only",
+            &handle.base_commit,
+            &handle.branch,
+        ],
+        &handle.project_root,
+        GIT_TIMEOUT_SECS,
+    )
+    .await
+    {
+        Ok(out) if out.success() => out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// GC best-effort dei worktree effimeri ORFANI di un progetto (regola H: mai
+/// accumulo su crash; regola E: filtrato per la root del progetto, mai un glob su
+/// tutta l'area worktree condivisa fra progetti).
+///
+/// Scandisce `<project_root>/../.nexus-worktrees/` e rimuove ogni sottodir il cui
+/// nome (un `run_id`) NON e' in `active_run_ids`: sono worktree di sub-run non piu'
+/// attivi (terminati regolarmente ma non ripuliti per crash, oppure lasciati da un
+/// `remove` fallito a runtime). Per ognuno esegue lo stesso teardown idempotente di
+/// [`remove_worktree`] (worktree remove --force -> branch -D -> prune) e, se la dir
+/// resiste (metadati git gia' assenti), la rimuove dal filesystem.
+///
+/// `git worktree prune` incondizionato ripulisce comunque i metadati di worktree la
+/// cui dir e' gia' sparita. Ritorna il numero di worktree orfani effettivamente
+/// bonificati (per audit/log). Nessun errore propagato: e' manutenzione.
+pub async fn gc_orphan_worktrees(project_root: &Path, active_run_ids: &[Uuid]) -> usize {
+    // prune incondizionato: ripulisce i metadati di worktree la cui dir e' gia'
+    // stata rimossa (crash a meta' cleanup).
+    let _ = run_cmd("git", &["worktree", "prune"], project_root, GIT_TIMEOUT_SECS).await;
+
+    let base_dir = match worktree_base_dir(project_root) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    let read_dir = match std::fs::read_dir(&base_dir) {
+        Ok(rd) => rd,
+        // Area worktree assente: niente da bonificare (caso comune).
+        Err(_) => return 0,
+    };
+
+    let mut removed = 0usize;
+    for entry in read_dir.flatten() {
+        let dir_name = entry.file_name();
+        let name = dir_name.to_string_lossy();
+        // Il nome della dir e' il run_id del sub-run proprietario. Se non e' un
+        // UUID (dir estranea), la lasciamo stare: regola E, non tocchiamo risorse
+        // che non abbiamo creato noi.
+        let Ok(run_id) = Uuid::parse_str(name.trim()) else {
+            continue;
+        };
+        if active_run_ids.contains(&run_id) {
+            // Sub-run ancora attivo: il suo worktree e' legittimo, non toccare.
+            continue;
+        }
+        let wt_path = entry.path();
+        // Teardown idempotente come remove_worktree, ricostruendo il branch dal
+        // run_id (stesso schema di ephemeral_branch).
+        let handle = WorktreeHandle {
+            path: wt_path.clone(),
+            base_commit: String::new(),
+            project_root: project_root.to_path_buf(),
+            run_id,
+            branch: ephemeral_branch(run_id),
+        };
+        let _ = remove_worktree(&handle).await;
+        // Se la dir resiste (worktree gia' scollegato dai metadati git), rimuovila
+        // dal filesystem: best-effort, sotto l'area controllata del progetto.
+        if wt_path.exists() {
+            let _ = std::fs::remove_dir_all(&wt_path);
+        }
+        removed += 1;
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -579,5 +739,145 @@ mod tests {
         remove_worktree(&handle).await.expect("primo remove");
         // Seconda chiamata su handle gia' rimosso: non deve fallire.
         remove_worktree(&handle).await.expect("remove idempotente");
+    }
+
+    #[tokio::test]
+    async fn promoted_files_elenca_delta_del_subrun() {
+        let (_td, root) = temp_repo();
+        let run_id = Uuid::new_v4();
+        let base = head_commit(&root).await.expect("head");
+        let handle = create_ephemeral_worktree(&root, run_id, &base)
+            .await
+            .expect("create worktree");
+
+        // Due file nuovi nel worktree (scope disgiunto dalla root).
+        std::fs::create_dir_all(handle.path.join("src")).expect("mkdir src");
+        std::fs::write(handle.path.join("src/a.rs"), "// a\n").expect("write a");
+        std::fs::write(handle.path.join("src/b.rs"), "// b\n").expect("write b");
+
+        // Applica: commit effimero nel branch + merge sulla root.
+        let outcome = apply_worktree_atomic(&root, &handle).await.expect("apply");
+        assert_eq!(outcome, ApplyOutcome::Applied);
+
+        let mut files = promoted_files(&handle).await;
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            "i file promossi devono essere i soli modificati dal sub-run, relativi alla root"
+        );
+
+        remove_worktree(&handle).await.expect("remove");
+    }
+
+    #[tokio::test]
+    async fn lock_stessa_root_canonicalizzata_stesso_arc() {
+        // Due path che canonicalizzano alla STESSA root reale devono mappare allo
+        // STESSO Arc (stesso lock): la mutua esclusione e' effettiva anche con path
+        // scritti in forme equivalenti.
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        // Forma equivalente della stessa root: <root>/. (canonicalize la normalizza).
+        let root_dot = root.join(".");
+
+        // Recupera gli Arc dal registry (non teniamo i guard: qui misuriamo l'identita'
+        // dell'Arc nel registry, non il blocco).
+        let arc_a = {
+            let key = lock_key(&root);
+            let mut map = root_locks().lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(
+                map.entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let arc_b = {
+            let key = lock_key(&root_dot);
+            let mut map = root_locks().lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(
+                map.entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        assert!(
+            Arc::ptr_eq(&arc_a, &arc_b),
+            "path equivalenti (canonicalizzati) devono condividere lo stesso lock"
+        );
+
+        // Una root DIVERSA deve avere un Arc diverso.
+        let other = td.path().join("altro");
+        std::fs::create_dir_all(&other).expect("mkdir altro");
+        let arc_other = {
+            let key = lock_key(&other);
+            let mut map = root_locks().lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(
+                map.entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        assert!(
+            !Arc::ptr_eq(&arc_a, &arc_other),
+            "root diverse devono avere lock distinti"
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_project_root_e_mutuamente_esclusivo() {
+        // Acquisito il lock su una root, un secondo tentativo sulla STESSA root deve
+        // restare bloccato finche' il primo guard non e' droppato.
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().join("proj");
+        std::fs::create_dir_all(&root).expect("mkdir proj");
+
+        let guard = lock_project_root(&root).await;
+
+        // Secondo tentativo entro un timeout breve: deve andare in timeout (bloccato).
+        let bloccato = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            lock_project_root(&root),
+        )
+        .await;
+        assert!(
+            bloccato.is_err(),
+            "il secondo lock sulla stessa root deve restare bloccato finche' il primo e' vivo"
+        );
+
+        // Rilascia il primo guard: ora il secondo tentativo deve riuscire subito.
+        drop(guard);
+        let riuscito = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            lock_project_root(&root),
+        )
+        .await;
+        assert!(
+            riuscito.is_ok(),
+            "dopo il drop del primo guard il lock deve essere riacquisibile"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_rimuove_orfani_ma_preserva_attivi() {
+        let (_td, root) = temp_repo();
+        let base = head_commit(&root).await.expect("head");
+        let attivo = Uuid::new_v4();
+        let orfano = Uuid::new_v4();
+
+        let h_attivo = create_ephemeral_worktree(&root, attivo, &base)
+            .await
+            .expect("create attivo");
+        let h_orfano = create_ephemeral_worktree(&root, orfano, &base)
+            .await
+            .expect("create orfano");
+        assert!(h_attivo.path.exists());
+        assert!(h_orfano.path.exists());
+
+        // GC con solo `attivo` nella lista dei run attivi: l'orfano va rimosso.
+        let removed = gc_orphan_worktrees(&root, &[attivo]).await;
+        assert_eq!(removed, 1, "solo l'orfano deve essere bonificato");
+        assert!(h_attivo.path.exists(), "il worktree attivo NON deve essere toccato");
+        assert!(!h_orfano.path.exists(), "il worktree orfano deve essere rimosso");
+
+        remove_worktree(&h_attivo).await.expect("cleanup attivo");
     }
 }

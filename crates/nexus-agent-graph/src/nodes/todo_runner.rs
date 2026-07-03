@@ -525,6 +525,12 @@ impl TodoRunnerNode {
                 "context": blob,
                 "expected_output_format":
                     "riepilogo conciso delle modifiche applicate e dell'esito",
+                // FASE 2 (PR4): aree file dichiarate dal todo. Alimenta il gating
+                // dell'isolamento fisico nel punto unico `tool_dispatch_subagents`
+                // (`subtasks_are_disjoint`). Assente/vuoto (finche' la colonna
+                // `nexus_agent_todos.write_scope` non e' persistita) -> il gating
+                // degrada a sequenziale (sicuro come oggi).
+                "write_scope": t.write_scope,
             }));
         }
 
