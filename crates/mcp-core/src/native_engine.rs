@@ -96,7 +96,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use nexus_agent_graph::nodes::{
-    ExecutorConfig, ExecutorNode, ScaleControlNode, StallRecoveryNode, VerifierConfig,
+    ExecutorConfig, ExecutorNode, ScaleConfig, ScaleControlNode, StallRecoveryNode, VerifierConfig,
     VerifierNode,
 };
 use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
@@ -688,6 +688,23 @@ async fn load_executor_config(
         // e' il cap duro anti meta-loop/costo del gate.
         stall_recovery_enabled: setting_bool(db, "agent.stall_recovery.enabled", d.stall_recovery_enabled).await,
         stall_recovery_max_moves_per_session: setting_i64(db, "agent.stall_recovery.max_moves_per_session", d.stall_recovery_max_moves_per_session).await,
+        // ── Scale-controller (mig 0516, opt-in DB, regola G) ──────────────────
+        // Con enabled=false (default) il detector-emissione dell'executor salta
+        // PRIMA di ogni lavoro -> nessun ScaleReason -> nodo ScaleControl mai
+        // raggiunto -> BIT-IDENTICO. Tutte le soglie dai settings agent.scale.*.
+        scale: ScaleConfig {
+            enabled: setting_bool(db, "agent.scale.enabled", d.scale.enabled).await,
+            downscale_enabled: setting_bool(db, "agent.scale.downscale_enabled", d.scale.downscale_enabled).await,
+            eval_every_iters: setting_i64(db, "agent.scale.eval_every_iters", d.scale.eval_every_iters).await,
+            min_tail_iters: setting_i64(db, "agent.scale.min_tail_iters", d.scale.min_tail_iters).await,
+            min_confidence: setting_f64(db, "agent.scale.min_confidence", d.scale.min_confidence).await,
+            change_cooldown_turns: setting_i64(db, "agent.scale.change_cooldown_turns", d.scale.change_cooldown_turns).await,
+            downscale_clean_window: setting_i64(db, "agent.scale.downscale_clean_window", d.scale.downscale_clean_window).await,
+            max_reversals: setting_i64(db, "agent.scale.max_reversals", d.scale.max_reversals).await,
+            max_tier_changes_per_run: setting_i64(db, "agent.scale.max_tier_changes_per_run", d.scale.max_tier_changes_per_run).await,
+            max_evals_per_run: setting_i64(db, "agent.scale.max_evals_per_run", d.scale.max_evals_per_run).await,
+            window_overhead_ratio: setting_f64(db, "agent.scale.window_overhead_ratio", d.scale.window_overhead_ratio).await,
+        },
         progress_controller_enabled: setting_bool(db, "agent.progress_controller_enabled", d.progress_controller_enabled).await,
         repeated_action_threshold: setting_i64(db, "agent.repeated_action_threshold", d.repeated_action_threshold).await,
         repeated_action_threshold_read_only: setting_i64(db, "agent.repeated_action_threshold.read_only", d.repeated_action_threshold_read_only).await,
@@ -1192,9 +1209,14 @@ async fn build_native_engine(
         // Scale-controller (gemello di stall_recovery). Riusa la STESSA istanza
         // `PgMetaReasonerPort` (regola L: UNA sola porta, tre scope disgiunti; il
         // nodo consuma SOLO `assess_scale`). OPT-IN via `agent.scale.enabled`
-        // (default false): con OFF la porta ritorna `Ok(None)` e, poiche' nessun
-        // detector emette ancora `ScaleReason` (PR-B3), il nodo non e' mai raggiunto
-        // -> comportamento BIT-IDENTICO a oggi.
+        // (default false). Con PR-B3 il detector-emissione (`maybe_scale_reason_delta`
+        // nell'executor, pre-LLM) EMETTE `ScaleReason` a flag ON, quindi il nodo E'
+        // raggiunto quando `enabled=true`. Il bit-identico NON deriva piu' dall'assenza
+        // del detector ma dal GUARD `agent.scale.enabled=OFF` (default): a flag OFF il
+        // detector ritorna subito None (zero overhead) e la porta ritorna `Ok(None)`,
+        // il nodo non e' mai raggiunto -> comportamento BIT-IDENTICO a oggi. Le soglie
+        // DB-driven del gate anti-oscillazione arrivano al nodo via extra (trasportate
+        // dal detector che possiede `ExecutorConfig.scale`, FIX-B), non via costruttore.
         scale_control: Arc::new(ScaleControlNode::new(reasoner.clone())),
         verifier: Arc::new(VerifierNode::new(
             verifier_cfg,

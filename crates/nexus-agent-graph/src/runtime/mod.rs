@@ -856,6 +856,13 @@ pub mod test_doubles {
         pub promoted_window: Option<i64>,
         /// Chiamate di selezione registrate: (current_model, required_tokens).
         pub selected: Mutex<Vec<(String, i64)>>,
+        /// Candidato ritornato da `select_model_for_tier` (SCALE-CONTROLLER, PR-B3):
+        /// `None` = nessun modello del tier soddisfa i vincoli (il chiamante annulla
+        /// il cambio-tier). Registra le chiamate `(tier, min_context_window)` in
+        /// `tier_selected` per le asserzioni.
+        pub tier_pick: Option<(String, String)>,
+        /// Chiamate `select_model_for_tier` registrate: (tier, min_context_window).
+        pub tier_selected: Mutex<Vec<(String, i64)>>,
     }
 
     impl StubModelUpscalePort {
@@ -871,6 +878,17 @@ pub mod test_doubles {
                 }),
                 promoted_window: None,
                 selected: Mutex::new(vec![]),
+                ..Default::default()
+            }
+        }
+
+        /// Stub che, per lo SCALE-CONTROLLER (PR-B3), risolve un modello del tier
+        /// target `(provider, model)` (nessun upscale-token). Per il test del rientro
+        /// DownscaleTo con modello disponibile.
+        pub fn tier_resolving(provider: &str, model: &str) -> Self {
+            Self {
+                tier_pick: Some((provider.to_string(), model.to_string())),
+                ..Default::default()
             }
         }
 
@@ -895,6 +913,7 @@ pub mod test_doubles {
                 pick: None,
                 promoted_window: None,
                 selected: Mutex::new(vec![]),
+                ..Default::default()
             }
         }
     }
@@ -920,6 +939,25 @@ pub mod test_doubles {
                 .expect("lock selected")
                 .push((current_model.to_string(), required_tokens));
             Ok(self.pick.clone())
+        }
+
+        async fn select_model_for_tier(
+            &self,
+            tier: &str,
+            min_context_window: i64,
+            _capability: Option<&str>,
+            _exclude_providers: &[String],
+            mode: ExecMode,
+        ) -> Result<Option<(String, String)>, PortError> {
+            // Opzione A: in Replay nessuna risoluzione (parita' con l'impl reale).
+            if mode != ExecMode::Real {
+                return Ok(None);
+            }
+            self.tier_selected
+                .lock()
+                .expect("lock tier_selected")
+                .push((tier.to_string(), min_context_window));
+            Ok(self.tier_pick.clone())
         }
     }
 }

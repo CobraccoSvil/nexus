@@ -169,7 +169,11 @@ use crate::decisions::loop_signatures::{
     LoopThresholds,
 };
 use crate::decisions::meta_reason::{build_stall_context, translate};
+use crate::decisions::orchestration_reason::context_pressure_from_tokens;
 use crate::decisions::progress_controller::{self as pc, Action, Axis, ProgressSignals};
+use crate::decisions::scale_reason::{
+    build_scale_context, scale_cache_key, scale_trigger, ScaleHysteresisConfig, ScaleTriggerConfig,
+};
 use crate::decisions::tool_dispatch::{
     current_context_token_estimate, estimate_context_chars, flatten_context_text,
     ContextMessage,
@@ -178,12 +182,16 @@ use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::routing::signals::{
     count_recent_request_port, detect_recent_tool_error, detect_repeated_action_detailed,
     detect_pending_steps_report_with, detect_repeated_failed_command, has_active_resources_in_history,
-    has_recent_productive_action, has_tool_calls_in_history, EXPLORATION_ONLY_TOOLS,
+    has_recent_productive_action, has_tool_calls_in_history, modified_files_from_messages,
+    tool_error_stats, EXPLORATION_ONLY_TOOLS,
 };
 use crate::runtime::ports::{
     AgentStepStore, BillingCooldownPort, EscalationPort, LlmMessage, LlmRequest, MetaStepStore,
-    ModelUpscalePort, NextActionsDeriver, RunControlStore, SseEvent, StallBudgetPort, SummaryStore,
-    TokenCounter,
+    ModelUpscalePort, NextActionsDeriver, RunControlStore, ScaleMove, ScaleTier, SseEvent,
+    StallBudgetPort, SummaryStore, TokenCounter,
+};
+use crate::nodes::scale_control::{
+    SCALE_CONTEXT_KEY, SCALE_HYSTERESIS_CFG_KEY, SCALE_MOVE_CACHE_KEY_KEY,
 };
 use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
 use crate::runtime::ports::RecoveryMove;
@@ -351,6 +359,68 @@ pub struct ExecutorConfig {
     /// gerarchia fissa (rete di sicurezza anti meta-loop / anti-costo). Regola G:
     /// DB-driven, mai hardcoded. Rilevante solo a `stall_recovery_enabled=true`.
     pub stall_recovery_max_moves_per_session: i64,
+    /// Config dello SCALE-CONTROLLER bidirezionale (mig 0516, opt-in DB, regola G).
+    /// Con `scale.enabled=false` (default) il detector-emissione dell'executor NON
+    /// valuta MAI: nessun `ScaleReason` emesso, nodo `ScaleControl` irraggiungibile
+    /// -> comportamento BIT-IDENTICO a oggi (vincolo primario PR-B3). Tutte le
+    /// soglie/flag arrivano dai settings `agent.scale.*` (mai hardcoded).
+    pub scale: ScaleConfig,
+}
+
+/// Config dello SCALE-CONTROLLER letta dai settings `agent.scale.*` (mig 0516).
+/// Tutti i default sono conservativi/OFF (regola G: default = comportamento piu'
+/// cauto, mai magic-value): con `enabled=false` (default) il controller e' inerte.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScaleConfig {
+    /// `agent.scale.enabled`: kill-switch dello scale-controller. `false` (default)
+    /// -> il detector salta PRIMA di ogni lavoro (zero overhead, bit-identico).
+    pub enabled: bool,
+    /// `agent.scale.downscale_enabled`: abilita il DOWNSCALE. `false` (default) ->
+    /// solo up-consolidation (rollout: prima up, poi down).
+    pub downscale_enabled: bool,
+    /// `agent.scale.eval_every_iters` (default 4): cadenza di valutazione + base
+    /// della chiave-cache `floor(iterations/N)`.
+    pub eval_every_iters: i64,
+    /// `agent.scale.min_tail_iters` (default 6): gate break-even. Coda residua
+    /// minima per attivare il controller (costo netto zero su run corti).
+    pub min_tail_iters: i64,
+    /// `agent.scale.min_confidence` (default 0.70): soglia sotto cui KeepTier.
+    pub min_confidence: f64,
+    /// `agent.scale.change_cooldown_turns` (default 2): cooldown post-cambio-tier.
+    pub change_cooldown_turns: i64,
+    /// `agent.scale.downscale_clean_window` (default 3): streak pulita richiesta per
+    /// il downscale (banda-morta asimmetrica).
+    pub downscale_clean_window: i64,
+    /// `agent.scale.max_reversals` (default 2): oltre -> pin al tier PIU' ALTO.
+    pub max_reversals: i64,
+    /// `agent.scale.max_tier_changes_per_run` (default 3): cambi-tier massimi/run.
+    pub max_tier_changes_per_run: i64,
+    /// `agent.scale.max_evals_per_run` (default 6): cap consultazioni LLM/run.
+    pub max_evals_per_run: i64,
+    /// `agent.scale.window_overhead_ratio` (default 1.3): overhead per il vincolo
+    /// finestra nel downscale (FIX-B): `required = est_tokens * ratio`.
+    pub window_overhead_ratio: f64,
+}
+
+impl Default for ScaleConfig {
+    fn default() -> Self {
+        // Default safe-DB-down = seed conservativi mig 0516 (OFF). Valgono SOLO se il
+        // DB e' irraggiungibile; il wiring mcp-core passa i valori reali. Con
+        // enabled=false il detector non scatta -> bit-identico.
+        Self {
+            enabled: false,
+            downscale_enabled: false,
+            eval_every_iters: 4,
+            min_tail_iters: 6,
+            min_confidence: 0.70,
+            change_cooldown_turns: 2,
+            downscale_clean_window: 3,
+            max_reversals: 2,
+            max_tier_changes_per_run: 3,
+            max_evals_per_run: 6,
+            window_overhead_ratio: 1.3,
+        }
+    }
 }
 
 impl Default for ExecutorConfig {
@@ -426,6 +496,9 @@ impl Default for ExecutorConfig {
             // resta bit-identico a oggi (il wiring mcp-core passa i valori reali).
             stall_recovery_enabled: false,
             stall_recovery_max_moves_per_session: 6,
+            // Default safe-DB-down = seed mig 0516 (scale OFF). Con enabled=false il
+            // detector-emissione salta PRIMA di ogni lavoro -> bit-identico.
+            scale: ScaleConfig::default(),
         }
     }
 }
@@ -688,6 +761,19 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // StallReason, quindi StallResolved non arriva MAI qui -> bit-identico.
         if state.stop_reason == Some(StopReason::StallResolved) {
             if let Some(delta) = self.consume_recovery_move(state, iters_in, ctx, mode).await {
+                return Ok(delta);
+            }
+        }
+
+        // ── CONSUMO scale-controller (rientro dal nodo ScaleControl) ──────────
+        // Speculare al rientro StallResolved: se rientriamo con ScaleResolved
+        // (self-loop `ScaleControl -> executor`), la ScaleMove e' persistita in
+        // extra: la consumiamo QUI (PR-B3). Some -> applica il cambio-tier (sticky +
+        // current_tier) e ri-fa il turno; None -> KeepTier / cambio annullato ->
+        // prosegue il turno normale. A flag OFF nessun detector emette ScaleReason,
+        // quindi ScaleResolved non arriva MAI qui -> bit-identico.
+        if state.stop_reason == Some(StopReason::ScaleResolved) {
+            if let Some(delta) = self.consume_scale_move(state, iters_in, ctx, mode).await {
                 return Ok(delta);
             }
         }
@@ -2493,6 +2579,48 @@ della finestra {effective_window} del modello {provider}/{model}"
                 ));
         let force_tc: Option<bool> = if force_now { Some(true) } else { None };
 
+        // ── DETECTOR-EMISSIONE scale-controller (PR-B3, FIX-A: PRE-LLM) ──────
+        // GEMELLO del detector stallo (`maybe_stall_reason_delta`, call site
+        // 1382/1707/2000): valutato PRIMA della chiamata LLM del turno (non a fine
+        // turno). Cosi':
+        //   - REPLAY-SAFE (F1): il superstep di emissione NON chiama `complete` ->
+        //     in shadow-replay NON consuma un gruppo dal cursore (allineato al
+        //     gemello stallo, che e' gia' pre-LLM). Nessun gate su `mode` serve:
+        //     l'asimmetria che disallineava il cursore era proprio l'emissione
+        //     post-LLM. In Replay `select_model_for_tier` ritorna Ok(None)
+        //     (opzione A): il rientro non cambia modello, ma NON avviene alcuna
+        //     doppia `complete` perche' la (sola) chiamata LLM del turno e' a valle.
+        //   - NIENTE TURNO SCARTATO (F4/F6): se la scala cambia il tier, il rientro
+        //     applica sticky+current_tier e si prosegue il turno col modello GIUSTO
+        //     (la `complete` sotto usa il nuovo modello). Su KeepTier / cambio
+        //     annullato il rientro ritorna None e si prosegue con UNA sola
+        //     `complete` (nessuna chiamata LLM produttiva scartata e rifatta).
+        // A flag `agent.scale.enabled=false` (default) `maybe_scale_reason_delta`
+        // ritorna SUBITO None (guard primario, zero overhead): bit-identico. Con
+        // flag ON, valuta solo su un run agentico che PROSEGUE (`requires_tool_use`
+        // resta true nel contesto). La precedenza stallo (FIX-E) usa il solo
+        // segnale disponibile pre-LLM: `detect_recent_tool_error` (l'ultimo
+        // tool_result e' errore -> asse stallo attivo, niente scale questo turno).
+        if self.cfg.scale.enabled {
+            let scale_escalations = state
+                .extra
+                .get("auto_escalations")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let scale_stall_active = detect_recent_tool_error(&messages, 4);
+            let scale_est_tokens = self.estimate_history_tokens(&hist);
+            if let Some(delta) = self.maybe_scale_reason_delta(
+                state,
+                iters_in,
+                &messages,
+                scale_escalations,
+                scale_est_tokens,
+                scale_stall_active,
+            ) {
+                return Ok(delta);
+            }
+        }
+
         // ── LLM CALL (py:2974-3107) ───────────────────────────────────────────
         // max_tokens = max(8192, min(budget*4, 16384)) == clamp(8192, 16384).
         let max_tokens = (state.token_budget.unwrap_or(400) * 4).clamp(8192, 16384);
@@ -3072,6 +3200,11 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
         let loop_forced_close = loop_close_result.is_some();
         let mut final_result = loop_close_result.unwrap_or(result_text);
         let stop_reason_enum = stop_reason_from_str(stop_reason_final);
+        // NOTA (FIX-A, PR-B3): il detector-emissione scale-controller e' stato
+        // spostato PRE-LLM (prima della `complete`, vedi call site sopra la LLM
+        // CALL). Emetterlo qui a fine turno (post-LLM) disallineava il cursore
+        // replay e scartava un turno LLM produttivo su KeepTier: entrambi chiusi
+        // spostandolo prima della chiamata, come il gemello stallo.
 
         // ── POST end_turn: next_actions + unfulfilled-report (py:3379-3429) ───
         // Entrambi i rami si applicano SOLO a turno realmente concluso (end_turn
@@ -3906,6 +4039,608 @@ al mio controllo e va risolta prima di continuare."
             // arm esplicito per esaustivita' (regola L, niente `_`).
             Action::Proceed | Action::Abort => None,
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  SCALE-CONTROLLER (PR-B3): detector-EMISSIONE (fine turno) + rientro-
+    //  APPLICAZIONE (`ScaleResolved`). Gemello del blocco stall_recovery, su
+    //  tipi DISGIUNTI. La DECISIONE (build_scale_context / scale_trigger /
+    //  scale_cache_key) vive nel modulo puro `decisions::scale_reason` (regola
+    //  L); qui c'e' solo la RACCOLTA dei segnali gia' risolti + il trasporto
+    //  in extra. La selezione tier->modello e' dietro la porta
+    //  `ModelUpscalePort::select_model_for_tier` (regola L), mai chiamata dal
+    //  nodo direttamente.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Iterazione dell'ultimo cambio-tier del run (default `-1` = mai cambiato).
+    /// Vive in `extra["scale_last_change_iter"]`, checkpointato con lo stato ->
+    /// REPLAY-SAFE. Il detector deriva `turns_since_change = iters - last_change_iter`
+    /// (default grande al primo giro: il cooldown non blocca l'avvio). Preferito a un
+    /// contatore incrementale per-turno (che richiederebbe una scrittura ogni turno
+    /// anche senza emissione, rompendo l'inerzia bit-identica a flag OFF).
+    fn scale_last_change_iter(state: &AgentState) -> i64 {
+        state
+            .extra
+            .get("scale_last_change_iter")
+            .and_then(Value::as_i64)
+            .unwrap_or(-1)
+    }
+
+    /// Consultazioni LLM dello scale-controller gia' fatte nel run
+    /// (`extra["scale_evals_used"]`, checkpointato). Cap `max_evals_per_run` (regola
+    /// G): oltre, il detector NON emette piu' `ScaleReason` (budget/costo).
+    fn scale_evals_used(state: &AgentState) -> i64 {
+        state
+            .extra
+            .get("scale_evals_used")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// Numero di INVERSIONI di direzione sulla stessa coppia di tier
+    /// (`extra["scale_reversal_count"]`, checkpointato): alimenta il reversal-pin
+    /// (gate 5 di `apply_hysteresis`). Aggiornato dal rientro `consume_scale_move`.
+    fn scale_reversal_count(state: &AgentState) -> i64 {
+        state
+            .extra
+            .get("scale_reversal_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// Numero di CAMBI-TIER effettivamente applicati nel run
+    /// (`extra["scale_tier_changes_used"]`, checkpointato): alimenta il tetto
+    /// `max_tier_changes_per_run` (FIX-C). Incrementato dal rientro
+    /// `consume_scale_move` a OGNI cambio-tier effettivo. Distinto da
+    /// `scale_reversal_count` (inversioni A->B->A) e da `scale_evals_used`
+    /// (valutazioni LLM).
+    fn scale_tier_changes_used(state: &AgentState) -> i64 {
+        state
+            .extra
+            .get("scale_tier_changes_used")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// Il run ha raggiunto il tetto `max_tier_changes_per_run` ed e' stato pinnato a
+    /// Heavy (`extra["scale_pinned_heavy"]`, checkpointato, FIX-C): il detector non
+    /// emette piu' `ScaleReason` (disattiva ulteriori cambi) e il rientro non applica
+    /// piu' mosse. Set dal rientro `consume_scale_move` all'ultimo cambio consentito.
+    fn scale_pinned_heavy(state: &AgentState) -> bool {
+        state
+            .extra
+            .get("scale_pinned_heavy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// `behavior_mode` come stringa opaca per lo `ScaleContext` (segnale, non prosa).
+    /// `None` -> `"none"` (default conservativo, coerente con `AutomationMode::None`).
+    fn behavior_mode_str(state: &AgentState) -> &'static str {
+        match state.automation_mode {
+            Some(crate::state::AutomationMode::None) | None => "none",
+            Some(crate::state::AutomationMode::Confirm) => "confirm",
+            Some(crate::state::AutomationMode::Automatic) => "automatic",
+            Some(crate::state::AutomationMode::Continuous) => "continuous",
+        }
+    }
+
+    /// Complessita' stimata del task come intero per lo `ScaleContext` (segnale
+    /// strutturato del classifier, regola M). `None` -> `0` (default conservativo,
+    /// nessuna complessita' affermata).
+    fn task_complexity_est(state: &AgentState) -> i64 {
+        match state.task_complexity {
+            Some(crate::state::TaskComplexity::Low) => 1,
+            Some(crate::state::TaskComplexity::Medium) => 2,
+            Some(crate::state::TaskComplexity::High) => 3,
+            None => 0,
+        }
+    }
+
+    /// Il task e' CRITICO (FIX-D): PROTEGGE dal downscale. Derivato con cura (NON
+    /// default-permissivo): `true` se la complessita' e' alta OPPURE il behavior_mode
+    /// e' `continuous` (catena autonoma prolungata, alto costo di sbagliare) OPPURE
+    /// il run ha gia' escalato (segnale che il task ha richiesto piu' potenza). Un
+    /// intent classificato non e' disponibile come set chiuso qui (e' testo libero),
+    /// quindi NON si deriva la criticita' dal parsing del testo intent (regola M): si
+    /// usano solo segnali strutturati. In dubbio, non-critico (il floor e gli altri
+    /// gate del downscale restano comunque attivi).
+    fn task_critical(state: &AgentState, escalations_done: i64) -> bool {
+        matches!(state.task_complexity, Some(crate::state::TaskComplexity::High))
+            || matches!(
+                state.automation_mode,
+                Some(crate::state::AutomationMode::Continuous)
+            )
+            || escalations_done > 0
+    }
+
+    /// Pavimento di tier per l'intent (FIX-D): il downscale non scende MAI sotto.
+    /// DEFAULT CONSERVATIVO documentato: senza una tabella intent->floor risolta a
+    /// monte nel path del turno (sarebbe I/O DB, vietato qui per il determinismo di
+    /// replay), il floor deriva dai soli segnali strutturati gia' presenti:
+    ///   - task CRITICO -> floor `medium` (mai downscale a `light` su task critici);
+    ///   - altrimenti -> floor `light` (nessun pavimento extra: gli altri 5 gate del
+    ///     downscale restano la protezione principale).
+    /// Il pavimento vero DB-driven per-intent e' un miglioramento futuro (TODO):
+    /// finche' assente, questa derivazione e' safety-biased (non permissiva).
+    fn intent_tier_floor(task_critical: bool) -> ScaleTier {
+        if task_critical {
+            ScaleTier::Medium
+        } else {
+            ScaleTier::Light
+        }
+    }
+
+    /// Gate di EMISSIONE dello `ScaleReason` (detector-emissione, PR-B3). GEMELLO di
+    /// [`Self::maybe_stall_reason_delta`]. Chiamato PRE-LLM (FIX-A), subito prima
+    /// della `complete` del turno, dopo che `hist` e' finalizzato (est_tokens
+    /// accurato). Emetterlo prima della chiamata LLM lo rende replay-safe (in
+    /// shadow non consuma un gruppo dal cursore) e non scarta mai una `complete`
+    /// produttiva: se la scala cambia il tier, il turno si prosegue col modello
+    /// nuovo; su KeepTier / cambio annullato si prosegue con UNA sola `complete`.
+    /// Ritorna `Some(delta)` — che instrada al nodo `ScaleControl` — SOLO se il
+    /// trigger scatta; `None` prosegue il turno normale.
+    ///
+    /// GUARD PRIMARIO (bit-identico): se `!self.cfg.scale.enabled` ritorna SUBITO
+    /// `None`, PRIMA di qualunque lavoro (zero overhead a flag OFF, vincolo primario).
+    ///
+    /// Costruisce lo `ScaleContext` dai segnali gia' risolti (regola M) col punto
+    /// unico `build_scale_context`, poi consulta `scale_trigger` (break-even + cadenza
+    /// + precedenza stallo FIX-E). Se scatta E il budget `max_evals_per_run` non e'
+    /// esaurito E non c'e' gia' una mossa in cache per la chiave-cache corrente:
+    /// serializza lo `ScaleContext` in `extra[SCALE_CONTEXT_KEY]` + la chiave-cache in
+    /// `extra[SCALE_MOVE_CACHE_KEY_KEY]` + la `ScaleHysteresisConfig` DB-driven in
+    /// `extra[SCALE_HYSTERESIS_CFG_KEY]` (FIX-B: le soglie del gate raggiungono il
+    /// nodo) + incrementa `scale_evals_used`, e ritorna `StopReason::ScaleReason`
+    /// (clone-whole-map, `put_extra`).
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_scale_reason_delta(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        messages: &[Message],
+        escalations_done: i64,
+        est_tokens: i64,
+        stall_active: bool,
+    ) -> Option<OpaqueDelta> {
+        // GUARD PRIMARIO: flag OFF -> zero overhead (nessun ScaleContext, nessun
+        // trigger). Bit-identico a oggi (vincolo primario PR-B3).
+        if !self.cfg.scale.enabled {
+            return None;
+        }
+        // FIX-C (F5): tetto cambi-tier raggiunto e run pinnato a Heavy -> non emettere
+        // piu' (il controller e' "disattivato" per il resto del run, mig 0516).
+        if Self::scale_pinned_heavy(state) {
+            return None;
+        }
+        // Budget consultazioni esaurito -> non emettere (rete anti-costo, regola G).
+        let evals_used = Self::scale_evals_used(state);
+        if evals_used >= self.cfg.scale.max_evals_per_run {
+            return None;
+        }
+
+        // ── Raccolta segnali STRUTTURATI (regola M). READY vs DEFAULT documentati ──
+        // context_window del modello del turno (config, regola G). 0 = ignoto ->
+        // pressione Low + headroom pieno (conservativo).
+        let context_window = self.cfg.context_window;
+        let context_pressure = context_pressure_from_tokens(est_tokens, context_window);
+        let token_headroom_ratio = if context_window > 0 {
+            (est_tokens.max(0) as f64 / context_window as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // error_count / error_free_streak dal segnale strutturato (exit_code/is_error),
+        // finestra 40 messaggi (coerente con modified_files lookback).
+        let (error_count, error_free_streak) = tool_error_stats(messages, 40);
+        // repeated_action_failed: l'ultimo tool_result e' errore (segnale strutturato).
+        let repeated_action_failed = detect_recent_tool_error(messages, 4);
+        // files_modified_delta: DEFAULT documentato = conteggio TOTALE dei file
+        // modificati nella finestra (non il delta per-checkpoint, che richiederebbe un
+        // segnale di checkpoint precedente non tracciato). Conservativo: il downscale
+        // richiede `> 0`, quindi un run senza modifiche NON downscala per questo campo.
+        let files_modified_delta = modified_files_from_messages(messages, 40).len() as i64;
+        let task_complexity_est = Self::task_complexity_est(state);
+        let task_critical = Self::task_critical(state, escalations_done);
+        let intent_tier_floor = Self::intent_tier_floor(task_critical);
+        // escalation_lock_active: DEFAULT safety-biased. Deriva da "c'e' stata
+        // un'escalation nel run" (escalations_done > 0): finche' il run ha dovuto
+        // salire di potenza, il downscale resta VIETATO (FIX-E). Non c'e' un
+        // escalation-lock esplicito tracciato nel path; questo proxy e' conservativo
+        // (protegge dal downscale piu' del necessario, mai meno).
+        let escalation_lock_active = escalations_done > 0;
+        let cost_spent_usd = state.subagent_cost_cumulative_usd.unwrap_or(0.0);
+        // cost_cap_usd: DEFAULT 0 = nessun cap propagato nel path del turno (il cap
+        // costo del run non e' un segnale disponibile qui). 0 disattiva le guard di
+        // costo dello scale-controller (conservativo: nessuna decisione forzata dal
+        // costo).
+        let cost_cap_usd = 0.0;
+        let turns_since_change = {
+            let last = Self::scale_last_change_iter(state);
+            if last < 0 {
+                // Mai cambiato: coda ampia -> il cooldown non blocca l'avvio.
+                iters_in.max(self.cfg.scale.change_cooldown_turns)
+            } else {
+                (iters_in - last).max(0)
+            }
+        };
+        let reversal_count = Self::scale_reversal_count(state);
+        // required_capability: DEFAULT `None`. Il selettore a valle
+        // (select_model_for_tier) forza gia' l'eleggibilita' agentica (tool-use); una
+        // capability specifica del turno (es. vision) non e' un segnale strutturato
+        // disponibile qui, quindi non la si afferma (regola M). `requires_tool_use`
+        // resta true (run agentico).
+        let required_capability: Option<&str> = None;
+
+        let scale_ctx = build_scale_context(
+            state.current_tier.as_deref(),
+            intent_tier_floor,
+            state.user_intent.as_deref(),
+            Self::behavior_mode_str(state),
+            iters_in,
+            self.cfg.iteration_cap,
+            task_complexity_est,
+            task_critical,
+            context_pressure,
+            est_tokens,
+            token_headroom_ratio,
+            files_modified_delta,
+            // todos_closed: DEFAULT 0 (nessun segnale TodoStore nel path del turno;
+            // TODO: propagare i todo chiusi dal TodoStore). Conservativo: il downscale
+            // richiede `> 0`, quindi con 0 NON downscala per questo campo (safety).
+            0,
+            error_count,
+            error_free_streak,
+            repeated_action_failed,
+            escalations_done,
+            escalation_lock_active,
+            cost_spent_usd,
+            cost_cap_usd,
+            required_capability,
+            true,
+            turns_since_change,
+            reversal_count,
+        );
+
+        // ── Trigger: gate break-even + cadenza + precedenza stallo (FIX-E) ─────
+        // I sotto-segnali di trigger (pressure_changed / todo_closed_now /
+        // error_ratchet_advanced / escalation_advanced) non sono tracciati per-turno
+        // nel path (richiederebbero uno snapshot precedente checkpointato): passiamo
+        // `false` e ci affidiamo alla CADENZA (`iterations % eval_every == 0`), che e'
+        // il trigger primario. DEFAULT conservativo documentato: senza gli snapshot
+        // il controller valuta a cadenza fissa, mai piu' spesso (mai un costo extra).
+        let trig_cfg = ScaleTriggerConfig {
+            enabled: self.cfg.scale.enabled,
+            eval_every_iters: self.cfg.scale.eval_every_iters,
+            min_tail_iters: self.cfg.scale.min_tail_iters,
+        };
+        let triggered = scale_trigger(
+            &scale_ctx,
+            &trig_cfg,
+            stall_active,
+            false,
+            false,
+            false,
+            false,
+        );
+        if !triggered {
+            return None;
+        }
+
+        // Chiave-cache (punto unico, con l'eval_every_iters reale). Idempotenza
+        // (anti meta-loop, FIX-A/F4/F6): NON ri-emettere per una chiave gia' valutata.
+        // Due sotto-casi:
+        //   - una MOSSA e' gia' in cache a questa chiave (`contains_key(&key)`): il
+        //     nodo farebbe cache-hit, la mossa e' gia' decisa;
+        //   - la chiave e' gia' stata TRASPORTATA a questo giro
+        //     (`SCALE_MOVE_CACHE_KEY_KEY == key`): copre il KeepTier, che il nodo NON
+        //     persiste. Senza questo, al rientro KeepTier (pre-LLM) il detector
+        //     ri-emetterebbe la stessa chiave -> meta-loop fino a max_evals_per_run.
+        let key = scale_cache_key(&scale_ctx, self.cfg.scale.eval_every_iters);
+        if state.extra.contains_key(&key) {
+            return None;
+        }
+        let already_evaluated = state
+            .extra
+            .get(SCALE_MOVE_CACHE_KEY_KEY)
+            .and_then(|v| v.as_str())
+            == Some(key.as_str());
+        if already_evaluated {
+            return None;
+        }
+
+        // Serializza ScaleContext + chiave-cache in extra (clone-whole-map: NON azzera
+        // gli altri canali) e incrementa il budget consultazioni.
+        let ctx_value = serde_json::to_value(&scale_ctx).ok()?;
+        let mut extra_out = put_extra(state, SCALE_CONTEXT_KEY, ctx_value);
+        extra_out.insert(SCALE_MOVE_CACHE_KEY_KEY.to_string(), json!(key));
+        // FIX-B (F2/F3): trasporta le 5 soglie DB-driven del gate anti-oscillazione
+        // al nodo (che non legge i settings, zero I/O). Costruite da
+        // `self.cfg.scale` (letto dal DB in mcp-core), cosi'
+        // `agent.scale.downscale_enabled` & co. raggiungono `apply_hysteresis` al
+        // posto dei default hardcoded (chiude la config muta, regola G/L).
+        let hyst_cfg = ScaleHysteresisConfig {
+            downscale_enabled: self.cfg.scale.downscale_enabled,
+            min_confidence: self.cfg.scale.min_confidence,
+            change_cooldown_turns: self.cfg.scale.change_cooldown_turns,
+            downscale_clean_window: self.cfg.scale.downscale_clean_window,
+            max_reversals: self.cfg.scale.max_reversals,
+            window_overhead_ratio: self.cfg.scale.window_overhead_ratio,
+        };
+        if let Ok(cfg_value) = serde_json::to_value(hyst_cfg) {
+            extra_out.insert(SCALE_HYSTERESIS_CFG_KEY.to_string(), cfg_value);
+        }
+        extra_out.insert("scale_evals_used".to_string(), json!(evals_used + 1));
+        tracing::info!(
+            target: "nexus_agent_graph::executor",
+            current_tier = scale_ctx.current_tier.as_str(),
+            iterations = iters_in,
+            tail_headroom = scale_ctx.tail_headroom,
+            evals_used = evals_used + 1,
+            "scale-controller: emetto ScaleReason -> nodo ScaleControl"
+        );
+        Some(
+            StateDelta {
+                extra: Some(extra_out),
+                stop_reason: Some(Some(StopReason::ScaleReason)),
+                iterations: Some(Some(iters_in + 1)),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
+
+    /// CONSUMO della `ScaleMove` al rientro dal nodo `ScaleControl`
+    /// (`StopReason::ScaleResolved`, PR-B3). GEMELLO di [`Self::consume_recovery_move`].
+    /// Legge la `ScaleMove` persistita dal nodo alla chiave-cache (trasportata in
+    /// `extra[SCALE_MOVE_CACHE_KEY_KEY]`):
+    ///   - `KeepTier` / mossa assente -> `None` (nessun cambio, prosegue il turno);
+    ///   - `UpscaleTo{tier}` / `DownscaleTo{tier}` -> risolve il modello del tier via
+    ///     la porta `select_model_for_tier` con `min_context_window = est_tokens *
+    ///     window_overhead_ratio` (FIX-B). Se `Some((provider,model))`: `StateDelta`
+    ///     con `sticky_provider`/`sticky_model` + `current_tier` aggiornato + meta_step
+    ///     `scale_applied` + self-loop (`G1Escalated`, ri-fa il turno col nuovo
+    ///     modello). Se `None` (nessun modello del tier con finestra/capability):
+    ///     ANNULLA il cambio (fail-safe, resta sul modello corrente), log strutturato.
+    /// Aggiorna `scale_last_change_iter`/`scale_reversal_count`/`scale_last_direction`
+    /// al cambio effettivo (clone-whole-map preservato).
+    ///
+    /// FIX-C (F5): applica il tetto `max_tier_changes_per_run`. Conta i cambi-tier
+    /// APPLICATI (`scale_tier_changes_used`); al raggiungimento del tetto forza il
+    /// target a Heavy (pin-UP safety-biased) e marca `scale_pinned_heavy`, cosi' il
+    /// detector non emette piu' e il rientro non applica piu' mosse (mig 0516). Se il
+    /// run e' gia' pinnato -> `None` (mantiene Heavy).
+    async fn consume_scale_move(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> Option<OpaqueDelta> {
+        // Contesto + chiave-cache trasportati dal detector (produttore). Assenti ->
+        // guasto a monte: prosegui il turno normale (nessuna marcatura).
+        let scale_ctx: crate::runtime::ports::ScaleContext = state
+            .extra
+            .get(SCALE_CONTEXT_KEY)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+        let key = state
+            .extra
+            .get(SCALE_MOVE_CACHE_KEY_KEY)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| scale_cache_key(&scale_ctx, self.cfg.scale.eval_every_iters));
+        // Mossa persistita dal nodo (KeepTier NON viene persistito: assenza = keep).
+        let mv: ScaleMove = state
+            .extra
+            .get(&key)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+
+        let (raw_target_tier, raw_is_down) = match &mv {
+            // KeepTier: nessun cambio, prosegue il turno normale (rete di sicurezza).
+            ScaleMove::KeepTier => return None,
+            ScaleMove::UpscaleTo { tier, .. } => (*tier, false),
+            ScaleMove::DownscaleTo { tier, .. } => (*tier, true),
+        };
+
+        // ── FIX-C (F5): tetto cambi-tier per run + pin-heavy (mig 0516) ────────
+        // `agent.scale.max_tier_changes_per_run`: cambi-tier EFFETTIVI massimi per
+        // run. E' semanticamente distinto da `max_reversals` (inversioni A->B->A,
+        // gia' in apply_hysteresis) e da `max_evals_per_run` (valutazioni LLM): qui
+        // si contano i cambi APPLICATI. Al raggiungimento il run "pinna heavy e
+        // disattiva" (descrizione mig 0516): l'ultimo cambio consentito e' forzato a
+        // Heavy (pin-UP safety-biased, non mute secco) e da li' in poi il detector
+        // non emette piu' (guard `scale_pinned_heavy`). Se il run e' GIA' pinnato
+        // (guasto/ri-emissione residua), nessun cambio -> mantiene Heavy.
+        if Self::scale_pinned_heavy(state) {
+            tracing::debug!(
+                target: "nexus_agent_graph::executor",
+                "scale-controller: run gia' pinnato heavy (tetto cambi-tier), nessun cambio"
+            );
+            return None;
+        }
+        let changes_used = Self::scale_tier_changes_used(state);
+        let cap = self.cfg.scale.max_tier_changes_per_run;
+        // Questo cambio RAGGIUNGE il tetto se, applicandolo, il contatore arriva al
+        // cap (`cap > 0`, altrimenti il tetto e' disattivato). In tal caso si pinna a
+        // Heavy invece del target proposto dall'LLM.
+        let reaches_cap = cap > 0 && changes_used + 1 >= cap;
+        let (target_tier, is_down) = if reaches_cap {
+            // Pin-UP a Heavy: la direzione diventa "up" se Heavy e' sopra il corrente.
+            (ScaleTier::Heavy, ScaleTier::Heavy.rank() < scale_ctx.current_tier.rank())
+        } else {
+            (raw_target_tier, raw_is_down)
+        };
+
+        // Caso limite: il tetto e' raggiunto ma il pin (Heavy) coincide col tier
+        // corrente (run gia' su heavy). Non c'e' cambio-modello da applicare, ma il
+        // run va comunque "disattivato": marca `scale_pinned_heavy` (e sincronizza il
+        // contatore al cap) senza ri-fare il turno con un G1Escalated inutile.
+        if reaches_cap && target_tier == scale_ctx.current_tier {
+            let mut extra_out = state.extra.clone();
+            extra_out.insert("scale_pinned_heavy".to_string(), json!(true));
+            extra_out.insert("scale_tier_changes_used".to_string(), json!(cap.max(changes_used)));
+            tracing::info!(
+                target: "nexus_agent_graph::executor",
+                current_tier = scale_ctx.current_tier.as_str(),
+                changes_used,
+                cap,
+                "scale-controller: tetto cambi-tier raggiunto, run gia' su Heavy -> pin+disattiva (nessun cambio)"
+            );
+            return Some(
+                StateDelta {
+                    stop_reason: Some(Some(StopReason::G1Escalated)),
+                    iterations: Some(Some(iters_in + 1)),
+                    extra: Some(extra_out),
+                    ..Default::default()
+                }
+                .into_opaque(),
+            );
+        }
+
+        // FIX-B: fabbisogno finestra = est_tokens * overhead. Nel downscale garantisce
+        // che il tier piu' basso abbia finestra sufficiente (mai troncamento); nell'
+        // upscale e' comunque una soglia minima sana.
+        let overhead = if self.cfg.scale.window_overhead_ratio.is_finite()
+            && self.cfg.scale.window_overhead_ratio >= 1.0
+        {
+            self.cfg.scale.window_overhead_ratio
+        } else {
+            1.0
+        };
+        let required = (scale_ctx.est_tokens.max(0) as f64 * overhead).ceil() as i64;
+
+        // Risolve il modello del tier target dietro la porta (regola L: MAI
+        // select_agentic_model direttamente dal nodo). Opzione A: in Replay la porta
+        // ritorna Ok(None) e il rientro NON cambia modello (lo sticky del primario e'
+        // gia' checkpointato -> stesso modello per costruzione).
+        let resolved = self
+            .upscale
+            .select_model_for_tier(target_tier.as_str(), required, None, &[], mode)
+            .await
+            .unwrap_or(None);
+
+        let Some((provider, model)) = resolved else {
+            // Fail-safe: nessun modello del tier target con finestra/capability
+            // sufficiente -> ANNULLA il cambio, resta sul modello corrente. Log
+            // strutturato (segnale, non prosa): l'esito e' None dalla porta.
+            tracing::warn!(
+                target: "nexus_agent_graph::executor",
+                from_tier = scale_ctx.current_tier.as_str(),
+                to_tier = target_tier.as_str(),
+                downscale = is_down,
+                required_window = required,
+                "scale-controller: nessun modello del tier target (finestra/capability), cambio ANNULLATO"
+            );
+            // FIX-C (F5): se questo cambio RAGGIUNGE il tetto ma il pin-Heavy non e'
+            // risolvibile (tier heavy non popolato / tutti in cooldown / finestra
+            // insufficiente), il tetto deve comunque DISATTIVARE il controller (mig
+            // 0516), esattamente come il caso "gia' su Heavy" sopra: altrimenti il
+            // detector ri-emette a ogni cadenza ri-tentando il pin fallito fino a
+            // esaurire `max_evals_per_run` (consultazioni LLM sprecate). Marca
+            // `scale_pinned_heavy` e sincronizza il contatore al cap; il G1Escalated e'
+            // al rientro (pre-LLM) -> salva l'extra e prosegue, nessuna complete persa.
+            if reaches_cap {
+                let mut extra_out = state.extra.clone();
+                extra_out.insert("scale_pinned_heavy".to_string(), json!(true));
+                extra_out.insert(
+                    "scale_tier_changes_used".to_string(),
+                    json!(cap.max(changes_used)),
+                );
+                tracing::info!(
+                    target: "nexus_agent_graph::executor",
+                    changes_used,
+                    cap,
+                    "scale-controller: tetto cambi-tier raggiunto ma pin-Heavy non risolvibile -> pin+disattiva (nessun cambio)"
+                );
+                return Some(
+                    StateDelta {
+                        stop_reason: Some(Some(StopReason::G1Escalated)),
+                        iterations: Some(Some(iters_in + 1)),
+                        extra: Some(extra_out),
+                        ..Default::default()
+                    }
+                    .into_opaque(),
+                );
+            }
+            return None;
+        };
+
+        // Cambio applicato: aggiorna il tracking anti-oscillazione in extra
+        // (clone-whole-map). Direzione corrente per il reversal-count.
+        let mut extra_out = state.extra.clone();
+        extra_out.insert("scale_last_change_iter".to_string(), json!(iters_in));
+        let cur_dir = if is_down { "down" } else { "up" };
+        let prev_dir = state
+            .extra
+            .get("scale_last_direction")
+            .and_then(Value::as_str);
+        if let Some(prev) = prev_dir {
+            if prev != cur_dir {
+                let rc = Self::scale_reversal_count(state) + 1;
+                extra_out.insert("scale_reversal_count".to_string(), json!(rc));
+            }
+        }
+        extra_out.insert("scale_last_direction".to_string(), json!(cur_dir));
+        // Grazia sui detector di ripetizione (come l'escalation): il modello del nuovo
+        // tier riparte con finestra pulita.
+        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        // FIX-C (F5): conta il cambio-tier APPLICATO. Al raggiungimento del tetto
+        // `max_tier_changes_per_run` il target e' gia' stato forzato a Heavy sopra
+        // (`reaches_cap`): marca `scale_pinned_heavy` cosi' il detector non emette piu'
+        // (pin heavy + disattiva, mig 0516).
+        let new_changes_used = changes_used + 1;
+        extra_out.insert("scale_tier_changes_used".to_string(), json!(new_changes_used));
+        if reaches_cap {
+            extra_out.insert("scale_pinned_heavy".to_string(), json!(true));
+            tracing::info!(
+                target: "nexus_agent_graph::executor",
+                changes_used = new_changes_used,
+                cap,
+                "scale-controller: tetto cambi-tier raggiunto -> pin a Heavy + disattiva ulteriori cambi"
+            );
+        }
+
+        let direction_label = if is_down { "down" } else { "up" };
+        self.emit_phase(
+            ctx,
+            mode,
+            "scale_applied",
+            format!(
+                "Scala {direction_label} a {provider}/{model} (tier {})",
+                target_tier.as_str()
+            ),
+            json!({
+                "from_tier": scale_ctx.current_tier.as_str(),
+                "to_tier": target_tier.as_str(),
+                "to_provider": provider,
+                "to_model": model,
+                "downscale": is_down,
+            }),
+        )
+        .await;
+        tracing::info!(
+            target: "nexus_agent_graph::executor",
+            from_tier = scale_ctx.current_tier.as_str(),
+            to_tier = target_tier.as_str(),
+            to_provider = %provider,
+            to_model = %model,
+            downscale = is_down,
+            "scale-controller: ScaleMove applicata -> sticky + current_tier + ri-do il turno"
+        );
+
+        Some(
+            StateDelta {
+                sticky_provider: Some(Some(provider)),
+                sticky_model: Some(Some(model)),
+                current_tier: Some(Some(target_tier.as_str().to_string())),
+                recent_tool_signatures: Some(Some(vec![])),
+                pending_tool_uses: Some(Some(vec![])),
+                stop_reason: Some(Some(StopReason::G1Escalated)),
+                iterations: Some(Some(iters_in + 1)),
+                extra: Some(extra_out),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
     }
 
     /// Registra `axis` fra gli assi per cui una `AskUser` e' gia' stata emessa

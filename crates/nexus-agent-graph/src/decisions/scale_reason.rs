@@ -36,7 +36,7 @@ use crate::runtime::ports::{ContextPressure, ScaleContext, ScaleMove, ScaleTier}
 /// conservativi della mig 0516 (documentati sul campo), MA a runtime i valori
 /// sono SEMPRE letti dal DB dal call site mcp-core (PR-B): questa struct e' solo
 /// il trasporto.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScaleHysteresisConfig {
     /// `agent.scale.downscale_enabled`: se `false`, ogni `DownscaleTo` degrada a
     /// `KeepTier` (rollout: prima solo up-consolidation).

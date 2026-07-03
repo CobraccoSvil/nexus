@@ -652,6 +652,49 @@ pub fn detect_recent_tool_error(messages: &[Message], lookback: usize) -> bool {
     false
 }
 
+/// Statistiche errore tool STRUTTURATE per lo SCALE-CONTROLLER (regola M: dal
+/// segnale `exit_code`/`is_error` del tool_result, MAI dal parsing della prosa —
+/// stesso punto unico di [`detect_recent_tool_error`] via
+/// `message_tool_result_outcome`). Scansiona gli ultimi `lookback` `Message::Tool`
+/// e ritorna `(error_count, error_free_streak)`:
+///   - `error_count`: quanti tool_result nella finestra sono errori (esito `true`);
+///   - `error_free_streak`: quanti tool_result CONSECUTIVI in coda (dall'ultimo
+///     all'indietro) sono SENZA errore, fermandosi al primo errore.
+/// Un tool_result con esito ignoto (`None`) NON conta come errore ma INTERROMPE la
+/// streak pulita (conservativo: non affermiamo "pulito" su un esito ambiguo). Su
+/// history vuota o senza tool_result ritorna `(0, 0)`.
+pub fn tool_error_stats(messages: &[Message], lookback: usize) -> (i64, i64) {
+    let mut error_count = 0i64;
+    let mut streak = 0i64;
+    let mut streak_open = true;
+    let mut checked = 0usize;
+    for m in messages.iter().rev() {
+        if checked >= lookback {
+            break;
+        }
+        let Message::Tool { .. } = m else {
+            continue;
+        };
+        checked += 1;
+        match message_tool_result_outcome(m) {
+            Some(true) => {
+                error_count += 1;
+                streak_open = false;
+            }
+            Some(false) => {
+                if streak_open {
+                    streak += 1;
+                }
+            }
+            None => {
+                // Esito ambiguo: non e' un errore, ma chiude la streak pulita.
+                streak_open = false;
+            }
+        }
+    }
+    (error_count, streak)
+}
+
 /// Comandi shell tracciati da `_detect_repeated_failed_command` (1:1).
 const FAILED_COMMAND_TOOLS: &[&str] = &["run_command", "run_service", "run_in_terminal"];
 
@@ -1552,6 +1595,26 @@ mod tests {
         ));
         // ToolMessage pulito -> nessun errore.
         assert!(!detect_recent_tool_error(&[tool_msg("done ok")], 4));
+    }
+
+    #[test]
+    fn tool_error_stats_conta_errori_e_streak() {
+        // Nessun tool_result -> (0, 0).
+        assert_eq!(tool_error_stats(&[], 40), (0, 0));
+        // Tre ok consecutivi in coda -> error_count 0, streak 3.
+        let all_ok = vec![tool_msg("done ok"), tool_msg("done ok"), tool_msg("done ok")];
+        assert_eq!(tool_error_stats(&all_ok, 40), (0, 3));
+        // Un errore in coda -> error_count 1, streak 0 (l'ultimo e' errore).
+        let last_err = vec![tool_msg("done ok"), tool_msg("Error: build failed")];
+        assert_eq!(tool_error_stats(&last_err, 40), (1, 0));
+        // Errore in mezzo, poi due ok in coda -> error_count 1, streak 2 (la streak
+        // parte dall'ultimo all'indietro e si ferma al primo errore).
+        let mixed = vec![
+            tool_msg("Error: fallito"),
+            tool_msg("done ok"),
+            tool_msg("done ok"),
+        ];
+        assert_eq!(tool_error_stats(&mixed, 40), (1, 2));
     }
 
     #[test]

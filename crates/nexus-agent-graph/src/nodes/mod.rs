@@ -28,7 +28,7 @@ pub mod verifier;
 pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
 };
-pub use executor::{ExecutorConfig, ExecutorNode};
+pub use executor::{ExecutorConfig, ExecutorNode, ScaleConfig};
 pub use final_gate::{count_build_errors, FinalGateConfig, FinalGateNode};
 pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
 pub use planner::{

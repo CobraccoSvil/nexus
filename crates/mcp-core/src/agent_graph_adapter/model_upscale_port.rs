@@ -15,9 +15,9 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use nexus_agent_graph::runtime::ports::{ModelUpscalePort, PortError, UpscalePick};
+use nexus_agent_graph::runtime::ports::{ExecMode, ModelUpscalePort, PortError, UpscalePick};
 
-use crate::orchestrator::{select_models_tierchain, EligibilityFilter};
+use crate::orchestrator::{select_agentic_model, select_models_tierchain, EligibilityFilter};
 
 /// Adapter [`ModelUpscalePort`] -> `ai_price_catalog` + settings `agent.upscale.*`.
 pub struct CatalogModelUpscalePort {
@@ -133,6 +133,42 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
             // il modello scelto e' garantito di quel tier.
             tier,
         }))
+    }
+
+    /// Selezione BIDIREZIONALE per lo SCALE-CONTROLLER (PR-B3): DELEGA al PUNTO
+    /// UNICO `select_agentic_model` (regola L) col `tier` target e il
+    /// `min_context_window` richiesto (FIX-B: nel downscale = est_tokens*overhead).
+    /// GATE mode opzione A: in Replay ritorna `Ok(None)` (il rientro rilegge lo
+    /// sticky checkpointato -> nessun I/O di risoluzione, parita' shadow). Fail-open
+    /// gia' incorporato: `select_agentic_model` ritorna `None` su guasto/nessun
+    /// candidato (nessun panico), che qui e' `Ok(None)` -> il chiamante ANNULLA il
+    /// cambio-tier (fail-safe, mantiene il modello corrente).
+    async fn select_model_for_tier(
+        &self,
+        tier: &str,
+        min_context_window: i64,
+        capability: Option<&str>,
+        exclude_providers: &[String],
+        mode: ExecMode,
+    ) -> Result<Option<(String, String)>, PortError> {
+        if mode != ExecMode::Real {
+            // Opzione A: nessuna risoluzione in Replay (lo sticky del primario e' la
+            // fonte di verita' checkpointata; risolvere qui divergerebbe se il
+            // catalog e' cambiato tra primario e resume).
+            return Ok(None);
+        }
+        // Stesso ordinamento del routing agentico (featured + piu' economico): a
+        // tier fissato preferisce i modelli in evidenza, poi il costo minore.
+        let picked = select_agentic_model(
+            &self.db,
+            &[tier],
+            capability,
+            min_context_window,
+            exclude_providers,
+            "is_featured DESC, input_cost_per_million_tokens ASC",
+        )
+        .await;
+        Ok(picked)
     }
 }
 

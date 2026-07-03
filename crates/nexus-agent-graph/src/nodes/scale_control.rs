@@ -102,6 +102,23 @@ pub const SCALE_CONTEXT_KEY: &str = "scale_context";
 /// non un magic-fallback di modello (regola G: sceglie solo la CHIAVE, non il tier).
 pub const SCALE_MOVE_CACHE_KEY_KEY: &str = "scale_move_cache_key";
 
+/// Chiave in `AgentState::extra` sotto cui l'executor serializza la
+/// [`ScaleHysteresisConfig`] DB-driven (le 5 soglie `agent.scale.*`:
+/// `downscale_enabled`, `min_confidence`, `change_cooldown_turns`,
+/// `downscale_clean_window`, `max_reversals` + `window_overhead_ratio`).
+///
+/// Stesso pattern di [`SCALE_MOVE_CACHE_KEY_KEY`] (regola L, punto unico del
+/// trasporto config->nodo): il nodo NON legge i settings (zero I/O per il
+/// determinismo di replay), quindi il produttore executor — che possiede
+/// `ExecutorConfig.scale` letto dal DB — serializza la config UNA volta e la
+/// trasporta. Il gate [`apply_hysteresis`] la consuma al posto dei default
+/// hardcoded, cosi' le soglie admin raggiungono davvero il punto di enforcement
+/// (chiude la config muta, regola G). Se assente (guasto a monte / produttore
+/// che non l'ha scritta) il nodo ricade sui seed conservativi mig 0516 via
+/// [`ScaleHysteresisConfig::conservative_defaults`] — deterministico, non un
+/// magic-fallback (i default coincidono coi seed DB).
+pub const SCALE_HYSTERESIS_CFG_KEY: &str = "scale_hysteresis_cfg";
+
 /// Nodo dello scale-controller.
 ///
 /// Riceve la porta [`MetaReasonerPort`] iniettata dal chiamante (mcp-core con
@@ -178,6 +195,22 @@ impl ScaleControlNode {
     fn cached_move(state: &AgentState, key: &str) -> Option<ScaleMove> {
         let raw = state.extra.get(key)?;
         serde_json::from_value::<ScaleMove>(raw.clone()).ok()
+    }
+
+    /// Legge la [`ScaleHysteresisConfig`] DB-driven trasportata dal produttore in
+    /// `extra[SCALE_HYSTERESIS_CFG_KEY]` (le 5 soglie `agent.scale.*` del gate
+    /// anti-oscillazione). Se assente o malformata (guasto a monte / produttore che
+    /// non l'ha scritta) ricade sui seed conservativi mig 0516: non e' un
+    /// magic-fallback di modello (regola G), solo la scelta deterministica dei
+    /// gate quando la config non e' arrivata. Sul percorso reale il detector la
+    /// trasporta sempre col valore DB, cosi' `agent.scale.downscale_enabled=true`
+    /// e le altre soglie raggiungono il punto di enforcement.
+    fn read_hysteresis_cfg(state: &AgentState) -> ScaleHysteresisConfig {
+        state
+            .extra
+            .get(SCALE_HYSTERESIS_CFG_KEY)
+            .and_then(|v| serde_json::from_value::<ScaleHysteresisConfig>(v.clone()).ok())
+            .unwrap_or_else(ScaleHysteresisConfig::conservative_defaults)
     }
 
     /// Determina la chiave-cache dello scale-move. Preferisce la chiave TRASPORTATA
@@ -285,15 +318,16 @@ impl GraphNode<AgentState, AgentNodeCtx> for ScaleControlNode {
         };
 
         // Validazione + anti-oscillazione (PUNTI UNICI scale_reason, regola L).
-        // Config anti-oscillazione: seed conservativi mig 0516 (a runtime i valori
-        // DB sono applicati a monte dal produttore/adapter; qui il gate finale usa
-        // i default documentati — inerte in PR-B2 perche' il nodo non e' raggiunto).
+        // Config anti-oscillazione DB-driven (FIX-B/F2/F3): le 5 soglie
+        // `agent.scale.*` arrivano dal produttore executor (che le legge dal DB in
+        // `ExecutorConfig.scale`) via `extra[SCALE_HYSTERESIS_CFG_KEY]` — cosi'
+        // `downscale_enabled`, `min_confidence`, `change_cooldown_turns`,
+        // `downscale_clean_window`, `max_reversals` raggiungono il gate reale (prima
+        // erano mute: il nodo usava `conservative_defaults()` hardcoded, viola G).
+        // Fallback ai seed mig 0516 solo se il trasporto manca (guasto a monte).
+        let hyst_cfg = Self::read_hysteresis_cfg(state);
         let validated = validate_scale_move(&raw_move_to_value(&raw_move));
-        let mv = apply_hysteresis(
-            validated,
-            &scale_ctx,
-            &ScaleHysteresisConfig::conservative_defaults(),
-        );
+        let mv = apply_hysteresis(validated, &scale_ctx, &hyst_cfg);
         if mv == ScaleMove::KeepTier {
             tracing::debug!(
                 target: "nexus_agent_graph::scale_control",
@@ -643,5 +677,105 @@ mod tests {
         assert_eq!(after.stop_reason, Some(StopReason::ScaleResolved));
         // La mossa alla chiave trasportata e' invariata (cache-hit, non ricalcolata).
         assert!(after.extra.get(&transported).is_some());
+    }
+
+    /// Stato con lo `ScaleContext` a BANDA PULITA per il downscale (context Low,
+    /// streak pulita, zero escalation, progresso reale, cooldown ok): con
+    /// `downscale_enabled=true` il gate `apply_hysteresis` deve lasciar passare il
+    /// downscale. `current`=Medium, `floor`=Light.
+    fn state_downscale_clean() -> AgentState {
+        let scale_ctx = ScaleContext {
+            current_tier: ScaleTier::Medium,
+            intent_tier_floor: ScaleTier::Light,
+            behavior_mode: "automatic".to_string(),
+            iterations: 8,
+            iteration_cap: 60,
+            tail_headroom: 52,
+            context_pressure: crate::runtime::ports::ContextPressure::Low,
+            error_free_streak: 5,
+            escalations_done: 0,
+            files_modified_delta: 3,
+            todos_closed: 2,
+            turns_since_change: 5,
+            requires_tool_use: true,
+            ..Default::default()
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            SCALE_CONTEXT_KEY.to_string(),
+            serde_json::to_value(&scale_ctx).expect("serialize ScaleContext"),
+        );
+        AgentState {
+            extra,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn downscale_passa_col_gate_config_db_downscale_enabled() {
+        // FIX-B (F2/F3): il nodo usa la ScaleHysteresisConfig DB-driven TRASPORTATA in
+        // extra, non i default hardcoded. Con `downscale_enabled=true` (config DB) e
+        // banda pulita, un DownscaleTo Light dall'LLM PASSA il gate ed e' persistito.
+        // Prima del fix il nodo usava `conservative_defaults()` (downscale_enabled=
+        // false) e ogni DownscaleTo degradava a KeepTier: la config DB era muta.
+        let node = ScaleControlNode::new(Arc::new(FixedScaleReasoner(ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.95,
+        })));
+        let ctx = real_ctx();
+        let mut state = state_downscale_clean();
+        // Config DB trasportata dal produttore: downscale ABILITATO.
+        let cfg_db = ScaleHysteresisConfig {
+            downscale_enabled: true,
+            ..ScaleHysteresisConfig::conservative_defaults()
+        };
+        state.extra.insert(
+            SCALE_HYSTERESIS_CFG_KEY.to_string(),
+            serde_json::to_value(cfg_db).expect("serialize cfg"),
+        );
+
+        let delta = node.run(&state, &ctx).await.expect("run ok");
+        let after = apply(&state, delta);
+        assert_eq!(after.stop_reason, Some(StopReason::ScaleResolved));
+        let scale_ctx = ScaleControlNode::read_context(&state).expect("ctx presente");
+        let key = fallback_cache_key(&scale_ctx);
+        let persisted = after
+            .extra
+            .get(&key)
+            .expect("il downscale DEVE essere persistito con downscale_enabled=true");
+        let mv: ScaleMove =
+            serde_json::from_value(persisted.clone()).expect("mossa deserializzabile");
+        assert_eq!(
+            mv,
+            ScaleMove::DownscaleTo {
+                tier: ScaleTier::Light,
+                confidence: 0.95
+            },
+            "la config DB (downscale_enabled=true) raggiunge il gate reale (FIX-B)"
+        );
+    }
+
+    #[tokio::test]
+    async fn downscale_muore_senza_config_trasportata_fallback_conservativo() {
+        // Contro-prova: SENZA la config trasportata (guasto a monte) il nodo ricade
+        // sui seed conservativi mig 0516 (downscale_enabled=false) -> il downscale
+        // degrada a KeepTier e NON e' persistito. Deterministico, non un magic-fallback
+        // (sceglie solo i gate, non il modello, regola G).
+        let node = ScaleControlNode::new(Arc::new(FixedScaleReasoner(ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.95,
+        })));
+        let ctx = real_ctx();
+        let state = state_downscale_clean(); // nessuna SCALE_HYSTERESIS_CFG_KEY in extra
+
+        let delta = node.run(&state, &ctx).await.expect("run ok");
+        let after = apply(&state, delta);
+        assert_eq!(after.stop_reason, Some(StopReason::ScaleResolved));
+        let scale_ctx = ScaleControlNode::read_context(&state).expect("ctx presente");
+        let key = fallback_cache_key(&scale_ctx);
+        assert!(
+            after.extra.get(&key).is_none(),
+            "senza config trasportata il fallback conservativo tiene il downscale OFF"
+        );
     }
 }

@@ -3270,6 +3270,391 @@ async fn stall_budget_consumo_registra_cross_run() {
     assert_eq!(*budget.recorded.lock().unwrap(), 1, "una consultazione cross-run registrata");
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+//  SCALE-CONTROLLER (PR-B3): detector-emissione + rientro-applicazione.
+// ──────────────────────────────────────────────────────────────────────────
+
+use crate::nodes::scale_control::{SCALE_CONTEXT_KEY as SCALE_CTX_KEY, SCALE_MOVE_CACHE_KEY_KEY};
+use crate::runtime::ports::{ScaleContext, ScaleMove, ScaleTier};
+
+/// Config con lo scale-controller ATTIVO (flag ON) e soglie seed mig 0516. Per i
+/// test del detector-emissione.
+fn cfg_scale_on() -> ExecutorConfig {
+    ExecutorConfig {
+        scale: ScaleConfig {
+            enabled: true,
+            eval_every_iters: 4,
+            min_tail_iters: 6,
+            max_evals_per_run: 6,
+            window_overhead_ratio: 1.3,
+            ..ScaleConfig::default()
+        },
+        ..cfg_resolved()
+    }
+}
+
+/// LLM stub che emette una tool call CON `stop_reason="tool_use"` (come il path
+/// reale del provider): il turno prosegue con tool pendenti e `stop_reason_enum`
+/// e' `ToolUse` (lo `with_tool_call` base non imposta lo stop_reason -> EndTurn).
+fn llm_tool_use(name: &str, input: Value) -> Arc<StubLlmGateway> {
+    Arc::new(StubLlmGateway {
+        canned: LlmResponse {
+            content: String::new(),
+            tool_calls: vec![ToolUse {
+                id: "stub-tc".to_string(),
+                name: name.to_string(),
+                input,
+            }],
+            usage: LlmUsage::default(),
+            stop_reason: Some("tool_use".into()),
+            ..Default::default()
+        },
+        error: None,
+        error_provider_unavailable: false,
+        seen: std::sync::Mutex::new(vec![]),
+    })
+}
+
+/// Stato con un turno che PROSEGUE (ToolUse): iterations a cadenza (4 % 4 == 0),
+/// coda ampia (cap 60 - 4 = 56 >= min_tail 6). Nessuno stallo (tool_result pulito).
+fn state_scale_turn() -> AgentState {
+    AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua il lavoro")],
+        action_oriented: Some(true),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        iterations: Some(4),
+        token_budget: Some(400),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn scale_off_non_emette_scale_reason() {
+    // (a) Flag OFF (default): il detector salta PRIMA di ogni lavoro. Il turno
+    // ToolUse chiude normale (bit-identico), nessuno ScaleContext in extra.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // scale.enabled=false di default
+    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_scale_turn();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::ToolUse), "turno normale, non ScaleReason");
+    assert!(out.extra.get(SCALE_CTX_KEY).is_none(), "nessuno ScaleContext a flag OFF");
+}
+
+#[tokio::test]
+async fn scale_on_trigger_emette_scale_reason() {
+    // (b) Flag ON + cadenza + coda ampia -> il detector emette ScaleReason con lo
+    // ScaleContext strutturato e la chiave-cache in extra. FIX-A: il detector e'
+    // PRE-LLM, quindi la `complete` del turno NON e' stata chiamata (nessun turno
+    // LLM produttivo scartato; in shadow-replay non consuma un gruppo dal cursore).
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_scale_on(), rc);
+    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_scale_turn();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::ScaleReason));
+    let ctx_val = out.extra.get(SCALE_CTX_KEY).expect("ScaleContext in extra");
+    let sc: ScaleContext = serde_json::from_value(ctx_val.clone()).expect("ScaleContext");
+    // current_tier assente nello stato -> fallback deterministico Medium.
+    assert_eq!(sc.current_tier, ScaleTier::Medium);
+    assert_eq!(sc.iterations, 4);
+    // La chiave-cache e' trasportata (il nodo la legge senza ricalcolarla).
+    assert!(out.extra.get(SCALE_MOVE_CACHE_KEY_KEY).is_some());
+    // FIX-B: le soglie DB-driven del gate anti-oscillazione sono trasportate al nodo.
+    assert!(
+        out.extra.get("scale_hysteresis_cfg").is_some(),
+        "la ScaleHysteresisConfig DB-driven deve raggiungere il nodo (FIX-B)"
+    );
+    // Budget consultazioni incrementato.
+    assert_eq!(out.extra.get("scale_evals_used").and_then(Value::as_i64), Some(1));
+    // FIX-A/F1/F4/F6: emissione PRE-LLM -> la `complete` del turno NON e' avvenuta.
+    assert!(
+        llm.seen.lock().unwrap().is_empty(),
+        "emissione ScaleReason pre-LLM: nessuna chiamata complete (replay-safe, niente turno scartato)"
+    );
+}
+
+#[tokio::test]
+async fn scale_precedenza_stallo_no_scale_reason() {
+    // (c) Precedenza stallo (FIX-E): con un tool_result ERRORE recente lo stallo e'
+    // attivo questo turno -> il detector NON emette ScaleReason (l'escalation
+    // reattiva ha priorita' sul risparmio pre-emptivo). Il turno chiude normale.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_scale_on(), rc);
+    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut state = state_scale_turn();
+    // Ultimo tool_result = errore -> detect_recent_tool_error true -> stall_active.
+    // `Message::Tool` (ToolMessage) con hint errore: e' la forma che
+    // `detect_recent_tool_error` scandisce (filtra i soli Message::Tool).
+    state.messages.push(ai_tool("write_file", json!({"path": "a.rs"})));
+    state.messages.push(Message::Tool {
+        tool_call_id: "c1".into(),
+        content: MessageContent::text("Error: permission denied"),
+    });
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::ScaleReason), "stallo attivo -> no ScaleReason");
+    assert!(out.extra.get(SCALE_CTX_KEY).is_none());
+}
+
+#[tokio::test]
+async fn scale_break_even_coda_corta_no_trigger() {
+    // (e) Break-even: tail_headroom < min_tail_iters -> nessun trigger. iteration_cap
+    // basso (8) e iterations 4 -> tail 4 < 6. Il turno chiude normale.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        iteration_cap: 8,
+        ..cfg_scale_on()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_scale_turn(); // iterations 4 -> tail 8-4=4 < 6
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::ScaleReason), "coda corta -> no trigger");
+    assert!(out.extra.get(SCALE_CTX_KEY).is_none());
+}
+
+/// Stato di RIENTRO dal nodo ScaleControl: `ScaleResolved` + ScaleContext + la
+/// ScaleMove persistita alla chiave-cache trasportata.
+fn state_scale_rientro(current: ScaleTier, mv: ScaleMove, est_tokens: i64) -> AgentState {
+    let scale_ctx = ScaleContext {
+        current_tier: current,
+        intent_tier_floor: ScaleTier::Light,
+        behavior_mode: "automatic".to_string(),
+        iterations: 8,
+        iteration_cap: 60,
+        tail_headroom: 52,
+        est_tokens,
+        turns_since_change: 5,
+        requires_tool_use: true,
+        ..Default::default()
+    };
+    let key = crate::decisions::scale_reason::scale_cache_key(&scale_ctx, 4);
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        SCALE_CTX_KEY.to_string(),
+        serde_json::to_value(&scale_ctx).expect("serialize ScaleContext"),
+    );
+    extra.insert(SCALE_MOVE_CACHE_KEY_KEY.to_string(), json!(key));
+    extra.insert(key, serde_json::to_value(&mv).expect("serialize ScaleMove"));
+    AgentState {
+        thread_id: Some("r1".into()),
+        stop_reason: Some(StopReason::ScaleResolved),
+        messages: vec![human("task")],
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        iterations: Some(8),
+        extra,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn scale_rientro_downscale_con_modello_applica_sticky() {
+    // (d) DownscaleTo con modello del tier disponibile -> sticky + current_tier
+    // aggiornati, self-loop G1Escalated (ri-fa il turno). La porta risolve un
+    // modello del tier target col vincolo finestra (FIX-B).
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    // La porta risolve (provider, model) per il tier target.
+    let upscale = Arc::new(StubModelUpscalePort::tier_resolving("mistral", "mistral-small"));
+    let (n, _m) = node_ports(cfg_scale_on(), rc, next_actions, billing, upscale.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_scale_rientro(
+        ScaleTier::Medium,
+        ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 },
+        5000,
+    );
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated), "self-loop ri-fa il turno");
+    assert_eq!(out.sticky_provider.as_deref(), Some("mistral"));
+    assert_eq!(out.sticky_model.as_deref(), Some("mistral-small"));
+    assert_eq!(out.current_tier.as_deref(), Some("light"), "current_tier al tier target");
+    // FIX-B: la porta e' stata chiamata col vincolo finestra (est 5000 * 1.3 = 6500).
+    let calls = upscale.tier_selected.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "light");
+    assert_eq!(calls[0].1, 6500);
+    // L'LLM del turno NON e' chiamato (il rientro ritorna prima della chiamata).
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scale_rientro_downscale_senza_modello_annulla() {
+    // (d-bis) DownscaleTo ma nessun modello del tier con finestra sufficiente
+    // (porta -> None): fail-safe, il cambio e' ANNULLATO. Lo sticky resta invariato
+    // (None nel delta): il turno prosegue col modello corrente.
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    // Porta di default: tier_pick None -> nessun modello del tier.
+    let upscale = Arc::new(StubModelUpscalePort::default());
+    let (n, _m) = node_ports(cfg_scale_on(), rc, next_actions, billing, upscale.clone());
+    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = state_scale_rientro(
+        ScaleTier::Medium,
+        ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 },
+        5000,
+    );
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Cambio annullato: il rientro ritorna None -> il turno prosegue normalmente
+    // (nessun sticky/current_tier scritto dal cambio annullato).
+    assert_ne!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_ne!(out.current_tier.as_deref(), Some("light"), "downscale annullato: tier invariato");
+    // La porta e' stata interrogata (poi ha ritornato None -> annullo).
+    assert_eq!(upscale.tier_selected.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn scale_replay_detector_non_emette_doppia_complete() {
+    // (F1) In Replay il detector-emissione e' PRE-LLM: se emette ScaleReason,
+    // il superstep NON chiama `complete` (nessun consumo di un gruppo dal cursore
+    // replay); se prosegue, chiama `complete` UNA sola volta. In entrambi i casi il
+    // conteggio complete di QUESTO superstep e' <= 1, mai 2. Qui il turno emette
+    // ScaleReason -> zero complete nel superstep di emissione (allineato al gemello
+    // stallo, che e' gia' pre-LLM). Prima del fix (detector post-LLM) lo shadow
+    // consumava un gruppo in emissione + un secondo al rientro annullato = cursore
+    // disallineato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_scale_on(), rc);
+    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
+    // shadow=true -> ExecMode::Replay.
+    let ctx = ctx_with(llm.clone(), true);
+    let state = state_scale_turn();
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::ScaleReason), "detector emette anche in Replay");
+    // Il superstep di emissione NON ha chiamato complete (replay-safe: nessun
+    // gruppo consumato dal cursore).
+    assert!(
+        llm.seen.lock().unwrap().is_empty(),
+        "emissione pre-LLM in Replay: zero complete nel superstep (cursore allineato al primario)"
+    );
+}
+
+#[tokio::test]
+async fn scale_rientro_keeptier_prosegue_una_sola_complete() {
+    // (F4/F6) Rientro con KeepTier (mossa assente in cache): `consume_scale_move`
+    // ritorna None e il turno PROSEGUE con UNA sola chiamata LLM (nessun turno
+    // produttivo scartato e rifatto). Prima del fix il detector post-LLM scartava
+    // la `complete` gia' fatta e il rientro ne innescava una seconda.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_scale_on(), rc);
+    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone(), false);
+    // Rientro ScaleResolved con ScaleContext ma NESSUNA mossa persistita alla
+    // chiave-cache (KeepTier non viene persistito dal nodo).
+    let scale_ctx = ScaleContext {
+        current_tier: ScaleTier::Medium,
+        intent_tier_floor: ScaleTier::Light,
+        behavior_mode: "automatic".to_string(),
+        iterations: 8,
+        iteration_cap: 60,
+        tail_headroom: 52,
+        turns_since_change: 5,
+        requires_tool_use: true,
+        ..Default::default()
+    };
+    let key = crate::decisions::scale_reason::scale_cache_key(&scale_ctx, 4);
+    let mut extra = serde_json::Map::new();
+    extra.insert(SCALE_CTX_KEY.to_string(), serde_json::to_value(&scale_ctx).unwrap());
+    extra.insert(SCALE_MOVE_CACHE_KEY_KEY.to_string(), json!(key));
+    // NB: nessuna chiave `key` -> KeepTier (mossa assente).
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        stop_reason: Some(StopReason::ScaleResolved),
+        messages: vec![human("task")],
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        iterations: Some(8),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Il turno prosegue e produce il ToolUse col modello corrente.
+    assert_eq!(out.stop_reason, Some(StopReason::ToolUse), "KeepTier: prosegue il turno");
+    // UNA sola chiamata LLM (nessun turno scartato/rifatto).
+    assert_eq!(
+        llm.seen.lock().unwrap().len(),
+        1,
+        "KeepTier al rientro: una sola complete, nessun turno produttivo scartato (F4/F6)"
+    );
+}
+
+#[tokio::test]
+async fn scale_tetto_cambi_tier_pinna_heavy() {
+    // (F5) Al raggiungimento di `max_tier_changes_per_run` il rientro forza il
+    // cambio a Heavy (pin-UP) e marca `scale_pinned_heavy`, disattivando ulteriori
+    // cambi. Qui cap=1: il PRIMO cambio (una DownscaleTo Light) e' rimpiazzato dal
+    // pin a Heavy. La porta e' interrogata sul tier "heavy", non "light".
+    let rc = Arc::new(StubRunControlStore::default());
+    let next_actions = Arc::new(StubNextActionsDeriver::default());
+    let billing = Arc::new(StubBillingCooldownPort::default());
+    let upscale = Arc::new(StubModelUpscalePort::tier_resolving("anthropic", "claude-heavy"));
+    let cfg = ExecutorConfig {
+        scale: ScaleConfig {
+            enabled: true,
+            eval_every_iters: 4,
+            min_tail_iters: 6,
+            max_evals_per_run: 6,
+            window_overhead_ratio: 1.3,
+            max_tier_changes_per_run: 1, // tetto strettissimo: pinna heavy dopo 1 cambio
+            ..ScaleConfig::default()
+        },
+        ..cfg_resolved()
+    };
+    let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    // Rientro con una DownscaleTo Light (l'LLM proponeva un downscale) e current=Medium.
+    let state = state_scale_rientro(
+        ScaleTier::Medium,
+        ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 },
+        5000,
+    );
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated), "cambio applicato (pin heavy)");
+    // Pin-UP a Heavy invece del Light proposto.
+    assert_eq!(out.current_tier.as_deref(), Some("heavy"), "tetto raggiunto -> pin a Heavy");
+    // La porta e' stata interrogata sul tier HEAVY, non light.
+    let calls = upscale.tier_selected.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "heavy", "risolve il modello del tier pinnato (heavy)");
+    // Contatore cambi + flag pin persistiti.
+    assert_eq!(out.extra.get("scale_tier_changes_used").and_then(Value::as_i64), Some(1));
+    assert_eq!(out.extra.get("scale_pinned_heavy").and_then(Value::as_bool), Some(true));
+}
+
+#[tokio::test]
+async fn scale_pinned_heavy_disattiva_detector() {
+    // (F5) Con `scale_pinned_heavy=true` il detector-emissione NON emette piu'
+    // ScaleReason (controller disattivato per il resto del run): il turno prosegue
+    // normalmente col modello corrente.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_scale_on(), rc);
+    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut state = state_scale_turn();
+    state.extra.insert("scale_pinned_heavy".to_string(), json!(true));
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::ScaleReason), "pinnato heavy -> nessuna emissione");
+    assert!(out.extra.get(SCALE_CTX_KEY).is_none(), "detector disattivato dal pin");
+}
+
 /// Golden di parita' 1:1 vs Python per la LOGICA DETERMINISTICA del singolo turno
 /// (gate testa, ordine nudge, risoluzione provider). Carica
 /// `/tmp/golden_executor_node.json` (vedi `gen_golden_executor_node.py`). Riusa i

@@ -845,6 +845,34 @@ pub trait ModelUpscalePort: Send + Sync {
         current_model: &str,
         required_tokens: i64,
     ) -> Result<Option<UpscalePick>, PortError>;
+
+    /// SELEZIONE BIDIREZIONALE per lo SCALE-CONTROLLER (PR-B3, regola L: NON una
+    /// nuova porta `ScaleApplyPort` — il design la vieta — ma un metodo su questa
+    /// porta gia' dedicata alla selezione modello-per-tier). Risolve il MIGLIOR
+    /// modello agentico SANO del `tier` TARGET (up O down) col `min_context_window`
+    /// richiesto (FIX-B: nel downscale = `est_tokens * overhead`, cosi' un tier piu'
+    /// basso con finestra insufficiente viene scartato invece di troncare), la
+    /// `capability` propagata (mai persa in un downscale) e i `exclude_providers`.
+    /// DELEGA al PUNTO UNICO `select_agentic_model` (regola L, che accetta gia'
+    /// `min_context_window`): stesso selettore del routing iniziale/failover
+    /// (pavimento agentico, gate cooldown ADR 0020, tool-use,
+    /// agentic_thinking_policy<>'exclude').
+    ///
+    /// Ritorna `Some((provider, model))` se un modello del tier soddisfa i vincoli,
+    /// `None` se nessun candidato (-> il chiamante ANNULLA il cambio-tier, fail-safe
+    /// che mantiene il modello corrente). GATE `mode` opzione A (parita' replay):
+    /// in [`ExecMode::Replay`] ritorna `Ok(None)` (il rientro nell'executor rilegge
+    /// lo sticky checkpointato dal primario -> stesso modello per costruzione, nessun
+    /// I/O di risoluzione). Fail-open: errore di lettura -> `Ok(None)`, MAI un
+    /// `PortError` nel flusso normale.
+    async fn select_model_for_tier(
+        &self,
+        tier: &str,
+        min_context_window: i64,
+        capability: Option<&str>,
+        exclude_providers: &[String],
+        mode: ExecMode,
+    ) -> Result<Option<(String, String)>, PortError>;
 }
 
 /// Astrazione dell'I/O dell'auto-escalation (catena DB + cooldown + router
