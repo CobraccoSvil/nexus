@@ -677,6 +677,23 @@ pub(crate) fn route_model_with_mode(
     }
 }
 
+/// True se la decisione della matrice statica NON e' direttamente servibile e
+/// serve il fallback tier-aware dal catalog: o non c'e' stato alcun match
+/// (sentinella `__no_model__`), o il provider scelto e' in cooldown.
+///
+/// Punto unico (regola L) del TRIGGER del fallback catalog. Prima il ramo
+/// `__no_model__` in `resolve_agent_provider` scavalcava il catalog e cadeva su
+/// un default per-provider "tier-blind" (il primo provider sano della hierarchy,
+/// tipicamente google, col suo `default_model` generico `gemini-2.5-flash`, un
+/// modello LIGHT che non converge sui task di coding heavy). Ora entrambi i casi
+/// (`__no_model__` e cooldown) passano dallo STESSO punto unico
+/// `select_agentic_model`, che rispetta tier + capability dell'intent prima di
+/// qualsiasi default per-provider.
+pub(crate) fn needs_catalog_fallback(decision_provider: &str) -> bool {
+    decision_provider == "__no_model__"
+        || crate::provider_cooldown::is_provider_in_cooldown(decision_provider)
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct SettingValueRow {
     pub(crate) key: String,

@@ -88,6 +88,63 @@ fn test_route_model_with_mode_uses_token_thresholds() {
 }
 
 #[test]
+fn needs_catalog_fallback_include_no_model_e_provider_sani_no() {
+    // Regressione (fix routing coding, regola H): la sentinella __no_model__ deve
+    // SEMPRE innescare il fallback tier-aware dal catalog. Prima il ramo
+    // __no_model__ in resolve_agent_provider scavalcava il catalog e cadeva su un
+    // default per-provider tier-blind (google/gemini-flash, modello light) per i
+    // task di coding heavy quando anthropic+openai erano in cooldown.
+    assert!(
+        needs_catalog_fallback("__no_model__"),
+        "__no_model__ deve innescare il fallback catalog"
+    );
+    // Un provider mai messo in cooldown (nome univoco per non collidere con lo
+    // stato globale di altri test) e' servibile direttamente: nessun fallback.
+    assert!(
+        !needs_catalog_fallback("__test_healthy_provider_ncf"),
+        "un provider sano non deve innescare il fallback catalog"
+    );
+}
+
+#[sqlx::test]
+async fn coding_fallback_resta_su_tier_heavy_non_su_google_light(pool: sqlx::PgPool) {
+    // Regressione (fix routing coding, regola H): con i provider forti di coding
+    // (anthropic, openai) non disponibili, il fallback per un task heavy deve
+    // scegliere un modello HEAVY tool-capable di un provider sano, MAI degradare a
+    // un google/gemini-flash LIGHT solo perche' e' il piu' economico e featured.
+    // E' l'invariante su cui poggia il fix: select_agentic_model, consultato dal
+    // ramo __no_model__/cooldown di resolve_agent_provider, rispetta il tier
+    // dell'intent (heavy) ed esclude per costruzione i modelli light.
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, is_featured, input_cost_per_million_tokens) VALUES \
+         ('anthropic', 'claude-heavy', true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', true,  3.0), \
+         ('openai',    'gpt-heavy',    true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', true,  2.0), \
+         ('deepseek',  'reasoner',     true, true, 'none',              'heavy', '[\"reasoning\"]', false, 0.5), \
+         ('google',    'gemini-flash', true, true, 'none',              'light', '[\"reasoning\"]', true,  0.1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert catalog");
+
+    // Simula anthropic+openai indisponibili (cooldown) via exclude_providers,
+    // con lo stesso ordine usato dal fallback di resolve_agent_provider.
+    let out = select_agentic_model(
+        &pool,
+        &["heavy", "medium"],
+        Some("reasoning"),
+        0,
+        &["anthropic".to_string(), "openai".to_string()],
+        "is_featured DESC, input_cost_per_million_tokens ASC",
+    )
+    .await;
+    // Resta sul tier heavy sano (deepseek/reasoner), NON cade su google/gemini-flash
+    // (light) benche' piu' economico e featured.
+    assert_eq!(out, Some(("deepseek".to_string(), "reasoner".to_string())));
+}
+
+#[test]
 fn test_prompt_hash_stable() {
     // sha256(message[:1000]) deve essere deterministico e ignorare il
     // contenuto oltre 1000 char per consistency tra prompt simili.
