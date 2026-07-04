@@ -9,7 +9,7 @@
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "format": "prettier --check .",
-    "verify": "bash scripts/verify.sh",
+    "verify": "node scripts/verify.mjs",
     "smoke": "bash scripts/smoke-services.sh",
     "e2e:debug-chat": "node scripts/debug-console-agent-e2e.mjs",
     "xtask": "cargo run -p xtask --",
