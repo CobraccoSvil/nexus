@@ -54,9 +54,13 @@
 //!    dal DB (`load_*_config`, punto unico `get_setting`, regola G piena), 1:1 con
 //!    le chiavi `orchestrator.*`/`agent.*` del brain; il `Default` resta solo come
 //!    safe-default se la chiave manca.
-//! 3. SSE: i nodi emettono via `ctx.emit` solo `MetaStep`; mancano
-//!    `AssistantDelta`/`ToolUse`/`ToolResult` e il terminatore `Done`, + la
-//!    finalizzazione di `agent_runs` e la gestione hollow nel call site.
+//! 3. SSE (in gran parte CHIUSO): i nodi emettono via `ctx.emit` `MetaStep`,
+//!    `ToolUse` (`executor.rs`), `ToolResult` (`tool_dispatch.rs`), `EndTurn` e
+//!    `ThinkingDelta`; la finalizzazione di `agent_runs` e la gestione hollow
+//!    avvengono nel call site (come nel path Python). RESTA non implementato solo
+//!    lo streaming `AssistantDelta` (delta token-by-token del content assistant):
+//!    NON e' una variante di `SseEvent` per scelta architetturale — il messaggio
+//!    assistant e' comunque consegnato e persistito. Feature futura, non residuo.
 //! 4. CHIUSO. Il ramo `engine == rust` del call site esce dal `'compute` con
 //!    `break 'compute` su `Ok` (niente doppio-run); su `Err` finalizza FAILED
 //!    diagnosticato (`native_engine_failure_result`), NIENTE fallback automatico
