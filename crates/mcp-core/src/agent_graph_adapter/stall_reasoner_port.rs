@@ -156,6 +156,17 @@ const SCALE_TEMPLATE_KEY: &str = "system.scale.assess";
 /// scala (`Ok(None)`). PR-A: nessun nodo/detector la chiama comunque -> bit-identico.
 const SCALE_ENABLED_SETTING: &str = "agent.scale.enabled";
 
+/// Chiave del template ADDENDUM del SIZING (mig 0522): descrive la mossa
+/// `adjust_sizing` (postura Compact/Relax/Hold). APPESO al template base SOLO quando
+/// `agent.scale.sizing_enabled=true`, cosi' con sizing OFF il prompt LLM resta
+/// BYTE-IDENTICO al pre-0522 (bit-identico per il flusso tier).
+const SCALE_SIZING_TEMPLATE_KEY: &str = "system.scale.assess.sizing";
+
+/// Setting kill-switch NESTED del sizing (opt-in, default OFF, regola G): con `false`
+/// l'addendum sizing NON e' appeso e il gate lato motore degrada ogni AdjustSizing a
+/// KeepTier.
+const SCALE_SIZING_ENABLED_SETTING: &str = "agent.scale.sizing_enabled";
+
 /// Setting del timeout (s) della chiamata LLM di scala. Clamp `[5, 300]`.
 const SCALE_TIMEOUT_SETTING: &str = "agent.scale.timeout_s";
 
@@ -579,6 +590,21 @@ impl PgMetaReasonerPort {
             .unwrap_or(false)
     }
 
+    /// `true` se il SIZING agentico e' abilitato (`agent.scale.sizing_enabled`, mig
+    /// 0522). Default OFF (opt-in, regola G): con `false` l'addendum sizing NON e'
+    /// appeso al prompt -> prompt byte-identico al pre-0522 (bit-identico).
+    async fn scale_sizing_enabled(&self) -> bool {
+        nexus_auth::get_setting(&self.db, SCALE_SIZING_ENABLED_SETTING)
+            .await
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
     /// Timeout (s) della scala clampato in `[5, 300]`. Setting assente / malformato
     /// -> [`SCALE_TIMEOUT_DEFAULT`] (safe-default numerico, mig 0516).
     async fn scale_timeout_s(&self) -> u64 {
@@ -634,7 +660,7 @@ impl PgMetaReasonerPort {
 
         // (3) Template (punto unico loader, regola L).
         let tpl_cache = crate::prompt_templates::TemplateCache::new();
-        let system_text = crate::prompt_templates::get_template_or_default(
+        let mut system_text = crate::prompt_templates::get_template_or_default(
             &self.db,
             &tpl_cache,
             SCALE_TEMPLATE_KEY,
@@ -650,6 +676,31 @@ impl PgMetaReasonerPort {
                 SCALE_TEMPLATE_KEY
             );
             return Ok(None);
+        }
+
+        // SIZING (mig 0522): appende l'ADDENDUM che descrive la mossa `adjust_sizing`
+        // SOLO se il sizing e' abilitato. Con sizing OFF il prompt resta byte-identico
+        // al pre-0522 (bit-identico per il flusso tier); il gate lato motore degrada
+        // comunque ogni AdjustSizing a KeepTier. Se l'addendum manca (misconfig) si
+        // procede col solo template tier (degrado safe, non un errore).
+        if self.scale_sizing_enabled().await {
+            let addendum = crate::prompt_templates::get_template_or_default(
+                &self.db,
+                &tpl_cache,
+                SCALE_SIZING_TEMPLATE_KEY,
+            )
+            .await;
+            if addendum.trim().is_empty() {
+                tracing::warn!(
+                    target: "nexus_scale_controller",
+                    key = SCALE_SIZING_TEMPLATE_KEY,
+                    "scale: sizing ON ma addendum template assente (applicare la mig 0522); \
+                     procedo col solo template tier"
+                );
+            } else {
+                system_text.push_str("\n\n");
+                system_text.push_str(&addendum);
+            }
         }
 
         // (4) Payload: SOLO lo ScaleContext serializzato (regola M: segnali

@@ -172,7 +172,9 @@ use crate::decisions::meta_reason::{build_stall_context, translate};
 use crate::decisions::orchestration_reason::context_pressure_from_tokens;
 use crate::decisions::progress_controller::{self as pc, Action, Axis, ProgressSignals};
 use crate::decisions::scale_reason::{
-    build_scale_context, scale_cache_key, scale_trigger, ScaleHysteresisConfig, ScaleTriggerConfig,
+    build_scale_context, effective_ctx_mgmt, effective_g1_threshold, effective_rolling,
+    effective_token_brake, resolve_sizing_overrides, scale_cache_key, scale_trigger,
+    ScaleHysteresisConfig, ScaleSizingConfig, ScaleTriggerConfig, SizingBaseline,
 };
 use crate::decisions::tool_dispatch::{
     current_context_token_estimate, estimate_context_chars, flatten_context_text,
@@ -187,11 +189,12 @@ use crate::routing::signals::{
 };
 use crate::runtime::ports::{
     AgentStepStore, BillingCooldownPort, EscalationPort, LlmMessage, LlmRequest, MetaStepStore,
-    ModelUpscalePort, NextActionsDeriver, RunControlStore, ScaleMove, ScaleTier, SseEvent,
-    StallBudgetPort, SummaryStore, TokenCounter,
+    ModelUpscalePort, NextActionsDeriver, RunControlStore, ScaleMove, ScaleTier, SizingOverrides,
+    SseEvent, StallBudgetPort, SummaryStore, TokenCounter,
 };
 use crate::nodes::scale_control::{
-    SCALE_CONTEXT_KEY, SCALE_HYSTERESIS_CFG_KEY, SCALE_MOVE_CACHE_KEY_KEY,
+    SCALE_CONTEXT_KEY, SCALE_HYSTERESIS_CFG_KEY, SCALE_MOVE_CACHE_KEY_KEY, SCALE_SIZING_CFG_KEY,
+    SCALE_SIZING_OVERRIDES_KEY,
 };
 use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
 use crate::runtime::ports::RecoveryMove;
@@ -434,6 +437,18 @@ pub struct ScaleConfig {
     /// `agent.scale.window_overhead_ratio` (default 1.3): overhead per il vincolo
     /// finestra nel downscale (FIX-B): `required = est_tokens * ratio`.
     pub window_overhead_ratio: f64,
+    /// `agent.scale.sizing_enabled` (default false): kill-switch NESTED del SIZING
+    /// agentico (mig 0522). Con `scale.enabled=true` ma sizing OFF il flusso TIER
+    /// resta bit-identico (il detector non popola i segnali sizing, il gate degrada
+    /// ogni `AdjustSizing` a `KeepTier`). Regola G, opt-in DB.
+    pub sizing_enabled: bool,
+    /// `agent.scale.sizing_cooldown_turns` (default 3): turni minimi tra due cambi di
+    /// POSTURA di sizing (anti-thrash del sizing, DISTINTO dal cooldown tier).
+    pub sizing_cooldown_turns: i64,
+    /// `agent.scale.sizing_aggressiveness` in `[0,1]` (default 0.5): quanto una
+    /// postura spinge le soglie di dimensionamento (UNICA manopola DB del
+    /// trasformatore proporzionale; i floor/ceil sono invarianti dell'algoritmo).
+    pub sizing_aggressiveness: f64,
 }
 
 impl Default for ScaleConfig {
@@ -453,6 +468,11 @@ impl Default for ScaleConfig {
             max_tier_changes_per_run: 3,
             max_evals_per_run: 6,
             window_overhead_ratio: 1.3,
+            // Sizing agentico OFF di default (mig 0522): con scale ON ma sizing OFF il
+            // flusso tier resta bit-identico.
+            sizing_enabled: false,
+            sizing_cooldown_turns: 3,
+            sizing_aggressiveness: 0.5,
         }
     }
 }
@@ -1210,16 +1230,29 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
         // modello una chance reale di convergere (la prima escalation azzera i
         // contatori re-entry ma non iters_in, quindi una soglia fissa ri-scatterebbe
         // subito). Cap assoluto iteration_cap resta la safety net finale.
+        // Override sizing STICKY del run (mig 0522): letti UNA volta, riusati dal gate
+        // g1-loop e dal blocco di riduzione contesto piu' avanti nello stesso turno.
+        // `None` (sizing OFF / nessuna postura applicata) -> gli helper `effective_*`
+        // lasciano invariate le soglie fisse -> BIT-IDENTICO. Read-only, replay-safe
+        // (lo stato e' checkpointato).
+        let sizing_ov = Self::read_sizing_overrides(state);
         let g1_escal_now = state
             .extra
             .get("auto_escalations")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let g1_loop_threshold = self
-            .cfg
-            .g1_max_nudges
-            .saturating_mul(4)
-            .saturating_mul(g1_escal_now + 1);
+        // Soglia g1-loop resa ADATTIVA dal sizing (mig 0522, decisione #5): base *
+        // moltiplicatore. Senza override il moltiplicatore e' 1.0 -> base invariata.
+        // Valuta i fattori INSIEME col guard `!g1_recent_productive` piu' sotto: un
+        // modello medio che PROGREDISCE ottiene piu' respiro (soglia alzata) invece di
+        // essere escalato a una soglia geometrica fissa.
+        let g1_loop_threshold = effective_g1_threshold(
+            self.cfg
+                .g1_max_nudges
+                .saturating_mul(4)
+                .saturating_mul(g1_escal_now + 1),
+            sizing_ov.as_ref(),
+        );
         // Anti falso-negativo (regola H): il ramo "loop conclamato" si basa su
         // `unfulfilled_for_g1`, che senza `closure_verdict` (non popolato nel grafo
         // nativo) usa il report STRUTTURALE di passi pendenti (ADR 0018 fase 3: la
@@ -2476,13 +2509,26 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         let mut hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();
         let compress_iter = iters_in;
 
+        // Config di DIMENSIONAMENTO EFFETTIVA (mig 0522): base DB-driven + eventuali
+        // override sizing STICKY (`sizing_ov`). Con override assenti -> clone della
+        // base INVARIATA (BIT-IDENTICO). Rende ADATTIVE (non piu' soglie fisse
+        // geometriche) la compressione (fasi/keep_recent/max_chars + compress_start),
+        // il freno token e il rolling-summary (punto unico del merge = scale_reason).
+        let eff_ctx_mgmt = effective_ctx_mgmt(&self.cfg.ctx_mgmt, sizing_ov.as_ref());
+        let (eff_rolling_enabled, eff_rolling_keep) = effective_rolling(
+            self.cfg.rolling_summary_enabled,
+            self.cfg.rolling_keep_recent,
+            sizing_ov.as_ref(),
+        );
+        let eff_token_brake = effective_token_brake(&self.cfg.token_brake, sizing_ov.as_ref());
+
         // Compressione a generazioni (cutoff fisso, py:2764-2810).
-        let boundaries = &self.cfg.ctx_mgmt.compress_phase_boundaries;
+        let boundaries = &eff_ctx_mgmt.compress_phase_boundaries;
         let phase_now = boundaries.iter().filter(|b| compress_iter >= **b).count() as i64;
         let prev_phase = state.compress_cutoff_phase.unwrap_or(0);
         let mut cutoff_idx = state.compress_cutoff_index.unwrap_or(0);
         let (do_compress, params): (bool, CompressParams) =
-            ctxr::should_compress_now(compress_iter, &self.cfg.ctx_mgmt);
+            ctxr::should_compress_now(compress_iter, &eff_ctx_mgmt);
         let mut gen_cutoff_index: Option<i64> = None;
         let mut gen_cutoff_phase: Option<i64> = None;
         if phase_now > prev_phase {
@@ -2495,9 +2541,9 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             // cutoff -> serialize -> SummaryStore.summarize (I/O, gata Real) -> apply.
             // BEST-EFFORT: su guasto (LLM down, cooldown, Replay no-op) la history
             // resta INVARIATA e si prosegue (compress/token_brake fanno il resto).
-            if self.cfg.rolling_summary_enabled {
+            if eff_rolling_enabled {
                 if let Some(cut) =
-                    ctxr::select_rolling_summary_cutoff(&hist, self.cfg.rolling_keep_recent)
+                    ctxr::select_rolling_summary_cutoff(&hist, eff_rolling_keep)
                 {
                     let prefix_text = ctxr::serialize_prefix_for_summary(&hist, cut);
                     match self.summary_store.summarize(prefix_text, mode).await {
@@ -2597,7 +2643,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             hist = ctxr::apply_token_brake(
                 &hist,
                 effective_window,
-                &self.cfg.token_brake,
+                &eff_token_brake,
                 &|h: &[HistoryMessage]| self.estimate_history_tokens(h),
             );
         }
@@ -2789,6 +2835,7 @@ della finestra {effective_window} del modello {provider}/{model}"
                 &messages,
                 scale_escalations,
                 scale_est_tokens,
+                effective_window,
                 scale_stall_active,
             ) {
                 return Ok(delta);
@@ -4371,6 +4418,29 @@ al mio controllo e va risolta prima di continuare."
             .unwrap_or(-1)
     }
 
+    /// Iterazione dell'ultimo cambio di POSTURA di sizing del run
+    /// (`extra["scale_sizing_last_iter"]`, default `-1` = mai). Alimenta il cooldown
+    /// anti-thrash del sizing (`sizing_turns_since_change = iters - last`), DISTINTO
+    /// dal cooldown tier. Replay-safe (checkpointato).
+    fn scale_sizing_last_iter(state: &AgentState) -> i64 {
+        state
+            .extra
+            .get("scale_sizing_last_iter")
+            .and_then(Value::as_i64)
+            .unwrap_or(-1)
+    }
+
+    /// Legge gli [`SizingOverrides`] STICKY persistiti dal rientro `consume_scale_move`
+    /// (ramo `AdjustSizing`) in `extra[SCALE_SIZING_OVERRIDES_KEY]`. `None` = sizing
+    /// OFF / nessuna postura applicata -> gli helper `effective_*` lasciano invariate
+    /// le soglie fisse (BIT-IDENTICO). Read-only, replay-safe (stato checkpointato).
+    fn read_sizing_overrides(state: &AgentState) -> Option<SizingOverrides> {
+        state
+            .extra
+            .get(SCALE_SIZING_OVERRIDES_KEY)
+            .and_then(|v| serde_json::from_value::<SizingOverrides>(v.clone()).ok())
+    }
+
     /// Consultazioni LLM dello scale-controller gia' fatte nel run
     /// (`extra["scale_evals_used"]`, checkpointato). Cap `max_evals_per_run` (regola
     /// G): oltre, il detector NON emette piu' `ScaleReason` (budget/costo).
@@ -4506,6 +4576,7 @@ al mio controllo e va risolta prima di continuare."
         messages: &[Message],
         escalations_done: i64,
         est_tokens: i64,
+        effective_window: i64,
         stall_active: bool,
     ) -> Option<OpaqueDelta> {
         // GUARD PRIMARIO: flag OFF -> zero overhead (nessun ScaleContext, nessun
@@ -4576,7 +4647,7 @@ al mio controllo e va risolta prima di continuare."
         // resta true (run agentico).
         let required_capability: Option<&str> = None;
 
-        let scale_ctx = build_scale_context(
+        let mut scale_ctx = build_scale_context(
             state.current_tier.as_deref(),
             intent_tier_floor,
             state.user_intent.as_deref(),
@@ -4605,6 +4676,45 @@ al mio controllo e va risolta prima di continuare."
             turns_since_change,
             reversal_count,
         );
+
+        // ── Segnali di SIZING (mig 0522): popolati SOLO se il sizing e' abilitato ──
+        // A sizing OFF restano None -> OMESSI dal JSON serializzato all'LLM
+        // (skip_serializing_if) -> il flusso TIER resta BIT-IDENTICO. Sono gli OCCHI
+        // del sizing (regola M): crescita history, rumore tool_result, progresso.
+        if self.cfg.scale.sizing_enabled {
+            let history_size = messages.len() as i64;
+            scale_ctx.history_size = Some(history_size);
+            // Crescita = messaggi per iterazione (proxy strutturato dell'espansione
+            // del contesto; nessuno stato extra richiesto -> replay-safe).
+            scale_ctx.history_growth_rate =
+                Some(history_size as f64 / (iters_in.max(0) + 1) as f64);
+            // Rumore storia = caratteri del piu' grande messaggio recente (proxy della
+            // tool_result_size_distribution: un singolo output enorme che inquina il
+            // contesto). Riusa il punto unico di stima char (regola L).
+            let noise_window = 10usize;
+            let start = messages.len().saturating_sub(noise_window);
+            scale_ctx.tool_result_noise = Some(
+                messages[start..]
+                    .iter()
+                    .map(|m| estimate_history_chars(&[message_to_history(m)]))
+                    .max()
+                    .unwrap_or(0),
+            );
+            scale_ctx.effective_window = if effective_window > 0 {
+                Some(effective_window)
+            } else {
+                None
+            };
+            scale_ctx.recent_productive = Some(has_recent_productive_action(messages, 16));
+            // Cooldown anti-thrash del SIZING (distinto dal cooldown TIER).
+            let sizing_last = Self::scale_sizing_last_iter(state);
+            scale_ctx.sizing_turns_since_change = Some(if sizing_last < 0 {
+                // Mai cambiata la postura: coda ampia -> non blocca il primo cambio.
+                iters_in.max(self.cfg.scale.sizing_cooldown_turns)
+            } else {
+                (iters_in - sizing_last).max(0)
+            });
+        }
 
         // ── Trigger: gate break-even + cadenza + precedenza stallo (FIX-E) ─────
         // I sotto-segnali di trigger (pressure_changed / todo_closed_now /
@@ -4674,6 +4784,23 @@ al mio controllo e va risolta prima di continuare."
         if let Ok(cfg_value) = serde_json::to_value(hyst_cfg) {
             extra_out.insert(SCALE_HYSTERESIS_CFG_KEY.to_string(), cfg_value);
         }
+        // Trasporta la ScaleSizingConfig DB-driven al nodo SOLO se il sizing e'
+        // abilitato (mig 0522): a sizing OFF nessuna chiave aggiunta -> extra map
+        // identica a pre-0522 (bit-identico); il nodo, senza la config trasportata,
+        // ricade sul fallback conservativo (sizing OFF) e degrada ogni AdjustSizing a
+        // KeepTier. La `min_confidence` e' RIUSATA da `agent.scale.min_confidence`
+        // (regola L: una soglia, due gate).
+        if self.cfg.scale.sizing_enabled {
+            let sizing_cfg = ScaleSizingConfig {
+                enabled: true,
+                min_confidence: self.cfg.scale.min_confidence,
+                cooldown_turns: self.cfg.scale.sizing_cooldown_turns,
+                aggressiveness: self.cfg.scale.sizing_aggressiveness,
+            };
+            if let Ok(sizing_value) = serde_json::to_value(sizing_cfg) {
+                extra_out.insert(SCALE_SIZING_CFG_KEY.to_string(), sizing_value);
+            }
+        }
         extra_out.insert("scale_evals_used".to_string(), json!(evals_used + 1));
         tracing::info!(
             target: "nexus_agent_graph::executor",
@@ -4739,11 +4866,23 @@ al mio controllo e va risolta prima di continuare."
             .get(&key)
             .and_then(|v| serde_json::from_value(v.clone()).ok())?;
 
+        // Ramo SIZING (mig 0522): AdjustSizing NON tocca il tier. Risolve la postura in
+        // override concreti, li persiste STICKY e ri-fa il turno con le soglie adattive
+        // (nessuna risoluzione modello/tier). Deviato QUI prima della macchina tier.
+        if let ScaleMove::AdjustSizing { posture, .. } = &mv {
+            return self
+                .consume_sizing_move(state, iters_in, *posture, &scale_ctx, ctx, mode)
+                .await;
+        }
+
         let (raw_target_tier, raw_is_down) = match &mv {
             // KeepTier: nessun cambio, prosegue il turno normale (rete di sicurezza).
             ScaleMove::KeepTier => return None,
             ScaleMove::UpscaleTo { tier, .. } => (*tier, false),
             ScaleMove::DownscaleTo { tier, .. } => (*tier, true),
+            // Gia' deviato sopra (early return): arm difensivo per esaustivita' (regola
+            // L, niente `_`). Irraggiungibile in pratica.
+            ScaleMove::AdjustSizing { .. } => return None,
         };
 
         // ── FIX-C (F5): tetto cambi-tier per run + pin-heavy (mig 0516) ────────
@@ -4939,6 +5078,91 @@ al mio controllo e va risolta prima di continuare."
                 current_tier: Some(Some(target_tier.as_str().to_string())),
                 recent_tool_signatures: Some(Some(vec![])),
                 pending_tool_uses: Some(Some(vec![])),
+                stop_reason: Some(Some(StopReason::G1Escalated)),
+                iterations: Some(Some(iters_in + 1)),
+                extra: Some(extra_out),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
+
+    /// CONSUMO di una [`ScaleMove::AdjustSizing`] (mig 0522, gemello di
+    /// [`Self::consume_scale_move`] ma su direzione DISGIUNTA: DIMENSIONAMENTO, non
+    /// tier). Risolve la postura in [`SizingOverrides`] concreti col PUNTO UNICO
+    /// `resolve_sizing_overrides` (proporzionali ai segnali dello ScaleContext), li
+    /// persiste STICKY in `extra[SCALE_SIZING_OVERRIDES_KEY]`, aggiorna il cooldown del
+    /// sizing (`scale_sizing_last_iter`) e ri-fa il turno (`G1Escalated`) cosi' il
+    /// blocco di riduzione contesto riparte con le soglie ADATTIVE. Nessuna
+    /// risoluzione modello/tier (il sizing e' ortogonale al tier).
+    ///
+    /// `Hold` / override effettivo vuoto -> `None` (prosegue il turno, nessun redo).
+    async fn consume_sizing_move(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        posture: crate::runtime::ports::SizingPosture,
+        scale_ctx: &crate::runtime::ports::ScaleContext,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> Option<OpaqueDelta> {
+        // Baseline = soglie FISSE correnti (regola L: il calcolo puro non tocca il DB;
+        // il produttore risolve i valori da ExecutorConfig e li passa al risolutore).
+        let baseline = SizingBaseline {
+            compress_start_iter: self.cfg.ctx_mgmt.compress_start_iter,
+            compress_phase_keep_recent: self.cfg.ctx_mgmt.compress_phase_keep_recent.clone(),
+            compress_phase_max_chars: self.cfg.ctx_mgmt.compress_phase_max_chars.clone(),
+            token_brake_max_context_ratio: self.cfg.token_brake.max_context_ratio,
+            rolling_keep_recent: self.cfg.rolling_keep_recent,
+        };
+        let sizing_cfg = ScaleSizingConfig {
+            enabled: self.cfg.scale.sizing_enabled,
+            min_confidence: self.cfg.scale.min_confidence,
+            cooldown_turns: self.cfg.scale.sizing_cooldown_turns,
+            aggressiveness: self.cfg.scale.sizing_aggressiveness,
+        };
+        let overrides = resolve_sizing_overrides(posture, scale_ctx, &baseline, &sizing_cfg);
+        // Hold / nessun override effettivo -> non ri-fare il turno (prosegue normale).
+        if overrides == SizingOverrides::default() {
+            return None;
+        }
+        let value = serde_json::to_value(&overrides).ok()?;
+
+        // Clone-whole-map: persiste gli override STICKY + il cooldown del sizing senza
+        // azzerare gli altri canali extra (auto_escalations, scale_*, ...).
+        let mut extra_out = state.extra.clone();
+        extra_out.insert(SCALE_SIZING_OVERRIDES_KEY.to_string(), value);
+        extra_out.insert("scale_sizing_last_iter".to_string(), json!(iters_in));
+
+        let posture_label = match posture {
+            crate::runtime::ports::SizingPosture::Compact => "compact",
+            crate::runtime::ports::SizingPosture::Relax => "relax",
+            crate::runtime::ports::SizingPosture::Hold => "hold",
+        };
+        // Narrazione live: la chat spiega che il motore ha adattato il dimensionamento.
+        self.emit_phase(
+            ctx,
+            mode,
+            "sizing_applied",
+            format!("Dimensionamento adattato ({posture_label})"),
+            json!({
+                "posture": posture_label,
+                "compress_start_iter": overrides.compress_start_iter,
+                "rolling_summary_enabled": overrides.rolling_summary_enabled,
+                "token_brake_max_context_ratio": overrides.token_brake_max_context_ratio,
+                "g1_loop_threshold_mult": overrides.g1_loop_threshold_mult,
+            }),
+        )
+        .await;
+        tracing::info!(
+            target: "nexus_agent_graph::executor",
+            posture = posture_label,
+            iterations = iters_in,
+            "scale-controller: SIZING applicato -> override sticky + ri-do il turno"
+        );
+
+        Some(
+            StateDelta {
                 stop_reason: Some(Some(StopReason::G1Escalated)),
                 iterations: Some(Some(iters_in + 1)),
                 extra: Some(extra_out),

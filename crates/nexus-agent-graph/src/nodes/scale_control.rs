@@ -74,7 +74,8 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::scale_reason::{
-    apply_hysteresis, scale_cache_key, validate_scale_move, ScaleHysteresisConfig,
+    apply_hysteresis, apply_sizing_gate, scale_cache_key, validate_scale_move,
+    ScaleHysteresisConfig, ScaleSizingConfig,
 };
 use crate::runtime::ports::{MetaReasonerPort, ScaleContext, ScaleMove};
 use crate::runtime::AgentNodeCtx;
@@ -118,6 +119,24 @@ pub const SCALE_MOVE_CACHE_KEY_KEY: &str = "scale_move_cache_key";
 /// [`ScaleHysteresisConfig::conservative_defaults`] — deterministico, non un
 /// magic-fallback (i default coincidono coi seed DB).
 pub const SCALE_HYSTERESIS_CFG_KEY: &str = "scale_hysteresis_cfg";
+
+/// Chiave in `AgentState::extra` sotto cui l'executor serializza la
+/// [`ScaleSizingConfig`] DB-driven (kill-switch nested `sizing_enabled`,
+/// `min_confidence` riusato, `cooldown_turns`, `aggressiveness`). Stesso pattern di
+/// [`SCALE_HYSTERESIS_CFG_KEY`] (regola L, trasporto config->nodo senza I/O nel
+/// nodo): il gate [`apply_sizing_gate`] la consuma per una [`ScaleMove::AdjustSizing`].
+/// Assente (guasto a monte / sizing non trasportato) -> fallback conservativo
+/// [`ScaleSizingConfig::conservative_defaults`] (sizing OFF) -> AdjustSizing degrada a
+/// `KeepTier` (bit-identico, non un magic-fallback: sceglie solo il gate, regola G).
+pub const SCALE_SIZING_CFG_KEY: &str = "scale_sizing_cfg";
+
+/// Chiave in `AgentState::extra` sotto cui il RIENTRO dell'executor
+/// (`consume_scale_move`, ramo `AdjustSizing`) persiste gli [`SizingOverrides`]
+/// concreti risolti dalla postura. Canale executor->executor (il nodo NON lo tocca):
+/// il blocco di riduzione contesto e il gate g1-loop del turno successivo lo leggono
+/// via gli helper `effective_*`. Sticky per il resto del run finche' una nuova
+/// postura non lo sostituisce. Assente -> soglie fisse (bit-identico).
+pub const SCALE_SIZING_OVERRIDES_KEY: &str = "scale_sizing";
 
 /// Nodo dello scale-controller.
 ///
@@ -211,6 +230,19 @@ impl ScaleControlNode {
             .get(SCALE_HYSTERESIS_CFG_KEY)
             .and_then(|v| serde_json::from_value::<ScaleHysteresisConfig>(v.clone()).ok())
             .unwrap_or_else(ScaleHysteresisConfig::conservative_defaults)
+    }
+
+    /// Legge la [`ScaleSizingConfig`] DB-driven trasportata dal produttore in
+    /// `extra[SCALE_SIZING_CFG_KEY]` (kill-switch nested + soglie del sizing). Assente
+    /// o malformata -> fallback conservativo (sizing OFF): il gate degrada ogni
+    /// `AdjustSizing` a `KeepTier`. Non e' un magic-fallback (regola G): sceglie solo
+    /// il gate quando la config non e' arrivata.
+    fn read_sizing_cfg(state: &AgentState) -> ScaleSizingConfig {
+        state
+            .extra
+            .get(SCALE_SIZING_CFG_KEY)
+            .and_then(|v| serde_json::from_value::<ScaleSizingConfig>(v.clone()).ok())
+            .unwrap_or_else(ScaleSizingConfig::conservative_defaults)
     }
 
     /// Determina la chiave-cache dello scale-move. Preferisce la chiave TRASPORTATA
@@ -325,9 +357,19 @@ impl GraphNode<AgentState, AgentNodeCtx> for ScaleControlNode {
         // `downscale_clean_window`, `max_reversals` raggiungono il gate reale (prima
         // erano mute: il nodo usava `conservative_defaults()` hardcoded, viola G).
         // Fallback ai seed mig 0516 solo se il trasporto manca (guasto a monte).
-        let hyst_cfg = Self::read_hysteresis_cfg(state);
         let validated = validate_scale_move(&raw_move_to_value(&raw_move));
-        let mv = apply_hysteresis(validated, &scale_ctx, &hyst_cfg);
+        // Instrada per DIREZIONE (regola L): il SIZING (AdjustSizing) passa dal gate
+        // dedicato `apply_sizing_gate` (kill-switch nested + confidenza + cooldown
+        // anti-thrash), NON dai 5 gate TIER di `apply_hysteresis`. I tier
+        // (Upscale/Downscale/KeepTier) passano dall'anti-oscillazione.
+        let is_sizing = matches!(validated, ScaleMove::AdjustSizing { .. });
+        let mv = if is_sizing {
+            let sizing_cfg = Self::read_sizing_cfg(state);
+            apply_sizing_gate(validated, &scale_ctx, &sizing_cfg)
+        } else {
+            let hyst_cfg = Self::read_hysteresis_cfg(state);
+            apply_hysteresis(validated, &scale_ctx, &hyst_cfg)
+        };
         if mv == ScaleMove::KeepTier {
             tracing::debug!(
                 target: "nexus_agent_graph::scale_control",
@@ -776,6 +818,66 @@ mod tests {
         assert!(
             after.extra.get(&key).is_none(),
             "senza config trasportata il fallback conservativo tiene il downscale OFF"
+        );
+    }
+
+    #[tokio::test]
+    async fn adjust_sizing_persistito_con_sizing_cfg_on() {
+        // Reasoner propone AdjustSizing{Compact}; con ScaleSizingConfig ON trasportata
+        // e confidenza alta il gate dedicato lascia passare -> il nodo persiste la
+        // mossa alla chiave-cache (poi consumata dall'executor).
+        let node = ScaleControlNode::new(Arc::new(FixedScaleReasoner(ScaleMove::AdjustSizing {
+            posture: crate::runtime::ports::SizingPosture::Compact,
+            confidence: 0.9,
+        })));
+        let ctx = real_ctx();
+        let mut state = state_with_context(ScaleTier::Medium);
+        let cfg_on = ScaleSizingConfig {
+            enabled: true,
+            ..ScaleSizingConfig::conservative_defaults()
+        };
+        state.extra.insert(
+            SCALE_SIZING_CFG_KEY.to_string(),
+            serde_json::to_value(cfg_on).expect("serialize sizing cfg"),
+        );
+
+        let delta = node.run(&state, &ctx).await.expect("run ok");
+        let after = apply(&state, delta);
+        assert_eq!(after.stop_reason, Some(StopReason::ScaleResolved));
+        let scale_ctx = ScaleControlNode::read_context(&state).expect("ctx presente");
+        let key = fallback_cache_key(&scale_ctx);
+        let persisted = after.extra.get(&key).expect("AdjustSizing deve essere persistito");
+        let mv: ScaleMove =
+            serde_json::from_value(persisted.clone()).expect("mossa deserializzabile");
+        assert_eq!(
+            mv,
+            ScaleMove::AdjustSizing {
+                posture: crate::runtime::ports::SizingPosture::Compact,
+                confidence: 0.9
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn adjust_sizing_degrada_senza_sizing_cfg() {
+        // Senza ScaleSizingConfig trasportata (sizing OFF di default) il gate degrada
+        // l'AdjustSizing a KeepTier -> nessuna mossa persistita (bit-identico anche con
+        // scale ON).
+        let node = ScaleControlNode::new(Arc::new(FixedScaleReasoner(ScaleMove::AdjustSizing {
+            posture: crate::runtime::ports::SizingPosture::Compact,
+            confidence: 0.9,
+        })));
+        let ctx = real_ctx();
+        let state = state_with_context(ScaleTier::Medium); // nessuna SCALE_SIZING_CFG_KEY
+
+        let delta = node.run(&state, &ctx).await.expect("run ok");
+        let after = apply(&state, delta);
+        assert_eq!(after.stop_reason, Some(StopReason::ScaleResolved));
+        let scale_ctx = ScaleControlNode::read_context(&state).expect("ctx presente");
+        let key = fallback_cache_key(&scale_ctx);
+        assert!(
+            after.extra.get(&key).is_none(),
+            "sizing OFF -> AdjustSizing degrada a KeepTier, niente mossa"
         );
     }
 }

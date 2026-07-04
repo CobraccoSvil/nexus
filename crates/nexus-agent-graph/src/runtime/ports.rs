@@ -1427,6 +1427,103 @@ pub struct ScaleContext {
     /// reversal-pin): oltre `max_reversals` si pinna al tier PIU' ALTO e si smette di
     /// consultare l'LLM su quell'asse (anti-oscillazione, gemello di `already_guided`).
     pub reversal_count: i64,
+
+    // ── Segnali di DIMENSIONAMENTO (sizing agentico, mig 0522) ────────────────
+    // Tutti `Option` + `skip_serializing_if`: ASSENTI (sizing OFF, o detector che
+    // non li popola) -> OMESSI dal JSON serializzato all'LLM -> il flusso TIER resta
+    // BIT-IDENTICO (nessun campo extra nella richiesta cambia la decisione tier).
+    // Popolati SOLO dal detector quando `agent.scale.sizing_enabled=true` (regola G).
+    // Sono gli OCCHI del sizing (regola M): crescita/rumore/progresso strutturati, mai
+    // prosa. La DECISIONE (posture Compact/Relax/Hold) e' dell'LLM; la traduzione in
+    // soglie concrete e' deterministica (`scale_reason::resolve_sizing_overrides`).
+    /// Numero di messaggi nella history conversazionale (segnale di crescita del
+    /// contesto). `None` = sizing OFF -> omesso (bit-identico).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_size: Option<i64>,
+    /// Tasso di crescita della history: messaggi per iterazione
+    /// (`history_size / (iterations+1)`), segnale strutturato di quanto rapidamente
+    /// il contesto si espande. `None` = sizing OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_growth_rate: Option<f64>,
+    /// Rumore della storia: dimensione (caratteri) del piu' grande tool_result
+    /// recente (proxy della distribuzione `tool_result_size_distribution`: un singolo
+    /// output enorme che inquina il contesto). `None` = sizing OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_noise: Option<i64>,
+    /// Finestra di contesto EFFETTIVA del modello del turno (post smart-upscale, in
+    /// token): denominatore reale della pressione. `None` = sizing OFF / ignota.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_window: Option<i64>,
+    /// Il run ha compiuto AZIONI PRODUTTIVE recenti (tool non-esplorazione): segnale
+    /// che il modello STA PROGREDENDO (per non stringere/escalare un modello che
+    /// avanza). `None` = sizing OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_productive: Option<bool>,
+    /// Turni dall'ultimo cambio di POSTURE di sizing (cooldown anti-thrash del
+    /// sizing, DISTINTO da `turns_since_change` che e' il cooldown TIER). `None` =
+    /// sizing OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizing_turns_since_change: Option<i64>,
+}
+
+/// Postura di DIMENSIONAMENTO scelta dall'LLM per lo scale-controller (regola M:
+/// l'LLM sceglie SOLO una DIREZIONE bounded, non le soglie numeriche — quelle sono
+/// derivate deterministicamente da [`crate::decisions::scale_reason::resolve_sizing_overrides`]
+/// proporzionalmente ai segnali). Enum CHIUSO. `Default` = [`SizingPosture::Hold`]
+/// (nessun cambio: rete di sicurezza).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizingPosture {
+    /// Contesto sotto pressione / storia rumorosa / crescita rapida: comprimi PRIMA
+    /// e piu' forte, attiva il rolling-summary, stringi il freno token, alza la
+    /// soglia g1-loop se il run progredisce (piu' respiro a un modello che avanza).
+    Compact,
+    /// Run che fila con finestra ampia: RILASSA la compressione (piu' contesto vivo),
+    /// rolling-summary off, allarga il freno token. Piu' fedelta', meno aggressivita'.
+    Relax,
+    /// Nessun cambio di dimensionamento (rete di sicurezza; degrado di ogni forma
+    /// non chiara).
+    #[default]
+    Hold,
+}
+
+/// Aggiustamenti CONCRETI di dimensionamento risolti deterministicamente da una
+/// [`SizingPosture`] + i segnali dello [`ScaleContext`] (punto unico
+/// [`crate::decisions::scale_reason::resolve_sizing_overrides`], regola L). Ogni
+/// campo e' `Option`: `None` = MANTIENI la soglia fissa DB-driven (il merge
+/// `effective_*` lascia invariata la config base -> bit-identico). Serializzato e
+/// persistito in `extra["scale_sizing"]` dal rientro dell'executor; letto dal blocco
+/// di riduzione contesto e dal gate g1-loop del turno successivo (regola M: segnali
+/// strutturati, mai prosa). Tutti i valori sono gia' CLAMPATI ai bound di sicurezza
+/// dal risolutore: il consumatore li applica senza ulteriori controlli.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SizingOverrides {
+    /// Override di `compress_start_iter` (anticipa/posticipa l'inizio compressione).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress_start_iter: Option<i64>,
+    /// Override di `compress_phase_keep_recent` (messaggi recenti preservati per
+    /// fase): shrink (Compact) / grow (Relax), clampato al floor di sicurezza.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress_phase_keep_recent: Option<Vec<i64>>,
+    /// Override di `compress_phase_max_chars` (cap del singolo tool_result per fase):
+    /// proporzionale al rumore storia.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress_phase_max_chars: Option<Vec<i64>>,
+    /// Override di `token_brake.max_context_ratio` (soglia del freno token),
+    /// clampato in `[brake_ratio_min, brake_ratio_max]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_brake_max_context_ratio: Option<f64>,
+    /// Forza ON/OFF il rolling-summary (attiva su pressione, disattiva su rilasso).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_summary_enabled: Option<bool>,
+    /// Override di `rolling_keep_recent` (prefisso preservato dal rolling-summary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_keep_recent: Option<i64>,
+    /// Moltiplicatore della soglia g1-loop (`>1.0` = piu' respiro prima dell'
+    /// escalation-da-loop quando il run progredisce; `<1.0` = anticipa se la storia
+    /// cresce a vuoto). `None` = 1.0 (bit-identico).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub g1_loop_threshold_mult: Option<f64>,
 }
 
 /// Mossa dello SCALE-CONTROLLER prodotta dal meta-reasoner (gemello di
@@ -1438,6 +1535,12 @@ pub struct ScaleContext {
 /// [`crate::decisions::scale_reason::apply_hysteresis`] applicano l'anti-oscillazione
 /// DOPO la validazione (l'LLM NON scavalca il gate). `KeepTier` = nessun cambio
 /// (rete di sicurezza: il routing usa comunque sticky, il tier resta).
+///
+/// [`ScaleMove::AdjustSizing`] e' la terza direzione (mig 0522): NON tocca il tier
+/// ma il DIMENSIONAMENTO del motore (soglie context_reduction / token_brake /
+/// rolling_summary / g1-loop). Non passa dai 5 gate tier di `apply_hysteresis` ma
+/// dal gate dedicato [`crate::decisions::scale_reason::apply_sizing_gate`]
+/// (kill-switch `sizing_enabled` + confidenza + cooldown anti-thrash del sizing).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "move", rename_all = "snake_case")]
 pub enum ScaleMove {
@@ -1457,6 +1560,21 @@ pub enum ScaleMove {
     DownscaleTo {
         /// Tier target (deve essere < current e >= floor per essere valido).
         tier: ScaleTier,
+        /// Confidenza LLM `[0,1]`: sotto `min_confidence` degrada a `KeepTier`.
+        confidence: f64,
+    },
+    /// Aggiusta il DIMENSIONAMENTO del motore (soglie di context_reduction /
+    /// token_brake / rolling_summary / compress-start / g1-loop) SENZA cambiare tier.
+    /// Terza direzione dello scale-controller (mig 0522): la stessa consultazione
+    /// `assess_scale` puo' decidere il TIER (up/down) O il SIZING (postura). L'LLM
+    /// sceglie SOLO la [`SizingPosture`] + `confidence`; il traduttore deterministico
+    /// [`crate::decisions::scale_reason::resolve_sizing_overrides`] la espande in
+    /// [`SizingOverrides`] concreti proporzionali ai segnali (regola M). Gata da
+    /// `agent.scale.sizing_enabled` (default OFF -> degrada a `KeepTier`): con
+    /// scale ON ma sizing OFF il flusso tier resta BIT-IDENTICO.
+    AdjustSizing {
+        /// Direzione del dimensionamento scelta dall'LLM (Compact/Relax/Hold).
+        posture: SizingPosture,
         /// Confidenza LLM `[0,1]`: sotto `min_confidence` degrada a `KeepTier`.
         confidence: f64,
     },
