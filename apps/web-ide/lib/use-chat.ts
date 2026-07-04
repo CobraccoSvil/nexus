@@ -909,7 +909,18 @@ export function useChat(
 
   const resend = useCallback(
     async (messageId: string, options: SendChatMessageOptions = {}) => {
-      if (!messageId || isLoading) return;
+      if (!messageId) return;
+      // Un run gia' in corso (POST in volo O agentRun attivo) rendeva il click
+      // "Reinvia" un NO-OP MUTO: sembrava non fare nulla e la richiesta non
+      // compariva in testa. Il `send` normale accoda invece di perdere il
+      // messaggio; il resend avvia un nuovo flusso che confligge con un run
+      // attivo, quindi diamo feedback ESPLICITO (niente perdita silenziosa).
+      if (isLoading || agentRun) {
+        setError(
+          "Un run è già in corso: fermalo con Stop prima di reinviare la richiesta.",
+        );
+        return;
+      }
       setBusyByMessage((current) => ({ ...current, [messageId]: "resend" }));
       setError(null);
       try {
@@ -959,7 +970,7 @@ export function useChat(
         });
       }
     },
-    [isLoading, profileId, subscribeToRun],
+    [isLoading, agentRun, profileId, subscribeToRun],
   );
 
   const remove = useCallback(async (messageId: string) => {
