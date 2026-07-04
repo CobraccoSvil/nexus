@@ -29,7 +29,18 @@ import type { AgentStep, AITraceEvent } from "../api/agent";
 
 export type ToolOutcome = "ok" | "err" | "running";
 
-export interface RoutingEvent {
+/** Provenienza dell'evento: provider/model che l'hanno eseguito. Stampata sugli
+ *  eventi in composeActivityStream cosi' OGNI riga del nastro puo' mostrare
+ *  l'icona provider + tooltip modello, senza risalire al segmento. Per i tool il
+ *  model puo' essere quello EFFETTIVO della trace della stessa iterazione (piu'
+ *  preciso su upscale intra-segmento). Le bande switch NON la usano (hanno i
+ *  ProviderBadge). */
+export interface EventProvenance {
+  provider?: string;
+  model?: string;
+}
+
+export interface RoutingEvent extends EventProvenance {
   type: "routing";
   /** intent classificato (payload.intent del meta-step routing). */
   intent?: string;
@@ -46,19 +57,19 @@ export interface PlanTodo {
   priority?: string;
 }
 
-export interface PlanEvent {
+export interface PlanEvent extends EventProvenance {
   type: "plan";
   todos: PlanTodo[];
 }
 
-export interface ThoughtEvent {
+export interface ThoughtEvent extends EventProvenance {
   type: "thought";
   /** iterazione a cui si riferisce (executor_call.iteration), se nota. */
   iteration?: number;
   text: string;
 }
 
-export interface ToolEvent {
+export interface ToolEvent extends EventProvenance {
   type: "tool";
   name: string;
   /** target leggibile (path/comando), se disponibile. */
@@ -89,7 +100,7 @@ export interface SwitchEvent {
   attempt?: string;
 }
 
-export interface VerifyEvent {
+export interface VerifyEvent extends EventProvenance {
   type: "verify";
   /** fase del final_gate (start/passed/failed/forced_close). */
   phase?: string;
@@ -97,7 +108,7 @@ export interface VerifyEvent {
   maxCycles?: number;
 }
 
-export interface ContextOverflowEvent {
+export interface ContextOverflowEvent extends EventProvenance {
   type: "context_overflow";
   detail?: string;
 }
@@ -107,7 +118,7 @@ export interface ContextOverflowEvent {
  *  renderer puo' espandere la riga collassata e mostrare i singoli tool (ognuno
  *  a sua volta espandibile per Parametri/Risultato). Niente troncamento
  *  silenzioso: il folding e' sempre reversibile con un click. */
-export interface FoldedToolsEvent {
+export interface FoldedToolsEvent extends EventProvenance {
   type: "folded_tools";
   count: number;
   firstIteration?: number;
@@ -445,9 +456,37 @@ export function composeActivityStream(
     }
   }
 
+  // Stampa la PROVENIENZA (provider/model) su ogni evento del segmento, cosi'
+  // ogni riga del nastro puo' mostrare l'icona provider + tooltip modello senza
+  // risalire al segmento. Per i TOOL usa il model EFFETTIVO della trace della
+  // stessa iterazione (piu' preciso su upscale intra-segmento); altrimenti il
+  // model del segmento. Le bande switch NON la ricevono (hanno i ProviderBadge).
+  // Va fatto PRIMA del folding cosi' i tool interni al folded hanno gia' la
+  // provenienza; il FoldedToolsEvent la eredita dal segmento subito dopo.
+  for (const seg of segments) {
+    for (const ev of seg.events) {
+      if (ev.type === "switch") continue;
+      ev.provider = seg.provider;
+      if (ev.type === "tool") {
+        const tr = ev.iteration != null ? traceIter.get(ev.iteration) : undefined;
+        ev.model = tr?.model ?? seg.model;
+      } else {
+        ev.model = seg.model;
+      }
+    }
+  }
+
   // Applica il collasso dei tool consecutivi ok dentro ogni segmento.
   for (const seg of segments) {
     seg.events = foldConsecutiveOkTools(seg.events, foldThreshold);
+    // Il FoldedToolsEvent eredita la provenienza del segmento (i singoli tool
+    // conservati mantengono la propria, gia' stampata sopra).
+    for (const ev of seg.events) {
+      if (ev.type === "folded_tools") {
+        ev.provider = seg.provider;
+        ev.model = seg.model;
+      }
+    }
   }
 
   return { segments, empty: segments.length === 0 };

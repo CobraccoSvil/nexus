@@ -39,6 +39,15 @@ export function providerBaseColor(provider: string | null | undefined): string {
   return (PROVIDER_COLORS[key] ?? PROVIDER_COLORS.unknown).base;
 }
 
+/** Etichetta leggibile del provider (brand). Punto unico riusato da ProviderIcon
+ *  per il tooltip. Per provider ignoti ritorna la sigla iniziale maiuscola. */
+export function providerLabel(provider: string | null | undefined): string {
+  const key = (provider ?? "unknown").toLowerCase();
+  const entry = PROVIDER_COLORS[key];
+  if (entry) return entry.label;
+  return provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : "?";
+}
+
 export interface ModelPricingEntry {
   provider: string;
   model: string;
@@ -120,9 +129,11 @@ export function useModelPricing(
 /**
  * Calcola la tonalita' (alpha 0.25 → 0.95) di un colore in base al costo
  * del modello. Scala logaritmica: modelli economici (≤$1/M) sono molto
- * trasparenti, modelli costosi (≥$50/M) molto opachi.
+ * trasparenti, modelli costosi (≥$50/M) molto opachi. Esportata come punto
+ * unico (regola L): riusata da ProviderIcon per distinguere modelli diversi
+ * dello stesso provider con una tonalita' del brand.
  */
-function alphaFromCost(entry: ModelPricingEntry | null): number {
+export function alphaFromCost(entry: ModelPricingEntry | null): number {
   if (!entry) return 0.55;
   const inCost = entry.input_cost_per_million_tokens ?? 0;
   const outCost = entry.output_cost_per_million_tokens ?? 0;
@@ -135,8 +146,9 @@ function alphaFromCost(entry: ModelPricingEntry | null): number {
   return 0.30 + 0.65 * norm;
 }
 
-/** Converte hex (#RRGGBB) + alpha in `rgba(r,g,b,a)`. */
-function rgba(hex: string, alpha: number): string {
+/** Converte hex (#RRGGBB) + alpha in `rgba(r,g,b,a)`. Esportata (regola L):
+ *  riusata da ProviderIcon per tingere il mark col brand + tonalita' costo. */
+export function rgba(hex: string, alpha: number): string {
   const m = /^#?([0-9a-fA-F]{6})$/.exec(hex);
   if (!m) return hex;
   const v = m[1];

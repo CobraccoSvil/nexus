@@ -25,6 +25,7 @@ import { PlanChecklist } from "./agent-meta-step-card";
 import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
 import { InlineTruncated, formatStepInput, humanizeToolResult } from "./step-detail";
+import { ProviderIcon } from "./provider-icon";
 import { capStreamToRecent } from "../../lib/use-chat/activity-stream";
 import type {
   ActivityStream,
@@ -250,7 +251,7 @@ function EventRow({
     <div
       style={{
         position: "relative",
-        padding: "7px 10px 7px 42px",
+        padding: "7px 26px 7px 42px",
         minWidth: 0,
       }}
     >
@@ -295,6 +296,13 @@ function EventRow({
       >
         {EVENT_GLYPH[event.type]}
       </span>
+      {/* Icona provider/model che ha ESEGUITO la riga (tooltip = modello). In
+          alto a destra, compatta: scorrendo il nastro si vede chi ha fatto cosa. */}
+      {event.provider && (
+        <span style={{ position: "absolute", right: 8, top: 9, zIndex: 2 }}>
+          <ProviderIcon provider={event.provider} model={event.model} />
+        </span>
+      )}
       <EventBody event={event} segColor={segColor} tc={tc} />
     </div>
   );
@@ -307,10 +315,14 @@ function ToolEventBody({
   event,
   segColor,
   tc,
+  showProviderIcon = false,
 }: {
   event: ToolEvent;
   segColor: string;
   tc: ThemeColors;
+  /** true quando reso DENTRO un folded (non passa da EventRow, che gia' mostra
+   *  l'icona): allora la mostra nell'header per non perderla. Default false. */
+  showProviderIcon?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const hasInput = event.input != null && Object.keys(event.input).length > 0;
@@ -330,6 +342,9 @@ function ToolEventBody({
         </span>
         {typeof event.iteration === "number" && (
           <span style={metaStyle(tc)}>iter. {event.iteration + 1}</span>
+        )}
+        {showProviderIcon && event.provider && (
+          <ProviderIcon provider={event.provider} model={event.model} />
         )}
       </div>
       <div
@@ -463,7 +478,13 @@ function FoldedToolsBody({
           }}
         >
           {event.tools.map((tool, i) => (
-            <ToolEventBody key={`folded-tool-${i}`} event={tool} segColor={segColor} tc={tc} />
+            <ToolEventBody
+              key={`folded-tool-${i}`}
+              event={tool}
+              segColor={segColor}
+              tc={tc}
+              showProviderIcon
+            />
           ))}
         </div>
       )}

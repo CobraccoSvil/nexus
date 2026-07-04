@@ -317,6 +317,64 @@ test("unwrap: step SSE con toolName presente non viene alterato", () => {
   assert.deepEqual(tool.input, { path: "a.ts", content: "x" });
 });
 
+// ── Stamping provider/model per riga (icona provider) ───────────────────────
+
+test("provenance: ogni riga porta provider/model del segmento", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta("routing", { intent: "fix", provider: "google", model: "gemini-2.5-pro" }),
+    meta("final_gate", { phase: "passed" }),
+  ];
+  const steps: AgentStep[] = [step("read_file", "completed", 0)];
+  const s = composeActivityStream(metaSteps, steps, [], 3);
+  const seg = s.segments[0];
+  // Ogni evento non-switch ha provider+model del segmento.
+  for (const ev of seg.events) {
+    if (ev.type === "switch") continue;
+    assert.equal(ev.provider, "google", `provider stampato su ${ev.type}`);
+    assert.equal(ev.model, "gemini-2.5-pro", `model stampato su ${ev.type}`);
+  }
+});
+
+test("provenance: il TOOL prende il model EFFETTIVO della trace della sua iterazione", () => {
+  beforeEach();
+  const runId = "run-1";
+  const metaSteps: MetaStepEntry[] = [
+    meta("routing", { intent: "x", provider: "anthropic", model: "claude-haiku" }),
+  ];
+  const steps: AgentStep[] = [step("run", "failed", 3, { toolResult: "e" })];
+  // La trace dell'iterazione 3 dichiara un model piu' potente (upscale).
+  const traces = [trace(runId, 3, "anthropic", "claude-sonnet")];
+  const s = composeActivityStream(metaSteps, steps, traces, 3);
+  const tool = s.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is ToolEvent => e.type === "tool");
+  assert.ok(tool);
+  assert.equal(tool.provider, "anthropic");
+  // Model effettivo della trace, non quello del segmento.
+  assert.equal(tool.model, "claude-sonnet");
+});
+
+test("provenance: il folded_tools eredita provider/model del segmento", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta("routing", { intent: "x", provider: "openai", model: "gpt-4o" }),
+  ];
+  const steps: AgentStep[] = [
+    step("read_file", "completed", 0),
+    step("read_file", "completed", 1),
+    step("read_file", "completed", 2),
+    step("read_file", "completed", 3),
+  ];
+  const s = composeActivityStream(metaSteps, steps, [], 3);
+  const folded = s.segments.flatMap((seg) => seg.events).find((e) => e.type === "folded_tools");
+  assert.ok(folded && folded.type === "folded_tools");
+  assert.equal(folded.provider, "openai");
+  assert.equal(folded.model, "gpt-4o");
+  // I tool conservati mantengono la propria provenance stampata.
+  assert.ok(folded.tools.every((t) => t.provider === "openai"));
+});
+
 test("folded: i tool conservati mantengono input/result (espandibili singolarmente)", () => {
   beforeEach();
   const steps: AgentStep[] = [
