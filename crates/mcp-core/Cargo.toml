@@ -90,10 +90,14 @@ onnx = ["nexus-orchestrator/onnx"]
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-# windows-sys: liveness di processo cross-platform in process_util.rs
-# (OpenProcess/WaitForSingleObject). Su Linux la liveness usa /proc, qui no dep.
+# windows-sys: liveness di processo + metriche OS cross-platform in
+# process_util.rs. Su Linux la liveness/metriche usano /proc, qui no dep.
+# - Win32_System_Threading: OpenProcess, GetProcessTimes, GetProcessIoCounters,
+#   IO_COUNTERS (metriche CPU/IO del processo servizio).
+# - Win32_System_ProcessStatus: K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS
+#   (WorkingSetSize -> RSS del processo servizio).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
 
 [lints]
 workspace = true

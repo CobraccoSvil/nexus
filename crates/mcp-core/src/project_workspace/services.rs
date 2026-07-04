@@ -289,6 +289,27 @@ pub(super) async fn list_services_fallback(
     services
 }
 
+/// PUNTO UNICO (regola L) della derivazione dello "slug di servizio" di un
+/// progetto a partire dal suo NOME. E' la formula usata da TUTTI i call site
+/// Windows (pannello Servizi, wizard install, allocazione porte) per costruire
+/// il nome dell'unit `{slug}-{label}.service`. NON coincide con `projects.slug`
+/// (slugify + suffisso di unicita' `-N`): usare `projects.slug` qui creerebbe
+/// unit divergenti (diagnosi orfane, readiness saltata). Chi costruisce un unit
+/// deve derivare lo slug SOLO da qui.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn project_service_slug(name: &str) -> String {
+    name.to_lowercase().replace([' ', '_'], "-")
+}
+
+/// PUNTO UNICO (regola L) della costruzione del nome unit di un servizio di
+/// progetto: `{slug}-{label}.service`. Usato dal pannello (`list_services_windows`)
+/// e dall'observer (`collect_units`) cosi' i due lati producono lo STESSO unit,
+/// che deve anche combaciare con `nexus_port_allocations.service_unit`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn service_unit_name(slug: &str, label: &str) -> String {
+    format!("{slug}-{label}.service")
+}
+
 /// Voci del pannello Servizi Windows a partire dalle righe storiche di
 /// agent_processes (label, status, created_at — ordinate per label,
 /// created_at DESC). Funzione pura testabile (punto unico, regola L):
@@ -361,7 +382,7 @@ pub(super) async fn list_services_windows(
         .into_iter()
         .map(|(label, running)| {
             json!({
-                "unit":       format!("{slug}-{label}.service"),
+                "unit":       service_unit_name(slug, &label),
                 "short":      label,
                 "state":      if running { "active" } else { "inactive" },
                 "sub":        if running { "running" } else { "dead" },

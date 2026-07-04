@@ -1,28 +1,35 @@
 //! Service Observer — osservabilita' runtime delle APP UTENTE (mig 0355/0356).
 //!
 //! Worker periodico, fratello di `services_watchdog` ma con scope DISGIUNTO:
-//! qui si monitorano i servizi systemd `{slug}-*.service` dei progetti utente,
-//! NON i microservizi Nexus (che restano al watchdog). L'observer NON riavvia:
-//! osserva e diagnostica. Copre in un solo ciclo:
-//!   - cap 4: metriche OS per processo (/proc) -> evento ServiceMetrics
+//! qui si monitorano i servizi `{slug}-*.service` dei progetti utente (unit
+//! systemd `--user` su Linux, processi gestiti `agent_processes` kind='service'
+//! su Windows), NON i microservizi Nexus (che restano al watchdog). L'observer
+//! NON riavvia: osserva e diagnostica. Copre in un solo ciclo:
+//!   - cap 4: metriche OS per processo -> evento ServiceMetrics
 //!   - cap 3: anomaly detection (cpu/rss/restart/error-rate) -> ServiceAnomaly
 //!   - cap 1: crash detection nei log -> ServiceCrashDetected (+ auto-debug,
 //!            vedi `remediation`, gated da agent.observer.auto_diagnose_enabled)
 //!
 //! Regole: G (tutte le soglie in settings, lette a ogni ciclo), E (solo unit
-//! `{slug}-` e PID del progetto, validati via /proc/<pid>/comm), L (riusa
-//! tcp/`/proc` readers e build_diagnostics; un solo loop per 3 capacita').
+//! `{slug}-` e PID del progetto), L (metriche via `process_util` cross-platform,
+//! readiness via `tcp_probe`, enumerazione Windows via `list_services_windows`;
+//! un solo loop per 3 capacita'), M (lo STATO del servizio si legge da segnali
+//! strutturati -- process_alive + exit_code/status di `agent_processes` su
+//! Windows, `is-active` su Linux -- mai dal parsing della prosa dei log: i log
+//! servono solo a error_rate e alla diagnosi).
 //!
 //! Anti-spam: anomalie e crash sono emessi sulla TRANSIZIONE (quando compaiono),
 //! non a ogni ciclo finche' persistono (stato in-memory per unit).
 //!
-//! Windows nativo: l'observer e' logica interamente Linux (systemd `--user` +
-//! `/proc`). `spawn_service_observer` fa early-return su Windows (vedi in fondo),
-//! quindi tutte le funzioni/struct/import del loop restano definiti ma inutilizzati.
-//! Si silenziano `dead_code`/`unused_imports` SOLO su Windows (un punto unico di
-//! gating, regola L: evita di marcare ~30 item con `#[cfg(unix)]` in modo fragile),
-//! mantenendo il lint pieno su Unix, dove il codice e' effettivamente usato.
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
+//! Sorgenti dati astratte per OS (`#[cfg(unix)]` / `#[cfg(windows)]`):
+//!   - Unix: systemd `--user` (enum/stato/restart/env) + `/proc` (metriche via
+//!     process_util) + journalctl (log). Comportamento invariato.
+//!   - Windows: i servizi di progetto girano come `agent_processes` (kind=
+//!     'service', tabella per-progetto): enumerazione via `list_services_windows`
+//!     (services.rs, riuso), stato da `process_alive(pid)` + `status`/`exit_code`,
+//!     metriche via Win32 (process_util), log da `output`/`error_output`. Il
+//!     conteggio restart nativo non esiste su Windows -> quella specifica anomaly
+//!     e' disabilitata (documentato), senza rompere il ciclo.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -34,10 +41,6 @@ use uuid::Uuid;
 
 use crate::AppState;
 
-/// Dimensione pagina (Linux x86_64) per convertire le pagine RSS in byte.
-const PAGE_SIZE_BYTES: u64 = 4096;
-/// USER_HZ standard Linux: i tick di /proc/<pid>/stat sono 1/100 di secondo.
-const USER_HZ: f64 = 100.0;
 /// Attesa iniziale: lascia stabilizzare l'avvio dei servizi.
 const STARTUP_DELAY_S: u64 = 25;
 /// Cap di progetti analizzati per ciclo (anti-overhead su molte istanze).
@@ -68,8 +71,10 @@ struct ObserverConfig {
 /// Stato runtime per unit, tra i cicli.
 #[derive(Debug, Default, Clone)]
 struct UnitState {
-    /// utime+stime (tick) del campione precedente, per il delta CPU.
-    prev_cpu_ticks: Option<u64>,
+    /// Tempo CPU cumulativo (secondi) del campione precedente, per il delta CPU.
+    /// Normalizzato dalla fonte (process_util), cosi' il calcolo CPU% e' identico
+    /// su Unix e Windows.
+    prev_cpu_seconds: Option<f64>,
     /// Istante del campione precedente (per il denominatore CPU%).
     prev_sample: Option<Instant>,
     /// NRestarts visto al ciclo precedente.
@@ -80,20 +85,19 @@ struct UnitState {
     last_crash_sig: Option<String>,
     /// Timestamp (unix) dell'ultima scansione log incrementale.
     last_log_scan_ts: i64,
+    /// (Solo Windows) Lunghezza del buffer log gia' scansionato al ciclo
+    /// precedente: l'error-rate conta SOLO le righe-error NUOVE (la coda oltre
+    /// questo offset), replicando l'incrementalita' della finestra journalctl.
+    /// Il buffer agent_processes e' cumulativo (append con cap 50KB): se si
+    /// accorcia (troncamento/nuovo avvio) l'offset si resetta.
+    #[cfg_attr(unix, allow(dead_code))]
+    prev_log_len: usize,
     /// Valore di `ActiveEnterTimestamp` visto al ciclo precedente: se cambia, e'
     /// un nuovo avvio ("run") -> si resetta il grace di readiness e l'anti-spam.
     prev_active_enter: Option<String>,
     /// Istante in cui e' stato osservato l'avvio corrente (per il grace period
     /// readiness, in-memory: niente parsing del timestamp systemd).
     run_seen_at: Option<Instant>,
-}
-
-/// Campione metriche grezze da /proc.
-struct ProcSample {
-    cpu_ticks: u64,
-    rss_bytes: u64,
-    io_read_bytes: u64,
-    io_write_bytes: u64,
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -145,75 +149,260 @@ async fn load_config(db: &PgPool) -> ObserverConfig {
     }
 }
 
-// ── Lettura /proc (riusa il pattern di port_recovery) ─────────────────────────
-
-/// Legge `comm` del processo (per validare PID non riciclato, regola E).
-fn read_comm(pid: u32) -> Option<String> {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
-/// Estrae metriche da /proc/<pid>/{stat,statm,io}. None se il PID non esiste.
-fn read_proc_metrics(pid: u32) -> Option<ProcSample> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Il campo comm (2o) e' tra parentesi e puo' contenere spazi: si parte dopo ')'.
-    let after = stat.rsplit_once(')').map(|(_, b)| b).unwrap_or(&stat);
-    let fields: Vec<&str> = after.split_whitespace().collect();
-    // Dopo ')' i campi ripartono da "state" (campo 3). utime=campo14 -> idx 11,
-    // stime=campo15 -> idx 12.
-    let utime = fields
-        .get(11)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let stime = fields
-        .get(12)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let rss_bytes = std::fs::read_to_string(format!("/proc/{pid}/statm"))
-        .ok()
-        .and_then(|s| {
-            s.split_whitespace()
-                .nth(1)
-                .and_then(|p| p.parse::<u64>().ok())
-        })
-        .map(|pages| pages * PAGE_SIZE_BYTES)
-        .unwrap_or(0);
-
-    let (mut io_read, mut io_write) = (0u64, 0u64);
-    if let Ok(io) = std::fs::read_to_string(format!("/proc/{pid}/io")) {
-        for line in io.lines() {
-            if let Some(v) = line.strip_prefix("read_bytes:") {
-                io_read = v.trim().parse().unwrap_or(0);
-            } else if let Some(v) = line.strip_prefix("write_bytes:") {
-                io_write = v.trim().parse().unwrap_or(0);
-            }
-        }
-    }
-
-    Some(ProcSample {
-        cpu_ticks: utime + stime,
-        rss_bytes,
-        io_read_bytes: io_read,
-        io_write_bytes: io_write,
-    })
-}
-
 // ── Enumerazione servizi utente (scope progetto, regola E) ────────────────────
 
-/// Progetti con slog non vuoto (al piu' MAX_PROJECTS_PER_CYCLE).
-async fn projects_with_slug(db: &PgPool) -> Vec<(Uuid, String)> {
-    sqlx::query_as::<_, (Uuid, Option<String>)>(
-        "SELECT id, slug FROM projects WHERE slug IS NOT NULL AND slug <> '' LIMIT $1",
+/// Progetti con slug non vuoto (al piu' MAX_PROJECTS_PER_CYCLE), con anche il
+/// `name` (serve al ramo Windows per derivare lo slug di servizio con la stessa
+/// formula del pannello, vedi `collect_units` Windows). Il ramo Unix usa lo
+/// `slug` (invariato) e ignora il name.
+async fn projects_with_slug(db: &PgPool) -> Vec<(Uuid, String, String)> {
+    sqlx::query_as::<_, (Uuid, Option<String>, Option<String>)>(
+        "SELECT id, slug, name FROM projects WHERE slug IS NOT NULL AND slug <> '' LIMIT $1",
     )
     .bind(MAX_PROJECTS_PER_CYCLE as i64)
     .fetch_all(db)
     .await
     .unwrap_or_default()
     .into_iter()
-    .filter_map(|(id, slug)| slug.map(|s| (id, s)))
+    .filter_map(|(id, slug, name)| slug.map(|s| (id, s, name.unwrap_or_default())))
     .collect()
+}
+
+/// Snapshot per-unit dei dati sorgente di un ciclo, aggregati per OS.
+///
+/// Il `run_cycle` e' cross-platform e legge SOLO da qui: i dettagli OS
+/// (systemctl+/proc+journalctl vs agent_processes+Win32) sono confinati nel
+/// collector (`collect_units`). `pid`/`active_state` vengono da segnali
+/// strutturati (regola M): MainPID+is-active su Linux, pid+status/exit_code di
+/// agent_processes su Windows.
+struct UnitSample {
+    /// Nome unit canonico `{slug}-{short}.service` (chiave stabile per lo stato).
+    unit: String,
+    /// Stato mappato: "active" | "failed" | "inactive" | "activating" | ...
+    active_state: String,
+    /// PID del processo servizio (None se non attivo).
+    pid: Option<u32>,
+    /// Conteggio restart cumulativo (systemd NRestarts). `None` = non disponibile
+    /// (Windows: agent_processes non traccia i restart -> anomaly restart off).
+    restarts: Option<u32>,
+    /// Marcatore opaco dell'avvio corrente ("run"): se cambia tra due cicli e' un
+    /// nuovo avvio (reset grace/anti-spam). NON viene parsato, solo confrontato.
+    /// Unix: `ActiveEnterTimestamp`. Windows: PID+started_at della riga
+    /// agent_processes. `None` = servizio non attivo.
+    active_enter: Option<String>,
+    /// Testo dei log del RUN corrente, per la diagnosi (startup incluso). Vuoto
+    /// -> il chiamante usa la finestra error-rate come fallback.
+    run_log: String,
+    /// Buffer di log applicativi per lo scan error-rate del ciclo (stdout+stderr).
+    /// Unix: finestra journalctl incrementale (calcolata nel loop). Windows:
+    /// buffer cumulativo di agent_processes (l'incrementale lo fa il loop via
+    /// offset in UnitState). Vuoto su Unix (il loop usa scan_new_logs).
+    log_buffer: String,
+}
+
+/// Enumera i servizi del progetto e ne aggrega i dati sorgente, per OS.
+///
+/// - Unix: systemd `--user` (file unit + is-active + MainPID + NRestarts +
+///   InvocationID) e journalctl per il run-log. Comportamento invariato.
+/// - Windows: `agent_processes` (kind='service'), enumerati con il PUNTO UNICO
+///   `list_services_windows` (services.rs, dedup label/fantasma). Stato da
+///   `process_alive(pid)` + `status`/`exit_code`; run-log da `output`/
+///   `error_output`. Nessun systemctl/journalctl/proc.
+#[cfg(unix)]
+async fn collect_units(
+    _state: &AppState,
+    _project_id: Uuid,
+    slug: &str,
+    _name: &str,
+) -> Vec<UnitSample> {
+    let mut out = Vec::new();
+    for (unit, active_state) in list_user_services(slug).await {
+        let pid = unit_main_pid(&unit).await;
+        let restarts = unit_restarts(&unit).await;
+        let active_enter = unit_active_enter(&unit).await;
+        let run_log = scan_run_logs(&unit).await;
+        out.push(UnitSample {
+            unit,
+            active_state,
+            pid,
+            restarts,
+            active_enter,
+            run_log,
+            // Su Unix i log incrementali arrivano da scan_new_logs nel loop (con
+            // finestra temporale journalctl): il buffer aggregato resta vuoto.
+            log_buffer: String::new(),
+        });
+    }
+    out
+}
+
+/// Tolleranza (secondi) nel confronto tra il creation-time reale del processo e
+/// lo `started_at` registrato in agent_processes, per validare l'identita' del
+/// PID (anti-riciclo). started_at e' impostato a NOW() subito dopo lo spawn della
+/// shell, il creation-time del figlio arriva pochi istanti dopo: lo scarto
+/// legittimo e' di frazioni di secondo. Un PID riciclato ha creation-time
+/// arbitrario (tipicamente molto distante). Margine ampio per non invalidare mai
+/// un processo vero, stretto abbastanza da scartare un estraneo.
+#[cfg(windows)]
+const PID_IDENTITY_TOLERANCE_S: i64 = 10;
+
+/// Predicato puro (regola L, testabile) dell'identita' di un PID: il creation-time
+/// reale del processo (`real_start`, epoch unix) combacia con lo `started_at`
+/// atteso (`expected_start`) entro `tolerance` secondi? Se non combacia, il PID e'
+/// stato riciclato dal SO su un processo estraneo -> il servizio va trattato come
+/// morto. Entrambi gli input sono Option: un dato mancante = identita' non
+/// confermabile = false (fail-safe: meglio un possibile crash segnalato che
+/// mascherato con metriche altrui).
+#[cfg(windows)]
+fn pid_identity_ok(real_start: Option<i64>, expected_start: Option<i64>, tolerance: i64) -> bool {
+    match (real_start, expected_start) {
+        (Some(real), Some(expected)) => (real - expected).abs() <= tolerance,
+        _ => false,
+    }
+}
+
+/// Windows: enumera i servizi del progetto da `agent_processes` (kind='service')
+/// e ne aggrega i dati sorgente. Regola L: la visibilita'/dedup delle label
+/// (voci fantasma nascoste, similarita') e' delegata al PUNTO UNICO
+/// `visible_windows_services` (services.rs), la stessa logica del pannello
+/// Servizi; lo slug e l'unit dai punti unici `project_service_slug`/
+/// `service_unit_name`. Regola M: lo stato deriva da `process_alive(pid)` +
+/// VALIDAZIONE IDENTITA' del PID + `status`/`exit_code`, non dal parsing dei log.
+///
+/// Anti-riciclo PID (regola M/H): `agent_processes.pid` NON viene mai azzerato
+/// allo stop/crash, e Windows ricicla i PID in modo aggressivo, quindi un pid
+/// persistito puo' gia' appartenere a un processo ESTRANEO. `process_alive`/
+/// `read_process_metrics` da soli aprono QUALSIASI processo con quel PID: si
+/// scambierebbe un crash per "attivo" e si campionerebbero metriche altrui. Per
+/// questo il pid e' considerato vivo SOLO se il suo creation-time reale
+/// (`process_start_unix`) combacia con lo `started_at` della riga entro
+/// `PID_IDENTITY_TOLERANCE_S`. Su Unix non serve: MainPID viene da systemd fresco
+/// a ogni ciclo (ramo invariato).
+#[cfg(windows)]
+async fn collect_units(
+    state: &AppState,
+    project_id: Uuid,
+    _slug: &str,
+    name: &str,
+) -> Vec<UnitSample> {
+    use chrono::{DateTime, Utc};
+
+    // Slug e unit dai PUNTI UNICI condivisi col pannello (regola L): la formula
+    // e' name.to_lowercase().replace([' ','_'],"-"), NON projects.slug (slugify +
+    // suffisso -N), altrimenti l'unit divergerebbe da list_services_windows e da
+    // nexus_port_allocations.service_unit (diagnosi orfane, readiness saltata).
+    let slug = super::services::project_service_slug(name);
+
+    // Separazione DB per-progetto: agent_processes e' tabella migrata (flag OFF
+    // -> meta-pool, behavior-preserving). Stessa fonte di list_services_windows.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // Tutte le righe service, ordinate come vuole visible_windows_services
+    // (label ASC, created_at DESC): la prima occorrenza di ogni label e' la piu'
+    // recente. Carico anche pid/exit_code/output/error_output/started_at.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,              // label
+        String,              // status
+        DateTime<Utc>,       // created_at
+        Option<i32>,         // pid
+        Option<i32>,         // exit_code
+        String,              // output (stdout)
+        String,              // error_output (stderr)
+        Option<DateTime<Utc>>, // started_at
+    )> = sqlx::query_as(
+        "SELECT label, status, created_at, pid, exit_code, output, error_output, started_at \
+         FROM agent_processes \
+         WHERE project_id = $1 AND kind = 'service' \
+         ORDER BY label, created_at DESC",
+    )
+    .bind(project_id)
+    .fetch_all(&proj_pool)
+    .await
+    .unwrap_or_default();
+
+    // Dedup/visibilita' dal punto unico: proiezione (label, status, created_at).
+    let visible_proj: Vec<(String, String, DateTime<Utc>)> = rows
+        .iter()
+        .map(|(label, status, created_at, ..)| (label.clone(), status.clone(), *created_at))
+        .collect();
+    let visible: std::collections::HashSet<String> =
+        super::services::visible_windows_services(&visible_proj)
+            .into_iter()
+            .map(|(label, _running)| label)
+            .collect();
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (label, status, _created_at, pid, exit_code, output, error_output, started_at) in rows {
+        // Prima occorrenza per label = riga piu' recente (rows ordinata DESC).
+        if !seen.insert(label.clone()) {
+            continue;
+        }
+        if !visible.contains(&label) {
+            continue;
+        }
+        let unit = super::services::service_unit_name(&slug, &label);
+        // Stato strutturato (regola M): la liveness reale via process_alive +
+        // VALIDAZIONE IDENTITA' del PID hanno la precedenza sul campo `status`
+        // (che puo' restare 'running' dopo un crash o un riciclo del PID).
+        // Vivo E identita' confermata => 'active'; altrimenti morto:
+        // exit_code!=0 o status='failed' => 'failed', sennò 'inactive'.
+        let pid_u = pid.and_then(|p| u32::try_from(p).ok()).filter(|&p| p > 0);
+        let alive = match pid_u {
+            // Anti-riciclo: il processo con quel PID e' vivo, ma e' DAVVERO il
+            // nostro servizio? Confronta il creation-time reale con started_at.
+            // Se started_at manca o il creation-time non e' leggibile, non si puo'
+            // confermare l'identita' -> NON considerarlo vivo (fail-safe: meglio
+            // segnalare un possibile crash che mascherarlo con metriche altrui).
+            Some(p) if crate::process_util::process_alive(p) => pid_identity_ok(
+                crate::process_util::process_start_unix(p),
+                started_at.map(|t| t.timestamp()),
+                PID_IDENTITY_TOLERANCE_S,
+            ),
+            _ => false,
+        };
+        let active_state = if alive {
+            "active".to_string()
+        } else if status == "failed" || exit_code.is_some_and(|c| c != 0) {
+            "failed".to_string()
+        } else {
+            "inactive".to_string()
+        };
+        let effective_pid = if alive { pid_u } else { None };
+
+        // Marcatore di run: pid + started_at. Cambia a ogni nuovo avvio (il pid e'
+        // nuovo, started_at pure) -> reset grace/anti-spam. Non viene parsato.
+        let active_enter = effective_pid.map(|p| {
+            format!(
+                "{p}:{}",
+                started_at.map(|t| t.timestamp()).unwrap_or(0)
+            )
+        });
+
+        // Log del run corrente = stdout + stderr accumulati (cap 50KB alla fonte,
+        // spawn_agent_process). Servono a error-rate e alla diagnosi LLM.
+        let mut run_log = String::with_capacity(output.len() + error_output.len() + 1);
+        run_log.push_str(&output);
+        if !error_output.is_empty() {
+            if !run_log.is_empty() {
+                run_log.push('\n');
+            }
+            run_log.push_str(&error_output);
+        }
+
+        out.push(UnitSample {
+            unit,
+            active_state,
+            pid: effective_pid,
+            // agent_processes non traccia i restart: anomaly 'restart' disabilitata
+            // su Windows (regola M/H: nessun dato strutturato -> None, non stime).
+            restarts: None,
+            active_enter,
+            log_buffer: run_log.clone(),
+            run_log,
+        });
+    }
+    out
 }
 
 /// Unit systemd `{slug}-*.service` con il loro stato active (es. "active",
@@ -226,6 +415,7 @@ async fn projects_with_slug(db: &PgPool) -> Vec<(Uuid, String)> {
 /// mai i log ne' lo stato. I file `{slug}-*.service` invece ci sono sempre; per
 /// ciascuno interroghiamo lo stato corrente per nome con `is-active` (che
 /// funziona anche su unit scaricati).
+#[cfg(unix)]
 async fn list_user_services(slug: &str) -> Vec<(String, String)> {
     let out = tokio::process::Command::new("systemctl")
         .args([
@@ -261,6 +451,7 @@ async fn list_user_services(slug: &str) -> Vec<(String, String)> {
 /// Usa `is-active`, che risponde anche se l'unit e' stato scaricato dalla
 /// memoria (a differenza di `list-units`). Exit code != 0 e' normale per
 /// inactive/failed: lo stato e' comunque stampato su stdout.
+#[cfg(unix)]
 async fn unit_active_state(unit: &str) -> String {
     match tokio::process::Command::new("systemctl")
         .args(["--user", "is-active", unit])
@@ -280,6 +471,7 @@ async fn unit_active_state(unit: &str) -> String {
 }
 
 /// MainPID di un'unita' systemd --user (0/None se non attiva).
+#[cfg(unix)]
 async fn unit_main_pid(unit: &str) -> Option<u32> {
     let out = tokio::process::Command::new("systemctl")
         .args(["--user", "show", unit, "--property=MainPID"])
@@ -294,6 +486,7 @@ async fn unit_main_pid(unit: &str) -> Option<u32> {
 }
 
 /// NRestarts di un'unita'.
+#[cfg(unix)]
 async fn unit_restarts(unit: &str) -> Option<u32> {
     let out = tokio::process::Command::new("systemctl")
         .args(["--user", "show", unit, "--property=NRestarts"])
@@ -309,6 +502,7 @@ async fn unit_restarts(unit: &str) -> Option<u32> {
 /// `ActiveEnterTimestamp` dell'unita' (stringa systemd, es. "Sun 2026-06-09
 /// 19:25:05 CEST"). Confrontata col valore del ciclo precedente per rilevare un
 /// nuovo avvio ("run"): NON la parsiamo, basta sapere se e' cambiata.
+#[cfg(unix)]
 async fn unit_active_enter(unit: &str) -> Option<String> {
     let out = tokio::process::Command::new("systemctl")
         .args(["--user", "show", unit, "--property=ActiveEnterTimestamp"])
@@ -331,6 +525,14 @@ async fn unit_active_enter(unit: &str) -> Option<String> {
 ///      PORT_BACKEND) — copre gli unit creati fuori dal flusso port_registry.
 ///
 /// Vuoto = servizio senza porta nota (worker): readiness non applicabile.
+///
+/// La fonte primaria `nexus_port_allocations` (meta-DB) e' cross-platform: e' la
+/// stessa tabella che `request_port` popola con `service_unit = {slug}-{short}
+/// .service`, formato identico all'unit costruito qui su entrambi gli OS. Su
+/// Unix si aggiungono le porte dalle `Environment=` dell'unit (per gli unit
+/// creati fuori dal flusso port_registry); su Windows quella seconda fonte non
+/// esiste (i servizi sono agent_processes, senza Environment= systemd) e ci si
+/// affida alle sole allocazioni registrate.
 async fn ports_for_unit(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<u16> {
     let mut ports: HashSet<u16> = HashSet::new();
     if let Ok(rows) = sqlx::query_scalar::<_, i32>(
@@ -347,6 +549,7 @@ async fn ports_for_unit(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<u16> {
             }
         }
     }
+    #[cfg(unix)]
     for p in unit_env_ports(unit).await {
         ports.insert(p);
     }
@@ -356,6 +559,7 @@ async fn ports_for_unit(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<u16> {
 /// Estrae le porte dalle variabili `Environment` del unit il cui NOME contiene
 /// "PORT" (es. `PORT`, `PORT_BACKEND`). `systemctl show --property=Environment`
 /// restituisce le coppie KEY=VALUE separate da spazio.
+#[cfg(unix)]
 async fn unit_env_ports(unit: &str) -> Vec<u16> {
     let out = match tokio::process::Command::new("systemctl")
         .args(["--user", "show", unit, "--property=Environment"])
@@ -401,10 +605,30 @@ async fn resolve_open_crashes(db: &PgPool, project_id: Uuid, unit: &str) {
     .await;
 }
 
+/// PUNTO UNICO (regola L) del criterio "riga-error" per l'error-rate: conta le
+/// righe che contengono error/exception/panic/fatal (case-insensitive). Usata
+/// dal ramo Unix (journalctl) e dal ramo Windows (buffer agent_processes), cosi'
+/// la soglia error_rate_max_per_min ha lo stesso significato su entrambi gli OS.
+fn count_error_lines(text: &str) -> u64 {
+    let mut error_lines = 0u64;
+    for line in text.lines() {
+        let low = line.to_lowercase();
+        if low.contains("error")
+            || low.contains("exception")
+            || low.contains("panic")
+            || low.contains("fatal")
+        {
+            error_lines += 1;
+        }
+    }
+    error_lines
+}
+
 /// Scansione incrementale dei log dell'unita' dal timestamp `since_unix`.
 /// Ritorna (n_righe_error, testo_completo). Usa journalctl one-shot (no follow).
 /// Il testo serve alla diagnosi LLM (service_log_diagnose) quando la detection
 /// strutturale segnala un servizio non funzionante: niente piu' pattern fissi.
+#[cfg(unix)]
 async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, String) {
     let since = chrono::DateTime::from_timestamp(since_unix.max(0), 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -426,17 +650,7 @@ async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, String) {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
         Err(_) => return (0, String::new()),
     };
-    let mut error_lines = 0u64;
-    for line in text.lines() {
-        let low = line.to_lowercase();
-        if low.contains("error")
-            || low.contains("exception")
-            || low.contains("panic")
-            || low.contains("fatal")
-        {
-            error_lines += 1;
-        }
-    }
+    let error_lines = count_error_lines(&text);
     (error_lines, text)
 }
 
@@ -447,6 +661,7 @@ async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, String) {
 /// e' nello startup, non negli ultimi secondi della finestra error-rate.
 /// L'InvocationID e' l'identificatore stabile del run corrente: niente parsing
 /// di timestamp/fuso orario. Stringa vuota -> il chiamante usa il suo fallback.
+#[cfg(unix)]
 async fn scan_run_logs(unit: &str) -> String {
     let inv = tokio::process::Command::new("systemctl")
         .args(["--user", "show", unit, "--property=InvocationID"])
@@ -754,19 +969,12 @@ fn sig_hash(s: &str) -> String {
 
 /// Avvia l'observer in background. Gating runtime via `agent.observer.enabled`.
 ///
-/// Su Windows nativo il monitoring dipende da systemd `--user` + `/proc`, non
-/// disponibili: il worker fa early-return e NON avvia alcun task (niente ciclo a
-/// vuoto ogni `interval_s`). L'osservabilita' runtime dei servizi utente su Windows
-/// va reimplementata nativamente (agent_processes + API Windows) in un intervento
-/// dedicato.
-#[cfg(windows)]
-pub fn spawn_service_observer(_state: AppState) {
-    tracing::info!(
-        "service_observer: monitoring processi via /proc non disponibile su Windows nativo, worker inattivo"
-    );
-}
-
-#[cfg(unix)]
+/// Cross-platform: le sorgenti dati (enumerazione servizi, stato, metriche, log,
+/// restart) sono astratte per OS in `collect_units` + i reader per-unit. Su Unix
+/// usa systemd `--user` + `/proc` + journalctl; su Windows usa `agent_processes`
+/// (kind='service') + le API Win32 (`process_util`). Il resto del ciclo
+/// (anomaly/crash detection, persistenza `service_diagnoses`, auto-debug con
+/// cooldown/cap/anti-loop) e' identico su entrambi gli OS.
 pub fn spawn_service_observer(state: AppState) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(STARTUP_DELAY_S)).await;
@@ -792,57 +1000,81 @@ async fn run_cycle(
     let now_ts = chrono::Utc::now().timestamp();
     let projects = projects_with_slug(&state.db).await;
 
-    for (project_id, slug) in projects {
-        let services = list_user_services(&slug).await;
-        let observed_units: Vec<String> = services.iter().map(|(u, _)| u.clone()).collect();
-        for (unit, active) in services {
+    for (project_id, slug, name) in projects {
+        // Sorgenti dati aggregate per OS (Unix: systemd+/proc+journalctl; Windows:
+        // agent_processes+Win32). Il ramo Unix usa `slug`, quello Windows deriva
+        // lo slug di servizio da `name`. Il resto del ciclo e' identico.
+        let services = collect_units(state, project_id, &slug, &name).await;
+        let observed_units: Vec<String> = services.iter().map(|s| s.unit.clone()).collect();
+        for sample in services {
+            let UnitSample {
+                unit,
+                active_state: active,
+                pid,
+                restarts,
+                active_enter,
+                run_log,
+                log_buffer,
+            } = sample;
             let key = format!("{project_id}:{unit}");
             let st = states.entry(key).or_default();
 
             // ── Metriche (cap 4) ───────────────────────────────────────────
-            let pid = unit_main_pid(&unit).await;
+            // Le metriche OS arrivano dal PUNTO UNICO cross-platform
+            // process_util::read_process_metrics (Unix /proc, Windows Win32).
+            // cpu_seconds e' cumulativo e gia' normalizzato: il delta / dt da la %
+            // in modo identico sui due OS. `pid` qui e' gia' il PID VALIDATO dal
+            // collector: su Unix e' il MainPID fresco di systemd; su Windows e' il
+            // pid solo se vivo E con identita' confermata (creation-time vs
+            // started_at, anti-riciclo) -- altrimenti None. Quindi qui non serve
+            // ri-validare: read_process_metrics campiona il processo giusto.
             let mut cpu_pct: Option<f64> = None;
+            let mut rss: u64 = 0;
             if let Some(pid) = pid {
-                // Validazione anti PID riciclato (regola E): il comm deve esistere.
-                if read_comm(pid).is_some() {
-                    if let Some(sample) = read_proc_metrics(pid) {
-                        let now_inst = Instant::now();
-                        if let (Some(prev_ticks), Some(prev_inst)) =
-                            (st.prev_cpu_ticks, st.prev_sample)
-                        {
-                            let dt = now_inst.duration_since(prev_inst).as_secs_f64();
-                            if dt > 0.0 {
-                                let dticks = sample.cpu_ticks.saturating_sub(prev_ticks) as f64;
-                                cpu_pct = Some((dticks / USER_HZ / dt) * 100.0);
-                            }
-                        }
-                        st.prev_cpu_ticks = Some(sample.cpu_ticks);
-                        st.prev_sample = Some(now_inst);
-
-                        if cfg.metrics_enabled {
-                            nexus_events::dispatcher::emit_global(
-                                project_id,
-                                ProjectEvent::ServiceMetrics {
-                                    unit: unit.clone(),
-                                    pid: Some(pid as i32),
-                                    cpu_pct: cpu_pct.unwrap_or(0.0) as f32,
-                                    rss_bytes: sample.rss_bytes,
-                                    io_read_bytes: sample.io_read_bytes,
-                                    io_write_bytes: sample.io_write_bytes,
-                                    latency_ms: None,
-                                },
-                            );
+                if let Some(m) = crate::process_util::read_process_metrics(pid) {
+                    rss = m.rss_bytes;
+                    let now_inst = Instant::now();
+                    if let (Some(prev_secs), Some(prev_inst)) =
+                        (st.prev_cpu_seconds, st.prev_sample)
+                    {
+                        let dt = now_inst.duration_since(prev_inst).as_secs_f64();
+                        if dt > 0.0 {
+                            let dcpu = (m.cpu_seconds - prev_secs).max(0.0);
+                            cpu_pct = Some((dcpu / dt) * 100.0);
                         }
                     }
+                    st.prev_cpu_seconds = Some(m.cpu_seconds);
+                    st.prev_sample = Some(now_inst);
+
+                    if cfg.metrics_enabled {
+                        nexus_events::dispatcher::emit_global(
+                            project_id,
+                            ProjectEvent::ServiceMetrics {
+                                unit: unit.clone(),
+                                pid: Some(pid as i32),
+                                cpu_pct: cpu_pct.unwrap_or(0.0) as f32,
+                                rss_bytes: m.rss_bytes,
+                                io_read_bytes: m.io_read_bytes,
+                                io_write_bytes: m.io_write_bytes,
+                                latency_ms: None,
+                            },
+                        );
+                    }
+                } else {
+                    // PID sparito tra enum e campionamento: azzera i campioni CPU.
+                    st.prev_cpu_seconds = None;
+                    st.prev_sample = None;
                 }
             } else {
                 // Servizio non attivo: azzera i campioni CPU.
-                st.prev_cpu_ticks = None;
+                st.prev_cpu_seconds = None;
                 st.prev_sample = None;
             }
 
             // ── Restart rate (cap 3) ───────────────────────────────────────
-            let restarts = unit_restarts(&unit).await;
+            // `restarts` e' None su Windows (agent_processes non traccia i
+            // restart): restart_delta resta 0 -> l'anomaly 'restart' e il reason
+            // 'restart_loop' sono di fatto disabilitati la', senza codice extra.
             let restart_delta = match (st.prev_restarts, restarts) {
                 (Some(prev), Some(cur)) => cur.saturating_sub(prev),
                 _ => 0,
@@ -858,16 +1090,48 @@ async fn run_cycle(
                 now_ts - 60
             };
             let window_min = ((now_ts - since).max(1) as f64) / 60.0;
-            let (error_lines, log_text) = scan_new_logs(&unit, since).await;
+            // Unix: finestra journalctl incrementale (scan_new_logs). Windows:
+            // buffer cumulativo di agent_processes; l'error-rate conta solo la
+            // CODA nuova (oltre prev_log_len), replicando l'incrementalita'.
+            #[cfg(unix)]
+            let (error_lines, log_text) = {
+                let _ = &log_buffer; // su Unix il buffer aggregato non serve
+                scan_new_logs(&unit, since).await
+            };
+            #[cfg(windows)]
+            let (error_lines, log_text) = {
+                // PRIMO CICLO (last_log_scan_ts==0): stabilisci solo la BASELINE,
+                // NON contare lo storico gia' accumulato nel buffer cumulativo.
+                // Su Unix journalctl --since limita agli ultimi ~60s; qui l'unico
+                // modo di replicare quella semantica time-bounded e' non conteggiare
+                // le righe-error preesistenti al primo campione (altrimenti fino a
+                // 50KB di storico gonfiano error_per_min -> anomaly 'error_rate'
+                // spuria). Dal secondo ciclo si conta solo la coda nuova.
+                if st.last_log_scan_ts == 0 {
+                    st.prev_log_len = log_buffer.len();
+                    (0u64, log_buffer.clone())
+                } else {
+                    // Se il buffer si e' accorciato (troncamento/nuovo avvio)
+                    // resetta l'offset. Conta le righe-error nella sola coda nuova.
+                    let mut start = if log_buffer.len() >= st.prev_log_len {
+                        st.prev_log_len
+                    } else {
+                        0
+                    };
+                    // L'offset e' in byte del ciclo precedente: potrebbe cadere in
+                    // mezzo a un carattere multibyte del buffer corrente. Avanza al
+                    // primo char boundary valido per evitare un panic di slicing.
+                    while start < log_buffer.len() && !log_buffer.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    let new_slice = &log_buffer[start..];
+                    let n = count_error_lines(new_slice);
+                    st.prev_log_len = log_buffer.len();
+                    (n, log_buffer.clone())
+                }
+            };
             st.last_log_scan_ts = now_ts;
             let error_per_min = error_lines as f64 / window_min;
-
-            // rss per detector
-            let rss = read_comm(pid.unwrap_or(0))
-                .and(pid)
-                .and_then(read_proc_metrics)
-                .map(|s| s.rss_bytes)
-                .unwrap_or(0);
 
             // ── Anomalie: emetti solo sulla transizione ────────────────────
             let signals =
@@ -922,8 +1186,8 @@ async fn run_cycle(
             // ascolto dopo l'avvio / restart-loop), poi un LLM classifica i log
             // (cross-tecnologia). Vedi service_log_diagnose + mig 0384.
 
-            // Nuovo "run"? (ActiveEnterTimestamp cambiato) -> reset grace + anti-spam.
-            let active_enter = unit_active_enter(&unit).await;
+            // Nuovo "run"? (marcatore d'avvio cambiato: ActiveEnterTimestamp su
+            // Unix, pid+started_at su Windows) -> reset grace + anti-spam.
             if active_enter != st.prev_active_enter {
                 st.prev_active_enter = active_enter;
                 st.run_seen_at = Some(Instant::now());
@@ -981,10 +1245,11 @@ async fn run_cycle(
                     // NON dipende dall'LLM; poi la diagnosi LLM raffina il detail in
                     // BACKGROUND (con timeout), senza bloccare il ciclo observer.
                     // Per la diagnosi usa il log dell'INTERO run corrente (startup
-                    // incluso) anziche' la sola finestra error-rate: lo startup
-                    // contiene il segnale chiave (es. la porta reale in ascolto).
-                    // Fallback alla finestra se l'InvocationID non e' disponibile.
-                    let run_log = scan_run_logs(&unit).await;
+                    // incluso, gia' in `run_log` dal collector: journalctl per
+                    // InvocationID su Unix, output+error_output su Windows) anziche'
+                    // la sola finestra error-rate: lo startup contiene il segnale
+                    // chiave (es. la porta reale in ascolto). Fallback alla finestra
+                    // se il run-log non e' disponibile.
                     let source: &str = if run_log.trim().is_empty() {
                         &log_text
                     } else {
@@ -1164,6 +1429,40 @@ mod tests {
             "rosso normale"
         );
         assert_eq!(strip_ansi("nessun codice"), "nessun codice");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pid_identity_riconosce_riciclo() {
+        // Creation-time entro tolleranza dello started_at atteso = identita' OK
+        // (e' il nostro servizio). started_at 1000, real 1002, tolleranza 10.
+        assert!(pid_identity_ok(Some(1002), Some(1000), 10));
+        assert!(pid_identity_ok(Some(1000), Some(1000), 10));
+        // Creation-time molto distante = PID riciclato su un processo estraneo
+        // (avviato in un altro momento) -> identita' FALLITA -> servizio morto.
+        assert!(!pid_identity_ok(Some(1050), Some(1000), 10));
+        assert!(!pid_identity_ok(Some(500), Some(1000), 10));
+        // Dato mancante (started_at NULL o creation-time non leggibile) = identita'
+        // non confermabile -> false (fail-safe).
+        assert!(!pid_identity_ok(None, Some(1000), 10));
+        assert!(!pid_identity_ok(Some(1000), None, 10));
+        assert!(!pid_identity_ok(None, None, 10));
+    }
+
+    #[test]
+    fn count_error_lines_criterio_condiviso() {
+        // Il criterio error-rate (error/exception/panic/fatal, case-insensitive)
+        // e' identico su Unix (journalctl) e Windows (buffer agent_processes).
+        let log = "avvio ok\n\
+                   ERROR: connessione rifiutata\n\
+                   info: caricamento moduli\n\
+                   Unhandled Exception at main\n\
+                   PANIC: index out of bounds\n\
+                   riga normale\n\
+                   FATAL could not bind";
+        assert_eq!(count_error_lines(log), 4);
+        assert_eq!(count_error_lines("tutto tranquillo\nnessun problema"), 0);
+        assert_eq!(count_error_lines(""), 0);
     }
 
     // Schema minimale di service_diagnoses + indice univoco parziale (mig 0491)
