@@ -21,7 +21,7 @@
 -- ── Settings del sizing (regola G: soglie nel DB, niente fallback hardcoded) ──────
 INSERT INTO settings (key, value, category, description) VALUES
   ('agent.scale.sizing_enabled', 'false', 'agent',
-   'Kill-switch NESTED del sizing agentico (mig 0524). OFF (default) = con scale ON il flusso tier resta bit-identico (nessun segnale sizing, nessun addendum, gate degrada adjust_sizing a keep_tier). ON = lo scale-controller puo' adattare le soglie di dimensionamento (compress/token_brake/rolling/g1-loop) via postura.'),
+   'Kill-switch NESTED del sizing agentico (mig 0524). OFF (default) = con scale ON il flusso tier resta bit-identico (nessun segnale sizing, nessun addendum, gate degrada adjust_sizing a keep_tier). ON = lo scale-controller puo'' adattare le soglie di dimensionamento (compress/token_brake/rolling/g1-loop) via postura.'),
   ('agent.scale.sizing_cooldown_turns', '3', 'agent',
    'Turni minimi tra due cambi di POSTURA di sizing (anti-thrash del sizing, DISTINTO dal cooldown tier change_cooldown_turns).'),
   ('agent.scale.sizing_aggressiveness', '0.5', 'agent',
