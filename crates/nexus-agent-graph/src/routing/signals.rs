@@ -203,6 +203,38 @@ pub fn has_filesystem_mutation_in_history(messages: &[Message], cfg: &RoutingCon
         .any(|name| cfg.fs_mutator_tools.iter().any(|m| m == name))
 }
 
+/// Estrae il set dei FILE modificati dal run: per ogni tool_use in history il cui
+/// nome e' un mutator fs (`cfg.fs_mutator_tools`, DB-driven), l'argomento `path`
+/// o `file_path`. PUNTO UNICO (regola L) usato dal final_gate per il gate
+/// DELTA-aware: un errore di build conta come REGRESSIONE solo se colpisce un
+/// file che il task ha toccato; il debito preesistente in file non toccati non
+/// blocca la chiusura. Riusa [`message_tool_uses`] (stesso estrattore (name,
+/// input) del resto del modulo).
+pub fn touched_files_in_history(
+    messages: &[Message],
+    cfg: &RoutingConfig,
+) -> std::collections::BTreeSet<String> {
+    let mut files = std::collections::BTreeSet::new();
+    for m in messages {
+        for (name, input) in message_tool_uses(m) {
+            if !cfg.fs_mutator_tools.iter().any(|t| t == name) {
+                continue;
+            }
+            let path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .or_else(|| input.get("file_path").and_then(Value::as_str));
+            if let Some(p) = path {
+                let p = p.trim();
+                if !p.is_empty() {
+                    files.insert(p.to_string());
+                }
+            }
+        }
+    }
+    files
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 //  Detector strutturali su lista messaggi (anti-loop dell'executor)
 //

@@ -31,7 +31,8 @@ pub use graph::{
     build_agent_graph, node_target_to_node_id, AgentGraphEngine, AgentGraphNode, AgentGraphNodes,
 };
 pub use nodes::{
-    clarifying_branch, count_build_errors, plan_reuse_decision, ClarifyConfig, ClarifyMode,
+    build_error_files, clarifying_branch, count_build_errors, error_file_matches_touched,
+    plan_reuse_decision, ClarifyConfig, ClarifyMode,
     ClarifyOrExpandNode, ClarifyingBranch, DecisionCategory, FinalGateConfig, FinalGateNode,
     GateOutcome, LearnerConfig, LearnerNode, LlmDecision, OnFailure, PlanReuse, PlannerConfig,
     PlannerNode, QdrantPayload, ReflectionConfig, ReflectionData, ReflectionNode, RouterNode,

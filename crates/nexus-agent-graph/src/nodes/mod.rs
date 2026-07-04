@@ -29,7 +29,10 @@ pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
 };
 pub use executor::{ExecutorConfig, ExecutorNode, ScaleConfig};
-pub use final_gate::{count_build_errors, FinalGateConfig, FinalGateNode};
+pub use final_gate::{
+    build_error_files, count_build_errors, error_file_matches_touched, FinalGateConfig,
+    FinalGateNode,
+};
 pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
 pub use planner::{
     clarifying_branch, plan_reuse_decision, ClarifyingBranch, PlanReuse, PlannerConfig, PlannerNode,

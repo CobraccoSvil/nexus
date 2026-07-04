@@ -260,6 +260,67 @@ pub fn count_build_errors(output: &str) -> usize {
         .sum()
 }
 
+/// Regex che catturano il FILE di un errore di compilazione dai formati con
+/// localizzazione esplicita (best-effort, come [`count_build_errors`]). Gruppo 1
+/// = path del file. Coprono tsc (`file(riga,col): error TSxxxx`) e rustc/cargo
+/// (`--> file:riga:col`). I formati SENZA path sulla riga d'errore (es. eslint
+/// stylish, errori generici) non contribuiscono qui: [`build_error_files`]
+/// ritorna un set VUOTO e il chiamante ricade sul criterio assoluto (fail-closed).
+static BUILD_ERROR_FILE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    vec![
+        // tsc: `src/foo.tsx(12,3): error TS1234:` -> path = tutto prima della `(`.
+        Regex::new(r"(?im)^\s*([^\n(]+?)\(\d+,\d+\):\s+error\s+TS\d+")
+            .expect("regex tsc file valida"),
+        // rustc/cargo: `  --> src/foo.rs:12:5` -> path prima di `:riga:col`.
+        Regex::new(r"(?m)^\s*-->\s+(.+?):\d+:\d+").expect("regex rustc file valida"),
+    ]
+});
+
+/// Normalizza un path per il confronto cross-piattaforma: separatori `/`, senza
+/// prefisso `./`, trimmato. NON lowercasa (Linux e' case-sensitive).
+fn normalize_path(p: &str) -> String {
+    p.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+/// Estrae il set dei FILE che presentano errori nell'output di un comando di
+/// verifica (tsc/rustc), con path normalizzati. Best-effort: un set VUOTO
+/// significa "nessuna localizzazione ricavabile" (formato non coperto o output
+/// pulito) — il chiamante NON deve dedurne "nessun errore" (per quello c'e'
+/// [`count_build_errors`]), ma ricadere sul criterio assoluto (fail-closed).
+pub fn build_error_files(output: &str) -> std::collections::BTreeSet<String> {
+    let mut files = std::collections::BTreeSet::new();
+    if output.is_empty() {
+        return files;
+    }
+    for pat in BUILD_ERROR_FILE_PATTERNS.iter() {
+        for cap in pat.captures_iter(output) {
+            if let Some(m) = cap.get(1) {
+                let norm = normalize_path(m.as_str());
+                if !norm.is_empty() {
+                    files.insert(norm);
+                }
+            }
+        }
+    }
+    files
+}
+
+/// True se il file `error_file` (dall'output di un build) e' lo STESSO file
+/// `touched_file` (modificato dal run), robusto a root/prefissi diversi: match
+/// esatto o suffisso a CONFINE DI SEGMENTO (`a/b/x.ts` vs `x.ts`, o vs
+/// `/abs/a/b/x.ts`). Il confine `/` evita che `Page.tsx` matchi `LoginPage.tsx`.
+pub fn error_file_matches_touched(error_file: &str, touched_file: &str) -> bool {
+    let e = normalize_path(error_file);
+    let t = normalize_path(touched_file);
+    if e.is_empty() || t.is_empty() {
+        return false;
+    }
+    e == t || e.ends_with(&format!("/{t}")) || t.ends_with(&format!("/{e}"))
+}
+
 /// Nodo final_gate. Stateless: legge lo stato + la config passata + la
 /// `RoutingConfig` (per `is_software_task`/lista mutator). I criteri sono
 /// eseguiti dietro il trait [`crate::runtime::ports::CriteriaRunner`], iniettato
@@ -365,6 +426,19 @@ impl FinalGateNode {
         //     (l'incidente Beaty-Book nasceva dal "npm run build" cieco che
         //     per Vite non type-checka). max_output_chars dedicato (mig 0426)
         //     + timeout build per ciascun comando.
+        // Gate DELTA-aware (regola H, causa del blocco su debito preesistente):
+        // i file toccati dal run. Il criteria_runner conta come REGRESSIONE (che
+        // fallisce il gate) solo un errore di build che colpisce uno di questi
+        // file; gli errori in file NON toccati sono debito preesistente del
+        // progetto e non impediscono la chiusura di un task che non li ha
+        // introdotti (es. login task bocciato da errori di tipo in BookingPage.tsx).
+        // Calcolato una volta (punto unico signals::touched_files_in_history,
+        // regola L) e passato in ogni spec run_command.
+        let touched_files: Vec<String> =
+            signals::touched_files_in_history(&state.messages, &self.routing_cfg)
+                .into_iter()
+                .collect();
+
         for vs in &self.cfg.verify_steps {
             let mut spec = serde_json::Map::new();
             spec.insert("command".to_string(), json!(vs.command));
@@ -373,6 +447,7 @@ impl FinalGateNode {
                 "max_output_chars".to_string(),
                 json!(self.cfg.build_output_max_chars),
             );
+            spec.insert("touched_files".to_string(), json!(touched_files));
             if let Some(cwd) = &vs.working_dir {
                 spec.insert("working_dir".to_string(), json!(cwd));
             }
@@ -1603,5 +1678,56 @@ mod golden {
             checked += 1;
         }
         println!("golden final_gate: {checked} casi verificati, tutti verdi");
+    }
+
+    // ── Gate DELTA-aware: localizzazione errori + matching file ─────────────────
+
+    #[test]
+    fn build_error_files_estrae_path_tsc_e_rustc() {
+        use super::build_error_files;
+        let tsc = "src/app/pages/BookingPage.tsx(156,7): error TS2554: Expected 2 arguments\n\
+                   src/app/pages/LoginPage.tsx(5,10): error TS2305: no member\n\
+                   Found 2 errors.";
+        let files = build_error_files(tsc);
+        assert!(files.contains("src/app/pages/BookingPage.tsx"));
+        assert!(files.contains("src/app/pages/LoginPage.tsx"));
+        assert_eq!(files.len(), 2);
+
+        let rustc = "error[E0432]: unresolved import\n  --> crates/foo/src/lib.rs:12:5\n";
+        assert!(build_error_files(rustc).contains("crates/foo/src/lib.rs"));
+
+        // Formato senza localizzazione sulla riga d'errore (eslint stylish) -> set
+        // VUOTO: il chiamante ricade sul criterio assoluto (fail-closed).
+        assert!(build_error_files("  1:1  error  Unexpected token  no-undef").is_empty());
+        assert!(build_error_files("").is_empty());
+    }
+
+    #[test]
+    fn error_file_matches_touched_suffisso_a_segmento() {
+        use super::error_file_matches_touched;
+        assert!(error_file_matches_touched(
+            "src/app/pages/LoginPage.tsx",
+            "src/app/pages/LoginPage.tsx"
+        ));
+        assert!(error_file_matches_touched(
+            "src/app/pages/LoginPage.tsx",
+            "LoginPage.tsx"
+        ));
+        assert!(error_file_matches_touched(
+            "D:/proj/src/app/LoginPage.tsx",
+            "src/app/LoginPage.tsx"
+        ));
+        // Normalizzazione (backslash + ./).
+        assert!(error_file_matches_touched(
+            "./src/app\\LoginPage.tsx",
+            "src/app/LoginPage.tsx"
+        ));
+        // NON deve matchare basename simili in dir diverse (confine di segmento).
+        assert!(!error_file_matches_touched(
+            "src/pages/BookingPage.tsx",
+            "src/pages/LoginPage.tsx"
+        ));
+        assert!(!error_file_matches_touched("a/Page.tsx", "b/OtherPage.tsx"));
+        assert!(!error_file_matches_touched("", "x"));
     }
 }

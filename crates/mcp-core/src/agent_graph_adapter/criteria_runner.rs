@@ -266,7 +266,44 @@ task_complete (outcome + summary)"
         // build (punto unico count_build_errors, regola L) il criterio FALLISCE
         // comunque, anche con exit 0.
         let build_errors = nexus_agent_graph::count_build_errors(&raw);
-        let passed = exit_ok && build_errors == 0;
+
+        // ── Gate DELTA-aware (regola H) ──────────────────────────────────────
+        // Un errore di build conta come REGRESSIONE (che fallisce il gate) solo se
+        // colpisce un file che QUESTO run ha TOCCATO. Gli errori in file non
+        // toccati sono debito preesistente del progetto: non devono impedire la
+        // chiusura di un task che non li ha introdotti (es. un fix di login
+        // bocciato da errori di tipo preesistenti in BookingPage.tsx). Segnali
+        // STRUTTURATI (regola M): exit_code, set dei file-con-errori (localizzazione
+        // tsc/rustc), lista dei file toccati (dai tool_use mutator, non dalla
+        // prosa). Fail-CLOSED di default: senza localizzazione degli errori
+        // (formato non coperto -> set vuoto) o senza file toccati dichiarati si
+        // ricade sul criterio ASSOLUTO (exit 0 + zero errori), identico a prima.
+        let touched: Vec<&str> = spec
+            .get("touched_files")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let error_files = nexus_agent_graph::build_error_files(&raw);
+        let regressed_files: Vec<String> = error_files
+            .iter()
+            .filter(|ef| {
+                touched
+                    .iter()
+                    .any(|tf| nexus_agent_graph::error_file_matches_touched(ef, tf))
+            })
+            .cloned()
+            .collect();
+        let delta_applicable = !error_files.is_empty() && !touched.is_empty();
+        let regression = !regressed_files.is_empty();
+        let preexisting_files = error_files.len().saturating_sub(regressed_files.len());
+        let passed = if delta_applicable {
+            // Chiude se il task non ha lasciato errori nei file che ha toccato,
+            // anche se il progetto ha debito preesistente altrove.
+            !regression
+        } else {
+            // Fallback fail-closed: criterio assoluto (identico a prima).
+            exit_ok && build_errors == 0
+        };
 
         // max_output_chars (parita' Python: default 600, floor 200). Il criterio
         // BUILD del nodo Rust lo valorizza (build_output_max_chars).
@@ -285,10 +322,24 @@ task_complete (outcome + summary)"
             "output_truncated": total_chars > max_chars,
             "output_total_chars": total_chars,
             "build_errors": build_errors,
+            "error_files": error_files.len(),
+            "delta_applied": delta_applicable,
+            "preexisting_error_files": preexisting_files,
+            "regressed_files": regressed_files.clone(),
         });
-        // Exit-code bugiardo: exit ok ma errori nell'output -> esplicita il motivo
-        // per l'agente (altrimenti non sarebbe ovvio perche' il gate ha fallito).
-        if exit_ok && build_errors > 0 {
+        if regression {
+            // Il task ha lasciato errori nei file che ha modificato: blocca e dillo.
+            ev["verdict"] = json!(format!(
+                "Verifica delta: errori nei file modificati da questo task ({}). Correggi TUTTI gli errori in questi file prima di chiudere; il debito preesistente in altri file non e' richiesto.",
+                regressed_files.join(", ")
+            ));
+        } else if delta_applicable && (build_errors > 0 || !exit_ok) {
+            // Passa nonostante gli errori: sono debito preesistente in file non toccati.
+            ev["verdict"] = json!(format!(
+                "Verifica delta superata: {preexisting_files} file con errori PREESISTENTI non modificati da questo task (debito del progetto, non una regressione introdotta qui). Nessun errore nei file toccati dal task."
+            ));
+        } else if exit_ok && build_errors > 0 {
+            // Fallback (delta non applicabile): exit-code bugiardo, come prima.
             ev["verdict"] = json!(format!(
                 "Build uscito con exit ok ma l'output contiene {build_errors} errore/i di build (es. import non risolti): il bundle NON e' valido. Correggi gli errori sopra e riverifica."
             ));
@@ -765,6 +816,96 @@ mod tests {
         assert_eq!(res[0].evidence["exit_code"], json!(101));
         // output_excerpt presente (render_failed_block ramo build lo legge).
         assert!(res[0].evidence["output_excerpt"].is_string());
+    }
+
+    // ── Gate DELTA-aware (regola H): regressione vs debito preesistente ──────────
+
+    /// NO fail-open: un errore in un file che il task ha TOCCATO e' una
+    /// regressione e fallisce il gate, anche se il resto e' preesistente.
+    #[sqlx::test]
+    async fn run_command_delta_regressione_in_file_toccato_fallisce(pool: PgPool) {
+        let out = "src/app/pages/BookingPage.tsx(156,7): error TS2554: Expected 2 args\n\
+                   src/app/pages/LoginPage.tsx(5,10): error TS2305: no member\n\
+                   Found 2 errors.\nEXIT CODE: 2";
+        let exec = FakeToolExecutor::with(&[("run_command", &[out])]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "run_command",
+                    json!({ "command": "npx tsc --noEmit", "touched_files": ["src/app/pages/LoginPage.tsx"] }),
+                    json!({ "exit_code": 0 }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(
+            !res[0].passed,
+            "errore in un file toccato = regressione -> fallisce (no fail-open)"
+        );
+        assert_eq!(res[0].evidence["delta_applied"], json!(true));
+        let regressed = res[0].evidence["regressed_files"].as_array().unwrap();
+        assert!(regressed
+            .iter()
+            .any(|v| v.as_str() == Some("src/app/pages/LoginPage.tsx")));
+    }
+
+    /// Debito preesistente: errori SOLO in file non toccati -> non bloccano la
+    /// chiusura, anche con exit != 0 (il task non li ha introdotti).
+    #[sqlx::test]
+    async fn run_command_delta_debito_preesistente_non_blocca(pool: PgPool) {
+        let out = "src/app/pages/BookingPage.tsx(156,7): error TS2554: Expected 2 args\n\
+                   src/app/pages/ConfirmationPage.tsx(17,42): error TS2304: Cannot find name\n\
+                   Found 2 errors.\nEXIT CODE: 2";
+        let exec = FakeToolExecutor::with(&[("run_command", &[out])]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "run_command",
+                    json!({ "command": "npx tsc --noEmit", "touched_files": ["src/app/services/authService.ts"] }),
+                    json!({ "exit_code": 0 }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(
+            res[0].passed,
+            "errori solo in file NON toccati (debito preesistente) -> non blocca"
+        );
+        assert_eq!(res[0].evidence["delta_applied"], json!(true));
+        assert_eq!(res[0].evidence["preexisting_error_files"], json!(2));
+        assert!(res[0].evidence["regressed_files"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Fail-CLOSED di default: errori localizzati ma il run non dichiara file
+    /// toccati -> criterio ASSOLUTO come prima (exit != 0 -> fallisce).
+    #[sqlx::test]
+    async fn run_command_delta_senza_file_toccati_e_failclosed(pool: PgPool) {
+        let out = "src/app/pages/BookingPage.tsx(156,7): error TS2554: Expected 2 args\nEXIT CODE: 2";
+        let exec = FakeToolExecutor::with(&[("run_command", &[out])]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "run_command",
+                    json!({ "command": "npx tsc --noEmit" }),
+                    json!({ "exit_code": 0 }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(
+            !res[0].passed,
+            "senza file toccati -> fail-closed (criterio assoluto)"
+        );
+        assert_eq!(res[0].evidence["delta_applied"], json!(false));
     }
 
     #[sqlx::test]
