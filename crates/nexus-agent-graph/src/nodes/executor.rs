@@ -1138,6 +1138,25 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // ignora tool_choice=required e continua a descrivere senza agire. Evita il
         // runaway di iterazioni/costi osservato con gemini (45+ giri).
         if iters_in >= self.cfg.iteration_cap {
+            // Niente di fisso (regola H): il cap ASSOLUTO iterazioni non chiude piu'
+            // secco. Come 4d/4e (token/text_only), e' un TRIGGER del giudice
+            // tier-agentico (nodo StallRecovery): decide su segnali strutturati
+            // (proseguire guidato / escalare modello / dichiarare blocked). None
+            // (giudice OFF / budget consultazioni esaurito / anti-meta-loop) ->
+            // backstop sotto (chiusura EndTurn, bit-identico al pre-fix).
+            if let Some(delta) = self
+                .maybe_runaway_stall_delta(
+                    state,
+                    crate::decisions::meta_reason::AXIS_ITERATION_CAP,
+                    iters_in,
+                    iters_in,
+                    &messages,
+                    ctx,
+                )
+                .await
+            {
+                return Ok(delta);
+            }
             let cap_text = format!(
                 "Raggiunto il numero massimo di iterazioni ({}) senza completare il \
 compito. Interrompo per evitare un ciclo infinito: riformula la richiesta in modo \
@@ -2917,6 +2936,25 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         if self.cfg.hard_cap_ratio > 0.0 {
             let post_brake_est = self.estimate_history_tokens(&hist);
             if ctxr::check_hard_cap(post_brake_est, effective_window, self.cfg.hard_cap_ratio) {
+                // Niente di fisso (regola H): il cap di CONTESTO non fa piu' fail-fast
+                // secco. E' un TRIGGER del giudice tier-agentico (nodo StallRecovery):
+                // col contesto oltre finestra anche dopo brake, il giudice tipicamente
+                // sceglie EscalateModel (finestra piu' grande) o DeclareBlocked. None
+                // (giudice OFF / budget esaurito / anti-meta-loop) -> backstop sotto
+                // (fail-fast strutturato context_overflow, bit-identico al pre-fix).
+                if let Some(delta) = self
+                    .maybe_runaway_stall_delta(
+                        state,
+                        crate::decisions::meta_reason::AXIS_CONTEXT_CAP,
+                        post_brake_est,
+                        iters_in,
+                        &messages,
+                        ctx,
+                    )
+                    .await
+                {
+                    return Ok(delta);
+                }
                 let text = if self.cfg.overflow_message_template.is_empty() {
                     // Fallback deterministico coi soli numeri: il testo
                     // redazionale vive SOLO nel template DB (regola G).

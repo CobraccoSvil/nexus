@@ -108,6 +108,15 @@ pub fn build_stall_context(
 pub const AXIS_TOKEN_OVERFLOW: &str = "token_overflow";
 /// Vedi [`AXIS_TOKEN_OVERFLOW`]: asse dei turni solo-testo consecutivi.
 pub const AXIS_TEXT_ONLY: &str = "text_only";
+/// Vedi [`AXIS_TOKEN_OVERFLOW`]: asse del CAP ASSOLUTO di iterazioni del run. Il
+/// cap iterazioni non chiude piu' secco -> trigger del giudice (regola H, niente
+/// di fisso): stesso gate/paradigma degli altri assi runaway.
+pub const AXIS_ITERATION_CAP: &str = "iteration_cap";
+/// Vedi [`AXIS_TOKEN_OVERFLOW`]: asse del CAP di CONTESTO (`hard_cap_ratio`) quando,
+/// dopo upscale+brake, la stima resta oltre la finestra. Trigger del giudice
+/// (tipicamente `EscalateModel` a finestra piu' grande, o `DeclareBlocked`) invece
+/// del fail-fast secco.
+pub const AXIS_CONTEXT_CAP: &str = "context_cap";
 
 /// Costruisce il [`StallContext`] per un asse RUNAWAY ([`AXIS_TOKEN_OVERFLOW`] /
 /// [`AXIS_TEXT_ONLY`]) direttamente dai segnali strutturati gia' risolti (regola
