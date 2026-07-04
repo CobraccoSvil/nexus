@@ -1243,6 +1243,18 @@ in modo piu' specifico, oppure riprova con un modello piu' capace.",
             {
                 return Ok(delta);
             }
+            // Non-convergenza (regola H, "niente di fisso"): PRIMA del backstop di
+            // chiusura, prova l'ESCALATION AGENTICA a un modello piu' capace e sano
+            // (selezione tier+telemetria, poi reset del budget per il promosso). Se
+            // non ne esiste uno (catena esaurita / max escalation / tutti in cooldown)
+            // -> backstop sotto. Chiude il cerchio: la non-convergenza fa SALIRE il
+            // modello invece di chiudere secco.
+            if let Some(delta) = self
+                .maybe_escalate_nonconvergence(state, iters_in, "budget_token", ctx, mode)
+                .await
+            {
+                return Ok(delta);
+            }
             let budget_text = format!(
                 "Raggiunto il budget massimo di token del run ({} token, tetto {}). \
 Interrompo per evitare un consumo incontrollato: riformula la richiesta in modo \
@@ -4376,6 +4388,106 @@ impl ExecutorNode {
                 extra: Some(extra),
                 stop_reason: Some(Some(StopReason::StallReason)),
                 iterations: Some(Some(iters_in + 1)),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
+
+    /// NON-CONVERGENZA -> ESCALATION AGENTICA (regola H, "niente di fisso"): quando
+    /// un limite di non-convergenza (budget token esaurito senza progresso) sta per
+    /// chiudere secco il run, prova PRIMA a promuovere a un modello piu' capace via
+    /// il punto unico [`pick_escalation_model`] (selezione tier+telemetria). Se ne
+    /// esiste uno sano, lo rende sticky, AZZERA il budget token cumulativo (il
+    /// promosso riparte con la sua quota, altrimenti ri-colpirebbe subito il tetto),
+    /// propaga il `current_tier` (aggiorna lo scale-controller) e RI-DA il turno
+    /// (`G1Escalated`). Bound da `auto_escalations < max_escalations` (anti-loop). Se
+    /// non c'e' un candidato (catena esaurita / gia' max escalation / tutti in
+    /// cooldown) -> `None`, il chiamante chiude col backstop. STESSO paradigma del
+    /// cap G1 (regola L), applicato al trigger di non-convergenza.
+    async fn maybe_escalate_nonconvergence(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        reason: &'static str,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> Option<OpaqueDelta> {
+        let escal = state
+            .extra
+            .get("auto_escalations")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if escal >= self.cfg.max_escalations {
+            return None;
+        }
+        let (cur_provider, cur_model) = self.escalation_current_pair(state);
+        let inputs = self
+            .escalation
+            .escalation_inputs(
+                state.user_intent.as_deref(),
+                cur_provider.as_deref(),
+                cur_model.as_deref(),
+                mode,
+            )
+            .await
+            .unwrap_or_default();
+        let pick = pick_escalation_model(
+            &inputs.candidates,
+            cur_provider.as_deref(),
+            cur_model.as_deref(),
+            &inputs.policy,
+        )?;
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            from_provider = cur_provider.as_deref().unwrap_or(""),
+            to_provider = %pick.provider,
+            to_model = %pick.model,
+            reason,
+            "non-convergenza: ESCALATION agentica a modello piu' capace -> reset budget, ri-do il turno"
+        );
+        self.emit_phase(
+            ctx,
+            mode,
+            "escalation",
+            format!(
+                "Passo a {}/{} (non-convergenza: budget senza progresso)",
+                pick.provider, pick.model
+            ),
+            json!({
+                "to_provider": pick.provider,
+                "to_model": pick.model,
+                "reason": reason,
+            }),
+        )
+        .await;
+        let esc_nudge = human_msg(
+            "Il modello precedente ha consumato il budget senza completare il compito. \
+Ora rispondi tu, che sei un modello piu' capace: NON descrivere, procedi con azioni \
+concrete e mirate verso il completamento.",
+        );
+        let mut extra_out = state.extra.clone();
+        extra_out.insert("auto_escalations".to_string(), json!(escal + 1));
+        // Grazia post-escalation: finestra pulita sugli assi anti-loop per il promosso.
+        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        Some(
+            StateDelta {
+                messages: Some(vec![esc_nudge]),
+                sticky_provider: Some(Some(pick.provider)),
+                sticky_model: Some(Some(pick.model)),
+                current_tier: Some(pick.tier),
+                recent_tool_signatures: Some(Some(vec![])),
+                g1_reroute_count: Some(Some(0)),
+                action_nudge_count: Some(Some(0)),
+                // Reset dei contatori di non-convergenza: il promosso riparte con la
+                // sua quota piena (budget) e streak azzerato (altrimenti erediterebbe
+                // il cumulativo e ri-colpirebbe subito il limite).
+                tokens_used_total: Some(Some(0)),
+                consecutive_text_only_turns: Some(Some(0)),
+                pending_tool_uses: Some(Some(vec![])),
+                stop_reason: Some(Some(StopReason::G1Escalated)),
+                iterations: Some(Some(iters_in + 1)),
+                extra: Some(extra_out),
                 ..Default::default()
             }
             .into_opaque(),
