@@ -1,432 +1,304 @@
-//! `escalation`: SELEZIONE deterministica del modello di auto-escalation
-//! dell'orchestratore. Porting 1:1 di `_pick_escalation_model`
-//! (`brain/agents/nodes/helpers.py:1702-1760`), usato sia dalla loop-detection
-//! per signature (`brain/agents/nodes/__init__.py:3159-3284`) sia dal cap G1
-//! (`__init__.py:1962-1993`): in entrambi i casi, prima di chiudere secco,
-//! l'orchestratore PROMUOVE il turno a un modello piu' capace.
+//! `escalation`: SELEZIONE AGENTICA del modello di auto-escalation dell'orchestratore.
 //!
-//! Punto unico (regola L) della domanda "dato (provider, model) corrente, le
-//! escalation gia' fatte, la catena DB e lo stato cooldown, qual e' il prossimo
-//! modello eleggibile?". La funzione [`pick_escalation_model`] e' PURA: la catena
-//! (`nexus_model_escalation_chain`, mig 0128), l'insieme dei provider in cooldown
-//! (gate ADR 0020) e il candidato cross-provider (`loop_fallback_default`)
-//! arrivano gia' risolti dal chiamante via [`crate::runtime::ports::EscalationPort`]
-//! (nessun IO, nessuna lettura DB qui — regola G).
+//! Punto unico (regola L) della domanda "dato il modello corrente che sta fallendo
+//! e l'insieme dei candidati di escalation ammissibili (con tier + telemetria), qual
+//! e' il PROSSIMO modello migliore?". La funzione [`pick_escalation_model`] e' PURA:
+//! l'insieme dei candidati (catena intra-provider + candidati cross-provider, gia'
+//! filtrati per capability/cooldown e arricchiti di tier + telemetria) arriva gia'
+//! risolto dal chiamante via [`crate::runtime::ports::EscalationPort`] (nessun IO,
+//! nessuna lettura DB qui — regola G).
 //!
-//! ## Selezione 1:1 col Python (due Tier, in ordine)
+//! ## Selezione AGENTICA (niente catena fissa)
 //!
-//! - **Tier 1 — catena intra-provider** (stesso provider, tier superiore): solo se
-//!   `current_provider` e' valorizzato e NON e' in cooldown billing/quota
-//!   (escalare sullo stesso provider morto sprecherebbe un turno, incidente
-//!   reale). La catena e' gia' filtrata per `(provider, base_model)` e ordinata
-//!   per `escalation_position` ASC. Si prende l'elemento all'indice `escalations`
-//!   (= numero di escalation gia' fatte, parita' con `LIMIT escalations+1` +
-//!   `_rows[escalations]` del Python). Se esiste ed e' DIVERSO dal modello
-//!   corrente, e' il risultato.
-//! - **Tier 2 — purpose cross-provider** (`loop_fallback_default`): se Tier 1 non
-//!   produce, si usa il candidato cross-provider risolto a monte dal router
-//!   (gia' filtrato dal gate, sentinelle escluse dal chiamante). Eleggibile se
-//!   non e' la coppia `(current_provider, current_model)` corrente.
-//! - Altrimenti `None` (catena esaurita / tutto in cooldown / nessun candidato):
-//!   il chiamante chiude secco (`loop_detected` / cap G1).
+//! Non c'e' piu' una catena POSIZIONALE (indice per numero di escalation) ne' uno
+//! split fisso Tier1-intra / Tier2-cross: c'e' UN solo insieme di candidati, ordinato
+//! agenticamente ad ogni escalation da segnali strutturati (regola M):
+//!   1. **salute** — i candidati "recently_failed" (cooldown / error-rate / fallimenti
+//!      consecutivi, punto unico [`crate::decisions::governance::is_recently_failed`])
+//!      sono RETROCESSI: si prende un modello sano se esiste (fail-safe: mai a mani
+//!      vuote);
+//!   2. **forza di tier** — a parita' di salute si preferisce il tier PIU' FORTE
+//!      (heavy > medium > light): l'escalation serve a ottenere piu' capacita' quando
+//!      il modello debole non converge (risolve il "restava su flash");
+//!   3. **likelihood** — a parita' di tier, punteggio di probabilita' di successo
+//!      ([`crate::decisions::governance::likelihood_score`], telemetria);
+//!   4. **ordine d'ingresso** — tie-breaker finale (`sort_by` STABILE): con telemetria
+//!      e tier uniformi l'ordine d'ingresso (preferenza del routing) e' preservato.
+//!
+//! Il modello corrente (quello che sta fallendo) e' sempre ESCLUSO. La scelta e'
+//! DETERMINISTICA e replay-stabile (nessun LLM, solo il ranking puro sui segnali).
 
 use serde::{Deserialize, Serialize};
 
+use crate::decisions::governance::{
+    is_recently_failed, likelihood_score, GovernancePolicy, ModelTelemetry,
+};
+
+/// Rank numerico del performance-tier per l'ordinamento di escalation (piu' alto =
+/// piu' capace). Sconosciuto/assente -> `medium` (neutro): non penalizza ne' premia.
+fn tier_rank(tier: Option<&str>) -> u8 {
+    match tier.map(|t| t.trim().to_ascii_lowercase()).as_deref() {
+        Some("light") => 1,
+        Some("medium") => 2,
+        Some("heavy") => 3,
+        _ => 2,
+    }
+}
+
 /// Una voce della catena di escalation intra-provider
-/// (`nexus_model_escalation_chain`, mig 0128) gia' filtrata per `(provider,
-/// base_model)` e ordinata per `escalation_position` ASC. Forma MINIMALE: al
-/// nodo serve solo il modello di destinazione (provider e base_model sono il
-/// contesto del lookup, gia' applicato dall'impl della porta).
+/// (`nexus_model_escalation_chain`) risolta dall'impl della porta. Tipo di
+/// TRASPORTO usato dalla porta per COSTRUIRE i candidati unificati; la SELEZIONE
+/// non lo usa direttamente (usa [`EscalationCandidate`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainEntry {
     /// Modello di destinazione dell'escalation (`escalation_model`).
     pub escalation_model: String,
-    /// Performance tier del modello di destinazione (`performance_tier` dalla vista
-    /// `v_model_escalation_chain`, che gia' espone la colonna del catalog). Trasporta
-    /// il tier del modello promosso fino al pick SENZA lookup extra (FIX-A
-    /// scale-controller, regola L/H: il DB e' gia' interrogato per derivare la
-    /// catena). `None` se la porta non ha risolto il tier (fail-open: il chiamante
-    /// ricade sul default `medium` di `build_scale_context`, comportamento invariato).
+    /// Performance tier del modello di destinazione (dal catalog). `None` se non
+    /// risolto (fail-open: trattato come `medium` neutro nel ranking).
     #[serde(default)]
     pub tier: Option<String>,
 }
 
-/// Candidato cross-provider (`loop_fallback_default`) risolto a monte dal router
-/// (regola G). `None` quando il purpose non e' configurato o il gate ADR 0020
-/// non ha un capable provider (sentinelle gia' escluse dall'impl della porta:
-/// `__router_unavailable__` / `__no_capable_provider__` NON arrivano qui).
+/// Candidato cross-provider (`loop_fallback_default`) risolto dal router. Tipo di
+/// TRASPORTO come [`ChainEntry`]: la porta lo fonde nei candidati unificati.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossProviderCandidate {
     /// Provider del candidato cross-provider.
     pub provider: String,
     /// Modello del candidato cross-provider.
     pub model: String,
-    /// Performance tier del modello cross-provider (dal catalog, risolto dall'impl
-    /// della porta insieme al modello). Trasporta il tier del modello promosso fino
-    /// al pick SENZA lookup extra (FIX-A scale-controller, regola L/H). `None` se non
-    /// risolto (fail-open: default `medium` a valle, comportamento invariato).
+    /// Performance tier del modello cross-provider (dal catalog). `None` = `medium`.
     #[serde(default)]
     pub tier: Option<String>,
 }
 
-/// Modello promosso dall'escalation: provider + model con cui RI-ESEGUIRE il
-/// turno (signature-loop) o da rendere sticky (cap G1).
+/// Candidato di escalation UNIFICATO (intra o cross): l'unita' su cui lavora la
+/// selezione agentica. Provider+model+tier dal routing/catalog, telemetria dal
+/// `model_health_probe`+catalog (regola M). Costruito dall'impl della porta.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EscalationCandidate {
+    /// Provider del candidato.
+    pub provider: String,
+    /// Modello del candidato.
+    pub model: String,
+    /// Performance tier (`light`/`medium`/`heavy`), `None` = `medium` neutro.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Telemetria strutturata del candidato (salute/likelihood). `default` = sano
+    /// (nessun segnale = nessuna penalita').
+    #[serde(default)]
+    pub telemetry: ModelTelemetry,
+}
+
+/// Modello promosso dall'escalation: provider + model con cui RI-ESEGUIRE il turno
+/// (signature-loop) o da rendere sticky (cap G1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscalationPick {
     /// Provider del modello promosso.
     pub provider: String,
     /// Modello promosso.
     pub model: String,
-    /// `true` se la scelta viene dalla catena intra-provider (Tier 1), `false`
-    /// se dal candidato cross-provider (Tier 2). Eco diagnostica (il chiamante
-    /// non cambia comportamento in base a questo): utile a log/golden.
+    /// `true` se il modello promosso e' dello STESSO provider corrente (eco
+    /// diagnostica: il chiamante non cambia comportamento in base a questo).
     pub from_chain: bool,
-    /// Performance tier del modello promosso (`ChainEntry::tier` per Tier 1,
-    /// `CrossProviderCandidate::tier` per Tier 2), propagato dalla scelta SENZA
-    /// lookup extra. Il chiamante lo scrive in `StateDelta::current_tier` (FIX-A
-    /// scale-controller). `None` se la porta non l'ha risolto: eco diagnostica, NON
-    /// influenza la SELEZIONE (bit-identico al comportamento pre-FIX-A).
+    /// Performance tier del modello promosso, propagato dal candidato scelto SENZA
+    /// lookup extra. Il chiamante lo scrive in `StateDelta::current_tier`. `None` se
+    /// il tier non era risolto.
     #[serde(default)]
     pub tier: Option<String>,
 }
 
-/// Punto unico (regola L): data la fotografia (catena + corrente + escalation gia'
-/// fatte + cooldown + candidato cross-provider), ritorna il prossimo modello
-/// eleggibile o `None`. PURA. Replica 1:1 `_pick_escalation_model`.
+/// PUNTO UNICO (regola L) della selezione AGENTICA del prossimo modello di
+/// escalation. PURA. Dato l'insieme dei candidati ammissibili (gia' con tier +
+/// telemetria) e la coppia corrente, ritorna il modello migliore o `None`.
 ///
-/// - `chain`: catena intra-provider per `(current_provider, current_model)`, gia'
-///   ordinata per posizione ASC (la porta applica il filtro + l'ordine + il
-///   `is_active`). Vuota se non c'e' catena per la coppia corrente.
-/// - `current_provider` / `current_model`: la coppia del turno corrente. `None`
-///   (provider) salta il Tier 1 (parita' col `if provider and model` Python).
-/// - `escalations`: numero di escalation gia' fatte nel run (`auto_escalations`):
-///   indice nella catena (Tier 1) come nel Python (`_rows[escalations]`).
-/// - `provider_in_cooldown`: `true` se `current_provider` e' in cooldown billing/
-///   quota (gate ADR 0020). Se `true`, Tier 1 e' SALTATO (escalare sullo stesso
-///   provider morto sprecherebbe un turno).
-/// - `cross_provider`: candidato `loop_fallback_default` (Tier 2), o `None`.
+/// Ordinamento (stabile): salute (non-recently_failed prima) -> tier DESC (piu'
+/// capace prima) -> likelihood DESC -> ordine d'ingresso. Il modello CORRENTE e'
+/// escluso. `None` solo se non resta alcun candidato (insieme vuoto o solo il
+/// corrente): il chiamante chiude secco.
+///
+/// - `candidates`: insieme unificato (intra + cross) dei target di escalation, gia'
+///   filtrati per capability/cooldown dall'impl della porta.
+/// - `current_provider` / `current_model`: la coppia del turno che sta fallendo
+///   (esclusa dalla selezione).
+/// - `policy`: soglie governance DB-driven (regola G) per salute/likelihood.
 pub fn pick_escalation_model(
-    chain: &[ChainEntry],
+    candidates: &[EscalationCandidate],
     current_provider: Option<&str>,
     current_model: Option<&str>,
-    escalations: i64,
-    provider_in_cooldown: bool,
-    cross_provider: Option<&CrossProviderCandidate>,
+    policy: &GovernancePolicy,
 ) -> Option<EscalationPick> {
-    // === Tier 1: catena intra-provider (stesso provider, tier superiore) ===
-    // Solo se provider+model valorizzati e provider NON in cooldown (parita' col
-    // gate Python: `provider.strip().lower() not in cooldown_set`).
-    if let (Some(provider), Some(model)) = (
-        current_provider.filter(|s| !s.is_empty()),
-        current_model.filter(|s| !s.is_empty()),
-    ) {
-        if !provider_in_cooldown {
-            // `_rows[escalations]` con `LIMIT escalations+1`: l'elemento all'indice
-            // `escalations` (numero di escalation gia' fatte). `escalations` < 0 e'
-            // impossibile in pratica (contatore >= 0); il cast a usize lo tratta
-            // come fuori-catena (nessun candidato), coerente col Python.
-            if let Ok(idx) = usize::try_from(escalations) {
-                if let Some(entry) = chain.get(idx) {
-                    if !entry.escalation_model.is_empty() && entry.escalation_model != model {
-                        return Some(EscalationPick {
-                            provider: provider.to_string(),
-                            model: entry.escalation_model.clone(),
-                            from_chain: true,
-                            tier: entry.tier.clone(),
-                        });
-                    }
-                }
-            }
-        }
-    }
+    let cur_p = current_provider.map(|p| p.trim().to_ascii_lowercase());
+    let cur_m = current_model.map(|m| m.trim().to_string());
+    let is_current = |c: &EscalationCandidate| {
+        cur_p.as_deref() == Some(c.provider.trim().to_ascii_lowercase().as_str())
+            && cur_m.as_deref() == Some(c.model.trim())
+    };
 
-    // === Tier 2: purpose model cross-provider dal router (loop_fallback_default) ===
-    // Eleggibile se non e' la coppia corrente (parita' col Python: `not (provider
-    // == current and model == current)`). Le sentinelle sono gia' escluse dalla
-    // porta (non arrivano come `cross_provider`).
-    if let Some(cand) = cross_provider {
-        let same_as_current = current_provider.map(|p| p == cand.provider).unwrap_or(false)
-            && current_model.map(|m| m == cand.model).unwrap_or(false);
-        if !same_as_current {
-            return Some(EscalationPick {
-                provider: cand.provider.clone(),
-                model: cand.model.clone(),
-                from_chain: false,
-                tier: cand.tier.clone(),
-            });
-        }
-    }
+    // Arricchisco i candidati (esclusi il corrente e i vuoti) con bucket-salute,
+    // rank-tier e punteggio. `sort_by` STABILE preserva l'ordine d'ingresso a
+    // parita' di chiave -> ultimo tie-breaker implicito.
+    let mut ranked: Vec<(&EscalationCandidate, u8, u8, f64)> = candidates
+        .iter()
+        .filter(|c| !c.provider.trim().is_empty() && !c.model.trim().is_empty())
+        .filter(|c| !is_current(c))
+        .map(|c| {
+            let bucket = u8::from(is_recently_failed(&c.telemetry, policy));
+            let trank = tier_rank(c.tier.as_deref());
+            let score = likelihood_score(&c.telemetry, policy);
+            (c, bucket, trank, score)
+        })
+        .collect();
 
-    None
+    ranked.sort_by(|a, b| {
+        a.1.cmp(&b.1) // salute: bucket ASC (sani prima)
+            .then(b.2.cmp(&a.2)) // tier DESC (piu' capace prima)
+            .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)) // likelihood DESC
+    });
+
+    ranked.first().map(|(c, _, _, _)| EscalationPick {
+        provider: c.provider.clone(),
+        model: c.model.clone(),
+        from_chain: cur_p.as_deref() == Some(c.provider.trim().to_ascii_lowercase().as_str()),
+        tier: c.tier.clone(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn chain(models: &[&str]) -> Vec<ChainEntry> {
-        models
-            .iter()
-            .map(|m| ChainEntry {
-                escalation_model: (*m).to_string(),
-                tier: None,
-            })
-            .collect()
-    }
-
-    /// Catena con tier esplicito per-entry (FIX-A: verifica propagazione tier).
-    fn chain_tier(entries: &[(&str, &str)]) -> Vec<ChainEntry> {
-        entries
-            .iter()
-            .map(|(m, t)| ChainEntry {
-                escalation_model: (*m).to_string(),
-                tier: Some((*t).to_string()),
-            })
-            .collect()
-    }
-
-    fn cross(p: &str, m: &str) -> CrossProviderCandidate {
-        CrossProviderCandidate {
-            provider: p.to_string(),
-            model: m.to_string(),
-            tier: None,
+    fn cand(provider: &str, model: &str, tier: Option<&str>) -> EscalationCandidate {
+        EscalationCandidate {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            tier: tier.map(str::to_string),
+            telemetry: ModelTelemetry::default(),
         }
     }
 
-    #[test]
-    fn tier1_prima_posizione() {
-        let c = chain(&["claude-sonnet-4-6", "claude-opus-4-6"]);
-        let r = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 0, false, None);
-        assert_eq!(
-            r,
-            Some(EscalationPick {
-                provider: "anthropic".into(),
-                model: "claude-sonnet-4-6".into(),
-                from_chain: true,
-                tier: None,
-            })
-        );
+    /// Telemetria che marca un candidato come "recently_failed" (cooldown).
+    fn cand_failed(provider: &str, model: &str, tier: Option<&str>) -> EscalationCandidate {
+        let mut c = cand(provider, model, tier);
+        c.telemetry.provider_in_cooldown = true;
+        c
     }
 
     #[test]
-    fn tier1_indice_segue_escalations() {
-        let c = chain(&["claude-sonnet-4-6", "claude-opus-4-6"]);
-        // escalations=1 -> seconda posizione.
-        let r = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 1, false, None);
-        assert_eq!(r.unwrap().model, "claude-opus-4-6");
-    }
-
-    #[test]
-    fn tier1_catena_esaurita_senza_cross_e_none() {
-        let c = chain(&["claude-sonnet-4-6"]);
-        // escalations=1 -> oltre la catena (len 1), nessun cross -> None.
-        let r = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 1, false, None);
-        assert_eq!(r, None);
-    }
-
-    #[test]
-    fn tier1_candidato_uguale_al_corrente_salta() {
-        // La catena ritorna lo stesso modello corrente -> Tier 1 NON eleggibile,
-        // cade al cross-provider.
-        let c = chain(&["claude-haiku-4-5"]);
-        let cand = cross("google", "gemini-2.5-pro");
-        let r = pick_escalation_model(
-            &c,
-            Some("anthropic"),
-            Some("claude-haiku-4-5"),
-            0,
-            false,
-            Some(&cand),
-        );
-        assert_eq!(
-            r,
-            Some(EscalationPick {
-                provider: "google".into(),
-                model: "gemini-2.5-pro".into(),
-                from_chain: false,
-                tier: None,
-            })
-        );
-    }
-
-    #[test]
-    fn provider_in_cooldown_salta_tier1_va_a_cross() {
-        let c = chain(&["claude-sonnet-4-6"]);
-        let cand = cross("openai", "gpt-4.1");
-        // provider_in_cooldown=true -> Tier 1 saltato anche se la catena avrebbe
-        // un candidato; si usa il cross-provider.
-        let r = pick_escalation_model(
-            &c,
-            Some("anthropic"),
-            Some("claude-haiku-4-5"),
-            0,
-            true,
-            Some(&cand),
-        );
-        assert_eq!(r.unwrap().provider, "openai");
-    }
-
-    #[test]
-    fn provider_in_cooldown_senza_cross_e_none() {
-        let c = chain(&["claude-sonnet-4-6"]);
-        let r = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 0, true, None);
-        assert_eq!(r, None);
-    }
-
-    #[test]
-    fn nessun_provider_corrente_salta_tier1() {
-        // provider None -> Tier 1 saltato (parita' `if provider and model`),
-        // si usa il cross-provider.
-        let c = chain(&["claude-sonnet-4-6"]);
-        let cand = cross("mistral", "mistral-large-2411");
-        let r = pick_escalation_model(&c, None, None, 0, false, Some(&cand));
-        assert_eq!(r.unwrap().provider, "mistral");
-    }
-
-    #[test]
-    fn cross_uguale_al_corrente_e_none() {
-        // Il cross-provider coincide con la coppia corrente -> non eleggibile.
-        let cand = cross("anthropic", "claude-haiku-4-5");
-        let r = pick_escalation_model(
-            &[],
-            Some("anthropic"),
-            Some("claude-haiku-4-5"),
-            0,
-            false,
-            Some(&cand),
-        );
-        assert_eq!(r, None);
-    }
-
-    #[test]
-    fn catena_vuota_usa_cross() {
-        let cand = cross("google", "gemini-2.5-flash");
-        let r = pick_escalation_model(&[], Some("openai"), Some("gpt-4o-mini"), 0, false, Some(&cand));
-        assert_eq!(r.unwrap().model, "gemini-2.5-flash");
-    }
-
-    #[test]
-    fn tutto_assente_e_none() {
-        let r = pick_escalation_model(&[], Some("openai"), Some("gpt-4o-mini"), 0, false, None);
-        assert_eq!(r, None);
-    }
-
-    /// FIX-A: il tier del modello scelto in Tier 1 e' propagato dalla `ChainEntry`
-    /// selezionata (quella all'indice `escalations`), NON dalla prima della catena.
-    #[test]
-    fn tier1_propaga_tier_della_entry_scelta() {
-        let c = chain_tier(&[("claude-sonnet-4-6", "medium"), ("claude-opus-4-6", "heavy")]);
-        // escalations=0 -> prima entry (medium).
-        let r0 = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 0, false, None)
-            .expect("Tier 1");
-        assert_eq!(r0.tier.as_deref(), Some("medium"));
-        assert!(r0.from_chain);
-        // escalations=1 -> seconda entry (heavy).
-        let r1 = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 1, false, None)
-            .expect("Tier 1");
-        assert_eq!(r1.tier.as_deref(), Some("heavy"));
-    }
-
-    /// FIX-A: il tier del modello scelto in Tier 2 e' propagato dal
-    /// `CrossProviderCandidate` (cross-provider), non dalla catena intra-provider.
-    #[test]
-    fn tier2_propaga_tier_del_cross_provider() {
-        let cand = CrossProviderCandidate {
-            provider: "google".into(),
-            model: "gemini-2.5-pro".into(),
-            tier: Some("heavy".into()),
-        };
-        // Catena vuota -> cade al cross-provider (Tier 2).
-        let r = pick_escalation_model(&[], Some("openai"), Some("gpt-4o-mini"), 0, false, Some(&cand))
-            .expect("Tier 2");
-        assert!(!r.from_chain);
+    fn preferisce_il_tier_piu_forte_a_parita_di_salute() {
+        // Il cuore del fix "restava su flash": tra due candidati sani, vince heavy.
+        let p = GovernancePolicy::default();
+        let cands = vec![
+            cand("deepseek", "deepseek-v4-flash-alt", Some("medium")),
+            cand("deepseek", "deepseek-v4-pro", Some("heavy")),
+        ];
+        let r = pick_escalation_model(&cands, Some("deepseek"), Some("deepseek-v4-flash"), &p)
+            .expect("pick");
+        assert_eq!(r.model, "deepseek-v4-pro");
         assert_eq!(r.tier.as_deref(), Some("heavy"));
     }
 
-    /// FIX-A: tier assente nella entry -> pick con `tier: None` (fail-open, il
-    /// chiamante ricade sul default a valle). La SELEZIONE resta invariata.
     #[test]
-    fn tier_assente_resta_none_senza_alterare_la_selezione() {
-        let c = chain(&["claude-sonnet-4-6"]);
-        let r = pick_escalation_model(&c, Some("anthropic"), Some("claude-haiku-4-5"), 0, false, None)
-            .expect("Tier 1");
-        assert_eq!(r.model, "claude-sonnet-4-6");
-        assert_eq!(r.tier, None);
-    }
-}
-
-/// Golden di parita' 1:1 vs Python per `pick_escalation_model`. Carica
-/// `/tmp/golden_escalation.json` (vedi `gen_golden_escalation.py`).
-#[cfg(test)]
-mod golden {
-    use super::*;
-    use serde::Deserialize;
-    use serde_json::{json, Value};
-
-    #[derive(Debug, Deserialize)]
-    struct In {
-        chain: Vec<String>,
-        current_provider: Option<String>,
-        current_model: Option<String>,
-        escalations: i64,
-        provider_in_cooldown: bool,
-        cross_provider: Option<[String; 2]>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct GoldenCase {
-        group: String,
-        case_id: String,
-        input: In,
-        output: Value,
+    fn cross_provider_heavy_vince_su_intra_medium() {
+        // Non c'e' preferenza intra-provider: se il cross e' piu' forte, ci si va.
+        let p = GovernancePolicy::default();
+        let cands = vec![
+            cand("deepseek", "deepseek-v4-pro-medium", Some("medium")),
+            cand("google", "gemini-2.5-pro", Some("heavy")),
+        ];
+        let r = pick_escalation_model(&cands, Some("deepseek"), Some("deepseek-v4-flash"), &p)
+            .expect("pick");
+        assert_eq!(r.provider, "google");
+        assert_eq!(r.model, "gemini-2.5-pro");
+        assert!(!r.from_chain);
     }
 
     #[test]
-    #[ignore = "richiede /tmp/golden_escalation.json generato da gen_golden_escalation.py"]
-    fn golden_escalation() {
-        let Some(raw) =
-            crate::golden_util::load_golden("golden_escalation.json", "gen_golden_escalation.py")
-        else {
-            return;
-        };
-        let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 10, "attesi >= 10 casi, trovati {}", cases.len());
-        for c in &cases {
-            assert_eq!(c.group, "pick_escalation_model");
-            let chain: Vec<ChainEntry> = c
-                .input
-                .chain
-                .iter()
-                .map(|m| ChainEntry {
-                    escalation_model: m.clone(),
-                    tier: None,
-                })
-                .collect();
-            let cand = c.input.cross_provider.as_ref().map(|pm| CrossProviderCandidate {
-                provider: pm[0].clone(),
-                model: pm[1].clone(),
-                tier: None,
-            });
-            let r = pick_escalation_model(
-                &chain,
-                c.input.current_provider.as_deref(),
-                c.input.current_model.as_deref(),
-                c.input.escalations,
-                c.input.provider_in_cooldown,
-                cand.as_ref(),
-            );
-            // Output Python: [provider, model] o null (from_chain non e' osservabile
-            // nel ritorno Python (tuple[str,str]|None), quindi NON entra nel golden).
-            let got = match &r {
-                Some(p) => json!([p.provider, p.model]),
-                None => Value::Null,
-            };
-            assert_eq!(
-                got, c.output,
-                "PARITA' FALLITA pick_escalation_model / {}:\n  rust   = {}\n  python = {}",
-                c.case_id, got, c.output
-            );
-        }
-        println!("golden escalation: {} casi verificati, tutti verdi", cases.len());
+    fn un_sano_batte_un_piu_forte_ma_malato() {
+        // Salute prima del tier: un medium sano batte un heavy in cooldown.
+        let p = GovernancePolicy::default();
+        let cands = vec![
+            cand_failed("google", "gemini-2.5-pro", Some("heavy")),
+            cand("deepseek", "deepseek-v4-pro", Some("medium")),
+        ];
+        let r = pick_escalation_model(&cands, Some("deepseek"), Some("deepseek-v4-flash"), &p)
+            .expect("pick");
+        assert_eq!(r.model, "deepseek-v4-pro"); // sano, anche se medium
+    }
+
+    #[test]
+    fn esclude_il_modello_corrente() {
+        let p = GovernancePolicy::default();
+        let cands = vec![
+            cand("deepseek", "deepseek-v4-flash", Some("medium")), // == corrente
+            cand("deepseek", "deepseek-v4-pro", Some("heavy")),
+        ];
+        let r = pick_escalation_model(&cands, Some("deepseek"), Some("deepseek-v4-flash"), &p)
+            .expect("pick");
+        assert_eq!(r.model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn esclusione_corrente_case_insensitive_sul_provider() {
+        let p = GovernancePolicy::default();
+        let cands = vec![cand("DeepSeek", "deepseek-v4-flash", Some("medium"))];
+        // L'unico candidato e' il corrente (provider case-diverso) -> None.
+        let r = pick_escalation_model(&cands, Some("deepseek"), Some("deepseek-v4-flash"), &p);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn insieme_vuoto_e_none() {
+        let p = GovernancePolicy::default();
+        let r = pick_escalation_model(&[], Some("deepseek"), Some("deepseek-v4-flash"), &p);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn tutti_malati_ne_ritorna_comunque_uno_fail_safe() {
+        // Fail-safe: se tutti "recently_failed", non resta a mani vuote (retrocede,
+        // non cancella). Sceglie il piu' forte tra i malati.
+        let p = GovernancePolicy::default();
+        let cands = vec![
+            cand_failed("mistral", "mistral-large", Some("medium")),
+            cand_failed("google", "gemini-2.5-pro", Some("heavy")),
+        ];
+        let r = pick_escalation_model(&cands, Some("deepseek"), Some("deepseek-v4-flash"), &p)
+            .expect("fail-safe: un candidato deve uscire");
+        assert_eq!(r.model, "gemini-2.5-pro"); // heavy tra i malati
+    }
+
+    #[test]
+    fn a_parita_totale_preserva_ordine_ingresso() {
+        // Stessa salute, stesso tier, stessa likelihood -> ordine d'ingresso.
+        let p = GovernancePolicy::default();
+        let cands = vec![
+            cand("google", "gemini-2.5-pro", Some("heavy")),
+            cand("anthropic", "claude-opus", Some("heavy")),
+        ];
+        let r = pick_escalation_model(&cands, Some("deepseek"), Some("deepseek-v4-flash"), &p)
+            .expect("pick");
+        assert_eq!(r.provider, "google"); // primo in ingresso
+    }
+
+    #[test]
+    fn tier_assente_trattato_come_medium_neutro() {
+        // Un candidato senza tier (None) non e' penalizzato ne' premiato: rank medium.
+        let p = GovernancePolicy::default();
+        let cands = vec![
+            cand("google", "gemini", None),        // -> medium
+            cand("deepseek", "pro", Some("heavy")), // heavy vince
+        ];
+        let r = pick_escalation_model(&cands, Some("x"), Some("y"), &p).expect("pick");
+        assert_eq!(r.model, "pro");
+    }
+
+    #[test]
+    fn from_chain_true_se_stesso_provider() {
+        let p = GovernancePolicy::default();
+        let cands = vec![cand("deepseek", "deepseek-v4-pro", Some("heavy"))];
+        let r = pick_escalation_model(&cands, Some("deepseek"), Some("deepseek-v4-flash"), &p)
+            .expect("pick");
+        assert!(r.from_chain);
     }
 }

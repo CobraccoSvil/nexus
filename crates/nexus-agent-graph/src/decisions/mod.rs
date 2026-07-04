@@ -90,7 +90,9 @@ pub use end_turn::{
     billing_fail_fast_message, build_unfulfilled_report, should_substitute_unfulfilled_report,
     should_upscale, strip_suggested_actions, upscale_required_tokens,
 };
-pub use escalation::{pick_escalation_model, ChainEntry, CrossProviderCandidate, EscalationPick};
+pub use escalation::{
+    pick_escalation_model, ChainEntry, CrossProviderCandidate, EscalationCandidate, EscalationPick,
+};
 pub use g1_accounting::{g1_accounting, G1Accounting, G1Signals};
 pub use governance::{
     is_recently_failed, likelihood_score, rank_candidates, rolling_summary_worthwhile,

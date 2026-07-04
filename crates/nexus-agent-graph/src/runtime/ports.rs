@@ -20,7 +20,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::decisions::dag_scheduler::{Todo, TodoStatus};
-use crate::decisions::escalation::{ChainEntry, CrossProviderCandidate};
+use crate::decisions::escalation::{CrossProviderCandidate, EscalationCandidate};
+use crate::decisions::governance::GovernancePolicy;
 use crate::state::ToolUse;
 
 /// Errore di una porta I/O. Opaco al runtime: messaggio + classe sintetica per
@@ -776,19 +777,16 @@ pub trait EmbeddingStore: Send + Sync {
 /// PURO. Il confine d'inversione (regola L): l'I/O (lettura
 /// `nexus_model_escalation_chain`, gate ADR 0020, purpose `loop_fallback_default`)
 /// vive nell'impl della porta; la SELEZIONE resta nel modulo puro `escalation`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EscalationInputs {
-    /// Catena intra-provider per `(provider, model)` correnti, gia' filtrata
-    /// (`is_active = TRUE`) e ordinata per `escalation_position` ASC. Vuota se non
-    /// c'e' catena per la coppia corrente.
-    pub chain: Vec<ChainEntry>,
-    /// `true` se il provider corrente e' in cooldown billing/quota (gate ADR 0020):
-    /// in tal caso la SELEZIONE salta il Tier 1 intra-provider.
-    pub provider_in_cooldown: bool,
-    /// Candidato cross-provider (`loop_fallback_default`) risolto dal router, gia'
-    /// con sentinelle escluse (`__router_unavailable__` / `__no_capable_provider__`
-    /// NON arrivano: l'impl ritorna `None` in quel caso). `None` = nessun Tier 2.
-    pub cross_provider: Option<CrossProviderCandidate>,
+    /// Insieme UNIFICATO dei candidati di escalation ammissibili (catena
+    /// intra-provider + cross-provider fusi), ognuno con tier + telemetria, gia'
+    /// filtrati per capability/cooldown dall'impl della porta. La SELEZIONE agentica
+    /// (salute -> tier -> likelihood, niente indice posizionale ne' split fisso) vive
+    /// nel modulo puro [`crate::decisions::escalation::pick_escalation_model`].
+    pub candidates: Vec<EscalationCandidate>,
+    /// Soglie governance DB-driven (regola G) per salute/likelihood del ranking.
+    pub policy: GovernancePolicy,
 }
 
 /// Una scelta di proseguimento derivata dal testo dell'assistente (meta_step

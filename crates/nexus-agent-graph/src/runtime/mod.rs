@@ -131,7 +131,7 @@ pub mod test_doubles {
         VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
-    use crate::decisions::escalation::{ChainEntry, CrossProviderCandidate};
+    use crate::decisions::escalation::CrossProviderCandidate;
 
     /// Gateway LLM di test: ritorna una `LlmResponse` fissa e registra le
     /// richieste ricevute (per asserzioni sull'input passato dal nodo).
@@ -774,24 +774,31 @@ pub mod test_doubles {
             if self.fail {
                 return Err(PortError::Llm("stub: escalation_inputs fail".to_string()));
             }
+            // Nuovo contratto agentico: insieme UNIFICATO di candidati (intra +
+            // cross) con tier + telemetria. Il provider della catena intra e' quello
+            // corrente (passato); telemetria default (sano) -> il ranking del modulo
+            // puro si riduce a tier + ordine d'ingresso (deterministico nei test).
+            let mut candidates: Vec<crate::decisions::escalation::EscalationCandidate> = self
+                .chain
+                .iter()
+                .map(|m| crate::decisions::escalation::EscalationCandidate {
+                    provider: provider.unwrap_or("").to_string(),
+                    model: m.clone(),
+                    tier: self.chain_tier.clone(),
+                    telemetry: crate::decisions::governance::ModelTelemetry::default(),
+                })
+                .collect();
+            if let Some((p, m)) = self.cross_provider.as_ref() {
+                candidates.push(crate::decisions::escalation::EscalationCandidate {
+                    provider: p.clone(),
+                    model: m.clone(),
+                    tier: None,
+                    telemetry: crate::decisions::governance::ModelTelemetry::default(),
+                });
+            }
             Ok(EscalationInputs {
-                chain: self
-                    .chain
-                    .iter()
-                    .map(|m| ChainEntry {
-                        escalation_model: m.clone(),
-                        tier: self.chain_tier.clone(),
-                    })
-                    .collect(),
-                provider_in_cooldown: self.provider_in_cooldown,
-                cross_provider: self
-                    .cross_provider
-                    .as_ref()
-                    .map(|(p, m)| CrossProviderCandidate {
-                        provider: p.clone(),
-                        model: m.clone(),
-                        tier: None,
-                    }),
+                candidates,
+                policy: crate::decisions::governance::GovernancePolicy::default(),
             })
         }
 
