@@ -689,6 +689,52 @@ async fn control_project_service_windows(
             .filter(|w| !w.trim().is_empty())
             .unwrap_or_else(|| context.root_path.to_string_lossy().to_string());
 
+        // Instrada il servizio managed sul percorso ALLOCA+INIETTA (regola L, riuso
+        // di find_or_allocate) invece del detect-path: Nexus assegna la porta stabile
+        // del bucket PRIMA dello spawn e la inietta come env PORT/HOST, cosi' il
+        // servizio non sceglie piu' una porta propria che poi verrebbe soltanto
+        // "rilevata" (allocation_mode='auto' con service_unit NULL -> rilasciata dal
+        // GC -> drift 31792->31798, incidente Beaty-Book). L'allocazione viene
+        // annotata col service_unit del servizio: la sua PRESENZA e' cio' che la
+        // preserva dal GC su Windows (service_unit_reserves_port, fix f0057b0).
+        // Gate sull'euristica web-service (stessa di run_service, regola L): un
+        // worker non-web resta invariato, senza PORT iniettato.
+        let port_env = if crate::agent_tools::service::looks_like_web_service(&command) {
+            match super::find_or_allocate_port(&state.db, &state.port_registry, project_id, &short)
+                .await
+            {
+                Ok(alloc) => {
+                    let unit_name = format!("{slug}-{short}.service");
+                    super::allocate_port::link_allocation_to_service_unit(
+                        &state.db,
+                        project_id,
+                        &short,
+                        &unit_name,
+                    )
+                    .await;
+                    tracing::info!(
+                        port = alloc.port,
+                        label = %short,
+                        mode = alloc.mode,
+                        "control_service_windows: PORT alloc+iniettato e service_unit collegato"
+                    );
+                    let mut env = std::collections::HashMap::new();
+                    env.insert("PORT".to_string(), alloc.port.to_string());
+                    env.insert("HOST".to_string(), "0.0.0.0".to_string());
+                    Some(env)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        label = %short,
+                        "control_service_windows: find_or_allocate fallita ({e}); avvio senza PORT iniettato"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         crate::agent_processes::spawn_agent_process(
             &state.db,
             project_id,
@@ -697,8 +743,8 @@ async fn control_project_service_windows(
             &command,
             &cwd,
             Some(context.root_path.clone()),
-            None,  // env non persistito in agent_processes; la porta e' tipicamente inline nel comando
-            false, // niente sandbox Docker su Windows
+            port_env, // porta del bucket iniettata come PORT/HOST per i web service (alloca+inietta)
+            false,    // niente sandbox Docker su Windows
             "service",
             None,
         )

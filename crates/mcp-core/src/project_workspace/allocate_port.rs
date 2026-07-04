@@ -382,6 +382,52 @@ pub async fn find_or_allocate(
     })
 }
 
+/// Collega l'allocazione porta di `(project_id, label)` al `service_unit` del
+/// servizio managed che la possiede.
+///
+/// Perche' serve (regola H, causa radice del drift Beaty-Book su Windows): il GC
+/// `port_registry::cleanup_orphaned_ports` rilascia le allocazioni non-`manual`
+/// rimaste senza listener TCP oltre la grace period, TRANNE quelle il cui
+/// `service_unit` "riserva" la porta (`service_unit_reserves_port`). Su Windows
+/// quella riserva scatta per la sola PRESENZA di un `service_unit` non vuoto
+/// (non c'e' alcun file systemd da leggere). Ma le righe create da
+/// `find_or_allocate` nascono con `service_unit = NULL`: senza questo link un
+/// servizio managed FERMO perderebbe la sua porta al primo giro di GC (drift
+/// 31792 -> 31798, pannello Porte svuotato).
+///
+/// Punto unico del linking allocazione -> unit (regola L): i call site che
+/// avviano un servizio managed annotano qui la riga gia' materializzata da
+/// `find_or_allocate`, invece di re-implementare l'UPDATE.
+pub async fn link_allocation_to_service_unit(
+    db: &PgPool,
+    project_id: Uuid,
+    label: &str,
+    service_unit: &str,
+) {
+    let label = label.trim();
+    let service_unit = service_unit.trim();
+    if label.is_empty() || service_unit.is_empty() {
+        return;
+    }
+    if let Err(e) = sqlx::query(
+        "UPDATE nexus_port_allocations SET service_unit = $1, updated_at = NOW() \
+         WHERE project_id = $2 AND label = $3",
+    )
+    .bind(service_unit)
+    .bind(project_id)
+    .bind(label)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            "link_allocation_to_service_unit: UPDATE service_unit fallito (label {} unit {}): {}",
+            label,
+            service_unit,
+            e
+        );
+    }
+}
+
 pub async fn allocate_port(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -522,6 +568,7 @@ mod tests {
                  port INT NOT NULL, \
                  label TEXT NOT NULL DEFAULT '', \
                  allocation_mode TEXT NOT NULL DEFAULT 'auto', \
+                 service_unit TEXT, \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
                  CONSTRAINT uq_port UNIQUE (port) \
@@ -727,5 +774,72 @@ mod tests {
         // Ri-risolvere non duplica righe ne' cambia le porte (idempotenza per label).
         assert_eq!(count_rows(&pool, proj, "frontend").await, 1);
         assert_eq!(count_rows(&pool, proj, "backend").await, 1);
+    }
+
+    async fn lookup_service_unit(
+        pool: &sqlx::PgPool,
+        project_id: Uuid,
+        label: &str,
+    ) -> Option<String> {
+        sqlx::query(
+            "SELECT service_unit FROM nexus_port_allocations \
+             WHERE project_id = $1 AND label = $2 LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .expect("lookup service_unit")
+        .get::<Option<String>, _>("service_unit")
+    }
+
+    /// Regressione drift Beaty-Book su Windows: un'allocazione instradata da
+    /// `find_or_allocate` nasce con `service_unit = NULL` -> il GC la rilascerebbe
+    /// al primo giro (servizio managed fermo -> porta persa). `link_allocation_to_service_unit`
+    /// deve annotare la riga esistente col service_unit, senza duplicarla.
+    #[sqlx::test]
+    async fn link_service_unit_annota_riga_esistente(pool: sqlx::PgPool) {
+        create_port_allocations_table(&pool).await;
+        let proj = Uuid::new_v4();
+
+        // La riga nasce senza service_unit (come dall'upsert di find_or_allocate).
+        upsert_alloc(&pool, proj, 31787, "backend").await;
+        assert_eq!(
+            lookup_service_unit(&pool, proj, "backend").await,
+            None,
+            "l'upsert di find_or_allocate non popola service_unit (nasce NULL)"
+        );
+
+        super::link_allocation_to_service_unit(&pool, proj, "backend", "beaty-book-backend.service")
+            .await;
+
+        assert_eq!(
+            lookup_service_unit(&pool, proj, "backend").await.as_deref(),
+            Some("beaty-book-backend.service"),
+            "dopo il link la riga deve riportare il service_unit (cosi' il GC la preserva)"
+        );
+        assert_eq!(
+            count_rows(&pool, proj, "backend").await,
+            1,
+            "il link e' un UPDATE della riga esistente, non deve crearne una nuova"
+        );
+    }
+
+    /// Guardie del punto unico: label o unit vuota -> no-op (nessun UPDATE, niente
+    /// panic). Evita di sovrascrivere righe con un service_unit vuoto/spurio.
+    #[sqlx::test]
+    async fn link_service_unit_no_op_su_input_vuoto(pool: sqlx::PgPool) {
+        create_port_allocations_table(&pool).await;
+        let proj = Uuid::new_v4();
+        upsert_alloc(&pool, proj, 31798, "frontend").await;
+
+        super::link_allocation_to_service_unit(&pool, proj, "frontend", "   ").await;
+        super::link_allocation_to_service_unit(&pool, proj, "", "x.service").await;
+
+        assert_eq!(
+            lookup_service_unit(&pool, proj, "frontend").await,
+            None,
+            "input vuoto (unit o label) non deve toccare service_unit"
+        );
     }
 }
