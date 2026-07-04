@@ -62,8 +62,9 @@
 //!
 //! [`MetaReasonerPort`] espone anche `orchestrate` (decisione di plan-phase /
 //! decompose / delega su [`OrchestrationContext`] -> [`OrchestrationMove`]),
-//! implementato in [`PgMetaReasonerPort::consult_orch_llm`] col PARADIGMA
-//! IDENTICO a `consult_llm` (regola L, stesso flusso, scope disgiunto):
+//! implementato in [`PgMetaReasonerPort::consult_orch_llm`] sul FLUSSO UNICO
+//! condiviso [`PgMetaReasonerPort::consult_meta_llm`] (regola L: STESSO flusso,
+//! parametrizzato dalla [`MetaConsultSpec`] dello scope, non re-inventato):
 //!   1. GATE REPLAY opzione A: in [`ExecMode::Replay`] -> `Ok(None)` immediato,
 //!      senza I/O (il `ReplayLlmGateway` rigioca solo `purpose=="executor"`);
 //!   2. kill-switch `agent.orchestration.enabled` (opt-in, default OFF, regola G):
@@ -180,6 +181,108 @@ const SCALE_TIMEOUT_DEFAULT: u64 = 15;
 /// il controller gira di frequente, non deve esplodere in token).
 const SCALE_MAX_TOKENS: u32 = 256;
 
+/// Parametri STATICI (const) che distinguono i 3 scope del meta-reasoner LLM
+/// (recovery / orchestrazione / scala). Il FLUSSO a 6 passi e' UNICO
+/// ([`PgMetaReasonerPort::consult_meta_llm`], regola L: un solo punto di controllo);
+/// qui vivono SOLO le differenze dichiarative, cosi' aggiungere un 4o scope =
+/// una const in piu', non una quarta re-implementazione del flusso.
+struct MetaConsultSpec {
+    /// Setting kill-switch (opt-in, default OFF -> porta inerte).
+    enabled_setting: &'static str,
+    /// Setting del timeout (s) della chiamata LLM, clamp `[5,300]`.
+    timeout_setting: &'static str,
+    /// Timeout (s) di default se il setting manca / e' malformato (safe-default
+    /// numerico seminato dalla migrazione dello scope, non un magic fallback).
+    timeout_default: u64,
+    /// Purpose (regola G) risolto tier-aware da `nexus_purpose_model`.
+    purpose: &'static str,
+    /// Chiave del template di sistema (schema XML fuori-chat, regola D).
+    template_key: &'static str,
+    /// Tetto di token in output (la mossa e' un piccolo oggetto JSON).
+    max_tokens: u32,
+    /// Valore del campo strutturato `metric` sui log di misconfig (preservato per
+    /// scope: e' un contratto d'osservabilita', regola M).
+    misconfig_metric: &'static str,
+    /// Identificatore dello scope: campo `kind` dei log unificati e prefisso dei
+    /// messaggi d'errore infrastrutturali.
+    kind: &'static str,
+    /// Prefisso del turno user che introduce il contesto serializzato.
+    user_prefix: &'static str,
+    /// (Opt-in per-scope, regola L) template ADDENDUM appeso al `template_key`
+    /// quando `addendum_enabled_setting` e' ON. `None` = nessun addendum
+    /// (system_text = solo `template_key`, bit-identico agli scope senza estensioni).
+    addendum_template_key: Option<&'static str>,
+    /// Kill-switch dell'addendum (opt-in, default OFF). Valutato solo se
+    /// `addendum_template_key` e' `Some`.
+    addendum_enabled_setting: Option<&'static str>,
+}
+
+/// Spec dello scope RECOVERY-da-stallo (mig 0510). Costruita dai const dello scope
+/// cosi' restano l'unica fonte dei valori (nessun doc-link orfano, regola L).
+const STALL_SPEC: MetaConsultSpec = MetaConsultSpec {
+    enabled_setting: STALL_ENABLED_SETTING,
+    timeout_setting: STALL_TIMEOUT_SETTING,
+    timeout_default: STALL_TIMEOUT_DEFAULT,
+    purpose: STALL_PURPOSE,
+    template_key: STALL_TEMPLATE_KEY,
+    max_tokens: STALL_MAX_TOKENS,
+    misconfig_metric: "stall_recovery_misconfig",
+    kind: "stall_recovery",
+    user_prefix: "Stato di stallo strutturato (JSON):",
+    addendum_template_key: None,
+    addendum_enabled_setting: None,
+};
+
+/// Spec dello scope ORCHESTRAZIONE (mig 0512). Gemello di [`STALL_SPEC`] su scope
+/// disgiunto: STESSO flusso, differenze solo dichiarative (regola L).
+const ORCH_SPEC: MetaConsultSpec = MetaConsultSpec {
+    enabled_setting: ORCH_ENABLED_SETTING,
+    timeout_setting: ORCH_TIMEOUT_SETTING,
+    timeout_default: ORCH_TIMEOUT_DEFAULT,
+    purpose: ORCH_PURPOSE,
+    template_key: ORCH_TEMPLATE_KEY,
+    max_tokens: ORCH_MAX_TOKENS,
+    misconfig_metric: "orchestration_misconfig",
+    kind: "orchestration",
+    user_prefix: "Contesto di orchestrazione strutturato (JSON):",
+    addendum_template_key: None,
+    addendum_enabled_setting: None,
+};
+
+/// Spec dello scope SCALE-CONTROLLER (mig 0516). Terzo scope disgiunto sul flusso
+/// unico (regola L).
+const SCALE_SPEC: MetaConsultSpec = MetaConsultSpec {
+    enabled_setting: SCALE_ENABLED_SETTING,
+    timeout_setting: SCALE_TIMEOUT_SETTING,
+    timeout_default: SCALE_TIMEOUT_DEFAULT,
+    purpose: SCALE_PURPOSE,
+    template_key: SCALE_TEMPLATE_KEY,
+    max_tokens: SCALE_MAX_TOKENS,
+    misconfig_metric: "scale_controller_misconfig",
+    kind: "scale",
+    user_prefix: "Andamento del run strutturato (JSON):",
+    // SIZING (mig 0524): addendum `system.scale.assess.sizing` appeso SOLO se
+    // agent.scale.sizing_enabled=ON. Con OFF il prompt tier resta byte-identico.
+    addendum_template_key: Some(SCALE_SIZING_TEMPLATE_KEY),
+    addendum_enabled_setting: Some(SCALE_SIZING_ENABLED_SETTING),
+};
+
+/// Esito del percorso LLM one-shot condiviso ([`PgMetaReasonerPort::consult_meta_llm`]),
+/// PRIMA della validazione tipizzata (che resta nel wrapper — punto unico per-scope
+/// `validate_move`/`validate_orch_move`/`validate_scale_move`, regola L):
+///   - `Degrade`  -> il wrapper ritorna `Ok(None)` (kill-switch OFF, misconfig
+///                   purpose/template, timeout, risposta vuota, serializzazione fallita);
+///   - `NoJson`   -> l'LLM ha risposto ma senza blocco JSON parsabile: il wrapper
+///                   ritorna il proprio fallback tipizzato (`Fallback`/`KeepTier`);
+///   - `Json(v)`  -> blocco JSON estratto: il wrapper lo valida col punto unico dello
+///                   scope. Il guasto INFRASTRUTTURALE (DB down, provider non risolto)
+///                   NON entra qui: e' un `Err(PortError)` propagato (regola G).
+enum MetaLlmParse {
+    Degrade,
+    NoJson,
+    Json(serde_json::Value),
+}
+
 /// Adapter [`MetaReasonerPort`] -> LLM via [`NeuralCoreClient`] (paradigma
 /// ADR 0036 di `verify_profile`). Legge config/purpose/template dal `db`.
 /// `recover` (recovery-da-stallo) e' implementato; `orchestrate` e' STUB (#11c).
@@ -198,11 +301,12 @@ impl PgMetaReasonerPort {
         Self { db, neural }
     }
 
-    /// `true` se il kill-switch e' attivo (`agent.stall_recovery.enabled`).
-    /// Default OFF (opt-in): setting assente / malformato -> `false` (regola G:
-    /// unica fonte DB, nessun fallback che accenda una feature).
-    async fn enabled(&self) -> bool {
-        nexus_auth::get_setting(&self.db, STALL_ENABLED_SETTING)
+    /// `true` se il kill-switch `key` e' attivo. Default OFF (opt-in): setting
+    /// assente / malformato -> `false` (regola G: unica fonte DB, nessun fallback
+    /// che accenda una feature). PUNTO UNICO dei 3 kill-switch del meta-reasoner
+    /// (`agent.{stall_recovery,orchestration,scale}.enabled`, regola L).
+    async fn setting_enabled(&self, key: &str) -> bool {
+        nexus_auth::get_setting(&self.db, key)
             .await
             .map(|v| {
                 matches!(
@@ -213,113 +317,159 @@ impl PgMetaReasonerPort {
             .unwrap_or(false)
     }
 
-    /// Timeout (s) clampato in `[5, 300]`. Setting assente / malformato ->
-    /// [`STALL_TIMEOUT_DEFAULT`] (safe-default numerico seminato dalla mig 0510).
-    async fn timeout_s(&self) -> u64 {
-        nexus_auth::get_setting(&self.db, STALL_TIMEOUT_SETTING)
+    /// Timeout (s) del setting `key` clampato in `[5, 300]`. Setting assente /
+    /// malformato -> `default` (safe-default numerico seminato dalla migrazione
+    /// dello scope). PUNTO UNICO dei 3 timeout del meta-reasoner (regola L).
+    async fn setting_timeout_s(&self, key: &str, default: u64) -> u64 {
+        nexus_auth::get_setting(&self.db, key)
             .await
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(STALL_TIMEOUT_DEFAULT)
+            .unwrap_or(default)
             .clamp(5, 300)
     }
 
-    /// Consulta l'LLM (Real): risolve modello + template, chiama il gateway,
-    /// parsa e valida. Ritorna `Ok(Some(move))` (validata; `Fallback` incluso e'
-    /// legittimo, il nodo lo tratta come "usa euristica") oppure `Ok(None)`
-    /// (degrado safe: kill-switch OFF, purpose NotFound, template assente,
-    /// timeout, risposta vuota/malformata), oppure `Err` solo su guasto
-    /// INFRASTRUTTURALE (DB down, provider non risolto per cooldown).
-    async fn consult_llm(&self, ctx: &StallContext) -> Result<Option<RecoveryMove>, PortError> {
+    /// FLUSSO UNICO a 6 passi del meta-reasoner LLM (paradigma ADR 0036 di
+    /// `verify_profile`), condiviso dai 3 scope (regola L: STESSO flusso, un solo
+    /// punto di controllo — prima era re-implementato 3 volte). I wrapper
+    /// [`Self::consult_llm`]/[`Self::consult_orch_llm`]/[`Self::consult_scale_llm`]
+    /// passano la [`MetaConsultSpec`] del proprio scope e applicano la validazione
+    /// tipizzata sull'esito ([`MetaLlmParse`]).
+    ///
+    /// Passi: (1) kill-switch (opt-in, OFF -> `Degrade`); (2) modello dal purpose
+    /// (regola G, distinzione delle cause: NotFound -> misconfig+`Degrade`,
+    /// NoCapableModel/MatrixUnavailable -> `Err` infrastrutturale, MAI `Degrade`
+    /// mascherante); (3) template (punto unico loader, assente -> misconfig+`Degrade`);
+    /// (4) payload = SOLO il contesto serializzato (regola M, non l'intera history);
+    /// (5) chiamata LLM one-shot col timeout clamp (ogni esito non utile -> `Degrade`);
+    /// (6) `extract_json_block` -> `Json`/`NoJson`.
+    ///
+    /// I log del percorso di degrado usano il target UNIFICATO `nexus_meta_reasoner`
+    /// col campo `kind` (il `target:` di tracing deve essere const, percio' e' unico;
+    /// il campo strutturato `metric` per-scope resta preservato). I log finali di
+    /// esito (mossa decisa / risposta senza JSON) restano nei wrapper col target
+    /// storico per-scope.
+    async fn consult_meta_llm<C>(
+        &self,
+        spec: &MetaConsultSpec,
+        ctx: &C,
+    ) -> Result<MetaLlmParse, PortError>
+    where
+        C: serde::Serialize,
+    {
         // (1) Kill-switch: opt-in, default OFF -> inerte (regola G).
-        if !self.enabled().await {
-            return Ok(None);
+        if !self.setting_enabled(spec.enabled_setting).await {
+            return Ok(MetaLlmParse::Degrade);
         }
 
-        // (2) Modello dal purpose (regola G). Distinzione delle cause (regola G,
-        // niente OFF mascherante):
-        //   - Resolved     -> procedi;
-        //   - NotFound      -> misconfig (flag ON ma mig 0510 non applicata):
-        //                      log ERROR + metrica, poi degrado Ok(None);
-        //   - NoCapableModel-> provider non risolto (cooldown) -> Err (infra);
-        //   - MatrixUnavail.-> DB down -> Err (infra), MAI Ok(None) mascherante.
-        let (provider, model) = match resolve_purpose_model_db(&self.db, STALL_PURPOSE).await {
+        // (2) Modello dal purpose (regola G). Distinzione delle cause (niente OFF
+        // mascherante): Resolved -> procedi; NotFound -> misconfig (flag ON ma
+        // migrazione non applicata): ERROR + metrica, poi degrado; NoCapableModel
+        // (cooldown) / MatrixUnavailable (DB down) -> Err INFRASTRUTTURALE.
+        let (provider, model) = match resolve_purpose_model_db(&self.db, spec.purpose).await {
             PurposeResolution::Resolved {
                 provider, model, ..
             } => (provider, model),
             PurposeResolution::NotFound => {
-                // Flag ON ma purpose assente: la config e' incompleta (mig 0510).
-                // NON un OFF silenzioso invisibile: ERROR + metrica misconfig.
                 tracing::error!(
-                    target: "nexus_stall_recovery",
-                    purpose = STALL_PURPOSE,
-                    metric = "stall_recovery_misconfig",
-                    "stall_recovery: flag ON ma purpose '{}' assente in nexus_purpose_model \
-                     (applicare la migrazione 0510); degrado alla gerarchia fissa",
-                    STALL_PURPOSE
+                    target: "nexus_meta_reasoner",
+                    kind = spec.kind,
+                    purpose = spec.purpose,
+                    metric = spec.misconfig_metric,
+                    "meta-reasoner: flag ON ma purpose assente in nexus_purpose_model \
+                     (migrazione dello scope non applicata); degrado all'euristica esistente"
                 );
-                return Ok(None);
+                return Ok(MetaLlmParse::Degrade);
             }
             PurposeResolution::NoCapableModel { tier } => {
-                // Tier senza modello disponibile (capability mancante / tutti in
-                // cooldown): guasto di risoluzione provider -> Err (il nodo degrada
-                // comunque alla gerarchia fissa, ma non maschera il guasto).
                 return Err(PortError::ProviderUnavailable(format!(
-                    "stall_recovery: nessun modello del tier '{tier}' per purpose '{STALL_PURPOSE}'"
+                    "{}: nessun modello del tier '{tier}' per purpose '{}'",
+                    spec.kind, spec.purpose
                 )));
             }
             PurposeResolution::MatrixUnavailable(e) => {
-                // DB down / routing non disponibile: guasto INFRASTRUTTURALE.
-                // MAI Ok(None) (regola G): il chiamante lo tratta come best-effort.
                 return Err(PortError::ProviderUnavailable(format!(
-                    "stall_recovery: routing non disponibile: {e}"
+                    "{}: routing non disponibile: {e}",
+                    spec.kind
                 )));
             }
         };
 
         // (3) Template (punto unico loader, regola L). Cache monouso: la
-        // consultazione e' rara (solo su stallo), il punto unico resta rispettato.
+        // consultazione e' rara. Assente/vuoto benche' enabled+purpose risolti ->
+        // misconfig parziale: ERROR + degrado safe (il chiamante usa l'euristica).
         let tpl_cache = crate::prompt_templates::TemplateCache::new();
-        let system_text = crate::prompt_templates::get_template_or_default(
+        let mut system_text = crate::prompt_templates::get_template_or_default(
             &self.db,
             &tpl_cache,
-            STALL_TEMPLATE_KEY,
+            spec.template_key,
         )
         .await;
         if system_text.trim().is_empty() {
-            // Enabled + purpose risolto MA template assente: misconfig parziale.
-            // ERROR (non WARN) + degrado safe (Ok(None)): il nodo usa l'euristica.
             tracing::error!(
-                target: "nexus_stall_recovery",
-                key = STALL_TEMPLATE_KEY,
-                metric = "stall_recovery_misconfig",
-                "stall_recovery: template '{}' assente/vuoto (applicare la migrazione 0510); \
-                 degrado alla gerarchia fissa",
-                STALL_TEMPLATE_KEY
+                target: "nexus_meta_reasoner",
+                kind = spec.kind,
+                key = spec.template_key,
+                metric = spec.misconfig_metric,
+                "meta-reasoner: template assente/vuoto (migrazione dello scope non \
+                 applicata); degrado all'euristica esistente"
             );
-            return Ok(None);
+            return Ok(MetaLlmParse::Degrade);
         }
 
-        // (4) Payload: SOLO lo StallContext serializzato (regola M: segnali
-        // strutturati, non l'intera history -> budget/costo). Un unico turno user.
+        // (3b) ADDENDUM opt-in (regola L): se lo scope dichiara un addendum e il suo
+        // kill-switch e' ON, lo appende al `system_text`. Scope senza addendum
+        // (`None`) o addendum OFF -> `system_text` invariato (bit-identico). Addendum
+        // dichiarato ON ma template assente -> WARN + si procede col solo template
+        // base (degrado safe, non un errore).
+        if let (Some(add_key), Some(add_setting)) =
+            (spec.addendum_template_key, spec.addendum_enabled_setting)
+        {
+            if self.setting_enabled(add_setting).await {
+                let addendum = crate::prompt_templates::get_template_or_default(
+                    &self.db,
+                    &tpl_cache,
+                    add_key,
+                )
+                .await;
+                if addendum.trim().is_empty() {
+                    tracing::warn!(
+                        target: "nexus_meta_reasoner",
+                        kind = spec.kind,
+                        key = add_key,
+                        "meta-reasoner: addendum ON ma template assente/vuoto; \
+                         procedo col solo template base"
+                    );
+                } else {
+                    system_text.push_str("\n\n");
+                    system_text.push_str(&addendum);
+                }
+            }
+        }
+
+        // (4) Payload: SOLO il contesto serializzato (regola M: segnali strutturati,
+        // non l'intera history -> budget/costo). Un unico turno user.
         let ctx_json = match serde_json::to_string(ctx) {
             Ok(j) => j,
             Err(err) => {
                 tracing::warn!(
-                    target: "nexus_stall_recovery",
+                    target: "nexus_meta_reasoner",
+                    kind = spec.kind,
                     error = %err,
-                    "stall_recovery: serializzazione StallContext fallita, degrado"
+                    "meta-reasoner: serializzazione contesto fallita, degrado"
                 );
-                return Ok(None);
+                return Ok(MetaLlmParse::Degrade);
             }
         };
-        let user_text = format!("Stato di stallo strutturato (JSON):\n{ctx_json}");
+        let user_text = format!("{}\n{ctx_json}", spec.user_prefix);
         let messages =
             serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
-        let timeout_s = self.timeout_s().await;
+        let timeout_s = self
+            .setting_timeout_s(spec.timeout_setting, spec.timeout_default)
+            .await;
 
         // (5) Chiamata LLM one-shot col paradigma verify_profile (generate_agent_turn
-        // -> pin_provider provider gia' risolto, regola G; nessun tool). Timeout +
-        // degrado safe: ogni esito non utile -> Ok(None), il nodo usa l'euristica.
+        // -> pin_provider gia' risolto, regola G; nessun tool). Timeout + degrado
+        // safe: ogni esito non utile -> Degrade, il chiamante usa l'euristica.
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_s),
             self.neural.generate_agent_turn(
@@ -327,7 +477,7 @@ impl PgMetaReasonerPort {
                 &model,
                 &messages,
                 "[]",
-                STALL_MAX_TOKENS,
+                spec.max_tokens,
                 &system_text,
             ),
         )
@@ -336,451 +486,129 @@ impl PgMetaReasonerPort {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 tracing::warn!(
-                    target: "nexus_stall_recovery",
+                    target: "nexus_meta_reasoner",
+                    kind = spec.kind,
                     error = %e,
-                    "stall_recovery: chiamata LLM fallita, degrado alla gerarchia fissa"
+                    "meta-reasoner: chiamata LLM fallita, degrado all'euristica esistente"
                 );
-                return Ok(None);
+                return Ok(MetaLlmParse::Degrade);
             }
             Err(_) => {
                 tracing::warn!(
-                    target: "nexus_stall_recovery",
+                    target: "nexus_meta_reasoner",
+                    kind = spec.kind,
                     timeout_s,
-                    "stall_recovery: chiamata LLM oltre il timeout, degrado alla gerarchia fissa"
+                    "meta-reasoner: chiamata LLM oltre il timeout, degrado all'euristica esistente"
                 );
-                return Ok(None);
+                return Ok(MetaLlmParse::Degrade);
             }
         };
 
         // (6) Estrai il testo (forma neural_service: `content`/`text`) e parsa il
-        // blocco JSON col punto unico; valida con meta_reason::validate_move (enum
-        // CHIUSO + blocker ADR 0034). Testo assente / JSON assente -> Fallback.
+        // blocco JSON col punto unico. La validazione tipizzata resta nel wrapper
+        // (punto unico per-scope): testo/JSON assente -> NoJson.
         let text = value
             .get("content")
             .and_then(|v| v.as_str())
             .or_else(|| value.get("text").and_then(|v| v.as_str()))
             .unwrap_or("");
-        let parsed = match nexus_types::llm_json::extract_json_block(text) {
-            Some(v) => v,
-            None => {
+        match nexus_types::llm_json::extract_json_block(text) {
+            Some(v) => Ok(MetaLlmParse::Json(v)),
+            None => Ok(MetaLlmParse::NoJson),
+        }
+    }
+
+    /// Wrapper RECOVERY sul flusso unico [`Self::consult_meta_llm`] (regola L).
+    /// Applica la validazione tipizzata col punto unico `validate_move` (enum CHIUSO
+    /// `RecoveryMove` + blocker ADR 0034). Ritorna `Ok(Some(move))` (validata;
+    /// `Fallback` incluso e' legittimo, il nodo lo tratta come "usa euristica")
+    /// oppure `Ok(None)` (degrado safe) oppure `Err` solo su guasto INFRASTRUTTURALE.
+    async fn consult_llm(&self, ctx: &StallContext) -> Result<Option<RecoveryMove>, PortError> {
+        match self.consult_meta_llm(&STALL_SPEC, ctx).await? {
+            MetaLlmParse::Degrade => Ok(None),
+            MetaLlmParse::NoJson => {
                 tracing::debug!(
                     target: "nexus_stall_recovery",
                     axis = %ctx.axis,
                     "stall_recovery: risposta senza JSON parsabile, degrado (Fallback)"
                 );
-                return Ok(Some(RecoveryMove::Fallback));
+                Ok(Some(RecoveryMove::Fallback))
             }
-        };
-        // validate_move: qualunque forma malformata / enum sconosciuto / campo
-        // vuoto / blocker fuori vocabolario -> RecoveryMove::Fallback (il nodo lo
-        // tratta come "usa euristica"). Il nodo ri-valida (idempotente, robustezza).
-        let mv = validate_move(&parsed);
-        tracing::info!(
-            target: "nexus_stall_recovery",
-            axis = %ctx.axis,
-            work_epoch = ctx.work_epoch,
-            "stall_recovery: mossa decisa dal meta-reasoner"
-        );
-        Ok(Some(mv))
+            MetaLlmParse::Json(parsed) => {
+                // validate_move: forma malformata / enum sconosciuto / blocker fuori
+                // vocabolario -> RecoveryMove::Fallback. Il nodo ri-valida (idempotente).
+                let mv = validate_move(&parsed);
+                tracing::info!(
+                    target: "nexus_stall_recovery",
+                    axis = %ctx.axis,
+                    work_epoch = ctx.work_epoch,
+                    "stall_recovery: mossa decisa dal meta-reasoner"
+                );
+                Ok(Some(mv))
+            }
+        }
     }
 
-    /// `true` se il kill-switch di orchestrazione e' attivo
-    /// (`agent.orchestration.enabled`). Default OFF (opt-in): setting assente /
-    /// malformato -> `false` (regola G: nessun fallback che accenda una feature).
-    /// Con `false` la porta e' inerte -> gate ricade su `is_eligible` -> oggi.
-    async fn orch_enabled(&self) -> bool {
-        nexus_auth::get_setting(&self.db, ORCH_ENABLED_SETTING)
-            .await
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
-    }
-
-    /// Timeout (s) dell'orchestrazione clampato in `[5, 300]`. Setting assente /
-    /// malformato -> [`ORCH_TIMEOUT_DEFAULT`] (safe-default numerico, mig 0512).
-    async fn orch_timeout_s(&self) -> u64 {
-        nexus_auth::get_setting(&self.db, ORCH_TIMEOUT_SETTING)
-            .await
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(ORCH_TIMEOUT_DEFAULT)
-            .clamp(5, 300)
-    }
-
-    /// Consulta l'LLM (Real) per la decisione di ORCHESTRAZIONE: risolve modello +
-    /// template, chiama il gateway, parsa e valida col PUNTO UNICO
-    /// [`validate_orch_move`]. Gemello di [`Self::consult_llm`] su scope disgiunto
-    /// (regola L: STESSO flusso, non re-inventato). Ritorna `Ok(Some(move))`
-    /// (validata; `Fallback` incluso e' legittimo, il gate lo tratta come "usa
-    /// euristica") oppure `Ok(None)` (degrado safe: kill-switch OFF, purpose
-    /// NotFound, template assente, timeout, risposta vuota/malformata), oppure
-    /// `Err` solo su guasto INFRASTRUTTURALE (DB down, provider non risolto per
-    /// cooldown). In Fase 1 `isolation_available` e' SEMPRE `false`
-    /// ([`ORCH_ISOLATION_AVAILABLE`]) -> `ParallelIsolated` e' sempre rifiutata.
+    /// Wrapper ORCHESTRAZIONE sul flusso unico [`Self::consult_meta_llm`] (regola L).
+    /// Applica la validazione col punto unico `validate_orch_move` (enum CHIUSO
+    /// `OrchestrationMove`), passando i segnali strutturati `isolation_available` /
+    /// `delegation_forbidden` dal ctx (regola M): in Fase 1 `ctx.isolation_available`
+    /// e' sempre `false` -> `ParallelIsolated` degrada a `Sequential`. Vincolo
+    /// primario: kill-switch OFF (default) -> `Ok(None)` -> il gate ricade su
+    /// `is_eligible` -> BIT-IDENTICO a oggi.
     async fn consult_orch_llm(
         &self,
         ctx: &OrchestrationContext,
     ) -> Result<Option<OrchestrationMove>, PortError> {
-        // (1) Kill-switch: opt-in, default OFF -> inerte (regola G). Vincolo
-        // primario: OFF => Ok(None) => gate su is_eligible => bit-identico a oggi.
-        if !self.orch_enabled().await {
-            return Ok(None);
-        }
-
-        // (2) Modello dal purpose (regola G). STESSA distinzione delle cause di
-        // consult_llm (niente OFF mascherante):
-        //   - Resolved     -> procedi;
-        //   - NotFound      -> misconfig (flag ON ma mig 0512 non applicata):
-        //                      log ERROR + metrica, poi degrado Ok(None);
-        //   - NoCapableModel-> provider non risolto (cooldown) -> Err (infra);
-        //   - MatrixUnavail.-> DB down -> Err (infra), MAI Ok(None) mascherante.
-        let (provider, model) = match resolve_purpose_model_db(&self.db, ORCH_PURPOSE).await {
-            PurposeResolution::Resolved {
-                provider, model, ..
-            } => (provider, model),
-            PurposeResolution::NotFound => {
-                tracing::error!(
-                    target: "nexus_orchestration",
-                    purpose = ORCH_PURPOSE,
-                    metric = "orchestration_misconfig",
-                    "orchestration: flag ON ma purpose '{}' assente in nexus_purpose_model \
-                     (applicare la migrazione 0512); degrado all'euristica esistente",
-                    ORCH_PURPOSE
-                );
-                return Ok(None);
-            }
-            PurposeResolution::NoCapableModel { tier } => {
-                return Err(PortError::ProviderUnavailable(format!(
-                    "orchestration: nessun modello del tier '{tier}' per purpose '{ORCH_PURPOSE}'"
-                )));
-            }
-            PurposeResolution::MatrixUnavailable(e) => {
-                return Err(PortError::ProviderUnavailable(format!(
-                    "orchestration: routing non disponibile: {e}"
-                )));
-            }
-        };
-
-        // (3) Template (punto unico loader, regola L). Cache monouso: la
-        // consultazione e' rara (una volta per run all'ingresso).
-        let tpl_cache = crate::prompt_templates::TemplateCache::new();
-        let system_text = crate::prompt_templates::get_template_or_default(
-            &self.db,
-            &tpl_cache,
-            ORCH_TEMPLATE_KEY,
-        )
-        .await;
-        if system_text.trim().is_empty() {
-            tracing::error!(
-                target: "nexus_orchestration",
-                key = ORCH_TEMPLATE_KEY,
-                metric = "orchestration_misconfig",
-                "orchestration: template '{}' assente/vuoto (applicare la migrazione 0512); \
-                 degrado all'euristica esistente",
-                ORCH_TEMPLATE_KEY
-            );
-            return Ok(None);
-        }
-
-        // (4) Payload: SOLO l'OrchestrationContext serializzato (regola M: segnali
-        // strutturati, non l'intera history -> budget/costo). Un unico turno user.
-        let ctx_json = match serde_json::to_string(ctx) {
-            Ok(j) => j,
-            Err(err) => {
-                tracing::warn!(
-                    target: "nexus_orchestration",
-                    error = %err,
-                    "orchestration: serializzazione OrchestrationContext fallita, degrado"
-                );
-                return Ok(None);
-            }
-        };
-        let user_text = format!("Contesto di orchestrazione strutturato (JSON):\n{ctx_json}");
-        let messages =
-            serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
-        let timeout_s = self.orch_timeout_s().await;
-
-        // (5) Chiamata LLM one-shot col paradigma verify_profile/recover
-        // (generate_agent_turn -> pin_provider gia' risolto, regola G; nessun tool).
-        // Timeout + degrado safe: ogni esito non utile -> Ok(None) (gate: euristica).
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_s),
-            self.neural.generate_agent_turn(
-                &provider,
-                &model,
-                &messages,
-                "[]",
-                ORCH_MAX_TOKENS,
-                &system_text,
-            ),
-        )
-        .await;
-        let value = match resp {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    target: "nexus_orchestration",
-                    error = %e,
-                    "orchestration: chiamata LLM fallita, degrado all'euristica esistente"
-                );
-                return Ok(None);
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "nexus_orchestration",
-                    timeout_s,
-                    "orchestration: chiamata LLM oltre il timeout, degrado all'euristica esistente"
-                );
-                return Ok(None);
-            }
-        };
-
-        // (6) Estrai il testo (forma neural_service: `content`/`text`) e parsa il
-        // blocco JSON col punto unico; valida con orchestration_reason::validate_orch_move
-        // (enum CHIUSO OrchestrationMove). Testo/JSON assente -> Fallback (il gate lo
-        // tratta come "usa euristica", identico a Ok(None)). isolation_available e
-        // delegation_forbidden arrivano dal ctx (segnali strutturati risolti a monte,
-        // regola M): in Fase 1 ctx.isolation_available e' sempre false ->
-        // ParallelIsolated degrada a Sequential dentro validate_orch_move.
-        let text = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .or_else(|| value.get("text").and_then(|v| v.as_str()))
-            .unwrap_or("");
-        let parsed = match nexus_types::llm_json::extract_json_block(text) {
-            Some(v) => v,
-            None => {
+        match self.consult_meta_llm(&ORCH_SPEC, ctx).await? {
+            MetaLlmParse::Degrade => Ok(None),
+            MetaLlmParse::NoJson => {
                 tracing::debug!(
                     target: "nexus_orchestration",
                     phase = ?ctx.phase,
                     "orchestration: risposta senza JSON parsabile, degrado (Fallback)"
                 );
-                return Ok(Some(OrchestrationMove::Fallback));
+                Ok(Some(OrchestrationMove::Fallback))
             }
-        };
-        // validate_orch_move: qualunque forma malformata / collezione vuota / mossa
-        // non applicabile per una guard deterministica (delegation_forbidden /
-        // ParallelIsolated senza isolamento) -> OrchestrationMove::Fallback (il gate
-        // lo tratta come "usa euristica"). Il nodo/gate ri-valida (idempotente).
-        let mv = validate_orch_move(&parsed, ctx.isolation_available, ctx.delegation_forbidden);
-        tracing::info!(
-            target: "nexus_orchestration",
-            phase = ?ctx.phase,
-            behavior_mode = %ctx.behavior_mode,
-            "orchestration: mossa decisa dal meta-reasoner"
-        );
-        Ok(Some(mv))
+            MetaLlmParse::Json(parsed) => {
+                let mv =
+                    validate_orch_move(&parsed, ctx.isolation_available, ctx.delegation_forbidden);
+                tracing::info!(
+                    target: "nexus_orchestration",
+                    phase = ?ctx.phase,
+                    behavior_mode = %ctx.behavior_mode,
+                    "orchestration: mossa decisa dal meta-reasoner"
+                );
+                Ok(Some(mv))
+            }
+        }
     }
 
-    /// `true` se il kill-switch della scala e' attivo (`agent.scale.enabled`).
-    /// Default OFF (opt-in): setting assente / malformato -> `false` (regola G:
-    /// nessun fallback che accenda una feature). Con `false` la porta e' inerte.
-    async fn scale_enabled(&self) -> bool {
-        nexus_auth::get_setting(&self.db, SCALE_ENABLED_SETTING)
-            .await
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
-    }
-
-    /// `true` se il SIZING agentico e' abilitato (`agent.scale.sizing_enabled`, mig
-    /// 0524). Default OFF (opt-in, regola G): con `false` l'addendum sizing NON e'
-    /// appeso al prompt -> prompt byte-identico al pre-0524 (bit-identico).
-    async fn scale_sizing_enabled(&self) -> bool {
-        nexus_auth::get_setting(&self.db, SCALE_SIZING_ENABLED_SETTING)
-            .await
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
-    }
-
-    /// Timeout (s) della scala clampato in `[5, 300]`. Setting assente / malformato
-    /// -> [`SCALE_TIMEOUT_DEFAULT`] (safe-default numerico, mig 0516).
-    async fn scale_timeout_s(&self) -> u64 {
-        nexus_auth::get_setting(&self.db, SCALE_TIMEOUT_SETTING)
-            .await
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(SCALE_TIMEOUT_DEFAULT)
-            .clamp(5, 300)
-    }
-
-    /// Consulta l'LLM per la SCALA-TIER (Real). PARADIGMA IDENTICO a
-    /// [`Self::consult_llm`]/[`Self::consult_orch_llm`] (regola L, scope disgiunto):
-    /// kill-switch -> purpose (`scale_assess`, regola G) -> template
-    /// (`system.scale.assess`) -> LLM one-shot (SOLO lo [`ScaleContext`]
-    /// serializzato, regola M) -> `extract_json_block` + [`validate_scale_move`]
-    /// (punto unico, enum CHIUSO; malformato -> `KeepTier`). Degrado safe su ogni
-    /// guasto NON infrastrutturale (`Ok(None)`); `Err` solo su DB down / provider
-    /// non risolto (regola G: mai OFF mascherante).
+    /// Wrapper SCALE-CONTROLLER sul flusso unico [`Self::consult_meta_llm`] (regola
+    /// L). Applica la validazione col punto unico `validate_scale_move` (enum CHIUSO
+    /// `ScaleMove`; tier fuori vocabolario / confidence fuori `[0,1]` -> `KeepTier`).
+    /// I 5 gate deterministici dell'anti-oscillazione sono a valle nel nodo PR-B.
     async fn consult_scale_llm(&self, ctx: &ScaleContext) -> Result<Option<ScaleMove>, PortError> {
-        // (1) Kill-switch: opt-in, default OFF -> inerte (regola G).
-        if !self.scale_enabled().await {
-            return Ok(None);
-        }
-
-        // (2) Modello dal purpose (regola G). STESSA distinzione delle cause di
-        // recover/orchestrate (niente OFF mascherante).
-        let (provider, model) = match resolve_purpose_model_db(&self.db, SCALE_PURPOSE).await {
-            PurposeResolution::Resolved {
-                provider, model, ..
-            } => (provider, model),
-            PurposeResolution::NotFound => {
-                tracing::error!(
-                    target: "nexus_scale_controller",
-                    purpose = SCALE_PURPOSE,
-                    metric = "scale_controller_misconfig",
-                    "scale: flag ON ma purpose '{}' assente in nexus_purpose_model \
-                     (applicare la migrazione 0516); degrado (nessuna scala)",
-                    SCALE_PURPOSE
-                );
-                return Ok(None);
-            }
-            PurposeResolution::NoCapableModel { tier } => {
-                return Err(PortError::ProviderUnavailable(format!(
-                    "scale: nessun modello del tier '{tier}' per purpose '{SCALE_PURPOSE}'"
-                )));
-            }
-            PurposeResolution::MatrixUnavailable(e) => {
-                return Err(PortError::ProviderUnavailable(format!(
-                    "scale: routing non disponibile: {e}"
-                )));
-            }
-        };
-
-        // (3) Template (punto unico loader, regola L).
-        let tpl_cache = crate::prompt_templates::TemplateCache::new();
-        let mut system_text = crate::prompt_templates::get_template_or_default(
-            &self.db,
-            &tpl_cache,
-            SCALE_TEMPLATE_KEY,
-        )
-        .await;
-        if system_text.trim().is_empty() {
-            tracing::error!(
-                target: "nexus_scale_controller",
-                key = SCALE_TEMPLATE_KEY,
-                metric = "scale_controller_misconfig",
-                "scale: template '{}' assente/vuoto (applicare la migrazione 0516); \
-                 degrado (nessuna scala)",
-                SCALE_TEMPLATE_KEY
-            );
-            return Ok(None);
-        }
-
-        // SIZING (mig 0524): appende l'ADDENDUM che descrive la mossa `adjust_sizing`
-        // SOLO se il sizing e' abilitato. Con sizing OFF il prompt resta byte-identico
-        // al pre-0524 (bit-identico per il flusso tier); il gate lato motore degrada
-        // comunque ogni AdjustSizing a KeepTier. Se l'addendum manca (misconfig) si
-        // procede col solo template tier (degrado safe, non un errore).
-        if self.scale_sizing_enabled().await {
-            let addendum = crate::prompt_templates::get_template_or_default(
-                &self.db,
-                &tpl_cache,
-                SCALE_SIZING_TEMPLATE_KEY,
-            )
-            .await;
-            if addendum.trim().is_empty() {
-                tracing::warn!(
-                    target: "nexus_scale_controller",
-                    key = SCALE_SIZING_TEMPLATE_KEY,
-                    "scale: sizing ON ma addendum template assente (applicare la mig 0524); \
-                     procedo col solo template tier"
-                );
-            } else {
-                system_text.push_str("\n\n");
-                system_text.push_str(&addendum);
-            }
-        }
-
-        // (4) Payload: SOLO lo ScaleContext serializzato (regola M: segnali
-        // strutturati, non l'intera history -> budget/costo).
-        let ctx_json = match serde_json::to_string(ctx) {
-            Ok(j) => j,
-            Err(err) => {
-                tracing::warn!(
-                    target: "nexus_scale_controller",
-                    error = %err,
-                    "scale: serializzazione ScaleContext fallita, degrado"
-                );
-                return Ok(None);
-            }
-        };
-        let user_text = format!("Andamento del run strutturato (JSON):\n{ctx_json}");
-        let messages =
-            serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
-        let timeout_s = self.scale_timeout_s().await;
-
-        // (5) Chiamata LLM one-shot (paradigma verify_profile; nessun tool). Timeout
-        // + degrado safe: ogni esito non utile -> Ok(None).
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_s),
-            self.neural.generate_agent_turn(
-                &provider,
-                &model,
-                &messages,
-                "[]",
-                SCALE_MAX_TOKENS,
-                &system_text,
-            ),
-        )
-        .await;
-        let value = match resp {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    target: "nexus_scale_controller",
-                    error = %e,
-                    "scale: chiamata LLM fallita, degrado (nessuna scala)"
-                );
-                return Ok(None);
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "nexus_scale_controller",
-                    timeout_s,
-                    "scale: chiamata LLM oltre il timeout, degrado (nessuna scala)"
-                );
-                return Ok(None);
-            }
-        };
-
-        // (6) Estrai il testo e parsa il blocco JSON; valida col punto unico
-        // scale_reason::validate_scale_move (enum CHIUSO; tier fuori vocabolario /
-        // confidence fuori [0,1] -> KeepTier). Testo/JSON assente -> KeepTier.
-        let text = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .or_else(|| value.get("text").and_then(|v| v.as_str()))
-            .unwrap_or("");
-        let parsed = match nexus_types::llm_json::extract_json_block(text) {
-            Some(v) => v,
-            None => {
+        match self.consult_meta_llm(&SCALE_SPEC, ctx).await? {
+            MetaLlmParse::Degrade => Ok(None),
+            MetaLlmParse::NoJson => {
                 tracing::debug!(
                     target: "nexus_scale_controller",
                     "scale: risposta senza JSON parsabile, degrado (KeepTier)"
                 );
-                return Ok(Some(ScaleMove::KeepTier));
+                Ok(Some(ScaleMove::KeepTier))
             }
-        };
-        let mv = validate_scale_move(&parsed);
-        tracing::info!(
-            target: "nexus_scale_controller",
-            current_tier = ctx.current_tier.as_str(),
-            iterations = ctx.iterations,
-            "scale: mossa decisa dallo scale-controller"
-        );
-        Ok(Some(mv))
+            MetaLlmParse::Json(parsed) => {
+                let mv = validate_scale_move(&parsed);
+                tracing::info!(
+                    target: "nexus_scale_controller",
+                    current_tier = ctx.current_tier.as_str(),
+                    iterations = ctx.iterations,
+                    "scale: mossa decisa dallo scale-controller"
+                );
+                Ok(Some(mv))
+            }
+        }
     }
 }
 
