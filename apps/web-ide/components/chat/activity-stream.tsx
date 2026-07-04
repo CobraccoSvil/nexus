@@ -251,7 +251,7 @@ function EventRow({
     <div
       style={{
         position: "relative",
-        padding: "7px 26px 7px 42px",
+        padding: "7px 34px 7px 42px",
         minWidth: 0,
       }}
     >

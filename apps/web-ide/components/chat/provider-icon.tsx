@@ -106,7 +106,7 @@ function ProviderMark({ mark, initial }: { mark: ProviderMarkKey; initial: strin
 export function ProviderIcon({
   provider,
   model,
-  size = 15,
+  size = 19,
 }: {
   provider: string | null | undefined;
   model?: string | null;
@@ -122,10 +122,14 @@ export function ProviderIcon({
     model != null
       ? catalog.find((e) => e.provider === provider && e.model === model) ?? null
       : null;
-  // Tonalita' in base al costo del modello (stessa logica del ProviderBadge):
-  // modelli piu' costosi -> icona piu' marcata.
+  // Riconoscibilita': il MARK e' sempre nel colore BRAND PIENO su un badge
+  // circolare tinto del brand. Il costo del modello modula SOLO la densita' del
+  // fondo (segnale secondario), cosi' modelli piu' costosi hanno il badge piu'
+  // marcato ma l'icona resta sempre chiaramente leggibile.
   const alpha = alphaFromCost(entry);
-  const color = rgba(brand, Math.min(0.95, alpha + 0.15));
+  const markColor = brand;
+  const bg = rgba(brand, 0.16 + Math.min(0.18, alpha * 0.18));
+  const border = rgba(brand, 0.55);
 
   const tipParts: string[] = [`${label}${model ? ` / ${model}` : ""}`];
   if (entry?.input_cost_per_million_tokens != null) {
@@ -146,7 +150,12 @@ export function ProviderIcon({
         justifyContent: "center",
         width: size,
         height: size,
-        color,
+        boxSizing: "border-box",
+        borderRadius: "50%",
+        background: bg,
+        border: `1px solid ${border}`,
+        padding: Math.round(size * 0.16),
+        color: markColor,
         flexShrink: 0,
         lineHeight: 0,
       }}
