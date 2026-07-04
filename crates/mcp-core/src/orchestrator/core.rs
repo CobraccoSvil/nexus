@@ -957,13 +957,16 @@ impl Orchestrator {
             .await;
         }
 
-        // La matrice gestisce già cooldown e fallback internamente.
-        // Usa direttamente provider+model dalla matrice: la decisione
-        // (intent, mode) → (provider, model) è specifica e non deve
-        // essere sovrascritta dai default generici provider_model_*.
-        // Solo se la matrice non ha trovato un provider disponibile
-        // (__no_model__), cade sui candidati + default admin.
-        let (provider, model) = if decision_provider != "__no_model__" {
+        // La matrice ha prodotto una decisione (intent, mode) → (provider, model).
+        // E' servibile DIRETTAMENTE solo se non e' la sentinella `__no_model__` e il
+        // provider NON e' in cooldown. Altrimenti (nessun match, oppure provider
+        // scelto in cooldown) si consulta PRIMA il catalog tier-aware — punto unico
+        // `select_agentic_model` (regola L) — e SOLO come ultima spiaggia si cade sul
+        // default per-provider. Prima il ramo `__no_model__` sceglieva un provider
+        // "tier-blind" (candidates + default_model_for_provider) PRIMA del catalog:
+        // con anthropic+openai in cooldown finiva su google col suo default generico
+        // gemini-2.5-flash (modello LIGHT), che non converge sui task di coding heavy.
+        let (provider, model) = if !needs_catalog_fallback(&decision_provider) {
             let model = if let Some(m) = model_override.filter(|v| !v.trim().is_empty()) {
                 m.to_string()
             } else {
@@ -971,104 +974,88 @@ impl Orchestrator {
             };
             (decision_provider, model)
         } else {
-            let provider = routing
-                .candidates(intent, Some(decision_provider.as_str()))
-                .into_iter()
-                .find(|p| !is_provider_in_cooldown(p))
-                .unwrap_or_else(|| decision_provider.clone());
-            // Modello: override esplicito del chiamante, altrimenti il default-per-
-            // provider dalla fonte DB unica (nexus_provider_default_model via
-            // default_model_for_provider). Rimosso il branch su provider_models
-            // (settings hardcoded, regola G).
-            let model = model_override
-                .filter(|v| !v.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
-            (provider, model)
-        };
-
-        // Se il provider scelto e' in cooldown (rate-limit recente nel processo), trova alternativa.
-        // Il fallback rispetta tier/capability: per task critici (heavy/medium) non degrada
-        // silenziosamente a un default generico che potrebbe essere un modello inadeguato.
-        let (provider, model) =
-            if is_provider_in_cooldown(&provider) {
+            if decision_provider == "__no_model__" {
                 tracing::warn!(
-                    "Agent routing: '{}' scelto dal routing ma in cooldown, cerco alternativa",
-                    provider
+                    "Agent routing: matrice senza modello per intent={} (provider preferito assente o in cooldown), consulto il catalog tier-aware",
+                    intent
                 );
-
-                // Risolvi tier/capability dalla cache (stessi valori usati sopra nel routing)
-                let icap_arc = self.intent_capability.current_async().await.ok();
-                let (tier, cap) = match icap_arc.as_deref() {
-                    Some(map) => match map.get(intent) {
-                        Some(c) => (
-                            c.tier_for_tokens(estimated_tokens),
-                            c.base_capability.clone(),
-                        ),
-                        None => ("light".to_string(), "chat".to_string()),
-                    },
-                    None => ("light".to_string(), "chat".to_string()),
-                };
-
-                // Strategia: PUNTO UNICO di selezione agentica (regola L). Cerca
-                // un modello dello stesso tier (o degradato) da un provider NON in
-                // cooldown, mantenendo tier/capability del task. Eleggibilita' e
-                // cooldown sono definiti una sola volta in select_agentic_model.
-                let tiers_to_try: Vec<&str> = match tier.as_str() {
-                    "heavy" => vec!["heavy", "medium"],
-                    "medium" => vec!["medium"],
-                    _ => vec!["light"],
-                };
-                let found = select_agentic_model(
-                    db,
-                    &tiers_to_try,
-                    Some(&cap),
-                    0,
-                    &[],
-                    "input_cost_per_million_tokens ASC",
-                )
-                .await;
-                if let Some((ref alt_provider, ref alt_model)) = found {
-                    tracing::info!(
-                        "Agent routing (cooldown-fallback, selettore unico): {} → {}/{}",
-                        provider,
-                        alt_provider,
-                        alt_model
-                    );
-                }
-
-                // Ultimo resort: hierarchy classica (se il catalogo non ha nulla)
-                found.unwrap_or_else(|| {
-                    let hierarchy_str: Option<String> =
-                        futures::executor::block_on(async {
-                            sqlx::query_scalar(
-                        "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1"
-                    ).fetch_optional(db).await.ok().flatten()
-                        });
-                    let hier: Vec<String> = hierarchy_str
-                        .as_deref()
-                        .unwrap_or(&provider)
-                        .split(',')
-                        .map(|s| s.trim().to_lowercase())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    let alt = hier
-                        .iter()
-                        .find(|p| !is_provider_in_cooldown(p))
-                        .cloned()
-                        .unwrap_or_else(|| provider.clone());
-                    let alt_model = default_model_for_provider(matrix, &alt).to_string();
-                    tracing::warn!(
-                        "Agent routing (cooldown-fallback legacy): {} → {}/{}",
-                        provider,
-                        alt,
-                        alt_model
-                    );
-                    (alt, alt_model)
-                })
             } else {
-                (provider, model)
+                tracing::warn!(
+                    "Agent routing: '{}' scelto dal routing ma in cooldown, consulto il catalog tier-aware",
+                    decision_provider
+                );
+            }
+
+            // Tier/capability dell'intent dalla cache intent_capability (mig 0110):
+            // stessi valori del routing dinamico. Default light/chat se non mappato.
+            let icap_arc = self.intent_capability.current_async().await.ok();
+            let (tier, cap) = match icap_arc.as_deref() {
+                Some(map) => match map.get(intent) {
+                    Some(c) => (
+                        c.tier_for_tokens(estimated_tokens),
+                        c.base_capability.clone(),
+                    ),
+                    None => ("light".to_string(), "chat".to_string()),
+                },
+                None => ("light".to_string(), "chat".to_string()),
             };
+
+            // Tier-chain con pavimento: un task heavy/medium non degrada sotto il
+            // proprio tier (niente caduta a un modello light per un coding heavy).
+            let tiers_to_try: Vec<&str> = match tier.as_str() {
+                "heavy" => vec!["heavy", "medium"],
+                "medium" => vec!["medium"],
+                _ => vec!["light"],
+            };
+
+            // PUNTO UNICO di selezione agentica (regola L): miglior modello
+            // tool-capable del tier/capability, da un provider NON in cooldown.
+            // Ordine allineato a route_model_from_catalog: i modelli flagship
+            // (is_featured) hanno precedenza sul solo costo, cosi' il fallback di
+            // coding preferisce il modello piu' forte disponibile invece del piu'
+            // economico (che nei tier degradati sarebbe un flash/lite).
+            let found = select_agentic_model(
+                db,
+                &tiers_to_try,
+                Some(&cap),
+                0,
+                &[],
+                "is_featured DESC, input_cost_per_million_tokens ASC",
+            )
+            .await;
+            if let Some((ref alt_provider, ref alt_model)) = found {
+                tracing::info!(
+                    "Agent routing (fallback catalog tier-aware, selettore unico): {} → {}/{} (intent={}, tier={}, cap={})",
+                    decision_provider,
+                    alt_provider,
+                    alt_model,
+                    intent,
+                    tier,
+                    cap
+                );
+            }
+
+            // ULTIMA spiaggia: hierarchy classica (candidates), raggiunta SOLO se il
+            // catalog non ha nulla di sano nel tier. Se nemmeno qui c'e' un provider
+            // fuori cooldown si mantiene la sentinella `__no_model__`, cosi' il
+            // chiamante (resolve_agent_provider_detailed) calcoli no_capable_provider
+            // e fermi il run con alert invece di spacciare un modello fittizio.
+            found.unwrap_or_else(|| {
+                let alt = routing
+                    .candidates(intent, None)
+                    .into_iter()
+                    .find(|p| !is_provider_in_cooldown(p))
+                    .unwrap_or_else(|| decision_provider.clone());
+                let alt_model = default_model_for_provider(matrix, &alt).to_string();
+                tracing::warn!(
+                    "Agent routing (fallback legacy hierarchy, catalog vuoto): {} → {}/{}",
+                    decision_provider,
+                    alt,
+                    alt_model
+                );
+                (alt, alt_model)
+            })
+        };
 
         tracing::info!(
             "Agent routing (local): intent={} tokens~{} → {}/{}",
