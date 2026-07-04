@@ -1339,9 +1339,8 @@ mod tests {
 
         // File promosso ma cancellato: NON esiste sul filesystem -> ramo delete.
         let cancellato = root.join("src").join("rimosso.rs");
-        assert_eq!(
-            tokio::fs::try_exists(&cancellato).await.unwrap(),
-            false,
+        assert!(
+            !tokio::fs::try_exists(&cancellato).await.unwrap(),
             "un file promosso ma cancellato deve risultare inesistente -> ramo delete"
         );
 
@@ -1349,9 +1348,8 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).expect("mkdir src");
         let presente = root.join("src").join("vivo.rs");
         std::fs::write(&presente, "// vivo\n").expect("write vivo");
-        assert_eq!(
+        assert!(
             tokio::fs::try_exists(&presente).await.unwrap(),
-            true,
             "un file promosso ancora presente deve risultare esistente -> ramo reindex"
         );
 

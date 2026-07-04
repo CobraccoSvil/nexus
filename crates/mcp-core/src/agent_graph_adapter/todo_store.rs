@@ -394,7 +394,7 @@ mod tests {
         )
         .bind(scoped)
         .bind(run_id)
-        .bind(&vec!["crates/api/".to_string(), "db/".to_string()])
+        .bind(vec!["crates/api/".to_string(), "db/".to_string()])
         .execute(&pool)
         .await
         .expect("insert scoped");

@@ -1,0 +1,25 @@
+# Toolchain Rust pinnata: unica fonte di verita' della versione per il gate
+# clippy/test (locale, lefthook, CI).
+#
+# Perche' il pin (regola H, fix definitivo del gate non deterministico):
+#   Il gate `cargo clippy --workspace --all-targets -- -D warnings`
+#   (scripts/verify.sh, .github/workflows/verify.yml) promuove ogni lint a
+#   errore. Con un canale flottante (@stable) un bump di clippy sul runner puo'
+#   arrossare `main` senza alcuna modifica al codice, perche' una nuova versione
+#   attiva lint aggiuntive di default. Il pin rende il gate riproducibile: lo
+#   stesso clippy in locale, nell'hook pre-commit e in CI.
+#
+# rustup legge questo override file per OGNI invocazione cargo/rustc/clippy nel
+# repository e auto-installa il canale piu' i componenti dichiarati. La CI non
+# duplica la versione: la ricava da qui (vedi step "Setup Rust toolchain" in
+# .github/workflows/verify.yml).
+#
+# Come bumpare (azione deliberata e rivedibile, mai automatica):
+#   1. Alza `channel` alla nuova versione stabile.
+#   2. Esegui `cargo clippy --workspace --all-targets -- -D warnings` e correggi
+#      le nuove lint NELLO STESSO commit.
+#   3. Un solo file da toccare: CI e locale seguono automaticamente.
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

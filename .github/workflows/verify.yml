@@ -47,10 +47,17 @@ jobs:
         # con "Multiple versions of pnpm specified".
         uses: pnpm/action-setup@v4
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # Toolchain pinnata in rust-toolchain.toml (channel + componenti clippy,
+      # rustfmt) = unica fonte di verita'. rustup legge l'override file e
+      # installa il canale con i suoi componenti; il workflow NON duplica la
+      # versione. Cosi' il gate clippy (-D warnings) e' deterministico: un bump
+      # di stable non arrossa piu' `main` da solo. `cargo clippy --version`
+      # forza l'install e stampa la versione effettiva nei log per audit.
+      - name: Setup Rust toolchain (da rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version
+          cargo clippy --version
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
