@@ -13,14 +13,18 @@
 //! registrato la risoluzione fallisce con errore tipizzato (regola M) e il
 //! chiamante degrada esplicitamente (WARN + skip progetto), mai in silenzio.
 //!
-//! I mattoni comuni ai due contratti — lettura flag con cache, lettura del
-//! registry `project_database_config`, elenco progetti, directory
-//! `nexus_data_routing` — vivono SOLO qui: `mcp-core::project_db_routes`
-//! delega a queste funzioni e vi aggiunge il layer provisioning+migrazione
-//! (lock per-progetto) e la propria cache pool condivisa con AppState.
+//! I mattoni comuni ai due contratti — lettura del registry
+//! `project_database_config`, elenco progetti, directory `nexus_data_routing`
+//! — vivono SOLO qui: `mcp-core::project_db_routes` delega a queste funzioni e
+//! vi aggiunge il layer provisioning+migrazione (lock per-progetto) e la
+//! propria cache pool condivisa con AppState.
 //!
-//! A flag `db.project_separation.enabled` OFF tutte le funzioni ritornano il
-//! pool meta ricevuto: comportamento storico pre-cutover, zero regressioni.
+//! La separazione DB per-progetto e' SEMPRE attiva: il cutover e' chiuso (le
+//! tabelle meta `zz_decommissioned_*` sono droppate, mig 0525) e il flag
+//! storico `db.project_separation.enabled` e' stato rimosso (mig 0527). Le
+//! funzioni instradano sempre al DB `<slug>_nexus` del progetto; l'unica via
+//! che ritorna il pool meta e' la resilienza (registry non inizializzato o DB
+//! non provisionato), mai un ramo di configurazione.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -52,33 +56,12 @@ pub enum ProjectPoolError {
     SessionNotFound(Uuid),
 }
 
-static SEPARATION_FLAG: OnceLock<TtlCache<(), bool>> = OnceLock::new();
 static POOLS: OnceLock<TtlCache<Uuid, PgPool>> = OnceLock::new();
-
-fn separation_flag_cache() -> &'static TtlCache<(), bool> {
-    SEPARATION_FLAG.get_or_init(|| TtlCache::new(Duration::from_secs(30)))
-}
 
 fn pool_cache() -> &'static TtlCache<Uuid, PgPool> {
     // TTL 5 min: alla scadenza il pool viene riaperto; l'ultima clone droppata
     // chiude le connessioni. I servizi separati sono a basso QPS, va bene.
     POOLS.get_or_init(|| TtlCache::new(Duration::from_secs(300)))
-}
-
-/// `true` se la separazione DB per-progetto e' abilitata (setting
-/// `db.project_separation.enabled`, mig 0495). Cache TTL 30s. Fonte unica
-/// (regola L): `mcp-core::project_db_routes::project_separation_enabled` e' un
-/// wrapper che delega qui (stessa cache di processo, un solo punto di lettura).
-pub async fn separation_enabled(meta: &PgPool) -> bool {
-    if let Some(v) = separation_flag_cache().get(&()) {
-        return v;
-    }
-    let v = nexus_auth::get_setting(meta, "db.project_separation.enabled")
-        .await
-        .map(|s| s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    separation_flag_cache().insert((), v);
-    v
 }
 
 /// Elenco dei `project_id` (tabella globale `projects`, sempre sul meta).
@@ -120,8 +103,8 @@ pub async fn resolve_meta_db_url(
         .filter(|s| !s.is_empty()))
 }
 
-/// Pool DOVE risiedono i dati del dominio chat/run per `project_id`: il meta a
-/// flag OFF (storico), il DB `<slug>_nexus` a flag ON. READ-ONLY: nessun
+/// Pool DOVE risiedono i dati del dominio chat/run per `project_id`: il DB
+/// `<slug>_nexus` del progetto (separazione sempre attiva). READ-ONLY: nessun
 /// provisioning; DB non registrato -> `Err(NotProvisioned)`.
 ///
 /// Niente lock di provisioning: due task concorrenti possono aprire due pool
@@ -131,9 +114,6 @@ pub async fn project_data_pool(
     meta: &PgPool,
     project_id: Uuid,
 ) -> Result<PgPool, ProjectPoolError> {
-    if !separation_enabled(meta).await {
-        return Ok(meta.clone());
-    }
     if let Some(pool) = pool_cache().get(&project_id) {
         return Ok(pool);
     }
@@ -207,15 +187,12 @@ pub async fn register_entity_routing(meta: &PgPool, entity_kind: &str, entity_id
 /// se la sessione non e' mappata la CERCA nei DB-progetto e auto-registra la
 /// mappa (self-healing, stesso pattern di
 /// `mcp-core::project_db_routes::project_data_pool_by_session_from`). MAI
-/// fallback silenzioso al meta a flag ON: le tabelle chat sul meta sono
-/// decommissionate (mig 0507) e la query fallirebbe comunque.
+/// fallback silenzioso al meta: le tabelle chat sul meta sono decommissionate
+/// (mig 0507/0525) e la query fallirebbe comunque.
 pub async fn project_data_pool_by_session(
     meta: &PgPool,
     session_id: Uuid,
 ) -> Result<PgPool, ProjectPoolError> {
-    if !separation_enabled(meta).await {
-        return Ok(meta.clone());
-    }
     if let Some(pid) = project_id_for_entity(meta, "session", session_id).await {
         return project_data_pool(meta, pid).await;
     }

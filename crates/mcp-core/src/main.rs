@@ -664,20 +664,17 @@ async fn main() -> anyhow::Result<()> {
     project_db_routes::init_global_pools(state.project_meta_pools.clone());
 
     // Boot-recovery per-progetto (separazione DB): il blocco di riconciliazione PID
-    // sopra opera sul meta; a flag ON i processi agent dei progetti migrati vivono nei
-    // DB per-progetto. Qui, DOPO init_global_pools (registry pool pronto), iteriamo i
-    // progetti e marchiamo 'failed' i processi 'running'/'starting' il cui PID non e'
-    // piu' vivo. tokio::spawn: non blocca l'avvio e un errore non impedisce il boot; a
-    // flag OFF e' no-op (guard su project_separation_enabled). Mark-only: NON re-attacha
-    // il monitor (per non replicare il side-effect non idempotente di
+    // sopra opera sul meta; i processi agent dei progetti migrati vivono nei DB
+    // per-progetto (separazione sempre attiva, cutover chiuso mig 0525/0527). Qui,
+    // DOPO init_global_pools (registry pool pronto), iteriamo i progetti e marchiamo
+    // 'failed' i processi 'running'/'starting' il cui PID non e' piu' vivo.
+    // tokio::spawn: non blocca l'avvio e un errore non impedisce il boot. Mark-only:
+    // NON re-attacha il monitor (per non replicare il side-effect non idempotente di
     // spawn_reattach_monitor); il re-attach dei processi VIVI per-progetto resta coperto
     // dal watchdog periodico (residuo noto, degrada non corrompe).
     {
         let db_recover = state.db.clone();
         tokio::spawn(async move {
-            if !project_db_routes::project_separation_enabled(&db_recover).await {
-                return;
-            }
             use sqlx::Row;
             for pid in project_db_routes::list_all_project_ids(&db_recover).await {
                 let pool = project_db_routes::project_data_pool_from(&db_recover, pid).await;

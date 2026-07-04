@@ -41,26 +41,24 @@ async fn tabelle_contratto_meta_esistono() {
     }
 }
 
-/// Un progetto inesistente non deve MAI degradare in silenzio: a flag ON la
-/// risoluzione fallisce con `NotProvisioned` (errore tipizzato, regola M);
-/// a flag OFF ritorna il meta (comportamento storico pre-cutover).
+/// Un progetto inesistente non deve MAI degradare in silenzio: la separazione
+/// e' sempre attiva (cutover chiuso, flag rimosso mig 0527), quindi la
+/// risoluzione di un progetto mai provisionato fallisce con `NotProvisioned`
+/// (errore tipizzato, regola M).
 #[tokio::test]
-async fn progetto_sconosciuto_fallisce_tipizzato_o_ritorna_meta() {
+async fn progetto_sconosciuto_fallisce_tipizzato() {
     let Some(pool) = meta_pool_or_skip().await else {
         eprintln!("skip: DATABASE_URL non impostata");
         return;
     };
     let ghost = Uuid::new_v4();
-    let enabled = nexus_project_pools::separation_enabled(&pool).await;
     match nexus_project_pools::project_data_pool(&pool, ghost).await {
-        Ok(_) => assert!(
-            !enabled,
-            "a flag separazione ON un progetto mai provisionato deve dare NotProvisioned"
-        ),
         Err(nexus_project_pools::ProjectPoolError::NotProvisioned(pid)) => {
-            assert!(enabled, "a flag OFF non deve mai fallire (ritorna il meta)");
             assert_eq!(pid, ghost);
         }
+        Ok(_) => panic!(
+            "un progetto mai provisionato deve dare NotProvisioned (separazione sempre attiva)"
+        ),
         Err(e) => panic!("errore inatteso per progetto sconosciuto: {e}"),
     }
 }
@@ -79,25 +77,22 @@ async fn entita_non_mappata_ritorna_none() {
 }
 
 /// Una sessione inesistente in TUTTI i DB progetto termina con
-/// `SessionNotFound` a flag ON (mai fallback silenzioso al meta, dove le
-/// tabelle chat sono decommissionate dalla mig 0507); a flag OFF ritorna il
-/// meta come da comportamento storico.
+/// `SessionNotFound`: separazione sempre attiva (cutover chiuso, flag rimosso
+/// mig 0527), mai fallback silenzioso al meta dove le tabelle chat sono
+/// decommissionate (mig 0507/0525).
 #[tokio::test]
-async fn sessione_sconosciuta_not_found_o_meta() {
+async fn sessione_sconosciuta_not_found() {
     let Some(pool) = meta_pool_or_skip().await else {
         eprintln!("skip: DATABASE_URL non impostata");
         return;
     };
     let ghost = Uuid::new_v4();
-    let enabled = nexus_project_pools::separation_enabled(&pool).await;
     match nexus_project_pools::project_data_pool_by_session(&pool, ghost).await {
-        Ok(_) => assert!(
-            !enabled,
-            "a flag ON una sessione inesistente deve dare SessionNotFound"
-        ),
         Err(nexus_project_pools::ProjectPoolError::SessionNotFound(sid)) => {
-            assert!(enabled, "a flag OFF non deve mai fallire (ritorna il meta)");
             assert_eq!(sid, ghost);
+        }
+        Ok(_) => {
+            panic!("una sessione inesistente deve dare SessionNotFound (separazione sempre attiva)")
         }
         Err(e) => panic!("errore inatteso per sessione sconosciuta: {e}"),
     }

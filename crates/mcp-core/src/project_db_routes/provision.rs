@@ -567,29 +567,17 @@ async fn resolve_meta_db_url(
         .map_err(|e| e.to_string())
 }
 
-/// `true` se la separazione DB per-progetto e' abilitata (setting
-/// `db.project_separation.enabled`, mig 0495). Delega al punto unico
-/// `nexus_project_pools::separation_enabled` (regola L), che cacha 30s.
-/// Pubblica: usata anche dal boot-recovery per-progetto in main.rs per saltare
-/// l'iterazione a flag OFF.
-pub async fn project_separation_enabled(meta_db: &sqlx::PgPool) -> bool {
-    nexus_project_pools::separation_enabled(meta_db).await
-}
-
 /// Punto unico (regola L) per il pool DOVE risiedono i dati per-progetto di un
-/// dominio gia' migrato: il DB metadati del progetto (`<slug>_nexus`) se la
-/// separazione e' abilitata, altrimenti il meta-DB centrale (comportamento
-/// storico). I call-site dei domini migrati usano QUESTO, mai `state.db` diretto.
-/// Fallback sicuro al meta-DB se il pool del progetto non si apre (es. DB non
-/// ancora provisionato): l'app non si rompe, legge dalla copia centrale.
+/// dominio gia' migrato: il DB metadati del progetto (`<slug>_nexus`). La
+/// separazione e' SEMPRE attiva (cutover chiuso, flag rimosso mig 0527); i
+/// call-site dei domini migrati usano QUESTO, mai `state.db` diretto.
+/// Fallback sicuro al meta-DB SOLO come resilienza se il pool del progetto non
+/// si apre (es. DB non ancora provisionato): l'app non si rompe.
 async fn project_data_pool_core(
     meta: &sqlx::PgPool,
     cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     project_id: Uuid,
 ) -> sqlx::PgPool {
-    if !project_separation_enabled(meta).await {
-        return meta.clone();
-    }
     match project_meta_pool_core(meta, cache, project_id).await {
         Ok(pool) => (*pool).clone(),
         Err(e) => {
@@ -633,17 +621,14 @@ pub async fn register_entity_routing(
 }
 
 /// Come [`project_data_pool`] ma a partire dall'id di un'entita' (handler senza
-/// `project_id`): risolve il progetto dalla directory di routing e delega. Flag
-/// off o entita' non mappata -> meta-DB (storico, sicuro). Punto unico (regola L).
+/// `project_id`): risolve il progetto dalla directory di routing e delega.
+/// Entita' non mappata -> meta-DB (resilienza sicura). Punto unico (regola L).
 async fn project_data_pool_by_entity_core(
     meta: &sqlx::PgPool,
     cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     entity_kind: &str,
     entity_id: Uuid,
 ) -> sqlx::PgPool {
-    if !project_separation_enabled(meta).await {
-        return meta.clone();
-    }
     match resolve_project_for_entity(meta, entity_kind, entity_id).await {
         Some(project_id) => project_data_pool_core(meta, cache, project_id).await,
         None => {
@@ -742,9 +727,6 @@ async fn project_data_pool_by_search_from(
     let Some(cache) = GLOBAL_PROJECT_POOL_CACHE.get() else {
         return meta.clone();
     };
-    if !project_separation_enabled(meta).await {
-        return meta.clone();
-    }
     // Fast-path: directory.
     if let Some(pid) = resolve_project_for_entity(meta, entity_kind, entity_id).await {
         return project_data_pool_core(meta, cache, pid).await;

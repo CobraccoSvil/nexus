@@ -25,18 +25,15 @@ use crate::AppState;
 
 // ── Routing pool per-progetto ───────────────────────────────────────────────
 // Separazione DB: nexus_agent_plans/todos/verifier_runs e nexus_subagent_runs
-// vivono nei DB-progetto (nel meta sono decommissionate, mig 0507). Le viste
-// GLOBALI di questo pannello aggregano iterando i DB-progetto; a flag OFF si
-// interroga il solo meta come prima del cutover (query storica invariata).
+// vivono nei DB-progetto (nel meta sono decommissionate, mig 0507/0525). Le
+// viste GLOBALI di questo pannello aggregano iterando i DB-progetto (separazione
+// sempre attiva, cutover chiuso mig 0527).
 
-/// Pool del dominio run da interrogare. A flag OFF: il solo meta. A flag ON:
-/// un pool per progetto (o il solo progetto richiesto). Un DB non ancora
-/// provisionato non ha dati (skip silenzioso); un DB irraggiungibile degrada
-/// con WARN senza azzerare gli altri (pattern detect_all_port_bindings).
+/// Pool del dominio run da interrogare: un pool per progetto (o il solo progetto
+/// richiesto). Un DB non ancora provisionato non ha dati (skip silenzioso); un
+/// DB irraggiungibile degrada con WARN senza azzerare gli altri (pattern
+/// detect_all_port_bindings).
 async fn run_domain_pools(state: &AppState, only: Option<Uuid>) -> Vec<sqlx::PgPool> {
-    if !nexus_project_pools::separation_enabled(&state.db).await {
-        return vec![state.db.clone()];
-    }
     let ids = match only {
         Some(pid) => vec![pid],
         None => nexus_project_pools::list_project_ids(&state.db).await,
