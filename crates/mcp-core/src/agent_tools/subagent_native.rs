@@ -932,7 +932,7 @@ async fn run_single_subagent(
     };
     let subagent_run_id: Uuid = match insert_res {
         Ok(id) => id,
-        Err(e) => return json!({"error": format!("INSERT nexus_subagent_runs: {e}")}),
+        Err(e) => return json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")}),
     };
 
     // ── Esecuzione sul GRAFO NATIVO (in-process, niente brain) ────────────────

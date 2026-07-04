@@ -42,8 +42,14 @@ fn detect_lang(file_path: &str) -> Lang {
 }
 
 // Keyword SQL: serve almeno una di queste perche' la stringa sia una query.
+// La keyword NON deve essere preceduta da `.` o `:` (evita i falsi positivi dei
+// METODI/funzioni omonime: `.insert(`/`.into()`/`.update(`/`.delete(`/`.from(`,
+// `Type::from(`, ecc. — di mappe, iterator, conversioni e query-builder, che non
+// sono SQL). Una vera query ha la keyword dentro un letterale stringa (preceduta
+// da apice/spazio) o a inizio riga, entrambi coperti da `(?:^|[^.:\w])`.
 static SQL_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|JOIN|VALUES|INTO)\b").unwrap()
+    Regex::new(r"(?i)(?:^|[^.:\w])(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE|JOIN|VALUES|INTO)\b")
+        .unwrap()
 });
 
 // Nomi di variabile che suggeriscono input esterno => severity high.
@@ -345,6 +351,29 @@ mod tests {
     fn rust_format_without_sql_keyword_safe() {
         let src = r#"let msg = format!("hello {}", name);"#;
         assert_eq!(count("x.rs", src), 0);
+    }
+
+    #[test]
+    fn rust_map_insert_method_not_flagged() {
+        // `.insert(` e' un metodo di mappa/set, NON la keyword SQL INSERT: la
+        // presenza di un `format!` sulla stessa riga non deve produrre finding.
+        let src = r#"obj.insert("error".into(), format!("boom {code}"));"#;
+        assert_eq!(count("x.rs", src), 0);
+    }
+
+    #[test]
+    fn rust_into_and_from_methods_not_flagged() {
+        // `.into()` / `.from(` sono conversioni/builder, non keyword SQL.
+        let src = r#"let v = Foo::from(bar).into(); let s = format!("v={v}");"#;
+        assert_eq!(count("x.rs", src), 0);
+    }
+
+    #[test]
+    fn rust_sql_keyword_in_string_still_flagged_after_method_exclusion() {
+        // Regressione inversa: la keyword dentro un letterale (preceduta da
+        // apice) resta un vero positivo anche dopo l'esclusione dei metodi.
+        let src = r#"let q = format!("INSERT INTO t VALUES ('{}')", v);"#;
+        assert_eq!(count("x.rs", src), 1);
     }
 
     #[test]
