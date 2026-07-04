@@ -10,7 +10,7 @@
     "test": "turbo run test",
     "format": "prettier --check .",
     "verify": "node scripts/verify.mjs",
-    "smoke": "bash scripts/smoke-services.sh",
+    "smoke": "node scripts/smoke.mjs",
     "e2e:debug-chat": "node scripts/debug-console-agent-e2e.mjs",
     "xtask": "cargo run -p xtask --",
     "prepare": "lefthook install || true",
