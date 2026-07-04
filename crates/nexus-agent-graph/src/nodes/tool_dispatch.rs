@@ -102,7 +102,8 @@ use crate::decisions::tool_dispatch::{
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::runtime::ports::{
-    AgentStepStore, ContextOffload, ExecMode, MetaStepStore, RunControlStore, SseEvent, ToolCall,
+    AgentStepStore, ContextOffload, ExecMode, MetaStepStore, OffloadKind, RunControlStore, SseEvent,
+    ToolCall,
     TodoStore,
     ToolExecutor,
 };
@@ -919,8 +920,10 @@ impl ToolDispatchNode {
     /// ritorna `PortError` -> qui `None` -> il chiamante tronca senza scrivere
     /// Qdrant. Passiamo `mode` end-to-end senza re-implementare il gate qui.
     async fn try_offload(&self, text: &str, mode: ExecMode) -> Option<String> {
+        // Tool_result grande al dispatch: collection ToolResult, senza filtro
+        // session/project (comportamento storico, cache del contesto offloadato).
         self.offload
-            .offload_to_rag(json!({"text": text}), mode)
+            .offload_to_rag(json!({"text": text}), OffloadKind::ToolResult, None, None, mode)
             .await
             .ok()
     }

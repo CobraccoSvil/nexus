@@ -20,7 +20,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{ContextOffload, ExecMode, PortError};
+use nexus_agent_graph::runtime::ports::{ContextOffload, ExecMode, OffloadKind, PortError};
 
 use crate::rag::{indexer, SourceKind};
 
@@ -46,10 +46,20 @@ impl ContextOffload for RagContextOffloadAdapter {
     /// [`crate::rag::indexer::index_text`] con kind [`SourceKind::ToolResult`]
     /// (collection del contesto offloadato).
     ///
-    /// GATE Real: in [`ExecMode::Replay`] e' un no-op che ritorna `PortError`
-    /// (il run shadow non scrive Qdrant). Su guasto infra (anche in Real) ritorna
-    /// `PortError` (il chiamante degrada a troncamento).
-    async fn offload_to_rag(&self, payload: Value, mode: ExecMode) -> Result<String, PortError> {
+    /// `kind` sceglie la collection RAG ([`OffloadKind::ToolResult`] per i
+    /// tool_result compressi, [`OffloadKind::ChatHistory`] per gli originali del
+    /// rolling-summary, recuperabili filtrando per `session_id`). GATE Real: in
+    /// [`ExecMode::Replay`] e' un no-op che ritorna `PortError` (il run shadow non
+    /// scrive Qdrant). Su guasto infra (anche in Real) ritorna `PortError` (il
+    /// chiamante degrada a troncamento).
+    async fn offload_to_rag(
+        &self,
+        payload: Value,
+        kind: OffloadKind,
+        session_id: Option<String>,
+        project_id: Option<String>,
+        mode: ExecMode,
+    ) -> Result<String, PortError> {
         if mode != ExecMode::Real {
             // Run shadow read-only: nessuna scrittura su Qdrant (gate shadow).
             return Err(PortError::Tool(
@@ -69,15 +79,27 @@ impl ContextOffload for RagContextOffloadAdapter {
             ));
         }
 
+        // Mappa OffloadKind (agnostico, regola L) -> SourceKind concreto: la
+        // traduzione infra vive qui, unico confine col RAG di mcp-core.
+        let source_kind = match kind {
+            OffloadKind::ToolResult => SourceKind::ToolResult,
+            OffloadKind::ChatHistory => SourceKind::ChatHistory,
+        };
+        // session/project come UUID (Some solo se parsano): abilitano il filtro di
+        // retrieval (chat_history filtra su session_id). Un valore non-UUID e'
+        // ignorato (offload senza filtro) invece di far fallire l'offload.
+        let session_uuid = session_id.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+        let project_uuid = project_id.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+
         // Pointer opaco deterministico per questa scrittura (source_id Qdrant).
         let pointer = format!("ctx-offload-{}", Uuid::new_v4());
 
         match indexer::index_text(
             &self.db,
-            SourceKind::ToolResult,
+            source_kind,
             &pointer,
-            None,
-            None,
+            project_uuid,
+            session_uuid,
             &text,
             Value::Null,
         )
@@ -87,6 +109,7 @@ impl ContextOffload for RagContextOffloadAdapter {
                 tracing::info!(
                     pointer = %pointer,
                     chunks = n_chunks,
+                    kind = ?kind,
                     "context_offload: payload indicizzato su RAG"
                 );
                 Ok(pointer)
@@ -117,7 +140,13 @@ mod tests {
     async fn replay_e_un_noop_che_ritorna_porterror(pool: PgPool) {
         let port = RagContextOffloadAdapter::new(pool.clone());
         let res = port
-            .offload_to_rag(serde_json::json!({"k": "v"}), ExecMode::Replay)
+            .offload_to_rag(
+                serde_json::json!({"k": "v"}),
+                OffloadKind::ToolResult,
+                None,
+                None,
+                ExecMode::Replay,
+            )
             .await;
         assert!(
             res.is_err(),
@@ -131,7 +160,13 @@ mod tests {
     async fn payload_vuoto_in_real_ritorna_porterror(pool: PgPool) {
         let port = RagContextOffloadAdapter::new(pool.clone());
         let res = port
-            .offload_to_rag(serde_json::Value::String(String::new()), ExecMode::Real)
+            .offload_to_rag(
+                serde_json::Value::String(String::new()),
+                OffloadKind::ChatHistory,
+                None,
+                None,
+                ExecMode::Real,
+            )
             .await;
         assert!(res.is_err(), "payload vuoto -> PortError");
     }

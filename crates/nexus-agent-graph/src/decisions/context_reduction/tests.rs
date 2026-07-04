@@ -497,3 +497,132 @@ fn overflow_message_senza_placeholder_resta_invariato() {
         "Contesto oltre il limite configurato."
     );
 }
+
+// ── 10) continuity-trim (coseno + selezione atomi + decisione + apply) ──────────
+
+fn tool_use_msg(id: &str, name: &str) -> HistoryMessage {
+    msg_blocks(json!([{ "type": "tool_use", "id": id, "name": name, "input": {} }]))
+}
+fn tool_result_msg(id: &str, body: &str) -> HistoryMessage {
+    // Forma inline: primo blocco tool_result -> opens_with_tool_result = true.
+    msg_blocks(json!([{ "type": "tool_result", "tool_use_id": id, "content": body }]))
+}
+fn assistant_text(text: &str) -> HistoryMessage {
+    HistoryMessage {
+        is_human: false,
+        content: Value::String(text.to_string()),
+        anthropic_content: Value::Null,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cosine_similarity_casi_base() {
+    // Identici -> 1.0; ortogonali -> 0.0; lunghezze diverse/vuoti/norma-nulla -> 0.0.
+    assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
+    assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+    assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+    assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+}
+
+#[test]
+fn select_continuity_candidates_atomi_e_confine() {
+    // [human, assist(tool_use t1), tool_result t1, assist-text, keep_recent(2): assist, human]
+    let hist = vec![
+        human_text("task originale"),           // 0 human (ancora, escluso)
+        tool_use_msg("t1", "read_file"),         // 1 \ atomo bilanciato droppabile [1,2]
+        tool_result_msg("t1", "contenuto file"), // 2 /
+        assistant_text("pensiero intermedio"),   // 3 assistant-text standalone [3]
+        assistant_text("penultimo"),             // 4 keep_recent
+        human_text("focus corrente"),            // 5 keep_recent
+    ];
+    // prefix_end = 6 - 2 = 4. Atomi candidati: [1,2] e [3]. Human 0 escluso.
+    let cands = select_continuity_trim_candidates(&hist, 2);
+    assert_eq!(cands.len(), 2);
+    assert_eq!(cands[0].indices, vec![1, 2]);
+    assert_eq!(cands[1].indices, vec![3]);
+}
+
+#[test]
+fn select_continuity_candidates_tool_use_al_confine_non_droppabile() {
+    // tool_use il cui tool_result cade nella coda keep_recent -> non candidato
+    // (rischio orfano). prefix_end = 4 - 2 = 2.
+    let hist = vec![
+        human_text("task"),              // 0
+        tool_use_msg("t1", "read_file"), // 1 tool_use, result a 2 (in coda) -> escluso
+        tool_result_msg("t1", "body"),   // 2 keep_recent
+        human_text("focus"),            // 3 keep_recent
+    ];
+    assert!(select_continuity_trim_candidates(&hist, 2).is_empty());
+}
+
+#[test]
+fn decide_continuity_drops_scarta_sotto_soglia() {
+    let candidates = vec![
+        ContinuityCandidate { indices: vec![1, 2], text: "a".into() },
+        ContinuityCandidate { indices: vec![3], text: "b".into() },
+    ];
+    let focus = vec![1.0f32, 0.0];
+    // cand0 rilevante (coseno 1.0, >=0.5), cand1 irrilevante (coseno 0.0, <0.5).
+    let cand_vecs = vec![vec![1.0f32, 0.0], vec![0.0f32, 1.0]];
+    assert_eq!(
+        decide_continuity_drops(&focus, &cand_vecs, &candidates, 0.5, 8),
+        vec![3]
+    );
+}
+
+#[test]
+fn decide_continuity_drops_rispetta_il_cap() {
+    let candidates = vec![
+        ContinuityCandidate { indices: vec![1, 2], text: "a".into() },
+        ContinuityCandidate { indices: vec![3], text: "b".into() },
+    ];
+    let focus = vec![1.0f32, 0.0];
+    // Entrambi sotto soglia; cand1 (coseno -1.0) piu' irrilevante -> ordinato prima.
+    // Cap=1: l'atomo [1,2] (2 msg) sfora, si scarta il singolo [3].
+    let cand_vecs = vec![vec![0.0f32, 1.0], vec![-1.0f32, 0.0]];
+    assert_eq!(
+        decide_continuity_drops(&focus, &cand_vecs, &candidates, 0.5, 1),
+        vec![3]
+    );
+}
+
+#[test]
+fn decide_continuity_drops_focus_vuoto_o_cap_zero_no_op() {
+    let candidates = vec![ContinuityCandidate { indices: vec![1], text: "a".into() }];
+    let cand_vecs = vec![vec![0.0f32, 1.0]];
+    assert!(decide_continuity_drops(&[], &cand_vecs, &candidates, 0.5, 8).is_empty());
+    assert!(decide_continuity_drops(&[1.0, 0.0], &cand_vecs, &candidates, 0.5, 0).is_empty());
+}
+
+#[test]
+fn apply_continuity_trim_rimuove_indici() {
+    let hist = vec![
+        human_text("0"),
+        assistant_text("1"),
+        assistant_text("2"),
+        human_text("3"),
+    ];
+    let out = apply_continuity_trim(&hist, &[1, 2]);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].content, Value::String("0".into()));
+    assert_eq!(out[1].content, Value::String("3".into()));
+    // Nessun drop -> identita'.
+    assert_eq!(apply_continuity_trim(&hist, &[]).len(), 4);
+}
+
+// ── 11) contents_eligible_for_offload ──────────────────────────────────────────
+
+#[test]
+fn contents_eligible_solo_tool_result_lunghi_sotto_cutoff() {
+    let long = "x".repeat(50);
+    let hist = vec![
+        msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t1", "content": long.clone() }])), // 0 lungo, dentro cutoff
+        msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t2", "content": "corto" }])),        // 1 corto
+        msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t3", "content": "y".repeat(50) }])), // 2 fuori cutoff
+    ];
+    // cutoff=2 (indici 0,1), threshold=10 -> solo il tool_result 0 (lungo) eleggibile.
+    let eligible = contents_eligible_for_offload(&hist, 2, 10);
+    assert_eq!(eligible, vec![long]);
+}

@@ -121,6 +121,7 @@ use crate::agent_graph_adapter::{
     billing_cooldown_port::{CooldownBillingPort, NullBillingCooldownPort},
     clarify_history_store::PgClarifyHistoryStore,
     context_offload::RagContextOffloadAdapter, criteria_runner::FinalGateCriteriaRunnerAdapter,
+    embedding_store::PgEmbeddingStore,
     escalation_port::PgEscalationPort, event_sink::SseEventSinkAdapter,
     llm_gateway::{GatewayLlmAdapter, ReplayLlmGateway},
     meta_step_store::PgMetaStepStore, model_upscale_port::CatalogModelUpscalePort,
@@ -787,6 +788,14 @@ async fn load_executor_config(
         // default -> il gate non si applica (comportamento storico bit-identico).
         governance_rolling_summary_adaptive: setting_bool(db, "agent.governance.rolling_summary_adaptive", d.governance_rolling_summary_adaptive).await,
         governance_rolling_summary_min_prefix: setting_i64(db, "agent.governance.rolling_summary_min_prefix", d.governance_rolling_summary_min_prefix).await,
+        // ── continuity-trim SEMANTICO + offload retrievabile (EmbeddingStore) ──
+        // Tutti OFF di default (regola G): con questi valori il comportamento e'
+        // bit-identico a oggi. La porta embedding/offload e' iniettata dal wiring.
+        continuity_trim_enabled: setting_bool(db, "agent.context.continuity_trim_enabled", d.continuity_trim_enabled).await,
+        continuity_trim_min_score: setting_f64(db, "agent.context.continuity_trim_min_score", d.continuity_trim_min_score as f64).await as f32,
+        continuity_trim_max_drop: setting_i64(db, "agent.context.continuity_trim_max_drop", d.continuity_trim_max_drop).await,
+        compress_offload_enabled: setting_bool(db, "agent.context.compress_offload_enabled", d.compress_offload_enabled).await,
+        rolling_summary_offload_enabled: setting_bool(db, "agent.context.rolling_summary_offload_enabled", d.rolling_summary_offload_enabled).await,
         // ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
         // dell'executor (stesse chiavi della RoutingConfig, regola L).
         pending_steps_detection_enabled: setting_bool(db, "agent.closure.pending_steps_detection_enabled", d.pending_steps_detection_enabled).await,
@@ -1220,6 +1229,16 @@ async fn build_native_engine(
                 run_db.clone(),
                 input.run_id,
             )));
+            // Continuity-trim SEMANTICO (EmbeddingStore, embedder ONNX in-process) +
+            // offload RAG del contesto (tool_result compressi + originali del
+            // rolling-summary). Le porte sono SEMPRE iniettate; i FLAG DB
+            // (`agent.context.continuity_trim_enabled`, `compress_offload_enabled`,
+            // `rolling_summary_offload_enabled`, tutti OFF di default) governano se
+            // scattano (regola G). `offload` riusa lo stesso adapter RAG del
+            // tool_dispatch (punto unico, regola L).
+            executor = executor
+                .with_embedding_store(Arc::new(PgEmbeddingStore::new()))
+                .with_context_offload(offload.clone());
             Arc::new(executor)
         },
         tool_dispatch: Arc::new(ToolDispatchNode::new(

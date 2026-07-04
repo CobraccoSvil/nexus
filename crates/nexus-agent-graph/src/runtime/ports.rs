@@ -680,7 +680,35 @@ pub trait ContextOffload: Send + Sync {
     /// successivo). Gata `Real`: in [`ExecMode::Replay`] e' un no-op che ritorna
     /// `PortError` (il run shadow non scrive Qdrant). Su guasto infrastrutturale
     /// (anche in Real) ritorna `PortError` (il chiamante degrada a troncamento).
-    async fn offload_to_rag(&self, payload: Value, mode: ExecMode) -> Result<String, PortError>;
+    ///
+    /// `kind` sceglie la collection RAG di destinazione (regola L: la porta resta
+    /// agnostica dall'enum `SourceKind` concreto di mcp-core, mappato dall'impl):
+    /// [`OffloadKind::ToolResult`] per i tool_result compressi, [`OffloadKind::ChatHistory`]
+    /// per gli originali del rolling-summary (recuperabili filtrando per `session_id`).
+    /// `session_id`/`project_id` (UUID come stringa, agnostici) abilitano il filtro
+    /// di retrieval; `None` = nessun filtro (offload globale). Prima di questa firma
+    /// l'offload era vincolato a `ToolResult` senza filtri, quindi il rolling-summary
+    /// non poteva essere reso recuperabile per sessione.
+    async fn offload_to_rag(
+        &self,
+        payload: Value,
+        kind: OffloadKind,
+        session_id: Option<String>,
+        project_id: Option<String>,
+        mode: ExecMode,
+    ) -> Result<String, PortError>;
+}
+
+/// Collection RAG di destinazione dell'offload, agnostica dall'enum `SourceKind`
+/// concreto di mcp-core (l'impl la mappa): tiene `nexus-agent-graph` disaccoppiato
+/// dall'infrastruttura RAG (regola L, confine d'inversione).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffloadKind {
+    /// Contenuto di tool_result compresso, cache del contesto offloadato.
+    ToolResult,
+    /// Originale della history conversazionale riassunta (rolling-summary),
+    /// recuperabile via `search_semantic(source_kinds=[chat_history], session_id)`.
+    ChatHistory,
 }
 
 /// Rolling-summary della history conversazionale: RIASSUME (non tronca) i
@@ -714,6 +742,32 @@ pub trait SummaryStore: Send + Sync {
     /// `PortError` (il run shadow non riassume). Su guasto LLM (anche in Real)
     /// ritorna `PortError` (il nodo degrada a history invariata). Best-effort.
     async fn summarize(&self, text: String, mode: ExecMode) -> Result<String, PortError>;
+}
+
+/// Embedding di testo per la compressione SEMANTICA del contesto (continuity-trim):
+/// scarta dal prefisso vecchio i messaggi semanticamente IRRILEVANTI al focus del
+/// turno, invece del troncamento posizionale.
+///
+/// CONFINE (regola L): la DECISIONE (coseno vs focus, chi scartare, cap, pairing)
+/// e' PURA e vive in [`crate::decisions::context_reduction`]
+/// ([`crate::decisions::context_reduction::cosine_similarity`],
+/// `select_continuity_trim_candidates`, `decide_continuity_drops`,
+/// `apply_continuity_trim`). Questo trait espone SOLO l'I/O: il calcolo del vettore
+/// (embedder ONNX in-process, punto unico `NeuralCoreClient::embed_text_with_model`).
+///
+/// Gata `Real` (PUNTO UNICO gate shadow, regola L; uniforme con
+/// [`ContextOffload`]/[`SummaryStore`]): l'embedding COSTA (CPU) e in shadow
+/// divergerebbe dal replay; quindi `embed` riceve `mode` e in [`ExecMode::Replay`]
+/// e' un NO-OP che ritorna `PortError` (il nodo degrada al troncamento posizionale
+/// odierno). Best-effort: su guasto infra (embedder down) ritorna `PortError` e il
+/// nodo degrada = niente continuity-trim, la history resta invariata.
+#[async_trait]
+pub trait EmbeddingStore: Send + Sync {
+    /// Calcola l'embedding di ciascun testo (batch), preservando l'ordine di input.
+    /// Gata `Real`: in [`ExecMode::Replay`] e' un no-op che ritorna `PortError`.
+    /// Su qualunque guasto (anche in Real) ritorna `PortError` (il nodo degrada al
+    /// troncamento posizionale). Best-effort. `texts` vuoto -> `Ok(vec![])`.
+    async fn embed(&self, texts: Vec<String>, mode: ExecMode) -> Result<Vec<Vec<f32>>, PortError>;
 }
 
 /// Dati di INPUT dell'auto-escalation gia' risolti dall'impl (catena DB + gate

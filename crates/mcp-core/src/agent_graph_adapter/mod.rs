@@ -57,6 +57,10 @@ pub mod stall_budget_store;
 // --- rolling-summary (intervento 3): SummaryStore (LLM economico) ---
 pub mod summary_store;
 
+// --- continuity-trim (EmbeddingStore): embedder ONNX in-process per la
+// compressione SEMANTICA del contesto (coseno vs focus del turno) ---
+pub mod embedding_store;
+
 // --- 3 impl FASE 2c: LlmGateway / ToolExecutor / CriteriaRunner ---
 pub mod criteria_runner;
 pub mod llm_gateway;

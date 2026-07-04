@@ -1424,6 +1424,246 @@ pub fn apply_rolling_summary(
     out
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+//  10) CONTINUITY-TRIM (parte PURA): coseno + selezione atomi + decisione + apply
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Compressione SEMANTICA del prefisso vecchio: invece del troncamento POSIZIONALE,
+// scarta interi "atomi" (turno assistant + i suoi tool_result) semanticamente
+// IRRILEVANTI al FOCUS del turno corrente. L'EMBEDDING (I/O) vive dietro il trait
+// [`crate::runtime::ports::EmbeddingStore`]; qui restano le primitive PURE (regola
+// L): FOCUS -> CANDIDATI -> DECISIONE (coseno) -> APPLY. Su guasto embedder il nodo
+// salta il trim (history invariata) e compress/token_brake fanno il resto.
+//
+// SICUREZZA PAIRING (vincolo non negoziabile, HTTP 400): un atomo droppabile e'
+// BILANCIATO (contiene sia il tool_use sia tutti i suoi tool_result), cosi'
+// rimuoverlo interamente non lascia mai un tool_result orfano. I messaggi human
+// (intento utente) e i riassunti non sono mai candidati.
+
+/// Similarita' coseno fra due vettori. `0.0` (nessuna similarita' definibile) se un
+/// vettore e' vuoto, di lunghezza diversa dall'altro, o a norma nulla. PURA.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// `true` se il messaggio porta almeno un blocco `tool_use` (in `anthropic_content`):
+/// e' l'apertura di un turno assistant con chiamata tool (la cui coppia sono i
+/// tool_result successivi). PURA.
+fn message_has_tool_use(m: &HistoryMessage) -> bool {
+    m.anthropic_blocks()
+        .map(|blocks| {
+            blocks.iter().any(|b| {
+                b.as_object().and_then(|o| o.get("type")).and_then(Value::as_str)
+                    == Some("tool_use")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Un ATOMO candidato al continuity-trim: gli indici (contigui) che lo compongono
+/// nella history e il testo serializzato per l'embedding. Droppare TUTTI gli indici
+/// insieme preserva il pairing (l'atomo e' bilanciato).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContinuityCandidate {
+    /// Indici (nella history) che compongono l'atomo (turno assistant + tool_result).
+    pub indices: Vec<usize>,
+    /// Testo serializzato dell'atomo (riusa [`serialize_message_body`]), per l'embed.
+    pub text: String,
+}
+
+/// FOCUS del turno per il continuity-trim: testo dell'ULTIMO messaggio human della
+/// history (l'intento corrente dell'utente). Riusa [`serialize_message_body`]. Vuoto
+/// se non c'e' alcun human. PURA.
+pub fn continuity_focus_text(hist: &[HistoryMessage]) -> String {
+    hist.iter()
+        .rev()
+        .find(|m| m.is_human)
+        .map(serialize_message_body)
+        .unwrap_or_default()
+}
+
+/// Serializza gli indici `[start, end)` come testo unico per l'embedding dell'atomo.
+fn serialize_atom(hist: &[HistoryMessage], start: usize, end: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for m in &hist[start..end.min(hist.len())] {
+        let body = serialize_message_body(m);
+        if !body.trim().is_empty() {
+            parts.push(body);
+        }
+    }
+    parts.join(" ")
+}
+
+/// SELEZIONA gli atomi candidati al continuity-trim nel prefisso vecchio
+/// `hist[0..len-keep_recent]`. Un atomo e' un turno assistant con tool_use + i suoi
+/// tool_result contigui (bilanciato) OPPURE un assistant testuale standalone.
+/// ESCLUSI (mai candidati): messaggi human (ancore intento), riassunti, e ogni
+/// atomo con tool_use che tocca il confine `keep_recent` (i cui tool_result
+/// potrebbero cadere nella coda preservata -> rischio orfano). PURA.
+pub fn select_continuity_trim_candidates(
+    hist: &[HistoryMessage],
+    keep_recent: i64,
+) -> Vec<ContinuityCandidate> {
+    let len = hist.len();
+    let prefix_end = (len as i64 - keep_recent.max(0)).max(0) as usize;
+    if prefix_end == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<ContinuityCandidate> = Vec::new();
+    let mut i = 0usize;
+    while i < prefix_end {
+        let m = &hist[i];
+        // Ancore non droppabili: human (intento) e riassunti.
+        if m.is_human || m.is_summary() {
+            i += 1;
+            continue;
+        }
+        if message_has_tool_use(m) {
+            // Atomo = assistant(tool_use) + tool_result contigui che rispondono.
+            let mut j = i + 1;
+            while j < prefix_end && (hist[j].is_tool || opens_with_tool_result(&hist[j])) {
+                j += 1;
+            }
+            // Droppabile solo se l'atomo e' CHIUSO prima del confine keep_recent: se
+            // il run di tool_result tocca prefix_end i risultati potrebbero
+            // continuare nella coda preservata -> orfano. Conservativo: salta.
+            if j < prefix_end {
+                out.push(ContinuityCandidate {
+                    indices: (i..j).collect(),
+                    text: serialize_atom(hist, i, j),
+                });
+            }
+            i = j;
+        } else if m.is_tool || opens_with_tool_result(m) {
+            // tool_result la cui coppia sta in un atomo precedente gia' consumato o
+            // fuori prefisso: non droppabile isolatamente (rischio orfano).
+            i += 1;
+        } else {
+            // Assistant testuale standalone: atomo droppabile singolo.
+            let text = serialize_message_body(m);
+            if !text.trim().is_empty() {
+                out.push(ContinuityCandidate { indices: vec![i], text });
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// DECIDE quali INDICI della history scartare: per ogni candidato calcola il coseno
+/// del suo vettore vs `focus`; scarta i candidati sotto `min_score` (meno rilevanti
+/// prima), fino al cap `max_drop_msgs` messaggi totali. `cand_vecs[k]` e' il vettore
+/// del candidato `candidates[k]` (stesso ordine). Ritorna gli indici ORDINATI e
+/// unici. PURA. Cap/soglia arrivano dal call site (config DB, regola G).
+pub fn decide_continuity_drops(
+    focus: &[f32],
+    cand_vecs: &[Vec<f32>],
+    candidates: &[ContinuityCandidate],
+    min_score: f32,
+    max_drop_msgs: usize,
+) -> Vec<usize> {
+    if focus.is_empty() || max_drop_msgs == 0 {
+        return Vec::new();
+    }
+    // (score, k) per i soli candidati SOTTO soglia (irrilevanti al focus).
+    let mut ranked: Vec<(f32, usize)> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(k, _)| {
+            let v = cand_vecs.get(k)?;
+            let score = cosine_similarity(focus, v);
+            (score < min_score).then_some((score, k))
+        })
+        .collect();
+    // Meno rilevanti (score piu' basso) prima; tiebreak per indice (determinismo).
+    ranked.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    let mut drops: Vec<usize> = Vec::new();
+    for (_, k) in ranked {
+        let atom = &candidates[k];
+        if drops.len() + atom.indices.len() > max_drop_msgs {
+            continue; // salterebbe il cap: prova gli atomi successivi piu' piccoli.
+        }
+        drops.extend_from_slice(&atom.indices);
+        if drops.len() >= max_drop_msgs {
+            break;
+        }
+    }
+    drops.sort_unstable();
+    drops.dedup();
+    drops
+}
+
+/// APPLICA il continuity-trim: ritorna la history senza gli indici in `drop_indices`
+/// (preserva l'ordine dei restanti). Gli atomi rimossi sono bilanciati -> nessun
+/// tool_result orfano. PURA. Indici fuori range ignorati.
+pub fn apply_continuity_trim(
+    hist: &[HistoryMessage],
+    drop_indices: &[usize],
+) -> Vec<HistoryMessage> {
+    if drop_indices.is_empty() {
+        return hist.to_vec();
+    }
+    let drop: std::collections::HashSet<usize> = drop_indices.iter().copied().collect();
+    hist.iter()
+        .enumerate()
+        .filter(|(i, _)| !drop.contains(i))
+        .map(|(_, m)| m.clone())
+        .collect()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  11) OFFLOAD ELIGIBILITY (parte PURA): contenuti tool_result che saranno compressi
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Enumera i CONTENUTI dei tool_result che [`compress_old_tool_results`] comprimera'
+/// nella modalita' A GENERAZIONI (`cutoff_index = Some`): i tool_result sotto il
+/// `cutoff` con content stringa piu' lungo di `threshold` (stessa selezione di
+/// [`compress_blocks`], boundary `i < cutoff`). Il call site (executor) offloada
+/// questi contenuti su RAG PRIMA di comprimere e costruisce un marker con `ref`
+/// (regola L: la SELEZIONE e' qui, l'I/O di offload sta fuori). PURA. `threshold` =
+/// `max_content_chars` di fase.
+pub fn contents_eligible_for_offload(
+    hist: &[HistoryMessage],
+    cutoff_index: usize,
+    threshold: usize,
+) -> Vec<String> {
+    let boundary = cutoff_index.min(hist.len());
+    let mut out: Vec<String> = Vec::new();
+    for m in &hist[..boundary] {
+        let Some(blocks) = m.anthropic_blocks() else {
+            continue;
+        };
+        for block in blocks {
+            let Some(obj) = block.as_object() else { continue };
+            if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            if let Some(Value::String(content)) = obj.get("content") {
+                if content.chars().count() > threshold {
+                    out.push(content.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;
 

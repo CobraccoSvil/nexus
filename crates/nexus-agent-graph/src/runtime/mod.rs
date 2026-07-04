@@ -11,8 +11,9 @@ pub mod ports;
 pub use ctx::AgentNodeCtx;
 pub use ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, ContextPressure, Coordination,
-    CriteriaRunner, CriterionResult, CriterionSpec, EscalationInputs, EscalationPort, EventSink,
-    ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage, MetaReasonerPort,
+    CriteriaRunner, CriterionResult, CriterionSpec, EmbeddingStore, EscalationInputs, EscalationPort,
+    EventSink, ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage, MetaReasonerPort,
+    OffloadKind,
     MetaStepStore, ModelUpscalePort, NextActionChoice, NextActionsDeriver, OrchPhase,
     OrchestrationContext, OrchestrationMove, PlanBlock, PlanRow, PortError, RecoveryMove,
     RunControlStore, ScaleContext, ScaleMove, ScaleTier, SseEvent, StallBudgetPort, StallContext,
@@ -123,10 +124,11 @@ pub mod test_doubles {
 
     use super::ports::{
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
-        CriterionSpec, EscalationInputs, EscalationPort, EventSink, ExecMode, LlmGateway,
-        LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort, NextActionChoice,
-        NextActionsDeriver, PlanRow, PortError, RunControlStore, SseEvent, SummaryStore, ToolCall,
-        ToolExecutor, ToolOutcome, TodoStore, UpscalePick, VerifierRunRecord, VerifierRunStore,
+        CriterionSpec, EmbeddingStore, EscalationInputs, EscalationPort, EventSink, ExecMode,
+        LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort,
+        NextActionChoice, NextActionsDeriver, OffloadKind, PlanRow, PortError, RunControlStore,
+        SseEvent, SummaryStore, ToolCall, ToolExecutor, ToolOutcome, TodoStore, UpscalePick,
+        VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
     use crate::decisions::escalation::{ChainEntry, CrossProviderCandidate};
@@ -550,6 +552,8 @@ pub mod test_doubles {
         pub fail: bool,
         /// Payload "offloadati" in ordine. Vuoto in shadow (gate `Real`).
         pub offloaded: Mutex<Vec<serde_json::Value>>,
+        /// `OffloadKind` di ogni offload, in ordine (per asserire tool_result vs chat_history).
+        pub offloaded_kinds: Mutex<Vec<OffloadKind>>,
     }
 
     #[async_trait]
@@ -557,6 +561,9 @@ pub mod test_doubles {
         async fn offload_to_rag(
             &self,
             payload: serde_json::Value,
+            kind: OffloadKind,
+            _session_id: Option<String>,
+            _project_id: Option<String>,
             mode: ExecMode,
         ) -> Result<String, PortError> {
             // Gate shadow: in Replay NON si scrive (no-op), come l'impl concreta.
@@ -569,8 +576,60 @@ pub mod test_doubles {
             }
             let mut g = self.offloaded.lock().expect("lock offloaded");
             g.push(payload);
+            self.offloaded_kinds.lock().expect("lock offloaded_kinds").push(kind);
             // Pointer fittizio deterministico (indice progressivo).
             Ok(format!("stub-rag-pointer-{}", g.len() - 1))
+        }
+    }
+
+    /// Embedder di test: NON chiama l'ONNX bridge. In Real ritorna, per ciascun
+    /// testo, il vettore associato in `vectors` per posizione (cicla se ci sono piu'
+    /// testi che vettori); se `vectors` e' vuoto (DEFAULT) ritorna `PortError` cosi'
+    /// i test esercitano il DEGRADO best-effort (niente continuity-trim). Gata `Real`
+    /// come l'impl concreta: in `Replay` e' NO-OP (`PortError`).
+    #[derive(Default)]
+    pub struct StubEmbeddingStore {
+        /// Vettori ritornati in Real (per posizione, ciclici). Vuoto -> `PortError`.
+        pub vectors: Vec<Vec<f32>>,
+        /// Testi ricevuti da `embed`, in ordine (per asserire l'input). Vuoto in shadow.
+        pub embed_seen: Mutex<Vec<String>>,
+    }
+
+    impl StubEmbeddingStore {
+        /// Costruttore comodo: stub che ritorna `vectors` (ciclici) in Real.
+        pub fn with_vectors(vectors: Vec<Vec<f32>>) -> Self {
+            StubEmbeddingStore {
+                vectors,
+                embed_seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingStore for StubEmbeddingStore {
+        async fn embed(
+            &self,
+            texts: Vec<String>,
+            mode: ExecMode,
+        ) -> Result<Vec<Vec<f32>>, PortError> {
+            if mode != ExecMode::Real {
+                return Err(PortError::Tool("shadow: embed no-op".to_string()));
+            }
+            if self.vectors.is_empty() {
+                return Err(PortError::Tool("stub: nessun vettore configurato".to_string()));
+            }
+            {
+                let mut seen = self.embed_seen.lock().expect("lock embed_seen");
+                for t in &texts {
+                    seen.push(t.clone());
+                }
+            }
+            let out = texts
+                .iter()
+                .enumerate()
+                .map(|(i, _)| self.vectors[i % self.vectors.len()].clone())
+                .collect();
+            Ok(out)
         }
     }
 

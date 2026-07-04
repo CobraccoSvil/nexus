@@ -188,9 +188,9 @@ use crate::routing::signals::{
     tool_error_stats, EXPLORATION_ONLY_TOOLS,
 };
 use crate::runtime::ports::{
-    AgentStepStore, BillingCooldownPort, EscalationPort, LlmMessage, LlmRequest, MetaStepStore,
-    ModelUpscalePort, NextActionsDeriver, RunControlStore, ScaleMove, ScaleTier, SizingOverrides,
-    SseEvent, StallBudgetPort, SummaryStore, TokenCounter,
+    AgentStepStore, BillingCooldownPort, ContextOffload, EmbeddingStore, EscalationPort, LlmMessage,
+    LlmRequest, MetaStepStore, ModelUpscalePort, NextActionsDeriver, OffloadKind, RunControlStore,
+    ScaleMove, ScaleTier, SizingOverrides, SseEvent, StallBudgetPort, SummaryStore, TokenCounter,
 };
 use crate::nodes::scale_control::{
     SCALE_CONTEXT_KEY, SCALE_HYSTERESIS_CFG_KEY, SCALE_MOVE_CACHE_KEY_KEY, SCALE_SIZING_CFG_KEY,
@@ -377,6 +377,28 @@ pub struct ExecutorConfig {
     /// il costo (`agent.governance.rolling_summary_min_prefix`, regola G). Usata solo
     /// se [`Self::governance_rolling_summary_adaptive`] e' ON.
     pub governance_rolling_summary_min_prefix: i64,
+    /// `true` se il continuity-trim SEMANTICO e' attivo
+    /// (`agent.context.continuity_trim_enabled`): al cambio-fase scarta dal prefisso
+    /// vecchio gli atomi (turno+tool_result) semanticamente irrilevanti al focus del
+    /// turno, via [`EmbeddingStore`] + coseno. Richiede la porta iniettata
+    /// ([`Self::with_embedding_store`]). Default safe-DB-down: OFF (bit-identico).
+    pub continuity_trim_enabled: bool,
+    /// Soglia coseno sotto la quale un atomo e' "irrilevante" e viene scartato dal
+    /// continuity-trim (`agent.context.continuity_trim_min_score`). Default 0.25.
+    pub continuity_trim_min_score: f32,
+    /// Cap massimo di messaggi scartabili dal continuity-trim in una passata
+    /// (`agent.context.continuity_trim_max_drop`), rete di sicurezza. Default 8.
+    pub continuity_trim_max_drop: i64,
+    /// `true` se i tool_result compressi vengono OFFLOADATI su RAG (recuperabili via
+    /// `ref` nel marker) invece di essere solo degradati
+    /// (`agent.context.compress_offload_enabled`). Richiede la porta
+    /// [`ContextOffload`] iniettata. Default safe-DB-down: OFF (bit-identico).
+    pub compress_offload_enabled: bool,
+    /// `true` se gli originali del rolling-summary vengono indicizzati su RAG
+    /// (`chat_history`, recuperabili per sessione) prima di essere sostituiti dal
+    /// riassunto (`agent.context.rolling_summary_offload_enabled`). Richiede la porta
+    /// [`ContextOffload`] iniettata. Default safe-DB-down: OFF (bit-identico).
+    pub rolling_summary_offload_enabled: bool,
     /// Hard cap del contesto (ADR 0016 D2, `agent.context.hard_cap_ratio`): se
     /// DOPO upscale+brake la stima resta `>= ratio*window`, il run termina
     /// fail-fast con errore strutturato invece di chiamare l'LLM. `0.0` = gate
@@ -561,6 +583,14 @@ impl Default for ExecutorConfig {
             // costo/beneficio non si applica -> comportamento storico bit-identico.
             governance_rolling_summary_adaptive: false,
             governance_rolling_summary_min_prefix: 6,
+            // Default safe-DB-down: continuity-trim/offload OFF (il wiring mcp-core
+            // passa i settaggi `agent.context.*`). Con questi default il
+            // comportamento e' bit-identico a oggi (nessun embed, nessun offload).
+            continuity_trim_enabled: false,
+            continuity_trim_min_score: 0.25,
+            continuity_trim_max_drop: 8,
+            compress_offload_enabled: false,
+            rolling_summary_offload_enabled: false,
             // Default safe-DB-down: hard cap OFF (il wiring mcp-core passa
             // `agent.context.hard_cap_ratio`, 0.95 in produzione).
             hard_cap_ratio: 0.0,
@@ -629,6 +659,18 @@ pub struct ExecutorNode {
     /// DECISIONE (cap raggiunto?) resta nel gate di emissione (regola L: la porta
     /// fornisce solo il conteggio). Fail-open: guasto -> conteggio 0, non blocca.
     stall_budget: Option<Arc<dyn StallBudgetPort>>,
+    /// Porta I/O embedding per il continuity-trim SEMANTICO. OPZIONALE (`None` ->
+    /// continuity-trim disattivo, bit-identico: solo troncamento posizionale):
+    /// iniettata dal wiring col builder [`Self::with_embedding_store`]. La DECISIONE
+    /// (coseno, chi scartare) resta nel modulo puro `context_reduction` (regola L).
+    /// Gata anche dal flag `cfg.continuity_trim_enabled`.
+    embedding_store: Option<Arc<dyn EmbeddingStore>>,
+    /// Porta I/O di offload RAG del contesto (tool_result compressi + originali
+    /// rolling-summary). OPZIONALE (`None` -> nessun offload: degrado a marker /
+    /// rolling non recuperabile, come oggi): iniettata col builder
+    /// [`Self::with_context_offload`]. Gata dai flag `cfg.compress_offload_enabled`
+    /// / `cfg.rolling_summary_offload_enabled`.
+    offload: Option<Arc<dyn ContextOffload>>,
 }
 
 impl ExecutorNode {
@@ -657,6 +699,8 @@ impl ExecutorNode {
             summary_store,
             token_counter: None,
             stall_budget: None,
+            embedding_store: None,
+            offload: None,
         }
     }
 
@@ -676,6 +720,76 @@ impl ExecutorNode {
     pub fn with_stall_budget(mut self, budget: Arc<dyn StallBudgetPort>) -> Self {
         self.stall_budget = Some(budget);
         self
+    }
+
+    /// Inietta la porta embedding per il continuity-trim SEMANTICO. Senza iniezione
+    /// (default) il continuity-trim e' disattivo (bit-identico: solo troncamento
+    /// posizionale). Scatta solo se ANCHE il flag `continuity_trim_enabled` e' attivo
+    /// (regola G: la porta abilita l'infra, il flag governa il comportamento).
+    pub fn with_embedding_store(mut self, store: Arc<dyn EmbeddingStore>) -> Self {
+        self.embedding_store = Some(store);
+        self
+    }
+
+    /// Inietta la porta di offload RAG del contesto (tool_result compressi +
+    /// originali del rolling-summary). Senza iniezione (default) niente offload: la
+    /// compressione degrada a marker e il rolling-summary non e' recuperabile. Scatta
+    /// solo se ANCHE i flag `compress_offload_enabled`/`rolling_summary_offload_enabled`
+    /// sono attivi (regola G).
+    pub fn with_context_offload(mut self, offload: Arc<dyn ContextOffload>) -> Self {
+        self.offload = Some(offload);
+        self
+    }
+
+    /// Costruisce la mappa `content -> pointer` per il compress-offload: offloada su
+    /// RAG (best-effort, gata dal flag `compress_offload_enabled` + porta + gate
+    /// Real) i tool_result che [`ctxr::compress_old_tool_results`] comprimera'
+    /// (SELEZIONE pura [`ctxr::contents_eligible_for_offload`], regola L). Mappa
+    /// VUOTA se disabilitato, senza porta, o su guasto/Replay -> il marker degrada a
+    /// [`ctxr::degraded_marker`] (bit-identico a oggi).
+    async fn build_compress_offload_map(
+        &self,
+        hist: &[HistoryMessage],
+        cutoff_index: usize,
+        threshold: usize,
+        run_id: &str,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        if !self.cfg.compress_offload_enabled {
+            return map;
+        }
+        let Some(offload) = self.offload.as_ref() else {
+            return map;
+        };
+        let session = if run_id.is_empty() { None } else { Some(run_id.to_string()) };
+        for content in ctxr::contents_eligible_for_offload(hist, cutoff_index, threshold) {
+            if map.contains_key(&content) {
+                continue;
+            }
+            if let Ok(ptr) = offload
+                .offload_to_rag(
+                    serde_json::Value::String(content.clone()),
+                    OffloadKind::ToolResult,
+                    session.clone(),
+                    None,
+                    mode,
+                )
+                .await
+            {
+                map.insert(content, ptr);
+            }
+            // Su Err: questo contenuto degrada a degraded_marker (nessun ref).
+        }
+        if !map.is_empty() {
+            tracing::info!(
+                target: "nexus_agent_graph::executor",
+                run_id = %run_id,
+                offloaded = map.len(),
+                "compress-offload: tool_result indicizzati (recuperabili via ref)"
+            );
+        }
+        map
     }
 
     /// PUNTO UNICO (regola L) della stima token della history nell'executor:
@@ -2584,8 +2698,38 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                         );
                     } else {
                         let prefix_text = ctxr::serialize_prefix_for_summary(&hist, cut);
-                        match self.summary_store.summarize(prefix_text, mode).await {
+                        match self.summary_store.summarize(prefix_text.clone(), mode).await {
                             Ok(summary) if !summary.trim().is_empty() => {
+                                // OFFLOAD retrievable degli ORIGINALI (chat_history) PRIMA di
+                                // sostituirli col riassunto: restano recuperabili per sessione
+                                // via search_semantic. Best-effort, gata dal flag + porta.
+                                if self.cfg.rolling_summary_offload_enabled {
+                                    if let Some(offload) = self.offload.as_ref() {
+                                        match offload
+                                            .offload_to_rag(
+                                                serde_json::Value::String(prefix_text.clone()),
+                                                OffloadKind::ChatHistory,
+                                                if run_id.is_empty() { None } else { Some(run_id.clone()) },
+                                                None,
+                                                mode,
+                                            )
+                                            .await
+                                        {
+                                            Ok(ptr) => tracing::info!(
+                                                target: "nexus_agent_graph::executor",
+                                                run_id = %run_id,
+                                                pointer = %ptr,
+                                                "rolling summary: originali indicizzati su RAG (recuperabili)"
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                target: "nexus_agent_graph::executor",
+                                                run_id = %run_id,
+                                                error = %e,
+                                                "rolling summary offload non disponibile (non blocca)"
+                                            ),
+                                        }
+                                    }
+                                }
                                 let before = hist.len();
                                 hist = ctxr::apply_rolling_summary(&hist, cut, &summary);
                                 tracing::info!(
@@ -2620,17 +2764,93 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                 }
             }
 
+            // CONTINUITY-TRIM SEMANTICO: scarta dal prefisso vecchio gli atomi (turno
+            // assistant + i suoi tool_result) semanticamente IRRILEVANTI al FOCUS del
+            // turno, invece del solo troncamento posizionale. DECISIONE pura (regola L:
+            // select/decide/apply in context_reduction); EMBEDDING via porta (gata Real).
+            // BEST-EFFORT: su guasto embedder / Replay no-op la history resta invariata.
+            if self.cfg.continuity_trim_enabled {
+                if let Some(embedder) = self.embedding_store.as_ref() {
+                    let candidates =
+                        ctxr::select_continuity_trim_candidates(&hist, self.cfg.rolling_keep_recent);
+                    let focus_text = ctxr::continuity_focus_text(&hist);
+                    if !candidates.is_empty() && !focus_text.trim().is_empty() {
+                        // Un solo embed: [focus] ++ testo dei candidati (ordine preservato).
+                        let mut texts: Vec<String> = Vec::with_capacity(candidates.len() + 1);
+                        texts.push(focus_text);
+                        texts.extend(candidates.iter().map(|c| c.text.clone()));
+                        match embedder.embed(texts, mode).await {
+                            Ok(vecs) if vecs.len() == candidates.len() + 1 => {
+                                let focus_vec = &vecs[0];
+                                let cand_vecs = &vecs[1..];
+                                let drops = ctxr::decide_continuity_drops(
+                                    focus_vec,
+                                    cand_vecs,
+                                    &candidates,
+                                    self.cfg.continuity_trim_min_score,
+                                    self.cfg.continuity_trim_max_drop.max(0) as usize,
+                                );
+                                if !drops.is_empty() {
+                                    let before = hist.len();
+                                    hist = ctxr::apply_continuity_trim(&hist, &drops);
+                                    tracing::info!(
+                                        target: "nexus_agent_graph::executor",
+                                        run_id = %run_id,
+                                        phase = phase_now,
+                                        dropped = drops.len(),
+                                        msgs_before = before,
+                                        msgs_after = hist.len(),
+                                        "continuity trim: atomi irrilevanti scartati (compressione semantica)"
+                                    );
+                                }
+                            }
+                            Ok(_) => tracing::warn!(
+                                target: "nexus_agent_graph::executor",
+                                run_id = %run_id,
+                                "continuity trim: embed disallineato, degrado a history invariata"
+                            ),
+                            Err(e) => tracing::warn!(
+                                target: "nexus_agent_graph::executor",
+                                run_id = %run_id,
+                                error = %e,
+                                "continuity trim: embedder non disponibile, degrado a history invariata"
+                            ),
+                        }
+                    }
+                }
+            }
+
             cutoff_idx = std::cmp::max(0, hist.len() as i64 - params.keep_recent);
             gen_cutoff_index = Some(cutoff_idx);
             gen_cutoff_phase = Some(phase_now);
         }
         if do_compress && cutoff_idx > 0 {
+            // COMPRESS-OFFLOAD: se abilitato, offloada su RAG i tool_result che
+            // verranno compressi PRIMA di comprimerli, cosi' il marker porta un `ref`
+            // recuperabile invece del solo "[... compresso ...]". SELEZIONE pura
+            // (regola L: contents_eligible_for_offload), I/O gata da flag + porta +
+            // gate Real. Su guasto/Replay la mappa resta vuota -> degraded_marker
+            // (bit-identico a oggi).
+            let max_chars = params.max_content_chars.max(0) as usize;
+            let offload_map = self
+                .build_compress_offload_map(&hist, cutoff_idx as usize, max_chars, &run_id, mode)
+                .await;
+            let marker_fn = |content: &str| -> String {
+                match offload_map.get(content) {
+                    Some(ptr) => format!(
+                        "\n[... compresso: {} char originali, recuperabili via \
+                         nexus_search_semantic ref={ptr} ...]",
+                        content.chars().count()
+                    ),
+                    None => ctxr::degraded_marker(content),
+                }
+            };
             hist = ctxr::compress_old_tool_results(
                 &hist,
                 0,
-                params.max_content_chars.max(0) as usize,
+                max_chars,
                 Some(cutoff_idx as usize),
-                &ctxr::degraded_marker,
+                &marker_fn,
             );
         } else if !do_compress
             && estimate_history_chars(&hist) > (ctxr::MAX_CONTEXT_CHARS as i64) / 2

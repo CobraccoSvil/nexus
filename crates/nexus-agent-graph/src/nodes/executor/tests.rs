@@ -17,7 +17,7 @@ use crate::routing::config::RoutingConfig;
 use crate::runtime::ports::{LlmResponse, LlmUsage, SseEvent};
 use crate::runtime::test_doubles::{
     NullEventSink, RecordingEventSink, StubAgentStepStore, StubBillingCooldownPort,
-    StubEscalationPort, StubLlmGateway, StubMetaStepStore, StubModelUpscalePort,
+    StubEmbeddingStore, StubEscalationPort, StubLlmGateway, StubMetaStepStore, StubModelUpscalePort,
     StubNextActionsDeriver, StubRunControlStore, StubSummaryStore, StubToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
@@ -2835,6 +2835,104 @@ async fn rolling_summary_degrado_best_effort_history_invariata() {
     assert!(
         !first.contains("[RIASSUNTO"),
         "nel degrado (summarizer fallito) NON deve comparire il messaggio di riassunto"
+    );
+}
+
+// ── continuity-trim SEMANTICO (EmbeddingStore): aggancio al cambio-fase ───────
+
+/// Config che attiva il continuity-trim (rolling-summary OFF per isolare l'effetto).
+fn cfg_continuity() -> ExecutorConfig {
+    ExecutorConfig {
+        continuity_trim_enabled: true,
+        continuity_trim_min_score: 0.5,
+        continuity_trim_max_drop: 8,
+        rolling_summary_enabled: false,
+        rolling_keep_recent: 2,
+        ..cfg_resolved()
+    }
+}
+
+/// Nodo con un [`StubEmbeddingStore`] iniettato (continuity-trim). Summarizer di
+/// default (nessun rolling-summary).
+fn node_continuity(
+    cfg: ExecutorConfig,
+    rc: Arc<StubRunControlStore>,
+    embedding: Arc<StubEmbeddingStore>,
+) -> ExecutorNode {
+    let meta = Arc::new(StubMetaStepStore::default());
+    let steps = Arc::new(StubAgentStepStore::default());
+    ExecutorNode::new(
+        cfg,
+        rc,
+        meta,
+        steps,
+        Arc::new(StubEscalationPort::default()),
+        Arc::new(StubNextActionsDeriver::default()),
+        Arc::new(StubBillingCooldownPort::default()),
+        Arc::new(StubModelUpscalePort::default()),
+        Arc::new(StubSummaryStore::default()),
+    )
+    .with_embedding_store(embedding)
+}
+
+/// Al cambio-fase, con l'embedder che marca un atomo come IRRILEVANTE (coseno sotto
+/// soglia), il continuity-trim lo SCARTA dalla history: la richiesta LLM non porta
+/// piu' quel messaggio. Gli atomi rilevanti restano.
+#[tokio::test]
+async fn continuity_trim_scarta_atomo_irrilevante_al_cambio_fase() {
+    let rc = Arc::new(StubRunControlStore::default());
+    // state_cambio_fase: 2 atomi candidati (ai "risposta 1" idx1, ai "risposta 2"
+    // idx3); focus = ultimo human "domanda 3". texts = [focus, r1, r2] -> 3 vettori:
+    // focus [1,0]; r1 [0,1] (coseno 0 < 0.5 -> scartato); r2 [1,0] (coseno 1 -> tenuto).
+    let embedding = Arc::new(StubEmbeddingStore::with_vectors(vec![
+        vec![1.0, 0.0],
+        vec![0.0, 1.0],
+        vec![1.0, 0.0],
+    ]));
+    let n = node_continuity(cfg_continuity(), rc, embedding.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
+    let ctx = ctx_with(llm.clone(), false);
+    let _ = n.run(&state_cambio_fase(), &ctx).await.expect("run");
+
+    // L'embedder ha ricevuto il focus (per primo) + i 2 atomi candidati.
+    let seen = embedding.embed_seen.lock().unwrap();
+    assert_eq!(seen.len(), 3, "embed chiamato con focus + 2 candidati");
+    assert!(seen.iter().any(|t| t.contains("risposta 1")), "candidato r1 embeddato");
+    assert!(seen.iter().any(|t| t.contains("risposta 2")), "candidato r2 embeddato");
+    drop(seen);
+
+    // La richiesta LLM NON porta piu' "risposta 1" (atomo scartato), ma porta "risposta 2".
+    let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
+    let contiene = |needle: &str| {
+        req.messages
+            .iter()
+            .any(|m| m.content.as_str().unwrap_or_default().contains(needle))
+    };
+    assert!(!contiene("risposta 1"), "l'atomo irrilevante deve essere scartato");
+    assert!(contiene("risposta 2"), "l'atomo rilevante resta");
+}
+
+/// A flag OFF il continuity-trim NON scatta anche con la porta iniettata: l'embedder
+/// non viene chiamato e la history resta invariata (bit-identico).
+#[tokio::test]
+async fn continuity_trim_flag_off_non_chiama_embedder() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let embedding = Arc::new(StubEmbeddingStore::with_vectors(vec![vec![1.0, 0.0]]));
+    let cfg = ExecutorConfig { continuity_trim_enabled: false, ..cfg_continuity() };
+    let n = node_continuity(cfg, rc, embedding.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
+    let ctx = ctx_with(llm.clone(), false);
+    let _ = n.run(&state_cambio_fase(), &ctx).await.expect("run");
+
+    assert!(
+        embedding.embed_seen.lock().unwrap().is_empty(),
+        "flag OFF: l'embedder NON deve essere chiamato"
+    );
+    // History invariata: "risposta 1" resta nella richiesta.
+    let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
+    assert!(
+        req.messages.iter().any(|m| m.content.as_str().unwrap_or_default().contains("risposta 1")),
+        "flag OFF: nessun trim, la history resta completa"
     );
 }
 
