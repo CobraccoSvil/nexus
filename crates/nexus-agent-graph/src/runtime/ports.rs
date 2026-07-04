@@ -1439,7 +1439,7 @@ pub struct ScaleContext {
     /// consultare l'LLM su quell'asse (anti-oscillazione, gemello di `already_guided`).
     pub reversal_count: i64,
 
-    // ── Segnali di DIMENSIONAMENTO (sizing agentico, mig 0522) ────────────────
+    // ── Segnali di DIMENSIONAMENTO (sizing agentico, mig 0524) ────────────────
     // Tutti `Option` + `skip_serializing_if`: ASSENTI (sizing OFF, o detector che
     // non li popola) -> OMESSI dal JSON serializzato all'LLM -> il flusso TIER resta
     // BIT-IDENTICO (nessun campo extra nella richiesta cambia la decisione tier).
@@ -1547,7 +1547,7 @@ pub struct SizingOverrides {
 /// DOPO la validazione (l'LLM NON scavalca il gate). `KeepTier` = nessun cambio
 /// (rete di sicurezza: il routing usa comunque sticky, il tier resta).
 ///
-/// [`ScaleMove::AdjustSizing`] e' la terza direzione (mig 0522): NON tocca il tier
+/// [`ScaleMove::AdjustSizing`] e' la terza direzione (mig 0524): NON tocca il tier
 /// ma il DIMENSIONAMENTO del motore (soglie context_reduction / token_brake /
 /// rolling_summary / g1-loop). Non passa dai 5 gate tier di `apply_hysteresis` ma
 /// dal gate dedicato [`crate::decisions::scale_reason::apply_sizing_gate`]
@@ -1576,7 +1576,7 @@ pub enum ScaleMove {
     },
     /// Aggiusta il DIMENSIONAMENTO del motore (soglie di context_reduction /
     /// token_brake / rolling_summary / compress-start / g1-loop) SENZA cambiare tier.
-    /// Terza direzione dello scale-controller (mig 0522): la stessa consultazione
+    /// Terza direzione dello scale-controller (mig 0524): la stessa consultazione
     /// `assess_scale` puo' decidere il TIER (up/down) O il SIZING (postura). L'LLM
     /// sceglie SOLO la [`SizingPosture`] + `confidence`; il traduttore deterministico
     /// [`crate::decisions::scale_reason::resolve_sizing_overrides`] la espande in

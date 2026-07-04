@@ -450,7 +450,7 @@ pub struct ScaleConfig {
     /// finestra nel downscale (FIX-B): `required = est_tokens * ratio`.
     pub window_overhead_ratio: f64,
     /// `agent.scale.sizing_enabled` (default false): kill-switch NESTED del SIZING
-    /// agentico (mig 0522). Con `scale.enabled=true` ma sizing OFF il flusso TIER
+    /// agentico (mig 0524). Con `scale.enabled=true` ma sizing OFF il flusso TIER
     /// resta bit-identico (il detector non popola i segnali sizing, il gate degrada
     /// ogni `AdjustSizing` a `KeepTier`). Regola G, opt-in DB.
     pub sizing_enabled: bool,
@@ -480,7 +480,7 @@ impl Default for ScaleConfig {
             max_tier_changes_per_run: 3,
             max_evals_per_run: 6,
             window_overhead_ratio: 1.3,
-            // Sizing agentico OFF di default (mig 0522): con scale ON ma sizing OFF il
+            // Sizing agentico OFF di default (mig 0524): con scale ON ma sizing OFF il
             // flusso tier resta bit-identico.
             sizing_enabled: false,
             sizing_cooldown_turns: 3,
@@ -1246,7 +1246,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
         // modello una chance reale di convergere (la prima escalation azzera i
         // contatori re-entry ma non iters_in, quindi una soglia fissa ri-scatterebbe
         // subito). Cap assoluto iteration_cap resta la safety net finale.
-        // Override sizing STICKY del run (mig 0522): letti UNA volta, riusati dal gate
+        // Override sizing STICKY del run (mig 0524): letti UNA volta, riusati dal gate
         // g1-loop e dal blocco di riduzione contesto piu' avanti nello stesso turno.
         // `None` (sizing OFF / nessuna postura applicata) -> gli helper `effective_*`
         // lasciano invariate le soglie fisse -> BIT-IDENTICO. Read-only, replay-safe
@@ -1257,7 +1257,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
             .get("auto_escalations")
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        // Soglia g1-loop resa ADATTIVA dal sizing (mig 0522, decisione #5): base *
+        // Soglia g1-loop resa ADATTIVA dal sizing (mig 0524, decisione #5): base *
         // moltiplicatore. Senza override il moltiplicatore e' 1.0 -> base invariata.
         // Valuta i fattori INSIEME col guard `!g1_recent_productive` piu' sotto: un
         // modello medio che PROGREDISCE ottiene piu' respiro (soglia alzata) invece di
@@ -2529,7 +2529,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         let mut hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();
         let compress_iter = iters_in;
 
-        // Config di DIMENSIONAMENTO EFFETTIVA (mig 0522): base DB-driven + eventuali
+        // Config di DIMENSIONAMENTO EFFETTIVA (mig 0524): base DB-driven + eventuali
         // override sizing STICKY (`sizing_ov`). Con override assenti -> clone della
         // base INVARIATA (BIT-IDENTICO). Rende ADATTIVE (non piu' soglie fisse
         // geometriche) la compressione (fasi/keep_recent/max_chars + compress_start),
@@ -4722,7 +4722,7 @@ al mio controllo e va risolta prima di continuare."
             reversal_count,
         );
 
-        // ── Segnali di SIZING (mig 0522): popolati SOLO se il sizing e' abilitato ──
+        // ── Segnali di SIZING (mig 0524): popolati SOLO se il sizing e' abilitato ──
         // A sizing OFF restano None -> OMESSI dal JSON serializzato all'LLM
         // (skip_serializing_if) -> il flusso TIER resta BIT-IDENTICO. Sono gli OCCHI
         // del sizing (regola M): crescita history, rumore tool_result, progresso.
@@ -4830,8 +4830,8 @@ al mio controllo e va risolta prima di continuare."
             extra_out.insert(SCALE_HYSTERESIS_CFG_KEY.to_string(), cfg_value);
         }
         // Trasporta la ScaleSizingConfig DB-driven al nodo SOLO se il sizing e'
-        // abilitato (mig 0522): a sizing OFF nessuna chiave aggiunta -> extra map
-        // identica a pre-0522 (bit-identico); il nodo, senza la config trasportata,
+        // abilitato (mig 0524): a sizing OFF nessuna chiave aggiunta -> extra map
+        // identica a pre-0524 (bit-identico); il nodo, senza la config trasportata,
         // ricade sul fallback conservativo (sizing OFF) e degrada ogni AdjustSizing a
         // KeepTier. La `min_confidence` e' RIUSATA da `agent.scale.min_confidence`
         // (regola L: una soglia, due gate).
@@ -4911,7 +4911,7 @@ al mio controllo e va risolta prima di continuare."
             .get(&key)
             .and_then(|v| serde_json::from_value(v.clone()).ok())?;
 
-        // Ramo SIZING (mig 0522): AdjustSizing NON tocca il tier. Risolve la postura in
+        // Ramo SIZING (mig 0524): AdjustSizing NON tocca il tier. Risolve la postura in
         // override concreti, li persiste STICKY e ri-fa il turno con le soglie adattive
         // (nessuna risoluzione modello/tier). Deviato QUI prima della macchina tier.
         if let ScaleMove::AdjustSizing { posture, .. } = &mv {
@@ -5132,7 +5132,7 @@ al mio controllo e va risolta prima di continuare."
         )
     }
 
-    /// CONSUMO di una [`ScaleMove::AdjustSizing`] (mig 0522, gemello di
+    /// CONSUMO di una [`ScaleMove::AdjustSizing`] (mig 0524, gemello di
     /// [`Self::consume_scale_move`] ma su direzione DISGIUNTA: DIMENSIONAMENTO, non
     /// tier). Risolve la postura in [`SizingOverrides`] concreti col PUNTO UNICO
     /// `resolve_sizing_overrides` (proporzionali ai segnali dello ScaleContext), li

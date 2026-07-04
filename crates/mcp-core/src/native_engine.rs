@@ -726,7 +726,7 @@ async fn load_executor_config(
             max_tier_changes_per_run: setting_i64(db, "agent.scale.max_tier_changes_per_run", d.scale.max_tier_changes_per_run).await,
             max_evals_per_run: setting_i64(db, "agent.scale.max_evals_per_run", d.scale.max_evals_per_run).await,
             window_overhead_ratio: setting_f64(db, "agent.scale.window_overhead_ratio", d.scale.window_overhead_ratio).await,
-            // ── Sizing agentico (mig 0522, kill-switch nested, opt-in DB, regola G) ─
+            // ── Sizing agentico (mig 0524, kill-switch nested, opt-in DB, regola G) ─
             // Con sizing_enabled=false (default) il detector non popola i segnali
             // sizing e il gate degrada ogni AdjustSizing a KeepTier -> flusso tier
             // BIT-IDENTICO anche con scale ON.

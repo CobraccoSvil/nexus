@@ -174,7 +174,7 @@ pub fn build_scale_context(
         requires_tool_use,
         turns_since_change: turns_since_change.max(0),
         reversal_count: reversal_count.max(0),
-        // Segnali di SIZING (mig 0522): NON popolati qui (regola L: il costruttore
+        // Segnali di SIZING (mig 0524): NON popolati qui (regola L: il costruttore
         // della decisione TIER non li conosce). Il detector li valorizza
         // post-costruzione SOLO quando `sizing_enabled`; a sizing OFF restano `None`
         // -> omessi dal JSON serializzato all'LLM (bit-identico per il flusso tier).
@@ -431,7 +431,7 @@ pub fn scale_trigger(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-//  SIZING AGENTICO (mig 0522): terza direzione dello scale-controller.
+//  SIZING AGENTICO (mig 0524): terza direzione dello scale-controller.
 //
 //  Rende ADATTIVE (non piu' soglie fisse geometriche) le decisioni di
 //  DIMENSIONAMENTO del motore: compress phases/keep_recent/max_chars +
@@ -483,7 +483,7 @@ pub struct ScaleSizingConfig {
 }
 
 impl ScaleSizingConfig {
-    /// Config con i seed conservativi della mig 0522 (sizing OFF). Solo per
+    /// Config con i seed conservativi della mig 0524 (sizing OFF). Solo per
     /// test/golden e riferimento; a runtime i valori vengono dal DB (regola G).
     pub fn conservative_defaults() -> Self {
         Self {

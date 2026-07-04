@@ -90,9 +90,16 @@ pub fn adaptive_billing_cooldown_secs(reason: &str, timings: &ProviderHealthTimi
     }
     // Quota/rate: recupero periodico prevedibile -> TTL ridotto (clampato).
     if r.contains("quota") || r.contains("rate") {
-        return timings
-            .adaptive_billing_cooldown_min_s
-            .clamp(timings.cooldown_min_s, timings.cooldown_long_s);
+        // Clamp robusto: `cooldown_min_s`/`cooldown_long_s` vengono da settings DB
+        // INDIPENDENTI, senza validazione reciproca. Se un operatore li invertisse
+        // (min > long) `u64::clamp` panicherebbe (`assert!(min <= max)`) proprio sul
+        // path di gestione errori billing (quando il sistema e' gia' in difficolta').
+        // `min(min_s, long_s)` garantisce lower <= upper: config invertita -> degrada
+        // al cooldown lungo pieno (conservativo), mai panic.
+        return timings.adaptive_billing_cooldown_min_s.clamp(
+            timings.cooldown_min_s.min(timings.cooldown_long_s),
+            timings.cooldown_long_s,
+        );
     }
     // Conservativo: qualunque altra causa resta al cooldown lungo pieno.
     timings.cooldown_long_s

@@ -156,10 +156,10 @@ const SCALE_TEMPLATE_KEY: &str = "system.scale.assess";
 /// scala (`Ok(None)`). PR-A: nessun nodo/detector la chiama comunque -> bit-identico.
 const SCALE_ENABLED_SETTING: &str = "agent.scale.enabled";
 
-/// Chiave del template ADDENDUM del SIZING (mig 0522): descrive la mossa
+/// Chiave del template ADDENDUM del SIZING (mig 0524): descrive la mossa
 /// `adjust_sizing` (postura Compact/Relax/Hold). APPESO al template base SOLO quando
 /// `agent.scale.sizing_enabled=true`, cosi' con sizing OFF il prompt LLM resta
-/// BYTE-IDENTICO al pre-0522 (bit-identico per il flusso tier).
+/// BYTE-IDENTICO al pre-0524 (bit-identico per il flusso tier).
 const SCALE_SIZING_TEMPLATE_KEY: &str = "system.scale.assess.sizing";
 
 /// Setting kill-switch NESTED del sizing (opt-in, default OFF, regola G): con `false`
@@ -591,8 +591,8 @@ impl PgMetaReasonerPort {
     }
 
     /// `true` se il SIZING agentico e' abilitato (`agent.scale.sizing_enabled`, mig
-    /// 0522). Default OFF (opt-in, regola G): con `false` l'addendum sizing NON e'
-    /// appeso al prompt -> prompt byte-identico al pre-0522 (bit-identico).
+    /// 0524). Default OFF (opt-in, regola G): con `false` l'addendum sizing NON e'
+    /// appeso al prompt -> prompt byte-identico al pre-0524 (bit-identico).
     async fn scale_sizing_enabled(&self) -> bool {
         nexus_auth::get_setting(&self.db, SCALE_SIZING_ENABLED_SETTING)
             .await
@@ -678,9 +678,9 @@ impl PgMetaReasonerPort {
             return Ok(None);
         }
 
-        // SIZING (mig 0522): appende l'ADDENDUM che descrive la mossa `adjust_sizing`
+        // SIZING (mig 0524): appende l'ADDENDUM che descrive la mossa `adjust_sizing`
         // SOLO se il sizing e' abilitato. Con sizing OFF il prompt resta byte-identico
-        // al pre-0522 (bit-identico per il flusso tier); il gate lato motore degrada
+        // al pre-0524 (bit-identico per il flusso tier); il gate lato motore degrada
         // comunque ogni AdjustSizing a KeepTier. Se l'addendum manca (misconfig) si
         // procede col solo template tier (degrado safe, non un errore).
         if self.scale_sizing_enabled().await {
@@ -694,7 +694,7 @@ impl PgMetaReasonerPort {
                 tracing::warn!(
                     target: "nexus_scale_controller",
                     key = SCALE_SIZING_TEMPLATE_KEY,
-                    "scale: sizing ON ma addendum template assente (applicare la mig 0522); \
+                    "scale: sizing ON ma addendum template assente (applicare la mig 0524); \
                      procedo col solo template tier"
                 );
             } else {
