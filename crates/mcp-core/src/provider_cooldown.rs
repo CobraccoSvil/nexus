@@ -28,6 +28,17 @@ pub struct ProviderHealthTimings {
     pub outage_threshold: usize,
     pub billing_recovery_interval_s: u64,
     pub recovery_probe_timeout_s: u64,
+    /// GOVERNANCE: TTL adattivo del cooldown LUNGO (billing) per TIPO d'errore
+    /// (`agent.governance.cooldown_adaptive_ttl`, regola G, default OFF). Con OFF il
+    /// cooldown lungo resta `cooldown_long_s` (bit-identico). NON tocca il
+    /// circuit-breaker ne' la fallback-chain (reti di sicurezza FISSE).
+    pub adaptive_billing_cooldown_enabled: bool,
+    /// TTL ridotto (s) usato dal cooldown adattivo per gli errori billing a recupero
+    /// periodico PREVEDIBILE (quota/rate), quando il flag e' ON
+    /// (`agent.governance.cooldown_adaptive_ttl_min_s`). Clampato in
+    /// `[cooldown_min_s, cooldown_long_s]`. Gli errori hard (credit/balance/payment,
+    /// ricarica manuale imprevedibile) restano a `cooldown_long_s`.
+    pub adaptive_billing_cooldown_min_s: u64,
 }
 
 impl Default for ProviderHealthTimings {
@@ -45,8 +56,46 @@ impl Default for ProviderHealthTimings {
             outage_threshold: 3,
             billing_recovery_interval_s: 60,
             recovery_probe_timeout_s: 30,
+            // Governance TTL adattivo OFF di default (opt-in): con OFF il cooldown
+            // lungo resta 6h (bit-identico). Min ridotto storico-neutro: 2h.
+            adaptive_billing_cooldown_enabled: false,
+            adaptive_billing_cooldown_min_s: 2 * 3600,
         }
     }
+}
+
+/// TTL adattivo del cooldown LUNGO (billing) per TIPO d'errore, derivato dalla
+/// `reason` STRUTTURATA (regola M: la reason e' la categoria d'errore, non prosa da
+/// classificare). Funzione PURA (testabile senza stato globale). Opt-in
+/// (`adaptive_billing_cooldown_enabled`): con OFF ritorna sempre `cooldown_long_s`
+/// -> comportamento bit-identico. NON tocca il circuit-breaker ne' la fallback-chain
+/// (reti di sicurezza FISSE, per vincolo del task).
+///
+/// Il re-probe periodico (`BILLING_REPROBE_INTERVAL_S`) recupera comunque in
+/// anticipo se il credito torna: il TTL e' solo il LIMITE SUPERIORE. La riduzione e'
+/// quindi a basso rischio.
+///   - hard billing (`credit`/`balance`/`payment`, ricarica MANUALE imprevedibile)
+///     -> `cooldown_long_s` pieno (nessuna riduzione).
+///   - quota/rate (recupero periodico PREVEDIBILE) -> `adaptive_billing_cooldown_min_s`
+///     clampato in `[cooldown_min_s, cooldown_long_s]`.
+///   - ogni altra reason -> `cooldown_long_s` (conservativo).
+pub fn adaptive_billing_cooldown_secs(reason: &str, timings: &ProviderHealthTimings) -> u64 {
+    if !timings.adaptive_billing_cooldown_enabled {
+        return timings.cooldown_long_s;
+    }
+    let r = reason.to_ascii_lowercase();
+    // Hard billing: ricarica manuale -> nessuna riduzione.
+    if r.contains("credit") || r.contains("balance") || r.contains("payment") {
+        return timings.cooldown_long_s;
+    }
+    // Quota/rate: recupero periodico prevedibile -> TTL ridotto (clampato).
+    if r.contains("quota") || r.contains("rate") {
+        return timings
+            .adaptive_billing_cooldown_min_s
+            .clamp(timings.cooldown_min_s, timings.cooldown_long_s);
+    }
+    // Conservativo: qualunque altra causa resta al cooldown lungo pieno.
+    timings.cooldown_long_s
 }
 
 static HEALTH_TIMINGS: OnceLock<ProviderHealthTimings> = OnceLock::new();
@@ -393,7 +442,10 @@ pub async fn billing_cooldown_recovery_loop(
 /// `restore_cooldown` invece di partire pulito (quel restart era il bug
 /// "LED openai verde" segnalato dall'utente).
 pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
-    let long_secs = provider_health_timings().cooldown_long_s;
+    // TTL adattivo per tipo d'errore (governance, opt-in): con flag OFF ritorna
+    // `cooldown_long_s` (6h, bit-identico). Il re-probe periodico recupera comunque
+    // in anticipo; il TTL e' solo il limite superiore.
+    let long_secs = adaptive_billing_cooldown_secs(reason, &provider_health_timings());
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(long_secs);
@@ -777,6 +829,52 @@ mod tests {
         assert_eq!(t.outage_threshold, 3);
         assert_eq!(t.billing_recovery_interval_s, 60);
         assert_eq!(t.recovery_probe_timeout_s, 30);
+    }
+
+    #[test]
+    fn adaptive_ttl_off_ritorna_sempre_cooldown_lungo() {
+        // Flag OFF (default): qualunque reason -> cooldown lungo pieno (bit-identico).
+        let t = ProviderHealthTimings::default();
+        assert!(!t.adaptive_billing_cooldown_enabled);
+        assert_eq!(adaptive_billing_cooldown_secs("credit balance too low", &t), t.cooldown_long_s);
+        assert_eq!(adaptive_billing_cooldown_secs("quota_exceeded", &t), t.cooldown_long_s);
+    }
+
+    #[test]
+    fn adaptive_ttl_on_riduce_solo_quota_e_rate() {
+        let t = ProviderHealthTimings {
+            adaptive_billing_cooldown_enabled: true,
+            adaptive_billing_cooldown_min_s: 2 * 3600,
+            ..Default::default()
+        };
+        // Hard billing (credit/balance/payment): ricarica manuale -> nessuna riduzione.
+        assert_eq!(adaptive_billing_cooldown_secs("credit balance too low", &t), t.cooldown_long_s);
+        assert_eq!(adaptive_billing_cooldown_secs("payment required", &t), t.cooldown_long_s);
+        // Quota/rate: recupero prevedibile -> TTL ridotto (2h).
+        assert_eq!(adaptive_billing_cooldown_secs("quota_exceeded", &t), 2 * 3600);
+        assert_eq!(adaptive_billing_cooldown_secs("rate_limit", &t), 2 * 3600);
+        // Altra causa: conservativo -> cooldown lungo pieno.
+        assert_eq!(adaptive_billing_cooldown_secs("boh", &t), t.cooldown_long_s);
+    }
+
+    #[test]
+    fn adaptive_ttl_min_clampato_nel_range() {
+        let base = ProviderHealthTimings {
+            adaptive_billing_cooldown_enabled: true,
+            ..Default::default()
+        };
+        // Min sotto cooldown_min_s (10) -> clampato a cooldown_min_s.
+        let t = ProviderHealthTimings {
+            adaptive_billing_cooldown_min_s: 1,
+            ..base
+        };
+        assert_eq!(adaptive_billing_cooldown_secs("quota", &t), t.cooldown_min_s);
+        // Min sopra cooldown_long_s -> clampato a cooldown_long_s.
+        let t2 = ProviderHealthTimings {
+            adaptive_billing_cooldown_min_s: 99 * 3600,
+            ..base
+        };
+        assert_eq!(adaptive_billing_cooldown_secs("quota", &t2), t2.cooldown_long_s);
     }
 
     #[test]

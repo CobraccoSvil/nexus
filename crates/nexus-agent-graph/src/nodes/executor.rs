@@ -365,6 +365,18 @@ pub struct ExecutorConfig {
     /// summary, da `agent.context.rolling_keep_recent_turns`. I messaggi
     /// `hist[..len-keep_recent]` (aggiustati per il pairing) vengono riassunti.
     pub rolling_keep_recent: i64,
+    /// GOVERNANCE costo/beneficio del rolling-summary (opt-in,
+    /// `agent.governance.rolling_summary_adaptive`, default OFF): quando ON, il
+    /// rolling-summary viene SALTATO se il prefisso da riassumere e' sotto
+    /// [`Self::governance_rolling_summary_min_prefix`] (il beneficio non giustifica
+    /// il costo della chiamata LLM). Decisione PURA
+    /// [`crate::decisions::governance::rolling_summary_worthwhile`]. OFF =
+    /// comportamento storico (bit-identico: decide solo `select_rolling_summary_cutoff`).
+    pub governance_rolling_summary_adaptive: bool,
+    /// Soglia minima di messaggi del prefisso sotto cui il rolling-summary NON vale
+    /// il costo (`agent.governance.rolling_summary_min_prefix`, regola G). Usata solo
+    /// se [`Self::governance_rolling_summary_adaptive`] e' ON.
+    pub governance_rolling_summary_min_prefix: i64,
     /// Hard cap del contesto (ADR 0016 D2, `agent.context.hard_cap_ratio`): se
     /// DOPO upscale+brake la stima resta `>= ratio*window`, il run termina
     /// fail-fast con errore strutturato invece di chiamare l'LLM. `0.0` = gate
@@ -545,6 +557,10 @@ impl Default for ExecutorConfig {
             rolling_summary_enabled: false,
             // Default coerente con `agent.context.rolling_keep_recent_turns` (2).
             rolling_keep_recent: 2,
+            // Governance rolling-summary OFF di default (opt-in): con OFF il gate
+            // costo/beneficio non si applica -> comportamento storico bit-identico.
+            governance_rolling_summary_adaptive: false,
+            governance_rolling_summary_min_prefix: 6,
             // Default safe-DB-down: hard cap OFF (il wiring mcp-core passa
             // `agent.context.hard_cap_ratio`, 0.95 in produzione).
             hard_cap_ratio: 0.0,
@@ -1299,6 +1315,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
                         state.user_intent.as_deref(),
                         g1_cur_provider.as_deref(),
                         g1_cur_model.as_deref(),
+                        ctx.exec_mode(),
                     )
                     .await
                     .unwrap_or_default();
@@ -1560,6 +1577,7 @@ la richiesta in modo piu' specifico.",
                         state.user_intent.as_deref(),
                         expl_cur_provider.as_deref(),
                         expl_cur_model.as_deref(),
+                        ctx.exec_mode(),
                     )
                     .await
                     .unwrap_or_default();
@@ -1873,6 +1891,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                             state.user_intent.as_deref(),
                             ra_cur_provider.as_deref(),
                             ra_cur_model.as_deref(),
+                            ctx.exec_mode(),
                         )
                         .await
                         .unwrap_or_default();
@@ -2178,6 +2197,7 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                             state.user_intent.as_deref(),
                             rp_cur_provider.as_deref(),
                             rp_cur_model.as_deref(),
+                            ctx.exec_mode(),
                         )
                         .await
                         .unwrap_or_default();
@@ -2545,37 +2565,56 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                 if let Some(cut) =
                     ctxr::select_rolling_summary_cutoff(&hist, eff_rolling_keep)
                 {
-                    let prefix_text = ctxr::serialize_prefix_for_summary(&hist, cut);
-                    match self.summary_store.summarize(prefix_text, mode).await {
-                        Ok(summary) if !summary.trim().is_empty() => {
-                            let before = hist.len();
-                            hist = ctxr::apply_rolling_summary(&hist, cut, &summary);
-                            tracing::info!(
-                                target: "nexus_agent_graph::executor",
-                                run_id = %run_id,
-                                phase = phase_now,
-                                msgs_before = before,
-                                msgs_after = hist.len(),
-                                cutoff = cut,
-                                "rolling summary: prefisso conversazione riassunto"
-                            );
-                        }
-                        Ok(_) => {
-                            // Summary vuoto: degrada (history invariata).
-                            tracing::warn!(
-                                target: "nexus_agent_graph::executor",
-                                run_id = %run_id,
-                                "rolling summary: risposta vuota, degrado a history invariata"
-                            );
-                        }
-                        Err(e) => {
-                            // Guasto LLM / Replay no-op: degrado best-effort.
-                            tracing::warn!(
-                                target: "nexus_agent_graph::executor",
-                                run_id = %run_id,
-                                error = %e,
-                                "rolling summary non disponibile, degrado a history invariata"
-                            );
+                    // GOVERNANCE costo/beneficio (opt-in, decisione PURA regola L):
+                    // salta il rolling-summary se il prefisso da riassumere e' troppo
+                    // piccolo per giustificare il costo della chiamata LLM. Flag OFF
+                    // (default) -> comportamento storico bit-identico.
+                    let governance_skip = self.cfg.governance_rolling_summary_adaptive
+                        && !crate::decisions::governance::rolling_summary_worthwhile(
+                            cut as i64,
+                            self.cfg.governance_rolling_summary_min_prefix,
+                        );
+                    if governance_skip {
+                        tracing::debug!(
+                            target: "nexus_agent_graph::executor",
+                            run_id = %run_id,
+                            cutoff = cut,
+                            min_prefix = self.cfg.governance_rolling_summary_min_prefix,
+                            "rolling summary: saltato per governance costo/beneficio (prefisso sotto soglia)"
+                        );
+                    } else {
+                        let prefix_text = ctxr::serialize_prefix_for_summary(&hist, cut);
+                        match self.summary_store.summarize(prefix_text, mode).await {
+                            Ok(summary) if !summary.trim().is_empty() => {
+                                let before = hist.len();
+                                hist = ctxr::apply_rolling_summary(&hist, cut, &summary);
+                                tracing::info!(
+                                    target: "nexus_agent_graph::executor",
+                                    run_id = %run_id,
+                                    phase = phase_now,
+                                    msgs_before = before,
+                                    msgs_after = hist.len(),
+                                    cutoff = cut,
+                                    "rolling summary: prefisso conversazione riassunto"
+                                );
+                            }
+                            Ok(_) => {
+                                // Summary vuoto: degrada (history invariata).
+                                tracing::warn!(
+                                    target: "nexus_agent_graph::executor",
+                                    run_id = %run_id,
+                                    "rolling summary: risposta vuota, degrado a history invariata"
+                                );
+                            }
+                            Err(e) => {
+                                // Guasto LLM / Replay no-op: degrado best-effort.
+                                tracing::warn!(
+                                    target: "nexus_agent_graph::executor",
+                                    run_id = %run_id,
+                                    error = %e,
+                                    "rolling summary non disponibile, degrado a history invariata"
+                                );
+                            }
                         }
                     }
                 }
@@ -3198,7 +3237,12 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
             if escalations < self.cfg.max_escalations && !tools_json.is_empty() {
                 let inputs = self
                     .escalation
-                    .escalation_inputs(state.user_intent.as_deref(), Some(&provider), Some(&model))
+                    .escalation_inputs(
+                        state.user_intent.as_deref(),
+                        Some(&provider),
+                        Some(&model),
+                        ctx.exec_mode(),
+                    )
                     .await
                     .unwrap_or_default();
                 // Indice catena 0: catena RELATIVA al corrente (vedi ramo G1);
@@ -4226,6 +4270,7 @@ impl ExecutorNode {
                             state.user_intent.as_deref(),
                             cur_provider.as_deref(),
                             cur_model.as_deref(),
+                            ctx.exec_mode(),
                         )
                         .await
                         .unwrap_or_default();

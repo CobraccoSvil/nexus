@@ -888,7 +888,17 @@ pub trait ModelUpscalePort: Send + Sync {
 pub trait EscalationPort: Send + Sync {
     /// Risolve gli input dell'escalation per il turno corrente: catena
     /// intra-provider di `(provider, model)`, stato cooldown del provider e
-    /// candidato cross-provider per `intent`. SOLA LETTURA: nessun gate `mode`.
+    /// candidato cross-provider per `intent`. SOLA LETTURA.
+    ///
+    /// GATE `mode` (governance telemetria-aware, opt-in): in [`ExecMode::Real`]
+    /// l'impl PUO' RIORDINARE la `chain` per PROBABILITA' di successo derivata da
+    /// telemetria strutturata (punto unico puro
+    /// [`crate::decisions::governance::rank_candidates`]) quando il flag di
+    /// governance e' ON; in [`ExecMode::Replay`] il riordino e' SALTATO -> catena
+    /// nell'ordine DB (parita' shadow col baseline Python, come le altre decisioni
+    /// gata `mode`). Con flag OFF (default) il riordino non avviene neppure in Real:
+    /// comportamento bit-identico. La SELEZIONE resta il punto unico puro
+    /// [`crate::decisions::escalation::pick_escalation_model`] (invariato).
     ///
     /// FAIL-OPEN (sicurezza): un guasto di lettura (DB/router down) NON deve
     /// bloccare il run — l'impl ritorna `EscalationInputs` "vuoto" (catena vuota,
@@ -900,6 +910,7 @@ pub trait EscalationPort: Send + Sync {
         intent: Option<&str>,
         provider: Option<&str>,
         model: Option<&str>,
+        mode: ExecMode,
     ) -> Result<EscalationInputs, PortError>;
 
     /// FAILOVER cross-provider su provider CADUTO (gateway 500 `PROVIDER_ERROR` /

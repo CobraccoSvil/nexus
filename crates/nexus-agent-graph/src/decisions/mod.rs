@@ -60,6 +60,7 @@ pub mod dag_scheduler;
 pub mod end_turn;
 pub mod escalation;
 pub mod g1_accounting;
+pub mod governance;
 pub mod helpers;
 pub mod loop_signatures;
 pub mod m16;
@@ -91,6 +92,10 @@ pub use end_turn::{
 };
 pub use escalation::{pick_escalation_model, ChainEntry, CrossProviderCandidate, EscalationPick};
 pub use g1_accounting::{g1_accounting, G1Accounting, G1Signals};
+pub use governance::{
+    is_recently_failed, likelihood_score, rank_candidates, rolling_summary_worthwhile,
+    GovernancePolicy, ModelTelemetry,
+};
 pub use m16::{
     build_m16_allowed, is_tool_allowed, merge_discovered_run, parse_discovered_tools,
     py_json_len_ascii, DiscoveredTool, M16_META_TOOLS,

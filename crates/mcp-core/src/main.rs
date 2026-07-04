@@ -52,6 +52,7 @@ mod long_running;
 mod mcp_client;
 mod mcp_connectors;
 mod middleware;
+mod governance_telemetry;
 mod model_catalog_sync;
 mod model_health_probe;
 mod models;
@@ -997,6 +998,15 @@ async fn main() -> anyhow::Result<()> {
             opt.and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(d)
         };
+        let p_bool = |opt: Option<String>, d: bool| -> bool {
+            opt.map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            })
+            .unwrap_or(d)
+        };
         let (
             s_recov_interval,
             s_recov_probe_to,
@@ -1047,6 +1057,20 @@ async fn main() -> anyhow::Result<()> {
         pht.health_probe_timeout_s = p_u64(s_probe_to.ok().flatten(), pht.health_probe_timeout_s);
         pht.slow_cooldown_s = p_u64(s_slow_cd.ok().flatten(), pht.slow_cooldown_s);
         pht.outage_threshold = p_usize(s_outage.ok().flatten(), pht.outage_threshold);
+        // Governance: TTL adattivo del cooldown lungo per tipo d'errore (opt-in,
+        // mig 0523). Default OFF -> cooldown lungo invariato (bit-identico).
+        let (s_adaptive_ttl, s_adaptive_ttl_min) = tokio::join!(
+            settings::get_setting(&state.db, "agent.governance.cooldown_adaptive_ttl"),
+            settings::get_setting(&state.db, "agent.governance.cooldown_adaptive_ttl_min_s"),
+        );
+        pht.adaptive_billing_cooldown_enabled = p_bool(
+            s_adaptive_ttl.ok().flatten(),
+            pht.adaptive_billing_cooldown_enabled,
+        );
+        pht.adaptive_billing_cooldown_min_s = p_u64(
+            s_adaptive_ttl_min.ok().flatten(),
+            pht.adaptive_billing_cooldown_min_s,
+        );
         provider_cooldown::init_provider_health_timings(pht);
         tracing::info!(
             "provider health timings (DB): recovery_interval={}s probe_timeout={}s cooldown_long={}s outage_threshold={}",

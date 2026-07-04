@@ -29,10 +29,15 @@
 
 use async_trait::async_trait;
 use sqlx::PgPool;
+use std::collections::HashMap;
 
 use nexus_agent_graph::decisions::escalation::{ChainEntry, CrossProviderCandidate};
-use nexus_agent_graph::runtime::ports::{EscalationInputs, EscalationPort, PortError};
+use nexus_agent_graph::decisions::governance::rank_candidates;
+use nexus_agent_graph::runtime::ports::{EscalationInputs, EscalationPort, ExecMode, PortError};
 
+use crate::governance_telemetry::{
+    governance_enabled, load_governance_policy, load_model_telemetry,
+};
 use crate::internal_routing::{resolve_purpose_model_db, PurposeResolution};
 use crate::provider_cooldown::is_provider_in_cooldown;
 
@@ -254,17 +259,92 @@ impl PgEscalationPort {
             tier,
         })
     }
+
+    /// GOVERNANCE telemetria-aware (opt-in, regola G + punto unico regola L):
+    /// riordina la catena intra-provider per PROBABILITA' di successo derivata da
+    /// telemetria strutturata (regola M), delegando al modulo PURO
+    /// [`rank_candidates`]. La SELEZIONE a valle (`pick_escalation_model`) prende
+    /// l'elemento all'indice `escalations`: col riordino il TOP e' il candidato
+    /// piu' promettente (i "recently_failed" retrocessi in coda), invece del piu'
+    /// economico per rank.
+    ///
+    /// GATE `mode` (parita' shadow): SOLO in [`ExecMode::Real`]; in
+    /// [`ExecMode::Replay`] la catena resta nell'ordine DB (bit-identico al baseline
+    /// Python, come le altre decisioni gata `mode`). Flag OFF (default) -> nessun
+    /// riordino neppure in Real. Catena con < 2 elementi -> nulla da riordinare.
+    /// FAIL-OPEN: telemetria vuota -> punteggi neutri -> ordine invariato.
+    async fn maybe_rank_chain(
+        &self,
+        provider: Option<&str>,
+        current_model: Option<&str>,
+        chain: Vec<ChainEntry>,
+        mode: ExecMode,
+    ) -> Vec<ChainEntry> {
+        // Replay: nessun riordino (parita' col baseline Python, come recover/scale).
+        if mode != ExecMode::Real {
+            return chain;
+        }
+        let provider = match provider.filter(|p| !p.trim().is_empty()) {
+            Some(p) => p,
+            None => return chain,
+        };
+        // 0/1 elementi: ordine indistinguibile, evita I/O inutile.
+        if chain.len() < 2 {
+            return chain;
+        }
+        // Master flag OFF (default): comportamento bit-identico.
+        if !governance_enabled(&self.db).await {
+            return chain;
+        }
+
+        // La catena e' INTRA-provider: tutti i candidati hanno lo stesso `provider`.
+        let candidates: Vec<(String, String)> = chain
+            .iter()
+            .map(|e| (provider.to_string(), e.escalation_model.clone()))
+            .collect();
+        let telemetry = load_model_telemetry(&self.db, &candidates).await;
+        let policy = load_governance_policy(&self.db).await;
+        // Il modello corrente NON e' nella catena (chain_for filtra rank > corrente);
+        // lo passo comunque come exclude per robustezza (rank lo escluderebbe).
+        let exclude: Vec<(String, String)> = current_model
+            .filter(|m| !m.trim().is_empty())
+            .map(|m| vec![(provider.to_string(), m.to_string())])
+            .unwrap_or_default();
+        let ranked = rank_candidates(&candidates, &telemetry, &exclude, &policy);
+
+        // Rimappa l'ordine sul vettore di ChainEntry (preserva il `tier`) con un
+        // sort STABILE per posizione di rank; le entry non presenti nel ranked
+        // (mai, salvo l'eventuale current) restano in coda nell'ordine originale.
+        let rank_pos: HashMap<&str, usize> = ranked
+            .iter()
+            .enumerate()
+            .map(|(i, (_, m))| (m.as_str(), i))
+            .collect();
+        let mut out = chain;
+        out.sort_by_key(|e| {
+            rank_pos
+                .get(e.escalation_model.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        out
+    }
 }
 
 #[async_trait]
 impl EscalationPort for PgEscalationPort {
     /// Risolve gli input dell'escalation per il turno corrente. SOLA LETTURA.
     /// FAIL-OPEN: ogni sotto-lettura degrada a vuoto, mai un `PortError`.
+    ///
+    /// La catena Tier 1 puo' essere RIORDINATA per probabilita' di successo
+    /// (governance telemetria-aware, `maybe_rank_chain`): gata `mode` (solo Real) e
+    /// dietro il flag `agent.governance.telemetry_aware` (OFF = bit-identico).
     async fn escalation_inputs(
         &self,
         _intent: Option<&str>,
         provider: Option<&str>,
         model: Option<&str>,
+        mode: ExecMode,
     ) -> Result<EscalationInputs, PortError> {
         // Tier 2 (cross-provider): sempre risolto, indipendente dalla coppia
         // corrente; e' il modulo puro a decidere se usarlo. Passiamo la coppia
@@ -294,6 +374,10 @@ impl EscalationPort for PgEscalationPort {
             }
             _ => (Vec::new(), false),
         };
+
+        // GOVERNANCE telemetria-aware (opt-in, gata Real): riordina la catena per
+        // probabilita' di successo. Flag OFF / Replay / < 2 elementi -> invariata.
+        let chain = self.maybe_rank_chain(provider, model, chain, mode).await;
 
         Ok(EscalationInputs {
             chain,
@@ -501,7 +585,7 @@ mod tests {
         .await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"))
+            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"), ExecMode::Real)
             .await
             .expect("fail-open: mai PortError");
         let models: Vec<&str> = inputs
@@ -536,7 +620,7 @@ mod tests {
         .await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"))
+            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"), ExecMode::Real)
             .await
             .expect("fail-open");
         let tiers: Vec<(&str, Option<&str>)> = inputs
@@ -592,7 +676,7 @@ mod tests {
         .await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("deepseek"), Some("deepseek-v4-flash"))
+            .escalation_inputs(None, Some("deepseek"), Some("deepseek-v4-flash"), ExecMode::Real)
             .await
             .expect("fail-open");
         let models: Vec<&str> = inputs
@@ -636,7 +720,7 @@ mod tests {
         // leggere la vista, quindi non serve alcun seed del catalog.
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"))
+            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"), ExecMode::Real)
             .await
             .expect("fail-open");
         assert!(
@@ -654,7 +738,7 @@ mod tests {
         // la vista non viene nemmeno interrogata (nessun seed catalog necessario).
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"))
+            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"), ExecMode::Real)
             .await
             .expect("fail-open");
         assert!(inputs.chain.is_empty(), "api key vuota -> provider non disponibile");
@@ -665,7 +749,10 @@ mod tests {
     async fn coppia_assente_catena_vuota(pool: PgPool) {
         create_schema(&pool).await;
         let port = PgEscalationPort::new(pool.clone());
-        let inputs = port.escalation_inputs(None, None, None).await.expect("fail-open");
+        let inputs = port
+            .escalation_inputs(None, None, None, ExecMode::Real)
+            .await
+            .expect("fail-open");
         assert!(inputs.chain.is_empty());
         assert!(!inputs.provider_in_cooldown);
         assert!(inputs.cross_provider.is_none());
@@ -678,7 +765,7 @@ mod tests {
         set_api_key(&pool, "openai", "sk-live").await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("openai"), Some("gpt-4o-mini"))
+            .escalation_inputs(None, Some("openai"), Some("gpt-4o-mini"), ExecMode::Real)
             .await
             .expect("fail-open");
         assert!(inputs.chain.is_empty());

@@ -783,6 +783,10 @@ async fn load_executor_config(
         // della porta PgSummaryStore (agent.context.rolling_summary_model).
         rolling_summary_enabled: setting_bool(db, "agent.context.rolling_summary_enabled", d.rolling_summary_enabled).await,
         rolling_keep_recent: setting_i64(db, "agent.context.rolling_keep_recent_turns", d.rolling_keep_recent).await,
+        // Governance costo/beneficio del rolling-summary (opt-in, mig 0523). OFF di
+        // default -> il gate non si applica (comportamento storico bit-identico).
+        governance_rolling_summary_adaptive: setting_bool(db, "agent.governance.rolling_summary_adaptive", d.governance_rolling_summary_adaptive).await,
+        governance_rolling_summary_min_prefix: setting_i64(db, "agent.governance.rolling_summary_min_prefix", d.governance_rolling_summary_min_prefix).await,
         // ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
         // dell'executor (stesse chiavi della RoutingConfig, regola L).
         pending_steps_detection_enabled: setting_bool(db, "agent.closure.pending_steps_detection_enabled", d.pending_steps_detection_enabled).await,

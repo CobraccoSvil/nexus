@@ -264,8 +264,11 @@ pub(crate) async fn route_model_from_catalog(
         "light" => vec!["light", "medium"],
         other => vec![other],
     };
-    // Branch: catalog dynamic routing (selettore agentico unico).
-    select_agentic_model(db, &tier_chain, Some(capability), 0, &[], order_clause)
+    // Branch: catalog dynamic routing (selettore agentico unico). Variante
+    // GOVERNATA telemetria-aware (opt-in `agent.governance.telemetry_aware`, OFF =
+    // bit-identico al selettore standard). Riordina i candidati ammissibili per
+    // probabilita' di successo (regola M) senza toccare tier/capability/gate.
+    select_agentic_model_governed(db, &tier_chain, Some(capability), 0, &[], order_clause)
         .await
         .map(|(provider, model)| DynamicRoutingDecision { provider, model })
 }
@@ -436,6 +439,91 @@ pub(crate) async fn select_agentic_model(
             None
         }
     }
+}
+
+/// Numero di candidati recuperati per il riordino telemetria-aware della
+/// selezione dinamica (governance). Un pool piccolo del PRIMO tier con candidati:
+/// il riordino promuove/retrocede tra alternative gia' ammissibili, non allarga la
+/// selezione ad altri tier (la degradazione graceful resta di `select_models_tierchain`).
+const GOVERNED_CANDIDATE_POOL: i64 = 8;
+
+/// Variante GOVERNATA (telemetria-aware) di [`select_agentic_model`] per la
+/// selezione dinamica dal catalog. Opt-in (regola G, flag
+/// `agent.governance.telemetry_aware`, default OFF): a flag OFF DELEGA a
+/// [`select_agentic_model`] -> comportamento BIT-IDENTICO (top-1 per `order_by`).
+///
+/// A flag ON recupera i primi [`GOVERNED_CANDIDATE_POOL`] candidati AMMISSIBILI del
+/// primo tier con match (stessa WHERE del punto unico `select_models_tierchain`,
+/// regola L) e li RIORDINA per probabilita' di successo derivata da telemetria
+/// strutturata (regola M) col modulo PURO
+/// [`nexus_agent_graph::decisions::governance::rank_candidates`]: un modello con
+/// error-rate/timeout alto negli ultimi N check viene retrocesso, l'alternativa
+/// sana promossa. L'ordinamento e' STABILE: con telemetria uniforme il top-1 resta
+/// quello per `order_by` (retro-compat anche nel ramo ON).
+///
+/// REPLAY: la selezione dinamica e' una risoluzione del turno PRIMARIO; il modello
+/// scelto viene PINNATO/sticky per il run, quindi il replay/shadow riusa il pin
+/// checkpointato (nessuna ri-derivazione divergente). FAIL-OPEN: errore di lettura
+/// telemetria -> punteggi neutri -> ordine invariato.
+pub(crate) async fn select_agentic_model_governed(
+    db: &PgPool,
+    tier_chain: &[&str],
+    capability: Option<&str>,
+    min_context_window: i64,
+    exclude_providers: &[String],
+    order_by: &str,
+) -> Option<(String, String)> {
+    // Flag OFF (default): comportamento bit-identico al selettore standard.
+    if !crate::governance_telemetry::governance_enabled(db).await {
+        return select_agentic_model(
+            db,
+            tier_chain,
+            capability,
+            min_context_window,
+            exclude_providers,
+            order_by,
+        )
+        .await;
+    }
+
+    // Stessa eleggibilita' del punto unico (regola L): NON re-implemento la WHERE.
+    let filter = crate::orchestrator::EligibilityFilter {
+        require_tool_use: true,
+        require_thinking_non_exclude: true,
+        capability,
+        min_context_window,
+        exclude_providers,
+        apply_cooldown: true,
+    };
+    let candidates = match crate::orchestrator::select_models_tierchain(
+        db,
+        &filter,
+        tier_chain,
+        order_by,
+        GOVERNED_CANDIDATE_POOL,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("select_agentic_model_governed: {e}");
+            return None;
+        }
+    };
+    // 0/1 candidati: nulla da riordinare (evita I/O telemetria inutile).
+    if candidates.len() < 2 {
+        return candidates.into_iter().next();
+    }
+
+    let telemetry = crate::governance_telemetry::load_model_telemetry(db, &candidates).await;
+    let policy = crate::governance_telemetry::load_governance_policy(db).await;
+    let ranked = nexus_agent_graph::decisions::governance::rank_candidates(
+        &candidates,
+        &telemetry,
+        &[],
+        &policy,
+    );
+    ranked.into_iter().next()
 }
 
 /// Mapping intent classificato -> intent_key per il lookup nella routing matrix.
