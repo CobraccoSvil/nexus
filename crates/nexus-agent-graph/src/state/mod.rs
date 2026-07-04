@@ -415,6 +415,22 @@ pub struct AgentState {
     pub exploration_nudge_sent: Option<bool>,
     /// `true` dopo aver iniettato il nudge anti-loop-comando.
     pub repeated_cmd_nudge_sent: Option<bool>,
+    /// Token CUMULATIVI del run (somma di `LlmUsage.total_tokens` di ogni risposta
+    /// LLM, regola M: segnale strutturato dal gateway, mai stima dal testo). Safety
+    /// net anti-runaway per-run: quando `>= ExecutorConfig::run_token_budget` (se il
+    /// budget e' `> 0`) l'executor chiude deterministicamente PRIMA della prossima
+    /// chiamata LLM. Reducer overwrite (last-write): l'executor legge il valore
+    /// portato dallo stato, somma il turno e riscrive il totale (come `iterations`).
+    /// `None`/0 su un run appena avviato -> nessun runaway rilevato. `i64` per
+    /// coerenza serde col resto dei contatori (letto/scritto come non-negativo).
+    pub tokens_used_total: Option<i64>,
+    /// Turni solo-testo CONSECUTIVI del run (la risposta LLM non conteneva tool_use
+    /// mentre il loop si aspettava azioni; segnale strutturato `LlmResponse.tool_calls`,
+    /// regola M). Azzerato appena il modello emette un tool_use, incrementato quando
+    /// non lo fa. Quando `>= ExecutorConfig::max_consecutive_text_only_turns` (se
+    /// `> 0`) l'executor chiude deterministicamente: fast-fail sul modello che descrive
+    /// senza agire (pattern gemini che ignora `force_tool_choice`). Reducer overwrite.
+    pub consecutive_text_only_turns: Option<i64>,
 
     // ── progress_controller ────────────────────────────────────────────────────
     /// Assi di stallo gia' guidati (GUIDE applicata) in questo run.

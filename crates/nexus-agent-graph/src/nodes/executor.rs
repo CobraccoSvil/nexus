@@ -197,7 +197,8 @@ use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
 use crate::runtime::ports::RecoveryMove;
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
-    put_extra, AgentState, ContentBlock, Message, MessageContent, StateDelta, StopReason, ToolUse,
+    put_extra, AgentState, ContentBlock, Message, MessageContent, MetaStep, StateDelta, StopReason,
+    ToolUse,
 };
 
 /// Tool brain-only `task_complete` (vedi `tool_dispatch`): conta nel gate
@@ -301,6 +302,25 @@ pub struct ExecutorConfig {
     /// auto-escalation intra-turno al signature-loop (`auto_escalations`). Regola
     /// G: ex literal `3` sparsi nei costrutti `ProgressSignals` e nel cap 2616.
     pub max_escalations: i64,
+    /// Budget TOKEN cumulativo del run (`agent.run_token_budget`, default 400000):
+    /// safety net anti-runaway COMPLEMENTARE a `iteration_cap` (che conta iterazioni).
+    /// Somma dei token (input+output, dal segnale strutturato `LlmUsage.total_tokens`,
+    /// regola M) di TUTTE le risposte LLM del run. Al raggiungimento (`>=`) il run
+    /// chiude deterministicamente (forced_close_unverified). `0` = disabilitato ->
+    /// comportamento bit-identico a oggi (retro-compatibile). Chiude il buco: un
+    /// modello che ignora `force_tool_choice` produce turni solo-testo che non
+    /// triggerano il signature-loop (contano ITERAZIONI, non TOKEN) e bruciano
+    /// ~16k token/turno (osservato un run a 1.8M token senza convergere). Regola G:
+    /// DB-driven, mai hardcoded.
+    pub run_token_budget: u64,
+    /// Turni solo-testo CONSECUTIVI oltre cui (`>=`) il run chiude deterministicamente
+    /// (`agent.max_consecutive_text_only_turns`, default 3): fast-fail sul modello che
+    /// DESCRIVE senza AGIRE (pattern gemini che ignora `force_tool_choice`). Un turno
+    /// e' "solo-testo" quando la risposta NON contiene tool_use mentre il loop si
+    /// aspetta azioni (segnale strutturato `LlmResponse.tool_calls`/`pending_tool_uses`,
+    /// regola M — mai dal parsing del testo). `0` = disabilitato -> bit-identico.
+    /// Regola G: DB-driven, mai hardcoded.
+    pub max_consecutive_text_only_turns: u32,
     /// Soglie DB-driven della rilevazione loop-by-signature
     /// (`agent.loop.signature_threshold` / `agent.loop.recent_signatures_cap`).
     /// Regola G: ex costanti `LOOP_THRESHOLD` / `RECENT_SIGNATURES_CAP`.
@@ -467,6 +487,10 @@ impl Default for ExecutorConfig {
             // se il DB non fornisce i setting; il wiring mcp-core passa i valori reali.
             forced_text_offset: 5,
             max_escalations: 3,
+            // Default safe-DB-down = seed mig 0520. Il wiring mcp-core passa i valori
+            // reali dai settings agent.run_token_budget / agent.max_consecutive_text_only_turns.
+            run_token_budget: 400_000,
+            max_consecutive_text_only_turns: 3,
             loop_thresholds: LoopThresholds::default(),
             // Default safe-DB-down = seed mig 0510 (2). Con nessuna storia di
             // clarify ripetuti l'asse non scatta mai -> comportamento invariato.
@@ -972,6 +996,73 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                 ..Default::default()
             }
             .into_opaque());
+        }
+
+        // ── (4d) BUDGET TOKEN cumulativo: safety net anti-runaway per COSTO ────
+        // Complementare a `iteration_cap` (che conta ITERAZIONI): un modello che
+        // ignora `force_tool_choice` produce turni solo-testo che non triggerano il
+        // signature-loop (contano ripetizioni di TOOL, non testo) e bruciano
+        // ~16k token/turno (osservato un run a 1.8M token / $2.42 senza convergere).
+        // Il conteggio arriva dal segnale STRUTTURATO dell'usage del gateway
+        // (regola M: `LlmUsage.total_tokens`, sommato a fine turno nello stato).
+        // `run_token_budget=0` = disabilitato -> bit-identico. Chiude PRIMA della
+        // chiamata LLM, come il cap iterazioni.
+        let tokens_used_total = state.tokens_used_total.unwrap_or(0).max(0) as u64;
+        if self.cfg.run_token_budget > 0 && tokens_used_total >= self.cfg.run_token_budget {
+            let budget_text = format!(
+                "Raggiunto il budget massimo di token del run ({} token, tetto {}). \
+Interrompo per evitare un consumo incontrollato: riformula la richiesta in modo \
+piu' specifico, oppure riprova con un modello piu' capace.",
+                tokens_used_total, self.cfg.run_token_budget
+            );
+            tracing::warn!(
+                target: "nexus_agent_graph::executor",
+                tokens_used = tokens_used_total,
+                budget = self.cfg.run_token_budget,
+                "BUDGET TOKEN cumulativo esaurito -> chiusura deterministica"
+            );
+            return Ok(self.close_runaway(
+                iters_in,
+                budget_text,
+                "budget_token_esaurito",
+                json!({
+                    "tokens_used_total": tokens_used_total,
+                    "run_token_budget": self.cfg.run_token_budget,
+                }),
+            ));
+        }
+
+        // ── (4e) FAST-FAIL turni SOLO-TESTO consecutivi ───────────────────────
+        // Rileva il modello che DESCRIVE senza AGIRE (pattern gemini che ignora
+        // `force_tool_choice`): N turni consecutivi in cui la risposta NON conteneva
+        // tool_use mentre il loop si aspettava azioni. Il contatore e' aggiornato a
+        // fine turno dal segnale STRUTTURATO `LlmResponse.tool_calls` (regola M), non
+        // dal testo. `max_consecutive_text_only_turns=0` = disabilitato -> bit-identico.
+        let text_only_streak = state.consecutive_text_only_turns.unwrap_or(0).max(0) as u32;
+        if self.cfg.max_consecutive_text_only_turns > 0
+            && text_only_streak >= self.cfg.max_consecutive_text_only_turns
+        {
+            let stall_text = format!(
+                "Il modello ha prodotto {} risposte consecutive di solo testo senza \
+eseguire alcuna azione (tetto {}). Interrompo: il compito non sta avanzando. \
+Riformula la richiesta, oppure riprova con un modello piu' capace di usare i tool.",
+                text_only_streak, self.cfg.max_consecutive_text_only_turns
+            );
+            tracing::warn!(
+                target: "nexus_agent_graph::executor",
+                text_only_streak,
+                threshold = self.cfg.max_consecutive_text_only_turns,
+                "TURNI SOLO-TESTO consecutivi oltre soglia -> chiusura deterministica"
+            );
+            return Ok(self.close_runaway(
+                iters_in,
+                stall_text,
+                "text_only_stallo",
+                json!({
+                    "consecutive_text_only_turns": text_only_streak,
+                    "max_consecutive_text_only_turns": self.cfg.max_consecutive_text_only_turns,
+                }),
+            ));
         }
 
         let mut g1_reroute_count = state.g1_reroute_count.unwrap_or(0);
@@ -2771,6 +2862,12 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                                 recent_tool_signatures: Some(Some(vec![])),
                                 g1_reroute_count: Some(Some(0)),
                                 action_nudge_count: Some(Some(0)),
+                                // Fresh start su provider sano: azzera anche lo streak
+                                // solo-testo (il failover NON e' un turno descrittivo
+                                // del modello; il tetto non deve scattare per un
+                                // cooldown di provider). tokens_used_total NON cambia:
+                                // la chiamata e' FALLITA (0 token effettivi).
+                                consecutive_text_only_turns: Some(Some(0)),
                                 pending_tool_uses: Some(Some(vec![])),
                                 stop_reason: Some(Some(StopReason::G1Escalated)),
                                 iterations: Some(Some(iters_in + 1)),
@@ -3401,6 +3498,28 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
             Some(merged)
         });
 
+        // ── Contatori anti-runaway CUMULATIVI (reducer overwrite last-write) ──
+        // (1) tokens_used_total: token del run finora + i token del turno dal
+        //     segnale STRUTTURATO dell'usage (regola M: `turn_total_tokens`,
+        //     input+output+cache, gia' calcolato sopra). Il ramo PRE-LLM del
+        //     prossimo giro lo confronta con `run_token_budget`. Su turno error
+        //     (gateway_errored) `turn_total_tokens` e' 0 (usage default): il totale
+        //     resta invariato, coerente col non-conteggio del ramo error.
+        // (2) consecutive_text_only_turns: azzerato se il modello ha emesso almeno
+        //     un tool_use (`pending_tool_uses` non vuoto = segnale strutturato
+        //     `resp.tool_calls`, regola M), altrimenti +1. Rileva il modello che
+        //     descrive senza agire (pattern gemini). Un turno error non conta come
+        //     "solo-testo" produttivo: e' un fallimento gestito dal ramo error, ma
+        //     resta comunque privo di tool_use -> incrementa (conservativo: un
+        //     provider che erra a raffica va chiuso anche via questo asse).
+        let prev_tokens_total = state.tokens_used_total.unwrap_or(0).max(0);
+        let new_tokens_total = prev_tokens_total.saturating_add(turn_total_tokens.max(0));
+        let new_text_only_streak = if pending_tool_uses.is_empty() {
+            state.consecutive_text_only_turns.unwrap_or(0).max(0) + 1
+        } else {
+            0
+        };
+
         let mut delta = StateDelta {
             messages: Some(vec![assistant_msg]),
             result: Some(Some(final_result)),
@@ -3417,6 +3536,9 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
             progress_strategy_axes: Some(Some(sorted(&progress_strategy))),
             repeated_cmd_nudge_sent: Some(Some(repeated_cmd_nudge_sent)),
             iterations: Some(Some(iters_in + 1)),
+            // Contatori anti-runaway cumulativi (safety net token, mig 0520).
+            tokens_used_total: Some(Some(new_tokens_total)),
+            consecutive_text_only_turns: Some(Some(new_text_only_streak)),
             action_nudge_count: Some(Some(nudge_count)),
             g1_reroute_count: Some(Some(g1_reroute_count)),
             sticky_provider: Some(sticky_provider),
@@ -4833,6 +4955,44 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
             pending_tool_uses: Some(Some(vec![])),
             stop_reason: Some(Some(StopReason::EndTurn)),
             iterations: Some(Some(iters_in + 1)),
+            ..Default::default()
+        }
+        .into_opaque()
+    }
+
+    /// Chiusura deterministica anti-runaway per un limite basato sui TOKEN
+    /// (budget cumulativo o turni solo-testo consecutivi). PUNTO UNICO (regola L)
+    /// della costruzione del delta di force-close per questi due limiti: replica
+    /// ESATTAMENTE il ramo `iteration_cap` (message assistant + `result` + pending
+    /// vuoto + `EndTurn` + `iterations+1` + `forced_close_unverified=true`) cosi'
+    /// il run NON finisce mai "completed" e il finalizzatore lo mappa a
+    /// FailedDiagnosed. Emette un `MetaStep` con `reason` strutturato + valore
+    /// (regola M: segnale strutturato, non testo) per la telemetria/chat.
+    fn close_runaway(
+        &self,
+        iters_in: i64,
+        close_text: String,
+        reason: &str,
+        meta_payload: Value,
+    ) -> OpaqueDelta {
+        StateDelta {
+            messages: Some(vec![Message::Ai {
+                content: MessageContent::text(close_text.clone()),
+                tool_calls: vec![],
+                reasoning: None,
+            }]),
+            meta_steps: Some(vec![MetaStep {
+                kind: "anti_runaway".to_string(),
+                title: "Run interrotto per limite di sicurezza".to_string(),
+                payload: json!({ "reason": reason, "detail": meta_payload }),
+                correlation_id: None,
+                created_at: None,
+            }]),
+            result: Some(Some(close_text)),
+            pending_tool_uses: Some(Some(vec![])),
+            stop_reason: Some(Some(StopReason::EndTurn)),
+            iterations: Some(Some(iters_in + 1)),
+            forced_close_unverified: Some(Some(true)),
             ..Default::default()
         }
         .into_opaque()

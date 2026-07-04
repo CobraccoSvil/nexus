@@ -3655,6 +3655,235 @@ async fn scale_pinned_heavy_disattiva_detector() {
     assert!(out.extra.get(SCALE_CTX_KEY).is_none(), "detector disattivato dal pin");
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+//  Limiti anti-runaway basati sui TOKEN (mig 0520)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Stub LLM che ritorna un turno SOLO-TESTO con un `usage` dato (input+output):
+/// esercita il conteggio `tokens_used_total` dal segnale strutturato dell'usage.
+fn llm_text_usage(text: &str, prompt: i64, completion: i64) -> Arc<StubLlmGateway> {
+    Arc::new(StubLlmGateway {
+        canned: LlmResponse {
+            content: text.to_string(),
+            tool_calls: vec![],
+            usage: LlmUsage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: prompt + completion,
+                ..LlmUsage::default()
+            },
+            ..Default::default()
+        },
+        error: None,
+        error_provider_unavailable: false,
+        seen: std::sync::Mutex::new(vec![]),
+    })
+}
+
+#[tokio::test]
+async fn run_token_budget_oltre_soglia_forza_chiusura_senza_modello() {
+    // Il run ha gia' consumato >= run_token_budget: il ramo PRE-LLM chiude
+    // deterministicamente (forced_close_unverified, EndTurn) SENZA chiamare il
+    // modello, come il cap iterazioni. Motivo strutturato nel meta_step.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 400_000,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        tokens_used_total: Some(400_001),
+        iterations: Some(10),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    assert_eq!(out.iterations, Some(11));
+    // Motivo strutturato (regola M): meta_step con reason budget_token_esaurito.
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("meta_step anti_runaway");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("budget_token_esaurito")
+    );
+    // LLM NON chiamato: chiusura prima del modello.
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn run_token_budget_sotto_soglia_prosegue() {
+    // Sotto la soglia il ramo NON scatta: il turno prosegue (chiamata LLM).
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 400_000,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("Ecco la risposta."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        tokens_used_total: Some(399_999),
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Il turno e' avvenuto normalmente.
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.result.as_deref(), Some("Ecco la risposta."));
+    assert_eq!(llm.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn tokens_used_total_accumula_usage_del_turno() {
+    // Il contatore CUMULATIVO somma i token del turno dal segnale strutturato
+    // dell'usage (input+output), sopra il valore portato dallo stato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = llm_text_usage("risposta", 1_000, 500);
+    let ctx = ctx_with(llm, false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        tokens_used_total: Some(2_000),
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // 2000 (prev) + 1500 (usage del turno) = 3500.
+    assert_eq!(out.tokens_used_total, Some(3_500));
+}
+
+#[tokio::test]
+async fn max_consecutive_text_only_turns_oltre_soglia_forza_chiusura() {
+    // A N turni solo-testo consecutivi (>= soglia) il ramo PRE-LLM chiude
+    // deterministicamente: fast-fail sul modello che descrive senza agire.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        max_consecutive_text_only_turns: 3,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea il file")],
+        consecutive_text_only_turns: Some(3),
+        iterations: Some(5),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("meta_step anti_runaway");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("text_only_stallo")
+    );
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn consecutive_text_only_turns_incrementa_su_testo_e_azzera_su_tool() {
+    // Il contatore si INCREMENTA su un turno solo-testo (nessun tool_use) e si
+    // AZZERA appena il modello emette un tool_use (segnale strutturato).
+    let rc = Arc::new(StubRunControlStore::default());
+
+    // (a) Turno solo-testo: da 1 -> 2. Soglia alta per non farlo scattare.
+    let cfg = ExecutorConfig {
+        max_consecutive_text_only_turns: 10,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg.clone(), rc.clone());
+    let llm = Arc::new(StubLlmGateway::with_text("descrivo soltanto"));
+    let ctx = ctx_with(llm, false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea il file")],
+        consecutive_text_only_turns: Some(1),
+        action_oriented: Some(true),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.consecutive_text_only_turns, Some(2));
+
+    // (b) Turno con tool_use: azzera a 0.
+    let (n2, _m2, _s2) = node(cfg, rc);
+    let llm2 = llm_tool_call("write_file", json!({"path": "a.rs"}));
+    let ctx2 = ctx_with(llm2, false);
+    let state2 = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea il file")],
+        consecutive_text_only_turns: Some(2),
+        action_oriented: Some(true),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta2 = n2.run(&state2, &ctx2).await.expect("run");
+    let out2 = apply(state2, delta2);
+    assert_eq!(out2.consecutive_text_only_turns, Some(0));
+}
+
+#[tokio::test]
+async fn limiti_token_disabilitati_a_zero_sono_retro_compatibili() {
+    // Con entrambi i limiti a 0 (disabilitati) i rami PRE-LLM NON scattano MAI,
+    // anche con contatori altissimi nello stato: comportamento bit-identico a
+    // prima (il turno prosegue e chiama il modello).
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        max_consecutive_text_only_turns: 0,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("Ecco la risposta."));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        // Valori che, con i limiti attivi, avrebbero chiuso il run.
+        tokens_used_total: Some(10_000_000),
+        consecutive_text_only_turns: Some(999),
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Nessuna chiusura anti-runaway: il turno e' avvenuto normalmente.
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.result.as_deref(), Some("Ecco la risposta."));
+    assert_eq!(llm.seen.lock().unwrap().len(), 1);
+    assert!(
+        !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
+        "nessun meta_step anti_runaway coi limiti a 0"
+    );
+}
+
 /// Golden di parita' 1:1 vs Python per la LOGICA DETERMINISTICA del singolo turno
 /// (gate testa, ordine nudge, risoluzione provider). Carica
 /// `/tmp/golden_executor_node.json` (vedi `gen_golden_executor_node.py`). Riusa i

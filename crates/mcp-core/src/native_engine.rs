@@ -676,6 +676,22 @@ async fn load_executor_config(
         // budget escalation unico, soglie loop-by-signature.
         forced_text_offset: setting_i64(db, "agent.executor.forced_text_offset", d.forced_text_offset).await,
         max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
+        // Limiti anti-runaway basati sui TOKEN (mig 0520, regola G): budget token
+        // cumulativo per run + fast-fail su turni solo-testo consecutivi. `0` =
+        // disabilitato -> bit-identico. Complementari a iteration_cap (che conta
+        // ITERAZIONI): chiudono il buco del modello che ignora force_tool_choice e
+        // brucia token in turni solo-testo (osservato 1.8M token / $2.42 senza
+        // convergere). Lettura via setting_i64 (punto unico) + clamp non-negativo.
+        run_token_budget: setting_i64(db, "agent.run_token_budget", d.run_token_budget as i64)
+            .await
+            .max(0) as u64,
+        max_consecutive_text_only_turns: setting_i64(
+            db,
+            "agent.max_consecutive_text_only_turns",
+            d.max_consecutive_text_only_turns as i64,
+        )
+        .await
+        .max(0) as u32,
         loop_thresholds: LoopThresholds {
             signature: setting_i64(db, "agent.loop.signature_threshold", d.loop_thresholds.signature as i64).await.max(1) as usize,
             cap: setting_i64(db, "agent.loop.recent_signatures_cap", d.loop_thresholds.cap as i64).await.max(1) as usize,

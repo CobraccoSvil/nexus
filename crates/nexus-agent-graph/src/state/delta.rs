@@ -399,6 +399,14 @@ pub struct StateDelta {
     /// Vedi `AgentState::repeated_cmd_nudge_sent`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub repeated_cmd_nudge_sent: Option<Option<bool>>,
+    /// Vedi `AgentState::tokens_used_total`. Reducer overwrite (last-write):
+    /// l'executor scrive `Some(Some(prev + turn_total))` dopo ogni risposta LLM.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub tokens_used_total: Option<Option<i64>>,
+    /// Vedi `AgentState::consecutive_text_only_turns`. Reducer overwrite: `0` al
+    /// primo tool_use, `prev + 1` su turno solo-testo.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub consecutive_text_only_turns: Option<Option<i64>>,
 
     // ── progress_controller ────────────────────────────────────────────────────
     /// Vedi `AgentState::progress_guided_axes`.
