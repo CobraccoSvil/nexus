@@ -37,7 +37,7 @@ Distinguere sempre il canale di invocazione del prompt prima di decidere quanto 
 - NESSUNA modalita' UI viene ereditata. Il prompt e' l'unico contratto.
 - Istruzioni di autonomia, anti-loop, output format, examples, reflection devono essere **esplicite** nel prompt stesso.
 - I prompt agente in `nexus_prompt_templates` (chiavi `agent.*`, `system.*`) seguono lo schema XML standard (`<role>` / `<contesto>` / `<autonomia>` / `<protocollo>` / `<tool_usage>` / `<anti_loop>` / `<output_format>` / `<examples>` / `<reflection>`) — vedi migrazione 0086.
-- Sono call site fuori chat (audit a riferimento, non esaustivo): `brain/grpc_server/main.py` `/agent/project-analyze`, `crates/mcp-core/src/prompt_templates.rs:404,501,549`, `crates/mcp-core/src/orchestrator.rs:1210`, qualunque worker in `crates/nexus-orchestrator/src/workers/`.
+- Sono call site fuori chat (audit a riferimento, non esaustivo): `crates/mcp-core/src/prompt_templates.rs:404,501,549`, `crates/mcp-core/src/orchestrator.rs:1210`, qualunque worker in `crates/nexus-orchestrator/src/workers/`.
 
 ### Conseguenze pratiche
 - Quando aggiungi un nuovo pulsante UI che invia un messaggio alla chat: prompt minimal, niente istruzioni di processo.
@@ -75,10 +75,7 @@ I nomi dei modelli AI (`mistral-small-latest`, `gemini-2.5-flash`, `claude-haiku
   - `matrix.lookup(intent, mode)` per routing utente
   - `matrix.default_model(provider)` per default per provider
   - `internal_routing::resolve_purpose_model(state, purpose)` per task interni (chat title, doc gen, ecc.) — tier-aware: un purpose con `tier` valorizzato ignora il `model_id` statico
-- **Python** (cache 60s):
-  - `_load_analyzer_provider_chain()` solleva `AnalyzerChainUnavailable` se DB down
-  - `_default_model_for_provider(provider)` solleva `DefaultModelUnavailable` se DB down o provider non configurato
-  - `load_provider_catalog(provider)` in `brain/providers/catalog_loader.py` solleva `ProviderCatalogUnavailable` se DB down o tabella vuota
+  - `load_provider_catalog` in `crates/mcp-core` (catalog loader Rust) propaga errore se DB down o tabella vuota (ex `brain/providers/catalog_loader.py`, porting zero-Python completato)
 
 ### Schema DB (tabelle uniche fonti di verita')
 - `nexus_routing_matrix` (intent x behavior_mode → provider+model) — mig **0101**
@@ -259,8 +256,8 @@ ereditarieta' di classi; in React ereditare componenti e' anti-pattern).
 | Natura della logica | Meccanismo corretto | Esempio |
 |---|---|---|
 | Stateless (calcolo puro, IO singolo) | funzione in un modulo | `get_setting`, `parse_user_id`, `extract_json_block` |
-| Stato + comportamento | classe/struct incapsulata + generics | `TtlCache<K,V>` (Rust), `db_pool` (Python) |
-| Varianti polimorfiche su contratto comune | `trait` (Rust) / ABC-Protocol (Python) + composizione | provider su `brain/providers/base.py` |
+| Stato + comportamento | classe/struct incapsulata + generics | `TtlCache<K,V>` (crate `nexus-cache`) |
+| Varianti polimorfiche su contratto comune | `trait` (Rust) + composizione | provider in `crates/nexus-gateway/src/providers/` |
 | UI | composizione (componenti + custom hooks) | `AdminPageHeader`, `useListData` |
 
 Anti-pattern vietati: incapsulare una funzione stateless in una classe con

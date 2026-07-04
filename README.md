@@ -2,15 +2,13 @@
 
 Enterprise monorepo scaffold for an AI-assisted development platform with:
 
-- Rust-first MCP/orchestrator core
-- Python neural core and provider adapters
+- Rust-first MCP/orchestrator core (native agent engine)
 - TypeScript Web IDE, CLI, and dashboard
 - PostgreSQL, Redis, and Qdrant backing services
 
 ## Workspaces
 
-- `crates/*`: Rust core crates
-- `brain/*`: Python neural core
+- `crates/*`: Rust core crates (MCP, orchestrator, native agent engine)
 - `apps/*`: Web IDE, VS Code extension, CLI
 - `packages/*`: shared TypeScript packages
 - `proto/*`: service contracts
