@@ -685,6 +685,12 @@ async fn load_executor_config(
         run_token_budget: setting_i64(db, "agent.run_token_budget", d.run_token_budget as i64)
             .await
             .max(0) as u64,
+        // BACKSTOP di catastrofe (mig 0521, regola G): col meta-reasoner acceso il
+        // run_token_budget diventa il TRIGGER del giudice, questo hard-cap e' la rete
+        // di sicurezza non-negoziabile che chiude d'autorita' senza consultarlo.
+        run_token_hard_cap: setting_i64(db, "agent.run_token_hard_cap", d.run_token_hard_cap as i64)
+            .await
+            .max(0) as u64,
         max_consecutive_text_only_turns: setting_i64(
             db,
             "agent.max_consecutive_text_only_turns",

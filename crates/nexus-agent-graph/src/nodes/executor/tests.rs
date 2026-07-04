@@ -3856,6 +3856,9 @@ async fn limiti_token_disabilitati_a_zero_sono_retro_compatibili() {
     let rc = Arc::new(StubRunControlStore::default());
     let cfg = ExecutorConfig {
         run_token_budget: 0,
+        // Anche il backstop hard-cap disabilitato (a 0): il test verifica la
+        // retro-compat "limiti token tutti spenti -> nessuna chiusura anti-runaway".
+        run_token_hard_cap: 0,
         max_consecutive_text_only_turns: 0,
         ..cfg_resolved()
     };
@@ -3882,6 +3885,192 @@ async fn limiti_token_disabilitati_a_zero_sono_retro_compatibili() {
         !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
         "nessun meta_step anti_runaway coi limiti a 0"
     );
+}
+
+#[tokio::test]
+async fn run_token_budget_a_flag_on_emette_stall_reason_runaway() {
+    // Meta-reasoner ACCESO: al superamento del budget MORBIDO l'executor NON chiude
+    // direttamente (close_runaway), ma EMETTE StallReason con StallContext asse
+    // "token_overflow" -> instrada al nodo StallRecovery (giudice agentico). Il
+    // limite fisso 4d diventa un TRIGGER del giudice.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 6,
+        run_token_budget: 400_000,
+        run_token_hard_cap: 800_000,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea il servizio")],
+        // Oltre il budget morbido ma SOTTO l'hard-cap: trigger del giudice.
+        tokens_used_total: Some(400_001),
+        iterations: Some(10),
+        user_intent: Some("crea il servizio".into()),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // NON chiude: instrada al giudice.
+    assert_eq!(out.stop_reason, Some(StopReason::StallReason));
+    assert!(
+        !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
+        "nessuna chiusura anti_runaway: il giudice decide"
+    );
+    // StallContext strutturato (regola M): asse token_overflow, count = token usati.
+    let ctx_val = out.extra.get(STALL_CONTEXT_KEY).expect("StallContext in extra");
+    let sc: StallContext = serde_json::from_value(ctx_val.clone()).expect("StallContext");
+    assert_eq!(sc.axis, "token_overflow");
+    assert_eq!(sc.count, 400_001);
+    // L'LLM NON e' chiamato dall'executor (lo fara' il nodo dedicato, replay-safe).
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn text_only_a_flag_on_emette_stall_reason_runaway() {
+    // Meta-reasoner ACCESO: allo streak solo-testo oltre soglia l'executor EMETTE
+    // StallReason con StallContext asse "text_only" invece di chiudere diretto.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 6,
+        max_consecutive_text_only_turns: 3,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea il file")],
+        consecutive_text_only_turns: Some(3),
+        iterations: Some(5),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::StallReason));
+    let ctx_val = out.extra.get(STALL_CONTEXT_KEY).expect("StallContext in extra");
+    let sc: StallContext = serde_json::from_value(ctx_val.clone()).expect("StallContext");
+    assert_eq!(sc.axis, "text_only");
+    assert_eq!(sc.count, 3);
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn token_hard_cap_a_flag_on_chiude_diretto_senza_giudice() {
+    // BACKSTOP di catastrofe: oltre l'hard-cap l'executor chiude d'autorita'
+    // (close_runaway, reason "token_hard_cap") SENZA consultare il giudice, anche
+    // col meta-reasoner acceso. Rete di sicurezza non-negoziabile (regola H).
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 6,
+        run_token_budget: 400_000,
+        run_token_hard_cap: 800_000,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        // Oltre l'hard-cap: chiusura d'autorita', il giudice NON e' consultato.
+        tokens_used_total: Some(800_001),
+        iterations: Some(20),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Chiusura d'autorita': NON StallReason.
+    assert_ne!(out.stop_reason, Some(StopReason::StallReason));
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    assert!(out.extra.get(STALL_CONTEXT_KEY).is_none());
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("meta_step anti_runaway (hard-cap)");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("token_hard_cap")
+    );
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn runaway_budget_esaurito_a_flag_on_ricade_su_close_runaway() {
+    // Meta-reasoner acceso ma budget consultazioni per-sessione esaurito: il gate
+    // runaway NON emette StallReason (rete di sicurezza) e ricade sul backstop
+    // close_runaway (reason "budget_token_esaurito"), come a flag OFF.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        stall_recovery_max_moves_per_session: 2,
+        run_token_budget: 400_000,
+        run_token_hard_cap: 800_000,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        tokens_used_total: Some(400_001),
+        iterations: Some(10),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    state.extra.insert("stall_moves_used".to_string(), json!(2));
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(out.stop_reason, Some(StopReason::StallReason));
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("meta_step anti_runaway (backstop)");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("budget_token_esaurito")
+    );
+}
+
+#[tokio::test]
+async fn runaway_stall_consuma_escalate_model() {
+    // Consumazione di una RecoveryMove per un asse RUNAWAY (token_overflow): il
+    // rientro StallResolved con EscalateModel promuove il modello riusando il ramo
+    // escalation esistente (axis-agnostico). Verifica che il consumo funzioni anche
+    // per gli assi runaway, non solo per quelli classici.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        stall_recovery_enabled: true,
+        ..cfg_resolved()
+    };
+    // Escalation configurata: una catena che promuove a un modello diverso.
+    let esc = Arc::new(StubEscalationPort::with_chain(&["claude-y"]));
+    let (n, _m, _s) = node_esc(cfg, rc, esc);
+    let llm = Arc::new(StubLlmGateway::with_text("x"));
+    let ctx = ctx_with(llm.clone(), false);
+    let epoch = stall_work_epoch(0, 0, 0);
+    let state = state_rientro("token_overflow", epoch, Some(RecoveryMove::EscalateModel));
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Escalation applicata: modello sticky promosso, budget consumato, ri-da il turno.
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_model.as_deref(), Some("claude-y"));
+    assert_eq!(out.extra.get("stall_moves_used").and_then(Value::as_i64), Some(1));
 }
 
 /// Golden di parita' 1:1 vs Python per la LOGICA DETERMINISTICA del singolo turno

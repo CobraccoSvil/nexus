@@ -98,6 +98,63 @@ pub fn build_stall_context(
     }
 }
 
+/// Assi di stallo RUNAWAY (pre-LLM, basati sui TOKEN) NON rappresentati
+/// nell'enum [`crate::decisions::progress_controller::Axis`]: non sono assi del
+/// progress_controller (non alimentano `pc::decide`, non hanno insiemi
+/// `already_*`), sono limiti anti-runaway del turno (budget token cumulativo /
+/// turni solo-testo consecutivi). Lo `StallContext::axis` e' una stringa libera,
+/// quindi questi assi vivono come costanti stabili (regola L: un solo posto per la
+/// stringa-asse, condivisa dal gate di emissione e dalla chiave-cache).
+pub const AXIS_TOKEN_OVERFLOW: &str = "token_overflow";
+/// Vedi [`AXIS_TOKEN_OVERFLOW`]: asse dei turni solo-testo consecutivi.
+pub const AXIS_TEXT_ONLY: &str = "text_only";
+
+/// Costruisce il [`StallContext`] per un asse RUNAWAY ([`AXIS_TOKEN_OVERFLOW`] /
+/// [`AXIS_TEXT_ONLY`]) direttamente dai segnali strutturati gia' risolti (regola
+/// M): questi assi NON sono in [`crate::decisions::progress_controller::Axis`] (non
+/// passano da `pc::decide`), quindi [`build_stall_context`] — che richiede l'enum
+/// `Axis` — non e' applicabile. Punto unico (regola L): la costruzione dello
+/// `StallContext` runaway vive QUI, accanto a [`build_stall_context`], non nel
+/// nodo executor.
+///
+/// `count` e' il conteggio del limite (token cumulativi o streak solo-testo);
+/// `escalations`/`max_escalations` orientano la scelta del reasoner tra
+/// escalation e chiusura; i segnali cross-cutting (esito ultimo tool, firme
+/// recenti, redazione, file modificati, intent) sono gli stessi di
+/// [`build_stall_context`]. `work_epoch` e' la chiave idempotenza/replay.
+#[allow(clippy::too_many_arguments)]
+pub fn build_runaway_context(
+    axis: &str,
+    count: i64,
+    action_oriented: bool,
+    escalations: i64,
+    max_escalations: i64,
+    recent_tool_signatures: &[String],
+    last_tool_outcome: Option<&str>,
+    redaction_rejected: bool,
+    user_intent: Option<&str>,
+    modified_files: &[String],
+    work_epoch: i64,
+) -> StallContext {
+    StallContext {
+        axis: axis.to_string(),
+        // Nessuna azione-ripetuta specifica: il runaway e' un limite di turno, non
+        // una firma-tool. I flag repeated_action_* restano falsi (default).
+        label: None,
+        count,
+        action_oriented,
+        escalations,
+        max_escalations,
+        user_intent: user_intent.map(str::to_string),
+        recent_tool_signatures: recent_tool_signatures.to_vec(),
+        last_tool_outcome: last_tool_outcome.map(str::to_string),
+        redaction_rejected,
+        modified_files: modified_files.to_vec(),
+        work_epoch,
+        ..Default::default()
+    }
+}
+
 /// Valida l'output JSON dell'LLM contro l'enum CHIUSO [`RecoveryMove`]. Qualunque
 /// forma non deserializzabile, con testo vuoto dove serve, o con `blocker` fuori
 /// dal vocabolario ADR 0034 ([`VALID_BLOCKERS`]) degrada a
@@ -280,6 +337,37 @@ mod tests {
         assert_eq!(ctx.escalations, 1);
         assert_eq!(ctx.last_tool_outcome.as_deref(), Some("error"));
         assert_eq!(ctx.work_epoch, 5);
+    }
+
+    #[test]
+    fn build_runaway_context_da_segnali_strutturati() {
+        // Asse runaway (token_overflow) costruito senza l'enum Axis: i campi
+        // strutturati (count, escalations, esito ultimo tool, epoca) fluiscono;
+        // i flag repeated_action_* restano falsi (non e' una firma-tool).
+        let ctx = build_runaway_context(
+            AXIS_TOKEN_OVERFLOW,
+            400_001,
+            true,
+            2,
+            3,
+            &["write_file|abc".to_string()],
+            Some("ok"),
+            false,
+            Some("crea il servizio"),
+            &["src/main.rs".to_string()],
+            12,
+        );
+        assert_eq!(ctx.axis, "token_overflow");
+        assert_eq!(ctx.count, 400_001);
+        assert!(ctx.action_oriented);
+        assert_eq!(ctx.escalations, 2);
+        assert_eq!(ctx.max_escalations, 3);
+        assert_eq!(ctx.last_tool_outcome.as_deref(), Some("ok"));
+        assert_eq!(ctx.work_epoch, 12);
+        assert!(!ctx.repeated_action_edit_failed);
+        assert!(!ctx.repeated_action_service_failed);
+        assert!(ctx.label.is_none());
+        assert_eq!(ctx.modified_files, vec!["src/main.rs".to_string()]);
     }
 
     #[test]

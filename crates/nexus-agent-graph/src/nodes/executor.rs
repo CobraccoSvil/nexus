@@ -313,6 +313,20 @@ pub struct ExecutorConfig {
     /// ~16k token/turno (osservato un run a 1.8M token senza convergere). Regola G:
     /// DB-driven, mai hardcoded.
     pub run_token_budget: u64,
+    /// BACKSTOP di ultima istanza (catastrofe) sul budget token cumulativo del run
+    /// (`agent.run_token_hard_cap`, default ~2x `run_token_budget`). Quando il
+    /// meta-reasoner e' ACCESO (`stall_recovery_enabled=true`) il `run_token_budget`
+    /// NON chiude piu' direttamente: diventa la soglia-TRIGGER che consulta il
+    /// giudice agentico (`StallReason` -> nodo `StallRecovery` -> `RecoveryMove`).
+    /// Il giudice puo' decidere di PROSEGUIRE (es. e' vicino a chiudere): senza un
+    /// tetto duro un modello patologico brucerebbe token all'infinito. Questo
+    /// hard-cap e' la rete di sicurezza NON-negoziabile: al raggiungimento (`>=`)
+    /// l'executor chiude deterministicamente (`close_runaway`) SENZA consultare il
+    /// giudice, come il vecchio comportamento di 822e083. `0` = disabilitato. Con
+    /// `stall_recovery_enabled=false` questo hard-cap e' irrilevante: il
+    /// `run_token_budget` chiude gia' prima (retro-compat 822e083). Regola G:
+    /// DB-driven, mai hardcoded.
+    pub run_token_hard_cap: u64,
     /// Turni solo-testo CONSECUTIVI oltre cui (`>=`) il run chiude deterministicamente
     /// (`agent.max_consecutive_text_only_turns`, default 3): fast-fail sul modello che
     /// DESCRIVE senza AGIRE (pattern gemini che ignora `force_tool_choice`). Un turno
@@ -490,6 +504,10 @@ impl Default for ExecutorConfig {
             // Default safe-DB-down = seed mig 0520. Il wiring mcp-core passa i valori
             // reali dai settings agent.run_token_budget / agent.max_consecutive_text_only_turns.
             run_token_budget: 400_000,
+            // Default safe-DB-down = seed mig 0521 (~2x budget). Backstop di
+            // catastrofe: rilevante solo a stall_recovery_enabled=true (altrimenti
+            // run_token_budget chiude gia' prima -> retro-compat 822e083).
+            run_token_hard_cap: 800_000,
             max_consecutive_text_only_turns: 3,
             loop_thresholds: LoopThresholds::default(),
             // Default safe-DB-down = seed mig 0510 (2). Con nessuna storia di
@@ -1008,7 +1026,54 @@ piu' specifico, oppure riprova con un modello piu' capace.",
         // `run_token_budget=0` = disabilitato -> bit-identico. Chiude PRIMA della
         // chiamata LLM, come il cap iterazioni.
         let tokens_used_total = state.tokens_used_total.unwrap_or(0).max(0) as u64;
+        // BACKSTOP di catastrofe (regola H: rete di sicurezza non-negoziabile): oltre
+        // l'hard-cap si chiude SEMPRE direttamente, senza consultare il giudice (un
+        // modello patologico brucerebbe token all'infinito se il giudice dicesse
+        // "prosegui"). Con stall_recovery_enabled=false questo ramo e' irrilevante
+        // (run_token_budget chiude gia' prima). `0` = disabilitato.
+        if self.cfg.run_token_hard_cap > 0 && tokens_used_total >= self.cfg.run_token_hard_cap {
+            let hard_text = format!(
+                "Raggiunto il tetto DURO di token del run ({} token, hard-cap {}). \
+Interrompo d'autorita' per evitare un consumo incontrollato: riformula la richiesta \
+in modo piu' specifico, oppure riprova con un modello piu' capace.",
+                tokens_used_total, self.cfg.run_token_hard_cap
+            );
+            tracing::error!(
+                target: "nexus_agent_graph::executor",
+                tokens_used = tokens_used_total,
+                hard_cap = self.cfg.run_token_hard_cap,
+                "HARD-CAP token raggiunto -> chiusura d'autorita' (backstop, no giudice)"
+            );
+            return Ok(self.close_runaway(
+                iters_in,
+                hard_text,
+                "token_hard_cap",
+                json!({
+                    "tokens_used_total": tokens_used_total,
+                    "run_token_hard_cap": self.cfg.run_token_hard_cap,
+                }),
+            ));
+        }
         if self.cfg.run_token_budget > 0 && tokens_used_total >= self.cfg.run_token_budget {
+            // Con il meta-reasoner ACCESO il budget morbido e' un TRIGGER del giudice
+            // agentico (non piu' un veto fisso): instrada al nodo StallRecovery che
+            // sceglie la mossa (proseguire guidato / escalare modello / dichiarare
+            // blocked). Se il gate ritorna None (flag OFF / budget consultazioni
+            // esaurito / anti-meta-loop) ricade sul backstop close_runaway sotto
+            // (comportamento bit-identico a 822e083 con flag OFF).
+            if let Some(delta) = self
+                .maybe_runaway_stall_delta(
+                    state,
+                    crate::decisions::meta_reason::AXIS_TOKEN_OVERFLOW,
+                    tokens_used_total as i64,
+                    iters_in,
+                    &messages,
+                    ctx,
+                )
+                .await
+            {
+                return Ok(delta);
+            }
             let budget_text = format!(
                 "Raggiunto il budget massimo di token del run ({} token, tetto {}). \
 Interrompo per evitare un consumo incontrollato: riformula la richiesta in modo \
@@ -1019,7 +1084,7 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                 target: "nexus_agent_graph::executor",
                 tokens_used = tokens_used_total,
                 budget = self.cfg.run_token_budget,
-                "BUDGET TOKEN cumulativo esaurito -> chiusura deterministica"
+                "BUDGET TOKEN cumulativo esaurito -> chiusura deterministica (backstop)"
             );
             return Ok(self.close_runaway(
                 iters_in,
@@ -1042,6 +1107,24 @@ piu' specifico, oppure riprova con un modello piu' capace.",
         if self.cfg.max_consecutive_text_only_turns > 0
             && text_only_streak >= self.cfg.max_consecutive_text_only_turns
         {
+            // Con il meta-reasoner ACCESO lo streak solo-testo e' un TRIGGER del
+            // giudice (non piu' un veto fisso): instrada al nodo StallRecovery, che
+            // tipicamente sceglie escalate_model o shift_strategy (il modello
+            // descrive senza agire). None -> backstop close_runaway (bit-identico
+            // 822e083 con flag OFF).
+            if let Some(delta) = self
+                .maybe_runaway_stall_delta(
+                    state,
+                    crate::decisions::meta_reason::AXIS_TEXT_ONLY,
+                    text_only_streak as i64,
+                    iters_in,
+                    &messages,
+                    ctx,
+                )
+                .await
+            {
+                return Ok(delta);
+            }
             let stall_text = format!(
                 "Il modello ha prodotto {} risposte consecutive di solo testo senza \
 eseguire alcuna azione (tetto {}). Interrompo: il compito non sta avanzando. \
@@ -1052,7 +1135,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
                 target: "nexus_agent_graph::executor",
                 text_only_streak,
                 threshold = self.cfg.max_consecutive_text_only_turns,
-                "TURNI SOLO-TESTO consecutivi oltre soglia -> chiusura deterministica"
+                "TURNI SOLO-TESTO consecutivi oltre soglia -> chiusura deterministica (backstop)"
             );
             return Ok(self.close_runaway(
                 iters_in,
@@ -3839,6 +3922,106 @@ impl ExecutorNode {
             moves_used_run = Self::stall_moves_used(state),
             moves_used_session,
             "meta-reasoner: emetto StallReason -> nodo StallRecovery"
+        );
+        Some(
+            StateDelta {
+                extra: Some(extra),
+                stop_reason: Some(Some(StopReason::StallReason)),
+                iterations: Some(Some(iters_in + 1)),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
+
+    /// Gate di EMISSIONE dello `StallReason` per un asse RUNAWAY pre-LLM
+    /// (`token_overflow` / `text_only`): trasforma i limiti FISSI 4d/4e in TRIGGER
+    /// del giudice agentico invece di chiudere direttamente con `close_runaway`.
+    /// GEMELLO di [`Self::maybe_stall_reason_delta`] (stesso budget per-sessione,
+    /// stessa `work_epoch`, stessa guardia anti-meta-loop, stessa costruzione
+    /// StallContext dal punto unico `meta_reason`), ma SENZA il gate
+    /// `pc::decide != Guide`: questi assi NON sono in [`Axis`]/`ProgressSignals`,
+    /// quindi la gerarchia fissa non li conosce. Il runaway E' di per se' un evento
+    /// costoso: se il gate scatta si consulta sempre il giudice (che puo' comunque
+    /// decidere `ContinueGuided`/`Fallback`).
+    ///
+    /// Ritorna `Some(delta)` (-> `StallReason` -> nodo `StallRecovery`) SOLO se:
+    ///   1. `stall_recovery_enabled` (flag OFF -> `None` -> il chiamante usa il
+    ///      backstop `close_runaway`, comportamento bit-identico a 822e083);
+    ///   2. budget per-SESSIONE non esaurito (per-run in `extra["stall_moves_used"]`
+    ///      + cross-run [`StallBudgetPort`], come il gemello);
+    ///   3. nessuna mossa gia' decisa / epoca gia' risolta a Fallback per questo
+    ///      (axis, epoch) (anti-meta-loop, punto unico `stall_move_key`).
+    /// `axis` e' [`AXIS_TOKEN_OVERFLOW`] o [`AXIS_TEXT_ONLY`]; `count` e' il valore
+    /// del limite (token cumulativi / streak). NON chiama l'LLM (lo fa il nodo).
+    async fn maybe_runaway_stall_delta(
+        &self,
+        state: &AgentState,
+        axis: &str,
+        count: i64,
+        iters_in: i64,
+        messages: &[Message],
+        ctx: &AgentNodeCtx,
+    ) -> Option<OpaqueDelta> {
+        // (1) Flag OFF -> il gate non scatta MAI (il chiamante fa close_runaway,
+        // bit-identico a 822e083).
+        if !self.cfg.stall_recovery_enabled {
+            return None;
+        }
+        // (2) Budget per-SESSIONE esaurito -> backstop (close_runaway).
+        let moves_used_session = self.stall_moves_cross_run(ctx).await;
+        let moves_total = Self::stall_moves_used(state) + moves_used_session;
+        if moves_total >= self.cfg.stall_recovery_max_moves_per_session {
+            return None;
+        }
+        // work_epoch STABILE (stessa formula del gemello): idempotenza/replay.
+        let escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+        let floor = state.extra.get("repeat_scan_floor").and_then(Value::as_i64).unwrap_or(0);
+        let epoch = crate::decisions::meta_reason::work_epoch(iters_in, escalations, floor);
+        // (3) ANTI-META-LOOP: mossa gia' decisa o epoca gia' risolta a Fallback per
+        // questo (axis, epoch) -> non ri-emettere (punto unico `stall_move_key`).
+        if state.extra.contains_key(&stall_move_key(axis, epoch))
+            || state
+                .extra
+                .get("stall_fallback_epochs")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().any(|v| v.as_i64() == Some(epoch)))
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        // Segnali cross-cutting per lo StallContext (regola M: tutti strutturati),
+        // identici al gemello: esito ultimo tool, firme recenti, redazione, file
+        // modificati, intent. `count` e' il limite runaway; escalations dal budget.
+        let recent_tool_signatures = state.recent_tool_signatures.clone().unwrap_or_default();
+        let last_outcome = Self::last_tool_outcome(messages);
+        let modified = crate::routing::signals::modified_files_from_messages(messages, 40);
+        let redaction_rejected =
+            crate::routing::signals::recent_redaction_rejected(messages, 16);
+        let action_oriented = turn_action_oriented(state.action_oriented);
+        let stall = crate::decisions::meta_reason::build_runaway_context(
+            axis,
+            count,
+            action_oriented,
+            escalations,
+            self.cfg.max_escalations,
+            &recent_tool_signatures,
+            last_outcome,
+            redaction_rejected,
+            state.user_intent.as_deref(),
+            &modified,
+            epoch,
+        );
+        let value = serde_json::to_value(&stall).ok()?;
+        let extra = put_extra(state, STALL_CONTEXT_KEY, value);
+        tracing::info!(
+            target: "nexus_agent_graph::executor",
+            axis,
+            count,
+            work_epoch = epoch,
+            moves_used_run = Self::stall_moves_used(state),
+            moves_used_session,
+            "meta-reasoner: runaway pre-LLM -> emetto StallReason (giudice agentico)"
         );
         Some(
             StateDelta {
