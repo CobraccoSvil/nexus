@@ -447,6 +447,22 @@ impl PortRegistryCache {
 /// `extract_ports_from_unit_content`. False se il file non esiste piu' (servizio
 /// rimosso) o non dichiara piu' quella porta (mapping stale dopo riconfig).
 async fn service_unit_reserves_port(unit: &str, port: u16) -> bool {
+    let unit = unit.trim();
+    if unit.is_empty() {
+        return false;
+    }
+    // Windows nativo: NIENTE systemd (i servizi di progetto sono processi gestiti).
+    // Il path `~/.config/systemd/user/<unit>` non esiste -> la lettura fallirebbe
+    // sempre -> il GC rilasciava la porta di un servizio managed fermo (drift 31792
+    // ->31798 / pannello Porte svuotato, bug Beaty-Book). Qui la PRESENZA di una
+    // `service_unit` non vuota e' gia' il segnale che un servizio managed RISERVA la
+    // porta: la preserviamo (piu' conservativo = porta stabile ai riavvii). `cfg!`
+    // runtime (non attributo) cosi' entrambi i rami compilano su ogni piattaforma
+    // (nessun dead_code / unused_async).
+    if cfg!(windows) {
+        let _ = port;
+        return true;
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
     let path = format!("{home}/.config/systemd/user/{unit}");
     match tokio::fs::read_to_string(&path).await {
