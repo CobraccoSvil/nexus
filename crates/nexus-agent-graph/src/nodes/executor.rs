@@ -3700,6 +3700,23 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
     }
 }
 
+/// Esito del gate CONDIVISO dei due detector-emissione dello `StallReason`
+/// ([`ExecutorNode::stall_emit_gate`], regola L). Portato ai due chiamanti
+/// ([`ExecutorNode::maybe_stall_reason_delta`] e il gemello runaway
+/// `maybe_runaway_stall_delta`) quando l'emissione e' PERMESSA; ognuno vi aggiunge
+/// i propri segnali e il proprio `build_*_context`.
+struct StallEmitGate {
+    /// work_epoch STABILE (chiave idempotenza/replay): avanza solo sui cambi
+    /// macroscopici del run.
+    epoch: i64,
+    /// Escalation gia' fatte nel run: serve al `build_runaway_context` del gemello
+    /// runaway (il ramo stall non la usa, destruttura con `..`).
+    escalations: i64,
+    /// Budget consultazioni CROSS-RUN gia' usate nella sessione (per il log di
+    /// emissione, campo strutturato).
+    moves_used_session: i64,
+}
+
 impl ExecutorNode {
     /// Risolve provider/model delegando al punto unico [`resolve_provider_model`]
     /// (regola L): legge sticky/override dallo stato + routing dalla config.
@@ -3820,6 +3837,65 @@ impl ExecutorNode {
             .unwrap_or(0)
     }
 
+    /// Gate CONDIVISO dei due detector-emissione dello `StallReason`
+    /// ([`Self::maybe_stall_reason_delta`] e il gemello runaway
+    /// `maybe_runaway_stall_delta`, regola L: STESSO gate budget+epoca+anti-meta-loop,
+    /// prima duplicato verbatim nei due). Ritorna `Some(StallEmitGate)` se l'emissione
+    /// e' PERMESSA per `(axis, epoch)`, `None` se va saltata:
+    ///   1. `stall_recovery_enabled` OFF (flag, default) -> `None` (bit-identico);
+    ///   2. budget per-SESSIONE esaurito: cap `stall_recovery_max_moves_per_session`
+    ///      (regola G) confrontato con la somma di per-run (`extra["stall_moves_used"]`)
+    ///      + cross-run ([`StallBudgetPort`], persistito per sessione, chiude il loop
+    ///      email) -> `None`. Fail-open: porta assente/guasta -> solo cap per-run;
+    ///   3. mossa gia' decisa o epoca gia' risolta a Fallback per `(axis, epoch)`
+    ///      (anti-meta-loop, punto unico `stall_move_key`) -> `None`.
+    /// SOLA LETTURA (nessun side-effect): il check `needs_meta` (solo stall) e la
+    /// costruzione dello `StallContext` restano nei due chiamanti.
+    async fn stall_emit_gate(
+        &self,
+        state: &AgentState,
+        axis: &str,
+        iters_in: i64,
+        ctx: &AgentNodeCtx,
+    ) -> Option<StallEmitGate> {
+        // (1) Flag OFF -> il gate non scatta MAI (comportamento bit-identico).
+        if !self.cfg.stall_recovery_enabled {
+            return None;
+        }
+        // (2) Budget per-SESSIONE esaurito -> rete di sicurezza (gerarchia fissa).
+        // Somma il per-run (extra, si azzera tra run) al CROSS-RUN (porta, persistito
+        // per sessione): il cap e' cosi' effettivo per-sessione, non solo per-run.
+        let moves_used_session = self.stall_moves_cross_run(ctx).await;
+        let moves_total = Self::stall_moves_used(state) + moves_used_session;
+        if moves_total >= self.cfg.stall_recovery_max_moves_per_session {
+            return None;
+        }
+        // work_epoch STABILE (chiave idempotenza/replay): avanza solo sui cambi
+        // macroscopici. `todo_seq` ~ iterazioni del run; escalation e floor da extra.
+        let escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+        let floor = state.extra.get("repeat_scan_floor").and_then(Value::as_i64).unwrap_or(0);
+        let epoch = crate::decisions::meta_reason::work_epoch(iters_in, escalations, floor);
+        // (3) ANTI-META-LOOP (idempotenza per epoca): mossa gia' decisa+consumata
+        // (chiave-cache in extra) o epoca gia' risolta a Fallback (marcatore) per questo
+        // (axis, epoch) -> non ri-emettere. La chiave-cache e' il punto unico
+        // `stall_move_key` (regola L).
+        if state.extra.contains_key(&stall_move_key(axis, epoch))
+            || state
+                .extra
+                .get("stall_fallback_epochs")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().any(|v| v.as_i64() == Some(epoch)))
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        Some(StallEmitGate {
+            epoch,
+            escalations,
+            moves_used_session,
+        })
+    }
+
     /// Gate di EMISSIONE dello `StallReason` (blocco #6, punto 2). Chiamato dai 3
     /// detector pre-LLM DOPO aver costruito i `signals` e PRIMA di applicare la
     /// gerarchia fissa `pc::decide`. Ritorna `Some(delta)` — che instrada al nodo
@@ -3847,44 +3923,19 @@ impl ExecutorNode {
         messages: &[Message],
         ctx: &AgentNodeCtx,
     ) -> Option<OpaqueDelta> {
-        // (1) Flag OFF -> il gate non scatta MAI (comportamento bit-identico).
-        if !self.cfg.stall_recovery_enabled {
-            return None;
-        }
-        // (2) Budget per-SESSIONE esaurito -> rete di sicurezza (gerarchia fissa).
-        // Somma il per-run (extra, si azzera tra run) al CROSS-RUN (porta, persistito
-        // per sessione): il cap e' cosi' effettivo per-sessione, non solo per-run.
-        let moves_used_session = self.stall_moves_cross_run(ctx).await;
-        let moves_total = Self::stall_moves_used(state) + moves_used_session;
-        if moves_total >= self.cfg.stall_recovery_max_moves_per_session {
-            return None;
-        }
-        // (3) Solo se la gerarchia fissa farebbe una mossa COSTOSA (non GUIDE/Proceed):
-        // il meta-ragionamento subentra DOPO il livello-1 GUIDE cheap.
+        // Gate CONDIVISO col gemello runaway (regola L): flag + budget per-SESSIONE +
+        // work_epoch + anti-meta-loop. `None` -> rete di sicurezza (gerarchia fissa).
+        let StallEmitGate {
+            epoch,
+            moves_used_session,
+            ..
+        } = self.stall_emit_gate(state, axis.as_str(), iters_in, ctx).await?;
+        // Solo se la gerarchia fissa farebbe una mossa COSTOSA (non GUIDE/Proceed): il
+        // meta-ragionamento subentra DOPO il livello-1 GUIDE cheap. Check STALL-ONLY
+        // (gli assi runaway non sono in `ProgressSignals`, il gemello non lo ha) e
+        // side-effect-free: eseguirlo DOPO il gate e' bit-identico all'ordine storico.
         let fixed = pc::decide(signals);
-        let needs_meta = !matches!(fixed.action, Action::Guide | Action::Proceed);
-        if !needs_meta {
-            return None;
-        }
-        // work_epoch STABILE (chiave idempotenza/replay): avanza solo sui cambi
-        // macroscopici. `todo_seq` ~ iterazioni del run; escalation e floor da extra.
-        let escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
-        let floor = state.extra.get("repeat_scan_floor").and_then(Value::as_i64).unwrap_or(0);
-        let epoch = crate::decisions::meta_reason::work_epoch(iters_in, escalations, floor);
-        // (4) ANTI META-LOOP (idempotenza per epoca): se per questo (axis, epoch) la
-        // mossa e' GIA' stata decisa+consumata (chiave-cache presente in extra) o e'
-        // gia' stata risolta a Fallback (marcatore), NON ri-emettere. Senza questa
-        // guardia, dopo un consumo che ri-fa il turno (nudge) o dopo un Fallback, il
-        // detector ri-scatterebbe con lo STESSO epoch e ri-consulterebbe l'LLM in
-        // loop. La chiave-cache e' il punto unico `stall_move_key` (regola L).
-        if state.extra.contains_key(&stall_move_key(axis.as_str(), epoch))
-            || state
-                .extra
-                .get("stall_fallback_epochs")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().any(|v| v.as_i64() == Some(epoch)))
-                .unwrap_or(false)
-        {
+        if matches!(fixed.action, Action::Guide | Action::Proceed) {
             return None;
         }
         // Segnali cross-cutting per lo StallContext (regola M: tutti strutturati).
@@ -3963,33 +4014,15 @@ impl ExecutorNode {
         messages: &[Message],
         ctx: &AgentNodeCtx,
     ) -> Option<OpaqueDelta> {
-        // (1) Flag OFF -> il gate non scatta MAI (il chiamante fa close_runaway,
-        // bit-identico a 822e083).
-        if !self.cfg.stall_recovery_enabled {
-            return None;
-        }
-        // (2) Budget per-SESSIONE esaurito -> backstop (close_runaway).
-        let moves_used_session = self.stall_moves_cross_run(ctx).await;
-        let moves_total = Self::stall_moves_used(state) + moves_used_session;
-        if moves_total >= self.cfg.stall_recovery_max_moves_per_session {
-            return None;
-        }
-        // work_epoch STABILE (stessa formula del gemello): idempotenza/replay.
-        let escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
-        let floor = state.extra.get("repeat_scan_floor").and_then(Value::as_i64).unwrap_or(0);
-        let epoch = crate::decisions::meta_reason::work_epoch(iters_in, escalations, floor);
-        // (3) ANTI-META-LOOP: mossa gia' decisa o epoca gia' risolta a Fallback per
-        // questo (axis, epoch) -> non ri-emettere (punto unico `stall_move_key`).
-        if state.extra.contains_key(&stall_move_key(axis, epoch))
-            || state
-                .extra
-                .get("stall_fallback_epochs")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().any(|v| v.as_i64() == Some(epoch)))
-                .unwrap_or(false)
-        {
-            return None;
-        }
+        // Gate CONDIVISO col gemello `maybe_stall_reason_delta` (regola L): flag +
+        // budget per-SESSIONE + work_epoch + anti-meta-loop. `None` -> backstop
+        // (`close_runaway`, bit-identico a 822e083). SENZA il check `needs_meta`: gli
+        // assi runaway non sono in `ProgressSignals` e il runaway E' di per se' costoso.
+        let StallEmitGate {
+            epoch,
+            escalations,
+            moves_used_session,
+        } = self.stall_emit_gate(state, axis, iters_in, ctx).await?;
         // Segnali cross-cutting per lo StallContext (regola M: tutti strutturati),
         // identici al gemello: esito ultimo tool, firme recenti, redazione, file
         // modificati, intent. `count` e' il limite runaway; escalations dal budget.
