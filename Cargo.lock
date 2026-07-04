@@ -1967,15 +1967,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcp-comments"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "regex",
- "serde",
-]
-
-[[package]]
 name = "mcp-core"
 version = "0.1.0"
 dependencies = [
@@ -2048,16 +2039,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "sqlparser",
-]
-
-[[package]]
-name = "mcp-learning"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "regex",
- "serde",
- "serde_json",
 ]
 
 [[package]]

@@ -10,8 +10,6 @@ members = [
   "crates/mcp-ast",
   "crates/mcp-quality",
   "crates/mcp-db",
-  "crates/mcp-comments",
-  "crates/mcp-learning",
   "crates/mcp-proto",
   "crates/nexus-auth",
   "crates/nexus-types",
