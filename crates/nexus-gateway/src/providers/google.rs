@@ -25,7 +25,7 @@ use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::gcp_auth::{
-    vertex_action_endpoint, vertex_endpoint, VertexAuth, SETTING_BACKEND,
+    vertex_action_endpoint, vertex_endpoint, vertex_host, VertexAuth, SETTING_BACKEND,
     SETTING_VERTEX_CREDENTIALS_JSON, SETTING_VERTEX_DISCOVERY_LOCATIONS, SETTING_VERTEX_LOCATION,
     SETTING_VERTEX_PROJECT,
 };
@@ -584,8 +584,13 @@ impl GoogleProvider {
         let mut all: Vec<String> = Vec::new();
         let mut ok_regions = 0usize;
         for region in discovery_locations {
+            // Host via punto unico vertex_host: la region `global` usa
+            // aiplatform.googleapis.com (senza prefisso), le altre {region}-aiplatform.
+            // Senza questo, `global` dava 404 e i modelli esposti solo li' (preview
+            // Gemini 3) restavano invisibili al discovery.
             let url = format!(
-                "https://{region}-aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                "https://{host}/v1beta1/publishers/google/models",
+                host = vertex_host(region)
             );
             match self.http.get(url).bearer_auth(&token).send().await {
                 Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
@@ -805,7 +810,8 @@ impl LlmProvider for GoogleProvider {
                     Err(_) => return false,
                 };
                 let url = format!(
-                    "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models"
+                    "https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models",
+                    host = vertex_host(location)
                 );
                 self.http.get(url).bearer_auth(token)
             }
@@ -928,7 +934,8 @@ impl LlmProvider for GoogleProvider {
 
         // 2. POLL: GET {operation_name} finche' done o timeout (regola H).
         let poll_url = format!(
-            "https://{location}-aiplatform.googleapis.com/v1/{operation_name}"
+            "https://{host}/v1/{operation_name}",
+            host = vertex_host(location)
         );
         let video = self
             .poll_veo_operation(&poll_url, auth, start, poll_timeout)

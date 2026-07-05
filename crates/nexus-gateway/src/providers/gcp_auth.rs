@@ -125,14 +125,31 @@ pub fn sign_jwt(claims: &JwtClaims, private_key_pem: &str) -> anyhow::Result<Str
     Ok(token)
 }
 
+/// Host aiplatform per una `location` Vertex (punto unico, regola L). La region
+/// speciale `global` usa l'endpoint globale SENZA prefisso regione
+/// (`aiplatform.googleapis.com`): costruire `global-aiplatform.googleapis.com`
+/// da' un host inesistente -> 404 (bug che nascondeva i modelli esposti solo su
+/// `global`, es. i preview Gemini 3). Le region geografiche usano il prefisso
+/// regionale (`{region}-aiplatform.googleapis.com`).
+pub fn vertex_host(location: &str) -> String {
+    if location.eq_ignore_ascii_case("global") {
+        "aiplatform.googleapis.com".to_string()
+    } else {
+        format!("{location}-aiplatform.googleapis.com")
+    }
+}
+
 /// Costruisce l'URL Vertex AI per una `action` arbitraria sul modello (punto
 /// unico, regola L): la chat usa `generateContent`/`streamGenerateContent`,
 /// l'image-gen usa `predict` (Imagen). project/location dai settings (regola G).
+/// Host risolto da [`vertex_host`] (gestisce `global`); il path mantiene
+/// `locations/{location}` anche per global.
 ///
-/// `https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}`
+/// `https://<host>/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}`
 pub fn vertex_action_endpoint(project: &str, location: &str, model: &str, action: &str) -> String {
     format!(
-        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}"
+        "https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}",
+        host = vertex_host(location)
     )
 }
 
@@ -419,6 +436,26 @@ mod tests {
             "/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
         ));
         assert!(url.starts_with("https://us-central1-aiplatform.googleapis.com/v1/projects/nexus-test/locations/us-central1/"));
+    }
+
+    #[test]
+    fn vertex_host_global_senza_prefisso() {
+        // La region `global` usa l'endpoint globale (host senza prefisso), le region
+        // geografiche il prefisso regionale. Bug pre-fix: global ->
+        // "global-aiplatform.googleapis.com" (host inesistente) -> 404 -> i modelli
+        // esposti solo su global (preview Gemini 3) restavano invisibili al discovery.
+        assert_eq!(vertex_host("global"), "aiplatform.googleapis.com");
+        assert_eq!(vertex_host("GLOBAL"), "aiplatform.googleapis.com");
+        assert_eq!(
+            vertex_host("europe-west4"),
+            "europe-west4-aiplatform.googleapis.com"
+        );
+        // Endpoint completo su global: host globale, path con locations/global.
+        let url = vertex_endpoint("nexus-test", "global", "gemini-3-pro-preview", false);
+        assert_eq!(
+            url,
+            "https://aiplatform.googleapis.com/v1/projects/nexus-test/locations/global/publishers/google/models/gemini-3-pro-preview:generateContent"
+        );
     }
 
     #[test]
