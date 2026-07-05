@@ -742,7 +742,9 @@ pub(crate) fn tier_score(preferred: &str, actual: &str) -> f32 {
 
 pub(crate) fn tier_rank(tier: &str) -> i32 {
     match tier {
-        "heavy" => 2,
+        "frontier" => 4,
+        "heavy" => 3,
+        "high" => 2,
         "medium" => 1,
         "light" => 0,
         _ => 1,
@@ -897,13 +899,19 @@ mod tests {
 
     #[test]
     fn tier_score_adjacent_half() {
-        assert_eq!(tier_score("heavy", "medium"), 0.5);
+        // Scala a 5 (light<medium<high<heavy<frontier): coppie a distanza 1 -> 0.5.
+        assert_eq!(tier_score("frontier", "heavy"), 0.5);
+        assert_eq!(tier_score("heavy", "high"), 0.5);
+        assert_eq!(tier_score("high", "medium"), 0.5);
         assert_eq!(tier_score("medium", "light"), 0.5);
+        // heavy e medium ora NON sono adiacenti (c'e' 'high' in mezzo) -> 0.0.
+        assert_eq!(tier_score("heavy", "medium"), 0.0);
     }
 
     #[test]
     fn tier_score_far_zero() {
         assert_eq!(tier_score("heavy", "light"), 0.0);
+        assert_eq!(tier_score("frontier", "medium"), 0.0);
     }
 
     #[test]

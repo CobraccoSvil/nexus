@@ -35,12 +35,15 @@ use crate::decisions::governance::{
 };
 
 /// Rank numerico del performance-tier per l'ordinamento di escalation (piu' alto =
-/// piu' capace). Sconosciuto/assente -> `medium` (neutro): non penalizza ne' premia.
+/// piu' capace). Scala a 5 livelli (light<medium<high<heavy<frontier).
+/// Sconosciuto/assente -> `medium` (neutro): non penalizza ne' premia.
 fn tier_rank(tier: Option<&str>) -> u8 {
     match tier.map(|t| t.trim().to_ascii_lowercase()).as_deref() {
         Some("light") => 1,
         Some("medium") => 2,
-        Some("heavy") => 3,
+        Some("high") => 3,
+        Some("heavy") => 4,
+        Some("frontier") => 5,
         _ => 2,
     }
 }

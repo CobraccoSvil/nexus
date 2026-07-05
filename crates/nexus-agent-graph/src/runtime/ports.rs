@@ -1352,11 +1352,15 @@ pub enum OrchestrationMove {
     Fallback,
 }
 
-/// Tier di scala del modello (`light`/`medium`/`heavy`): valore opaco che riflette
-/// la tassonomia `ai_price_catalog.performance_tier` (CHECK light/medium/heavy, mig
-/// 0032, default `medium`). Qui e' un dominio STRUTTURATO (regola M): lo scale-controller
-/// ragiona sul TIER astratto, non su un nome modello (regola G). Il tier->modello sano
-/// e' risolto A VALLE (PR-B) via `best_model_for_tier`/`select_agentic_model`.
+/// Tier di scala del modello: valore opaco che riflette la tassonomia
+/// `ai_price_catalog.performance_tier`. Scala a 5 livelli
+/// (`light`<`medium`<`high`<`heavy`<`frontier`, mig 0032 estesa): i modelli di
+/// fascia alta, prima tutti `heavy`, si distribuiscono ora su high/heavy/frontier
+/// (es. gemini-2.5-pro->high, gemini-3-pro->heavy, gpt-5.5/opus-4-8->frontier),
+/// cosi' l'escalation e la selezione distinguono il "meglio disponibile". Qui e'
+/// un dominio STRUTTURATO (regola M): lo scale-controller ragiona sul TIER astratto,
+/// non su un nome modello (regola G). Il tier->modello sano e' risolto A VALLE via
+/// `best_model_for_tier`/`select_agentic_model`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScaleTier {
@@ -1365,40 +1369,64 @@ pub enum ScaleTier {
     /// Tier intermedio (default catalog, mig 0032).
     #[default]
     Medium,
-    /// Modelli grandi/potenti (alta potenza, alto costo).
+    /// Modelli forti ma non di frontiera (es. gemini-2.5-pro, deepseek-v4-pro).
+    High,
+    /// Modelli molto potenti (es. gemini-3-pro, gpt-5.1/5.2, opus-4-6).
     Heavy,
+    /// Modelli di frontiera, il top assoluto (es. gpt-5.5, claude-opus-4-8, fable-5).
+    Frontier,
 }
 
 impl ScaleTier {
-    /// Etichetta canonica del tier (`light`/`medium`/`heavy`), 1:1 con
-    /// `ai_price_catalog.performance_tier`. Usata per serializzare/chiave-cache.
+    /// Etichetta canonica del tier, 1:1 con `ai_price_catalog.performance_tier`.
+    /// Usata per serializzare/chiave-cache.
     pub fn as_str(&self) -> &'static str {
         match self {
             ScaleTier::Light => "light",
             ScaleTier::Medium => "medium",
+            ScaleTier::High => "high",
             ScaleTier::Heavy => "heavy",
+            ScaleTier::Frontier => "frontier",
         }
     }
 
-    /// Parsa un tier dal catalog (`light`/`medium`/`heavy`, case-insensitive,
-    /// trimmed). Valore fuori vocabolario -> `None` (il chiamante decide il
-    /// fallback DETERMINISTICO, tipicamente [`ScaleTier::Medium`], default catalog):
-    /// niente magic-fallback nascosto qui (regola G), solo parsing puro.
+    /// Parsa un tier dal catalog (case-insensitive, trimmed). Valore fuori
+    /// vocabolario -> `None` (il chiamante decide il fallback DETERMINISTICO,
+    /// tipicamente [`ScaleTier::Medium`], default catalog): niente magic-fallback
+    /// nascosto qui (regola G), solo parsing puro.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "light" => Some(ScaleTier::Light),
             "medium" => Some(ScaleTier::Medium),
+            "high" => Some(ScaleTier::High),
             "heavy" => Some(ScaleTier::Heavy),
+            "frontier" => Some(ScaleTier::Frontier),
             _ => None,
         }
     }
 
-    /// Ordinale del tier per il clamp "1 gradino per epoca" (light=0/medium=1/heavy=2).
+    /// Ordinale del tier per il clamp "1 gradino per epoca"
+    /// (light=0/medium=1/high=2/heavy=3/frontier=4).
     pub fn rank(&self) -> i64 {
         match self {
             ScaleTier::Light => 0,
             ScaleTier::Medium => 1,
-            ScaleTier::Heavy => 2,
+            ScaleTier::High => 2,
+            ScaleTier::Heavy => 3,
+            ScaleTier::Frontier => 4,
+        }
+    }
+
+    /// Inverso di [`rank`]: ricostruisce il tier dal suo ordinale (clampato al
+    /// range valido 0..=4). Punto unico usato dal clamp "1 gradino per epoca"
+    /// per avanzare/arretrare di un solo gradino su una scala a N livelli.
+    pub fn from_rank(rank: i64) -> Self {
+        match rank {
+            r if r <= 0 => ScaleTier::Light,
+            1 => ScaleTier::Medium,
+            2 => ScaleTier::High,
+            3 => ScaleTier::Heavy,
+            _ => ScaleTier::Frontier,
         }
     }
 }

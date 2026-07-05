@@ -266,16 +266,18 @@ fn higher_tier(a: ScaleTier, b: ScaleTier) -> ScaleTier {
     }
 }
 
-/// Clampa il tier target a UN SOLO gradino dal corrente (gate 4): `light<->medium
-/// <->heavy`, mai un salto diretto light<->heavy in una sola epoca. Ritorna il tier
-/// intermedio se il salto e' di 2 gradini, altrimenti il target invariato.
+/// Clampa il tier target a UN SOLO gradino dal corrente (gate 4): sulla scala a 5
+/// livelli (light<medium<high<heavy<frontier) mai un salto diretto di 2+ gradini in
+/// una sola epoca. Ritorna il target se e' gia' adiacente, altrimenti AVANZA/ARRETRA
+/// di un solo gradino verso di esso (punto unico [`ScaleTier::from_rank`]).
 fn clamp_one_step(current: ScaleTier, target: ScaleTier) -> ScaleTier {
     let (c, t) = (current.rank(), target.rank());
     if (t - c).abs() <= 1 {
         return target;
     }
-    // Salto di 2 gradini: fermati a medium (l'unico intermedio).
-    ScaleTier::Medium
+    // Salto multi-gradino: muovi di UN solo gradino verso il target.
+    let stepped = if t > c { c + 1 } else { c - 1 };
+    ScaleTier::from_rank(stepped)
 }
 
 /// Applica i 5 gate deterministici dell'anti-oscillazione DOPO [`validate_scale_move`]
@@ -743,6 +745,25 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn from_rank_e_clamp_a_5_tier() {
+        use ScaleTier::*;
+        // round-trip rank <-> from_rank sui 5 livelli
+        for t in [Light, Medium, High, Heavy, Frontier] {
+            assert_eq!(ScaleTier::from_rank(t.rank()), t);
+        }
+        // parse dei due nuovi tier
+        assert_eq!(ScaleTier::parse("high"), Some(High));
+        assert_eq!(ScaleTier::parse("frontier"), Some(Frontier));
+        // clamp: un salto multi-gradino avanza/arretra di UN solo gradino
+        assert_eq!(clamp_one_step(Light, Frontier), Medium); // +4 -> +1
+        assert_eq!(clamp_one_step(Frontier, Light), Heavy); //  -4 -> -1
+        assert_eq!(clamp_one_step(Medium, Heavy), High); //    +2 -> +1
+        // tier adiacenti passano invariati
+        assert_eq!(clamp_one_step(High, Heavy), Heavy);
+        assert_eq!(clamp_one_step(Heavy, High), High);
+    }
+
     fn base_ctx() -> ScaleContext {
         ScaleContext {
             current_tier: ScaleTier::Medium,
@@ -925,10 +946,12 @@ mod tests {
     fn gate_confidenza_sopra_soglia_upscale_passa() {
         let cfg = ScaleHysteresisConfig::conservative_defaults();
         let ctx = base_ctx();
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.9 };
+        // Target adiacente (Medium->High) per isolare il gate confidenza dal gate
+        // clamp (gate 4): un salto Medium->Heavy verrebbe clampato a High.
+        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.9 };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
-            ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.9 }
+            ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.9 }
         );
     }
 
@@ -943,10 +966,11 @@ mod tests {
             error_count: 5,
             ..base_ctx()
         };
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.75 };
+        // Target adiacente (Medium->High) per isolare il gate banda dal gate clamp.
+        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.75 };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
-            ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.75 }
+            ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.75 }
         );
     }
 
@@ -1034,18 +1058,18 @@ mod tests {
     #[test]
     fn gate_reversal_pin_sale_al_piu_alto_dei_due() {
         // FIX-D: reversal_count >= max_reversals sulla coppia (current, target) ->
-        // pin al tier PIU' ALTO DEI DUE (safety-biased). Coppia (Medium, Heavy) con
-        // richiesta di UpscaleTo Heavy -> pin a Heavy.
+        // pin al tier PIU' ALTO DEI DUE (safety-biased). Coppia ADIACENTE (Medium,
+        // High) per non innescare il gate clamp: richiesta UpscaleTo High -> pin a High.
         let cfg = ScaleHysteresisConfig::conservative_defaults();
         let ctx = ScaleContext {
             current_tier: ScaleTier::Medium,
             reversal_count: 2,
             ..base_ctx()
         };
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.9 };
+        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.9 };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
-            ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.9 },
+            ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.9 },
             "reversal-pin sale al tier piu' alto dei due, safety-biased"
         );
     }

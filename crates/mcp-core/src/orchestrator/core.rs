@@ -1003,7 +1003,9 @@ impl Orchestrator {
             // Tier-chain con pavimento: un task heavy/medium non degrada sotto il
             // proprio tier (niente caduta a un modello light per un coding heavy).
             let tiers_to_try: Vec<&str> = match tier.as_str() {
-                "heavy" => vec!["heavy", "medium"],
+                "frontier" => vec!["frontier", "heavy", "high"],
+                "heavy" => vec!["heavy", "high", "medium"],
+                "high" => vec!["high", "medium"],
                 "medium" => vec!["medium"],
                 _ => vec!["light"],
             };
@@ -1144,7 +1146,9 @@ impl Orchestrator {
                     // PUNTO UNICO di selezione agentica (regola L): tier degradato,
                     // provider non in cooldown, eleggibilita' definita una volta sola.
                     let tiers_to_try: Vec<&str> = match base_tier.as_str() {
-                        "heavy" => vec!["heavy", "medium"],
+                        "frontier" => vec!["frontier", "heavy", "high", "medium"],
+                        "heavy" => vec!["heavy", "high", "medium"],
+                        "high" => vec!["high", "medium", "light"],
                         "medium" => vec!["medium", "light"],
                         _ => vec!["light"],
                     };

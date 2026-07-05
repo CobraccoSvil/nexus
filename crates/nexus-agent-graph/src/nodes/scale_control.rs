@@ -588,8 +588,10 @@ mod tests {
         // la valida, applica l'anti-oscillazione (passa: cooldown ok, 1 gradino) e la
         // persiste alla chiave-cache, poi risolve. Il clone-whole-map preserva le
         // altre chiavi.
+        // Target adiacente al corrente (Medium->High) per isolare la PERSISTENZA
+        // dal gate clamp (Medium->Heavy verrebbe clampato a High).
         let node = ScaleControlNode::new(Arc::new(FixedScaleReasoner(ScaleMove::UpscaleTo {
-            tier: ScaleTier::Heavy,
+            tier: ScaleTier::High,
             confidence: 0.9,
         })));
         let ctx = real_ctx();
@@ -612,7 +614,7 @@ mod tests {
         assert_eq!(
             mv,
             ScaleMove::UpscaleTo {
-                tier: ScaleTier::Heavy,
+                tier: ScaleTier::High,
                 confidence: 0.9
             }
         );

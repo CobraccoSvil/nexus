@@ -223,14 +223,21 @@ pub(crate) async fn route_model_from_catalog(
     // "approfondita" scala in alto, "veloce"/"economica" scala in basso.
     // Il `base_tier` arriva gia' risolto dal chiamante via IntentCapabilityMap
     // (mig 0110), che applica le soglie di token threshold per l'intent.
+    // Scala a 5 tier (light<medium<high<heavy<frontier): "approfondita" sale di UN
+    // gradino, "veloce"/"economica" scende di UN gradino con pavimento a 'medium'
+    // (non si va sotto medium per un intent di velocita'/costo).
     let mode_tier = match mode {
         "approfondita" => match base_tier {
             "light" => "medium",
-            "medium" => "heavy",
+            "medium" => "high",
+            "high" => "heavy",
+            "heavy" => "frontier",
             other => other,
         },
         "veloce" | "economica" => match base_tier {
-            "heavy" => "medium",
+            "frontier" => "heavy",
+            "heavy" => "high",
+            "high" => "medium",
             other => other,
         },
         _ => base_tier,
@@ -258,12 +265,7 @@ pub(crate) async fn route_model_from_catalog(
     // GRACEFUL: il primo tier con un candidato eleggibile vince; se il tier
     // minimo (incluso il pavimento agentico) e' tutto in cooldown, scende verso
     // il basso fino a 'light' invece di fallire (heavy->medium->light).
-    let tier_chain: Vec<&str> = match required_tier {
-        "heavy" => vec!["heavy", "medium", "light"],
-        "medium" => vec!["medium", "light"],
-        "light" => vec!["light", "medium"],
-        other => vec![other],
-    };
+    let tier_chain = agentic_tier_chain(required_tier);
     // Branch: catalog dynamic routing (selettore agentico unico). Variante
     // GOVERNATA telemetria-aware (opt-in `agent.governance.telemetry_aware`, OFF =
     // bit-identico al selettore standard). Riordina i candidati ammissibili per
@@ -271,6 +273,24 @@ pub(crate) async fn route_model_from_catalog(
     select_agentic_model_governed(db, &tier_chain, Some(capability), 0, &[], order_clause)
         .await
         .map(|(provider, model)| DynamicRoutingDecision { provider, model })
+}
+
+/// Catena di degradazione graceful dei tier da `top` fino a `light` sulla scala a
+/// 5 livelli (frontier>heavy>high>medium>light). PUNTO UNICO (regola L) della
+/// tier-chain agentica, condiviso da `route_model_from_catalog`,
+/// `best_agentic_failover` e `select_models_tierchain`: il primo tier con un
+/// candidato sano vince; se il tier alto e' tutto in cooldown si scende, invece di
+/// fallire. Un `top` fuori vocabolario degrada da 'medium' (neutro), mai un
+/// fallimento silenzioso.
+pub(crate) fn agentic_tier_chain(top: &str) -> Vec<&'static str> {
+    match top.trim() {
+        "frontier" => vec!["frontier", "heavy", "high", "medium", "light"],
+        "heavy" => vec!["heavy", "high", "medium", "light"],
+        "high" => vec!["high", "medium", "light"],
+        "medium" => vec!["medium", "light"],
+        "light" => vec!["light", "medium"],
+        _ => vec!["medium", "light"],
+    }
 }
 
 /// FAILOVER agentico cross-provider (regola L, punto unico): il MIGLIOR modello
@@ -297,11 +317,7 @@ pub(crate) async fn best_agentic_failover(
     let floor = agentic_min_tier(db).await;
     // Stessa degradazione graceful di route_model_from_catalog, partendo dal
     // pavimento agentico (il failover e' sempre un turno agentico a tool).
-    let tier_chain: Vec<&str> = match floor.as_str() {
-        "heavy" => vec!["heavy", "medium", "light"],
-        "medium" => vec!["medium", "light"],
-        _ => vec!["light", "medium"],
-    };
+    let tier_chain = agentic_tier_chain(floor.as_str());
     // capability None: per il failover basta un modello agentico (tool-use) SANO
     // di tier adeguato; non lo vincoliamo a una capability specifica del turno
     // (il pavimento garantisce gia' la forza). Ordine: featured + piu' economico.
@@ -1299,7 +1315,22 @@ mod intent_key_tests {
 // ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod agentic_tier_floor_tests {
-    use super::{floor_tier_for_agentic, route_model_from_catalog};
+    use super::{agentic_tier_chain, floor_tier_for_agentic, route_model_from_catalog};
+
+    #[test]
+    fn agentic_tier_chain_degrada_su_5_livelli() {
+        // Ogni tier degrada verso il basso fino a 'light' (scala a 5).
+        assert_eq!(
+            agentic_tier_chain("frontier"),
+            vec!["frontier", "heavy", "high", "medium", "light"]
+        );
+        assert_eq!(agentic_tier_chain("heavy"), vec!["heavy", "high", "medium", "light"]);
+        assert_eq!(agentic_tier_chain("high"), vec!["high", "medium", "light"]);
+        assert_eq!(agentic_tier_chain("medium"), vec!["medium", "light"]);
+        assert_eq!(agentic_tier_chain("light"), vec!["light", "medium"]);
+        // tier fuori vocabolario: degrada da 'medium' (neutro), mai fallimento.
+        assert_eq!(agentic_tier_chain("boh"), vec!["medium", "light"]);
+    }
 
     // ── Parte PURA: floor_tier_for_agentic (nessun DB) ──────────────────────
 
