@@ -377,9 +377,11 @@ pub(crate) fn infer_capabilities_from_name(provider: &str, model: &str) -> Vec<&
 /// `infer_capabilities_from_name`), applicata SOLO ai nuovi insert (non
 /// sovrascrive le righe esistenti / override admin).
 ///
-/// Regole per famiglia (allineate alla migrazione 0354 che riclassifica gli
-/// esistenti): i modelli "piccoli" (mini/nano/lite/haiku/ministral/small/nemo)
-/// sono light; i flagship (opus/o3/o1/*-pro) heavy; il resto medium.
+/// Regole per famiglia su scala a 5 livelli (light<medium<high<heavy<frontier,
+/// mig 0528): i "piccoli" (mini/nano/lite/haiku/ministral/small/nemo) sono light;
+/// la fascia alta si distribuisce per generazione (es. gemini-2.5-pro->high,
+/// gemini-3-pro->heavy, gpt-5.5/opus-4-8->frontier) invece di collassare tutta in
+/// 'heavy'; il resto medium. La telemetria (governance) affina a valle col dato reale.
 /// Estrae il major version number da un nome modello OpenAI della famiglia
 /// `gpt-N` / `gpt-N.M` (es. "gpt-5.5" -> 5, "gpt-4.1-nano" -> 4). Ritorna None
 /// se il nome non e' un modello `gpt-` numerato (es. o-series, chatgpt-*).
@@ -396,16 +398,43 @@ pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str 
     let m = model.to_ascii_lowercase();
     match provider {
         "google" => {
-            if m.contains("pro") {
-                "heavy"
+            // Marcatori di generazione: 3.5 e' l'attuale frontiera Google.
+            let g35 = m.contains("3.5") || m.contains("3-5");
+            let g3 = !g35 && (m.contains("gemini-3") || m.contains("-3-") || m.ends_with("-3"));
+            if m.contains("lite") {
+                "light"
+            } else if m.contains("flash") {
+                // flash veloce/economico resta light (fascia bassa invariata);
+                // ECCEZIONE: 3.5-flash e' il flagship coding Google -> heavy.
+                if g35 {
+                    "heavy"
+                } else {
+                    "light"
+                }
+            } else if m.contains("pro") {
+                // 3.5-pro -> frontier, gemini-3-pro/3.1-pro -> heavy, 2.5-pro -> high.
+                if g35 {
+                    "frontier"
+                } else if g3 {
+                    "heavy"
+                } else {
+                    "high"
+                }
             } else {
-                // flash, flash-lite
                 "light"
             }
         }
         "anthropic" => {
             if m.contains("opus") {
-                "heavy"
+                // opus-4-8 (l'attuale flagship coding) frontier; opus precedenti heavy.
+                if m.contains("4-8") || m.contains("4.8") {
+                    "frontier"
+                } else {
+                    "heavy"
+                }
+            } else if m.contains("fable") {
+                // claude-fable-5: flagship "most capable widely-released".
+                "frontier"
             } else if m.contains("haiku") {
                 "light"
             } else {
@@ -418,31 +447,52 @@ pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str 
             // mini/nano (anche di un flagship, es. gpt-5.4-mini) e' light.
             if m.contains("nano") || m.contains("mini") {
                 "light"
-            } else if m.contains("o3") || m.contains("o1") || m.contains("pro") {
-                // Reasoning o-series (o1/o3) e varianti *-pro = flagship heavy.
+            } else if m.contains("o1") {
+                "high"
+            } else if m.contains("o3") || m.contains("o4") {
                 "heavy"
-            } else if openai_gpt_major(&m).is_some_and(|major| major >= 5) {
-                // Flagship GPT di punta: gpt-5, gpt-5.x e successivi senza
-                // suffisso mini/nano e che non siano chat-only sono heavy.
-                // Parsare il major number (anziche' confrontare nomi esatti)
-                // mantiene l'euristica robusta alle versioni future della
-                // famiglia (regola G: niente nome modello hardcoded).
-                // I "chat-latest" sono varianti ottimizzate per chat veloce,
-                // non i flagship reasoning: restano medium.
-                if m.contains("chat") {
+            } else if let Some(major) = openai_gpt_major(&m) {
+                // Famiglia GPT: la versione distingue la fascia (regola G: parsing
+                // del numero, niente nome hardcoded). I "chat-latest" sono varianti
+                // chat veloci, non flagship reasoning: medium.
+                if major < 5 {
+                    // gpt-4o, gpt-4.1, ecc.
                     "medium"
-                } else {
+                } else if m.contains("chat") {
+                    "medium"
+                } else if major >= 6 || m.contains("5.5") || m.contains("5-5") {
+                    // gpt-5.5 e generazioni future = frontiera.
+                    "frontier"
+                } else if m.contains("pro")
+                    || m.contains("codex")
+                    || m.contains("5.1")
+                    || m.contains("5.2")
+                    || m.contains("5.3")
+                    || m.contains("5.4")
+                    || m.contains("5-1")
+                    || m.contains("5-2")
+                    || m.contains("5-3")
+                    || m.contains("5-4")
+                {
                     "heavy"
+                } else {
+                    // gpt-5 base
+                    "high"
                 }
+            } else if m.contains("pro") {
+                "heavy"
             } else {
-                // gpt-4o, gpt-4.1, ecc. restano medium.
                 "medium"
             }
         }
         "mistral" => {
-            // Mistral non ha un tier "heavy" reale: large e' il loro massimo.
-            // Piccoli (ministral 3b/8b/14b, small, nemo) -> light.
-            if m.contains("ministral") || m.contains("small") || m.contains("nemo") {
+            // Mistral non ha un tier "heavy"/"frontier" reale: large/medium-3.5 e'
+            // il loro massimo (medium). Piccoli (ministral, small, nemo, tiny) light.
+            if m.contains("ministral")
+                || m.contains("small")
+                || m.contains("nemo")
+                || m.contains("tiny")
+            {
                 "light"
             } else {
                 // large, medium, codestral, devstral, magistral
@@ -450,18 +500,15 @@ pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str 
             }
         }
         "deepseek" => {
-            // Distinzione di CAPACITA' reale (regola H, causa radice "agentic usa
-            // deepseek-coder"): deepseek-coder e deepseek-chat sono modelli
-            // completion/chat LEGACY (V2/V3) -> 'light'. Tenerli a 'medium' li
-            // metteva nello stesso pool agentico dei reasoning V4 e, essendo
-            // policy='none', li scavalcavano. I V4 sono i forti: pro -> 'heavy',
+            // deepseek-coder/chat = completion/chat LEGACY (V2/V3) -> light. I V4
+            // sono i forti: pro/reasoner -> 'high' (fascia alta ma non frontier),
             // flash (1M ctx, veloce) -> 'medium'.
             if m.contains("coder") || m.contains("chat") {
                 "light"
-            } else if m.contains("pro") {
-                "heavy"
+            } else if m.contains("pro") || m.contains("reasoner") || m.contains("r1") {
+                "high"
             } else {
-                // deepseek-v4-flash, reasoner e successivi.
+                // deepseek-v4-flash e successivi.
                 "medium"
             }
         }
@@ -1734,8 +1781,8 @@ mod tests {
 
     #[test]
     fn test_infer_tier_other_providers() {
-        // Google: pro=heavy, flash*=light.
-        assert_eq!(infer_tier_from_name("google", "gemini-2.5-pro"), "heavy");
+        // Google (scala 5): 2.5-pro=high, flash*=light.
+        assert_eq!(infer_tier_from_name("google", "gemini-2.5-pro"), "high");
         assert_eq!(infer_tier_from_name("google", "gemini-2.5-flash"), "light");
         assert_eq!(
             infer_tier_from_name("google", "gemini-2.5-flash-lite"),
@@ -1767,13 +1814,13 @@ mod tests {
 
     #[test]
     fn test_infer_tier_flagship_naming_recente() {
-        // OpenAI: i flagship gpt-5+ senza suffisso mini/nano sono heavy
-        // (prima erano erroneamente medium perche' l'euristica marcava heavy
-        // solo con 'pro' nel nome). Robusto alle versioni future via major.
-        assert_eq!(infer_tier_from_name("openai", "gpt-5"), "heavy");
-        assert_eq!(infer_tier_from_name("openai", "gpt-5.5"), "heavy");
+        // OpenAI (scala 5): gpt-5 base = high; gpt-5.1..5.4 e *-pro/*-codex = heavy;
+        // gpt-5.5 e generazioni future (>=6) = frontier. Robusto alle versioni
+        // future via parsing del major (regola G).
+        assert_eq!(infer_tier_from_name("openai", "gpt-5"), "high");
+        assert_eq!(infer_tier_from_name("openai", "gpt-5.5"), "frontier");
         assert_eq!(infer_tier_from_name("openai", "gpt-5.4"), "heavy");
-        assert_eq!(infer_tier_from_name("openai", "gpt-6"), "heavy");
+        assert_eq!(infer_tier_from_name("openai", "gpt-6"), "frontier");
         // Le varianti piccole di un flagship restano light.
         assert_eq!(infer_tier_from_name("openai", "gpt-5.4-mini"), "light");
         assert_eq!(infer_tier_from_name("openai", "gpt-5-nano"), "light");
@@ -1785,11 +1832,46 @@ mod tests {
         // I gpt precedenti (4.x, 4o) restano medium.
         assert_eq!(infer_tier_from_name("openai", "gpt-4o"), "medium");
         assert_eq!(infer_tier_from_name("openai", "gpt-4.1"), "medium");
-        // Anthropic: naming nuovo opus-4-8 deve restare heavy (caso del bug).
+        // Anthropic (scala 5): opus-4-8 (flagship coding attuale) = frontier;
+        // opus precedenti = heavy.
         assert_eq!(
             infer_tier_from_name("anthropic", "claude-opus-4-8"),
+            "frontier"
+        );
+        assert_eq!(
+            infer_tier_from_name("anthropic", "claude-opus-4-6"),
             "heavy"
         );
+    }
+
+    #[test]
+    fn test_infer_tier_scala_5_fascia_alta() {
+        // Il cuore della scala a 5: la vecchia fascia 'heavy' si spalma su
+        // high/heavy/frontier per capacita' reale (distingue il "meglio disponibile").
+        // Google: 3.5-pro frontier, gemini-3/3.1-pro heavy, 2.5-pro high, 3.5-flash heavy.
+        assert_eq!(
+            infer_tier_from_name("google", "gemini-3-pro-preview"),
+            "heavy"
+        );
+        assert_eq!(
+            infer_tier_from_name("google", "gemini-3.1-pro-preview"),
+            "heavy"
+        );
+        assert_eq!(infer_tier_from_name("google", "gemini-3.5-pro"), "frontier");
+        assert_eq!(infer_tier_from_name("google", "gemini-3.5-flash"), "heavy");
+        assert_eq!(
+            infer_tier_from_name("google", "gemini-flash-lite-latest"),
+            "light"
+        );
+        // Anthropic: fable-5 frontier.
+        assert_eq!(infer_tier_from_name("anthropic", "claude-fable-5"), "frontier");
+        // OpenAI: *-pro / *-codex = heavy.
+        assert_eq!(infer_tier_from_name("openai", "gpt-5-pro"), "heavy");
+        assert_eq!(infer_tier_from_name("openai", "gpt-5.2-codex"), "heavy");
+        // DeepSeek: v4-pro/reasoner high, v4-flash medium, coder light.
+        assert_eq!(infer_tier_from_name("deepseek", "deepseek-v4-pro"), "high");
+        assert_eq!(infer_tier_from_name("deepseek", "deepseek-v4-flash"), "medium");
+        assert_eq!(infer_tier_from_name("deepseek", "deepseek-coder"), "light");
     }
 
     #[test]
