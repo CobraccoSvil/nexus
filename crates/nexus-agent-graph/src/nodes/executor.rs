@@ -3242,7 +3242,7 @@ della finestra {effective_window} del modello {provider}/{model}"
                 // `failover_tried` cosi' la cascata ne sceglie sempre uno diverso. Solo
                 // quando NESSUN provider sano resta cadiamo nella chiusura `Error`
                 // (onesta). Gated `auto_escalations < 3` (no escalation a raffica).
-                if matches!(err, crate::runtime::ports::PortError::ProviderUnavailable(_)) {
+                if let crate::runtime::ports::PortError::ProviderUnavailable(pu) = &err {
                     let cd_escal = state
                         .extra
                         .get("auto_escalations")
@@ -3290,38 +3290,79 @@ della finestra {effective_window} del modello {provider}/{model}"
                                 from_provider = %provider,
                                 to_provider = %pick.provider,
                                 to_model = %pick.model,
+                                cause = pu.cause.as_str(),
                                 tried = tried.len(),
                                 "provider caduto -> FAILOVER cross-provider via routing (cascata)"
                             );
+                            // Motivo ONESTO dello switch (regola M): la causa
+                            // tipizzata arriva dal body strutturato del gateway
+                            // (details.primary_cause / POLICY_TIER_EXCLUDED), mai
+                            // dal testo. PRIMA era hardcoded "cooldown" per tutto:
+                            // un 4xx del provider o un'esclusione di policy
+                            // venivano raccontati come instabilita' del provider
+                            // (incidente run 48793fde, 2026-07-06).
+                            use crate::runtime::ports::ProviderFailureCause as Cause;
+                            let title = match pu.cause {
+                                Cause::Billing => format!(
+                                    "Credito esaurito su {provider}: passo a {}/{}",
+                                    pick.provider, pick.model
+                                ),
+                                Cause::ClientError => format!(
+                                    "{provider} ha rifiutato la richiesta: passo a {}/{}",
+                                    pick.provider, pick.model
+                                ),
+                                Cause::PolicyTierExcluded => format!(
+                                    "Contenuto riservato: {provider} escluso dalla policy, \
+passo a {}/{}",
+                                    pick.provider, pick.model
+                                ),
+                                Cause::Cooldown | Cause::Unknown => format!(
+                                    "Provider {provider} non disponibile: passo a {}/{}",
+                                    pick.provider, pick.model
+                                ),
+                            };
                             self.emit_phase(
                                 ctx,
                                 mode,
                                 "escalation",
-                                format!(
-                                    "Provider {provider} non disponibile: passo a {}/{}",
-                                    pick.provider, pick.model
-                                ),
+                                title,
                                 json!({
                                     "from_provider": provider,
                                     "to_provider": pick.provider,
                                     "to_model": pick.model,
                                     "reason": "provider_failover",
-                                    // Causa STRUTTURATA (ADR 0037 arricchimento B):
-                                    // questo ramo entra SOLO su ProviderUnavailable,
-                                    // derivato dal CODICE errore del gateway
-                                    // (PROVIDER_ERROR), non dal testo (regola M). Lo
-                                    // switch e' dovuto a cooldown/quota del provider
-                                    // di partenza: il frontend puo' colorare la banda
-                                    // "Cambio provider" come cooldown senza euristiche.
-                                    "cooldown": true,
-                                    "cause": "cooldown",
+                                    // Causa STRUTTURATA (ADR 0037 arricchimento B),
+                                    // vocabolario chiuso ProviderFailureCause: il
+                                    // frontend mappa l'etichetta umana senza
+                                    // euristiche. `cooldown` resta bool per
+                                    // retro-compatibilita' ed e' true SOLO quando
+                                    // lo switch e' davvero da indisponibilita'
+                                    // temporale (cooldown/credito).
+                                    "cooldown": pu.cause.is_cooldown_like(),
+                                    "cause": pu.cause.as_str(),
                                 }),
                             )
                             .await;
-                            let esc_nudge = human_msg(
-                                "Il provider precedente non e' disponibile (in cooldown). \
-Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito.",
-                            );
+                            let esc_nudge = human_msg(match pu.cause {
+                                Cause::ClientError => {
+                                    "Il provider precedente ha rifiutato la richiesta \
+(errore lato provider sulla richiesta, non un cooldown). Riprendi tu, sul nuovo provider: \
+esegui il prossimo step concreto del compito."
+                                }
+                                Cause::PolicyTierExcluded => {
+                                    "Il provider precedente e' stato escluso dalla policy per \
+contenuto riservato (sensitivity tier). Riprendi tu, sul provider ammesso: esegui il \
+prossimo step concreto del compito."
+                                }
+                                Cause::Billing => {
+                                    "Il provider precedente ha il credito esaurito. Riprendi \
+tu, su un provider sano: esegui il prossimo step concreto del compito."
+                                }
+                                Cause::Cooldown | Cause::Unknown => {
+                                    "Il provider precedente non e' disponibile (in cooldown). \
+Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
+                                }
+                            });
                             // Marca il provider scelto come provato: se cadesse anche
                             // lui, il giro dopo lo esclude e ne sceglie un altro sano.
                             tried.push(pick.provider.clone());

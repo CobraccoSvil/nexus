@@ -1,4 +1,38 @@
 # Profilo CLOUD — provider esterni, no on-premise
+#
+# ── Come leggere la matrice tier -> provider ─────────────────────────────────
+# Il policy engine (crates/nexus-gateway/src/policy_engine.rs) classifica ogni
+# richiesta con un sensitivity tier EFFETTIVO = max(tier dichiarato dal caller,
+# tier rilevato dal classifier su segreti/PII nella history). Il tier effettivo
+# seleziona la chain `routing.tier_N` (primary -> secondary -> tertiary ->
+# fallback) dei provider ammessi.
+#
+# Gate cloud per-tier (flag `features.allow_cloud_tier2/3`, override runtime
+# dai settings DB `dlp_allow_cloud_tier2/3` — regola G, cache 60s):
+#   - flag a false => i provider CLOUD (anthropic/openai/mistral/deepseek/
+#     google) sono ESCLUSI dal tier, restano solo i locali (vllm);
+#   - `dlp_enabled=false` => ogni richiesta e' trattata come tier 0.
+#
+# Pin del provider (`pin_provider` nella richiesta, usato dal motore agentico):
+# bypassa il ROUTING di questa matrice ma NON il gate cloud per-tier: se il
+# tier effettivo vieta il cloud e il pin e' un provider cloud, il gateway
+# risponde 403 `POLICY_TIER_EXCLUDED` (vedi sotto) invece di inviare il
+# contenuto riservato al cloud. La redazione (segreti/PII) resta attiva in
+# entrambi i path per tier >= 2 (strict mode).
+#
+# Codici d'errore STRUTTURATI del gateway verso i caller (regola M — decidere
+# dai codici/details, mai dal testo umano):
+#   - `POLICY_TIER_EXCLUDED` (403): provider escluso dalla policy per il
+#     sensitivity tier del contenuto; `details` porta `detected_tier`,
+#     `provider` (se pinnato) e `allowed_providers`.
+#   - `TIER_BLOCKED` (403): routing bloccato per motivi non-DLP (tier ignoto,
+#     flag tenant).
+#   - `PROVIDER_ERROR` (500): tutti i provider della chain hanno fallito;
+#     `details.failures[]` porta la classe per-provider (`billing` |
+#     `client_error` | `transient` | `cooldown` | `cooldown_billing`) +
+#     status/code HTTP del provider; `details.primary_cause` e' la classe del
+#     primo fallimento. Un `client_error` (4xx del provider) NON e' un
+#     cooldown: il motore lo racconta come rifiuto della richiesta.
 profile: cloud
 
 providers:
@@ -48,7 +82,10 @@ features:
   allow_cloud_tier3: true
   dlp_enabled: true
 
-# Provider routing policy
+# Provider routing policy — matrice tier -> chain provider (vedi header del
+# file per gate DLP, semantica pin e codici errore). Riepilogo del profilo
+# cloud: TUTTI i tier ammettono i provider cloud (allow_cloud_tier2/3=true,
+# scelta esplicita dell'operatore dev; in prod usare hybrid/onprem).
 routing:
   tier_0:
     primary: openai

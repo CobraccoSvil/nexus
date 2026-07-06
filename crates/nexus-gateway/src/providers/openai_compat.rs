@@ -143,7 +143,15 @@ impl OpenAiCompatClient {
             return Err(provider_http_error(&self.provider_name, resp).await.into());
         }
 
-        let parsed: ChatCompletion = resp.json().await?;
+        // Body come testo + parse esplicito: il generico `resp.json()` di
+        // reqwest appiattiva OGNI mismatch in "error decoding response body"
+        // (incidente mistral 2026-07-06: 18 errori in history senza causa
+        // diagnosticabile). Il parse separato distingue "body troncato dalla
+        // rete" (fallisce `text()`, transitorio vero) da "schema inatteso"
+        // (fallisce serde con campo/posizione precisi, senza payload nel
+        // messaggio: regola F).
+        let body = resp.text().await?;
+        let parsed = parse_chat_completion(&self.provider_name, &body)?;
         let latency_ms = start.elapsed().as_millis() as u64;
         from_chat_completion(parsed, req.model.clone(), &self.provider_name, latency_ms)
     }
@@ -834,6 +842,20 @@ fn blocks_to_openai_parts(blocks: &[crate::types::LlmContentBlock]) -> Vec<serde
         .collect()
 }
 
+/// Parsa il body 200 di `/chat/completions` in [`ChatCompletion`] con errore
+/// CONTESTUALIZZATO: provider + causa serde (campo mancante/tipo inatteso, con
+/// riga e colonna), mai il contenuto del body (regola F). Funzione PURA
+/// (testabile senza rete); punto unico del parse non-streaming (regola L).
+fn parse_chat_completion(provider: &str, body: &str) -> anyhow::Result<ChatCompletion> {
+    serde_json::from_str(body).map_err(|e| {
+        // Causa serde troncata: per gli invalid-type su stringhe serde include
+        // il valore nel messaggio; il taglio evita di trascinare contenuto di
+        // risposta nel canale d'errore (regola F) mantenendo campo/riga/colonna.
+        let cause: String = e.to_string().chars().take(200).collect();
+        anyhow::anyhow!("{provider}: risposta 200 non decodificabile come ChatCompletion ({cause})")
+    })
+}
+
 /// Mappa una [`ChatCompletion`] non-streaming in [`LlmResponse`].
 fn from_chat_completion(
     resp: ChatCompletion,
@@ -1339,7 +1361,14 @@ struct RespChoice {
 
 #[derive(Debug, Deserialize)]
 struct RespMessage {
-    #[serde(default)]
+    /// Content della risposta. Il dialetto OpenAI classico e' una STRINGA, ma
+    /// Mistral (contratto ufficiale: `content: string | ContentChunk[]`) puo'
+    /// rispondere con un ARRAY di chunk (`{type:"text", text}`, reference,
+    /// thinking). Un `Option<String>` rigido faceva fallire l'intero parse
+    /// ("error decoding response body", classificato transitorio e ritentato a
+    /// vuoto): il deserializzatore tollerante estrae il testo dai chunk `text`
+    /// e ignora gli altri.
+    #[serde(default, deserialize_with = "deserialize_lenient_content")]
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<RespToolCall>>,
@@ -1347,6 +1376,30 @@ struct RespMessage {
     /// provider OpenAI-compat.
     #[serde(default)]
     reasoning_content: Option<String>,
+}
+
+/// Deserializza un content wire tollerante: stringa as-is, array di chunk
+/// concatenando i soli `{type:"text"}` (il resto — reference, thinking — non e'
+/// testo di risposta), `null`/assente -> `None`. Punto unico riusato da
+/// response e delta streaming (regola L).
+fn deserialize_lenient_content<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(v.and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        // null gia' mappato a None da Option; altri tipi inattesi -> None
+        // (il chiamante degrada a content vuoto, non a parse fallito).
+        _ => None,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1412,7 +1465,10 @@ struct ChunkChoice {
 
 #[derive(Debug, Deserialize)]
 struct ChunkDelta {
-    #[serde(default)]
+    /// Stesso contratto tollerante del content non-streaming (stringa o array
+    /// di chunk): un delta array altrimenti veniva scartato in silenzio dal
+    /// parser SSE (risposta troncata senza errore).
+    #[serde(default, deserialize_with = "deserialize_lenient_content")]
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ChunkToolCallDelta>>,
@@ -1759,6 +1815,67 @@ mod tests {
         let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
         let resp = from_chat_completion(parsed, "m".to_string(), "openai", 1).unwrap();
         assert_eq!(resp.usage.cache_read_tokens, Some(12));
+    }
+
+    // ── Content tollerante (contratto Mistral: string | ContentChunk[]) ─────
+
+    #[test]
+    fn content_array_di_chunk_estrae_il_testo() {
+        // Mistral puo' rispondere content come array di chunk: i `text` vanno
+        // concatenati, reference/thinking ignorati. Prima falliva l'INTERO
+        // parse -> "error decoding response body" (18 occorrenze in history il
+        // 2026-07-06) ritentato a vuoto come transitorio.
+        let raw = r#"{
+            "choices": [{
+                "message": {"content": [
+                    {"type": "text", "text": "Ciao "},
+                    {"type": "reference", "reference_ids": [1]},
+                    {"type": "text", "text": "mondo"}
+                ]},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        }"#;
+        let parsed = parse_chat_completion("mistral", raw).expect("parse tollerante");
+        let resp = from_chat_completion(parsed, "m".to_string(), "mistral", 1).unwrap();
+        assert_eq!(resp.content, "Ciao mondo");
+    }
+
+    #[test]
+    fn content_stringa_resta_invariato() {
+        let raw = r#"{
+            "choices": [{"message": {"content": "semplice"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        }"#;
+        let parsed = parse_chat_completion("mistral", raw).expect("parse stringa");
+        let resp = from_chat_completion(parsed, "m".to_string(), "mistral", 1).unwrap();
+        assert_eq!(resp.content, "semplice");
+    }
+
+    #[test]
+    fn sse_delta_content_array_non_scartato() {
+        // Delta streaming con content array: prima il parser SSE scartava la
+        // riga in silenzio (risposta troncata); ora estrae il testo.
+        let raw = r#"{
+            "choices": [{"delta": {"content": [{"type": "text", "text": "pezzo"}]}, "finish_reason": null}]
+        }"#;
+        let chunk: ChatCompletionChunk = serde_json::from_str(raw).unwrap();
+        let out = chunk_from_sse(chunk, "mistral", "m").expect("chunk emesso");
+        assert_eq!(out.delta, "pezzo");
+    }
+
+    #[test]
+    fn parse_fallito_ha_errore_contestualizzato() {
+        // Il messaggio deve dire provider + causa serde (diagnostico), MAI il
+        // generico "error decoding response body" ne' il contenuto del body.
+        let err = parse_chat_completion("mistral", "<html>proxy error</html>").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mistral"), "manca il provider: {msg}");
+        assert!(
+            msg.contains("non decodificabile come ChatCompletion"),
+            "manca il contesto: {msg}"
+        );
+        assert!(!msg.contains("proxy error"), "il body non va nel messaggio: {msg}");
     }
 
     #[test]

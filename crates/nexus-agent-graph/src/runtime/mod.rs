@@ -220,7 +220,7 @@ pub mod test_doubles {
             self.seen.lock().expect("lock seen").push(req);
             if let Some(msg) = &self.error {
                 if self.error_provider_unavailable {
-                    return Err(PortError::ProviderUnavailable(msg.clone()));
+                    return Err(PortError::ProviderUnavailable(msg.clone().into()));
                 }
                 return Err(PortError::Llm(msg.clone()));
             }

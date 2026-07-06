@@ -471,7 +471,7 @@ mod tests {
             _ctx: ScaleContext,
             _mode: ExecMode,
         ) -> Result<Option<ScaleMove>, PortError> {
-            Err(PortError::ProviderUnavailable("test".to_string()))
+            Err(PortError::ProviderUnavailable("test".to_string().into()))
         }
     }
 

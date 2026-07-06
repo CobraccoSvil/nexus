@@ -114,6 +114,30 @@ test("escalation apre un nuovo segmento con banda switch", () => {
   assert.equal(second.switch?.cooldown, "quota");
 });
 
+test("escalation con causa strutturata la porta nello SwitchEvent", () => {
+  beforeEach();
+  // Il motivo onesto dello switch (regola M): cause dal vocabolario chiuso
+  // ProviderFailureCause del backend; il renderer lo mappa in etichetta umana
+  // (un 4xx del provider non va raccontato come cooldown).
+  const metaSteps: MetaStepEntry[] = [
+    meta("executor_call", { iteration: 1, provider: "deepseek", model: "deepseek-chat" }),
+    meta("escalation", {
+      from_provider: "deepseek",
+      to_provider: "google",
+      to_model: "gemini-2.5-flash",
+      reason: "provider_failover",
+      cause: "client_error",
+      cooldown: false,
+    }),
+  ];
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const sw = stream.segments[1]?.switch;
+  assert.ok(sw, "segmento aperto dallo switch");
+  assert.equal(sw?.cause, "client_error");
+  // cooldown=false (bool) NON deve diventare una stringa-causa spuria.
+  assert.equal(sw?.cooldown, undefined);
+});
+
 test("fallback senza to_provider strutturato non crea segmento fantasma", () => {
   beforeEach();
   const metaSteps: MetaStepEntry[] = [

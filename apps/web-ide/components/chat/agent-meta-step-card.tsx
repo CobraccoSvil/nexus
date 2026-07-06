@@ -6,6 +6,7 @@ import { useThemeColors } from "../../lib/theme";
 import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
+import { switchCauseLabel } from "../../lib/use-chat/activity-stream";
 
 /**
  * Card collassabile per visualizzare i meta-step semantici pubblicati dal
@@ -324,6 +325,20 @@ function renderPayload(
         <DefRow k="A" v={`${String(payload.to_provider ?? "?")} / ${String(payload.to_model ?? "?")}`} tc={tc} />
         <DefRow k="Motivo" v={String(payload.reason ?? "—")} tc={tc} />
         <DefRow k="Tentativo" v={`#${String(payload.attempt ?? "?")}`} tc={tc} />
+      </div>
+    );
+  }
+  if (kind === "escalation") {
+    // Cambio provider/modello: il motivo usa l'etichetta umana della causa
+    // strutturata (punto unico switchCauseLabel, regola L/M) invece del codice
+    // grezzo `provider_failover`, che resta il degrado per cause ignote.
+    const cause = payload.cause as string | undefined;
+    const reason = switchCauseLabel(cause) ?? String(payload.reason ?? cause ?? "—");
+    return (
+      <div style={grid}>
+        <DefRow k="Da" v={`${String(payload.from_provider ?? "?")}`} tc={tc} />
+        <DefRow k="A" v={`${String(payload.to_provider ?? "?")} / ${String(payload.to_model ?? "?")}`} tc={tc} />
+        <DefRow k="Motivo" v={reason} tc={tc} />
       </div>
     );
   }

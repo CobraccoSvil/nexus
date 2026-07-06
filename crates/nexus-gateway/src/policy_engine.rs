@@ -99,6 +99,12 @@ pub struct RoutingDecision {
     pub blocked: bool,
     /// Motivo del blocco / dell'esito (per audit).
     pub reason: Option<String>,
+    /// SEGNALE STRUTTURATO (regola M): `true` quando il blocco deriva dal gate
+    /// DLP cloud per-tier (contenuto riservato -> provider cloud esclusi), NON
+    /// da tier ignoto o flag tenant. I caller lo usano per rispondere col
+    /// codice dedicato `POLICY_TIER_EXCLUDED` invece del generico
+    /// `TIER_BLOCKED`, senza parsare la `reason` testuale.
+    pub dlp_blocked: bool,
 }
 
 /// Override DLP letti dai settings DB. `None` su un campo = nessun valore in DB
@@ -192,6 +198,23 @@ impl PolicyEngine {
         self.flag(DlpFlag::DlpEnabled) == Some(false)
     }
 
+    /// `true` se i provider CLOUD sono bloccati dal gate DLP per il tier dato
+    /// (flag `dlp_allow_cloud_tier2/3`, DB > YAML). Tier 0/1 non hanno gate.
+    /// Punto unico (regola L) riusato dal path pin di `routes.rs`: il pin
+    /// bypassa il ROUTING (`decide`) ma non questo gate di sicurezza.
+    pub fn cloud_blocked_for_tier(&self, tier: SensitivityTier) -> bool {
+        if self.is_dlp_disabled() {
+            return false;
+        }
+        self.cloud_gate_for_tier(tier) == Some(false)
+    }
+
+    /// `true` se `name` e' un provider cloud (invia dati a servizi esterni).
+    /// Espone la fonte unica [`CLOUD_PROVIDERS`] ai caller del gate.
+    pub fn is_cloud_provider(name: &str) -> bool {
+        CLOUD_PROVIDERS.contains(&name)
+    }
+
     /// Ricarica i flag DLP dai settings DB con cache TTL 60s. Se il DB e'
     /// irraggiungibile mantiene i valori correnti (fallback graceful sullo YAML).
     /// `force=true` ignora la cache (usato all'avvio).
@@ -253,6 +276,7 @@ impl PolicyEngine {
                 providers: Vec::new(),
                 blocked: true,
                 reason: Some(format!("Nessuna policy per tier {effective_tier}")),
+                dlp_blocked: false,
             };
         };
 
@@ -271,6 +295,7 @@ impl PolicyEngine {
                     "Tier {effective_tier} bloccato dalla policy (profilo: {})",
                     self.policy.profile
                 )),
+                dlp_blocked: false,
             };
         }
 
@@ -311,6 +336,7 @@ impl PolicyEngine {
                 providers: Vec::new(),
                 blocked: true,
                 reason: Some(reason),
+                dlp_blocked: block_cloud_by_dlp,
             };
         }
 
@@ -318,6 +344,7 @@ impl PolicyEngine {
             providers: filtered,
             blocked: false,
             reason: None,
+            dlp_blocked: false,
         }
     }
 
@@ -404,7 +431,15 @@ routing:
         let d = e.decide(3, "chat", &HashMap::new());
         assert!(d.blocked);
         assert!(d.providers.is_empty());
+        // Segnale strutturato: il blocco viene dal gate DLP (regola M).
+        assert!(d.dlp_blocked);
         assert!(d.reason.unwrap().contains("dlp_allow_cloud_tier3=false"));
+        // Gate riusato dal path pin: cloud bloccato a tier 3, libero a tier 0-2.
+        assert!(e.cloud_blocked_for_tier(3));
+        assert!(!e.cloud_blocked_for_tier(2));
+        assert!(!e.cloud_blocked_for_tier(0));
+        assert!(PolicyEngine::is_cloud_provider("deepseek"));
+        assert!(!PolicyEngine::is_cloud_provider("vllm"));
     }
 
     #[test]
@@ -425,6 +460,8 @@ routing:
         let d = e.decide(0, "chat", &flags);
         assert!(d.blocked);
         assert!(d.providers.is_empty());
+        // Blocco da flag TENANT, non dal gate DLP: dlp_blocked resta false.
+        assert!(!d.dlp_blocked);
     }
 
     #[test]

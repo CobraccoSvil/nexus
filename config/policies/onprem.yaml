@@ -1,4 +1,11 @@
 # Profilo ON-PREMISE — solo vLLM locale, zero cloud
+#
+# Matrice tier -> provider: vedi la documentazione estesa in default.yaml
+# (gate DLP per-tier, semantica pin, codici errore strutturati). In questo
+# profilo i provider cloud sono disabilitati E i flag allow_cloud_tier2/3 sono
+# false: ogni tentativo di instradare (o pinnare) un provider cloud a tier >= 2
+# risponde 403 POLICY_TIER_EXCLUDED; tutti i tier instradano solo su vllm.
+# Override runtime dei flag: settings DB dlp_allow_cloud_tier2/3, dlp_enabled.
 profile: onprem
 
 providers:

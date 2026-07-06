@@ -53,11 +53,19 @@ use super::AppState;
 
 /// Errore della pipeline tradotto in HTTP. Mantiene lo status coerente col
 /// server.ts (403 per blocchi tier/DLP/quota, 500 per fallimenti provider).
+///
+/// `details` (regola M): payload JSON STRUTTURATO addizionale nel body della
+/// risposta, accanto a `error`/`code`. Il chiamante (motore agentico) decide
+/// dalla struttura — classe del fallimento per-provider, tier rilevato,
+/// provider ammessi — mai dal testo umano di `message`.
 #[derive(Debug)]
 struct PipelineError {
     status: StatusCode,
     code: String,
     message: String,
+    // Boxed: tiene la Err-variant dei Result della pipeline sotto la soglia
+    // clippy `result_large_err` (il details e' raro, il Result e' ovunque).
+    details: Option<Box<Value>>,
 }
 
 impl PipelineError {
@@ -66,6 +74,29 @@ impl PipelineError {
             status: StatusCode::FORBIDDEN,
             code: "TIER_BLOCKED".to_string(),
             message: message.into(),
+            details: None,
+        }
+    }
+    /// Provider escluso/i dalla policy per il sensitivity tier EFFETTIVO
+    /// (contenuto riservato). Codice dedicato, distinto sia dal generico
+    /// `TIER_BLOCKED` sia da `PROVIDER_ERROR`: il motore lo usa per riportare
+    /// il motivo onesto ("escluso per policy", non "provider instabile") e per
+    /// scegliere un sostituto tra gli `allowed_providers`.
+    fn policy_tier_excluded(
+        provider: Option<&str>,
+        detected_tier: u8,
+        allowed: &[String],
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "POLICY_TIER_EXCLUDED".to_string(),
+            message: message.into(),
+            details: Some(Box::new(json!({
+                "provider": provider,
+                "detected_tier": detected_tier,
+                "allowed_providers": allowed,
+            }))),
         }
     }
     fn quota(scope: &str, reason: &str) -> Self {
@@ -73,6 +104,7 @@ impl PipelineError {
             status: StatusCode::FORBIDDEN,
             code: "QUOTA_EXCEEDED".to_string(),
             message: format!("quota_exceeded:{scope}:{reason}"),
+            details: None,
         }
     }
     fn provider(message: impl Into<String>) -> Self {
@@ -80,6 +112,17 @@ impl PipelineError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "PROVIDER_ERROR".to_string(),
             message: message.into(),
+            details: None,
+        }
+    }
+    /// Variante di [`Self::provider`] col dettaglio strutturato dei fallimenti
+    /// per-provider (`details.failures` + `details.primary_cause`).
+    fn provider_with_details(message: impl Into<String>, details: Value) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "PROVIDER_ERROR".to_string(),
+            message: message.into(),
+            details: Some(Box::new(details)),
         }
     }
     fn invalid_request(message: impl Into<String>) -> Self {
@@ -87,6 +130,7 @@ impl PipelineError {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_REQUEST".to_string(),
             message: message.into(),
+            details: None,
         }
     }
 }
@@ -115,11 +159,11 @@ fn validate_logical_model(model: &str) -> Result<(), PipelineError> {
 
 impl IntoResponse for PipelineError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({ "error": self.message, "code": self.code })),
-        )
-            .into_response()
+        let mut body = json!({ "error": self.message, "code": self.code });
+        if let Some(details) = self.details {
+            body["details"] = *details;
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -146,23 +190,34 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
 
     // Pin esplicito: bypassa policy.decide + resolve_providers e costruisce una
     // chain di UN solo provider. La policy DLP (classify/validate_tier_claim/
-    // redaction) resta attiva: il pin salta SOLO il routing, non la sicurezza.
+    // redaction) resta attiva: il pin salta SOLO il routing, non la sicurezza —
+    // incluso il gate cloud per-tier qui sotto (`pin_tier_gate`).
     let resolved: Vec<ResolvedProvider> = if let Some(pin) = req.pin_provider.as_deref() {
+        pin_tier_gate(&runtime.policy, pin, effective_tier, &req.metadata.feature)?;
         vec![resolve_pinned_provider(pin, &runtime.providers, &req.model)?]
     } else {
         let decision = runtime
             .policy
             .decide(effective_tier, &req.metadata.feature, &HashMap::new());
         if decision.blocked {
-            return Err(PipelineError::blocked(
-                decision
-                    .reason
-                    .unwrap_or_else(|| "routing bloccato dalla policy".to_string()),
-            ));
+            let reason = decision
+                .reason
+                .unwrap_or_else(|| "routing bloccato dalla policy".to_string());
+            // Blocco dal gate DLP per-tier (segnale strutturato, non parsing
+            // della reason): codice dedicato con tier rilevato e ammessi.
+            if decision.dlp_blocked {
+                return Err(PipelineError::policy_tier_excluded(
+                    None,
+                    effective_tier,
+                    &decision.providers,
+                    reason,
+                ));
+            }
+            return Err(PipelineError::blocked(reason));
         }
 
         // Accoppia ogni nome-provider deciso col provider costruito + modello risolto.
-        let resolved = resolve_providers(
+        let (resolved, any_tier_mismatch) = resolve_providers(
             &decision.providers,
             &runtime.providers,
             &runtime.aliases,
@@ -170,6 +225,20 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
             effective_tier,
         );
         if resolved.is_empty() {
+            // Chain svuotata da esclusioni per tier (alias min/max): il motivo
+            // e' la sensitivity del contenuto, non la configurazione -> codice
+            // dedicato cosi' il chiamante non lo scambia per un guasto.
+            if any_tier_mismatch {
+                return Err(PipelineError::policy_tier_excluded(
+                    None,
+                    effective_tier,
+                    &decision.providers,
+                    format!(
+                        "nessun provider ammesso per il modello richiesto al sensitivity \
+                         tier {effective_tier} (contenuto riservato)"
+                    ),
+                ));
+            }
             return Err(PipelineError::blocked(
                 "nessun provider configurato/risolvibile per il tier richiesto",
             ));
@@ -250,14 +319,21 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
 /// Accoppia i nomi-provider della decisione coi provider costruiti e risolve il
 /// modello reale per ciascuno. Provider non costruiti (chiave assente) o senza
 /// modello risolvibile vengono esclusi (regola G: niente fallback silenzioso).
+///
+/// Il secondo elemento della tupla e' `true` se ALMENO un provider e' stato
+/// escluso per incompatibilita' di tier dell'alias (`AliasError::TierMismatch`):
+/// segnale strutturato che permette al caller di rispondere
+/// `POLICY_TIER_EXCLUDED` (esclusione per sensitivity) quando la chain resta
+/// vuota, invece del generico "non configurato".
 fn resolve_providers(
     names: &[String],
     built: &[Arc<dyn LlmProvider>],
     aliases: &ModelAliasResolver,
     logical_model: &str,
     tier: u8,
-) -> Vec<ResolvedProvider> {
+) -> (Vec<ResolvedProvider>, bool) {
     let mut out = Vec::new();
+    let mut any_tier_mismatch = false;
     for name in names {
         let Some(provider) = built.iter().find(|p| p.name() == name) else {
             // Provider deciso dalla policy ma non costruito (es. chiave mancante).
@@ -269,13 +345,53 @@ fn resolve_providers(
                 model,
             }),
             Err(e) => {
+                if matches!(e, crate::model_alias_resolver::AliasError::TierMismatch { .. }) {
+                    any_tier_mismatch = true;
+                }
                 // Provider escluso dalla chain: modello non risolvibile per quel
                 // provider/tier. Solo nome+motivo nel log (regola F).
                 tracing::debug!(provider = %name, reason = %e, "gateway: provider escluso dalla chain");
             }
         }
     }
-    out
+    (out, any_tier_mismatch)
+}
+
+/// Gate DLP cloud per-tier sul provider PINNATO (punto unico, regola L, usato
+/// dai path complete e stream). Il pin bypassa il ROUTING (`policy.decide`) ma
+/// NON questo gate: se il tier effettivo vieta i provider cloud
+/// (`dlp_allow_cloud_tier2/3=false`) e il pin e' cloud, la richiesta viene
+/// rifiutata con `POLICY_TIER_EXCLUDED` (tier rilevato + provider ammessi)
+/// invece di inviare comunque il contenuto riservato al cloud. Coi flag DLP
+/// permissivi (default profilo cloud) il gate non scatta mai: bit-identico al
+/// comportamento storico.
+fn pin_tier_gate(
+    policy: &crate::policy_engine::PolicyEngine,
+    pin: &str,
+    effective_tier: u8,
+    feature: &str,
+) -> Result<(), PipelineError> {
+    use crate::policy_engine::PolicyEngine;
+    if policy.cloud_blocked_for_tier(effective_tier) && PolicyEngine::is_cloud_provider(pin) {
+        // Provider ammessi al tier (solo i locali, dato il gate chiuso).
+        let allowed = policy.decide(effective_tier, feature, &HashMap::new()).providers;
+        return Err(PipelineError::policy_tier_excluded(
+            Some(pin),
+            effective_tier,
+            &allowed,
+            format!(
+                "provider \"{pin}\" escluso dalla policy per sensitivity tier \
+                 {effective_tier} (contenuto riservato, cloud vietato dal gate DLP); \
+                 provider ammessi: {}",
+                if allowed.is_empty() {
+                    "nessuno".to_string()
+                } else {
+                    allowed.join(", ")
+                }
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Costruisce la chain pinnata di UN SOLO elemento per il provider esplicito
@@ -331,7 +447,7 @@ async fn run_fallback(
     base_req: &LlmRequest,
     strict: bool,
 ) -> Result<LlmResponse, PipelineError> {
-    let mut failures: Vec<String> = Vec::new();
+    let mut failures: Vec<ProviderFailure> = Vec::new();
     let policy = cooldown.retry_policy();
 
     for rp in resolved {
@@ -343,7 +459,13 @@ async fn run_fallback(
                 // Billing: il provider e' inutilizzabile finche' non si ricarica.
                 // Il messaggio lo segnala cosi' il chiamante applica il cooldown
                 // lungo invece di riprovare a ogni iterazione.
-                failures.push(format!("{name} (cooldown billing, {secs}s rimanenti)"));
+                failures.push(ProviderFailure {
+                    provider: name.to_string(),
+                    class: "cooldown_billing",
+                    status: None,
+                    code: None,
+                    message: format!("cooldown billing, {secs}s rimanenti"),
+                });
                 continue;
             }
             // Cooldown transitorio BREVE + strict pin (nessuno swap): attendi il
@@ -360,7 +482,13 @@ async fn run_fallback(
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
             } else {
-                failures.push(format!("{name} (in cooldown, {secs}s rimanenti)"));
+                failures.push(ProviderFailure {
+                    provider: name.to_string(),
+                    class: "cooldown",
+                    status: None,
+                    code: None,
+                    message: format!("in cooldown, {secs}s rimanenti"),
+                });
                 continue;
             }
         }
@@ -377,14 +505,89 @@ async fn run_fallback(
                 cooldown.clear(name);
                 return Ok(resp);
             }
-            Err(msg) => failures.push(format!("{name} ({msg})")),
+            Err(f) => failures.push(f.into_provider_failure(name)),
         }
     }
 
-    Err(PipelineError::provider(format!(
-        "tutti i provider hanno fallito -> {}",
-        failures.join("; ")
-    )))
+    // Messaggio umano invariato (display/log); la CLASSE di ogni fallimento
+    // viaggia in `details` (regola M: il motore decide dalla struttura).
+    let human = failures
+        .iter()
+        .map(|f| format!("{} ({})", f.provider, f.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    // Causa primaria = classe del PRIMO fallimento: col pin la chain ha un solo
+    // elemento; nella chain multi-provider il primo e' il primario del tier.
+    let primary_cause = failures.first().map(|f| f.class).unwrap_or("unknown");
+    let details = json!({
+        "primary_cause": primary_cause,
+        "failures": failures.iter().map(ProviderFailure::to_json).collect::<Vec<_>>(),
+    });
+    Err(PipelineError::provider_with_details(
+        format!("tutti i provider hanno fallito -> {human}"),
+        details,
+    ))
+}
+
+/// Fallimento di UN provider della chain, in forma STRUTTURATA (regola M).
+/// `class` e' il vocabolario chiuso condiviso col motore agentico:
+/// `billing` | `client_error` | `transient` (esito della chiamata) oppure
+/// `cooldown` | `cooldown_billing` (provider saltato senza chiamarlo).
+/// `status`/`code` arrivano dal [`ProviderHttpError`] quando disponibili.
+struct ProviderFailure {
+    provider: String,
+    class: &'static str,
+    status: Option<u16>,
+    code: Option<String>,
+    message: String,
+}
+
+impl ProviderFailure {
+    fn to_json(&self) -> Value {
+        json!({
+            "provider": self.provider,
+            "class": self.class,
+            "status": self.status,
+            "code": self.code,
+            "message": self.message,
+        })
+    }
+}
+
+/// Esito d'errore di [`complete_with_retry`]: classe + segnali strutturati del
+/// [`ProviderHttpError`] (se la chiamata ha raggiunto il provider). Sostituisce
+/// il vecchio `Err(String)` che appiattiva la classificazione gia' calcolata.
+struct CallFailure {
+    class: &'static str,
+    status: Option<u16>,
+    code: Option<String>,
+    message: String,
+}
+
+impl CallFailure {
+    fn from_error(kind: ProviderErrorKind, err: &anyhow::Error) -> Self {
+        let http = err.chain().find_map(|c| c.downcast_ref::<ProviderHttpError>());
+        Self {
+            class: match kind {
+                ProviderErrorKind::Billing => "billing",
+                ProviderErrorKind::ClientError => "client_error",
+                ProviderErrorKind::Transient => "transient",
+            },
+            status: http.map(|h| h.status),
+            code: http.and_then(|h| h.code.clone()),
+            message: err.to_string(),
+        }
+    }
+
+    fn into_provider_failure(self, provider: &str) -> ProviderFailure {
+        ProviderFailure {
+            provider: provider.to_string(),
+            class: self.class,
+            status: self.status,
+            code: self.code,
+            message: self.message,
+        }
+    }
 }
 
 /// Chiama `provider.complete` con retry sullo STESSO modello per errori
@@ -404,7 +607,7 @@ async fn complete_with_retry(
     cooldown: &CooldownManager,
     policy: &RetryPolicy,
     strict: bool,
-) -> Result<LlmResponse, String> {
+) -> Result<LlmResponse, CallFailure> {
     let max_attempts = if strict { policy.max_attempts.max(1) } else { 1 };
     let mut attempt = 0u32;
     loop {
@@ -420,16 +623,28 @@ async fn complete_with_retry(
                     .chain()
                     .find_map(|c| c.downcast_ref::<ProviderHttpError>())
                     .and_then(|h| h.retry_after_seconds);
-                let msg = err.to_string();
+                let failure = CallFailure::from_error(kind, &err);
+                let msg = failure.message.clone();
                 match kind {
                     ProviderErrorKind::Billing => {
-                        cooldown.mark_billing(name, Some(msg.clone()));
-                        return Err(msg);
+                        cooldown.mark_billing(name, Some(msg));
+                        return Err(failure);
                     }
                     ProviderErrorKind::ClientError => {
                         // Colpa nostra/config o modello singolo non abilitato:
-                        // ne' cooldown (il provider e' sano) ne' retry.
-                        return Err(msg);
+                        // ne' cooldown (il provider e' sano) ne' retry. PRIMA era
+                        // un'uscita muta: il 4xx spariva dai log e il chiamante
+                        // vedeva solo il 500 aggregato scambiandolo per un
+                        // provider instabile (incidente run 48793fde). Log dei
+                        // soli segnali strutturati (regola F: niente body).
+                        tracing::warn!(
+                            provider = name,
+                            status = failure.status,
+                            code = failure.code.as_deref(),
+                            "gateway: il provider ha rifiutato la richiesta \
+                             (errore client, niente retry/cooldown)"
+                        );
+                        return Err(failure);
                     }
                     ProviderErrorKind::Transient => {
                         let cap_s = policy.wait_short_cooldown_cap_s.max(0) as u64;
@@ -437,8 +652,8 @@ async fn complete_with_retry(
                         // bloccare la richiesta cosi' a lungo: arrenditi (cooldown
                         // breve; la riprova successiva o il re-probe recuperano).
                         if attempt >= max_attempts || retry_after.is_some_and(|s| s > cap_s) {
-                            cooldown.mark_transient(name, Some(msg.clone()));
-                            return Err(msg);
+                            cooldown.mark_transient(name, Some(msg));
+                            return Err(failure);
                         }
                         // Onora `Retry-After` (autoritativo) se presente e sotto il
                         // tetto; altrimenti backoff esponenziale+jitter calcolato.
@@ -667,14 +882,24 @@ async fn build_sse_stream(
 
         // Pin esplicito: chain di UN solo provider, niente policy.decide ne'
         // fallback cross-provider (parita' col path non-streaming). La DLP
-        // (classify/redaction) resta a monte; qui si salta solo il routing.
+        // (classify/redaction) resta a monte; qui si salta solo il routing —
+        // il gate cloud per-tier (`pin_tier_gate`) resta enforced come nel
+        // path non-streaming.
         let resolved: Vec<ResolvedProvider> = if let Some(pin) = body.pin_provider.as_deref() {
-            match resolve_pinned_provider(pin, &runtime.providers, &body.model) {
+            let pinned = pin_tier_gate(&runtime.policy, pin, tier, &body.metadata.feature)
+                .and_then(|()| resolve_pinned_provider(pin, &runtime.providers, &body.model));
+            match pinned {
                 Ok(rp) => vec![rp],
                 Err(e) => {
+                    // Parita' col body JSON del path non-streaming: `code` (e
+                    // `details` se presenti) accanto al testo, cosi' il
+                    // consumer SSE decide dalla struttura (regola M).
+                    let mut payload = json!({ "error": e.message, "code": e.code });
+                    if let Some(d) = e.details {
+                        payload["details"] = *d;
+                    }
                     let _ = tx
-                        .send(Ok(Event::default()
-                            .data(json!({ "error": e.message }).to_string())))
+                        .send(Ok(Event::default().data(payload.to_string())))
                         .await;
                     let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                     return;
@@ -683,9 +908,19 @@ async fn build_sse_stream(
         } else {
             let decision = runtime.policy.decide(tier, &body.metadata.feature, &HashMap::new());
             if decision.blocked {
+                let code = if decision.dlp_blocked {
+                    "POLICY_TIER_EXCLUDED"
+                } else {
+                    "TIER_BLOCKED"
+                };
                 let _ = tx
                     .send(Ok(Event::default().data(
-                        json!({ "error": decision.reason.unwrap_or_default() }).to_string(),
+                        json!({
+                            "error": decision.reason.unwrap_or_default(),
+                            "code": code,
+                            "details": { "detected_tier": tier, "allowed_providers": decision.providers },
+                        })
+                        .to_string(),
                     )))
                     .await;
                 let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
@@ -698,6 +933,7 @@ async fn build_sse_stream(
                 &body.model,
                 tier,
             )
+            .0
         };
 
         // Primo provider non in cooldown. Con pin la chain ha un solo elemento:
@@ -1998,7 +2234,7 @@ mod tests {
         let p1: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
         let built = vec![p1];
         // Policy decide openai + deepseek; deepseek NON e' costruito -> escluso.
-        let resolved = resolve_providers(
+        let (resolved, any_tier_mismatch) = resolve_providers(
             &["openai".into(), "deepseek".into()],
             &built,
             &aliases(),
@@ -2009,6 +2245,8 @@ mod tests {
         assert_eq!(resolved[0].provider.name(), "openai");
         // openai/gpt-x stesso provider -> strip prefisso.
         assert_eq!(resolved[0].model, "gpt-x");
+        // Nessuna esclusione per tier: il flag strutturato resta false.
+        assert!(!any_tier_mismatch);
     }
 
     #[tokio::test]
@@ -2150,6 +2388,116 @@ mod tests {
         assert!(err.message.contains("tutti i provider hanno fallito"));
         assert_eq!(p.calls.load(Ordering::SeqCst), 1); // niente retry
         assert!(!cooldown.is_in_cooldown("google")); // niente cooldown
+    }
+
+    // ── Body d'errore strutturato (regola M): classe per-provider nei details ──
+
+    #[tokio::test]
+    async fn client_error_produce_details_con_classe_e_status() {
+        // Il 4xx del provider NON deve sparire nel 500 aggregato: la classe
+        // `client_error` + status + code viaggiano in details.failures cosi' il
+        // motore riporta il motivo onesto (incidente run 48793fde: 4xx deepseek
+        // travestito da "cooldown" nel nastro chat).
+        let p = FakeProvider::new("deepseek", Behaviour::ErrClient);
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: "deepseek-chat".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(&resolved, &cooldown, &req(), true)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, "PROVIDER_ERROR");
+        let details = err.details.expect("details strutturati presenti");
+        assert_eq!(details["primary_cause"], "client_error");
+        let f = &details["failures"][0];
+        assert_eq!(f["provider"], "deepseek");
+        assert_eq!(f["class"], "client_error");
+        assert_eq!(f["status"], 400);
+        assert_eq!(f["code"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn cooldown_billing_produce_classe_dedicata() {
+        // Provider saltato per cooldown billing attivo: classe "cooldown_billing"
+        // (mai chiamato), distinta dal billing fresco della chiamata.
+        let p: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: "gpt-x".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        cooldown.mark_billing("openai", Some("insufficient_quota".into()));
+        let err = run_fallback(&resolved, &cooldown, &req(), false)
+            .await
+            .err()
+            .unwrap();
+        let details = err.details.expect("details presenti");
+        assert_eq!(details["primary_cause"], "cooldown_billing");
+        assert_eq!(details["failures"][0]["class"], "cooldown_billing");
+    }
+
+    // ── Gate DLP sul pin + esclusioni per tier (POLICY_TIER_EXCLUDED) ─────────
+
+    /// Policy con cloud VIETATO a tier 3 (YAML), come i profili hybrid/onprem.
+    fn policy_tier3_blocked() -> crate::policy_engine::PolicyEngine {
+        crate::policy_engine::PolicyEngine::from_yaml_str(
+            r#"
+profile: test
+features:
+  allow_cloud_tier2: true
+  allow_cloud_tier3: false
+  dlp_enabled: true
+routing:
+  tier_0:
+    primary: deepseek
+  tier_3:
+    primary: deepseek
+"#,
+        )
+        .expect("policy valida")
+    }
+
+    #[test]
+    fn pin_cloud_escluso_a_tier3_con_codice_dedicato() {
+        let policy = policy_tier3_blocked();
+        // Tier 3 + pin cloud: rifiuto STRUTTURATO, non un 500 generico.
+        let err = pin_tier_gate(&policy, "deepseek", 3, "chat").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.code, "POLICY_TIER_EXCLUDED");
+        let details = err.details.expect("details presenti");
+        assert_eq!(details["provider"], "deepseek");
+        assert_eq!(details["detected_tier"], 3);
+        // Tier basso: il gate non scatta (bit-identico allo storico).
+        assert!(pin_tier_gate(&policy, "deepseek", 0, "chat").is_ok());
+        // Provider non-cloud: mai bloccato dal gate DLP.
+        assert!(pin_tier_gate(&policy, "vllm", 3, "chat").is_ok());
+    }
+
+    #[test]
+    fn resolve_providers_segnala_esclusione_per_tier() {
+        // Alias con max_tier 1: a tier 2 il provider e' escluso per sensitivity
+        // (TierMismatch) e il flag strutturato lo segnala, cosi' il caller
+        // risponde POLICY_TIER_EXCLUDED invece di "non configurato".
+        let aliases = ModelAliasResolver::from_yaml_str(
+            r#"
+aliases:
+  coder-small:
+    cloud_primary: openai/gpt-4o-mini
+    min_tier: 0
+    max_tier: 1
+"#,
+        )
+        .unwrap();
+        let p: Arc<dyn LlmProvider> = FakeProvider::new("openai", Behaviour::Ok);
+        let built = vec![p];
+        let (resolved, any_tier_mismatch) =
+            resolve_providers(&["openai".into()], &built, &aliases, "coder-small", 2);
+        assert!(resolved.is_empty());
+        assert!(any_tier_mismatch);
     }
 
     #[tokio::test]
