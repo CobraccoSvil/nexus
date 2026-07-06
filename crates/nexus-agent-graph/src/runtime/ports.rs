@@ -440,6 +440,11 @@ pub enum SseEvent {
         title: String,
         /// Payload arbitrario.
         payload: Value,
+        /// Id di correlazione opzionale: collega lo step a un'entita' esterna
+        /// (es. la narrazione sub-agente porta il `subagent_run_id`, cosi' il
+        /// frontend raggruppa gli step dello stesso sub-run). `None` per gli
+        /// step non correlati (default storico).
+        correlation_id: Option<String>,
     },
     /// Consumo token aggiornato (barra contesto).
     Usage {

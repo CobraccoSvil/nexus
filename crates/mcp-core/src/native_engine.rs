@@ -1050,6 +1050,16 @@ async fn build_native_engine(
             // principale/sub-run non isolato) -> ctx sulla root del progetto,
             // comportamento invariato. In PR3 e' sempre `None` (accensione in PR4).
             input.working_root.clone(),
+            // Narrazione verso QUESTO run: i tool a lunga durata (dispatch_
+            // subagents) emettono meta-step di avvio/progresso/chiusura sul
+            // canale SSE del run invocante mentre lavorano. Vale anche per i
+            // sub-run (il loro canale e' il ponte verso il padre): la
+            // narrazione risale la catena in modo ricorsivo.
+            Some(crate::agent_tools::context::ParentNarration {
+                run_id: input.run_id,
+                session_id: input.session_id,
+                step_tx: input.step_tx.clone(),
+            }),
         )),
         RunRole::Shadow { primary_run_id } => Arc::new(
             ToolRunnerExecutorAdapter::from_db_for_replay(run_db.clone(), Some(primary_run_id)),

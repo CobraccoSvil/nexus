@@ -87,6 +87,11 @@ pub struct ToolRunnerExecutorAdapter {
     /// invariato. In PR3 NESSUN call site passa `Some` (l'accensione e' PR4); il
     /// canale esiste per essere acceso senza toccare di nuovo l'adapter.
     working_root: Option<PathBuf>,
+    /// Narrazione del run invocante (run_id + canale SSE del run del grafo che
+    /// esegue i tool): iniettata nel ctx dei tool dal path Real, cosi' i tool a
+    /// lunga durata (dispatch_subagents) possono emettere meta-step sul run
+    /// padre mentre lavorano. `None` su adapter Replay-only / fuori dal grafo.
+    parent_narration: Option<crate::agent_tools::context::ParentNarration>,
 }
 
 impl ToolRunnerExecutorAdapter {
@@ -103,6 +108,7 @@ impl ToolRunnerExecutorAdapter {
         session_id: Uuid,
         primary_run_id: Option<Uuid>,
         working_root: Option<PathBuf>,
+        parent_narration: Option<crate::agent_tools::context::ParentNarration>,
     ) -> Self {
         Self {
             db: deps.db.clone(),
@@ -111,6 +117,7 @@ impl ToolRunnerExecutorAdapter {
             primary_run_id,
             replay_cursor: Mutex::new(HashMap::new()),
             working_root,
+            parent_narration,
         }
     }
 
@@ -132,8 +139,9 @@ impl ToolRunnerExecutorAdapter {
             primary_run_id,
             replay_cursor: Mutex::new(HashMap::new()),
             // Replay-only: nessun path Real -> nessun ctx costruito -> l'override
-            // root e' irrilevante (execute_real fallisce prima, deps assente).
+            // root e la narrazione sono irrilevanti (execute_real fallisce prima).
             working_root: None,
+            parent_narration: None,
         }
     }
 
@@ -160,10 +168,14 @@ impl ToolRunnerExecutorAdapter {
         // (default PR3) e' identico a `build_ctx(session_id)` — stessa root del
         // progetto, `isolated_subrun=false`. Con un override (PR4) il ctx punta al
         // worktree effimero del sub-run e sopprime autocommit/reindex.
-        let ctx = svc
+        let mut ctx = svc
             .build_ctx_with_root(self.session_id, self.working_root.as_deref())
             .await
             .map_err(|status| PortError::Tool(format!("build_ctx fallita: {status}")))?;
+        // Inietta la narrazione del run invocante (run_id + canale SSE del run
+        // del grafo): i tool a lunga durata (dispatch_subagents) la usano per
+        // emettere meta-step sul run padre mentre lavorano. Solo path Real.
+        ctx.parent_narration = self.parent_narration.clone();
 
         // Esecuzione IN-PROCESS: la STESSA funzione del dispatch gRPC, non una
         // chiamata di rete a se' stessi (regola: mcp-core E' il ToolRunner).

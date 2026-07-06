@@ -283,6 +283,7 @@ impl EventSink for SseEventSinkAdapter {
                 kind,
                 title,
                 payload,
+                correlation_id,
             } => {
                 if kind.is_empty() {
                     return;
@@ -301,7 +302,7 @@ impl EventSink for SseEventSinkAdapter {
                     kind,
                     title,
                     payload,
-                    correlation_id: None,
+                    correlation_id,
                     created_at: chrono::Utc::now().to_rfc3339(),
                 });
                 self.send(e);
@@ -608,6 +609,7 @@ mod tests {
             kind: String::new(),
             title: "x".to_string(),
             payload: json!({}),
+            correlation_id: None,
         });
         assert!(rx.try_recv().is_err(), "kind vuoto non deve emettere");
     }
@@ -653,6 +655,7 @@ mod tests {
                 "iteration": 2,
                 "tools_count": 5,
             }),
+            correlation_id: None,
         });
         sink.emit(SseEvent::Usage {
             prompt_tokens: 100,
@@ -682,6 +685,7 @@ mod tests {
             kind: "executor_call".to_string(),
             title: "t1".to_string(),
             payload: json!({"provider": "google", "model": "g", "iteration": 0, "tools_count": 3}),
+            correlation_id: None,
         });
         sink.emit(SseEvent::Usage {
             prompt_tokens: 50,
@@ -698,6 +702,7 @@ mod tests {
             kind: "executor_call".to_string(),
             title: "t2".to_string(),
             payload: json!({"provider": "google", "model": "g", "iteration": 1, "tools_count": 3}),
+            correlation_id: None,
         });
 
         let trace = next_trace(&mut rx).expect("traccia del primo turno");
@@ -715,6 +720,7 @@ mod tests {
             kind: "executor_call".to_string(),
             title: "t".to_string(),
             payload: json!({"provider": "mistral", "model": "m", "iteration": 0, "tools_count": 1}),
+            correlation_id: None,
         });
         sink.emit(SseEvent::ToolUse {
             id: "tu".to_string(),
@@ -767,6 +773,7 @@ mod tests {
                 "iteration": 0,
                 "tools_count": 4,
             }),
+            correlation_id: None,
         });
         sink.emit(SseEvent::Usage {
             prompt_tokens: 120,

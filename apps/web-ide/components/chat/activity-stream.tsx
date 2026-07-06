@@ -60,6 +60,7 @@ const EVENT_GLYPH: Record<ActivityEvent["type"], string> = {
   verify: "✓", // check
   context_overflow: "!",
   folded_tools: "…", // ellissi
+  subagent: "◈", // rombo con centro (attivita' delegata)
 };
 
 const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
@@ -71,7 +72,12 @@ const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
   verify: "Verifica",
   context_overflow: "Contesto",
   folded_tools: "Passi",
+  subagent: "Subagente",
 };
+
+/** Accent della narrazione sub-agente (viola: attivita' delegata, distinto dal
+ *  verde tool del run corrente). */
+const SUBAGENT_ACCENT = "#8b5cf6";
 
 const FINAL_GATE_PHASES: Record<string, string> = {
   start: "avviata",
@@ -564,6 +570,56 @@ function EventBody({
           </span>
         </div>
       );
+    case "subagent": {
+      // Errore = fase failed o esito strutturato del tool inoltrato (regola M).
+      const isErr = event.phase === "failed" || event.isError === true;
+      const accent = isErr ? tc.error : SUBAGENT_ACCENT;
+      // Id corto del sub-run (primi 4 hex del subagentRunId): distingue i sub-run
+      // di un batch PARALLELO (dispatch_subagents), i cui eventi si interlacciano
+      // sul canale del padre e altrimenti sarebbero indistinguibili quando dello
+      // stesso kind. Presente solo se il meta-step porta il correlation_id.
+      const shortId = event.subagentRunId ? event.subagentRunId.slice(0, 4) : undefined;
+      return (
+        <div style={{ minWidth: 0 }}>
+          <div style={rowStyle}>
+            <span className="nx-as-kind-label" style={kindLabelStyle(accent)}>
+              {EVENT_KIND_LABEL.subagent}
+            </span>
+            {shortId && (
+              <span
+                style={{
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 10.5,
+                  color: accent,
+                  opacity: 0.85,
+                }}
+              >
+                #{shortId}
+              </span>
+            )}
+            <span style={{ fontSize: 12.5, color: isErr ? tc.error : tc.text }}>
+              {event.title}
+            </span>
+            {event.phase === "completed" && typeof event.costUsd === "number" && event.costUsd > 0 && (
+              <span style={metaStyle(tc)}>${event.costUsd.toFixed(4)}</span>
+            )}
+          </div>
+          {(event.phase === "completed" || event.phase === "failed") && event.summary && (
+            <div
+              style={{
+                marginTop: 3,
+                fontSize: 12,
+                color: tc.textMuted,
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
+              }}
+            >
+              {event.summary}
+            </div>
+          )}
+        </div>
+      );
+    }
     default:
       return null;
   }

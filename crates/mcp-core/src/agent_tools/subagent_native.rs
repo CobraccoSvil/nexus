@@ -58,6 +58,12 @@ struct SubagentSettings {
     max_depth: i64,
     cost_cap_usd: f64,
     default_timeout_s: i64,
+    /// Narrazione del sub-run sul run PADRE (meta-step avvio/progresso/chiusura,
+    /// mig 0535). Kill-switch UX: OFF -> chat muta durante il dispatch (storico).
+    narration_enabled: bool,
+    /// Heartbeat "al lavoro" nei silenzi del sub-run (secondi, mig 0535).
+    /// 0 -> heartbeat disabilitato (restano avvio/progressi/chiusura).
+    narration_heartbeat_s: i64,
 }
 
 async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettings, String> {
@@ -67,7 +73,9 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
             'orchestrator.subagent_kinds_whitelist',
             'orchestrator.subagent_max_depth',
             'orchestrator.subagent_cost_cap_per_run_usd',
-            'orchestrator.subagent_default_timeout_s'
+            'orchestrator.subagent_default_timeout_s',
+            'orchestrator.subagent_narration_enabled',
+            'orchestrator.subagent_narration_heartbeat_s'
         )",
     )
     .fetch_all(&*ctx.core.db)
@@ -80,6 +88,8 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
         max_depth: 2,
         cost_cap_usd: 5.0,
         default_timeout_s: 300,
+        narration_enabled: true,
+        narration_heartbeat_s: 20,
     };
     for row in rows {
         let k: String = row.get("key");
@@ -101,6 +111,13 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
             }
             "orchestrator.subagent_default_timeout_s" => {
                 s.default_timeout_s = v.trim().parse().unwrap_or(300)
+            }
+            "orchestrator.subagent_narration_enabled" => {
+                s.narration_enabled =
+                    matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+            }
+            "orchestrator.subagent_narration_heartbeat_s" => {
+                s.narration_heartbeat_s = v.trim().parse().unwrap_or(20)
             }
             _ => {}
         }
@@ -758,6 +775,208 @@ async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
         .clamp(1, MAX_PARALLEL_HARD_CAP)
 }
 
+// ─── Narrazione del sub-run sul run PADRE (ADR 0037) ───────────────────────
+//
+// Il dispatch sub-agente e' BLOCCANTE e puo' durare minuti: senza narrazione la
+// chat del run padre resta muta (nessun meta-step, `updated_at` fermo) e il run
+// sembra bloccato mentre il figlio lavora. Qui il tool — che conosce il canale
+// SSE del run invocante via `ctx.parent_narration` — emette sul PADRE:
+//   1. `subagent_started`  all'avvio (kind + task);
+//   2. `subagent_progress` per ogni tool CONCLUSO del figlio (esito dal segnale
+//      strutturato `AgentStepStatus`, regola M) + heartbeat nei silenzi;
+//   3. `subagent_completed`/`subagent_failed` alla chiusura, col summary.
+// Ogni step porta `correlation_id = subagent_run_id`. La composizione
+// live+storico delega al PUNTO UNICO `emit_phase_meta_correlated` (regola L).
+
+/// Compositore della narrazione sul run PADRE: sink SSE + store meta-step del
+/// run invocante. `say` delega al punto unico `emit_phase_meta_correlated`.
+struct ParentNarrator {
+    sink: crate::agent_graph_adapter::event_sink::SseEventSinkAdapter,
+    store: crate::agent_graph_adapter::meta_step_store::PgMetaStepStore,
+}
+
+impl ParentNarrator {
+    /// Costruisce il narratore per il run invocante. `None` se la narrazione e'
+    /// disabilitata (setting) o il ctx non porta il canale (tool invocato fuori
+    /// dal grafo nativo): il dispatch degrada al comportamento muto storico.
+    fn from_ctx(
+        ctx: &AgentToolContext,
+        proj_pool: &sqlx::PgPool,
+        enabled: bool,
+    ) -> Option<std::sync::Arc<Self>> {
+        if !enabled {
+            return None;
+        }
+        let pn = ctx.parent_narration.as_ref()?;
+        Some(std::sync::Arc::new(Self {
+            sink: crate::agent_graph_adapter::event_sink::SseEventSinkAdapter::with_persistence(
+                pn.step_tx.clone(),
+                pn.run_id,
+                pn.session_id,
+                proj_pool.clone(),
+            ),
+            store: crate::agent_graph_adapter::meta_step_store::PgMetaStepStore::new(
+                proj_pool.clone(),
+                pn.run_id,
+            ),
+        }))
+    }
+
+    /// Emette (live) + persiste (storico) UN meta-step della narrazione,
+    /// correlato al sub-run. Best-effort: mai un errore al chiamante. Il tool
+    /// gira SOLO in `ExecMode::Real` (in Replay il tool_result e' riletto da
+    /// `agent_steps` senza eseguire l'handler), quindi il mode e' fissato.
+    async fn say(&self, kind: &str, title: String, payload: Value, subagent_run_id: Uuid) {
+        nexus_agent_graph::nodes::emit_phase_meta_correlated(
+            &self.sink,
+            &self.store,
+            nexus_agent_graph::runtime::ports::ExecMode::Real,
+            kind,
+            title,
+            payload,
+            Some(subagent_run_id.to_string()),
+        )
+        .await;
+    }
+}
+
+/// Decisione PURA (regola M): uno step del sub-run va inoltrato al padre solo
+/// se CONCLUSO — `Completed` (ok) o `Failed` (errore) dal segnale strutturato
+/// `AgentStepStatus`, mai dal testo. `Running` e' escluso (doppione per tool);
+/// uno step senza nome (ToolResult orfano) non produce narrazione utile.
+fn concluded_tool_step(
+    ev: &crate::agent_types::AgentStepEvent,
+) -> Option<(bool, String, u32)> {
+    let step = ev.step.as_ref()?;
+    let is_error = match step.status {
+        crate::agent_types::AgentStepStatus::Completed => false,
+        crate::agent_types::AgentStepStatus::Failed => true,
+        _ => return None,
+    };
+    if step.tool_name.is_empty() {
+        return None;
+    }
+    Some((is_error, step.tool_name.clone(), step.step_index))
+}
+
+/// Target leggibile dallo step `Running` del sub-run: il ToolUse porta l'input
+/// REALE in `tool_input.input` (il ToolResult no — vedi `SseEventSinkAdapter`),
+/// quindi il ponte lo memorizza per `step_index` e lo riusa nel titolo alla
+/// conclusione. Estrazione col punto unico del grafo (`tool_target_from_input`).
+fn running_tool_target(ev: &crate::agent_types::AgentStepEvent) -> Option<(u32, String)> {
+    let step = ev.step.as_ref()?;
+    if step.status != crate::agent_types::AgentStepStatus::Running {
+        return None;
+    }
+    let target = step
+        .tool_input
+        .get("input")
+        .and_then(nexus_agent_graph::nodes::tool_target_from_input)?;
+    Some((step.step_index, target))
+}
+
+/// Compone titolo + payload del meta-step `subagent_progress` per un tool
+/// concluso del sub-run (PURA, testabile). Stesso registro della narrazione
+/// tool del run corrente ("tool edit_file — src/x.ts" / "errore run_command").
+fn tool_progress_meta(
+    sub_kind: &str,
+    subagent_run_id: Uuid,
+    tool: &str,
+    target: Option<&str>,
+    is_error: bool,
+) -> (String, Value) {
+    let esito = if is_error { "errore" } else { "tool" };
+    let title = match target {
+        Some(t) => format!("subagente {sub_kind}: {esito} {tool} — {t}"),
+        None => format!("subagente {sub_kind}: {esito} {tool}"),
+    };
+    let payload = json!({
+        "phase": "tool",
+        "tool": tool,
+        "target": target,
+        "is_error": is_error,
+        "subagent_run_id": subagent_run_id.to_string(),
+        "subagent_kind": sub_kind,
+    });
+    (title, payload)
+}
+
+/// Ponte narrazione: consuma gli eventi SSE del SUB-run (prima scartati:
+/// `_sub_rx`, la feature era muta) e li traduce in meta-step
+/// `subagent_progress` sul run PADRE, con heartbeat nei silenzi (LLM call
+/// lunghe senza tool). Termina alla chiusura del canale; il chiamante lo
+/// aborta comunque prima del meta-step di chiusura.
+fn spawn_narration_bridge(
+    narrator: std::sync::Arc<ParentNarrator>,
+    mut rx: tokio::sync::broadcast::Receiver<crate::agent_types::AgentStepEvent>,
+    subagent_run_id: Uuid,
+    sub_kind: String,
+    heartbeat_s: i64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let hb_enabled = heartbeat_s > 0;
+        // Con heartbeat disabilitato il branch del tick resta spento (guard
+        // `if hb_enabled`): il periodo placeholder non scatta mai.
+        let period = if hb_enabled { heartbeat_s as u64 } else { 3600 };
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(period));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Il primo tick di `interval()` e' immediato: consumato subito, il
+        // heartbeat parte dal primo periodo pieno.
+        tick.tick().await;
+        let mut targets: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        let mut emitted_since_tick = false;
+        loop {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Ok(ev) => {
+                        if let Some((idx, target)) = running_tool_target(&ev) {
+                            targets.insert(idx, target);
+                        }
+                        if let Some((is_error, tool, idx)) = concluded_tool_step(&ev) {
+                            let target = targets.remove(&idx);
+                            let (title, payload) = tool_progress_meta(
+                                &sub_kind,
+                                subagent_run_id,
+                                &tool,
+                                target.as_deref(),
+                                is_error,
+                            );
+                            narrator
+                                .say("subagent_progress", title, payload, subagent_run_id)
+                                .await;
+                            emitted_since_tick = true;
+                        }
+                    }
+                    // Lagged: il ponte e' narrazione best-effort, gli eventi
+                    // persi non fermano il run ne' il ponte.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = tick.tick(), if hb_enabled => {
+                    if !emitted_since_tick {
+                        let elapsed = started.elapsed().as_secs();
+                        narrator
+                            .say(
+                                "subagent_progress",
+                                format!("Subagente {sub_kind}: al lavoro da {elapsed}s"),
+                                json!({
+                                    "phase": "working",
+                                    "elapsed_s": elapsed,
+                                    "subagent_run_id": subagent_run_id.to_string(),
+                                    "subagent_kind": sub_kind,
+                                }),
+                                subagent_run_id,
+                            )
+                            .await;
+                    }
+                    emitted_since_tick = false;
+                }
+            }
+        }
+    })
+}
+
 /// Slot di isolamento fisico di un sub-run (FASE 2): il worktree effimero
 /// pre-creato dal batch e i metadati da persistire su `nexus_subagent_runs` per
 /// audit/reconcile. `run_id` E' l'identita' del sub-run (row DB) E del worktree
@@ -935,6 +1154,28 @@ async fn run_single_subagent(
         Err(e) => return json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")}),
     };
 
+    // ── NARRAZIONE sul run PADRE (ADR 0037): avvio ────────────────────────────
+    // Il dispatch e' bloccante e puo' durare minuti: senza questi meta-step la
+    // chat resta muta e il run padre sembra bloccato mentre il figlio lavora.
+    let narrator = ParentNarrator::from_ctx(ctx, &proj_pool, settings.narration_enabled);
+    if let Some(n) = &narrator {
+        let task_head: String = task.trim().chars().take(160).collect();
+        n.say(
+            "subagent_started",
+            format!("Subagente {kind} avviato — {task_head}"),
+            json!({
+                "subagent_run_id": subagent_run_id.to_string(),
+                "subagent_kind": kind,
+                "task": task_head,
+                "depth": current_depth,
+                "timeout_s": timeout_s,
+                "isolated": isolation.is_some(),
+            }),
+            subagent_run_id,
+        )
+        .await;
+    }
+
     // ── Esecuzione sul GRAFO NATIVO (in-process, niente brain) ────────────────
     // Il sub-run e' un run a se': run_id = subagent_run_id (= thread del grafo),
     // STESSA session_id del parent (eredita root/permessi/canali). Lo stato porta
@@ -942,8 +1183,19 @@ async fn run_single_subagent(
     // (UnderstandingNode salta il fan-out explore se depth>=1).
     let deps = build_native_deps_for_tool(ctx).await;
     // Canale SSE proprio del sub-run: NON instrada al frontend (l'output utente
-    // resta quello del main, che riceve solo il summary). Buffer minimo.
-    let (sub_tx, _sub_rx) = tokio::sync::broadcast::channel(64);
+    // resta quello del main, che riceve solo il summary). Il receiver alimenta
+    // il PONTE narrazione verso il padre (prima era scartato: feature muta);
+    // senza narratore il receiver e' droppato e il comportamento e' lo storico.
+    let (sub_tx, sub_rx) = tokio::sync::broadcast::channel(256);
+    let bridge = narrator.as_ref().map(|n| {
+        spawn_narration_bridge(
+            n.clone(),
+            sub_rx,
+            subagent_run_id,
+            kind.to_string(),
+            settings.narration_heartbeat_s,
+        )
+    });
 
     let native_input = NativeRunInput {
         run_id: subagent_run_id,
@@ -984,6 +1236,17 @@ async fn run_single_subagent(
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await {
             Ok(res) => res,
             Err(_) => {
+                // Ponte fermato e ATTESO prima del meta-step di chiusura: senza
+                // l'await, abort() e' cooperativo (cancella al prossimo poll) e
+                // un progress/heartbeat gia' dentro persist_meta_step potrebbe
+                // ottenere un NOW() > del completed -> ordine invertito nella
+                // timeline storica (ordinata per created_at). L'await del handle
+                // garantisce che nessuna INSERT del ponte segua quella di
+                // chiusura (race chiusa alla radice, regola H).
+                if let Some(b) = bridge {
+                    b.abort();
+                    let _ = b.await;
+                }
                 let _ = mark_run(
                     &proj_pool,
                     subagent_run_id,
@@ -995,6 +1258,20 @@ async fn run_single_subagent(
                     0.0,
                 )
                 .await;
+                if let Some(n) = &narrator {
+                    n.say(
+                        "subagent_failed",
+                        format!("Subagente {kind} in timeout dopo {timeout_s}s"),
+                        json!({
+                            "subagent_run_id": subagent_run_id.to_string(),
+                            "subagent_kind": kind,
+                            "status": "timeout",
+                            "timeout_s": timeout_s,
+                        }),
+                        subagent_run_id,
+                    )
+                    .await;
+                }
                 return json!({
                     "subagent_run_id": subagent_run_id.to_string(),
                     "kind": kind,
@@ -1003,6 +1280,14 @@ async fn run_single_subagent(
                 });
             }
         };
+
+    // Ponte fermato e ATTESO prima del meta-step di chiusura (entrambi i rami):
+    // l'await del handle chiude la race abort-cooperativo/INSERT-in-volo, cosi'
+    // nessun progress puo' persistere dopo il completed/failed (regola H).
+    if let Some(b) = bridge {
+        b.abort();
+        let _ = b.await;
+    }
 
     match outcome {
         Ok(o) => {
@@ -1028,6 +1313,27 @@ async fn run_single_subagent(
                 summary_len = summary.len(),
                 "subagent_native: sub-run eseguito sul grafo nativo"
             );
+            if let Some(n) = &narrator {
+                let title = if o.completed {
+                    format!("Subagente {kind} completato ({} iterazioni)", o.iterations)
+                } else {
+                    format!("Subagente {kind} in pausa ({} iterazioni)", o.iterations)
+                };
+                n.say(
+                    "subagent_completed",
+                    title,
+                    json!({
+                        "subagent_run_id": subagent_run_id.to_string(),
+                        "subagent_kind": kind,
+                        "status": status,
+                        "summary": compact_summary(&summary),
+                        "iterations": o.iterations,
+                        "cost_usd": o.total_cost,
+                    }),
+                    subagent_run_id,
+                )
+                .await;
+            }
             json!({
                 "subagent_run_id": subagent_run_id.to_string(),
                 "kind": kind,
@@ -1051,6 +1357,20 @@ async fn run_single_subagent(
                 error = %e,
                 "subagent_native: sub-run fallito"
             );
+            if let Some(n) = &narrator {
+                n.say(
+                    "subagent_failed",
+                    format!("Subagente {kind} fallito"),
+                    json!({
+                        "subagent_run_id": subagent_run_id.to_string(),
+                        "subagent_kind": kind,
+                        "status": "failed",
+                        "error": compact_summary(&msg),
+                    }),
+                    subagent_run_id,
+                )
+                .await;
+            }
             json!({
                 "error": msg,
                 "subagent_run_id": subagent_run_id.to_string(),
@@ -1357,6 +1677,102 @@ mod tests {
         // delete_code_index_file_points.
         let rel = "src\\rimosso.rs";
         assert_eq!(rel.replace('\\', "/"), "src/rimosso.rs");
+    }
+
+    /// Costruttore di comodo per gli eventi step del sub-run nei test del ponte.
+    fn step_event(
+        status: crate::agent_types::AgentStepStatus,
+        tool: &str,
+        idx: u32,
+        input: Value,
+    ) -> crate::agent_types::AgentStepEvent {
+        crate::agent_types::AgentStepEvent {
+            run_id: "r".into(),
+            step: Some(crate::agent_types::AgentStep {
+                run_id: "r".into(),
+                step_index: idx,
+                tool_name: tool.into(),
+                tool_input: input,
+                tool_result: None,
+                status,
+                created_at: String::new(),
+            }),
+            trace: None,
+            is_final: false,
+            token_delta: None,
+            thinking_delta: None,
+            meta_step: None,
+        }
+    }
+
+    /// La decisione d'inoltro guarda SOLO il segnale strutturato dello step
+    /// (regola M): conclusi si', Running no, orfani (nome vuoto) no.
+    #[test]
+    fn concluded_tool_step_solo_esiti_conclusi() {
+        use crate::agent_types::AgentStepStatus as S;
+        let ok = step_event(S::Completed, "read_file", 3, json!({}));
+        assert_eq!(
+            concluded_tool_step(&ok),
+            Some((false, "read_file".to_string(), 3))
+        );
+        let ko = step_event(S::Failed, "run_command", 5, json!({}));
+        assert_eq!(
+            concluded_tool_step(&ko),
+            Some((true, "run_command".to_string(), 5))
+        );
+        let running = step_event(S::Running, "read_file", 1, json!({}));
+        assert_eq!(concluded_tool_step(&running), None, "Running: doppione");
+        let orfano = step_event(S::Completed, "", 2, json!({}));
+        assert_eq!(concluded_tool_step(&orfano), None, "senza nome: nessuna riga utile");
+        let senza_step = crate::agent_types::AgentStepEvent {
+            run_id: "r".into(),
+            step: None,
+            trace: None,
+            is_final: false,
+            token_delta: None,
+            thinking_delta: None,
+            meta_step: None,
+        };
+        assert_eq!(concluded_tool_step(&senza_step), None);
+    }
+
+    /// Il target si estrae dallo step `Running` (il ToolUse porta l'input reale
+    /// in `tool_input.input`), col punto unico del grafo (path/command/...).
+    #[test]
+    fn running_tool_target_dal_tool_use() {
+        use crate::agent_types::AgentStepStatus as S;
+        let ev = step_event(
+            S::Running,
+            "edit_file",
+            7,
+            json!({"id": "tu_1", "input": {"path": "src/a.rs"}}),
+        );
+        assert_eq!(running_tool_target(&ev), Some((7, "src/a.rs".to_string())));
+        // Il Completed non porta l'input reale: nessun target da qui.
+        let done = step_event(S::Completed, "edit_file", 7, json!({"id": "tu_1"}));
+        assert_eq!(running_tool_target(&done), None);
+    }
+
+    /// Titolo e payload del progresso: stesso registro della narrazione tool del
+    /// run corrente, con l'esito dall'is_error strutturato.
+    #[test]
+    fn tool_progress_meta_compone_titolo_e_payload() {
+        let id = Uuid::nil();
+        let (title, payload) =
+            tool_progress_meta("coder", id, "edit_file", Some("src/a.rs"), false);
+        assert_eq!(title, "subagente coder: tool edit_file — src/a.rs");
+        assert_eq!(payload["phase"], json!("tool"));
+        assert_eq!(payload["tool"], json!("edit_file"));
+        assert_eq!(payload["target"], json!("src/a.rs"));
+        assert_eq!(payload["is_error"], json!(false));
+        assert_eq!(payload["subagent_kind"], json!("coder"));
+        assert_eq!(payload["subagent_run_id"], json!(id.to_string()));
+
+        let (title_err, payload_err) =
+            tool_progress_meta("tester", id, "run_command", None, true);
+        assert_eq!(title_err, "subagente tester: errore run_command");
+        assert_eq!(payload_err["is_error"], json!(true));
+        assert_eq!(payload_err["target"], json!(null));
     }
 
     /// Il parse dei task del batch estrae `write_scope` dal JSON (alimenta il

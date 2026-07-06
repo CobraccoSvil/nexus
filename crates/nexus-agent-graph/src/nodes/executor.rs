@@ -2699,6 +2699,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             kind: "executor_call".to_string(),
             title: format!("Sto interrogando {provider}/{model}"),
             payload: calling_meta.get("payload").cloned().unwrap_or(Value::Null),
+            correlation_id: None,
         });
         let _ = self.meta_steps.persist_meta_step(calling_meta, mode).await;
         // Heartbeat best-effort (anti-recovery prematuro), gata Real.
@@ -3042,6 +3043,7 @@ della finestra {effective_window} del modello {provider}/{model}"
                     kind: "context_overflow".to_string(),
                     title: "Contesto oltre il limite del modello".to_string(),
                     payload: overflow_meta.get("payload").cloned().unwrap_or(Value::Null),
+                    correlation_id: None,
                 });
                 let _ = self.meta_steps.persist_meta_step(overflow_meta, mode).await;
                 // `extra` nel delta e' overwrite: merge con lo stato per non
@@ -3923,6 +3925,7 @@ modello piu' capace.",
                     kind: "next_actions".to_string(),
                     title: "Prossimi passi".to_string(),
                     payload,
+                    correlation_id: None,
                 });
                 let _ = self.meta_steps.persist_meta_step(meta, mode).await;
             }

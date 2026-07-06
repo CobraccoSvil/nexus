@@ -203,6 +203,10 @@ impl ToolRunnerService {
             neural: self.deps.neural.clone(),
             dependency_status: self.deps.dependency_status.clone(),
             port_registry: self.deps.port_registry.clone(),
+            // Narrazione verso il run invocante: il ctx base non la conosce (il
+            // contratto porta solo session_id). La valorizza il SOLO path Real
+            // del grafo nativo (ToolRunnerExecutorAdapter::execute_real).
+            parent_narration: None,
         })
     }
 }

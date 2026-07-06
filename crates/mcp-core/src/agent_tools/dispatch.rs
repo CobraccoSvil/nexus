@@ -327,6 +327,7 @@ mod tests {
             neural: crate::orchestrator::NeuralCoreClient::disconnected_for_tests(),
             dependency_status: Arc::new(crate::task_watchdog::DependencyStatus::new()),
             port_registry: crate::port_registry::PortRegistryCache::empty_for_tests(db),
+            parent_narration: None,
         }
     }
 

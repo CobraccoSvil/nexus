@@ -43,7 +43,7 @@ pub use router::RouterNode;
 pub use scale_control::{ScaleControlNode, SCALE_CONTEXT_KEY, SCALE_MOVE_CACHE_KEY_KEY};
 pub use stall_recovery::{stall_move_key, StallRecoveryNode, STALL_CONTEXT_KEY};
 pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};
-pub use tool_dispatch::{ToolDispatchConfig, ToolDispatchNode};
+pub use tool_dispatch::{tool_target_from_input, ToolDispatchConfig, ToolDispatchNode};
 pub use understanding::{UnderstandingConfig, UnderstandingNode};
 
 /// NARRAZIONE LIVE di una FASE semantica del run (punto unico, regola L):
@@ -60,12 +60,36 @@ pub(crate) async fn emit_phase_meta(
     title: String,
     payload: serde_json::Value,
 ) {
+    emit_phase_meta_correlated(emit, store, mode, kind, title, payload, None).await;
+}
+
+/// Variante CORRELATA del punto unico di narrazione (stessa composizione
+/// live+storico): il `correlation_id` collega lo step a un'entita' esterna
+/// (es. la narrazione sub-agente porta il `subagent_run_id`) sia nell'evento
+/// SSE sia nella riga persistita (`nexus_agent_meta_steps.correlation_id`).
+/// `pub` perche' chiamata anche fuori dal grafo (ponte narrazione sub-agente in
+/// mcp-core): il punto di composizione resta UNO (regola L).
+pub async fn emit_phase_meta_correlated(
+    emit: &dyn crate::runtime::ports::EventSink,
+    store: &dyn crate::runtime::ports::MetaStepStore,
+    mode: crate::runtime::ports::ExecMode,
+    kind: &str,
+    title: String,
+    payload: serde_json::Value,
+    correlation_id: Option<String>,
+) {
     emit.emit(crate::runtime::ports::SseEvent::MetaStep {
         kind: kind.to_string(),
         title: title.clone(),
         payload: payload.clone(),
+        correlation_id: correlation_id.clone(),
     });
-    let meta = serde_json::json!({"kind": kind, "title": title, "payload": payload});
+    let meta = serde_json::json!({
+        "kind": kind,
+        "title": title,
+        "payload": payload,
+        "correlation_id": correlation_id,
+    });
     let _ = store.persist_meta_step(meta, mode).await;
 }
 pub use verifier::{suggest_remediation, VerifierConfig, VerifierNode};

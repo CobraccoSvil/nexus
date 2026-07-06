@@ -126,6 +126,30 @@ export interface FoldedToolsEvent extends EventProvenance {
   tools: ToolEvent[];
 }
 
+/** Narrazione di un SUB-AGENTE dispatchato dal run (meta-step subagent_started/
+ *  progress/completed/failed emessi dal ponte in subagent_native.rs, mig 0535).
+ *  La `phase` e' il segnale strutturato del payload (regola M), il `title` e'
+ *  gia' composto dal backend. Gli eventi dello stesso sub-run condividono
+ *  `subagentRunId` (= correlation_id del meta-step). */
+export interface SubagentEvent extends EventProvenance {
+  type: "subagent";
+  phase: "started" | "tool" | "working" | "completed" | "failed";
+  subagentKind?: string;
+  subagentRunId?: string;
+  /** titolo leggibile del meta-step (composto dal backend). */
+  title: string;
+  /** dettagli tool inoltrato (phase="tool"). */
+  tool?: string;
+  target?: string;
+  isError?: boolean;
+  /** dettagli di chiusura (phase="completed"/"failed"). */
+  summary?: string;
+  iterations?: number;
+  costUsd?: number;
+  /** secondi di lavoro (phase="working", heartbeat). */
+  elapsedS?: number;
+}
+
 export type ActivityEvent =
   | RoutingEvent
   | PlanEvent
@@ -134,7 +158,8 @@ export type ActivityEvent =
   | SwitchEvent
   | VerifyEvent
   | ContextOverflowEvent
-  | FoldedToolsEvent;
+  | FoldedToolsEvent
+  | SubagentEvent;
 
 /** Segmento del nastro: tutti gli eventi eseguiti da UN provider/model, in
  *  ordine. Un nuovo segmento si apre a ogni cambio provider effettivo. */
@@ -424,6 +449,56 @@ export function composeActivityStream(
             const seg = ensureSegment(undefined, undefined);
             seg.events.push({ type: "thought", text: summary });
           }
+          break;
+        }
+        case "subagent_started":
+        case "subagent_progress":
+        case "subagent_completed":
+        case "subagent_failed": {
+          // Narrazione sub-agente (ponte subagent_native.rs): la fase viene dal
+          // SEGNALE STRUTTURATO kind + payload.phase (regola M), mai dal titolo.
+          const seg = ensureSegment(undefined, undefined);
+          const phase: SubagentEvent["phase"] =
+            m.kind === "subagent_started"
+              ? "started"
+              : m.kind === "subagent_completed"
+                ? "completed"
+                : m.kind === "subagent_failed"
+                  ? "failed"
+                  : asString(p.phase) === "working"
+                    ? "working"
+                    : "tool";
+          const ev: SubagentEvent = {
+            type: "subagent",
+            phase,
+            subagentKind: asString(p.subagent_kind),
+            subagentRunId: asString(p.subagent_run_id) ?? m.correlationId ?? undefined,
+            title: m.title,
+            tool: asString(p.tool),
+            target: asString(p.target),
+            isError: p.is_error === true || m.kind === "subagent_failed",
+            summary: asString(p.summary) ?? asString(p.error),
+            iterations: asNumber(p.iterations),
+            costUsd: asNumber(p.cost_usd),
+            elapsedS: asNumber(p.elapsed_s),
+          };
+          // Heartbeat "al lavoro": tiene UN SOLO working per sub-run, sempre in
+          // coda (l'elapsed piu' recente). Cerchiamo il precedente working DELLO
+          // STESSO subagentRunId ovunque sia (non solo l'ultimo evento): col
+          // batch parallelo gli heartbeat di sub-run diversi si interlacciano e
+          // un confronto col solo `last` non li comprimerebbe. Rimuovendo il
+          // vecchio e ri-accodando il nuovo si mantiene un working per run e
+          // l'ordine cronologico. Keep-alive: nessuna informazione persa.
+          if (phase === "working") {
+            const prevIdx = seg.events.findIndex(
+              (e) =>
+                e.type === "subagent" &&
+                e.phase === "working" &&
+                e.subagentRunId === ev.subagentRunId,
+            );
+            if (prevIdx >= 0) seg.events.splice(prevIdx, 1);
+          }
+          seg.events.push(ev);
           break;
         }
         default:

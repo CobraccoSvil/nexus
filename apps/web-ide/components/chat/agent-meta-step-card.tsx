@@ -171,6 +171,13 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   final_gate: { icon: "✓", label: "Verifica", accent: "#22c55e", defaultOpen: false },
   declaration_request: { icon: "…", label: "Richiesta esito", accent: "#f59e0b", defaultOpen: false },
   outcome_declared: { icon: "◆", label: "Esito dichiarato", accent: "#22c55e", defaultOpen: true },
+  // Narrazione del sub-agente sul run padre (ponte subagent_native.rs, mig
+  // 0535): avvio, progresso (tool inoltrati + heartbeat) e chiusura col
+  // summary, correlati via correlation_id = subagent_run_id.
+  subagent_started: { icon: "◈", label: "Subagente", accent: "#8b5cf6", defaultOpen: false },
+  subagent_progress: { icon: "◈", label: "Subagente", accent: "#8b5cf6", defaultOpen: false },
+  subagent_completed: { icon: "◈", label: "Subagente completato", accent: "#8b5cf6", defaultOpen: true },
+  subagent_failed: { icon: "◈", label: "Subagente fallito", accent: "#ef4444", defaultOpen: true },
 };
 
 const DEFAULT_DESC: KindDescriptor = {

@@ -456,3 +456,111 @@ test("cap: le bande switch restano SEMPRE visibili anche se cappate", () => {
   assert.ok(switchSeg.switch, "la banda switch e' preservata");
   assert.equal(switchSeg.switch?.toProvider, "anthropic");
 });
+
+// ── 8. Narrazione sub-agente (subagent_started/progress/completed) ──────────
+
+test("i meta-step subagent_* diventano eventi 'subagent' con fase strutturata", () => {
+  beforeEach();
+  const subRunId = "8f1e0b2a-0000-0000-0000-000000000001";
+  const metaSteps: MetaStepEntry[] = [
+    meta("executor_call", { iteration: 0, provider: "google", model: "gemini" }),
+    meta(
+      "subagent_started",
+      { subagent_run_id: subRunId, subagent_kind: "coder", task: "fix bug" },
+      "Subagente coder avviato — fix bug",
+    ),
+    meta(
+      "subagent_progress",
+      { phase: "tool", tool: "edit_file", target: "src/a.rs", is_error: false, subagent_run_id: subRunId, subagent_kind: "coder" },
+      "subagente coder: tool edit_file — src/a.rs",
+    ),
+    meta(
+      "subagent_completed",
+      { status: "completed", summary: "fatto", iterations: 7, cost_usd: 0.02, subagent_run_id: subRunId, subagent_kind: "coder" },
+      "Subagente coder completato (7 iterazioni)",
+    ),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const events = s.segments.flatMap((seg) => seg.events);
+  const subs = events.filter((e): e is Extract<ActivityEvent, { type: "subagent" }> => e.type === "subagent");
+  assert.equal(subs.length, 3, "avvio + progresso + chiusura");
+  assert.equal(subs[0].phase, "started");
+  assert.equal(subs[0].subagentKind, "coder");
+  assert.equal(subs[1].phase, "tool");
+  assert.equal(subs[1].tool, "edit_file");
+  assert.equal(subs[1].isError, false);
+  assert.equal(subs[2].phase, "completed");
+  assert.equal(subs[2].summary, "fatto");
+  assert.equal(subs[2].iterations, 7);
+  // Correlazione: tutti gli eventi portano lo stesso subagentRunId.
+  assert.ok(subs.every((e) => e.subagentRunId === subRunId));
+});
+
+test("gli heartbeat 'working' consecutivi dello stesso sub-run collassano nell'ultimo", () => {
+  beforeEach();
+  const subRunId = "8f1e0b2a-0000-0000-0000-000000000002";
+  const hb = (elapsed: number) =>
+    meta(
+      "subagent_progress",
+      { phase: "working", elapsed_s: elapsed, subagent_run_id: subRunId, subagent_kind: "tester" },
+      `Subagente tester: al lavoro da ${elapsed}s`,
+    );
+  const metaSteps: MetaStepEntry[] = [
+    meta("subagent_started", { subagent_run_id: subRunId, subagent_kind: "tester" }, "Subagente tester avviato"),
+    hb(20),
+    hb(40),
+    hb(60),
+    meta("subagent_completed", { status: "completed", subagent_run_id: subRunId }, "Subagente tester completato"),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const events = s.segments.flatMap((seg) => seg.events);
+  const subs = events.filter((e): e is Extract<ActivityEvent, { type: "subagent" }> => e.type === "subagent");
+  assert.equal(subs.length, 3, "avvio + UN solo heartbeat (l'ultimo) + chiusura");
+  assert.equal(subs[1].phase, "working");
+  assert.equal(subs[1].elapsedS, 60, "resta l'heartbeat piu' recente");
+  // L'errore strutturato del subagent_failed marca l'evento.
+  const failed = composeActivityStream(
+    [meta("subagent_failed", { status: "timeout", error: "[Sub-agent timeout]", subagent_run_id: subRunId }, "Subagente tester in timeout")],
+    [],
+    [],
+    3,
+  );
+  const fev = failed.segments.flatMap((seg) => seg.events).find((e) => e.type === "subagent");
+  assert.ok(fev && fev.type === "subagent");
+  assert.equal(fev.phase, "failed");
+  assert.equal(fev.isError, true);
+  assert.equal(fev.summary, "[Sub-agent timeout]");
+});
+
+test("batch parallelo: gli heartbeat INTERLACCIATI di sub-run diversi restano distinti (uno per run)", () => {
+  beforeEach();
+  const runA = "aaaaaaaa-0000-0000-0000-000000000001";
+  const runB = "bbbbbbbb-0000-0000-0000-000000000002";
+  const hb = (run: string, kind: string, elapsed: number) =>
+    meta(
+      "subagent_progress",
+      { phase: "working", elapsed_s: elapsed, subagent_run_id: run, subagent_kind: kind },
+      `Subagente ${kind}: al lavoro da ${elapsed}s`,
+    );
+  // Heartbeat interlacciati (A e B alternati): il collasso deve tenere UN solo
+  // working per run, non confondere i due (il vecchio confronto col solo `last`
+  // non li avrebbe compressi -> 4 righe invece di 2).
+  const metaSteps: MetaStepEntry[] = [
+    meta("subagent_started", { subagent_run_id: runA, subagent_kind: "coder" }, "Subagente coder avviato"),
+    meta("subagent_started", { subagent_run_id: runB, subagent_kind: "tester" }, "Subagente tester avviato"),
+    hb(runA, "coder", 20),
+    hb(runB, "tester", 20),
+    hb(runA, "coder", 40),
+    hb(runB, "tester", 40),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const subs = s.segments
+    .flatMap((seg) => seg.events)
+    .filter((e): e is Extract<ActivityEvent, { type: "subagent" }> => e.type === "subagent");
+  const workingA = subs.filter((e) => e.phase === "working" && e.subagentRunId === runA);
+  const workingB = subs.filter((e) => e.phase === "working" && e.subagentRunId === runB);
+  assert.equal(workingA.length, 1, "un solo working per il run A");
+  assert.equal(workingB.length, 1, "un solo working per il run B");
+  assert.equal(workingA[0].elapsedS, 40, "resta l'heartbeat piu' recente di A");
+  assert.equal(workingB[0].elapsedS, 40, "resta l'heartbeat piu' recente di B");
+});

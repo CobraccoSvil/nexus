@@ -19,6 +19,23 @@ use nexus_agent_tools::ToolContextCore;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Canale di NARRAZIONE del run invocante: run_id + sender broadcast SSE del
+/// run del grafo nativo che sta eseguendo il tool corrente. Permette ai tool a
+/// lunga durata (`dispatch_subagent`/`dispatch_subagents`) di emettere meta-step
+/// sul run PADRE mentre lavorano (avvio/progresso/chiusura del sub-run), invece
+/// di lasciare la chat muta per minuti. Valorizzato SOLO dal path Real del
+/// grafo nativo (`ToolRunnerExecutorAdapter`): fuori dal grafo (server gRPC,
+/// dispatch legacy) resta `None` -> nessuna narrazione, comportamento invariato.
+#[derive(Debug, Clone)]
+pub struct ParentNarration {
+    /// Run del grafo che ha invocato il tool (destinatario dei meta-step).
+    pub run_id: Uuid,
+    /// Sessione del run invocante (colonne trace/persistenze correlate).
+    pub session_id: Uuid,
+    /// Canale broadcast SSE del run invocante (lo stesso di `agent_channels`).
+    pub step_tx: tokio::sync::broadcast::Sender<crate::agent_types::AgentStepEvent>,
+}
+
 /// Contesto necessario all'esecuzione dei tool.
 #[derive(Debug, Clone)]
 pub struct AgentToolContext {
@@ -34,6 +51,9 @@ pub struct AgentToolContext {
     /// Cache port_registry (PR hardening): usata da `tool_run_service` per
     /// auto-allocare PORT nel bucket del progetto via `find_or_allocate_port`.
     pub port_registry: crate::port_registry::PortRegistryCache,
+    /// Narrazione verso il run invocante (vedi [`ParentNarration`]). `None`
+    /// fuori dal grafo nativo.
+    pub parent_narration: Option<ParentNarration>,
 }
 
 impl Deref for AgentToolContext {

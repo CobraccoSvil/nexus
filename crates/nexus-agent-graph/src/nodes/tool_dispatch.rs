@@ -966,6 +966,28 @@ const META_TARGET_KEYS: &[&str] = &[
     "tool_name",
 ];
 
+/// PUNTO UNICO (regola L) del "target leggibile" di un tool per la narrazione:
+/// primo campo presente (stringa non vuota) tra [`META_TARGET_KEYS`] negli
+/// argomenti del tool, troncato a 80 char (77 + "..."). `None` se nessun campo
+/// candidato e' presente. Usato da `tool_executed_meta_step` (narrazione tool
+/// del run corrente) e dal ponte narrazione sub-agente in mcp-core.
+pub fn tool_target_from_input(input: &Value) -> Option<String> {
+    let obj = input.as_object()?;
+    META_TARGET_KEYS.iter().find_map(|k| {
+        obj.get(*k)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                if v.chars().count() <= 80 {
+                    v.to_string()
+                } else {
+                    let head: String = v.chars().take(77).collect();
+                    format!("{head}...")
+                }
+            })
+    })
+}
+
 /// Costruisce il `MetaStep` `kind="tool_executed"` per UN tool del turno (live UX
 /// progressiva, PORTA il `meta_steps.make(kind="tool_executed", ...)` Python,
 /// `__init__.py:4087-4114`). PURO (nessun side-effect): il nodo lo accumula nel
@@ -982,27 +1004,11 @@ fn tool_executed_meta_step(
 ) -> MetaStep {
     let tool = block.get("name").and_then(Value::as_str).unwrap_or("?");
     let tool_use_id = block.get("id").and_then(Value::as_str);
-    // target: primo campo presente (stringa non vuota) tra META_TARGET_KEYS,
-    // troncato a 80 char (77 + "..."), 1:1 col Python.
+    // target: punto unico `tool_target_from_input` (primo campo presente tra
+    // META_TARGET_KEYS, troncato a 80 char), 1:1 col Python.
     let target = block
         .get("input")
-        .and_then(Value::as_object)
-        .and_then(|input| {
-            META_TARGET_KEYS.iter().find_map(|k| {
-                input
-                    .get(*k)
-                    .and_then(Value::as_str)
-                    .filter(|v| !v.is_empty())
-                    .map(|v| {
-                        if v.chars().count() <= 80 {
-                            v.to_string()
-                        } else {
-                            let head: String = v.chars().take(77).collect();
-                            format!("{head}...")
-                        }
-                    })
-            })
-        })
+        .and_then(tool_target_from_input)
         .unwrap_or_default();
     let title = {
         let kind_word = if is_error { "errore" } else { "tool" };
