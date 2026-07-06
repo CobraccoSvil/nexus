@@ -391,6 +391,27 @@ pub struct NativeRunOutcome {
     /// (distinto da `Completed`/`CompletedVerified`). `None` = gate non entrato o
     /// verifica eseguita. Segnale strutturato (regola M).
     pub final_gate_unverified: Option<bool>,
+    /// `true` quando l'ULTIMO verdetto del final gate e' una BOCCIATURA con
+    /// correzione rimandata all'executor e la ri-verifica non e' mai avvenuta,
+    /// con il run chiuso in modo anomalo TRA il gate fallito e il gate
+    /// successivo (es. provider esauriti che bruciano i turni fino al cap
+    /// iterazioni, run a5db0985).
+    ///
+    /// Derivazione (regola M, due segnali strutturati dello stato):
+    /// `final_gate_cycle > 0` AND `!plan_phase_active`.
+    /// - `final_gate_cycle > 0`: il gate azzera il ciclo a 0 su OGNI chiusura
+    ///   (ramo passed E ramo forced/cap), quindi solo il ramo di bocciatura
+    ///   intermedia lascia un ciclo > 0; un residuo a fine run implica che il
+    ///   giro di gate successivo non c'e' mai stato.
+    /// - `!plan_phase_active`: SOLO fuori dalla plan-phase un ciclo > 0 residuo
+    ///   equivale a "morto prima della ri-verifica". In plan-phase il gate e'
+    ///   raggiunto UNA volta da `route_after_todo_runner` e dopo la bocciatura
+    ///   il loop executor non vi rientra mai (`final_gate_eligible` esclude
+    ///   `plan_phase`), quindi un ciclo > 0 e' il normale esito di una
+    ///   chiusura LEGITTIMA e NON va declassato (falso positivo, review).
+    ///
+    /// Letto dal finalizzatore: mai `Completed` con una bocciatura pendente.
+    pub final_gate_failed_pending: bool,
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -1816,6 +1837,11 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
         final_gate_passed: state.final_gate_passed,
         final_gate_unverified: state.final_gate_unverified,
+        // Bocciatura del gate rimasta pendente a fine run (dettaglio in
+        // NativeRunOutcome::final_gate_failed_pending). Gated su !plan_phase:
+        // in plan-phase il gate e' one-shot e un ciclo residuo e' legittimo.
+        final_gate_failed_pending: state.final_gate_cycle.unwrap_or(0) > 0
+            && !state.plan_phase_active.unwrap_or(false),
     }
 }
 
@@ -2457,6 +2483,57 @@ mod tests {
         assert!(!out.completed);
         // resume_at e' la label del nodo da cui riprendere (HITL).
         assert_eq!(out.resume_at.as_deref(), Some(NodeId::Executor.as_label()));
+    }
+
+    /// REGRESSIONE run a5db0985: run morto TRA il final_gate fallito (ciclo
+    /// intermedio: `final_gate_cycle > 0`, correzione rimandata all'executor) e
+    /// la ri-verifica (provider esauriti fino al cap iterazioni). Il segnale
+    /// strutturato della bocciatura pendente deve arrivare al finalizzatore,
+    /// non morire nello stato del grafo.
+    #[test]
+    fn map_outcome_final_gate_bocciato_in_sospeso() {
+        // Fuori dalla plan-phase (a5db0985): ciclo residuo > 0 -> pendente.
+        let state = AgentState {
+            final_gate_cycle: Some(1),
+            ..Default::default()
+        };
+        assert!(map_outcome(StepOutcome::Completed(state)).final_gate_failed_pending);
+        // Gate mai entrato (None): nessuna bocciatura in sospeso.
+        let state = AgentState::default();
+        assert!(!map_outcome(StepOutcome::Completed(state)).final_gate_failed_pending);
+        // Gate CHIUSO (passed o forced azzerano il ciclo a 0): nessun sospeso.
+        let state = AgentState {
+            final_gate_cycle: Some(0),
+            final_gate_passed: Some(true),
+            ..Default::default()
+        };
+        assert!(!map_outcome(StepOutcome::Completed(state)).final_gate_failed_pending);
+    }
+
+    /// REGRESSIONE (review adversariale, falso positivo): in plan-phase il final
+    /// gate e' raggiunto UNA volta da `route_after_todo_runner` e, dopo una
+    /// bocciatura, il loop executor NON vi rientra mai (`final_gate_eligible`
+    /// esclude plan_phase). Un `final_gate_cycle > 0` residuo e' quindi il
+    /// normale esito di una chiusura LEGITTIMA e NON va declassato: il gating su
+    /// `!plan_phase_active` deve sopprimere il segnale.
+    #[test]
+    fn map_outcome_final_gate_ciclo_residuo_in_plan_phase_non_pendente() {
+        let state = AgentState {
+            final_gate_cycle: Some(1),
+            plan_phase_active: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            !map_outcome(StepOutcome::Completed(state)).final_gate_failed_pending,
+            "in plan-phase un ciclo residuo e' legittimo, non una bocciatura pendente"
+        );
+        // Contro-prova: stesso ciclo residuo, ma plan_phase disattiva -> pendente.
+        let state = AgentState {
+            final_gate_cycle: Some(1),
+            plan_phase_active: Some(false),
+            ..Default::default()
+        };
+        assert!(map_outcome(StepOutcome::Completed(state)).final_gate_failed_pending);
     }
 
     /// REGRESSIONE (porting Python->Rust): `load_executor_config` aveva smesso di

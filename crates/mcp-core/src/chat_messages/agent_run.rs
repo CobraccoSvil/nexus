@@ -1343,6 +1343,15 @@ async fn native_outcome_to_run_result(
         // verifica e' fallita. Difesa in profondita' rispetto a `forced_close`:
         // il cap del final_gate NON imposta forced_close_unverified.
         AgentRunStatus::FailedDiagnosed
+    } else if outcome.final_gate_failed_pending {
+        // L'ULTIMO verdetto del final_gate e' una BOCCIATURA di ciclo intermedio
+        // (correzione rimandata all'executor) e il run e' morto PRIMA della
+        // ri-verifica — es. provider esauriti che bruciano i turni fino al cap
+        // iterazioni (run a5db0985: gate 1/2 fallito, regressione introdotta in
+        // correzione, gate 2/2 mai eseguito, chiusura 'completed' bugiarda). Il
+        // lavoro post-bocciatura non e' mai stato verificato e l'ultimo esito
+        // oggettivo noto e' un fallimento: mai `Completed` (regola M).
+        AgentRunStatus::FailedDiagnosed
     } else if outcome.final_gate_unverified == Some(true) {
         // Lavoro SVOLTO ma verifica tecnica NON eseguita (gate entrato senza
         // profilo di verifica dell'ambiente): esito ONESTO distinto da un
@@ -1388,6 +1397,17 @@ async fn native_outcome_to_run_result(
              raggiunto): i criteri di verifica del progetto non sono passati, quindi \
              il task potrebbe non essere completo. Controlla i criteri falliti nella \
              timeline \"Decisioni del turno\" e riverifica il flusso reale prima di \
+             considerarlo concluso."
+        )),
+        // Bocciatura del gate in sospeso (run morto prima della ri-verifica, es.
+        // provider esauriti): l'ultima verifica ESEGUITA era fallita e le
+        // correzioni successive non sono mai state ri-verificate (run a5db0985).
+        (Some(ans), _, _) if outcome.final_gate_failed_pending => Some(format!(
+            "{ans}\n\n---\n**Verifica automatica fallita e non ripetuta**: l'ultima \
+             verifica dei criteri del progetto era FALLITA e il run si e' chiuso \
+             prima di poter ri-verificare le correzioni. Il task NON risulta \
+             verificato e puo' contenere regressioni: controlla i criteri falliti \
+             nella timeline \"Decisioni del turno\" e riesegui la verifica prima di \
              considerarlo concluso."
         )),
         // Lavoro svolto ma verifica tecnica NON eseguita (profilo di verifica
@@ -4721,6 +4741,7 @@ mod tests_select_engine {
             forced_close_unverified: false,
             final_gate_passed: None,
             final_gate_unverified: None,
+            final_gate_failed_pending: false,
         }
     }
 
@@ -4870,6 +4891,79 @@ mod tests_select_engine {
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::Completed);
         assert_eq!(r.final_answer.as_deref(), Some("fatto"));
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_final_gate_bocciato_mai_riverificato(pool: sqlx::PgPool) {
+        // REGRESSIONE run a5db0985: final_gate 1/2 FALLITO -> correzione in volo
+        // (che introduce una regressione) -> provider esauriti bruciano i turni
+        // fino al cap iterazioni -> chiusura SENZA gate 2/2. L'ultimo verdetto
+        // oggettivo e' una bocciatura: mai 'completed' (esito bugiardo), sempre
+        // FailedDiagnosed dal segnale strutturato (regola M).
+        create_steps_tables(&pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+
+        // Chiusura muta (la nota cooldown viene composta a valle): lo status
+        // deve comunque essere onesto.
+        let mut o = outcome_base();
+        o.final_answer = None;
+        o.final_gate_passed = None; // gate 2/2 mai eseguito
+        o.final_gate_failed_pending = true;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
+
+        // Con resoconto presente: status onesto + annotazione della bocciatura.
+        let mut o = outcome_base();
+        o.final_answer = Some("Correzioni applicate.".to_string());
+        o.final_gate_failed_pending = true;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
+        let ans = r.final_answer.expect("resoconto presente");
+        assert!(ans.starts_with("Correzioni applicate."));
+        assert!(
+            ans.contains("Verifica automatica fallita e non ripetuta"),
+            "annotazione onesta attesa sul resoconto: {ans}"
+        );
+
+        // La dichiarazione onesta `blocked` resta piu' specifica del segnale
+        // di bocciatura pendente (stessa precedenza del forced_close).
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = true;
+        o.declared_outcome = Some(serde_json::json!({
+            "outcome": "blocked", "summary": "fermo", "blocker": "credential"
+        }));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
+
+        // PRECEDENZA vs StopReason::Error: un errore infrastrutturale sopraggiunto
+        // DOPO la bocciatura del gate deve dare Failed (percorso retry/diagnosi),
+        // mai FailedDiagnosed. Blinda l'ordine della catena col campo nuovo attivo.
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = true;
+        o.stop_reason = Some(StopReason::Error);
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Failed);
+
+        // PRECEDENZA vs AwaitingConfirmation: un run sospeso per HITL con una
+        // bocciatura pendente resta AwaitingConfirmation (riprendera'), mai
+        // declassato a FailedDiagnosed.
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = true;
+        o.completed = false;
+        o.resume_at = Some("executor".to_string());
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::AwaitingConfirmation);
+
+        // Contro-prova: senza bocciatura pendente il comportamento e' invariato.
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = false;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
     }
 
     #[sqlx::test]
