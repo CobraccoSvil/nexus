@@ -19,6 +19,21 @@ use crate::types::{
 /// elemento e' un chunk valido oppure un errore di trasporto/parsing.
 pub type ChunkStream = BoxStream<'static, anyhow::Result<LlmStreamChunk>>;
 
+/// Metadati di un modello esposti dall'API di listing del provider.
+///
+/// `context_window` e' la finestra di contesto DICHIARATA DAL PROVIDER
+/// (es. `max_context_length` nel dialetto Mistral): `None` quando l'API non la
+/// espone. Mai inventata a valle (regola H: il catalogo scrive 0 = ignota,
+/// non un placeholder): l'incidente sub-agente 2026-07-06 nasce da un default
+/// schema 8192 preso per finestra reale dal predictive cap.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelMeta {
+    /// Id canonico del modello (es. "mistral-medium-3").
+    pub id: String,
+    /// Finestra di contesto in token dichiarata dal provider, se esposta.
+    pub context_window: Option<i64>,
+}
+
 /// Contratto di un provider LLM. `Send + Sync` perche' i provider vengono
 /// condivisi tra task tokio dietro `Arc`.
 #[async_trait]
@@ -59,6 +74,26 @@ pub trait LlmProvider: Send + Sync {
     /// rete/auth ritorna `Err` (il chiamante aggrega best-effort).
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         Ok(vec![])
+    }
+
+    /// Autodiscovery live CON METADATI ([`ModelMeta`]): id + finestra di
+    /// contesto dichiarata dal provider quando l'API la espone.
+    ///
+    /// Default impl: delega a [`Self::list_models`] con `context_window=None`
+    /// (il provider non dichiara la finestra nel suo listing). I provider il cui
+    /// dialetto la espone (es. Mistral `max_context_length`) sovrascrivono.
+    /// Punto unico a valle: il catalog sync scrive la finestra SOLO se
+    /// dichiarata, altrimenti 0 = ignota (regola G/H, mai placeholder).
+    async fn list_models_meta(&self) -> anyhow::Result<Vec<ModelMeta>> {
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(|id| ModelMeta {
+                id,
+                context_window: None,
+            })
+            .collect())
     }
 
     /// Se il provider supporta la generazione di immagini (text-to-image).

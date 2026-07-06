@@ -1040,10 +1040,22 @@ async fn sync_provider(
     // Fetch modelli live dal gateway (via UNICA per la discovery: il gateway
     // incapsula l'auth di ogni provider, Vertex Service Account incluso, quindi
     // non servono api_key qui ne' la delega al brain per Google — regola L).
-    let api_models = fetch_provider_models(orchestrator, provider).await?;
-    if api_models.is_empty() {
+    let api_metas = fetch_provider_models(orchestrator, provider).await?;
+    if api_metas.is_empty() {
         anyhow::bail!("gateway ha ritornato lista vuota (sospetto, skip per safety)");
     }
+    // Finestra di contesto DICHIARATA dal provider per modello (quando l'API la
+    // espone, es. Mistral max_context_length). Fonte per scrivere il valore
+    // REALE nel catalog: mai inventarne uno (regola H, incidente 2026-07-06:
+    // il default schema 8192 preso per finestra vera paralizzava i sub-run).
+    let mut declared_windows: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    for m in &api_metas {
+        if let Some(w) = m.context_window.filter(|w| *w > 0) {
+            declared_windows.insert(m.id.clone(), w);
+        }
+    }
+    let api_models: Vec<String> = api_metas.into_iter().map(|m| m.id).collect();
 
     // Carica modelli del catalog locale per questo provider.
     // Il flag `manual_locked` viene letto da `auto_disabled_reason LIKE 'manual:%'`
@@ -1113,16 +1125,21 @@ async fn sync_provider(
             continue;
         }
 
+        let declared_window = declared_windows.get(api_model.as_str()).copied();
         match catalog_models.get(api_model) {
             None => {
                 if insert_new_disabled
-                    && insert_new_chat_model(db, orchestrator, provider, api_model).await
+                    && insert_new_chat_model(db, orchestrator, provider, api_model, declared_window)
+                        .await
                 {
                     inserted += 1;
                 }
             }
             Some(&(is_enabled, manual_locked)) => {
                 tier_realigned += realign_existing_model(db, provider, api_model).await;
+                // Finestra dichiarata dal provider: riallinea il catalog al
+                // valore REALE (self-healing dei placeholder, regola H).
+                realign_context_window(db, provider, api_model, declared_window).await;
                 if reenable_existing_model(db, provider, api_model, is_enabled, manual_locked).await
                 {
                     reenabled += 1;
@@ -1320,6 +1337,15 @@ async fn disable_missing_models(
     disabled
 }
 
+/// Valore di `context_window` da scrivere nel catalog (regola H): quello
+/// DICHIARATO dal provider quando l'API lo espone, altrimenti 0 = finestra
+/// IGNOTA (i gate che la usano si disattivano su 0). Mai un placeholder
+/// spacciato per reale: il default schema 8192 (mig 0032) paralizzava i run
+/// via predictive cap (incidente sub-agente 2026-07-06).
+fn catalog_window_value(declared: Option<i64>) -> i32 {
+    declared.filter(|w| *w > 0).unwrap_or(0) as i32
+}
+
 /// INSERT di un nuovo modello CHAT scoperto via API discovery (default sicuro
 /// is_enabled=false) + probe-on-insert. Estratta dal ramo `None` di
 /// `sync_provider` senza cambi di comportamento. Ritorna `true` se la riga e'
@@ -1329,54 +1355,67 @@ async fn disable_missing_models(
 /// modello gratuito (regola H, mig 0477). performance_tier inferito dal nome
 /// (non il default 'medium' dello schema): evita che i modelli piccoli entrino
 /// come 'medium' nel pool agentico (infer_tier_from_name + mig 0354).
+/// `context_window` esplicito via [`catalog_window_value`].
 async fn insert_new_chat_model(
     db: &PgPool,
     orchestrator: Option<&Orchestrator>,
     provider: &str,
     api_model: &str,
+    declared_window: Option<i64>,
 ) -> bool {
     let inferred_tier = infer_tier_from_name(provider, api_model);
+    let context_window = catalog_window_value(declared_window);
     let res = sqlx::query(
         "INSERT INTO ai_price_catalog \
          (provider, model, display_name, input_cost_per_million_tokens, \
-          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, pricing_state, effective_from) \
-         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, 'unknown', NOW()) \
+          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, pricing_state, context_window, effective_from) \
+         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, 'unknown', $5, NOW()) \
          ON CONFLICT (provider, model) DO NOTHING",
     )
     .bind(provider)
     .bind(api_model)
     .bind(api_model)
     .bind(inferred_tier)
+    .bind(context_window)
     .execute(db)
     .await;
-    if let Ok(r) = res {
-        if r.rows_affected() > 0 {
-            audit_log(
-                db,
-                provider,
-                api_model,
-                "inserted",
-                json!({"source":"api_discovery"}),
-            )
-            .await;
-            tracing::info!(
-                "catalog_sync[{}]: + nuovo modello rilevato '{}'",
-                provider,
-                api_model
-            );
-            // Probe-on-insert: subito dopo l'INSERT (modello e' is_enabled=false di
-            // default), prova una chiamata di test al provider. Se passa, abilita;
-            // se fallisce con model_not_found/hollow, marca esplicitamente il motivo
-            // cosi' l'admin sa che NON va abilitato manualmente. Cosi' i modelli
-            // "fantasma" (es. la famiglia gemini-3.x al 05/2026) non possono mai
-            // entrare enabled via auto-discovery.
-            if let Some(orch) = orchestrator {
-                probe_new_model_on_insert(db, orch, provider, api_model).await;
-            }
-            return true;
+    match res {
+        Ok(r) if r.rows_affected() > 0 => {
+            on_chat_model_inserted(db, orchestrator, provider, api_model).await;
+            true
         }
+        _ => false,
     }
-    false
+}
+
+/// Coda dell'INSERT riuscito di un modello chat: audit + log + probe-on-insert.
+/// Il probe prova subito una chiamata di test al provider (il modello e'
+/// is_enabled=false di default): se passa, abilita; se fallisce con
+/// model_not_found/hollow, marca esplicitamente il motivo cosi' l'admin sa che
+/// NON va abilitato manualmente. Cosi' i modelli "fantasma" (es. la famiglia
+/// gemini-3.x al 05/2026) non possono mai entrare enabled via auto-discovery.
+async fn on_chat_model_inserted(
+    db: &PgPool,
+    orchestrator: Option<&Orchestrator>,
+    provider: &str,
+    api_model: &str,
+) {
+    audit_log(
+        db,
+        provider,
+        api_model,
+        "inserted",
+        json!({"source":"api_discovery"}),
+    )
+    .await;
+    tracing::info!(
+        "catalog_sync[{}]: + nuovo modello rilevato '{}'",
+        provider,
+        api_model
+    );
+    if let Some(orch) = orchestrator {
+        probe_new_model_on_insert(db, orch, provider, api_model).await;
+    }
 }
 
 /// Riallinea `supports_vision` e `performance_tier` di un modello GIA' presente
@@ -1428,6 +1467,53 @@ async fn realign_existing_model(db: &PgPool, provider: &str, api_model: &str) ->
         }
     }
     0
+}
+
+/// Riallinea `context_window` di un modello GIA' nel catalog al valore
+/// DICHIARATO dal provider nella discovery (es. Mistral `max_context_length`).
+///
+/// Self-healing dei placeholder (regola H, incidente sub-agente 2026-07-06: il
+/// default schema 8192 preso per finestra reale faceva bloccare OGNI tool dal
+/// predictive cap): la fonte autoritativa della finestra e' il provider stesso;
+/// quando la dichiara, il catalog converge senza patch manuali. `None`/<=0 =
+/// non dichiarata -> nessun tocco (il valore esistente, anche 0 = ignota,
+/// resta). UPDATE mirato (solo se differisce) + audit.
+async fn realign_context_window(
+    db: &PgPool,
+    provider: &str,
+    api_model: &str,
+    declared_window: Option<i64>,
+) {
+    let Some(window) = declared_window.filter(|w| *w > 0) else {
+        return;
+    };
+    let res = sqlx::query(
+        "UPDATE ai_price_catalog SET context_window = $3, updated_at = NOW() \
+         WHERE provider = $1 AND model = $2 AND context_window IS DISTINCT FROM $3",
+    )
+    .bind(provider)
+    .bind(api_model)
+    .bind(window as i32)
+    .execute(db)
+    .await;
+    let realigned = matches!(res, Ok(r) if r.rows_affected() > 0);
+    if !realigned {
+        return;
+    }
+    tracing::info!(
+        "catalog_sync[{}]: context_window riallineato '{}' -> {} (dichiarato dal provider)",
+        provider,
+        api_model,
+        window
+    );
+    audit_log(
+        db,
+        provider,
+        api_model,
+        "context_window_realigned",
+        json!({"context_window": window, "source": "provider_declared"}),
+    )
+    .await;
 }
 
 /// Re-enable di un modello GIA' presente disabilitato ma ricomparso nell'API,
@@ -1727,7 +1813,7 @@ async fn audit_log(db: &PgPool, provider: &str, model: &str, action: &str, detai
 async fn fetch_provider_models(
     orchestrator: Option<&Orchestrator>,
     provider: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<crate::nexus_gateway::GwModelMeta>> {
     let gateway = orchestrator
         .and_then(|orch| orch.nexus_gateway.as_ref())
         .ok_or_else(|| {

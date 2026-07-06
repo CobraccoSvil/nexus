@@ -57,6 +57,8 @@ const K_SUMMARY: &str = "summary";
 const K_TIMEOUT_S: &str = "timeout_s";
 const K_TARGET: &str = "target";
 const K_IS_ERROR: &str = "is_error";
+const K_PROVIDER: &str = "provider";
+const K_MODEL: &str = "model";
 
 /// Soglie sub-agent lette dal DB (regola G). I default coincidono coi default del
 /// brain (`orchestrator_config` + mig 0153): safe-default se la chiave manca, MAI
@@ -809,19 +811,28 @@ async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
 
 /// Compositore della narrazione sul run PADRE: sink SSE + store meta-step del
 /// run invocante. `say` delega al punto unico `emit_phase_meta_correlated`.
+/// Porta anche il PIN provider/model del sub-run (risolto dal model_purpose al
+/// dispatch, vuoto = routing di default): ogni meta `subagent_*` lo espone nel
+/// payload via [`ParentNarrator::with_pin`], cosi' il nastro frontend attribuisce
+/// ai blocchi del figlio la SUA provenienza (non quella del padre).
 struct ParentNarrator {
     sink: crate::agent_graph_adapter::event_sink::SseEventSinkAdapter,
     store: crate::agent_graph_adapter::meta_step_store::PgMetaStepStore,
+    pin_provider: String,
+    pin_model: String,
 }
 
 impl ParentNarrator {
     /// Costruisce il narratore per il run invocante. `None` se la narrazione e'
     /// disabilitata (setting) o il ctx non porta il canale (tool invocato fuori
     /// dal grafo nativo): il dispatch degrada al comportamento muto storico.
+    /// `provider`/`model`: pin del sub-run quando risolto (vuoto = omesso).
     fn from_ctx(
         ctx: &AgentToolContext,
         proj_pool: &sqlx::PgPool,
         enabled: bool,
+        provider: &str,
+        model: &str,
     ) -> Option<std::sync::Arc<Self>> {
         if !enabled {
             return None;
@@ -838,7 +849,17 @@ impl ParentNarrator {
                 proj_pool.clone(),
                 pn.run_id,
             ),
+            pin_provider: provider.to_string(),
+            pin_model: model.to_string(),
         }))
+    }
+
+    /// Arricchisce un payload `subagent_*` col pin provider/model del figlio
+    /// (punto unico, delega a [`put_model_fields`]): campi presenti SOLO quando
+    /// il pin e' risolto, mai inventati (il frontend degrada a '?').
+    fn with_pin(&self, mut payload: Value) -> Value {
+        put_model_fields(&mut payload, &self.pin_provider, &self.pin_model);
+        payload
     }
 
     /// Emette (live) + persiste (storico) UN meta-step della narrazione,
@@ -877,7 +898,8 @@ impl ParentNarrator {
         let target = targets.remove(&idx);
         let (title, payload) =
             tool_progress_meta(sub_kind, sub_run_id, &tool, target.as_deref(), is_error);
-        self.say("subagent_progress", title, payload, sub_run_id).await;
+        self.say("subagent_progress", title, self.with_pin(payload), sub_run_id)
+            .await;
         true
     }
 
@@ -897,15 +919,31 @@ impl ParentNarrator {
         self.say(
             "subagent_progress",
             format!("Subagente {sub_kind}: al lavoro da {elapsed}s"),
-            json!({
+            self.with_pin(json!({
                 "phase": "working",
                 "elapsed_s": elapsed,
                 K_SUB_RUN_ID: sub_run_id.to_string(),
                 K_SUB_KIND: sub_kind,
-            }),
+            })),
             sub_run_id,
         )
         .await;
+    }
+}
+
+/// Arricchisce il payload di un meta `subagent_*` con provider/model del
+/// figlio QUANDO NOTI (risoluzione dal model_purpose al dispatch; stringa
+/// vuota = routing di default nel motore -> campo omesso, mai inventato).
+/// PURA: il frontend (icona provenienza del nastro) legge questi campi.
+fn put_model_fields(payload: &mut Value, provider: &str, model: &str) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    if !provider.trim().is_empty() {
+        obj.insert(K_PROVIDER.into(), json!(provider));
+    }
+    if !model.trim().is_empty() {
+        obj.insert(K_MODEL.into(), json!(model));
     }
 }
 
@@ -1142,23 +1180,45 @@ async fn run_single_subagent(
         Err(e) => return json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")}),
     };
 
+    // ── Riga agent_runs del SUB-run (osservabilita', regola M) ────────────────
+    // Il sub-run gira sul grafo nativo con run_id=subagent_run_id ma non aveva
+    // alcuna riga in agent_runs: il guard "untracked_run" di PgAgentStepStore
+    // scartava in SILENZIO ogni tool_result del figlio (agent_steps vuoto ->
+    // errori dei tool illeggibili, incidente 2026-07-06). La riga rende il
+    // figlio un run TRACCIATO: step (input+result+esito) persistiti e
+    // ispezionabili. `nexus_agent_type='subagent'` e' il discriminatore per le
+    // query UI top-level (active-run, timeline, guard 409); `parent_run_id` e'
+    // valorizzato solo se l'ancora e' un run tracciato (FK su agent_runs).
+    ensure_child_agent_run(
+        &proj_pool,
+        subagent_run_id,
+        session_id,
+        project_id,
+        ctx.core.user_id,
+        anchor,
+        &provider,
+        &model,
+    )
+    .await;
+
     // ── NARRAZIONE sul run PADRE (ADR 0037): avvio ────────────────────────────
     // Il dispatch e' bloccante e puo' durare minuti: senza questi meta-step la
     // chat resta muta e il run padre sembra bloccato mentre il figlio lavora.
-    let narrator = ParentNarrator::from_ctx(ctx, &proj_pool, settings.narration_enabled);
+    let narrator =
+        ParentNarrator::from_ctx(ctx, &proj_pool, settings.narration_enabled, &provider, &model);
     if let Some(n) = &narrator {
         let task_head: String = task.trim().chars().take(160).collect();
         n.say(
             "subagent_started",
             format!("Subagente {kind} avviato — {task_head}"),
-            json!({
+            n.with_pin(json!({
                 K_SUB_RUN_ID: subagent_run_id.to_string(),
                 K_SUB_KIND: kind,
                 "task": task_head,
                 "depth": current_depth,
                 K_TIMEOUT_S: timeout_s,
                 "isolated": isolation.is_some(),
-            }),
+            })),
             subagent_run_id,
         )
         .await;
@@ -1334,17 +1394,22 @@ async fn finalize_timeout(
     kind: &str,
     timeout_s: i64,
 ) -> Value {
-    let _ = mark_run(pool, sub_run_id, "timeout", "[Sub-agent timeout]", 0, 0, 0, 0.0).await;
+    let _ = mark_run(
+        pool,
+        sub_run_id,
+        SubRunClosure::without_metrics("timeout", "[Sub-agent timeout]"),
+    )
+    .await;
     if let Some(n) = narrator {
         n.say(
             "subagent_failed",
             format!("Subagente {kind} in timeout dopo {timeout_s}s"),
-            json!({
+            n.with_pin(json!({
                 K_SUB_RUN_ID: sub_run_id.to_string(),
                 K_SUB_KIND: kind,
                 "status": "timeout",
                 K_TIMEOUT_S: timeout_s,
-            }),
+            })),
             sub_run_id,
         )
         .await;
@@ -1366,9 +1431,18 @@ async fn finalize_success(
     let summary = o.final_answer.clone().unwrap_or_default();
     let status = if o.completed { "completed" } else { "paused" };
     let _ = mark_run(
-        pool, sub_run_id, status, &summary,
-        o.iterations, o.prompt_tokens, o.completion_tokens, o.total_cost,
-    ).await;
+        pool,
+        sub_run_id,
+        SubRunClosure {
+            status,
+            summary: &summary,
+            iterations: o.iterations,
+            tokens_prompt: o.prompt_tokens,
+            tokens_completion: o.completion_tokens,
+            cost_usd: o.total_cost,
+        },
+    )
+    .await;
     tracing::info!(
         kind = %kind,
         subagent_run_id = %sub_run_id,
@@ -1383,14 +1457,14 @@ async fn finalize_success(
         n.say(
             "subagent_completed",
             format!("Subagente {kind} {esito} ({} iterazioni)", o.iterations),
-            json!({
+            n.with_pin(json!({
                 K_SUB_RUN_ID: sub_run_id.to_string(),
                 K_SUB_KIND: kind,
                 "status": status,
                 K_SUMMARY: compact_summary(&summary),
                 "iterations": o.iterations,
                 "cost_usd": o.total_cost,
-            }),
+            })),
             sub_run_id,
         )
         .await;
@@ -1415,7 +1489,7 @@ async fn finalize_failure(
     e: &anyhow::Error,
 ) -> Value {
     let msg = format!("[errore grafo nativo: {e}]");
-    let _ = mark_run(pool, sub_run_id, "failed", &msg, 0, 0, 0, 0.0).await;
+    let _ = mark_run(pool, sub_run_id, SubRunClosure::without_metrics("failed", &msg)).await;
     tracing::warn!(
         kind = %kind,
         subagent_run_id = %sub_run_id,
@@ -1426,12 +1500,12 @@ async fn finalize_failure(
         n.say(
             "subagent_failed",
             format!("Subagente {kind} fallito"),
-            json!({
+            n.with_pin(json!({
                 K_SUB_RUN_ID: sub_run_id.to_string(),
                 K_SUB_KIND: kind,
                 "status": "failed",
                 "error": compact_summary(&msg),
-            }),
+            })),
             sub_run_id,
         )
         .await;
@@ -1443,31 +1517,110 @@ async fn finalize_failure(
     })
 }
 
-/// Marca una sub-run come conclusa (status + summary + metriche). Best-effort.
+/// Crea la riga `agent_runs` del SUB-run (run TRACCIATO: senza, il guard
+/// "untracked_run" di `PgAgentStepStore` scarta in silenzio ogni step del
+/// figlio). `nexus_agent_type='subagent'` discrimina i sub-run nelle query UI
+/// top-level; `parent_run_id` e' impostato via subquery SOLO se l'ancora e' un
+/// run tracciato (FK verso agent_runs: l'ancora puo' essere la sessione).
+/// Best-effort ma LOGGATO forte: se fallisce, gli step del figlio non verranno
+/// persistiti (la stessa cecita' dell'incidente 2026-07-06).
 #[allow(clippy::too_many_arguments)]
-async fn mark_run(
+async fn ensure_child_agent_run(
     db: &sqlx::PgPool,
     run_id: Uuid,
-    status: &str,
-    summary: &str,
+    session_id: Uuid,
+    project_id: Uuid,
+    user_id: Uuid,
+    anchor: Uuid,
+    provider: &str,
+    model: &str,
+) {
+    let provider = (!provider.trim().is_empty()).then_some(provider);
+    let model = (!model.trim().is_empty()).then_some(model);
+    let res = sqlx::query(
+        r#"INSERT INTO agent_runs
+           (id, session_id, project_id, user_id, status, automation_mode,
+            provider, model, nexus_agent_type, parent_run_id)
+           VALUES ($1, $2, $3, $4, 'running', 'automatic', $5, $6, 'subagent',
+                   (SELECT id FROM agent_runs WHERE id = $7))
+           ON CONFLICT (id) DO NOTHING"#,
+    )
+    .bind(run_id)
+    .bind(session_id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(provider)
+    .bind(model)
+    .bind(anchor)
+    .execute(db)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(
+            target: "mcp_core::subagent_native",
+            subagent_run_id = %run_id,
+            error = %e,
+            "riga agent_runs del sub-run NON creata: gli step del figlio non saranno persistiti"
+        );
+    }
+}
+
+/// Esito di chiusura di un sub-run: status + summary + metriche, condiviso
+/// dalle due righe da chiudere (nexus_subagent_runs + gemella agent_runs).
+struct SubRunClosure<'a> {
+    status: &'a str,
+    summary: &'a str,
     iterations: i64,
     tokens_prompt: i64,
     tokens_completion: i64,
     cost_usd: f64,
+}
+
+impl<'a> SubRunClosure<'a> {
+    /// Chiusura senza metriche: il run e' morto prima di produrre usage
+    /// (timeout, errore del grafo) — contatori a zero.
+    fn without_metrics(status: &'a str, summary: &'a str) -> Self {
+        Self {
+            status,
+            summary,
+            iterations: 0,
+            tokens_prompt: 0,
+            tokens_completion: 0,
+            cost_usd: 0.0,
+        }
+    }
+}
+
+/// Marca una sub-run come conclusa su `nexus_subagent_runs` E chiude la riga
+/// gemella `agent_runs` del figlio, in UNA statement atomica (CTE): stessi
+/// bind per entrambe. La gemella esiste solo per i figli tracciati (la WHERE
+/// id limita l'effetto); stessi status (completed/paused/timeout/failed):
+/// `agent_runs.status` e' TEXT libero. Best-effort.
+async fn mark_run(
+    db: &sqlx::PgPool,
+    run_id: Uuid,
+    c: SubRunClosure<'_>,
 ) -> Result<(), sqlx::Error> {
+    let compact = c.summary.chars().take(4000).collect::<String>();
     sqlx::query(
-        "UPDATE nexus_subagent_runs SET
-            status = $1, final_summary = $2, iterations = $3,
-            tokens_prompt = $4, tokens_completion = $5, cost_usd = $6,
-            completed_at = NOW()
+        "WITH sub AS (
+            UPDATE nexus_subagent_runs SET
+                status = $1, final_summary = $2, iterations = $3,
+                tokens_prompt = $4, tokens_completion = $5, cost_usd = $6,
+                completed_at = NOW()
+             WHERE id = $7
+        )
+        UPDATE agent_runs SET
+            status = $1, final_answer = $2, iteration_count = $3,
+            prompt_tokens = $4, completion_tokens = $5,
+            total_tokens = $4 + $5, total_cost = $6, completed_at = NOW()
          WHERE id = $7",
     )
-    .bind(status)
-    .bind(summary.chars().take(4000).collect::<String>())
-    .bind(iterations as i32)
-    .bind(tokens_prompt as i32)
-    .bind(tokens_completion as i32)
-    .bind(cost_usd)
+    .bind(c.status)
+    .bind(&compact)
+    .bind(c.iterations as i32)
+    .bind(c.tokens_prompt as i32)
+    .bind(c.tokens_completion as i32)
+    .bind(c.cost_usd)
     .bind(run_id)
     .execute(db)
     .await
@@ -1917,5 +2070,197 @@ mod tests {
             fetch_worktree_cols(&pool, iso_id).await,
             (Some(slot.worktree_path.to_string_lossy().to_string()), Some(slot.base_commit)),
         );
+    }
+
+    /// Il pin provider/model entra nel payload SOLO quando risolto; vuoto =
+    /// campo omesso (il nastro frontend degrada a '?', mai valori inventati).
+    #[test]
+    fn put_model_fields_solo_quando_risolto() {
+        let mut payload = json!({"phase": "tool"});
+        put_model_fields(&mut payload, "mistral", "mistral-medium-3");
+        assert_eq!(payload[K_PROVIDER], json!("mistral"));
+        assert_eq!(payload[K_MODEL], json!("mistral-medium-3"));
+
+        let mut vuoto = json!({"phase": "tool"});
+        put_model_fields(&mut vuoto, "", "  ");
+        assert!(vuoto.get(K_PROVIDER).is_none(), "pin non risolto: campo omesso");
+        assert!(vuoto.get(K_MODEL).is_none());
+    }
+
+    /// Schema minimo per i test del run TRACCIATO del figlio (senza FK di
+    /// sessione: qui interessa il contratto insert/close, non lo schema pieno).
+    async fn create_child_run_tables(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE agent_runs ( \
+                 id UUID PRIMARY KEY, \
+                 session_id UUID NOT NULL, \
+                 project_id UUID NOT NULL, \
+                 user_id UUID NOT NULL, \
+                 status TEXT NOT NULL DEFAULT 'running', \
+                 automation_mode TEXT NOT NULL DEFAULT 'confirm', \
+                 provider TEXT, \
+                 model TEXT, \
+                 nexus_agent_type TEXT, \
+                 parent_run_id UUID REFERENCES agent_runs(id) ON DELETE SET NULL, \
+                 iteration_count INT NOT NULL DEFAULT 0, \
+                 final_answer TEXT, \
+                 prompt_tokens INT NOT NULL DEFAULT 0, \
+                 completion_tokens INT NOT NULL DEFAULT 0, \
+                 total_tokens INT NOT NULL DEFAULT 0, \
+                 total_cost DOUBLE PRECISION NOT NULL DEFAULT 0, \
+                 completed_at TIMESTAMPTZ, \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
+        )
+        .execute(pool)
+        .await
+        .expect("create agent_runs");
+        sqlx::query(
+            "CREATE TABLE nexus_subagent_runs ( \
+                 id UUID PRIMARY KEY, \
+                 status TEXT NOT NULL DEFAULT 'running', \
+                 final_summary TEXT, \
+                 iterations INT NOT NULL DEFAULT 0, \
+                 tokens_prompt INT NOT NULL DEFAULT 0, \
+                 tokens_completion INT NOT NULL DEFAULT 0, \
+                 cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0, \
+                 completed_at TIMESTAMPTZ )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_subagent_runs (chiusura)");
+    }
+
+    /// Helper: crea il run TRACCIATO del figlio con ids freschi (punto unico
+    /// dei call-site di test, evita blocchi duplicati).
+    async fn ensure_child(
+        pool: &sqlx::PgPool,
+        child: Uuid,
+        anchor: Uuid,
+        provider: &str,
+        model: &str,
+    ) {
+        ensure_child_agent_run(
+            pool,
+            child,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            anchor,
+            provider,
+            model,
+        )
+        .await;
+    }
+
+    /// Il sub-run diventa un run TRACCIATO (riga agent_runs marcata
+    /// 'subagent'): senza, il guard untracked_run dello step store scartava in
+    /// silenzio ogni tool_result del figlio (incidente 2026-07-06). L'ancora
+    /// NON tracciata (sessione) NON deve violare la FK: parent_run_id resta
+    /// NULL via subquery.
+    #[sqlx::test]
+    async fn ensure_child_agent_run_traccia_il_figlio(pool: sqlx::PgPool) {
+        create_child_run_tables(&pool).await;
+        let child = Uuid::new_v4();
+        let anchor_non_tracciato = Uuid::new_v4(); // sessione: NON in agent_runs
+        ensure_child(&pool, child, anchor_non_tracciato, "mistral", "mistral-medium-3").await;
+        let row: (String, Option<String>, Option<Uuid>, Option<String>) = sqlx::query_as(
+            "SELECT status, nexus_agent_type, parent_run_id, model FROM agent_runs WHERE id = $1",
+        )
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("riga figlio presente");
+        assert_eq!(row.0, "running");
+        assert_eq!(row.1.as_deref(), Some("subagent"));
+        assert_eq!(row.2, None, "ancora non tracciata -> parent NULL (no FK rotta)");
+        assert_eq!(row.3.as_deref(), Some("mistral-medium-3"));
+
+        // Idempotente sul retry (ON CONFLICT DO NOTHING).
+        ensure_child(&pool, child, anchor_non_tracciato, "", "").await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE id = $1")
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    /// Con l'ancora TRACCIATA (run padre reale) parent_run_id viene valorizzato:
+    /// e' il collegamento padre<->figlio per audit e query.
+    #[sqlx::test]
+    async fn ensure_child_agent_run_collega_il_padre_tracciato(pool: sqlx::PgPool) {
+        create_child_run_tables(&pool).await;
+        let parent = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agent_runs (id, session_id, project_id, user_id) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(parent)
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("padre");
+        let child = Uuid::new_v4();
+        ensure_child(&pool, child, parent, "google", "gemini-2.5-flash").await;
+        let linked: Option<Uuid> =
+            sqlx::query_scalar("SELECT parent_run_id FROM agent_runs WHERE id = $1")
+                .bind(child)
+                .fetch_one(&pool)
+                .await
+                .expect("figlio");
+        assert_eq!(linked, Some(parent));
+    }
+
+    /// `mark_run` chiude ENTRAMBE le righe del figlio (nexus_subagent_runs +
+    /// gemella agent_runs) nella stessa statement, con status/metriche coerenti.
+    #[sqlx::test]
+    async fn mark_run_chiude_anche_la_riga_agent_runs(pool: sqlx::PgPool) {
+        create_child_run_tables(&pool).await;
+        let child = Uuid::new_v4();
+        sqlx::query("INSERT INTO nexus_subagent_runs (id) VALUES ($1)")
+            .bind(child)
+            .execute(&pool)
+            .await
+            .expect("sub-run");
+        ensure_child(&pool, child, Uuid::new_v4(), "mistral", "mistral-medium-3").await;
+        mark_run(
+            &pool,
+            child,
+            SubRunClosure {
+                status: "completed",
+                summary: "fatto",
+                iterations: 7,
+                tokens_prompt: 1000,
+                tokens_completion: 200,
+                cost_usd: 0.05,
+            },
+        )
+        .await
+        .expect("mark ok");
+        let sub: (String, Option<String>, i32) = sqlx::query_as(
+            "SELECT status, final_summary, iterations FROM nexus_subagent_runs WHERE id = $1",
+        )
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("sub");
+        assert_eq!(sub.0, "completed");
+        assert_eq!(sub.1.as_deref(), Some("fatto"));
+        assert_eq!(sub.2, 7);
+        let run: (String, Option<String>, i32, i32, bool) = sqlx::query_as(
+            "SELECT status, final_answer, iteration_count, total_tokens, \
+             completed_at IS NOT NULL FROM agent_runs WHERE id = $1",
+        )
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("run gemello");
+        assert_eq!(run.0, "completed");
+        assert_eq!(run.1.as_deref(), Some("fatto"));
+        assert_eq!(run.2, 7);
+        assert_eq!(run.3, 1200, "total = prompt + completion");
+        assert!(run.4, "completed_at valorizzato");
     }
 }

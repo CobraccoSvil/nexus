@@ -580,8 +580,16 @@ pub async fn models_for_provider(
         )
             .into_response();
     };
-    match p.list_models().await {
-        Ok(models) => Json(json!({ "provider": provider, "models": models })).into_response(),
+    match p.list_models_meta().await {
+        Ok(metas) => {
+            // Contratto retro-compatibile: `models` resta la lista di id;
+            // `models_meta` (additivo) porta la finestra dichiarata dal provider
+            // quando esposta (Mistral `max_context_length`), cosi' il catalog
+            // sync scrive il valore REALE invece di un placeholder (regola G/H).
+            let ids: Vec<&str> = metas.iter().map(|m| m.id.as_str()).collect();
+            Json(json!({ "provider": provider, "models": ids, "models_meta": metas }))
+                .into_response()
+        }
         Err(e) => {
             tracing::warn!(provider = %provider, "gateway: list_models singolo fallita");
             (

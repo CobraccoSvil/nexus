@@ -546,33 +546,84 @@ impl GoogleProvider {
     }
 
     /// Autodiscovery Gemini direct: `GET {base_url}/models?key=...` ->
-    /// `{ "models": [{ "name": "models/gemini-..." }] }`. Estratto da
-    /// [`list_models`](LlmProvider::list_models) (regola A) per contenerne la
-    /// lunghezza; la normalizzazione a basename delega al parser puro.
-    async fn list_gemini_models(&self) -> anyhow::Result<Vec<String>> {
-        let resp = self
-            .http
-            .get(format!("{}/models", self.base_url))
-            .query(&[("key", &self.api_key)])
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            // Errore strutturato anche sulla lista modelli (regola M): status +
-            // codice, mai testo da classificare.
-            let text = resp.text().await.unwrap_or_default();
-            return Err(
-                super::ProviderHttpError::from_response("google", status.as_u16(), text).into(),
-            );
+    /// `{ "models": [{ "name": "models/gemini-...", "inputTokenLimit": N }],
+    ///    "nextPageToken": "..." }`, seguendo la paginazione (senza `pageSize`
+    /// il default e' 50: sopra i 50 modelli il discovery troncava in silenzio).
+    /// Estratto da [`list_models_meta`](LlmProvider::list_models_meta)
+    /// (regola A). La Gemini API dichiara `inputTokenLimit` per ogni modello
+    /// nel listing; propagarlo come finestra di contesto permette al catalog
+    /// sync di scrivere il valore REALE invece di 0 = ignota (regola G/H: i
+    /// preview/gemma senza finestra nota vengono re-instradati dal pre-check
+    /// agentico).
+    async fn list_gemini_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
+        self.fetch_google_models_pages(
+            || {
+                self.http
+                    .get(format!("{}/models", self.base_url))
+                    .query(&[("key", self.api_key.as_str())])
+            },
+            "gemini",
+        )
+        .await
+    }
+
+    /// Loop di paginazione condiviso dai listing modelli Google (punto unico,
+    /// regola L: Gemini direct e Vertex differiscono solo per URL/auth della
+    /// singola pagina, costruita da `build_page_req` SENZA i parametri di
+    /// paginazione, aggiunti qui). Segue `nextPageToken` accumulando le pagine
+    /// parsate dal parser puro; su pagina non-2xx propaga l'errore STRUTTURATO
+    /// (regola M) senza ritornare liste parziali: sarebbe il troncamento
+    /// silenzioso che la paginazione elimina. Guard anti-loop: al tetto
+    /// `GOOGLE_MODELS_MAX_PAGES` logga WARN (mai troncamento muto).
+    async fn fetch_google_models_pages(
+        &self,
+        build_page_req: impl Fn() -> reqwest::RequestBuilder,
+        scope: &str,
+    ) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
+        let mut metas: Vec<crate::provider::ModelMeta> = Vec::new();
+        let mut page_token: Option<String> = None;
+        for page in 0..GOOGLE_MODELS_MAX_PAGES {
+            let mut req = build_page_req().query(&[("pageSize", GOOGLE_MODELS_PAGE_SIZE)]);
+            if let Some(tok) = page_token.as_deref() {
+                req = req.query(&[("pageToken", tok)]);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                // Errore strutturato anche sulla lista modelli (regola M): status +
+                // codice, mai testo da classificare.
+                let text = resp.text().await.unwrap_or_default();
+                return Err(
+                    super::ProviderHttpError::from_response("google", status.as_u16(), text)
+                        .into(),
+                );
+            }
+            let body: serde_json::Value = resp.json().await?;
+            metas.extend(parse_google_models_meta_response(&body));
+            page_token = next_google_page_token(&body);
+            if page_token.is_none() {
+                break;
+            }
+            if page + 1 == GOOGLE_MODELS_MAX_PAGES {
+                tracing::warn!(
+                    scope = %scope,
+                    pages = GOOGLE_MODELS_MAX_PAGES,
+                    "google discovery: tetto pagine raggiunto con nextPageToken ancora presente, listing potenzialmente incompleto"
+                );
+            }
         }
-        let body: serde_json::Value = resp.json().await?;
-        Ok(parse_google_models_response(&body))
+        // Il parser ordina+deduplica la singola pagina; l'unione cross-pagina
+        // va ripulita di nuovo per output deterministico.
+        metas.sort_by(|a, b| a.id.cmp(&b.id));
+        metas.dedup_by(|a, b| a.id == b.id);
+        Ok(metas)
     }
 
     /// Autodiscovery Vertex multi-region (mig 0476): interroga OGNI region
-    /// candidata e unisce i risultati. europe-west4 NON espone i gemini-3.x,
-    /// 'global' si': iterando le scopriamo entrambe. Una region che fallisce
-    /// (non-2xx / rete) e' loggata WARN e saltata, senza far fallire l'intero
+    /// candidata (con paginazione via `fetch_google_models_pages`) e unisce i
+    /// risultati. europe-west4 NON espone i gemini-3.x, 'global' si': iterando
+    /// le scopriamo entrambe. Una region che fallisce (non-2xx / rete, su
+    /// QUALUNQUE pagina) e' loggata WARN e saltata, senza far fallire l'intero
     /// discovery (degrado parziale). Estratto da
     /// [`list_models`](LlmProvider::list_models) (regola A).
     async fn list_vertex_models(
@@ -592,26 +643,32 @@ impl GoogleProvider {
                 "https://{host}/v1beta1/publishers/google/models",
                 host = vertex_host(region)
             );
-            match self.http.get(url).bearer_auth(&token).send().await {
-                Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        all.extend(parse_google_models_response(&body));
-                        ok_regions += 1;
-                    }
-                    Err(_) => tracing::warn!(
+            // Una pagina fallita fa fallire la region INTERA (warn+skip sotto):
+            // una region parziale sarebbe un troncamento mascherato da successo.
+            match self
+                .fetch_google_models_pages(|| self.http.get(&url).bearer_auth(&token), "vertex")
+                .await
+            {
+                Ok(metas) => {
+                    // Il listing Vertex non espone la finestra di contesto:
+                    // qui servono i soli id.
+                    all.extend(metas.into_iter().map(|m| m.id));
+                    ok_regions += 1;
+                }
+                // Log dei soli segnali strutturati (status+codice via downcast,
+                // regola M), mai il body (regola F).
+                Err(err) => match err.downcast_ref::<super::ProviderHttpError>() {
+                    Some(he) => tracing::warn!(
                         region = %region,
-                        "vertex discovery: risposta models non parsabile, salto"
+                        status = he.status,
+                        code = he.code.as_deref().unwrap_or(""),
+                        "vertex discovery: GET models non-2xx, salto la region"
+                    ),
+                    None => tracing::warn!(
+                        region = %region,
+                        "vertex discovery: errore di rete/parse su GET models, salto la region"
                     ),
                 },
-                Ok(r) => tracing::warn!(
-                    region = %region,
-                    status = r.status().as_u16(),
-                    "vertex discovery: GET models non-2xx, salto la region"
-                ),
-                Err(_) => tracing::warn!(
-                    region = %region,
-                    "vertex discovery: errore di rete su GET models, salto la region"
-                ),
             }
         }
         if ok_regions == 0 {
@@ -823,23 +880,45 @@ impl LlmProvider for GoogleProvider {
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // Un solo bivio gemini/vertex (regola L): delega alla variante con
+        // metadati e proietta i soli id, come il dialetto OpenAI-compat.
+        Ok(self
+            .list_models_meta()
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect())
+    }
+
+    async fn list_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
         // Autodiscovery live per entrambi i backend:
         //   - Gemini: `GET {base_url}/models?key=...`
-        //     -> `{ "models": [{ "name": "models/gemini-..." }] }`;
+        //     -> `{ "models": [{ "name": "models/gemini-...", "inputTokenLimit": N }] }`,
+        //     la finestra dichiarata fluisce nel `ModelMeta`;
         //   - Vertex: token Bearer su
         //     `GET https://{location}-aiplatform.googleapis.com/v1beta1/publishers/google/models`
-        //     -> `{ "publisherModels": [{ "name": "publishers/google/models/gemini-..." }] }`.
+        //     -> `{ "publisherModels": [{ "name": "publishers/google/models/gemini-..." }] }`,
+        //     il listing NON espone la finestra -> `context_window=None`
+        //     (il catalog sync scrive 0 = ignota, regola G/H, mai placeholder).
         // Il bivio gemini/vertex e' qui (l'auth Vertex riusa `gcp_auth`, regola L);
         // la normalizzazione a basename e' delegata al parser puro
-        // [`parse_google_models_response`] (parita' col brain `list_models_live`).
+        // [`parse_google_models_meta_response`] (parita' col brain `list_models_live`).
         let backend = self.resolved_backend().await?;
         match backend.as_ref() {
-            GoogleBackend::Gemini => self.list_gemini_models().await,
+            GoogleBackend::Gemini => self.list_gemini_models_meta().await,
             GoogleBackend::Vertex {
                 discovery_locations,
                 auth,
                 ..
-            } => self.list_vertex_models(discovery_locations, auth).await,
+            } => Ok(self
+                .list_vertex_models(discovery_locations, auth)
+                .await?
+                .into_iter()
+                .map(|id| crate::provider::ModelMeta {
+                    id,
+                    context_window: None,
+                })
+                .collect()),
         }
     }
 
@@ -1144,33 +1223,83 @@ fn build_discovery_locations(csv: &str, location: &str) -> Vec<String> {
     out
 }
 
+/// Dimensione pagina richiesta ai listing modelli Google (`pageSize`): massimo
+/// documentato dall'API Gemini `models.list`; oltre il massimo il server la
+/// riduce da se' (AIP-158). Senza il parametro il default e' 50.
+const GOOGLE_MODELS_PAGE_SIZE: &str = "1000";
+
+/// Tetto di sicurezza sulle pagine seguite per singolo listing: previene il
+/// loop infinito se il server ripetesse lo stesso `nextPageToken`. 20 pagine
+/// x 1000 modelli sono ordini di grandezza sopra il catalogo reale; se scatta
+/// viene loggato WARN (mai troncamento silenzioso).
+const GOOGLE_MODELS_MAX_PAGES: usize = 20;
+
+/// Estrae il `nextPageToken` da una pagina del listing modelli Google (stesso
+/// campo per Gemini `models[]` e Vertex `publisherModels[]`). Funzione PURA
+/// (regola L, testabile senza rete): token assente o vuoto/spazi -> `None`
+/// (ultima pagina).
+pub fn next_google_page_token(body: &serde_json::Value) -> Option<String> {
+    body.get("nextPageToken")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Estrae i nomi modello dalla risposta `models.list` di Google e li normalizza
 /// a basename. Funzione PURA (regola L, testabile senza rete): gestisce entrambe
 /// le forme di risposta, leggendo il campo `name` da:
 ///   - `models[]` (Gemini direct, es. `"models/gemini-2.5-flash"`);
 ///   - `publisherModels[]` (Vertex AI, es. `"publishers/google/models/gemini-2.5-flash"`).
-/// Normalizza ogni nome al basename (`rsplit('/').next()`), come il brain
-/// `list_models_live`; deduplica e ordina per output deterministico.
+/// Punto unico del parsing (regola L): delega alla variante con metadati e
+/// proietta i soli id.
 pub fn parse_google_models_response(body: &serde_json::Value) -> Vec<String> {
+    parse_google_models_meta_response(body)
+        .into_iter()
+        .map(|m| m.id)
+        .collect()
+}
+
+/// Variante CON METADATI di [`parse_google_models_response`] (punto unico del
+/// parsing, regola L: la versione nomi-soli vi delega). Oltre al basename,
+/// estrae la finestra di contesto DICHIARATA dal provider quando la forma la
+/// espone: Gemini direct dichiara `inputTokenLimit` per ogni modello in
+/// `models[]`; `publisherModels[]` (Vertex) non ha il campo -> `None`. Valori
+/// non positivi sono trattati come non dichiarati: meglio "ignota" di una
+/// finestra inventata (regola H, incidente sub-agente 2026-07-06).
+/// Normalizza ogni nome al basename (`rsplit('/').next()`), come il brain
+/// `list_models_live`; deduplica e ordina per id (output deterministico).
+pub fn parse_google_models_meta_response(
+    body: &serde_json::Value,
+) -> Vec<crate::provider::ModelMeta> {
     let items = body
         .get("models")
         .and_then(|m| m.as_array())
         .or_else(|| body.get("publisherModels").and_then(|m| m.as_array()));
-    let mut names: Vec<String> = items
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("name").and_then(|v| v.as_str()))
-                // Normalizza a basename: "publishers/google/models/X" -> "X",
-                // "models/X" -> "X", "X" -> "X".
-                .filter_map(|name| name.rsplit('/').next())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
+    let mut metas: Vec<crate::provider::ModelMeta> = items
+        .map(|arr| arr.iter().filter_map(google_model_meta_of).collect())
         .unwrap_or_default();
-    names.sort();
-    names.dedup();
-    names
+    metas.sort_by(|a, b| a.id.cmp(&b.id));
+    metas.dedup_by(|a, b| a.id == b.id);
+    metas
+}
+
+/// Mappa UN elemento del listing Google in [`ModelMeta`]: `name` normalizzato
+/// a basename ("publishers/google/models/X" -> "X", "models/X" -> "X",
+/// "X" -> "X"); `inputTokenLimit` (Gemini direct) come finestra dichiarata
+/// solo se positiva (Vertex non ha il campo -> `None`).
+fn google_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelMeta> {
+    let id = m
+        .get("name")
+        .and_then(|v| v.as_str())
+        .and_then(|name| name.rsplit('/').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let context_window = m
+        .get("inputTokenLimit")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|w| *w > 0);
+    Some(crate::provider::ModelMeta { id, context_window })
 }
 
 /// Esito della risoluzione del thinking Gemini per una richiesta.
@@ -2613,6 +2742,117 @@ mod tests {
             ]
         });
         assert_eq!(parse_google_models_response(&body), vec!["gemini-x"]);
+    }
+
+    #[test]
+    fn parse_models_meta_gemini_estrae_input_token_limit() {
+        // Payload REALE (campi e valori) della Gemini API `GET /models`:
+        // ogni modello dichiara `inputTokenLimit` accanto a nome/versione.
+        let body = serde_json::json!({
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash",
+                    "version": "001",
+                    "displayName": "Gemini 2.5 Flash",
+                    "description": "Stable version of Gemini 2.5 Flash",
+                    "inputTokenLimit": 1048576,
+                    "outputTokenLimit": 65536,
+                    "supportedGenerationMethods": ["generateContent", "countTokens"],
+                    "temperature": 1.0,
+                    "topP": 0.95,
+                    "topK": 64
+                },
+                {
+                    "name": "models/gemma-3-27b-it",
+                    "version": "001",
+                    "displayName": "Gemma 3 27B",
+                    "inputTokenLimit": 131072,
+                    "outputTokenLimit": 8192,
+                    "supportedGenerationMethods": ["generateContent", "countTokens"]
+                }
+            ]
+        });
+        let metas = parse_google_models_meta_response(&body);
+        assert_eq!(
+            metas,
+            vec![
+                crate::provider::ModelMeta {
+                    id: "gemini-2.5-flash".to_string(),
+                    context_window: Some(1_048_576),
+                },
+                crate::provider::ModelMeta {
+                    id: "gemma-3-27b-it".to_string(),
+                    context_window: Some(131_072),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_models_meta_finestra_assente_o_non_positiva_resta_ignota() {
+        // Campo assente o non positivo: `None`, mai una finestra inventata
+        // (regola H, incidente sub-agente 2026-07-06).
+        let body = serde_json::json!({
+            "models": [
+                { "name": "models/gemini-preview-x" },
+                { "name": "models/gemini-zero", "inputTokenLimit": 0 },
+                { "name": "models/gemini-neg", "inputTokenLimit": -1 },
+            ]
+        });
+        let metas = parse_google_models_meta_response(&body);
+        assert_eq!(metas.len(), 3);
+        assert!(metas.iter().all(|m| m.context_window.is_none()));
+    }
+
+    #[test]
+    fn parse_models_meta_vertex_senza_finestra() {
+        // Il listing Vertex `publisherModels[]` non espone la finestra:
+        // basename normalizzato e `context_window=None`.
+        let body = serde_json::json!({
+            "publisherModels": [
+                { "name": "publishers/google/models/gemini-2.5-pro" },
+            ]
+        });
+        let metas = parse_google_models_meta_response(&body);
+        assert_eq!(
+            metas,
+            vec![crate::provider::ModelMeta {
+                id: "gemini-2.5-pro".to_string(),
+                context_window: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn next_page_token_presente_assente_vuoto() {
+        // Presente: il listing segue la pagina successiva.
+        let body = serde_json::json!({
+            "models": [{ "name": "models/gemini-2.5-flash", "inputTokenLimit": 1048576 }],
+            "nextPageToken": "Ch4KHG1vZGVscy9nZW1pbmktMi41LWZsYXNo"
+        });
+        assert_eq!(
+            next_google_page_token(&body).as_deref(),
+            Some("Ch4KHG1vZGVscy9nZW1pbmktMi41LWZsYXNo")
+        );
+        // Assente o vuoto/spazi: ultima pagina, il loop si ferma.
+        assert!(next_google_page_token(&serde_json::json!({ "models": [] })).is_none());
+        assert!(next_google_page_token(&serde_json::json!({ "nextPageToken": "" })).is_none());
+        assert!(next_google_page_token(&serde_json::json!({ "nextPageToken": "  " })).is_none());
+    }
+
+    #[test]
+    fn parse_models_meta_deduplica_e_ordina_per_id() {
+        let body = serde_json::json!({
+            "models": [
+                { "name": "models/gemini-b", "inputTokenLimit": 200 },
+                { "name": "models/gemini-a", "inputTokenLimit": 100 },
+                { "name": "models/gemini-b", "inputTokenLimit": 300 }, // duplicato
+            ]
+        });
+        let metas = parse_google_models_meta_response(&body);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].id, "gemini-a");
+        assert_eq!(metas[1].id, "gemini-b");
     }
 
     #[test]

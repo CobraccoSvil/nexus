@@ -101,15 +101,45 @@ impl AgentStepStore for PgAgentStepStore {
         .bind("completed")
         .execute(&self.db)
         .await;
-        if let Err(e) = res {
-            tracing::warn!(
+        match res {
+            Err(e) => tracing::warn!(
                 run_id = %run_id,
                 step_index,
                 error = %e,
                 "agent_step_store: INSERT agent_steps fallita (best-effort)"
-            );
+            ),
+            // 0 righe = guard scattato: o retry idempotente (step gia' presente,
+            // benigno) o RUN NON TRACCIATO in agent_runs -> lo step e' PERSO.
+            Ok(r) if r.rows_affected() == 0 => {
+                self.warn_if_untracked(run_uuid, step_index, &tool_name).await;
+            }
+            Ok(_) => {}
         }
         Ok(())
+    }
+}
+
+impl PgAgentStepStore {
+    /// Distingue e logga il caso "run non tracciato" quando il guard EXISTS ha
+    /// scartato uno step (regola M: mai buchi neri silenziosi — l'incidente
+    /// sub-agenti 2026-07-06 e' rimasto invisibile proprio perche' gli step dei
+    /// figli venivano scartati senza traccia). Solo diagnosi, mai errore.
+    async fn warn_if_untracked(&self, run_uuid: Uuid, step_index: i32, tool_name: &str) {
+        let tracked: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM agent_runs WHERE id = $1)")
+                .bind(run_uuid)
+                .fetch_one(&self.db)
+                .await
+                .unwrap_or(true);
+        if !tracked {
+            tracing::warn!(
+                run_id = %run_uuid,
+                step_index,
+                tool = %tool_name,
+                "agent_step_store: run NON tracciato in agent_runs, step SCARTATO \
+                 (osservabilita' persa: creare la riga run prima degli step)"
+            );
+        }
     }
 }
 

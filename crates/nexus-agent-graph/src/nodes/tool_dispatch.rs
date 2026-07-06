@@ -497,6 +497,17 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
         let allowed = self.m16_allowed();
         let disc_now = Self::discovered_now(state);
         let predictive_tokens = self.predictive_tokens(state);
+        // Finestra per il predictive cap: quella EFFETTIVA dell'ultimo turno LLM
+        // (scritta dall'executor: config o modello PROMOSSO dallo smart-upscale),
+        // fallback alla finestra statica di config quando assente (primo turno /
+        // checkpoint storici). Regola H (incidente 2026-07-06): col gate fermo
+        // alla finestra del modello di partenza, dopo l'upscale per
+        // context_overflow OGNI tool veniva bloccato per sempre dal cap mentre
+        // le chiamate LLM giravano gia' su un modello con finestra ampia.
+        let cap_window = state
+            .effective_context_window
+            .filter(|w| *w > 0)
+            .unwrap_or(self.cfg.context_window);
 
         // Esito per posizione: None = ancora da eseguire (kept), Some = synthetic.
         let mut slots: Vec<Option<ToolResultBlock>> = Vec::with_capacity(pending.len());
@@ -510,11 +521,11 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
 
             // (a) predictive cap (priorita'): esente -> salta; altrimenti la
             //     proiezione e' valutata SOLO se window e' nota (>0).
-            let cap_msg = if self.cfg.context_window > 0 && !is_cap_exempt(name) {
+            let cap_msg = if cap_window > 0 && !is_cap_exempt(name) {
                 let expected = estimate_tool_result_size_bytes(name, &input);
                 predictive_cap_check(
                     self.cfg.predictive_cap_ratio,
-                    self.cfg.context_window,
+                    cap_window,
                     expected,
                     predictive_tokens,
                 )
@@ -1503,6 +1514,76 @@ mod tests {
         assert!(content.starts_with(PREDICTIVE_CAP_SENTINEL));
         // Tool NON eseguito (synthetic-block).
         assert!(tools.seen.lock().unwrap().is_empty());
+    }
+
+    // ── (3a) la finestra EFFETTIVA dello stato (post smart-upscale) prevale ──────
+
+    /// Fixture dei test del cap con finestra effettiva: config con finestra
+    /// piccola + cap bassissimo (con 1000 blocca sempre) e UN pending
+    /// `nexus_read_attachment` grande. `effective` valorizza lo stato.
+    fn cap_fixture(effective: Option<i64>) -> (ToolDispatchConfig, AgentState) {
+        let cfg = ToolDispatchConfig {
+            context_window: 1000,
+            predictive_cap_ratio: 0.1,
+            ..Default::default()
+        };
+        let mut st = state_with_pending(vec![pending_tool(
+            "c1",
+            "nexus_read_attachment",
+            json!({"length": 100000}),
+        )]);
+        st.effective_context_window = effective;
+        (cfg, st)
+    }
+
+    /// Regressione incidente 2026-07-06: run partito su un modello con finestra
+    /// piccola (o placeholder) e PROMOSSO dallo smart-upscale a un modello con
+    /// finestra ampia. Il gate del predictive cap deve usare la finestra
+    /// EFFETTIVA scritta dall'executor nello stato, non quella statica di
+    /// config: prima restava alla finestra di partenza e bloccava OGNI tool
+    /// per sempre (il figlio "completava" senza aver mai scritto un file).
+    #[tokio::test]
+    async fn predictive_cap_usa_finestra_effettiva_dello_stato() {
+        // L'executor ha promosso il modello: finestra effettiva AMPIA nello stato.
+        let (cfg, st) = cap_fixture(Some(10_000_000));
+        let tools = Arc::new(MapToolExecutor::new().with(
+            "nexus_read_attachment",
+            ToolOutcome {
+                tool_call_id: "c1".into(),
+                content: json!("{\"text\":\"ok\"}"),
+                is_error: false,
+                ..Default::default()
+            },
+        ));
+        let (n, _steps, _rc) = node(cfg, tools.clone());
+        let ctx = ctx_with(false, CancellationToken::new());
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        let blocks = blocks_of(out.messages.last().expect("msg"));
+        assert_eq!(blocks.len(), 1);
+        // Nessun blocco sintetico: il tool e' stato ESEGUITO davvero.
+        assert!(!blocks[0]["is_error"].as_bool().expect("bool"));
+        assert_eq!(tools.seen.lock().expect("lock").len(), 1, "tool eseguito");
+    }
+
+    /// Contro-prova: finestra effettiva assente o non valida (<=0) -> fallback
+    /// alla finestra di config (comportamento storico invariato).
+    #[tokio::test]
+    async fn predictive_cap_fallback_su_config_senza_finestra_effettiva() {
+        let (cfg, st) = cap_fixture(Some(0)); // non valida -> fallback config
+        let tools = Arc::new(MapToolExecutor::new());
+        let (n, _steps, _rc) = node(cfg, tools.clone());
+        let ctx = ctx_with(false, CancellationToken::new());
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        let blocks = blocks_of(out.messages.last().expect("msg"));
+        assert!(blocks[0]["is_error"].as_bool().expect("bool"));
+        assert!(blocks[0]["content"]
+            .as_str()
+            .expect("str")
+            .starts_with(PREDICTIVE_CAP_SENTINEL));
+        assert!(
+            tools.seen.lock().expect("lock").is_empty(),
+            "tool bloccato dal cap"
+        );
     }
 
     // ── (3a) guard blocked-da-cap matcha il SENTINEL e NON riesegue ──────────────
