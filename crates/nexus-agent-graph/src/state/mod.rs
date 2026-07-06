@@ -215,6 +215,10 @@ pub struct AgentState {
     pub declared_outcome: Option<Value>,
     /// Verdetto del closure_judge (LLM) quando l'esito non e' dichiarato.
     pub closure_verdict: Option<Value>,
+    /// Verdetto strutturato del REVISORE via tool review_verdict (Fase B
+    /// ultracode): dict normalizzato {verdict, summary, findings[]}. Propagato
+    /// oltre il confine sub-run in `structured_verdict` (regola M).
+    pub review_verdict: Option<Value>,
     /// `true` se un tool e' fallito per ToolRunner gRPC down (infrastruttura).
     pub tool_infra_error: Option<bool>,
     /// Passi strutturati del playbook matchato.

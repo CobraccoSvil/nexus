@@ -1590,6 +1590,20 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   }
   ,
   {
+    "name": "review_verdict",
+    "description": "Dichiara il VERDETTO strutturato di una code review (per i run di revisione). Chiamalo UNA SOLA VOLTA, come ULTIMISSIMA azione della review, DOPO aver letto il codice: se dopo la dichiarazione esegui altri tool, il verdetto viene invalidato. verdict=pass SOLO se non hai trovato difetti reali; fail se hai trovato almeno un difetto che rende il lavoro non accettabile; needs_changes se il lavoro e' accettabile ma richiede correzioni. Ogni finding deve avere file ed evidenza concreta: niente osservazioni vaghe. Il summary e' il resoconto umano della review. Dichiara il verdetto REALE: un pass di cortesia su codice difettoso e' il peggior esito possibile.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "fail", "needs_changes"], "description": "Verdetto macchina della review: pass = nessun difetto reale; fail = difetti che rendono il lavoro non accettabile; needs_changes = accettabile ma da correggere."},
+        "summary": {"type": "string", "description": "Resoconto umano della review (cosa e' stato verificato e con quale esito)."},
+        "findings": {"type": "array", "items": {"type": "object", "properties": {"file": {"type": "string", "description": "Percorso del file col difetto."}, "line": {"type": "integer", "description": "Riga (1-based) del difetto, se puntuale."}, "severity": {"type": "string", "enum": ["alta", "media", "bassa"], "description": "Severita' del difetto."}, "description": {"type": "string", "description": "Il difetto e la sua evidenza concreta (scenario di fallimento)."}}, "required": ["file", "description"]}, "description": "Difetti trovati con evidenza. Obbligatorio (non vuoto) con verdict=fail o needs_changes."}
+      },
+      "required": ["verdict", "summary"]
+    }
+  }
+  ,
+  {
     "name": "nexus_verify_change",
     "description": "Verifica le modifiche appena fatte eseguendo la catena typecheck -> build -> lint -> test del progetto (fail-fast al primo step rosso). Usalo PRIMA di dichiarare completato un task di codice: e' la prova oggettiva che la modifica compila e non rompe i test. Ritorna un VerifyReport JSON strutturato: passed complessivo, first_failure, e per ogni step exit_code, build_errors, durata e un estratto dell'output. I comandi vengono dalle run_configurations del progetto o dai default per linguaggio configurati dall'admin: se uno step non ha comando configurato viene saltato con motivo esplicito, non inventato.",
     "input_schema": {
