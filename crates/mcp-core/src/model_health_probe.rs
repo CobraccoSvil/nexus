@@ -850,6 +850,94 @@ async fn persist_probe_history(
     .await;
 }
 
+/// Categorie di `error_class` che NON sono colpa del MODELLO ma dell'ambiente o
+/// del provider (credito, quota, contesto, infrastruttura, rete): un run che
+/// fallisce con una di queste NON deve abbassare la likelihood del modello.
+/// Allineato a `is_provider_wide_error` della governance (regola M): match su
+/// sottostringa della categoria STRUTTURATA, mai sul testo umano.
+pub fn run_error_is_environmental(error_class: Option<&str>) -> bool {
+    let Some(ec) = error_class else {
+        return false;
+    };
+    let ec = ec.trim().to_ascii_lowercase();
+    if ec.is_empty() {
+        return false;
+    }
+    const ENV: &[&str] = &[
+        "infrastructure",
+        "context_overflow",
+        "billing",
+        "quota",
+        "rate_limit",
+        "overload",
+        "service_unavailable",
+        "credit",
+        "balance",
+        "insufficient",
+        "timeout",
+        "network",
+    ];
+    ENV.iter().any(|k| ec.contains(k))
+}
+
+/// PUNTO UNICO (regola L, M): decide se l'esito di un RUN e' un fallimento
+/// attribuibile al MODELLO (che deve abbassarne la likelihood) o no. Pura,
+/// testabile. Colpa del modello SOLO negli esiti dove il modello ha davvero
+/// girato e non ha completato la sostanza del task:
+///   - `Failed` / `LoopAborted` / `FailedDiagnosed` (non-convergenza, loop, cap);
+/// ED esclusi i casi che NON sono colpa sua:
+///   - `BlockedNeedsInput` (blocco ambientale REALE dichiarato) e ogni altro
+///     status non-fallito -> non entrano (mappati fuori dall'enum-target);
+///   - `error_class` ambientale/provider-wide (credito, quota, contesto, infra);
+///   - `hollow_*` -> gia' gestiti dai loro contatori dedicati (tool_capability /
+///     consecutive_failures), non doppiare.
+pub fn run_outcome_blames_model(
+    status: crate::agent_types::AgentRunStatus,
+    error_class: Option<&str>,
+    hollow_completion: bool,
+    hollow_no_tools: bool,
+) -> bool {
+    use crate::agent_types::AgentRunStatus::{Failed, FailedDiagnosed, LoopAborted};
+    matches!(status, Failed | LoopAborted | FailedDiagnosed)
+        && !hollow_completion
+        && !hollow_no_tools
+        && !run_error_is_environmental(error_class)
+}
+
+/// Registra l'esito di un RUN reale nella telemetria di salute del modello
+/// (`ai_model_health_history`), cosi' la governance (`likelihood_score`) lo
+/// consuma nella finestra scorrevole. Segnale MORBIDO: a differenza del probe e
+/// dell'hollow, NON tocca `is_enabled` ne' i contatori di auto-disable — abbassa
+/// o rialza solo l'error-rate recente, e il "reset" e' implicito (i run di
+/// successo escono l'error-rate dalla finestra). Un falso positivo occasionale
+/// (es. debito preesistente su un formato non ancora coperto dal gate) retrocede
+/// il modello di poco e viene recuperato al primo successo. `error_kind` vuoto o
+/// `healthy=true` -> nessuna categoria d'errore (record positivo).
+pub async fn record_run_outcome_health(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    healthy: bool,
+    error_kind: &str,
+) {
+    let ek = if healthy || error_kind.trim().is_empty() {
+        None
+    } else {
+        Some(error_kind)
+    };
+    let _ = sqlx::query(
+        r#"INSERT INTO ai_model_health_history
+           (provider, model, healthy, latency_ms, error_kind, error_message)
+           VALUES ($1, $2, $3, NULL, $4, NULL)"#,
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(healthy)
+    .bind(ek)
+    .execute(db)
+    .await;
+}
+
 /// Applica la logica counter / auto-disable / auto-reenable in base alla
 /// classificazione dell'esito del chat-probe. Estratta da `probe_one_model`.
 async fn apply_probe_outcome(
@@ -1796,5 +1884,41 @@ mod tests {
             now,
             backoff
         ));
+    }
+
+    #[test]
+    fn run_error_ambientale_riconosce_le_categorie_provider_wide() {
+        assert!(run_error_is_environmental(Some("context_overflow")));
+        assert!(run_error_is_environmental(Some("billing_error")));
+        assert!(run_error_is_environmental(Some("insufficient_quota")));
+        assert!(run_error_is_environmental(Some("infrastructure")));
+        assert!(run_error_is_environmental(Some("rate_limit")));
+        // Non ambientali (colpa modello o sconosciuto specifico) / vuoti.
+        assert!(!run_error_is_environmental(Some("model_not_found")));
+        assert!(!run_error_is_environmental(Some("")));
+        assert!(!run_error_is_environmental(None));
+    }
+
+    #[test]
+    fn run_outcome_blames_model_distingue_modello_da_ambiente() {
+        use crate::agent_types::AgentRunStatus as S;
+        // Colpa modello: fallito/loop/diagnosed, non hollow, error_class non ambientale.
+        assert!(run_outcome_blames_model(S::FailedDiagnosed, None, false, false));
+        assert!(run_outcome_blames_model(S::Failed, Some("model_not_found"), false, false));
+        assert!(run_outcome_blames_model(S::LoopAborted, None, false, false));
+        // Ambiente: blocco reale, provider giu', errore ambientale -> NON colpa modello.
+        assert!(!run_outcome_blames_model(S::BlockedNeedsInput, None, false, false));
+        assert!(!run_outcome_blames_model(S::ProviderUnavailable, None, false, false));
+        assert!(!run_outcome_blames_model(
+            S::FailedDiagnosed,
+            Some("context_overflow"),
+            false,
+            false
+        ));
+        // Hollow: gia' contato dai contatori dedicati, non doppiare.
+        assert!(!run_outcome_blames_model(S::FailedDiagnosed, None, true, false));
+        assert!(!run_outcome_blames_model(S::Failed, None, false, true));
+        // Successo: mai colpa.
+        assert!(!run_outcome_blames_model(S::CompletedVerified, None, false, false));
     }
 }

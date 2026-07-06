@@ -262,10 +262,18 @@ pub fn count_build_errors(output: &str) -> usize {
 
 /// Regex che catturano il FILE di un errore di compilazione dai formati con
 /// localizzazione esplicita (best-effort, come [`count_build_errors`]). Gruppo 1
-/// = path del file. Coprono tsc (`file(riga,col): error TSxxxx`) e rustc/cargo
-/// (`--> file:riga:col`). I formati SENZA path sulla riga d'errore (es. eslint
-/// stylish, errori generici) non contribuiscono qui: [`build_error_files`]
-/// ritorna un set VUOTO e il chiamante ricade sul criterio assoluto (fail-closed).
+/// = path del file. Coprono tsc, rustc/cargo, eslint (stylish + compact) e
+/// vite/rollup/esbuild — i formati usati dai profili di verifica reali (il
+/// profilo standard e' `npx eslint` + `pnpm build`). I formati ANCORA non
+/// coperti non contribuiscono qui: [`build_error_files`] ritorna un set VUOTO e
+/// il chiamante ricade sul criterio assoluto (fail-closed, mai fail-open).
+///
+/// Nota anti-falso-positivo: i pattern che localizzano su una singola riga
+/// (tsc/rustc/compact/esbuild) matchano SOLO righe con `error` (non `warning`),
+/// perche' solo un errore fa fallire il gate. Il pattern eslint stylish, dove il
+/// path e' su una riga a se' seguita da righe indentate, cattura il path solo se
+/// dopo gli eventuali `warning` compare almeno un `error` (un file con soli
+/// warning non e' una regressione).
 static BUILD_ERROR_FILE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         // tsc: `src/foo.tsx(12,3): error TS1234:` -> path = tutto prima della `(`.
@@ -273,6 +281,26 @@ static BUILD_ERROR_FILE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
             .expect("regex tsc file valida"),
         // rustc/cargo: `  --> src/foo.rs:12:5` -> path prima di `:riga:col`.
         Regex::new(r"(?m)^\s*-->\s+(.+?):\d+:\d+").expect("regex rustc file valida"),
+        // eslint stylish (default): il path e' una riga a se' (non indentata) che
+        // termina con un'estensione sorgente, seguita da righe `  riga:col  livello`.
+        // Cattura il path solo se, dopo zero o piu' `warning`, arriva un `error`.
+        Regex::new(
+            r"(?m)^(\S[^\n]*\.(?:tsx?|jsx?|vue|svelte|mjs|cjs))\r?\n(?:[ \t]+\d+:\d+[ \t]+warning[^\n]*\r?\n)*[ \t]+\d+:\d+[ \t]+error\b",
+        )
+        .expect("regex eslint stylish valida"),
+        // eslint compact (`-f compact`): `src/foo.js: line 1, col 1, Error - msg`.
+        Regex::new(r"(?im)^(.+?):\s+line\s+\d+,\s+col\s+\d+,\s+Error\b")
+            .expect("regex eslint compact valida"),
+        // vite/rollup resolve: `Could not resolve "./x" from "src/foo.ts"` /
+        // `Rollup failed to resolve import "x" from "src/foo.ts"` -> path = `from`.
+        Regex::new(
+            r#"(?im)(?:could not resolve|failed to resolve import)\s+["'][^"'\n]*["']\s+from\s+["']([^"'\n]+)["']"#,
+        )
+        .expect("regex rollup resolve valida"),
+        // esbuild/vite generico: `src/foo.ts:12:34: ERROR: msg` (path senza `:`
+        // interni per non spezzare i drive Windows su `file:riga:col: error`).
+        Regex::new(r"(?im)^\s*([^\s:][^\n:]*?):\d+:\d+:\s+error\b")
+            .expect("regex esbuild valida"),
     ]
 });
 
@@ -821,6 +849,13 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 final_gate_cycle: Some(Some(0)),
                 stop_reason: Some(Some(StopReason::EndTurn)),
                 final_gate_passed: Some(Some(true)),
+                // Esito ONESTO (regola M): i criteri soft (no_orphan/outputs_exist)
+                // sono passati, ma se il profilo di verifica dell'ambiente manca
+                // NESSUN comando di verifica reale e' stato eseguito. Lo segnaliamo
+                // come "svolto ma non verificato" -> il finalizzatore mappa
+                // CompletedUnverified (distinto da CompletedVerified). Con profilo
+                // presente (verifica eseguita) e' Some(false): esito verificato.
+                final_gate_unverified: Some(Some(self.cfg.verify_profile_missing)),
                 ..Default::default()
             }
             .into_opaque());
@@ -1696,10 +1731,51 @@ mod golden {
         let rustc = "error[E0432]: unresolved import\n  --> crates/foo/src/lib.rs:12:5\n";
         assert!(build_error_files(rustc).contains("crates/foo/src/lib.rs"));
 
-        // Formato senza localizzazione sulla riga d'errore (eslint stylish) -> set
+        // Una riga d'errore stylish ISOLATA (senza la riga-path sopra) -> set
         // VUOTO: il chiamante ricade sul criterio assoluto (fail-closed).
         assert!(build_error_files("  1:1  error  Unexpected token  no-undef").is_empty());
         assert!(build_error_files("").is_empty());
+    }
+
+    #[test]
+    fn build_error_files_estrae_path_eslint_e_vite() {
+        use super::build_error_files;
+
+        // eslint stylish (default): path su riga a se' + righe indentate. Solo il
+        // file con un `error` viene catturato; il file con soli `warning` NO.
+        let stylish = "\
+/repo/src/app/LoginForm.tsx\n  \
+  12:5   error    'foo' is not defined       no-undef\n  \
+  20:1   warning  Unexpected console         no-console\n\
+\n\
+/repo/src/app/OnlyWarn.tsx\n  \
+  3:1    warning  Missing semicolon          semi\n\
+\n\
+\u{2716} 2 problems (1 error, 1 warning)";
+        let files = build_error_files(stylish);
+        assert!(
+            files.contains("/repo/src/app/LoginForm.tsx"),
+            "il file con error deve essere catturato: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains("OnlyWarn")),
+            "un file con soli warning non e' una regressione: {files:?}"
+        );
+
+        // eslint compact (`-f compact`).
+        let compact =
+            "src/utils/date.ts: line 4, col 2, Error - 'x' is assigned but never used (no-unused-vars)";
+        assert!(build_error_files(compact).contains("src/utils/date.ts"));
+
+        // vite/rollup: import irrisolto -> path del file che importa (`from`).
+        let rollup = "\
+[vite]: Rollup failed to resolve import \"./missing\" from \"src/pages/Home.tsx\".\n\
+This is most likely unintended.";
+        assert!(build_error_files(rollup).contains("src/pages/Home.tsx"));
+
+        // esbuild/vite generico: `path:riga:col: ERROR: msg`.
+        let esbuild = "  src/components/Button.tsx:15:22: ERROR: Unexpected \"}\"";
+        assert!(build_error_files(esbuild).contains("src/components/Button.tsx"));
     }
 
     #[test]

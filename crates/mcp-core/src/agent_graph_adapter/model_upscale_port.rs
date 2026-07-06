@@ -157,15 +157,16 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
             // catalog e' cambiato tra primario e resume).
             return Ok(None);
         }
-        // Stesso ordinamento del routing agentico (featured + piu' economico): a
-        // tier fissato preferisce i modelli in evidenza, poi il costo minore.
+        // Stesso ordinamento del routing agentico (AGENTIC_COST_FIRST_ORDER): a
+        // tier fissato prende il modello piu' economico che soddisfa i vincoli
+        // (context_window incluso), is_featured solo come tie-break.
         let picked = select_agentic_model(
             &self.db,
             &[tier],
             capability,
             min_context_window,
             exclude_providers,
-            "is_featured DESC, input_cost_per_million_tokens ASC",
+            crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
         )
         .await;
         Ok(picked)

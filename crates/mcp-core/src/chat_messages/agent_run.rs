@@ -1343,6 +1343,13 @@ async fn native_outcome_to_run_result(
         // verifica e' fallita. Difesa in profondita' rispetto a `forced_close`:
         // il cap del final_gate NON imposta forced_close_unverified.
         AgentRunStatus::FailedDiagnosed
+    } else if outcome.final_gate_unverified == Some(true) {
+        // Lavoro SVOLTO ma verifica tecnica NON eseguita (gate entrato senza
+        // profilo di verifica dell'ambiente): esito ONESTO distinto da un
+        // "completato" pieno. Successo (is_success=true) ma etichettato come non
+        // verificato -> l'utente sa che l'esito non e' stato confermato da un
+        // comando reale. Segnale strutturato dal gate (regola M).
+        AgentRunStatus::CompletedUnverified
     } else {
         AgentRunStatus::Completed
     };
@@ -1375,15 +1382,24 @@ async fn native_outcome_to_run_result(
     // "completato" mentre lo status era failed_diagnosed (run e91d4892). Non si
     // applica alle dichiarazioni oneste (blocked/needs_input/partial: il modello
     // stesso ha gia' descritto l'incompletezza nel summary).
-    let final_answer = match (final_answer, outcome.final_gate_passed) {
-        (Some(ans), Some(false)) => Some(format!(
+    let final_answer = match (final_answer, outcome.final_gate_passed, outcome.final_gate_unverified) {
+        (Some(ans), Some(false), _) => Some(format!(
             "{ans}\n\n---\n**Verifica automatica non superata** (limite tentativi \
              raggiunto): i criteri di verifica del progetto non sono passati, quindi \
              il task potrebbe non essere completo. Controlla i criteri falliti nella \
              timeline \"Decisioni del turno\" e riverifica il flusso reale prima di \
              considerarlo concluso."
         )),
-        (other, _) => other,
+        // Lavoro svolto ma verifica tecnica NON eseguita (profilo di verifica
+        // dell'ambiente assente): annotazione onesta (regola M), non un fallimento.
+        (Some(ans), _, Some(true)) => Some(format!(
+            "{ans}\n\n---\n**Verifica tecnica non eseguita**: per questo progetto non \
+             e' disponibile un profilo di verifica (comandi di build/test), quindi \
+             l'esito NON e' stato confermato da un comando reale. Definisci i comandi \
+             di verifica del progetto oppure ricontrolla manualmente prima di \
+             considerarlo concluso."
+        )),
+        (other, _, _) => other,
     };
 
     // Hollow sul path NATIVO (prima: false hardcoded, "detection del client
@@ -2563,19 +2579,21 @@ pub(crate) async fn spawn_agent_run(
         use futures::FutureExt;
 
         tracing::info!(
-            "spawn_agent_run: delega al brain LangGraph run_id={}",
+            "spawn_agent_run: avvio run agentico (motore da nexus_orchestrator_engine) run_id={}",
             run_id
         );
 
         let agent_body = std::panic::AssertUnwindSafe(async move {
             // ── Confine di selezione del motore (strangler-fig) ──────────────────
             // Punto unico select_engine: legge nexus_orchestrator_engine (regola
-            // G). Cutover completo: ritorna 'rust' sulla riga jolly '*'=rust ->
-            // si esegue il PRIMARIO nativo (run_via_native). Il record
-            // agent_runs.engine viene popolato per il recovery (sa su quale
-            // motore girava un run interrotto). Il ramo Python legacy
-            // (run_via_brain) resta solo come rollback per-sessione / default
-            // difensivo (riga DB assente / DB down / valore non riconosciuto).
+            // G; cutover versionato in mig 0532: '*'=rust) -> si esegue il
+            // PRIMARIO nativo (run_via_native). Il record agent_runs.engine
+            // viene popolato per il recovery (sa su quale motore girava un run
+            // interrotto). Il ramo Python legacy (run_via_brain) e' raggiungibile
+            // SOLO con una riga per-scope esplicita engine='python' ed e' INERTE
+            // (il servizio brain e' stato rimosso, mig 0462); il default
+            // difensivo (riga assente / DB down / valore non riconosciuto) e'
+            // Engine::Rust.
             let engine = select_engine(&db_clone, &session_id_cp.to_string()).await;
             // Pool del progetto risolto DENTRO il task (separazione DB): la tabella
             // agent_runs (e agent_steps) e' migrata -> tutte le scritture del run
@@ -3114,6 +3132,54 @@ pub(crate) async fn spawn_agent_run(
                             &result.provider,
                             &result.model,
                             true,
+                        )
+                        .await;
+                    }
+                }
+
+                // FIX telemetria esiti-run (audit selezione costi/mascheramento):
+                // gli esiti REALI dei run agentici alimentano la telemetria di
+                // governance, cosi' un modello che non converge mai vede scendere la
+                // sua likelihood e il routing smette di ripescarlo come partenza
+                // economica. Prima solo probe + hollow la alimentavano: un modello che
+                // chiudeva 10 run FailedDiagnosed (fa tool call + testo, mai hollow)
+                // restava likelihood 1.0. Segnale MORBIDO (health-history, MAI
+                // auto-disable); NON penalizza l'ambiente (blocker reale ->
+                // BlockedNeedsInput; error_class ambientale escluso; hollow gia' contato
+                // sopra coi suoi contatori dedicati). Punto unico regola L/M in
+                // model_health_probe.
+                if intent_uses_tools {
+                    if crate::model_health_probe::run_outcome_blames_model(
+                        result.status.clone(),
+                        result.error_class.as_deref(),
+                        result.hollow_completion,
+                        result.hollow_no_tools,
+                    ) {
+                        crate::model_health_probe::record_run_outcome_health(
+                            &db_clone,
+                            &result.provider,
+                            &result.model,
+                            false,
+                            "run_nonconvergence",
+                        )
+                        .await;
+                        tracing::info!(
+                            "agent_run {}: esito '{}' attribuito al modello {}/{} -> telemetria governance (likelihood)",
+                            run_id,
+                            result.status.as_str(),
+                            result.provider,
+                            result.model
+                        );
+                    } else if result.status.is_success() && !result.hollow_completion {
+                        // Successo reale: record POSITIVO per bilanciare la finestra
+                        // scorrevole (l'error-rate riflette gli esiti reali, non solo i
+                        // fallimenti che altrimenti la saturerebbero).
+                        crate::model_health_probe::record_run_outcome_health(
+                            &db_clone,
+                            &result.provider,
+                            &result.model,
+                            true,
+                            "",
                         )
                         .await;
                     }
@@ -3762,6 +3828,14 @@ pub(crate) async fn spawn_agent_run(
                         result.iteration_count
                     ),
                 ),
+                AgentRunStatus::CompletedUnverified => (
+                    "completato (non verificato)",
+                    format!(
+                        "{} step · {} iter · verifica non eseguita",
+                        result.steps.len(),
+                        result.iteration_count
+                    ),
+                ),
                 AgentRunStatus::AwaitingConfirmation => (
                     "in attesa conferma",
                     "conferma utente richiesta".to_string(),
@@ -4178,10 +4252,11 @@ fn engine_cache() -> &'static nexus_cache::TtlCache<String, Engine> {
 ///
 /// Comportamento difensivo coerente col resto del sistema: se il DB e'
 /// irraggiungibile o nessuna riga matcha (ne' specifica ne' '*'), ritorna
-/// `Engine::Python` come default difensivo loggando un warn. NON e' un "magic
+/// `Engine::Rust` come default difensivo loggando un warn. NON e' un "magic
 /// fallback" sul comportamento configurabile (e' una decisione di safety): in
-/// assenza di configurazione leggibile ricade sul motore legacy noto invece di
-/// instradare alla cieca, mentre il default globale '*'=rust resta il primario.
+/// assenza di configurazione leggibile ricade sul motore primario in-process —
+/// il brain Python e' stato rimosso (mig 0462/0532), quindi un fallback su
+/// `Engine::Python` instraderebbe i run verso un servizio inesistente.
 pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
     let cache = engine_cache();
     if let Some(hit) = cache.get(scope_key) {
@@ -4206,9 +4281,9 @@ pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
             tracing::warn!(
                 error = %e,
                 scope_key = %scope_key,
-                "select_engine: query nexus_orchestrator_engine fallita, uso il motore stabile (python)"
+                "select_engine: query nexus_orchestrator_engine fallita, uso il motore primario (rust)"
             );
-            Engine::Python
+            Engine::Rust
         }
     };
 
@@ -4218,17 +4293,17 @@ pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
 
 /// Logica PURA di risoluzione del motore dalle righe gia' lette (nessun DB,
 /// nessuna cache): pick specifico -> pick jolly '*' -> parse -> fallback
-/// difensivo `Engine::Python`. Estratta da `select_engine` (regola L: la
-/// precedenza scope-specifico/jolly vive in un solo punto, testabile senza DB).
-/// Comportamento 1:1 con la versione inline precedente (stessi warn di
-/// diagnostica su riga assente / valore engine non riconosciuto).
+/// difensivo `Engine::Rust` (il motore primario: il brain Python e' stato
+/// rimosso, mig 0462/0532 — un fallback su Python instraderebbe i run verso un
+/// servizio inesistente). Estratta da `select_engine` (regola L: la precedenza
+/// scope-specifico/jolly vive in un solo punto, testabile senza DB).
 fn resolve_engine_from_rows(rows: &[sqlx::postgres::PgRow], scope_key: &str) -> Engine {
     if rows.is_empty() {
         tracing::warn!(
             scope_key = %scope_key,
-            "select_engine: nessuna riga (ne' '{scope_key}' ne' jolly '*') in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
+            "select_engine: nessuna riga (ne' '{scope_key}' ne' jolly '*') in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore primario (rust)"
         );
-        return Engine::Python;
+        return Engine::Rust;
     }
 
     // Preferisci la riga con scope_key == quello richiesto; altrimenti la
@@ -4249,18 +4324,18 @@ fn resolve_engine_from_rows(rows: &[sqlx::postgres::PgRow], scope_key: &str) -> 
                     tracing::warn!(
                         engine_raw = %raw,
                         scope_key = %scope_key,
-                        "select_engine: valore engine non riconosciuto in nexus_orchestrator_engine, uso il motore stabile (python)"
+                        "select_engine: valore engine non riconosciuto in nexus_orchestrator_engine, uso il motore primario (rust)"
                     );
-                    Engine::Python
+                    Engine::Rust
                 }
             }
         }
         None => {
             tracing::warn!(
                 scope_key = %scope_key,
-                "select_engine: nessuna riga specifica ne' jolly '*' in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore stabile (python)"
+                "select_engine: nessuna riga specifica ne' jolly '*' in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore primario (rust)"
             );
-            Engine::Python
+            Engine::Rust
         }
     }
 }
@@ -4548,11 +4623,13 @@ mod tests_select_engine {
     }
 
     #[sqlx::test]
-    async fn select_engine_cade_su_python_se_riga_assente(pool: sqlx::PgPool) {
-        // Tabella vuota: nessuna riga jolly. Comportamento difensivo: python.
+    async fn select_engine_cade_su_rust_se_riga_assente(pool: sqlx::PgPool) {
+        // Tabella vuota: nessuna riga jolly. Comportamento difensivo: rust, il
+        // motore primario (il brain Python e' stato rimosso, mig 0462/0532: un
+        // fallback su python instraderebbe verso un servizio inesistente).
         create_engine_table(&pool).await;
         let engine = select_engine(&pool, "*").await;
-        assert_eq!(engine, Engine::Python);
+        assert_eq!(engine, Engine::Rust);
     }
 
     #[sqlx::test]
@@ -4643,6 +4720,7 @@ mod tests_select_engine {
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,
+            final_gate_unverified: None,
         }
     }
 

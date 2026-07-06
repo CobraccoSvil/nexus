@@ -88,9 +88,11 @@
 //! `select_engine` ritorna `rust` sulla riga jolly `*`=rust (regola G, tabella
 //! `nexus_orchestrator_engine`): il motore nativo Rust e' il PRIMARIO in
 //! produzione e questo path e' quello effettivamente eseguito per i nuovi run.
-//! `Engine::Python` resta solo come default difensivo (riga DB assente / DB down /
-//! valore non riconosciuto), rollback per-sessione e valore storico dei run
-//! `agent_runs.engine='python'`. L'instradamento e' un dato nel DB, non codice.
+//! `Engine::Python` resta solo come rollback per-scope esplicito (INERTE: il
+//! servizio brain e' stato rimosso, mig 0462/0532) e valore storico dei run
+//! `agent_runs.engine='python'`; il default difensivo (riga DB assente / DB down
+//! / valore non riconosciuto) e' `Engine::Rust`. L'instradamento e' un dato nel
+//! DB, non codice.
 
 use std::sync::Arc;
 
@@ -104,7 +106,7 @@ use nexus_agent_graph::nodes::{
     VerifierNode,
 };
 use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
-use nexus_agent_graph::decisions::LoopThresholds;
+use nexus_agent_graph::decisions::{LoopThresholds, RepetitionThresholds};
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
     LlmGateway, MetaReasonerPort, MetaStepStore, ModelUpscalePort, NextActionsDeriver,
@@ -383,6 +385,12 @@ pub struct NativeRunOutcome {
     /// l'esito reale della verifica (run e91d4892: resoconto "completato" ma
     /// status failed_diagnosed).
     pub final_gate_passed: Option<bool>,
+    /// `Some(true)` quando il final gate e' entrato ma NON ha potuto verificare
+    /// (profilo di verifica dell'ambiente assente): lavoro svolto ma non
+    /// verificato. Letto dal finalizzatore per l'esito onesto `CompletedUnverified`
+    /// (distinto da `Completed`/`CompletedVerified`). `None` = gate non entrato o
+    /// verifica eseguita. Segnale strutturato (regola M).
+    pub final_gate_unverified: Option<bool>,
 }
 
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
@@ -400,6 +408,52 @@ async fn resolve_context_window(db: &PgPool, provider: &str, model: &str) -> i64
     .ok()
     .flatten();
     row.map(|(w,)| w).unwrap_or(0)
+}
+
+/// Prezzo BLENDED (input*0.75 + output*0.25, stessa formula dell'`escalation_rank`
+/// della vista v_model_escalation_chain) per MILIONE di token di `(provider,
+/// model)` dal catalog (regola G). `0.0` = prezzo ignoto (modello non in catalog o
+/// errore) -> il cap di costo resta inattivo (no toppa: un cap su un prezzo
+/// inventato produrrebbe tetti spurii). Cast esplicito a `double precision` cosi'
+/// la colonna NUMERIC arriva come `f64` a sqlx.
+async fn resolve_model_blended_cost_per_million(db: &PgPool, provider: &str, model: &str) -> f64 {
+    let row: Option<(f64, f64)> = sqlx::query_as(
+        "SELECT input_cost_per_million_tokens::double precision, \
+                output_cost_per_million_tokens::double precision \
+         FROM ai_price_catalog WHERE provider = $1 AND model = $2 LIMIT 1",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    row.map(|(i, o)| i * 0.75 + o * 0.25).unwrap_or(0.0)
+}
+
+/// Budget token PRICE-AWARE (audit selezione costi): converte il tetto in DOLLARI
+/// `cost_budget_usd` nel numero di token equivalente per il prezzo blended del
+/// modello del turno e ritorna il piu' STRINGENTE tra questo e il tetto in token
+/// `fixed`. Cosi' il tetto effettivo del run e' uniforme in DOLLARI, non in token:
+/// 400k token costano ~64x su gpt-5.5 (blended ~11.25 $/M) rispetto a
+/// deepseek-v4-flash (~0.175 $/M) — col solo tetto token il run caro spendeva
+/// silenziosamente decine di volte tanto. PURA e testabile.
+///
+/// - `cost_budget_usd <= 0` o prezzo ignoto (`<= 0`) -> nessun cap di costo (solo
+///   il tetto token, comportamento storico bit-identico).
+/// - tetto token disattivato (`fixed == 0`) ma cap costo attivo -> vale il derivato.
+/// - almeno 1 token (mai 0 spurio che bloccherebbe il primo turno).
+fn price_aware_token_budget(fixed: u64, cost_budget_usd: f64, blended_cost_per_million: f64) -> u64 {
+    if cost_budget_usd <= 0.0 || blended_cost_per_million <= 0.0 {
+        return fixed;
+    }
+    let derived = (cost_budget_usd / blended_cost_per_million * 1_000_000.0).floor();
+    let derived = if derived < 1.0 { 1 } else { derived as u64 };
+    if fixed == 0 {
+        derived
+    } else {
+        fixed.min(derived)
+    }
 }
 
 /// Performance tier del modello del turno INIZIALE dal catalog (`ai_price_catalog`,
@@ -687,9 +741,21 @@ async fn load_executor_config(
         // ITERAZIONI): chiudono il buco del modello che ignora force_tool_choice e
         // brucia token in turni solo-testo (osservato 1.8M token / $2.42 senza
         // convergere). Lettura via setting_i64 (punto unico) + clamp non-negativo.
-        run_token_budget: setting_i64(db, "agent.run_token_budget", d.run_token_budget as i64)
-            .await
-            .max(0) as u64,
+        run_token_budget: {
+            // Budget PRICE-AWARE (audit selezione costi): il tetto in TOKEN e' cieco
+            // al prezzo. Deriviamo un tetto equivalente in DOLLARI dal prezzo blended
+            // del modello del turno e prendiamo il piu' stringente. cost_budget_usd=0
+            // (chiave assente) -> disattivato, solo tetto token (bit-identico).
+            // NOTA: e' il tetto del TURNO-MODELLO; dopo un'escalation il budget si
+            // ri-legge col nuovo modello se load_executor_config e' rivalutata, altrimenti
+            // il fix 2 (salita di un solo gradino) limita quanto il prezzo puo' crescere.
+            let fixed = setting_i64(db, "agent.run_token_budget", d.run_token_budget as i64)
+                .await
+                .max(0) as u64;
+            let cost_budget_usd = setting_f64(db, "agent.run_cost_budget_usd", 0.0).await;
+            let blended = resolve_model_blended_cost_per_million(db, provider, model).await;
+            price_aware_token_budget(fixed, cost_budget_usd, blended)
+        },
         // BACKSTOP di catastrofe (mig 0521, regola G): col meta-reasoner acceso il
         // run_token_budget diventa il TRIGGER del giudice, questo hard-cap e' la rete
         // di sicurezza non-negoziabile che chiude d'autorita' senza consultarlo.
@@ -706,6 +772,17 @@ async fn load_executor_config(
         loop_thresholds: LoopThresholds {
             signature: setting_i64(db, "agent.loop.signature_threshold", d.loop_thresholds.signature as i64).await.max(1) as usize,
             cap: setting_i64(db, "agent.loop.recent_signatures_cap", d.loop_thresholds.cap as i64).await.max(1) as usize,
+        },
+        // Anti repetition-collapse del testo (mig 0531, regola G): soglie della
+        // rilevazione del turno degenere (stessa sottostringa ripetuta N+ volte).
+        // `scan_tail_cap=0` disabilita -> bit-identico. Clamp non-negativo; le
+        // lunghezze minime >=1 (0 sarebbe insensato).
+        repetition: RepetitionThresholds {
+            min_unit_len: setting_i64(db, "agent.anti_repetition.min_unit_len", d.repetition.min_unit_len as i64).await.max(1) as usize,
+            max_unit_len: setting_i64(db, "agent.anti_repetition.max_unit_len", d.repetition.max_unit_len as i64).await.max(1) as usize,
+            min_repeats: setting_i64(db, "agent.anti_repetition.min_repeats", d.repetition.min_repeats as i64).await.max(0) as usize,
+            min_total_len: setting_i64(db, "agent.anti_repetition.min_total_len", d.repetition.min_total_len as i64).await.max(0) as usize,
+            scan_tail_cap: setting_i64(db, "agent.anti_repetition.scan_tail_cap", d.repetition.scan_tail_cap as i64).await.max(0) as usize,
         },
         // Soglia dell'asse RepeatedUserQuestion (loop clarify cross-run, mig 0510).
         repeated_user_question_threshold: setting_i64(db, "agent.loop.repeated_user_question_threshold", d.repeated_user_question_threshold).await,
@@ -1741,6 +1818,7 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             .map(str::to_string),
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
         final_gate_passed: state.final_gate_passed,
+        final_gate_unverified: state.final_gate_unverified,
     }
 }
 
@@ -2993,5 +3071,31 @@ mod tests {
         assert!(cfg.endpoint_criterion.is_none());
         assert!(cfg.verify_steps.is_empty(), "loader non popola la catena");
         assert!(!cfg.verify_profile_missing);
+    }
+
+    #[test]
+    fn price_aware_budget_uniforma_il_tetto_in_dollari() {
+        use super::price_aware_token_budget;
+        let fixed = 400_000u64;
+
+        // Cap costo disattivato (0) o prezzo ignoto -> resta il tetto token.
+        assert_eq!(price_aware_token_budget(fixed, 0.0, 11.25), fixed);
+        assert_eq!(price_aware_token_budget(fixed, 3.0, 0.0), fixed);
+
+        // Modello economico (deepseek-flash blended ~0.175 $/M): 3$/0.175 = ~17M
+        // token -> il tetto token 400k e' piu' stringente, nessun taglio.
+        assert_eq!(price_aware_token_budget(fixed, 3.0, 0.175), fixed);
+
+        // Modello caro (gpt-5.5 blended ~11.25 $/M): 3$/11.25 = ~267k token ->
+        // il cap costo morde (il run si ferma a ~$3 invece di ~$4.5 a 400k).
+        let caro = price_aware_token_budget(fixed, 3.0, 11.25);
+        assert!(caro < fixed, "il modello caro deve essere tagliato: {caro}");
+        assert_eq!(caro, 266_666); // floor(3/11.25 * 1e6)
+
+        // Tetto token disattivato (0) ma cap costo attivo -> vale il derivato.
+        assert_eq!(price_aware_token_budget(0, 3.0, 11.25), 266_666);
+
+        // Mai 0 spurio (bloccherebbe il primo turno).
+        assert_eq!(price_aware_token_budget(fixed, 0.0000001, 11.25), 1);
     }
 }

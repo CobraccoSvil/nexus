@@ -167,6 +167,34 @@ pub fn pick_escalation_model(
     })
 }
 
+/// Limita i candidati di escalation a una salita di UN SOLO gradino di tier
+/// rispetto a `current_tier` (piu' i pari-tier e inferiori, che
+/// [`pick_escalation_model`] arbitra con l'ordine salute -> tier -> likelihood).
+/// Evita il SALTO diretto al tier MASSIMO disponibile su una non-convergenza:
+/// si sale gradualmente (es. medium -> high, non medium -> frontier), coerente
+/// con `clamp_one_step` dello scale-controller e con l'obiettivo costi (un
+/// gradino costa molto meno del massimo, e spesso basta). FALLBACK graceful: se
+/// NESSUN candidato e' entro `current+1` (l'unico piu' capace e' 2+ gradini
+/// sopra), ritorna TUTTI i candidati — meglio un salto grande che restare bloccati
+/// su un modello che non converge. `current_tier` `None` = medium neutro
+/// (coerente con `tier_rank`).
+pub fn cap_candidates_one_step(
+    candidates: &[EscalationCandidate],
+    current_tier: Option<&str>,
+) -> Vec<EscalationCandidate> {
+    let ceil = tier_rank(current_tier).saturating_add(1);
+    let capped: Vec<EscalationCandidate> = candidates
+        .iter()
+        .filter(|c| tier_rank(c.tier.as_deref()) <= ceil)
+        .cloned()
+        .collect();
+    if capped.is_empty() {
+        candidates.to_vec()
+    } else {
+        capped
+    }
+}
+
 /// PUNTO UNICO (regola L) della selezione AGENTICA del SOSTITUTO su provider
 /// caduto (failover cross-provider). PURA. Dato l'insieme dei candidati
 /// ammissibili (tutti i tier, gia' filtrati per eleggibilita'/cooldown/exclude
@@ -477,5 +505,44 @@ mod tests {
     fn failover_insieme_vuoto_ritorna_none() {
         let p = GovernancePolicy::default();
         assert!(pick_failover_model(&[], Some("heavy"), &p).is_none());
+    }
+
+    // ---- cap_candidates_one_step (salita di un gradino) ----
+
+    #[test]
+    fn cap_un_gradino_scarta_i_tier_troppo_alti() {
+        // Corrente medium (rank 2): ammessi fino a high (rank 3). heavy/frontier fuori.
+        let cands = vec![
+            cand("a", "med", Some("medium")),
+            cand("b", "high", Some("high")),
+            cand("c", "heavy", Some("heavy")),
+            cand("d", "frontier", Some("frontier")),
+        ];
+        let capped = cap_candidates_one_step(&cands, Some("medium"));
+        let models: Vec<&str> = capped.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(models, vec!["med", "high"], "solo <= corrente+1 (high)");
+    }
+
+    #[test]
+    fn cap_un_gradino_fallback_se_nessuno_entro_il_gradino() {
+        // Corrente medium ma l'unico piu' capace e' frontier (2+ gradini): niente
+        // candidato entro high -> fallback a TUTTI (meglio saltare che bloccarsi).
+        let cands = vec![cand("z", "frontier", Some("frontier"))];
+        let capped = cap_candidates_one_step(&cands, Some("medium"));
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].model, "frontier");
+    }
+
+    #[test]
+    fn cap_un_gradino_pari_tier_altro_provider_ammesso() {
+        // Corrente high: pari-tier (high, altro provider) e high+1 (heavy) ammessi.
+        let cands = vec![
+            cand("p1", "high-alt", Some("high")),
+            cand("p2", "heavy", Some("heavy")),
+            cand("p3", "frontier", Some("frontier")),
+        ];
+        let capped = cap_candidates_one_step(&cands, Some("high"));
+        let models: Vec<&str> = capped.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(models, vec!["high-alt", "heavy"]);
     }
 }

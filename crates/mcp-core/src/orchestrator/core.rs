@@ -1012,17 +1012,18 @@ impl Orchestrator {
 
             // PUNTO UNICO di selezione agentica (regola L): miglior modello
             // tool-capable del tier/capability, da un provider NON in cooldown.
-            // Ordine allineato a route_model_from_catalog: i modelli flagship
-            // (is_featured) hanno precedenza sul solo costo, cosi' il fallback di
-            // coding preferisce il modello piu' forte disponibile invece del piu'
-            // economico (che nei tier degradati sarebbe un flash/lite).
+            // Ordine allineato a route_model_from_catalog (AGENTIC_COST_FIRST_ORDER):
+            // il tier gia' garantisce la fascia di capacita', dentro il tier si
+            // prende il piu' ECONOMICO (obiettivo costi). I modelli economici
+            // problematici sono retrocessi dalla governance telemetria-aware e dagli
+            // esiti dei run, non da un flag `is_featured` statico.
             let found = select_agentic_model(
                 db,
                 &tiers_to_try,
                 Some(&cap),
                 0,
                 &[],
-                "is_featured DESC, input_cost_per_million_tokens ASC",
+                crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
             )
             .await;
             if let Some((ref alt_provider, ref alt_model)) = found {
@@ -1302,7 +1303,12 @@ impl Orchestrator {
                     tenant_id: input.project_id.clone(),
                     user_id: input.user_id.clone(),
                     request_id: run_id.to_string(),
-                    sensitivity_tier: 0,
+                    // Claim locale di sensibilita' (punto unico dlp, regola L).
+                    // L'enforcement resta nel gateway, che ri-classifica e usa
+                    // max(claim, classificazione) + validate_tier_claim: il claim
+                    // onesto evita di dichiarare 'pubblico' (0) un prompt che il
+                    // DLP locale sa gia' essere sensibile.
+                    sensitivity_tier: crate::dlp::classify_sensitivity(&composed_prompt) as u8,
                     feature: intent.clone(),
                 },
                 ..Default::default()

@@ -158,7 +158,7 @@ use crate::decisions::end_turn::{
     billing_fail_fast_message, build_unfulfilled_report, should_substitute_unfulfilled_report,
     should_upscale, strip_suggested_actions, upscale_required_tokens,
 };
-use crate::decisions::escalation::pick_escalation_model;
+use crate::decisions::escalation::{cap_candidates_one_step, pick_escalation_model};
 use crate::decisions::g1_accounting::{g1_accounting, G1Signals};
 use crate::decisions::helpers::{
     provider_style_supports_forcing, should_force_tool_choice, structural_unfulfilled_signal,
@@ -169,6 +169,7 @@ use crate::decisions::loop_signatures::{
     LoopThresholds,
 };
 use crate::decisions::meta_reason::{build_stall_context, translate};
+use crate::decisions::text_repetition::{detect_repetition_collapse, RepetitionThresholds};
 use crate::decisions::orchestration_reason::context_pressure_from_tokens;
 use crate::decisions::progress_controller::{self as pc, Action, Axis, ProgressSignals};
 use crate::decisions::scale_reason::{
@@ -342,6 +343,13 @@ pub struct ExecutorConfig {
     /// (`agent.loop.signature_threshold` / `agent.loop.recent_signatures_cap`).
     /// Regola G: ex costanti `LOOP_THRESHOLD` / `RECENT_SIGNATURES_CAP`.
     pub loop_thresholds: LoopThresholds,
+    /// Soglie DB-driven (`agent.anti_repetition.*`) del rilevamento
+    /// repetition-collapse del TESTO di un turno assistant: un muro di testo con
+    /// la stessa sottostringa ripetuta N+ volte (collasso dei modelli piccoli) NON
+    /// e' una risposta valida ne' un esito verificato. Complementare al
+    /// signature-loop (che guarda le tool call, non il testo). `scan_tail_cap=0`
+    /// disabilita -> comportamento bit-identico. Regola G: mai hardcoded.
+    pub repetition: RepetitionThresholds,
     /// Soglia (`agent.loop.repeated_user_question_threshold`, mig 0510, default 2)
     /// oltre la quale (`>=`) scatta l'asse `RepeatedUserQuestion` (loop
     /// clarification CROSS-RUN, chiude il loop email). Il conteggio arriva da
@@ -564,6 +572,7 @@ impl Default for ExecutorConfig {
             run_token_hard_cap: 800_000,
             max_consecutive_text_only_turns: 3,
             loop_thresholds: LoopThresholds::default(),
+            repetition: RepetitionThresholds::default(),
             // Default safe-DB-down = seed mig 0510 (2). Con nessuna storia di
             // clarify ripetuti l'asse non scatta mai -> comportamento invariato.
             repeated_user_question_threshold: 2,
@@ -3625,6 +3634,71 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
                 new_signatures = vec![]; // reset accumulator (py:3281)
             }
         }
+
+        // ── Anti repetition-collapse del TESTO (regola M) ─────────────────────
+        // Complementare al signature-loop (che guarda le tool call): un turno con
+        // UNA sola tool call ma un muro di testo ripetuto (stessa sottostringa
+        // N+ volte) NON triggera il signature-loop eppure e' spazzatura degenere
+        // (collasso dei modelli piccoli: codestral "Command failed" x898, run
+        // de7477e9). Segnale STRUTTURALE (periodicita' della coda, punto unico
+        // [`detect_repetition_collapse`]), mai semantica del testo.
+        //
+        // Chiusura come il signature-loop (regola L): impostiamo le variabili di
+        // chiusura (assistant_msg col recap ONESTO, tool azzerati, loop_close_result)
+        // e LASCIAMO proseguire il flusso normale. NON un early return: quello
+        // bypasserebbe la coda del turno (contabilita' token da resp.usage,
+        // emissione SseEvent::Usage, propagazione auto_escalations, set_effective_model)
+        // -> total_tokens=0 e conteggio escalation perso (review adversariale).
+        // Il testo degenere viene SCARTATO (sostituito dal recap); i TOKEN del turno
+        // restano contati (sono stati consumati davvero). loop_close_result rende il
+        // delta finale forced_close_unverified -> esito FailedDiagnosed, mai 'completed'.
+        // Salta se il signature-loop ha gia' deciso la chiusura del turno.
+        if loop_close_result.is_none() {
+            if let Some(hit) = detect_repetition_collapse(&result_text, self.cfg.repetition) {
+                let preview = hit.unit_preview(80);
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    provider = %provider,
+                    model = %model,
+                    repeats = hit.repeats,
+                    span_len = hit.span_len,
+                    "repetition-collapse rilevato nel testo del turno -> chiusura non-verificata"
+                );
+                self.emit_phase(
+                    ctx,
+                    mode,
+                    "repetition_collapse",
+                    format!("Risposta degenere di {provider}/{model}: interrompo (testo ripetuto)"),
+                    json!({
+                        "reason": "repetition_collapse",
+                        "repeats": hit.repeats,
+                        "span_len": hit.span_len,
+                    }),
+                )
+                .await;
+                let close_text = format!(
+                    "[RISPOSTA DEGENERE] Il modello {provider}/{model} ha prodotto una \
+risposta ripetitiva non valida: la sequenza \"{preview}\" e' stata ripetuta \
+{}+ volte senza contenuto utile. Nessuna verifica e' stata eseguita e il \
+compito NON e' stato completato. Riformula la richiesta oppure riprova con un \
+modello piu' capace.",
+                    hit.repeats
+                );
+                assistant_msg = Message::Ai {
+                    content: MessageContent::text(close_text.clone()),
+                    tool_calls: vec![],
+                    reasoning: None,
+                };
+                pending_tool_uses = vec![];
+                // Riusa il vocabolario stop_reason del forced-close anti-loop
+                // (riconosciuto da stop_reason_from_str -> canonical "loop"); il
+                // meta_step "repetition_collapse" sopra distingue nella timeline.
+                stop_reason_str_resp = Some("loop_detected".to_string());
+                loop_close_result = Some(close_text);
+                new_signatures = vec![];
+            }
+        }
+
         let stop_reason_final = stop_reason_str_resp.as_deref();
 
         // Provider/model EFFETTIVI (cascade interno del gateway), calcolati DOPO l'
@@ -4439,8 +4513,14 @@ impl ExecutorNode {
             )
             .await
             .unwrap_or_default();
+        // Salita di UN gradino, non al tier MASSIMO disponibile (audit selezione
+        // costi): la non-convergenza fa salire gradualmente (es. medium -> high, non
+        // -> frontier). Il giudice meta-reasoner progress-aware ha gia' avuto la sua
+        // chance a monte (maybe_runaway_stall_delta); esaurito quello, qui si promuove
+        // con moderazione invece di saltare al piu' caro per abitudine.
+        let stepped = cap_candidates_one_step(&inputs.candidates, state.current_tier.as_deref());
         let pick = pick_escalation_model(
-            &inputs.candidates,
+            &stepped,
             cur_provider.as_deref(),
             cur_model.as_deref(),
             &inputs.policy,
@@ -4451,14 +4531,14 @@ impl ExecutorNode {
             to_provider = %pick.provider,
             to_model = %pick.model,
             reason,
-            "non-convergenza: ESCALATION agentica a modello piu' capace -> reset budget, ri-do il turno"
+            "non-convergenza: ESCALATION agentica di un gradino -> budget del turno azzerato per il promosso"
         );
         self.emit_phase(
             ctx,
             mode,
             "escalation",
             format!(
-                "Passo a {}/{} (non-convergenza: budget senza progresso)",
+                "Passo a {}/{} (non-convergenza sul budget del turno)",
                 pick.provider, pick.model
             ),
             json!({
@@ -4469,9 +4549,9 @@ impl ExecutorNode {
         )
         .await;
         let esc_nudge = human_msg(
-            "Il modello precedente ha consumato il budget senza completare il compito. \
-Ora rispondi tu, che sei un modello piu' capace: NON descrivere, procedi con azioni \
-concrete e mirate verso il completamento.",
+            "Il modello precedente non ha completato il compito entro il budget del turno. \
+Prosegui tu da dove e' arrivato: NON ricominciare da capo ne' descrivere, procedi con \
+azioni concrete e mirate verso il completamento.",
         );
         let mut extra_out = state.extra.clone();
         extra_out.insert("auto_escalations".to_string(), json!(escal + 1));

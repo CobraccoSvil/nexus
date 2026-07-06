@@ -212,6 +212,19 @@ fn floor_tier_for_agentic<'a>(
 /// diverge. La degradazione resta GRACEFUL: la tier-chain scende comunque verso
 /// il basso (es. heavy->medium->light) se nessun candidato del tier minimo e'
 /// disponibile (tutti in cooldown), senza mai fallire.
+/// `ORDER BY` della selezione agentica dal catalog: COSTO prima, `is_featured`
+/// come solo tie-break. PUNTO UNICO (regola L). Razionale (obiettivo primario di
+/// Nexus: ottimizzare i costi restando svincolati dal provider): il `tier` gia'
+/// garantisce la FASCIA di capacita' richiesta; DENTRO il tier si prende il
+/// modello piu' ECONOMICO, non quello marcato `is_featured` a mano — un flag
+/// curato senza semantica di costo che faceva pagare fino a ~7x (es. codestral
+/// 1.0 $/M featured al posto di deepseek-v4-flash 0.14 sul tier medium). I
+/// modelli economici problematici NON restano scelti: la governance
+/// telemetria-aware (regola M) e gli esiti dei run li retrocedono per salute, che
+/// e' il criterio corretto (un flag statico non lo era).
+pub(crate) const AGENTIC_COST_FIRST_ORDER: &str =
+    "input_cost_per_million_tokens ASC, is_featured DESC";
+
 pub(crate) async fn route_model_from_catalog(
     db: &PgPool,
     base_tier: &str,
@@ -251,12 +264,14 @@ pub(crate) async fn route_model_from_catalog(
     let required_tier = floor_tier_for_agentic(is_agentic_turn, mode_tier, &floor);
 
     // Query al catalogo: trova il modello più economico che soddisfa tier+capability.
-    // Per "veloce" ordina per speed_tier, per "economica" per costo, per altri per featured.
+    // "veloce" ordina per speed_tier, "economica"/dinamico per costo (il tier gia'
+    // garantisce la capacita', regola costi: AGENTIC_COST_FIRST_ORDER), "approfondita"
+    // preferisce il piu' capace/caro DENTRO il tier gia' promosso.
     let order_clause = match mode {
         "veloce"    => "CASE speed_tier WHEN 'fast' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, input_cost_per_million_tokens ASC",
         "economica" => "input_cost_per_million_tokens ASC",
         "approfondita" => "is_featured DESC, input_cost_per_million_tokens DESC",
-        _           => "is_featured DESC, input_cost_per_million_tokens ASC",
+        _           => AGENTIC_COST_FIRST_ORDER,
     };
 
     // Selezione tramite il PUNTO UNICO (regola L): l'eleggibilita' agentica
@@ -335,7 +350,7 @@ pub(crate) async fn agentic_failover_candidates(
         db,
         &filter,
         &[],
-        "is_featured DESC, input_cost_per_million_tokens ASC",
+        AGENTIC_COST_FIRST_ORDER,
         FAILOVER_CANDIDATE_POOL,
     )
     .await
@@ -377,15 +392,8 @@ pub async fn best_model_for_tier(
     // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
     // applica l'eleggibilita' agentica + cooldown in un solo posto.
     if requires_tool_use {
-        return select_agentic_model(
-            db,
-            &[tier],
-            capability,
-            0,
-            &[],
-            "is_featured DESC, input_cost_per_million_tokens ASC",
-        )
-        .await;
+        return select_agentic_model(db, &[tier], capability, 0, &[], AGENTIC_COST_FIRST_ORDER)
+            .await;
     }
 
     // Caso NON-agentico (es. purpose vision/chat/embedding): vista sottile sul
@@ -418,7 +426,7 @@ pub async fn best_model_for_tier(
         &filter,
         &[tier],
         "(uses_thinking_mode AND NOT supports_tool_use) ASC, \
-         is_featured DESC, input_cost_per_million_tokens ASC",
+         input_cost_per_million_tokens ASC, is_featured DESC",
         1,
     )
     .await
