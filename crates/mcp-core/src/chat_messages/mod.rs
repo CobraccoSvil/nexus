@@ -47,6 +47,11 @@ pub struct SendChatMessageRequest {
     /// nel DB e usato per triggerare l'agent run.
     #[serde(default)]
     pub synthetic: bool,
+    /// Chiave di idempotenza generata dal client (mig progetto 0008): un retry
+    /// di rete della stessa POST porta lo stesso UUID e il backend, se il
+    /// messaggio risulta gia' persistito nella sessione, fa replay della
+    /// risposta invece di duplicare messaggio e agent run.
+    pub client_message_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

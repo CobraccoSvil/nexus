@@ -138,7 +138,7 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
         )
         .route(
             "/api/chat/sessions/:id",
-            axum::routing::patch(chat_sessions::rename_chat_session)
+            axum::routing::patch(chat_sessions::update_chat_session)
                 .delete(chat_sessions::delete_chat_session)
                 .layer(axum_mw::from_fn_with_state(
                     state.clone(),

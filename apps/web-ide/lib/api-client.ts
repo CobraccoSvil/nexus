@@ -14,6 +14,7 @@
 
 export * from "./api/_shared";
 export * from "./api/system";
+export * from "./api/health-monitor";
 export * from "./api/admin-settings";
 export * from "./api/admin-sudo";
 export * from "./api/prompts";

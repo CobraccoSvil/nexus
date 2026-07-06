@@ -111,6 +111,61 @@ pub async fn list_chat_messages(
         "messages": messages
     })))
 }
+/// Risposta di replay per una POST /messages ritentata dal client con lo
+/// stesso `clientMessageId` (idempotenza invio, mig progetto 0008). Il
+/// messaggio utente esiste gia': si restituisce quello, allegando l'eventuale
+/// run attivo della sessione cosi' il client si riaggancia allo stream SSE
+/// invece di restare su uno stato ottimistico mai confermato.
+async fn replay_idempotent_send(
+    state: &AppState,
+    session_pool: &PgPool,
+    context: &crate::chat_sessions::SessionContext,
+    user_message_id: Uuid,
+) -> ApiResult {
+    let user_row = load_message_by_id(&state.db, context.project_id, user_message_id).await?;
+    let user_message = to_message_view(&user_row)?;
+
+    // Run attivo della sessione (stessa soglia di recency del gate
+    // anti-run-concorrente): se presente, e' il run avviato dal primo
+    // tentativo di questa stessa POST.
+    let active_run: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, status, provider, model FROM agent_runs \
+         WHERE session_id = $1 \
+           AND status IN ('running', 'awaiting_confirmation') \
+           AND created_at > NOW() - INTERVAL '15 minutes' \
+         ORDER BY created_at DESC \
+         LIMIT 1",
+    )
+    .bind(context.session_id)
+    .fetch_optional(session_pool)
+    .await
+    .ok()
+    .flatten();
+
+    let agent_run = active_run.map(|(run_id, status, provider, model)| {
+        json!({
+            "runId": run_id.to_string(),
+            "status": status,
+            "provider": provider.unwrap_or_default(),
+            "model": model.unwrap_or_default(),
+        })
+    });
+
+    // Allegati gia' persistiti dal primo tentativo (punto unico
+    // message_attachments_json): li restituiamo nello stesso shape del path
+    // normale, cosi' i chip e la proposta di indicizzazione KB non si perdono
+    // col retry idempotente.
+    let saved_attachments = message_attachments_json(session_pool, user_message_id).await;
+
+    Ok(Json(json!({
+        "sessionId": context.session_id.to_string(),
+        "userMessage": user_message,
+        "agentRun": agent_run,
+        "savedAttachments": saved_attachments,
+        "idempotentReplay": true,
+    })))
+}
+
 pub async fn send_chat_message(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -181,6 +236,28 @@ pub async fn send_chat_message(
             .await;
     }
 
+    // ── Idempotenza invio (mig progetto 0008) ────────────────────────────────
+    // Retry di rete della stessa POST: il client dichiara clientMessageId. Se
+    // il messaggio risulta gia' persistito in questa sessione, il tentativo
+    // precedente era arrivato al server (si e' persa solo la risposta):
+    // replay di userMessage + eventuale run attivo, senza duplicare il
+    // messaggio ne' avviare un secondo run. DEVE stare PRIMA del gate
+    // anti-run-concorrente: il run avviato dal primo tentativo e' proprio
+    // quello che il retry deve ritrovare, non un 409.
+    if let Some(client_mid) = body.client_message_id {
+        let existing_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM chat_messages WHERE session_id = $1 AND client_message_id = $2",
+        )
+        .bind(context.session_id)
+        .bind(client_mid)
+        .fetch_optional(&session_pool)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Some(existing_id) = existing_id {
+            return replay_idempotent_send(&state, &session_pool, &context, existing_id).await;
+        }
+    }
+
     if parse_automation_mode(body.automation_mode.as_deref()) != AutomationMode::Study {
         let active_run: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM agent_runs \
@@ -203,7 +280,7 @@ pub async fn send_chat_message(
         }
     }
 
-    let user_message_id = insert_message(
+    let user_message_id = match insert_message_with_client_id(
         &state.db,
         context.session_id,
         context.project_id,
@@ -220,8 +297,33 @@ pub async fn send_chat_message(
             "synthetic": body.synthetic,
         }),
         None,
+        body.client_message_id,
     )
-    .await?;
+    .await?
+    {
+        ClientIdInsert::Inserted(id) => id,
+        ClientIdInsert::Duplicate => {
+            // Race stretta: un retry concorrente ha vinto l'INSERT tra il
+            // pre-check di idempotenza e questo punto. Il segnale e' l'unique
+            // violation strutturata (23505, regola M): si rilegge il messaggio
+            // vincente e si fa replay, mai duplicare.
+            let existing_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM chat_messages WHERE session_id = $1 AND client_message_id = $2",
+            )
+            .bind(context.session_id)
+            .bind(body.client_message_id)
+            .fetch_optional(&session_pool)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let Some(existing_id) = existing_id else {
+                return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "messaggio duplicato non ritrovato dopo unique violation",
+                ));
+            };
+            return replay_idempotent_send(&state, &session_pool, &context, existing_id).await;
+        }
+    };
     let user_row = load_message_by_id(&state.db, context.project_id, user_message_id).await?;
     let user_message = to_message_view(&user_row)?;
 

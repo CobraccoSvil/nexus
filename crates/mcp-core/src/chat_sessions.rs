@@ -47,6 +47,11 @@ struct SessionSummary {
     last_message_preview: Option<String>,
     created_at: String,
     updated_at: String,
+    /// Pin provider/modello per-sessione (chat_sessions.preferred_provider /
+    /// preferred_model): il frontend re-idrata il dropdown della chat da qui,
+    /// cosi' il pin sopravvive al refresh della pagina.
+    preferred_provider: Option<String>,
+    preferred_model: Option<String>,
 }
 
 pub(crate) async fn load_session_context(
@@ -147,6 +152,8 @@ pub async fn list_chat_sessions(
             s.status,
             s.created_at,
             s.updated_at,
+            s.preferred_provider,
+            s.preferred_model,
             (
                 SELECT COUNT(*)
                 FROM chat_messages m
@@ -203,6 +210,8 @@ pub async fn list_chat_sessions(
             let last_message_preview: Option<String> = row.try_get("last_message_preview").ok()?;
             let created_at: DateTime<Utc> = row.try_get("created_at").ok()?;
             let updated_at: DateTime<Utc> = row.try_get("updated_at").ok()?;
+            let preferred_provider: Option<String> = row.try_get("preferred_provider").ok()?;
+            let preferred_model: Option<String> = row.try_get("preferred_model").ok()?;
             Some(SessionSummary {
                 id: id.to_string(),
                 project_id: project_id.to_string(),
@@ -213,6 +222,8 @@ pub async fn list_chat_sessions(
                 last_message_preview,
                 created_at: created_at.to_rfc3339(),
                 updated_at: updated_at.to_rfc3339(),
+                preferred_provider,
+                preferred_model,
             })
         })
         .collect::<Vec<_>>();
@@ -276,15 +287,36 @@ pub async fn create_chat_session(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RenameChatSessionRequest {
-    pub title: String,
+pub struct UpdateChatSessionRequest {
+    /// Nuovo titolo. Assente = non toccare.
+    pub title: Option<String>,
+    /// Pin provider per-sessione dal dropdown della chat. Semantica:
+    /// campo assente = non toccare; "auto" o stringa vuota = azzera (NULL,
+    /// routing automatico); altro valore = pin. Punto unico di persistenza:
+    /// chat_sessions.preferred_provider, la stessa colonna gia' usata dal
+    /// comando testuale "usa <modello>" (detect_model_switch) e letta da
+    /// send_chat_message come override di default dei run successivi.
+    pub preferred_provider: Option<String>,
+    /// Come preferred_provider, per il modello.
+    pub preferred_model: Option<String>,
 }
 
-pub async fn rename_chat_session(
+/// Normalizza un valore di pin dal client: "auto" / stringa vuota significano
+/// "nessuna preferenza" (NULL in chat_sessions).
+fn normalize_session_pin(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub async fn update_chat_session(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(session_id_str): Path<String>,
-    Json(body): Json<RenameChatSessionRequest>,
+    Json(body): Json<UpdateChatSessionRequest>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
     let session_id = Uuid::parse_str(&session_id_str)
@@ -292,23 +324,54 @@ pub async fn rename_chat_session(
 
     let ctx = load_session_context(&state, session_id, user_id).await?;
 
-    let title = body.title.trim().to_string();
-    if title.is_empty() {
-        return Err(api_error(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Il titolo non puo' essere vuoto",
-        ));
-    }
+    let title = match body.title.as_deref().map(str::trim) {
+        Some("") => {
+            return Err(api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                "Il titolo non puo' essere vuoto",
+            ));
+        }
+        Some(value) => Some(value.to_string()),
+        None => None,
+    };
+    let set_provider = body.preferred_provider.is_some();
+    let provider_value = body
+        .preferred_provider
+        .as_deref()
+        .and_then(normalize_session_pin);
+    let set_model = body.preferred_model.is_some();
+    let model_value = body
+        .preferred_model
+        .as_deref()
+        .and_then(normalize_session_pin);
 
     let chat_pool = crate::project_db_routes::project_data_pool(&state, ctx.project_id).await;
-    sqlx::query("UPDATE chat_sessions SET title = $1, updated_at = NOW() WHERE id = $2")
-        .bind(&title)
-        .bind(ctx.session_id)
-        .execute(&chat_pool)
-        .await
-        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query(
+        r#"
+        UPDATE chat_sessions SET
+            title = COALESCE($1, title),
+            preferred_provider = CASE WHEN $2 THEN $3 ELSE preferred_provider END,
+            preferred_model = CASE WHEN $4 THEN $5 ELSE preferred_model END,
+            updated_at = NOW()
+        WHERE id = $6
+        "#,
+    )
+    .bind(&title)
+    .bind(set_provider)
+    .bind(&provider_value)
+    .bind(set_model)
+    .bind(&model_value)
+    .bind(ctx.session_id)
+    .execute(&chat_pool)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(json!({ "ok": true, "title": title })))
+    Ok(Json(json!({
+        "ok": true,
+        "title": title,
+        "preferredProvider": provider_value,
+        "preferredModel": model_value,
+    })))
 }
 
 pub async fn delete_chat_session(
@@ -919,4 +982,38 @@ pub async fn toggle_project_memory(
     }
 
     Ok(Json(json!({ "ok": true, "active": new_active })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_session_pin;
+
+    #[test]
+    fn pin_auto_and_empty_clear_the_preference() {
+        // "auto" e stringa vuota (in qualunque forma) azzerano il pin -> NULL:
+        // e' la stessa semantica che il frontend invia quando l'utente torna ad
+        // "Auto" nel dropdown della chat. Senza questo, un pin "auto" verrebbe
+        // salvato come stringa e i run successivi tenterebbero di forzare un
+        // provider inesistente.
+        assert_eq!(normalize_session_pin("auto"), None);
+        assert_eq!(normalize_session_pin("AUTO"), None);
+        assert_eq!(normalize_session_pin("  Auto  "), None);
+        assert_eq!(normalize_session_pin(""), None);
+        assert_eq!(normalize_session_pin("   "), None);
+    }
+
+    #[test]
+    fn pin_concrete_value_is_trimmed_and_kept() {
+        assert_eq!(normalize_session_pin("google"), Some("google".to_string()));
+        assert_eq!(
+            normalize_session_pin("  anthropic "),
+            Some("anthropic".to_string())
+        );
+        // "automatic" NON e' "auto": e' un valore concreto e va preservato
+        // (evita che un match troppo largo lo scarti).
+        assert_eq!(
+            normalize_session_pin("automatic"),
+            Some("automatic".to_string())
+        );
+    }
 }

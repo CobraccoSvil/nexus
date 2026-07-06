@@ -1,4 +1,4 @@
-import { API_BASE, fetchJson } from "./_shared";
+import { API_BASE, fetchJson, fetchJsonWithRetry } from "./_shared";
 
 export interface ChatSessionSummary {
   id: string;
@@ -10,6 +10,11 @@ export interface ChatSessionSummary {
   lastMessagePreview?: string;
   createdAt: string;
   updatedAt: string;
+  /** Pin provider/modello per-sessione (chat_sessions.preferred_provider/
+   *  preferred_model): il dropdown della chat si re-idrata da qui al mount e
+   *  al cambio tab, cosi' il pin sopravvive al refresh della pagina. */
+  preferredProvider?: string | null;
+  preferredModel?: string | null;
 }
 
 export interface ChatMessage {
@@ -199,6 +204,22 @@ export async function renameChatSession(
   });
 }
 
+/** Persiste il pin provider/modello della sessione lato server
+ *  (chat_sessions.preferred_provider/preferred_model, lo stesso punto unico
+ *  usato dal comando testuale "usa <modello>"). Semantica: "auto" o stringa
+ *  vuota azzerano il pin (routing automatico); campo undefined = non toccato.
+ *  Il backend applica il pin a TUTTI i run successivi della sessione finche'
+ *  l'utente non lo cambia — e' questo che rende il pin robusto al refresh. */
+export async function updateChatSessionPrefs(
+  sessionId: string,
+  prefs: { preferredProvider?: string; preferredModel?: string },
+): Promise<{ ok: boolean; preferredProvider: string | null; preferredModel: string | null }> {
+  return fetchJson(`${API_BASE}/api/chat/sessions/${sessionId}`, {
+    method: "PATCH",
+    body: JSON.stringify(prefs),
+  });
+}
+
 export async function deleteChatSession(
   sessionId: string,
 ): Promise<{ ok: boolean }> {
@@ -249,10 +270,22 @@ export async function sendChatMessage(
   content: string,
   options: SendChatMessageOptions = {},
 ): Promise<SendChatMessageResponse> {
-  return fetchJson(`${API_BASE}/api/chat/sessions/${sessionId}/messages`, {
+  // Chiave di idempotenza (mig progetto 0008): rende sicuro il retry della POST
+  // su errori di trasporto/timeout/5xx. Se il primo tentativo era arrivato al
+  // server (risposta persa in rete), il backend riconosce il clientMessageId e
+  // fa replay della risposta invece di duplicare messaggio e run.
+  const clientMessageId =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : undefined;
+  // Senza chiave di idempotenza (runtime senza crypto.randomUUID) il retry
+  // duplicherebbe il messaggio: in quel caso si degrada al singolo tentativo.
+  const doFetch = clientMessageId ? fetchJsonWithRetry : fetchJson;
+  return doFetch(`${API_BASE}/api/chat/sessions/${sessionId}/messages`, {
     method: "POST",
     body: JSON.stringify({
       content,
+      clientMessageId,
       profileId: options.profileId ?? "default",
       activeFiles: options.activeFiles ?? [],
       providerOverride: options.providerOverride,

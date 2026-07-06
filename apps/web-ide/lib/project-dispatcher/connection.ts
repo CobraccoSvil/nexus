@@ -3,6 +3,7 @@
 // Se SSE down, il ConnectionStatusBadge mostra lo stato; nessun fetch silenzioso
 // con dati potenzialmente stantii.
 
+import { onBackendRecovered } from "../api/health-monitor";
 import { useProjectStore } from "./store";
 import type { EnvelopedEvent } from "./types";
 
@@ -14,6 +15,9 @@ let currentSource: EventSource | null = null;
 let currentProjectId: string | null = null;
 let reconnectTimer: number | null = null;
 let snapshotInflight: AbortController | null = null;
+// Unsubscribe del listener di recovery del backend (registrato una volta alla
+// prima connessione). Il monitor health e' un punto unico condiviso (regola L).
+let recoveryUnsub: (() => void) | null = null;
 
 async function fetchSnapshot(projectId: string): Promise<void> {
   // Abort precedente snapshot ancora in volo (cambio progetto rapido)
@@ -159,6 +163,19 @@ export async function connectDispatcher(projectId: string): Promise<void> {
 
   currentProjectId = projectId;
   useProjectStore.getState().setProject(projectId);
+
+  // Segnale "backend ritornato disponibile" (punto unico health-monitor): quando
+  // mcp-core si riavvia, l'EventSource cade e il backoff sopra riprova, ma
+  // ri-aggancia solo il broadcast live da `lastSeq`. Alla recovery forziamo un
+  // resync completo: fetchSnapshot riallinea lo stato corrente (colma gli eventi
+  // persi durante il down, es. ChatSessionCompacted/ChatMessageAdded) e POI
+  // riapre lo stream. refreshDispatcher applica gia' quest'ordine ed e'
+  // idempotente (chiude la connessione corrente prima di riaprire).
+  if (!recoveryUnsub) {
+    recoveryUnsub = onBackendRecovered(() => {
+      if (currentProjectId) refreshDispatcher();
+    });
+  }
 
   // 1) Bootstrap snapshot REST (stato corrente)
   await fetchSnapshot(projectId);

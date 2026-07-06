@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ApiError,
+  onBackendRecovered,
   cancelAgentRun,
   confirmAgentRun,
   createChatSession,
@@ -43,6 +45,11 @@ export function useChat(
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(opts.sessionId ?? null);
   const [isLoading, setIsLoading] = useState(false);
+  // POST /messages in volo, NON ancora confermata dal server. Distinta da
+  // isLoading (che copre anche il run agentico gia' avviato): finche'
+  // isSending=true il messaggio NON e' persistito e la UI deve dirlo
+  // ("invio in corso"), non fingere un'elaborazione gia' accettata.
+  const [isSending, setIsSending] = useState(false);
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyByMessage, setBusyByMessage] = useState<Record<string, BusyAction | undefined>>({});
@@ -362,10 +369,26 @@ export function useChat(
     void bootstrap();
   }, [bootstrap]);
 
+  // Cleanup della subscription SSE PRIMARIA corrente. subscribeAgentStream
+  // ritorna una funzione che chiude l'EventSource e ferma il loop di reconnect;
+  // la conserviamo qui per poterla chiudere PRIMA di aprirne un'altra sullo
+  // stesso canale primario. Senza questo, un riaggancio (recovery del backend,
+  // reattach post-409, reattach in onDone) apriva un secondo EventSource mentre
+  // il primo era ancora in reconnect-loop -> due stream concorrenti sullo stesso
+  // run, doppioni di step e usage. Le subscription FIGLIE (sub-agenti) non sono
+  // tracciate qui: vivono legate al ciclo del run padre.
+  const primarySubCleanupRef = useRef<(() => void) | null>(null);
+
   // Sottoscrive a un run (primario o figlio) e aggiorna le map di stato
   const subscribeToRun = useCallback(
     (sid: string, runId: string, isPrimary: boolean) => {
-      subscribeAgentStream(
+      // Chiudi la subscription primaria precedente prima di aprirne una nuova
+      // (idempotenza del riaggancio: mai due EventSource primari attivi).
+      if (isPrimary && primarySubCleanupRef.current) {
+        primarySubCleanupRef.current();
+        primarySubCleanupRef.current = null;
+      }
+      const cleanup = subscribeAgentStream(
         sid,
         runId,
         (event) => {
@@ -732,6 +755,10 @@ export function useChat(
           }
         },
       );
+      // Conserva il cleanup della sola subscription primaria (vedi ref sopra).
+      if (isPrimary) {
+        primarySubCleanupRef.current = cleanup;
+      }
     },
     [projectId, refreshSessionUsage],
   );
@@ -789,15 +816,21 @@ export function useChat(
       setAutoContinuePending(false);
 
       setIsLoading(true);
+      setIsSending(true);
       setError(null);
       // Reset thinking buffer: il prossimo run partira pulito
       setThinkingText("");
       let isAgentMode = false;
       try {
+        // sendChatMessage e' idempotente (clientMessageId) e ritenta da solo
+        // sugli errori di trasporto/5xx: quando risolve, il messaggio E'
+        // persistito lato server (response.userMessage.id); quando rigetta,
+        // l'invio e' definitivamente fallito e l'errore diventa visibile.
         const response = await sendChatMessage(sessionId, content.trim(), {
           ...options,
           profileId: options.profileId ?? profileId,
         });
+        setIsSending(false);
 
         // Inietta gli allegati salvati (se presenti) nel messaggio utente,
         // cosi' i chip vengono renderizzati subito dal MessageList senza
@@ -865,7 +898,8 @@ export function useChat(
         // l'utente: accodiamo il messaggio e ci riagganciamo al run in corso, cosi'
         // il drain lo invia a fine run invece di mostrare "Invio fallito". L'isLoading
         // viene gestito da reattachActiveRun; non lo resettiamo qui.
-        const is409 = e instanceof Error && e.message.includes("409");
+        // Status dallo stato strutturato di ApiError (regola M), mai dal testo.
+        const is409 = e instanceof ApiError && e.status === 409;
         if (is409) {
           setPendingQueue((q) => [...q, { content: content.trim(), options }]);
           const attached = await reattachActiveRun(sessionId);
@@ -880,6 +914,7 @@ export function useChat(
         setError(formatChatError(e, "Invio messaggio fallito."));
         isAgentMode = false;
       } finally {
+        setIsSending(false);
         if (!isAgentMode) setIsLoading(false);
       }
     },
@@ -1180,8 +1215,15 @@ export function useChat(
   // run attivo, riconcilia con lo stato reale del DB (a intervalli regolari e al
   // ritorno sul tab) e, se terminale, sblocca la UI come farebbe onDone. Le
   // chiamate di chiusura sono idempotenti: una corsa con onDone e' innocua.
+  //
+  // Si arma su agentRun (NON su isLoading): l'onDone dello stream, se la
+  // getAgentRun finale fallisce per rete, resetta isLoading MA lascia agentRun
+  // valorizzato. In quello stato "fantasma" (agentRun!=null, isLoading=false)
+  // la coda pendingQueue resta bloccata per sempre: il drain richiede
+  // agentRun==null e col vecchio guard su isLoading il watchdog non girava piu'
+  // (causa radice del messaggio accodato mai inviato dopo una riconnessione).
   useEffect(() => {
-    if (!isLoading || !sessionId) return;
+    if (!sessionId) return;
     const runId = agentRun?.runId;
     if (!runId) return;
     let cancelled = false;
@@ -1221,7 +1263,38 @@ export function useChat(
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLoading, sessionId, agentRun?.runId, projectId]);
+  }, [sessionId, agentRun?.runId, projectId]);
+
+  // Risync SSE al ritorno del backend (fix "chat cieca sul run dopo restart di
+  // mcp-core"). Il canale agent-stream ha gia' reconnect con backoff, ma dopo un
+  // restart puo' restare agganciato a un run_id ormai terminale/sostituito e non
+  // sa qual e' il run attivo ORA. Il punto unico health-monitor emette un segnale
+  // down->up: qui ri-verifichiamo il run attivo della sessione dal server e
+  // riagganciamo la subscription (reattachActiveRun chiude quella precedente via
+  // primarySubCleanupRef e ne apre una nuova sul run corrente, con lo stato
+  // risincronizzato dal replay backend — non solo i delta futuri). Se non c'e'
+  // piu' un run attivo, il watchdog sopra e l'agent_final del replay chiudono la
+  // UI: nessuna azione qui.
+  useEffect(() => {
+    if (!sessionId) return;
+    const unsub = onBackendRecovered(() => {
+      void reattachActiveRun(sessionId);
+    });
+    return unsub;
+  }, [sessionId, reattachActiveRun]);
+
+  // Chiude la subscription SSE primaria all'unmount del componente: senza questo
+  // un EventSource (con il suo loop di reconnect) resterebbe orfano dopo la
+  // smontatura della chat. finish e' idempotente, quindi e' innocuo anche se lo
+  // stream era gia' concluso.
+  useEffect(() => {
+    return () => {
+      if (primarySubCleanupRef.current) {
+        primarySubCleanupRef.current();
+        primarySubCleanupRef.current = null;
+      }
+    };
+  }, []);
 
   /** Chiude la modal di indicizzazione KB senza eseguire alcuna richiesta.
    *  Usato sia dal pulsante "Salta tutto" sia dopo il completamento di una
@@ -1258,6 +1331,7 @@ export function useChat(
     messages,
     sessionId,
     isLoading,
+    isSending,
     isReady,
     isReconnecting,
     error,
