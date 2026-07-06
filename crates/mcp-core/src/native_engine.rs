@@ -773,7 +773,7 @@ async fn load_executor_config(
             signature: setting_i64(db, "agent.loop.signature_threshold", d.loop_thresholds.signature as i64).await.max(1) as usize,
             cap: setting_i64(db, "agent.loop.recent_signatures_cap", d.loop_thresholds.cap as i64).await.max(1) as usize,
         },
-        // Anti repetition-collapse del testo (mig 0534, regola G): soglie della
+        // Anti repetition-collapse del testo (mig 0531, regola G): soglie della
         // rilevazione del turno degenere (stessa sottostringa ripetuta N+ volte).
         // `scan_tail_cap=0` disabilita -> bit-identico. Clamp non-negativo; le
         // lunghezze minime >=1 (0 sarebbe insensato).

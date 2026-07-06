@@ -1,4 +1,4 @@
--- 0534_anti_repetition_collapse.sql
+-- 0531_anti_repetition_collapse.sql
 -- Rilevamento del repetition-collapse del TESTO nel motore agentico nativo
 -- (crates/nexus-agent-graph, nodo executor + decisions::text_repetition).
 -- Complementare al signature-loop (agent.loop.*), che guarda la FIRMA delle TOOL
@@ -28,13 +28,13 @@
 
 INSERT INTO settings (key, value, category, description) VALUES
   ('agent.anti_repetition.min_unit_len', '1', 'agent',
-   'Lunghezza minima (caratteri) dell''unita'' ripetuta considerata nel rilevamento repetition-collapse del testo di un turno assistant. 1 cattura anche il collasso di un singolo carattere ripetuto; le unita'' di soli whitespace sono comunque escluse (padding). Cache 60s (mig 0534).'),
+   'Lunghezza minima (caratteri) dell''unita'' ripetuta considerata nel rilevamento repetition-collapse del testo di un turno assistant. 1 cattura anche il collasso di un singolo carattere ripetuto; le unita'' di soli whitespace sono comunque escluse (padding). Cache 60s (mig 0531).'),
   ('agent.anti_repetition.max_unit_len', '512', 'agent',
-   'Lunghezza massima (caratteri) dell''unita'' ripetuta: oltre questa un periodo lungo e'' quasi sempre struttura legittima (paragrafi simili), non un loop degenere. Cache 60s (mig 0534).'),
+   'Lunghezza massima (caratteri) dell''unita'' ripetuta: oltre questa un periodo lungo e'' quasi sempre struttura legittima (paragrafi simili), non un loop degenere. Cache 60s (mig 0531).'),
   ('agent.anti_repetition.min_repeats', '20', 'agent',
-   'Numero minimo di ripetizioni consecutive della stessa sottostringa oltre cui (>=) il testo del turno e'' considerato in collasso. 0 = disabilitato. Cache 60s (mig 0534).'),
+   'Numero minimo di ripetizioni consecutive della stessa sottostringa oltre cui (>=) il testo del turno e'' considerato in collasso. 0 = disabilitato. Cache 60s (mig 0531).'),
   ('agent.anti_repetition.min_total_len', '400', 'agent',
-   'Caratteri minimi coperti dalla ripetizione (repeats * unit_len) perche'' conti come collasso. Evita falsi positivi su ripetizioni brevi legittime: la porzione ripetuta deve essere sostanziosa. Cache 60s (mig 0534).'),
+   'Caratteri minimi coperti dalla ripetizione (repeats * unit_len) perche'' conti come collasso. Evita falsi positivi su ripetizioni brevi legittime: la porzione ripetuta deve essere sostanziosa. Cache 60s (mig 0531).'),
   ('agent.anti_repetition.scan_tail_cap', '16384', 'agent',
-   'Caratteri della CODA del testo ispezionati (il collasso degenera verso la fine): mantiene il costo O(coda) su final_answer lunghi. 0 = rilevamento DISABILITATO (bit-identico). Cache 60s (mig 0534).')
+   'Caratteri della CODA del testo ispezionati (il collasso degenera verso la fine): mantiene il costo O(coda) su final_answer lunghi. 0 = rilevamento DISABILITATO (bit-identico). Cache 60s (mig 0531).')
 ON CONFLICT (key) DO NOTHING;

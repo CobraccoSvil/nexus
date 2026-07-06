@@ -1,7 +1,7 @@
 -- 0007_kb_ingest_canonical_outcomes.sql
 -- Allinea l'indice parziale del worker di ingest KB (run_summary_worker.rs) agli
 -- esiti TERMINALI canonici della macchina a stati (mig 0386 + completed_unverified
--- di mig 0534): il filtro precedente ('completed','failed','aborted') dimenticava
+-- di mig 0531): il filtro precedente ('completed','failed','aborted') dimenticava
 -- gli esiti canonici, quindi un run verificato (completed_verified), non verificato
 -- (completed_unverified) o diagnosticato (failed_diagnosed) NON entrava nella
 -- memoria episodica del progetto (wiki_doc kind='run_summary').
