@@ -3873,8 +3873,58 @@ async fn tokens_used_total_accumula_usage_del_turno() {
     };
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    // 2000 (prev) + 1500 (usage del turno) = 3500.
+    // 2000 (prev) + 1500 (delta prompt 1000 da 0 + completion 500) = 3500.
     assert_eq!(out.tokens_used_total, Some(3_500));
+}
+
+#[tokio::test]
+async fn budget_conta_prompt_incrementale_non_la_history_ripetuta() {
+    // REGRESSIONE run 8c4f5eea: la history viene ri-inviata a OGNI turno; il
+    // budget deve contare solo il DELTA del prompt (contesto nuovo) + output,
+    // non il prompt lordo, altrimenti un run SANO con contesto grande esaurisce
+    // il budget in pochi turni (cascata di escalation "non-convergenza").
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    // Turno precedente: prompt 50_000 (history grande). Turno corrente: 51_000
+    // prompt (1_000 di contesto nuovo) + 200 completion.
+    let llm = llm_text_usage("risposta", 51_000, 200);
+    let ctx = ctx_with(llm, false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        tokens_used_total: Some(2_000),
+        prompt_tokens: Some(50_000),
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // 2000 + (51000-50000) + 200 = 3200 — NON 2000+51200=53200.
+    assert_eq!(out.tokens_used_total, Some(3_200));
+}
+
+#[tokio::test]
+async fn budget_prompt_compresso_clampa_a_zero_il_delta() {
+    // Dopo una compressione della history il prompt SCENDE: il delta negativo
+    // clampa a 0 (nessun "rimborso" di budget), conta solo l'output.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = llm_text_usage("risposta", 30_000, 400);
+    let ctx = ctx_with(llm, false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        tokens_used_total: Some(5_000),
+        prompt_tokens: Some(50_000),
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // 5000 + max(0, 30000-50000) + 400 = 5400.
+    assert_eq!(out.tokens_used_total, Some(5_400));
 }
 
 #[tokio::test]

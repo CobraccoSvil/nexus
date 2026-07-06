@@ -4049,12 +4049,25 @@ modello piu' capace.",
         });
 
         // ── Contatori anti-runaway CUMULATIVI (reducer overwrite last-write) ──
-        // (1) tokens_used_total: token del run finora + i token del turno dal
-        //     segnale STRUTTURATO dell'usage (regola M: `turn_total_tokens`,
-        //     input+output+cache, gia' calcolato sopra). Il ramo PRE-LLM del
-        //     prossimo giro lo confronta con `run_token_budget`. Su turno error
-        //     (gateway_errored) `turn_total_tokens` e' 0 (usage default): il totale
-        //     resta invariato, coerente col non-conteggio del ramo error.
+        // (1) tokens_used_total: LAVORO INCREMENTALE del run, dal segnale
+        //     STRUTTURATO dell'usage (regola M): delta del prompt rispetto al
+        //     turno precedente (solo il contesto NUOVO caricato) + output +
+        //     cache_creation. NON il prompt lordo per-turno: la history viene
+        //     ri-inviata a OGNI turno, quindi cumulare `turn_total_tokens`
+        //     condannava matematicamente i run con contesto grande (run 8c4f5eea:
+        //     history ~50k -> ~8 turni SANI bruciavano il budget 400k -> cascata
+        //     di escalation "non-convergenza" fino al cap -> failed_diagnosed,
+        //     con la correzione post-gate uccisa pre-LLM senza fare lavoro).
+        //     Il runaway vero resta coperto: contesto che esplode = delta grandi,
+        //     output ripetuto a raffica = completion cumulate, e il freno di
+        //     spesa in dollari (`run_cost_cumulative_usd`) conta comunque il
+        //     costo REALE lordo. Il ramo PRE-LLM del prossimo giro confronta
+        //     questo totale con `run_token_budget`. Su turno error
+        //     (gateway_errored) l'usage e' default (zero): delta 0 e output 0,
+        //     il totale resta invariato, coerente col non-conteggio del ramo
+        //     error. `state.prompt_tokens` porta il prompt dell'ULTIMO turno
+        //     (reducer overwrite): dopo una compressione il prompt scende e il
+        //     delta clampa a 0 (nessun rimborso, conservativo).
         // (2) consecutive_text_only_turns: azzerato se il modello ha emesso almeno
         //     un tool_use (`pending_tool_uses` non vuoto = segnale strutturato
         //     `resp.tool_calls`, regola M), altrimenti +1. Rileva il modello che
@@ -4063,7 +4076,12 @@ modello piu' capace.",
         //     resta comunque privo di tool_use -> incrementa (conservativo: un
         //     provider che erra a raffica va chiuso anche via questo asse).
         let prev_tokens_total = state.tokens_used_total.unwrap_or(0).max(0);
-        let new_tokens_total = prev_tokens_total.saturating_add(turn_total_tokens.max(0));
+        let prev_turn_prompt = state.prompt_tokens.unwrap_or(0).max(0);
+        let incremental_prompt = (turn_prompt_tokens - prev_turn_prompt).max(0);
+        let turn_budget_tokens = incremental_prompt
+            .saturating_add(turn_completion_tokens.max(0))
+            .saturating_add(turn_cache_creation.max(0));
+        let new_tokens_total = prev_tokens_total.saturating_add(turn_budget_tokens);
         // Costo cumulativo REALE del run (freno di spesa in dollari): somma il costo
         // del turno (dall'usage, gia' col prezzo del modello del turno) al totale
         // portato dallo stato. Reducer overwrite (come i token). turn_total_cost None

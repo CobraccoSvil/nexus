@@ -423,14 +423,19 @@ pub struct AgentState {
     pub exploration_nudge_sent: Option<bool>,
     /// `true` dopo aver iniettato il nudge anti-loop-comando.
     pub repeated_cmd_nudge_sent: Option<bool>,
-    /// Token CUMULATIVI del run (somma di `LlmUsage.total_tokens` di ogni risposta
-    /// LLM, regola M: segnale strutturato dal gateway, mai stima dal testo). Safety
-    /// net anti-runaway per-run: quando `>= ExecutorConfig::run_token_budget` (se il
-    /// budget e' `> 0`) l'executor chiude deterministicamente PRIMA della prossima
-    /// chiamata LLM. Reducer overwrite (last-write): l'executor legge il valore
-    /// portato dallo stato, somma il turno e riscrive il totale (come `iterations`).
-    /// `None`/0 su un run appena avviato -> nessun runaway rilevato. `i64` per
-    /// coerenza serde col resto dei contatori (letto/scritto come non-negativo).
+    /// Token di LAVORO INCREMENTALE cumulati sul run (regola M: segnale
+    /// strutturato dal gateway, mai stima dal testo): per ogni turno si somma il
+    /// DELTA del prompt rispetto al turno precedente (solo contesto nuovo, non la
+    /// history ri-inviata) + completion + cache_creation. La vecchia semantica
+    /// (somma dei `total_tokens` lordi per-turno) condannava i run con contesto
+    /// grande: history ~50k -> ~8 turni sani esaurivano il budget -> cascata di
+    /// escalation fino al cap. Safety net anti-runaway per-run: quando
+    /// `>= ExecutorConfig::run_token_budget` (se il budget e' `> 0`) l'executor
+    /// chiude deterministicamente PRIMA della prossima chiamata LLM. Reducer
+    /// overwrite (last-write): l'executor legge il valore portato dallo stato,
+    /// somma il turno e riscrive il totale (come `iterations`). `None`/0 su un
+    /// run appena avviato -> nessun runaway rilevato. `i64` per coerenza serde
+    /// col resto dei contatori (letto/scritto come non-negativo).
     pub tokens_used_total: Option<i64>,
     /// Costo CUMULATIVO in USD del run (somma di `LlmUsage.total_cost_usd` di ogni
     /// turno, ognuno col prezzo del modello di QUEL turno -> esatto anche dopo
