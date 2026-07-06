@@ -156,6 +156,9 @@ gia' migrati anche coi punti 1-5 residui aperti (degradano, non corrompono).
    copie meta pre-flip dei dati chat/run del progetto sono ora ridondanti. Rimuovile
    per-progetto con `scripts/db-cleanup-dual-presence.sh <PROJECT_ID>` (dry-run) poi
    `--apply` (guardato dal flag, transazione FK-safe), infine `VACUUM (ANALYZE)`.
+   [STORICO 2026-07-06: cleanup completato, tabelle dual-presence rimosse dal meta
+   e flag `db.project_separation.enabled` eliminato (mig 0527); lo script e' stato
+   rimosso dal repo perche' la sua guardia dipendeva dal flag ormai inesistente.]
 
 ### Validazione tecnica del flip (fatta questa sessione)
 Il flip e' stato acceso e verificato end-to-end sul binario corrente, poi
