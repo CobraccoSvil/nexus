@@ -1280,6 +1280,20 @@ pub fn is_software_task(state: &AgentState, cfg: &RoutingConfig) -> bool {
     if has_filesystem_mutation_in_history(&state.messages, cfg) {
         return true;
     }
+    // (1-bis) DELEGA a subagente = lavoro software per PROCURA (incidente run
+    // 1daf83b3): il padre non tocca file in prima persona ma il figlio puo'
+    // averlo fatto, e il suo summary puo' ALLUCINARE il completamento. Senza
+    // questo segnale il final_gate veniva SALTATO in silenzio (pass-through su
+    // is_software_task=false) e un run chiudeva 'completed' sulla parola del
+    // subagente, senza alcuna verifica oggettiva. Prefix-match STRUTTURALE sul
+    // nome del tool di delega (dispatch_subagent / dispatch_subagents), mai
+    // sul testo (regola M).
+    if ai_tool_use_names(&state.messages)
+        .into_iter()
+        .any(|name| name.starts_with("dispatch_subagent"))
+    {
+        return true;
+    }
     // (2) Whitelist intent (user_intent, fallback su extra["intent"]).
     let intent = state
         .user_intent
@@ -2081,6 +2095,36 @@ mod tests {
         let cfg = RoutingConfig::default();
         let mut state = AgentState::default();
         state.extra.insert("intent".into(), json!("frontend"));
+        assert!(is_software_task(&state, &cfg));
+    }
+
+    #[test]
+    fn software_task_da_delega_subagente() {
+        // REGRESSIONE run 1daf83b3: il padre delega tutto a un subagente (zero
+        // mutazioni proprie, intent fuori whitelist) -> il final_gate veniva
+        // SALTATO e la dichiarazione allucinata del figlio chiudeva 'completed'
+        // senza verifica. La delega e' lavoro software per procura: gate attivo.
+        let cfg = RoutingConfig::default();
+        let mut state = AgentState {
+            user_intent: Some("architecture".into()), // fuori whitelist
+            ..Default::default()
+        };
+        state.messages = vec![Message::Ai {
+            content: MessageContent::text(""),
+            tool_calls: vec![ToolUse {
+                id: "c1".to_string(),
+                name: "dispatch_subagent".to_string(),
+                input: json!({"task": "correggi gli errori"}),
+                thought_signature: None,
+            }],
+            reasoning: None,
+            thinking_signature: None,
+        }];
+        assert!(is_software_task(&state, &cfg));
+        // Anche la variante plurale (fan-out) attiva il gate.
+        if let Some(Message::Ai { tool_calls, .. }) = state.messages.first_mut() {
+            tool_calls[0].name = "dispatch_subagents".to_string();
+        }
         assert!(is_software_task(&state, &cfg));
     }
 
