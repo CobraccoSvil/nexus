@@ -414,6 +414,115 @@ pub struct NativeRunOutcome {
     pub final_gate_failed_pending: bool,
 }
 
+impl NativeRunOutcome {
+    /// Status CANONICO del run dai segnali strutturati dell'esito (regola M).
+    /// PUNTO UNICO (regola L) della classificazione: estratto dal finalizzatore
+    /// (`native_outcome_to_run_result`, che vi delega) ed usato anche dal ponte
+    /// esito del SUB-agente (`agent_tools::subagent_native`), cosi' il verdetto
+    /// che un coordinatore legge da un sub-run e' lo STESSO che il run padre
+    /// otterrebbe. L'ordine dei rami e' significativo (dichiarazione onesta del
+    /// modello > forced_close > verdetto oggettivo del gate).
+    pub fn classify_status(&self) -> crate::agent_types::AgentRunStatus {
+        use crate::agent_types::AgentRunStatus;
+
+        // `forced_close_unverified` e' il segnale AUTORITATIVO (mig 0386):
+        // sopravvive alla riscrittura di `stop_reason` operata dal final_gate
+        // sul ramo forced_close (senza, un abort anti-loop ripulito dal
+        // final_gate finiva "completed" col testo di sistema come risposta —
+        // run b833a83d).
+        let forced_close = self.forced_close_unverified
+            || matches!(
+                self.stop_reason,
+                Some(
+                    StopReason::LoopDetected
+                        | StopReason::LoopAbort
+                        | StopReason::G1Escalated
+                        | StopReason::G1CapReached
+                )
+            );
+        // Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
+        // MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
+        // (regola M). Ha precedenza sul forced_close: una dichiarazione onesta
+        // (es. blocked su credenziale mancante) e' piu' specifica del segnale
+        // generico di chiusura coordinata.
+        let declared_kind = self
+            .declared_outcome
+            .as_ref()
+            .and_then(|v| v.get("outcome"))
+            .and_then(Value::as_str);
+        let declared_refusal = self
+            .declared_outcome
+            .as_ref()
+            .and_then(|v| v.get("refusal"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !self.completed && self.resume_at.is_some() {
+            AgentRunStatus::AwaitingConfirmation
+        } else if matches!(self.stop_reason, Some(StopReason::Error)) {
+            AgentRunStatus::Failed
+        } else if declared_refusal
+            || matches!(declared_kind, Some("blocked") | Some("needs_input"))
+        {
+            // Bloccato per causa esterna / serve input umano / rifiuto safety:
+            // esito canonico BlockedNeedsInput (parita' WAVE 3.2 del path brain).
+            AgentRunStatus::BlockedNeedsInput
+        } else if matches!(declared_kind, Some("partial")) {
+            // Lavoro dichiarato PARZIALE: onesto, non un successo (mai
+            // "completed" su una dichiarazione esplicita di incompletezza).
+            AgentRunStatus::FailedDiagnosed
+        } else if forced_close {
+            AgentRunStatus::FailedDiagnosed
+        } else if self.final_gate_passed == Some(false) {
+            // Verifica oggettiva pre-chiusura NON superata (final_gate al
+            // cap/forced): il verdetto STRUTTURATO del gate (regola M) prevale
+            // su una dichiarazione "done" ottimista del modello -> mai
+            // "completed" su un task la cui verifica e' fallita. Difesa in
+            // profondita' rispetto a `forced_close`: il cap del final_gate NON
+            // imposta forced_close_unverified.
+            AgentRunStatus::FailedDiagnosed
+        } else if self.final_gate_failed_pending {
+            // L'ULTIMO verdetto del final_gate e' una BOCCIATURA di ciclo
+            // intermedio (correzione rimandata all'executor) e il run e' morto
+            // PRIMA della ri-verifica (run a5db0985): il lavoro post-bocciatura
+            // non e' mai stato verificato e l'ultimo esito oggettivo noto e' un
+            // fallimento — mai `Completed` (regola M).
+            AgentRunStatus::FailedDiagnosed
+        } else if self.final_gate_unverified == Some(true) {
+            // Lavoro SVOLTO ma verifica tecnica NON eseguita (gate entrato
+            // senza profilo di verifica dell'ambiente): esito ONESTO distinto
+            // da un "completato" pieno (is_success=true ma etichettato).
+            AgentRunStatus::CompletedUnverified
+        } else {
+            AgentRunStatus::Completed
+        }
+    }
+
+    /// Blocco esito STRUTTURATO machine-readable dell'intero run (regola M /
+    /// ADR 0034), il PONTE del confine padre<->figlio: persistito su
+    /// `nexus_subagent_runs.verdict` (mig project/0009) per il fan-in asincrono
+    /// (poll/resume) ed esposto come campo `outcome` nel tool_result dei
+    /// finalizzatori del sub-run; disponibile per un coordinatore che compone i
+    /// verdetti dei sub-run in modo deterministico.
+    ///
+    /// `verdict`/`success` derivano dal punto unico [`Self::classify_status`],
+    /// cosi' il verdetto del sub-run coincide con quello che il run padre
+    /// otterrebbe sugli stessi segnali. `declared` e' il dict gia' normalizzato
+    /// (ADR 0034) o `null`; gli altri campi sono i segnali del gate as-is.
+    pub fn structured_verdict(&self) -> Value {
+        let status = self.classify_status();
+        serde_json::json!({
+            "verdict": status.as_str(),
+            "success": status.is_success(),
+            "declared": self.declared_outcome,
+            "final_gate_passed": self.final_gate_passed,
+            "final_gate_unverified": self.final_gate_unverified,
+            "final_gate_failed_pending": self.final_gate_failed_pending,
+            "forced_close_unverified": self.forced_close_unverified,
+            "error_class": self.error_class,
+        })
+    }
+}
+
 /// Context window (token) del modello del turno dal catalog (regola G). `0` =
 /// finestra ignota -> il tool_dispatch disattiva il predictive cap (no toppa: un
 /// cap su una finestra inventata produrrebbe blocchi spurii).
@@ -3156,4 +3265,151 @@ mod tests {
         assert!(!cfg.verify_profile_missing);
     }
 
+    // ── classify_status / structured_verdict (punto unico esito, regola L/M) ────
+
+    use crate::agent_types::AgentRunStatus;
+
+    /// Esito "completato pulito": tutti i segnali neutri. Override per-test dei
+    /// soli campi rilevanti (gli altri non entrano nella classificazione).
+    fn base_outcome() -> NativeRunOutcome {
+        NativeRunOutcome {
+            completed: true,
+            final_answer: Some("fatto".to_string()),
+            stop_reason: None,
+            provider_used: None,
+            model_used: None,
+            resume_at: None,
+            iterations: 1,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            total_cost: 0.0,
+            user_intent: None,
+            reasoning: None,
+            messages_json: None,
+            declared_outcome: None,
+            error_class: None,
+            forced_close_unverified: false,
+            final_gate_passed: None,
+            final_gate_unverified: None,
+            final_gate_failed_pending: false,
+        }
+    }
+
+    #[test]
+    fn classify_status_completed_pulito() {
+        assert_eq!(base_outcome().classify_status(), AgentRunStatus::Completed);
+    }
+
+    #[test]
+    fn classify_status_awaiting_confirmation() {
+        let o = NativeRunOutcome {
+            completed: false,
+            resume_at: Some(NodeId::Executor.as_label().to_string()),
+            ..base_outcome()
+        };
+        assert_eq!(o.classify_status(), AgentRunStatus::AwaitingConfirmation);
+    }
+
+    #[test]
+    fn classify_status_error_infrastrutturale() {
+        let o = NativeRunOutcome {
+            stop_reason: Some(StopReason::Error),
+            ..base_outcome()
+        };
+        assert_eq!(o.classify_status(), AgentRunStatus::Failed);
+    }
+
+    #[test]
+    fn classify_status_dichiarazione_blocked_e_refusal() {
+        let blocked = NativeRunOutcome {
+            declared_outcome: Some(serde_json::json!({"outcome": "blocked"})),
+            ..base_outcome()
+        };
+        assert_eq!(blocked.classify_status(), AgentRunStatus::BlockedNeedsInput);
+        let refusal = NativeRunOutcome {
+            declared_outcome: Some(serde_json::json!({"outcome": "done", "refusal": true})),
+            ..base_outcome()
+        };
+        assert_eq!(refusal.classify_status(), AgentRunStatus::BlockedNeedsInput);
+    }
+
+    #[test]
+    fn classify_status_dichiarazione_partial() {
+        let o = NativeRunOutcome {
+            declared_outcome: Some(serde_json::json!({"outcome": "partial"})),
+            ..base_outcome()
+        };
+        assert_eq!(o.classify_status(), AgentRunStatus::FailedDiagnosed);
+    }
+
+    #[test]
+    fn classify_status_forced_close_e_gate() {
+        // Abort anti-loop (segnale autoritativo).
+        let forced = NativeRunOutcome {
+            forced_close_unverified: true,
+            ..base_outcome()
+        };
+        assert_eq!(forced.classify_status(), AgentRunStatus::FailedDiagnosed);
+        // Verifica oggettiva non superata.
+        let gate_ko = NativeRunOutcome {
+            final_gate_passed: Some(false),
+            ..base_outcome()
+        };
+        assert_eq!(gate_ko.classify_status(), AgentRunStatus::FailedDiagnosed);
+        // Bocciatura del gate in sospeso (morto prima della ri-verifica).
+        let pending = NativeRunOutcome {
+            final_gate_failed_pending: true,
+            ..base_outcome()
+        };
+        assert_eq!(pending.classify_status(), AgentRunStatus::FailedDiagnosed);
+    }
+
+    #[test]
+    fn classify_status_completato_ma_non_verificato() {
+        let o = NativeRunOutcome {
+            final_gate_unverified: Some(true),
+            ..base_outcome()
+        };
+        assert_eq!(o.classify_status(), AgentRunStatus::CompletedUnverified);
+        // CompletedUnverified E' un successo (lavoro svolto, verifica non eseguita).
+        assert!(o.classify_status().is_success());
+    }
+
+    #[test]
+    fn classify_status_dichiarazione_onesta_precede_il_gate() {
+        // Il modello dichiara blocked E il gate oggettivo e' fallito: la
+        // dichiarazione onesta (piu' specifica) ha precedenza sul verdetto generico.
+        let o = NativeRunOutcome {
+            declared_outcome: Some(serde_json::json!({"outcome": "blocked"})),
+            final_gate_passed: Some(false),
+            ..base_outcome()
+        };
+        assert_eq!(o.classify_status(), AgentRunStatus::BlockedNeedsInput);
+    }
+
+    #[test]
+    fn structured_verdict_forma_e_success() {
+        // Successo pulito: verdict canonico, success=true, campi gate neutri.
+        let v = base_outcome().structured_verdict();
+        assert_eq!(v["verdict"], serde_json::json!("completed"));
+        assert_eq!(v["success"], serde_json::json!(true));
+        assert_eq!(v["declared"], serde_json::Value::Null);
+        assert_eq!(v["final_gate_passed"], serde_json::Value::Null);
+
+        // Gate fallito + dichiarazione "done" ottimista: il verdetto oggettivo
+        // prevale (failed_diagnosed) e l'error_class strutturata viaggia col blocco.
+        let ko = NativeRunOutcome {
+            final_gate_passed: Some(false),
+            declared_outcome: Some(serde_json::json!({"outcome": "done", "summary": "fatto"})),
+            error_class: Some("context_overflow".to_string()),
+            ..base_outcome()
+        };
+        let vk = ko.structured_verdict();
+        assert_eq!(vk["verdict"], serde_json::json!("failed_diagnosed"));
+        assert_eq!(vk["success"], serde_json::json!(false));
+        assert_eq!(vk["final_gate_passed"], serde_json::json!(false));
+        assert_eq!(vk["error_class"], serde_json::json!("context_overflow"));
+        assert_eq!(vk["declared"]["outcome"], serde_json::json!("done"));
+    }
 }

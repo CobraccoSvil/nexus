@@ -1394,10 +1394,11 @@ async fn finalize_timeout(
     kind: &str,
     timeout_s: i64,
 ) -> Value {
+    let verdict = terminal_verdict("timed_out", "timeout");
     let _ = mark_run(
         pool,
         sub_run_id,
-        SubRunClosure::without_metrics("timeout", "[Sub-agent timeout]"),
+        SubRunClosure::without_metrics("timeout", "[Sub-agent timeout]", verdict.clone()),
     )
     .await;
     if let Some(n) = narrator {
@@ -1419,6 +1420,9 @@ async fn finalize_timeout(
         "kind": kind,
         "status": "timeout",
         "error": "[Sub-agent timeout]",
+        // Verdetto ESITO strutturato (regola M): il coordinatore legge
+        // success/verdict qui, mai dalla prosa di `error`.
+        "outcome": verdict,
     })
 }
 
@@ -1429,7 +1433,13 @@ async fn finalize_success(
     sub_run_id: Uuid, kind: &str, depth: i64, o: &NativeRunOutcome,
 ) -> Value {
     let summary = o.final_answer.clone().unwrap_or_default();
+    // `status` LIFECYCLE del sub-run (completed = arrivato a End, paused = fermato
+    // su interrupt HITL). Backward-compat: todo_runner e il batch lo leggono come
+    // {completed|paused}; NON va sostituito col verdetto canonico (regredirebbe i
+    // completed_unverified). Il VERDETTO del lavoro (segnali strutturati, regola M)
+    // viaggia separato nel blocco `outcome`, senza toccare il lifecycle.
     let status = if o.completed { "completed" } else { "paused" };
+    let verdict = o.structured_verdict();
     let _ = mark_run(
         pool,
         sub_run_id,
@@ -1440,6 +1450,7 @@ async fn finalize_success(
             tokens_prompt: o.prompt_tokens,
             tokens_completion: o.completion_tokens,
             cost_usd: o.total_cost,
+            verdict: verdict.clone(),
         },
     )
     .await;
@@ -1477,6 +1488,9 @@ async fn finalize_success(
         "iterations": o.iterations,
         "cost_usd": o.total_cost,
         "tokens": { "prompt": o.prompt_tokens, "completion": o.completion_tokens },
+        // Verdetto ESITO strutturato (regola M): il coordinatore legge
+        // success/verdict qui invece di dedurre l'esito dalla prosa di `summary`.
+        "outcome": verdict,
     })
 }
 
@@ -1489,7 +1503,13 @@ async fn finalize_failure(
     e: &anyhow::Error,
 ) -> Value {
     let msg = format!("[errore grafo nativo: {e}]");
-    let _ = mark_run(pool, sub_run_id, SubRunClosure::without_metrics("failed", &msg)).await;
+    let verdict = terminal_verdict("failed", "engine_error");
+    let _ = mark_run(
+        pool,
+        sub_run_id,
+        SubRunClosure::without_metrics("failed", &msg, verdict.clone()),
+    )
+    .await;
     tracing::warn!(
         kind = %kind,
         subagent_run_id = %sub_run_id,
@@ -1514,6 +1534,9 @@ async fn finalize_failure(
         "error": msg,
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
+        // Verdetto ESITO strutturato (regola M): mai dedurre il fallimento
+        // dalla prosa di `error`.
+        "outcome": verdict,
     })
 }
 
@@ -1573,12 +1596,16 @@ struct SubRunClosure<'a> {
     tokens_prompt: i64,
     tokens_completion: i64,
     cost_usd: f64,
+    /// Blocco esito STRUTTURATO del sub-run (regola M / ADR 0034), distinto dallo
+    /// `status` lifecycle: persistito su `nexus_subagent_runs.verdict` (mig
+    /// project/0009) per il fan-in asincrono (poll) e i coordinatori.
+    verdict: Value,
 }
 
 impl<'a> SubRunClosure<'a> {
     /// Chiusura senza metriche: il run e' morto prima di produrre usage
     /// (timeout, errore del grafo) — contatori a zero.
-    fn without_metrics(status: &'a str, summary: &'a str) -> Self {
+    fn without_metrics(status: &'a str, summary: &'a str, verdict: Value) -> Self {
         Self {
             status,
             summary,
@@ -1586,27 +1613,52 @@ impl<'a> SubRunClosure<'a> {
             tokens_prompt: 0,
             tokens_completion: 0,
             cost_usd: 0.0,
+            verdict,
         }
     }
+}
+
+/// Blocco esito strutturato per i rami TERMINALI del sub-run privi di un
+/// [`NativeRunOutcome`] (timeout / errore del motore): stessa forma di
+/// [`NativeRunOutcome::structured_verdict`] cosi' il coordinatore e il poll
+/// leggono SEMPRE lo stesso schema. `verdict` usa il vocabolario canonico
+/// (`AgentRunStatus::as_str`: `timed_out` / `failed`), `success` e' sempre
+/// `false`.
+fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
+    json!({
+        "verdict": verdict,
+        "success": false,
+        "declared": Value::Null,
+        "final_gate_passed": Value::Null,
+        "final_gate_unverified": Value::Null,
+        "final_gate_failed_pending": false,
+        "forced_close_unverified": false,
+        "error_class": error_class,
+    })
 }
 
 /// Marca una sub-run come conclusa su `nexus_subagent_runs` E chiude la riga
 /// gemella `agent_runs` del figlio, in UNA statement atomica (CTE): stessi
 /// bind per entrambe. La gemella esiste solo per i figli tracciati (la WHERE
 /// id limita l'effetto); stessi status (completed/paused/timeout/failed):
-/// `agent_runs.status` e' TEXT libero. Best-effort.
+/// `agent_runs.status` e' TEXT libero. Il `verdict` strutturato (regola M) va
+/// SOLO sulla riga sub (la gemella eredita l'esito dal finalizzatore del padre).
+/// Best-effort per i chiamanti (la finalizzazione non deve fallire per un
+/// errore di persistenza) ma MAI muto: l'UPDATE respinto lascerebbe la riga
+/// 'running' per sempre (depth chain bloccata, poll che non converge) e senza
+/// log sarebbe invisibile — WARN qui, nel punto unico (regola L).
 async fn mark_run(
     db: &sqlx::PgPool,
     run_id: Uuid,
     c: SubRunClosure<'_>,
 ) -> Result<(), sqlx::Error> {
     let compact = c.summary.chars().take(4000).collect::<String>();
-    sqlx::query(
+    let res = sqlx::query(
         "WITH sub AS (
             UPDATE nexus_subagent_runs SET
                 status = $1, final_summary = $2, iterations = $3,
                 tokens_prompt = $4, tokens_completion = $5, cost_usd = $6,
-                completed_at = NOW()
+                verdict = $8, completed_at = NOW()
              WHERE id = $7
         )
         UPDATE agent_runs SET
@@ -1622,9 +1674,19 @@ async fn mark_run(
     .bind(c.tokens_completion as i32)
     .bind(c.cost_usd)
     .bind(run_id)
+    .bind(c.verdict)
     .execute(db)
     .await
-    .map(|_| ())
+    .map(|_| ());
+    if let Err(e) = &res {
+        tracing::warn!(
+            subagent_run_id = %run_id,
+            status = c.status,
+            error = %e,
+            "mark_run: esito del sub-run NON persistito (la riga resta 'running')"
+        );
+    }
+    res
 }
 
 const TRUNC_SUFFIX: &str = "...[truncated]";
@@ -1679,7 +1741,8 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
         crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
     let row = sqlx::query(
         "SELECT id::text, status, kind, final_summary, artifacts, iterations,
-                tokens_prompt, tokens_completion, cost_usd, depth, source, is_background
+                tokens_prompt, tokens_completion, cost_usd, depth, source, is_background,
+                verdict
          FROM nexus_subagent_runs WHERE id::text = $1",
     )
     .bind(&run_id)
@@ -1701,6 +1764,11 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
             "depth": r.try_get::<i32, _>("depth").unwrap_or(1),
             "source": r.try_get::<String, _>("source").unwrap_or_else(|_| "db".into()),
             "is_background": r.try_get::<bool, _>("is_background").unwrap_or(false),
+            // Verdetto ESITO strutturato (mig project/0009): `null` finche' il
+            // sub-run non e' finalizzato (fase running). Il coordinatore che fa
+            // poll legge success/verdict qui senza dedurre l'esito dalla prosa
+            // di `summary` (regola M).
+            "outcome": r.try_get::<Option<Value>, _>("verdict").unwrap_or(None),
         })
         .to_string(),
         Ok(None) => format!("\u{274C} [nexus_subagent_poll] sub-agent run '{run_id}' non trovato"),
@@ -2123,6 +2191,7 @@ mod tests {
                  tokens_prompt INT NOT NULL DEFAULT 0, \
                  tokens_completion INT NOT NULL DEFAULT 0, \
                  cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0, \
+                 verdict JSONB, \
                  completed_at TIMESTAMPTZ )",
         )
         .execute(pool)
@@ -2235,12 +2304,14 @@ mod tests {
                 tokens_prompt: 1000,
                 tokens_completion: 200,
                 cost_usd: 0.05,
+                verdict: json!({"verdict": "completed", "success": true}),
             },
         )
         .await
         .expect("mark ok");
-        let sub: (String, Option<String>, i32) = sqlx::query_as(
-            "SELECT status, final_summary, iterations FROM nexus_subagent_runs WHERE id = $1",
+        let sub: (String, Option<String>, i32, Option<Value>) = sqlx::query_as(
+            "SELECT status, final_summary, iterations, verdict \
+             FROM nexus_subagent_runs WHERE id = $1",
         )
         .bind(child)
         .fetch_one(&pool)
@@ -2249,6 +2320,11 @@ mod tests {
         assert_eq!(sub.0, "completed");
         assert_eq!(sub.1.as_deref(), Some("fatto"));
         assert_eq!(sub.2, 7);
+        // Il verdetto strutturato (regola M) e' persistito SOLO sulla riga sub:
+        // e' il canale del fan-in asincrono (poll) e dei coordinatori.
+        let verdict = sub.3.expect("verdict persistito");
+        assert_eq!(verdict["verdict"], json!("completed"));
+        assert_eq!(verdict["success"], json!(true));
         let run: (String, Option<String>, i32, i32, bool) = sqlx::query_as(
             "SELECT status, final_answer, iteration_count, total_tokens, \
              completed_at IS NOT NULL FROM agent_runs WHERE id = $1",
