@@ -60,7 +60,7 @@ pub(crate) async fn emit_phase_meta(
     title: String,
     payload: serde_json::Value,
 ) {
-    emit_phase_meta_correlated(emit, store, mode, kind, title, payload, None).await;
+    emit_phase_meta_correlated(emit, store, mode, kind, None, title, payload).await;
 }
 
 /// Variante CORRELATA del punto unico di narrazione (stessa composizione
@@ -68,15 +68,16 @@ pub(crate) async fn emit_phase_meta(
 /// (es. la narrazione sub-agente porta il `subagent_run_id`) sia nell'evento
 /// SSE sia nella riga persistita (`nexus_agent_meta_steps.correlation_id`).
 /// `pub` perche' chiamata anche fuori dal grafo (ponte narrazione sub-agente in
-/// mcp-core): il punto di composizione resta UNO (regola L).
+/// mcp-core): il punto di composizione resta UNO (regola L). Il correlation_id
+/// sta accanto al `kind` (gli identificatori dello step precedono il contenuto).
 pub async fn emit_phase_meta_correlated(
     emit: &dyn crate::runtime::ports::EventSink,
     store: &dyn crate::runtime::ports::MetaStepStore,
     mode: crate::runtime::ports::ExecMode,
     kind: &str,
+    correlation_id: Option<String>,
     title: String,
     payload: serde_json::Value,
-    correlation_id: Option<String>,
 ) {
     emit.emit(crate::runtime::ports::SseEvent::MetaStep {
         kind: kind.to_string(),

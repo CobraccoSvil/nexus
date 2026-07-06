@@ -4720,6 +4720,22 @@ mod tests_select_engine {
         .expect("create agent_steps");
     }
 
+    /// Preambolo comune dei test di mapping: tabelle minime + riga run.
+    async fn setup_mapping_run(pool: &sqlx::PgPool) -> Uuid {
+        create_steps_tables(pool).await;
+        let run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
+            .bind(run)
+            .execute(pool)
+            .await
+            .expect("insert run");
+        run
+    }
+
+    // Chiavi/valori fixture ricorrenti degli outcome dichiarati.
+    const K_BLOCKER: &str = "blocker";
+    const RESUME_EXECUTOR: &str = "executor";
+
     fn outcome_base() -> crate::native_engine::NativeRunOutcome {
         crate::native_engine::NativeRunOutcome {
             completed: true,
@@ -4747,13 +4763,7 @@ mod tests_select_engine {
 
     #[sqlx::test]
     async fn native_mapping_completed_legge_step_e_usage(pool: sqlx::PgPool) {
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
         // Step gia' persistiti dal grafo (step_index = iteration*1000+idx).
         for (si, name, st) in [(1000, "read_file", "completed"), (2000, "write_file", "failed")] {
             sqlx::query(
@@ -4796,13 +4806,7 @@ mod tests_select_engine {
     async fn native_mapping_declared_outcome_stati_canonici(pool: sqlx::PgPool) {
         // ADR 0034: l'esito DICHIARATO via task_complete e' un segnale MACCHINA
         // che decide lo status canonico (mai la prosa, regola M).
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
 
         // blocked -> BlockedNeedsInput; senza testo, il summary fa da risposta.
         let mut o = outcome_base();
@@ -4810,7 +4814,7 @@ mod tests_select_engine {
         o.declared_outcome = Some(serde_json::json!({
             "outcome": "blocked",
             "summary": "Serve la API key.",
-            "blocker": "credential"
+            K_BLOCKER: "credential"
         }));
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
@@ -4837,7 +4841,7 @@ mod tests_select_engine {
         let mut o = outcome_base();
         o.stop_reason = Some(StopReason::LoopAbort);
         o.declared_outcome = Some(serde_json::json!({
-            "outcome": "blocked", "summary": "fermo", "blocker": "service"
+            "outcome": "blocked", "summary": "fermo", K_BLOCKER: "service"
         }));
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
@@ -4855,13 +4859,7 @@ mod tests_select_engine {
         // Verifica oggettiva pre-chiusura NON superata (final_gate al cap/forced):
         // il verdetto strutturato final_gate_passed=false (regola M) prevale su una
         // dichiarazione "done" ottimista e annota il resoconto (run e91d4892).
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
 
         // done dichiarato + gate NON passato -> FailedDiagnosed, mai Completed.
         let mut o = outcome_base();
@@ -4900,13 +4898,7 @@ mod tests_select_engine {
         // fino al cap iterazioni -> chiusura SENZA gate 2/2. L'ultimo verdetto
         // oggettivo e' una bocciatura: mai 'completed' (esito bugiardo), sempre
         // FailedDiagnosed dal segnale strutturato (regola M).
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
 
         // Chiusura muta (la nota cooldown viene composta a valle): lo status
         // deve comunque essere onesto.
@@ -4930,12 +4922,25 @@ mod tests_select_engine {
             "annotazione onesta attesa sul resoconto: {ans}"
         );
 
+        // Contro-prova: senza bocciatura pendente il comportamento e' invariato.
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = false;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+    }
+
+    #[sqlx::test]
+    async fn native_mapping_final_gate_bocciato_precedenze_di_stato(pool: sqlx::PgPool) {
+        // Ordine della catena col segnale `final_gate_failed_pending` attivo:
+        // gli stati piu' specifici mantengono la precedenza sulla bocciatura.
+        let run = setup_mapping_run(&pool).await;
+
         // La dichiarazione onesta `blocked` resta piu' specifica del segnale
         // di bocciatura pendente (stessa precedenza del forced_close).
         let mut o = outcome_base();
         o.final_gate_failed_pending = true;
         o.declared_outcome = Some(serde_json::json!({
-            "outcome": "blocked", "summary": "fermo", "blocker": "credential"
+            "outcome": "blocked", "summary": "fermo", K_BLOCKER: "credential"
         }));
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
@@ -4955,29 +4960,17 @@ mod tests_select_engine {
         let mut o = outcome_base();
         o.final_gate_failed_pending = true;
         o.completed = false;
-        o.resume_at = Some("executor".to_string());
+        o.resume_at = Some(RESUME_EXECUTOR.to_string());
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::AwaitingConfirmation);
-
-        // Contro-prova: senza bocciatura pendente il comportamento e' invariato.
-        let mut o = outcome_base();
-        o.final_gate_failed_pending = false;
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::Completed);
     }
 
     #[sqlx::test]
     async fn native_mapping_hitl_e_awaiting_confirmation(pool: sqlx::PgPool) {
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
         let mut o = outcome_base();
         o.completed = false;
-        o.resume_at = Some("executor".to_string());
+        o.resume_at = Some(RESUME_EXECUTOR.to_string());
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(
             r.status,
@@ -4988,13 +4981,7 @@ mod tests_select_engine {
 
     #[sqlx::test]
     async fn native_mapping_forced_close_failed_diagnosed(pool: sqlx::PgPool) {
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
         let mut o = outcome_base();
         o.stop_reason = Some(StopReason::LoopAbort);
         let r = native_outcome_to_run_result(&pool, run, o).await;
@@ -5013,13 +5000,7 @@ mod tests_select_engine {
         // mapping calcola hollow (prima: false hardcoded), il canonico declassa
         // a FailedDiagnosed e il compositore del messaggio produce comunque un
         // testo per la chat (placeholder/recap deterministico).
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
         let mut o = outcome_base();
         o.final_answer = Some("   ".to_string()); // whitespace-only = vuota
         let r = native_outcome_to_run_result(&pool, run, o).await;
@@ -5043,13 +5024,7 @@ mod tests_select_engine {
     ) {
         // Contro-prova del calcolo hollow nativo: risposta presente (o run
         // HITL non concluso) -> hollow false, status invariato.
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
         // Risposta presente -> non hollow.
         let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
         assert!(!r.hollow_completion);
@@ -5058,7 +5033,7 @@ mod tests_select_engine {
         // Interrupt HITL (final_answer assente ma run NON concluso) -> non hollow.
         let mut o = outcome_base();
         o.completed = false;
-        o.resume_at = Some("executor".to_string());
+        o.resume_at = Some(RESUME_EXECUTOR.to_string());
         o.final_answer = None;
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert!(!r.hollow_completion, "un interrupt HITL non e' un run muto");
@@ -5076,13 +5051,7 @@ mod tests_select_engine {
         // REGRESSIONE incidente run b07c7e78 (gap 1, lato mapping): risposta
         // VUOTA al turno forzato -> l'executor marca forced_close_unverified;
         // il mapping non deve MAI produrre 'completed' e la chat non resta muta.
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = setup_mapping_run(&pool).await;
         let mut o = outcome_base();
         o.final_answer = None;
         o.forced_close_unverified = true; // segnale autoritativo dell'executor
