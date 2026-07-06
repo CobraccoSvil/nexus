@@ -291,51 +291,15 @@ impl CooldownManager {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let provider = provider.to_lowercase();
-        let kind = reason.as_str();
         // Regola F: e' il messaggio d'errore del provider (status+codice), mai
         // prompt/response. Troncato a 500 char come la history del probe.
         let message = truncate_chars(last_error.unwrap_or(""), 500);
-        handle.spawn(async move {
-            if let Err(e) = sqlx::query(
-                "INSERT INTO nexus_provider_health \
-                   (provider, last_error, last_error_at, last_error_source, updated_at) \
-                 VALUES ($1, $2, NOW(), 'gateway', NOW()) \
-                 ON CONFLICT (provider) DO UPDATE SET \
-                   last_error = EXCLUDED.last_error, \
-                   last_error_at = NOW(), \
-                   last_error_source = 'gateway', \
-                   updated_at = NOW()",
-            )
-            .bind(&provider)
-            .bind(&message)
-            .execute(&pool)
-            .await
-            {
-                tracing::warn!(
-                    provider,
-                    error = %e,
-                    "gateway-cooldown: UPSERT last_error su nexus_provider_health fallito"
-                );
-            }
-            if let Err(e) = sqlx::query(
-                "INSERT INTO nexus_provider_health_history \
-                   (provider, healthy, error_kind, error_message, source) \
-                 VALUES ($1, false, $2, $3, 'gateway')",
-            )
-            .bind(&provider)
-            .bind(kind)
-            .bind(&message)
-            .execute(&pool)
-            .await
-            {
-                tracing::warn!(
-                    provider,
-                    error = %e,
-                    "gateway-cooldown: INSERT su nexus_provider_health_history fallito"
-                );
-            }
-        });
+        handle.spawn(persist_provider_error(
+            pool,
+            provider.to_lowercase(),
+            reason.as_str(),
+            message,
+        ));
     }
 
     /// `true` se il provider e' in cooldown rispetto all'istante corrente.
@@ -488,6 +452,49 @@ impl CooldownManager {
                     "gateway-cooldown: refresh durate fallito, mantengo i valori correnti (fallback)"
                 );
             }
+        }
+    }
+}
+
+/// Valore di `last_error_source` / `source` scritto dal gateway (mig 0536).
+const LAST_ERROR_SOURCE: &str = "gateway";
+
+/// Scrittura DB dell'errore provider (vedi [`CooldownManager::persist_last_error`]):
+/// UPSERT dell'ultimo errore + riga history append-only con source='gateway'.
+async fn persist_provider_error(pool: PgPool, provider: String, kind: &'static str, message: String) {
+    let upsert = sqlx::query(
+        "INSERT INTO nexus_provider_health \
+           (provider, last_error, last_error_at, last_error_source, updated_at) \
+         VALUES ($1, $2, NOW(), $3, NOW()) \
+         ON CONFLICT (provider) DO UPDATE SET \
+           last_error = EXCLUDED.last_error, \
+           last_error_at = NOW(), \
+           last_error_source = EXCLUDED.last_error_source, \
+           updated_at = NOW()",
+    )
+    .bind(&provider)
+    .bind(&message)
+    .bind(LAST_ERROR_SOURCE)
+    .execute(&pool)
+    .await;
+    let history = sqlx::query(
+        "INSERT INTO nexus_provider_health_history \
+           (provider, healthy, error_kind, error_message, source) \
+         VALUES ($1, false, $2, $3, $4)",
+    )
+    .bind(&provider)
+    .bind(kind)
+    .bind(&message)
+    .bind(LAST_ERROR_SOURCE)
+    .execute(&pool)
+    .await;
+    let esiti = [
+        ("UPSERT nexus_provider_health", upsert),
+        ("INSERT nexus_provider_health_history", history),
+    ];
+    for (what, res) in esiti {
+        if let Err(e) = res {
+            tracing::warn!(provider, error = %e, "gateway-cooldown: {} fallito", what);
         }
     }
 }
@@ -700,13 +707,13 @@ mod tests {
         let m = CooldownManager::new();
         let now = t0();
         m.mark_at(
-            "deepseek",
+            "acme",
             CooldownReason::Transient,
             Some("HTTP 502 upstream".to_string()),
             now,
             30,
         );
-        assert!(m.is_in_cooldown_at("deepseek", now));
+        assert!(m.is_in_cooldown_at("acme", now));
     }
 
     #[test]
