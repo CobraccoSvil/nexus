@@ -426,24 +426,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Recovery SELETTIVO all'avvio (mig 0392): marca 'interrupted' SOLO i run
-    // 'running' orfani (heartbeat agent_runs.updated_at oltre soglia), NON gli
-    // 'awaiting_confirmation' (stato resumibile via checkpoint LangGraph +
-    // /agent/approve) ne' i run VIVI (il brain — separato da mcp-core — li sta
-    // ancora elaborando e batte updated_at). Punto unico in
-    // run_reaper::reap_stale_runs, condiviso col loop periodico (regola L).
-    //
-    // NOTA: il cleanup dei processi 'running'/'starting' è già gestito dal blocco
-    // di riconciliazione PID sopra (kill -0).
-    {
-        // All'avvio ogni run 'running' e' un ORFANO del processo precedente (il task
-        // che lo eseguiva — heartbeat updated_at incluso — e' morto col restart):
-        // li marchiamo tutti 'interrupted' SENZA time-gate, altrimenti un orfano con
-        // updated_at recente resterebbe 'running' e bloccherebbe i nuovi run sulla
-        // sessione (gate 409 / session_has_active_run). Esclude 'awaiting_confirmation'.
-        // No broadcast channel attivi qui: ignoriamo gli id reapati. (regola H/L/G)
-        let _ = run_reaper::reap_orphaned_runs_at_boot(&db).await;
-    }
+    // NOTA: il recovery dei run 'running' orfani (reap_orphaned_runs_at_boot) e'
+    // stato SPOSTATO dopo `init_global_pools` (vedi blocco piu' sotto). Con la
+    // separazione DB i run agentici vivono nei DB per-progetto; qui, prima
+    // dell'inizializzazione del registry globale dei pool, `project_data_pool_from`
+    // ricadeva sul meta-DB e l'UPDATE non toccava mai i run per-progetto -> run
+    // 'running' zombie sopravvissuti al restart (causa radice del bug "la chat
+    // resta cieca sul run finche' non fai refresh": la subscription SSE non
+    // riceve mai `agent_final` perche' il run non diventa terminale). Il cleanup
+    // dei processi 'running'/'starting' e' gia' gestito dal blocco di
+    // riconciliazione PID sopra (kill -0).
 
     let redis = cache::init_redis(&redis_url).await?;
 
@@ -662,6 +654,20 @@ async fn main() -> anyhow::Result<()> {
     // con state.project_meta_pools, cosi' gli helper che instradano i dati
     // per-progetto (insert_message, ...) non aprono pool doppi.
     project_db_routes::init_global_pools(state.project_meta_pools.clone());
+
+    // Recovery run 'running' orfani (mig 0392) — spostato QUI dopo init_global_pools
+    // (regola H: causa radice del bug "chat cieca sul run dopo restart del backend").
+    // Con la separazione DB i run agentici vivono nei DB per-progetto; il registry
+    // globale dei pool DEVE essere gia' inizializzato, altrimenti
+    // reap_orphaned_runs_at_boot -> project_data_pool_from ricade sul meta-DB e
+    // l'UPDATE non tocca mai i run per-progetto, lasciandoli 'running' zombie. Un run
+    // zombie non diventa mai terminale, quindi la (ri)connessione SSE non riceve
+    // `agent_final` e la UI resta bloccata sul run finche' l'utente non fa refresh.
+    // Await (non tokio::spawn): deve concludere PRIMA del bind del listener HTTP —
+    // ogni 'running' e' per definizione un orfano del processo precedente e va
+    // marcato 'interrupted' prima di accettare nuovi run (sblocca il gate 409 /
+    // session_has_active_run). Esclude 'awaiting_confirmation' (resumibile).
+    let _ = run_reaper::reap_orphaned_runs_at_boot(&state.db).await;
 
     // Boot-recovery per-progetto (separazione DB): il blocco di riconciliazione PID
     // sopra opera sul meta; i processi agent dei progetti migrati vivono nei DB

@@ -7,6 +7,7 @@ import {
   renameChatSession,
   deleteChatSession,
   compactChatSession,
+  updateChatSessionPrefs,
   type ChatSessionSummary,
 } from "./api-client";
 import { useProjectStore } from "./project-dispatcher/store";
@@ -55,6 +56,12 @@ export interface UseMultiChatReturn {
   setActiveTab: (id: string) => void;
   newSession: () => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
+  /** Persiste il pin provider/modello della sessione ("auto" = azzera).
+   *  Ottimistico su allSessions + PATCH server; toast su errore. */
+  setSessionPrefs: (
+    id: string,
+    prefs: { preferredProvider?: string; preferredModel?: string },
+  ) => void;
   deleteSession: (id: string) => Promise<void>;
   compactSession: (id: string) => Promise<{ summary: string }>;
   setAgentActive: (sessionId: string, active: boolean) => void;
@@ -198,6 +205,41 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
     setAllSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)));
   }, []);
 
+  // Pin provider/modello per-sessione (fix "pin perso al refresh"): la fonte di
+  // verita' e' chat_sessions.preferred_provider/preferred_model lato server;
+  // qui aggiornamento ottimistico di allSessions (cosi' la re-idratazione del
+  // dropdown al cambio tab legge subito il valore nuovo) + PATCH in background.
+  const setSessionPrefs = useCallback(
+    (id: string, prefs: { preferredProvider?: string; preferredModel?: string }) => {
+      const normalize = (v: string | undefined): string | null | undefined =>
+        v === undefined ? undefined : (v.trim() === "" || v.trim().toLowerCase() === "auto" ? null : v.trim());
+      const provider = normalize(prefs.preferredProvider);
+      const model = normalize(prefs.preferredModel);
+      setAllSessions((prev) =>
+        prev.map((s) =>
+          s.id === id
+            ? {
+                ...s,
+                ...(provider !== undefined ? { preferredProvider: provider } : {}),
+                ...(model !== undefined ? { preferredModel: model } : {}),
+              }
+            : s,
+        ),
+      );
+      void updateChatSessionPrefs(id, prefs).catch((e) => {
+        // Feedback esplicito: un PATCH fallito significa che il pin NON e'
+        // persistito e al prossimo refresh tornerebbe al valore precedente.
+        useProjectStore.getState().pushToast(
+          "error",
+          e instanceof Error
+            ? `Pin provider non salvato: ${e.message}`
+            : "Pin provider non salvato",
+        );
+      });
+    },
+    [],
+  );
+
   const deleteSession = useCallback(async (id: string) => {
     await deleteChatSession(id);
     setAllSessions((prev) => prev.filter((s) => s.id !== id));
@@ -267,6 +309,7 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
     setActiveTab,
     newSession,
     renameSession,
+    setSessionPrefs,
     deleteSession,
     compactSession,
     setAgentActive,

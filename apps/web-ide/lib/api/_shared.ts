@@ -27,6 +27,59 @@ export function adminServiceUrl(path: string): string {
   return `${origin}/api/admin${p}`;
 }
 
+/** Errore HTTP tipizzato del client API (punto unico, regola M): lo status
+ *  numerico e' il segnale strutturato su cui i call site decidono (409 = run
+ *  concorrente, >=500 = ritentabile, ...). MAI ri-parsare lo status dal testo
+ *  del messaggio. `message` resta identico al formato storico per il display. */
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+/** True se l'errore indica un fallimento di trasporto o transitorio del server
+ *  per cui ha senso ritentare una chiamata IDEMPOTENTE: rete giu' (fetch
+ *  TypeError), timeout locale (AbortError), o HTTP 5xx. Un 4xx e' definitivo
+ *  (richiesta sbagliata / conflitto di stato) e non va mai ritentato. */
+export function isRetryableFetchError(e: unknown): boolean {
+  if (e instanceof ApiError) return e.status >= 500;
+  if (e instanceof DOMException && e.name === "AbortError") return true;
+  // fetch() rigetta con TypeError su errore di rete (DNS, connessione rifiutata,
+  // offline). L'abort per timeout via AbortController puo' arrivare anche come
+  // stringa/valore custom (abort("timeout")): qualunque non-ApiError uscito da
+  // fetchJson prima della risposta HTTP e' per costruzione un errore di trasporto.
+  return e instanceof TypeError || e === "timeout";
+}
+
+/** Wrapper con retry per chiamate IDEMPOTENTI (punto unico, regola L): ritenta
+ *  solo su errori di trasporto o 5xx (vedi isRetryableFetchError), con backoff.
+ *  Da usare SOLO quando il server garantisce idempotenza (es. POST messaggi
+ *  chat con clientMessageId, GET). Mai su POST non idempotenti. */
+export async function fetchJsonWithRetry<T>(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = 30000,
+  attempts = 3,
+  backoffMs = 1000,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
+    }
+    try {
+      return await fetchJson<T>(url, init, timeoutMs);
+    } catch (e) {
+      lastError = e;
+      if (!isRetryableFetchError(e)) throw e;
+    }
+  }
+  throw lastError;
+}
+
 export async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 30000): Promise<T> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort("timeout"), timeoutMs);
@@ -114,7 +167,7 @@ export async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 
     } catch {
       // ignore body parse errors and keep generic status details
     }
-    throw new Error(`API error ${res.status}: ${res.statusText}${details}`);
+    throw new ApiError(res.status, `API error ${res.status}: ${res.statusText}${details}`);
   }
   return res.json();
 }

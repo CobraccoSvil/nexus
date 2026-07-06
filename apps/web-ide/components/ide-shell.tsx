@@ -481,17 +481,19 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const [chatModel, setChatModel] = useState<string>("auto");
   const [chatAutomationMode, setChatAutomationMode] = useState<"study" | "confirm" | "automatic">("confirm");
   const [chatSupervisorMode, setChatSupervisorMode] = useState<"none" | "anomaly" | "interleaved" | "continuous">("none");
-  // Ripristina da localStorage dopo l'idratazione (SSR-safe)
+  // Ripristina da localStorage dopo l'idratazione (SSR-safe).
+  // Provider/modello NON si ripristinano piu' da qui: il pin e' PER-SESSIONE,
+  // persistito lato server (chat_sessions.preferred_provider/preferred_model,
+  // punto unico gia' letto da send_chat_message per i run successivi) e
+  // re-idratato dall'effect sulla sessione attiva qui sotto. La vecchia
+  // idratazione localStorage aveva una whitelist hardcoded di provider
+  // (violazione regola G) che scartava i pin su deepseek/mistral al refresh.
   useEffect(() => {
     try {
-      const p = localStorage.getItem("nexus:chatProvider");
-      const m = localStorage.getItem("nexus:chatModel");
+      localStorage.removeItem("nexus:chatProvider");
+      localStorage.removeItem("nexus:chatModel");
       const a = localStorage.getItem("nexus:chatAutomationMode") as "study" | "confirm" | "automatic" | null;
       const s = localStorage.getItem("nexus:chatSupervisorMode") as "none" | "anomaly" | "interleaved" | "continuous" | null;
-      // Accetta solo valori validi — resetta a "auto" se era rimasto un provider fisso
-      const validProviders = ["auto", "anthropic", "openai", "google"];
-      if (p && validProviders.includes(p)) setChatProvider(p); else localStorage.removeItem("nexus:chatProvider");
-      if (m) setChatModel(m);
       if (a) setChatAutomationMode(a);
       if (s) setChatSupervisorMode(s);
     } catch {}
@@ -505,6 +507,20 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const [selectedProfileId, setSelectedProfileId] = useState<string>("auto");
   const [showProfileEditor, setShowProfileEditor] = useState(false);
   const [editingProfile, setEditingProfile] = useState<import("../lib/api-client").UserProfile | undefined>(undefined);
+
+  // Re-idratazione del pin provider/modello dalla sessione attiva. La fonte di
+  // verita' e' il server (chat_sessions.preferred_provider/preferred_model,
+  // esposti da list_chat_sessions in multiChat.allSessions): cosi' il pin
+  // sopravvive al refresh della pagina e al cambio tab, e i run successivi
+  // continuano a usare il provider pinnato finche' l'utente non lo cambia.
+  // setSessionPrefs aggiorna allSessions in modo ottimistico, quindi questo
+  // effect e' un no-op subito dopo una modifica manuale del dropdown.
+  useEffect(() => {
+    const active = multiChat.allSessions.find((s) => s.id === multiChat.activeTabId);
+    if (!active) return;
+    setChatProvider(active.preferredProvider ?? "auto");
+    setChatModel(active.preferredModel ?? "auto");
+  }, [multiChat.activeTabId, multiChat.allSessions]);
 
   useEffect(() => {
     if (chatProvider === "auto") {
@@ -1549,9 +1565,20 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               onAgentActivityChange={handleChatAgentActivityChange}
               onCtxRatioChange={handleChatCtxRatioChange}
               selectedProvider={chatProvider}
-              setSelectedProvider={(v) => { setChatProvider(v); try { localStorage.setItem("nexus:chatProvider", v); } catch {} }}
+              setSelectedProvider={(v) => {
+                setChatProvider(v);
+                // Pin per-sessione lato server (sopravvive al refresh e vale
+                // per tutti i run successivi). Cambiare provider azzera il pin
+                // del modello: la lista modelli viene ricaricata da zero.
+                const sid = multiChat.activeTabId;
+                if (sid) multiChat.setSessionPrefs(sid, { preferredProvider: v, preferredModel: "auto" });
+              }}
               selectedModel={chatModel}
-              setSelectedModel={(v) => { setChatModel(v); try { localStorage.setItem("nexus:chatModel", v); } catch {} }}
+              setSelectedModel={(v) => {
+                setChatModel(v);
+                const sid = multiChat.activeTabId;
+                if (sid) multiChat.setSessionPrefs(sid, { preferredModel: v });
+              }}
               providerModels={chatProviderModels}
               automationMode={chatAutomationMode}
               setAutomationMode={(v) => { setChatAutomationMode(v); try { localStorage.setItem("nexus:chatAutomationMode", v); } catch {} }}

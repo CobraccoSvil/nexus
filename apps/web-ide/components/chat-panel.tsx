@@ -201,7 +201,7 @@ export function ChatPanel({
     getModels().then(({ models }) => setModelCatalog(models)).catch(() => {});
   }, []);
   const {
-    messages, isLoading, isReady, isReconnecting, error, busyByMessage,
+    messages, isLoading, isSending, isReady, isReconnecting, error, busyByMessage,
     agentRun, agentSteps, agentRuns, agentStepsMap, metaStepsMap,
     tokenUsage, traces, streamingToken, thinkingText,
     attachmentIndexProposal, clearAttachmentIndexProposal, applyAttachmentsIndexed,
@@ -430,11 +430,16 @@ export function ChatPanel({
     return arr.filter((x): x is string => typeof x === "string");
   })();
   const isChatBusy = isLoading || isAgentRunning || hasBusyMessageAction;
+  // "Invio al server in corso" SOLO finche' la POST non e' confermata
+  // (isSending): lo stato di elaborazione non deve essere ottimismo del client
+  // ma riflettere la conferma del server (messaggio persistito / run avviato).
   const busyLabel = isAgentRunning
     ? "Agente AI in esecuzione"
     : hasBusyMessageAction
       ? "Operazione sui messaggi in corso"
-      : "Elaborazione richiesta in corso";
+      : isSending
+        ? "Invio al server in corso…"
+        : "Elaborazione richiesta in corso";
 
   /* ---- Scroll management ---- */
 
