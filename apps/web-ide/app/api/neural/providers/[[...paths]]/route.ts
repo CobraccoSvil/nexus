@@ -10,12 +10,12 @@ export async function GET(
   { params }: { params: Promise<{ paths?: string[] }> }
 ) {
   const { paths = [] } = await params;
-  if (!paths || paths.length === 0) {
-    return NextResponse.json({ error: "Path non specificato" }, { status: 400 });
-  }
-
-  const pathStr = paths.join("/");
-  const targetUrl = `${CORE_URL}/api/neural/providers/${pathStr}`;
+  // paths vuoto => endpoint base /api/neural/providers (elenco provider attivi);
+  // con segmenti => sotto-risorsa /providers/<pathStr> (models, health, ...).
+  const pathStr = (paths ?? []).join("/");
+  const targetUrl = pathStr
+    ? `${CORE_URL}/api/neural/providers/${pathStr}`
+    : `${CORE_URL}/api/neural/providers`;
 
   try {
     console.log(`[API Proxy] GET ${targetUrl}`);

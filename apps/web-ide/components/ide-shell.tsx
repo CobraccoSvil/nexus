@@ -20,6 +20,7 @@ import {
   getProjectProblems,
   getRunConfigs,
   getProviderModels,
+  getProviders,
   getWorkbenchState,
   openProject,
   analyzeProject,
@@ -500,7 +501,25 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   }, []);
   const [showMemory, setShowMemory] = useState(false);
   const [chatProviderModels, setChatProviderModels] = useState<string[]>([]);
+  // Provider selezionabili nel dropdown chat: fetch dal catalog DB (regola G),
+  // niente elenco hardcoded. Vuoto = DB down/catalog vuoto -> il composer mostra
+  // solo "Auto" (caso vuoto gestito, nessun fallback hardcoded).
+  const [availableProviders, setAvailableProviders] = useState<string[]>([]);
   const [aiTraces, setAiTraces] = useState<AITraceEvent[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getProviders()
+      .then((r) => {
+        if (cancelled) return;
+        setAvailableProviders(r.providers ?? []);
+      })
+      .catch(() => {
+        // Rete/DB non raggiungibili: lista vuota, il dropdown resta su "Auto".
+        // Nessun fallback hardcoded (regola G).
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   // Profili
   const profilesMgr = useProfiles();
@@ -1580,6 +1599,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                 if (sid) multiChat.setSessionPrefs(sid, { preferredModel: v });
               }}
               providerModels={chatProviderModels}
+              availableProviders={availableProviders}
               automationMode={chatAutomationMode}
               setAutomationMode={(v) => { setChatAutomationMode(v); try { localStorage.setItem("nexus:chatAutomationMode", v); } catch {} }}
               supervisorMode={chatSupervisorMode}

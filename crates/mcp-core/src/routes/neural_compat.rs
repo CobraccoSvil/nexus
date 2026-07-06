@@ -26,6 +26,7 @@ pub fn merge(router: Router<AppState>, _state: &AppState) -> Router<AppState> {
             "/api/neural/providers/billing-cooldown",
             get(neural_compat::billing_cooldown),
         )
+        .route("/api/neural/providers", get(neural_compat::providers))
         .route(
             "/api/neural/providers/:provider/models",
             get(neural_compat::provider_models),

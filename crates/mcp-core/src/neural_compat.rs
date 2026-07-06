@@ -86,6 +86,16 @@ pub struct ProviderModelsResponse {
     pub models: Vec<String>,
 }
 
+/// Forma di `/providers`: `{status, providers[]}` — elenco dei provider che
+/// hanno almeno un modello abilitato nel catalog. Controparte simmetrica di
+/// `ProviderModelsResponse`: alimenta il dropdown provider della chat (regola G,
+/// unica fonte di verita' nel DB, nessun elenco hardcoded lato client).
+#[derive(Debug, Serialize)]
+pub struct ProvidersResponse {
+    pub status: String,
+    pub providers: Vec<String>,
+}
+
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 /// GET /health (mount: `/api/neural/health`).
@@ -169,6 +179,42 @@ pub async fn route_model(
         rationale,
         confidence: format!("{:.2}", classified.confidence),
     })
+}
+
+/// GET /providers (mount: `/api/neural/providers`).
+/// Elenca i provider DISTINCT che hanno almeno un modello ENABLED nel catalog
+/// `ai_price_catalog` (regola G: nessun provider hardcoded, tutto da DB). E' la
+/// controparte simmetrica di `provider_models`: il dropdown chat mostra solo
+/// provider che poi espongono modelli selezionabili, e un provider aggiunto o
+/// rimosso dal catalog/routing matrix si riflette qui senza toccare il frontend.
+/// Forma: `{status, providers[]}`.
+pub async fn providers(State(state): State<AppState>) -> impl IntoResponse {
+    let result = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT provider FROM ai_price_catalog \
+         WHERE is_enabled = TRUE \
+         ORDER BY provider",
+    )
+    .fetch_all(&state.db)
+    .await;
+
+    match result {
+        Ok(providers) => Json(ProvidersResponse {
+            status: "ok".to_string(),
+            providers,
+        })
+        .into_response(),
+        Err(e) => {
+            tracing::warn!("neural_compat: query provider attivi catalog fallita: {e}");
+            // Forma stabile anche in errore: status != ok, lista vuota. Il
+            // frontend (getProviders) usa `response.providers ?? []`: il caso
+            // vuoto degrada a "solo Auto", nessun fallback hardcoded (regola G).
+            Json(ProvidersResponse {
+                status: "error".to_string(),
+                providers: Vec::new(),
+            })
+            .into_response()
+        }
+    }
 }
 
 /// GET /providers/{provider}/models (mount: `/api/neural/providers/:provider/models`).
