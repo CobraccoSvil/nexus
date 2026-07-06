@@ -804,6 +804,9 @@ pub mod test_doubles {
 
         async fn failover_provider(
             &self,
+            _current_provider: Option<&str>,
+            _current_model: Option<&str>,
+            _current_tier: Option<&str>,
             exclude: &[String],
         ) -> Result<Option<CrossProviderCandidate>, PortError> {
             self.failover_seen

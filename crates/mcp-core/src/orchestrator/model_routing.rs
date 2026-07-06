@@ -277,11 +277,10 @@ pub(crate) async fn route_model_from_catalog(
 
 /// Catena di degradazione graceful dei tier da `top` fino a `light` sulla scala a
 /// 5 livelli (frontier>heavy>high>medium>light). PUNTO UNICO (regola L) della
-/// tier-chain agentica, condiviso da `route_model_from_catalog`,
-/// `best_agentic_failover` e `select_models_tierchain`: il primo tier con un
-/// candidato sano vince; se il tier alto e' tutto in cooldown si scende, invece di
-/// fallire. Un `top` fuori vocabolario degrada da 'medium' (neutro), mai un
-/// fallimento silenzioso.
+/// tier-chain agentica, condiviso da `route_model_from_catalog` e
+/// `select_models_tierchain`: il primo tier con un candidato sano vince; se il
+/// tier alto e' tutto in cooldown si scende, invece di fallire. Un `top` fuori
+/// vocabolario degrada da 'medium' (neutro), mai un fallimento silenzioso.
 pub(crate) fn agentic_tier_chain(top: &str) -> Vec<&'static str> {
     match top.trim() {
         "frontier" => vec!["frontier", "heavy", "high", "medium", "light"],
@@ -293,38 +292,73 @@ pub(crate) fn agentic_tier_chain(top: &str) -> Vec<&'static str> {
     }
 }
 
-/// FAILOVER agentico cross-provider (regola L, punto unico): il MIGLIOR modello
-/// agentico SANO escludendo `exclude` (i provider gia' provati / caduti in questo
-/// run). Usato dall'auto-escalation runtime quando il gateway segnala che il
-/// provider corrente non e' disponibile (500 `PROVIDER_ERROR` / cooldown).
+/// Backstop anti-runaway del pool di candidati del failover agentico: NON e' un
+/// dimensionamento. Il pool deve contenere TUTTI i modelli agentici ammissibili
+/// (la scelta spetta al modulo puro, non a un taglio SQL): l'ordine della query
+/// e' featured+economico, quindi un limite vicino alla dimensione reale del
+/// catalog taglierebbe proprio i tier alti/costosi (il catalog reale ha ~112
+/// eleggibili: un limite 64 escludeva tutti i frontier/heavy, reintroducendo il
+/// pavimento). 512 sta ben sopra ogni catalog realistico; la saturazione viene
+/// loggata WARN (mai un cap silenzioso).
+const FAILOVER_CANDIDATE_POOL: i64 = 512;
+
+/// Pool di candidati del FAILOVER agentico cross-provider (regola L, punto unico):
+/// TUTTI i modelli agentici ammissibili — OGNI tier, esclusi i provider `exclude`
+/// (gia' provati / caduti in questo run) e quelli in cooldown (ADR 0020). Usato
+/// dall'auto-escalation runtime quando il gateway segnala che il provider corrente
+/// non e' disponibile (500 `PROVIDER_ERROR` / cooldown).
 ///
-/// CONVERGENZA (regola L): NON re-implementa la selezione ne' usa il purpose
-/// `loop_fallback_default` (un solo candidato statico, senza filtro cooldown, che
-/// non fa cascata). Delega allo STESSO punto unico del routing iniziale —
-/// [`select_agentic_model`] — che applica il gate completo (supports_tool_use,
-/// `agentic_thinking_policy <> 'exclude'`, provider NON in cooldown, NON in
-/// `exclude_providers`). Cosi' il failover "in-run" sceglie esattamente come farebbe
-/// il rilancio manuale del run, senza che l'utente debba ri-lanciare.
-///
-/// Pavimento agentico (`agent.routing.agentic_min_tier`, default 'medium') +
-/// tier-chain GRACEFUL verso il basso: se il tier minimo e' tutto in cooldown
-/// scende fino a 'light' invece di fallire. `None` SOLO quando nessun provider
-/// sano resta (rete davvero esaurita -> il chiamante chiude `Error` onestamente).
-pub(crate) async fn best_agentic_failover(
+/// NESSUN pavimento ne' tier-chain (a differenza del routing iniziale): la SCELTA
+/// del sostituto e' AGENTICA e spetta al modulo puro
+/// `nexus_agent_graph::decisions::escalation::pick_failover_model` (salute ->
+/// likelihood da telemetria, col tier corrente come semplice INDICAZIONE). Qui si
+/// enumera solo l'eleggibilita', delegando la WHERE al punto unico
+/// [`select_models_tierchain`] (supports_tool_use, `agentic_thinking_policy <>
+/// 'exclude'`, provider sani). Ordine: featured + piu' economico — diventa il
+/// tie-break d'ingresso della selezione pura. `Vec::new()` SOLO quando nessun
+/// candidato sano resta (rete davvero esaurita) o su errore di lettura
+/// (fail-open: il chiamante chiude `Error` onestamente).
+pub(crate) async fn agentic_failover_candidates(
     db: &PgPool,
     exclude: &[String],
-) -> Option<DynamicRoutingDecision> {
-    let floor = agentic_min_tier(db).await;
-    // Stessa degradazione graceful di route_model_from_catalog, partendo dal
-    // pavimento agentico (il failover e' sempre un turno agentico a tool).
-    let tier_chain = agentic_tier_chain(floor.as_str());
-    // capability None: per il failover basta un modello agentico (tool-use) SANO
-    // di tier adeguato; non lo vincoliamo a una capability specifica del turno
-    // (il pavimento garantisce gia' la forza). Ordine: featured + piu' economico.
-    let order_clause = "is_featured DESC, input_cost_per_million_tokens ASC";
-    select_agentic_model(db, &tier_chain, None, 0, exclude, order_clause)
-        .await
-        .map(|(provider, model)| DynamicRoutingDecision { provider, model })
+) -> Vec<(String, String, Option<String>)> {
+    let filter = crate::orchestrator::EligibilityFilter {
+        require_tool_use: true,
+        require_thinking_non_exclude: true,
+        capability: None,
+        min_context_window: 0,
+        exclude_providers: exclude,
+        apply_cooldown: true,
+    };
+    // tier_chain VUOTA = nessun filtro tier (query singola su tutti i tier).
+    match crate::orchestrator::select_models_tierchain(
+        db,
+        &filter,
+        &[],
+        "is_featured DESC, input_cost_per_million_tokens ASC",
+        FAILOVER_CANDIDATE_POOL,
+    )
+    .await
+    {
+        Ok(v) => {
+            if v.len() as i64 >= FAILOVER_CANDIDATE_POOL {
+                // Il backstop e' scattato: con l'ordine featured+economico il
+                // taglio esclude i tier alti -> il pool NON e' piu' completo.
+                // Segnale rumoroso (niente cap silenziosi): alzare il backstop.
+                tracing::warn!(
+                    pool = v.len(),
+                    backstop = FAILOVER_CANDIDATE_POOL,
+                    "agentic_failover_candidates: pool saturo, candidati troncati \
+                     (i tier alti possono mancare) - alzare FAILOVER_CANDIDATE_POOL"
+                );
+            }
+            v
+        }
+        Err(e) => {
+            tracing::warn!("agentic_failover_candidates: {e}");
+            Vec::new()
+        }
+    }
 }
 
 /// Seleziona il miglior modello del catalog per un dato `tier`, opzionalmente
@@ -389,7 +423,7 @@ pub async fn best_model_for_tier(
     )
     .await
     {
-        Ok(mut v) => v.drain(..).next(),
+        Ok(mut v) => v.drain(..).next().map(|(p, m, _)| (p, m)),
         Err(e) => {
             tracing::warn!("best_model_for_tier (non-agentico): {e}");
             None
@@ -447,7 +481,7 @@ pub(crate) async fn select_agentic_model(
         apply_cooldown: true,
     };
     match crate::orchestrator::select_models_tierchain(db, &filter, tier_chain, order_by, 1).await {
-        Ok(mut v) => v.drain(..).next(),
+        Ok(mut v) => v.drain(..).next().map(|(p, m, _)| (p, m)),
         Err(e) => {
             // Regola H: l'errore SQL viene loggato, non silenziato come "nessun
             // modello" (prima `.ok().flatten()` lo inghiottiva).
@@ -511,7 +545,7 @@ pub(crate) async fn select_agentic_model_governed(
         exclude_providers,
         apply_cooldown: true,
     };
-    let candidates = match crate::orchestrator::select_models_tierchain(
+    let candidates: Vec<(String, String)> = match crate::orchestrator::select_models_tierchain(
         db,
         &filter,
         tier_chain,
@@ -520,7 +554,7 @@ pub(crate) async fn select_agentic_model_governed(
     )
     .await
     {
-        Ok(v) => v,
+        Ok(v) => v.into_iter().map(|(p, m, _)| (p, m)).collect(),
         Err(e) => {
             tracing::warn!("select_agentic_model_governed: {e}");
             return None;

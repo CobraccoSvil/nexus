@@ -32,7 +32,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 
 use nexus_agent_graph::decisions::escalation::{
-    ChainEntry, CrossProviderCandidate, EscalationCandidate,
+    pick_failover_model, ChainEntry, CrossProviderCandidate, EscalationCandidate,
 };
 use nexus_agent_graph::decisions::governance::ModelTelemetry;
 use nexus_agent_graph::runtime::ports::{EscalationInputs, EscalationPort, ExecMode, PortError};
@@ -260,6 +260,47 @@ impl PgEscalationPort {
         })
     }
 
+    /// PUNTO UNICO (regola L) dell'arricchimento candidati: triple
+    /// `(provider, model, tier)` -> [`EscalationCandidate`] con telemetria
+    /// strutturata (regola M, batch: una query per l'intero insieme) e flag
+    /// cooldown (gate ADR 0020, segnale forte anche senza storico probe).
+    /// Condiviso da `escalation_inputs` e `failover_provider`.
+    ///
+    /// `load_telemetry=false` (replay): telemetria default (sano) -> il ranking
+    /// a valle si riduce a tier + ordine d'ingresso, replay-stabile.
+    async fn enrich_candidates(
+        &self,
+        pmt: Vec<(String, String, Option<String>)>,
+        load_telemetry: bool,
+    ) -> Vec<EscalationCandidate> {
+        let tmap: HashMap<(String, String), ModelTelemetry> = if load_telemetry {
+            let pm: Vec<(String, String)> =
+                pmt.iter().map(|(p, m, _)| (p.clone(), m.clone())).collect();
+            load_model_telemetry(&self.db, &pm)
+                .await
+                .into_iter()
+                .map(|t| (ModelTelemetry::key(&t.provider, &t.model), t))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        pmt.into_iter()
+            .map(|(p, m, tier)| {
+                let mut telemetry = tmap
+                    .get(&ModelTelemetry::key(&p, &m))
+                    .cloned()
+                    .unwrap_or_default();
+                telemetry.provider_in_cooldown =
+                    telemetry.provider_in_cooldown || is_provider_in_cooldown(&p);
+                EscalationCandidate {
+                    provider: p,
+                    model: m,
+                    tier,
+                    telemetry,
+                }
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -316,75 +357,63 @@ impl EscalationPort for PgEscalationPort {
         // Telemetria: caricata SOLO in Real. In Replay resterebbe non-deterministica
         // (parita' shadow), quindi telemetria default (sano) -> il ranking si riduce a
         // tier + ordine d'ingresso, replay-stabile (come le altre decisioni gata mode).
-        let tmap: HashMap<(String, String), ModelTelemetry> = if mode == ExecMode::Real {
-            let pm: Vec<(String, String)> =
-                pmt.iter().map(|(p, m, _)| (p.clone(), m.clone())).collect();
-            load_model_telemetry(&self.db, &pm)
-                .await
-                .into_iter()
-                .map(|t| (ModelTelemetry::key(&t.provider, &t.model), t))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-
-        let candidates: Vec<EscalationCandidate> = pmt
-            .into_iter()
-            .map(|(p, m, tier)| {
-                let mut telemetry = tmap
-                    .get(&ModelTelemetry::key(&p, &m))
-                    .cloned()
-                    .unwrap_or_default();
-                // Cooldown del provider come segnale forte anche senza storico probe
-                // (gate ADR 0020): un provider in cooldown viene retrocesso dal ranking.
-                telemetry.provider_in_cooldown =
-                    telemetry.provider_in_cooldown || is_provider_in_cooldown(&p);
-                EscalationCandidate {
-                    provider: p,
-                    model: m,
-                    tier,
-                    telemetry,
-                }
-            })
-            .collect();
+        let candidates = self
+            .enrich_candidates(pmt, mode == ExecMode::Real)
+            .await;
 
         Ok(EscalationInputs { candidates, policy })
     }
 
-    /// FAILOVER su provider caduto: DELEGA al punto unico del routing iniziale
-    /// ([`crate::orchestrator::model_routing::best_agentic_failover`], regola L),
-    /// che esclude i provider in cooldown (gate ADR 0020) E quelli gia' provati
-    /// (`exclude`). Niente `loop_fallback_default` (un solo candidato statico senza
-    /// filtro cooldown): qui si sceglie il MIGLIOR provider agentico SANO come
-    /// farebbe il rilancio manuale del run. FAIL-OPEN: errore di lettura -> `None`.
+    /// FAILOVER su provider caduto: selezione AGENTICA del SOSTITUTO. Enumera
+    /// TUTTI i candidati agentici ammissibili (OGNI tier — nessun pavimento ne'
+    /// catena — esclusi i provider in cooldown, gate ADR 0020, e quelli gia'
+    /// provati `exclude`) dal punto unico di eleggibilita'
+    /// ([`crate::orchestrator::model_routing::agentic_failover_candidates`],
+    /// regola L), li arricchisce di telemetria strutturata (regola M, batch) e
+    /// DELEGA la scelta al modulo puro `pick_failover_model`: salute ->
+    /// `likelihood * affinita' di tier`. Il tier del modello CADUTO e' una
+    /// INDICAZIONE (dal chiamante, o risolto dal catalog se assente), mai un
+    /// filtro. FAIL-OPEN: errore di lettura -> `None`.
     async fn failover_provider(
         &self,
+        current_provider: Option<&str>,
+        current_model: Option<&str>,
+        current_tier: Option<&str>,
         exclude: &[String],
     ) -> Result<Option<CrossProviderCandidate>, PortError> {
-        let decision =
-            crate::orchestrator::model_routing::best_agentic_failover(&self.db, exclude).await;
-        // FIX-A (scale-controller): il selettore agentico ritorna (provider, model)
-        // (firma INVARIATA, regola L); il tier del modello scelto lo risolviamo qui
-        // dal catalog (punto unico `model_tier`, DB gia' interrogato in questo ramo)
-        // cosi' il pick di failover porta `current_tier` come gli altri.
-        let pick = match decision {
-            Some(d) => {
-                let tier = self.model_tier(&d.provider, &d.model).await;
-                Some(CrossProviderCandidate {
-                    provider: d.provider,
-                    model: d.model,
-                    tier,
-                })
-            }
-            None => None,
+        let pool =
+            crate::orchestrator::model_routing::agentic_failover_candidates(&self.db, exclude)
+                .await;
+        if pool.is_empty() {
+            return Ok(None);
+        }
+
+        // Arricchimento dal punto unico condiviso con `escalation_inputs`
+        // (telemetria batch + cooldown, regola L). Il failover e' sempre Real.
+        let policy = load_governance_policy(&self.db).await;
+        let candidates = self.enrich_candidates(pool, true).await;
+
+        // Tier corrente come INDICAZIONE: dal chiamante se noto, altrimenti
+        // risolto dal catalog (fail-open: None = medium neutro nel modulo puro).
+        let cur_tier = match current_tier.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => Some(t.to_string()),
+            None => match (current_provider, current_model) {
+                (Some(p), Some(m)) => self.model_tier(p, m).await,
+                _ => None,
+            },
         };
+
+        let pick = pick_failover_model(&candidates, cur_tier.as_deref(), &policy);
         if let Some(ref c) = pick {
             tracing::info!(
                 target: "nexus_mcp_core::escalation_port",
                 failover_provider = %c.provider,
                 failover_model = %c.model,
+                failover_tier = c.tier.as_deref().unwrap_or("?"),
+                current_tier = cur_tier.as_deref().unwrap_or("?"),
+                candidates = candidates.len(),
                 excluded = exclude.len(),
-                "failover_provider: scelto provider sano via routing (esclusi i gia' provati)"
+                "failover_provider: sostituto scelto agenticamente (salute+likelihood, tier come indicazione)"
             );
         }
         Ok(pick)
@@ -424,29 +453,25 @@ mod tests {
         .execute(pool)
         .await
         .expect("create nexus_purpose_model");
-        // Catalog + vista derivata (mig 0471): chain_for ora legge la vista, non la
-        // tabella seed. Colonne minime usate da v_model_escalation_chain.
+        // Catalog dal punto unico condiviso (regola L, `test_support`): la stessa
+        // tabella serve sia la vista v_model_escalation_chain sia il punto unico
+        // `select_models_tierchain` usato dal failover agentico.
+        crate::test_support::create_ai_price_catalog_table(pool).await;
+        // Storico health per la telemetria del failover (`load_model_telemetry`):
+        // vuoto = telemetria neutra dai soli contatori del catalog.
         sqlx::query(
-            "CREATE TABLE ai_price_catalog ( \
+            "CREATE TABLE ai_model_health_history ( \
                  provider TEXT NOT NULL, \
                  model TEXT NOT NULL, \
-                 input_cost_per_million_tokens NUMERIC NOT NULL DEFAULT 0, \
-                 output_cost_per_million_tokens NUMERIC NOT NULL DEFAULT 0, \
-                 performance_tier TEXT NOT NULL DEFAULT 'medium', \
-                 speed_tier TEXT NOT NULL DEFAULT 'medium', \
-                 is_enabled BOOLEAN NOT NULL DEFAULT TRUE, \
-                 consecutive_failures INT NOT NULL DEFAULT 0, \
-                 consecutive_tool_failures INT NOT NULL DEFAULT 0, \
-                 supports_tool_use BOOLEAN NOT NULL DEFAULT TRUE, \
-                 supports_vision BOOLEAN NOT NULL DEFAULT FALSE, \
-                 agentic_thinking_policy TEXT NOT NULL DEFAULT 'allow', \
-                 capabilities JSONB NOT NULL DEFAULT '[]', \
-                 context_window INT NOT NULL DEFAULT 8192 \
+                 healthy BOOLEAN NOT NULL, \
+                 latency_ms BIGINT, \
+                 error_kind TEXT, \
+                 checked_at TIMESTAMPTZ NOT NULL DEFAULT now() \
              )",
         )
         .execute(pool)
         .await
-        .expect("create ai_price_catalog");
+        .expect("create ai_model_health_history");
         sqlx::query(
             "CREATE VIEW v_model_escalation_chain AS SELECT \
                  provider, model, performance_tier, speed_tier, is_enabled, \
@@ -730,5 +755,130 @@ mod tests {
             .await
             .expect("fail-open");
         assert!(inputs.candidates.is_empty());
+    }
+
+    // ---- failover_provider: selezione agentica del sostituto ----
+
+    /// REGRESSIONE (incidente run a0b6e0a9): cade un heavy, il vecchio failover
+    /// ripartiva dal pavimento fisso 'medium' e sceglieva il piu' economico
+    /// (v4-flash), IGNORANDO il high sano (v4-pro). Con la selezione agentica il
+    /// tier corrente e' un'indicazione: vince il sostituto piu' vicino.
+    #[sqlx::test]
+    async fn failover_sceglie_il_sostituto_vicino_non_il_pavimento(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("deepseek", "deepseek-v4-flash", "medium", 0.1, true, true),
+                ("deepseek", "deepseek-v4-pro", "high", 1.0, true, true),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(
+                Some("google"),
+                Some("gemini-3.5-flash"),
+                Some("heavy"),
+                &["google".to_string(), "mistral".to_string()],
+            )
+            .await
+            .expect("fail-open")
+            .expect("un sostituto sano esiste");
+        assert_eq!(pick.provider, "deepseek");
+        assert_eq!(pick.model, "deepseek-v4-pro");
+        assert_eq!(pick.tier.as_deref(), Some("high"));
+    }
+
+    /// La salute (segnale strutturato, regola M) domina l'indicazione di tier:
+    /// il candidato piu' vicino ma "recently_failed" (contatori del catalog)
+    /// perde contro uno piu' lontano ma sano.
+    #[sqlx::test]
+    async fn failover_telemetria_retrocede_il_degradato(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("deepseek", "deepseek-v4-pro", "high", 1.0, true, true),
+                ("mistral", "mistral-large", "medium", 0.5, true, true),
+            ],
+        )
+        .await;
+        // 2 fallimenti consecutivi = soglia recently_failed della policy default.
+        sqlx::query(
+            "UPDATE ai_price_catalog SET consecutive_failures = 2 \
+             WHERE provider = 'deepseek' AND model = 'deepseek-v4-pro'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update failures");
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(Some("google"), Some("g"), Some("heavy"), &["google".to_string()])
+            .await
+            .expect("fail-open")
+            .expect("un sostituto sano esiste");
+        assert_eq!(pick.model, "mistral-large");
+    }
+
+    /// I provider gia' provati (`exclude`) non rientrano mai nel pool.
+    #[sqlx::test]
+    async fn failover_esclude_i_provider_gia_provati(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("google", "gemini-heavy", "heavy", 1.0, true, true),
+                ("deepseek", "deepseek-v4-pro", "high", 1.0, true, true),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(Some("google"), Some("gemini-heavy"), Some("heavy"), &[
+                "google".to_string(),
+            ])
+            .await
+            .expect("fail-open")
+            .expect("resta deepseek");
+        assert_eq!(pick.provider, "deepseek");
+    }
+
+    /// `current_tier` assente -> risolto dal catalog via (provider, model). Con la
+    /// risoluzione attiva l'indicazione 'heavy' preferisce il high; senza (medium
+    /// neutro) vincerebbe il medium (distanza 0): il test discrimina i due casi.
+    #[sqlx::test]
+    async fn failover_tier_corrente_risolto_dal_catalog(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("google", "gemini-heavy", "heavy", 1.0, true, true),
+                ("deepseek", "deepseek-v4-flash", "medium", 0.1, true, true),
+                ("deepseek", "deepseek-v4-pro", "high", 1.0, true, true),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(Some("google"), Some("gemini-heavy"), None, &[
+                "google".to_string(),
+            ])
+            .await
+            .expect("fail-open")
+            .expect("un sostituto esiste");
+        assert_eq!(pick.model, "deepseek-v4-pro");
+    }
+
+    /// Catalog vuoto (o tutto escluso) -> `None`, mai un errore (fail-open).
+    #[sqlx::test]
+    async fn failover_pool_vuoto_ritorna_none(pool: PgPool) {
+        create_schema(&pool).await;
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(Some("google"), Some("g"), Some("heavy"), &[])
+            .await
+            .expect("fail-open");
+        assert!(pick.is_none());
     }
 }

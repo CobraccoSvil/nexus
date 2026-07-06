@@ -906,9 +906,8 @@ pub trait ModelUpscalePort: Send + Sync {
     /// basso con finestra insufficiente viene scartato invece di troncare), la
     /// `capability` propagata (mai persa in un downscale) e i `exclude_providers`.
     /// DELEGA al PUNTO UNICO `select_agentic_model` (regola L, che accetta gia'
-    /// `min_context_window`): stesso selettore del routing iniziale/failover
-    /// (pavimento agentico, gate cooldown ADR 0020, tool-use,
-    /// agentic_thinking_policy<>'exclude').
+    /// `min_context_window`): stesso selettore del routing iniziale
+    /// (gate cooldown ADR 0020, tool-use, agentic_thinking_policy<>'exclude').
     ///
     /// Ritorna `Some((provider, model))` se un modello del tier soddisfa i vincoli,
     /// `None` se nessun candidato (-> il chiamante ANNULLA il cambio-tier, fail-safe
@@ -966,15 +965,16 @@ pub trait EscalationPort: Send + Sync {
     ) -> Result<EscalationInputs, PortError>;
 
     /// FAILOVER cross-provider su provider CADUTO (gateway 500 `PROVIDER_ERROR` /
-    /// cooldown runtime): ritorna il MIGLIOR modello agentico SANO escludendo i
-    /// provider gia' provati `exclude` (incluso quello appena caduto). A differenza
-    /// del candidato `loop_fallback_default` di [`escalation_inputs`] (UN solo
-    /// candidato statico, senza filtro cooldown, che non fa CASCATA), questo metodo
-    /// DELEGA al PUNTO UNICO del routing iniziale (`select_agentic_model`, regola L):
-    /// la STESSA selezione che il rilancio manuale del run usa — pavimento agentico,
-    /// gate cooldown (ADR 0020), tool-use, agentic_thinking_policy<>'exclude'.
-    /// Accumulando `exclude` ad ogni salto la cascata prova in sequenza tutti i
-    /// provider sani disponibili invece di insistere su uno solo.
+    /// cooldown runtime): selezione AGENTICA del SOSTITUTO. L'impl enumera TUTTI i
+    /// candidati agentici ammissibili (OGNI tier, esclusi i provider gia' provati
+    /// `exclude` e quelli in cooldown, ADR 0020), li arricchisce di telemetria
+    /// strutturata (regola M) e DELEGA la scelta al modulo puro
+    /// [`crate::decisions::escalation::pick_failover_model`] (regola L): salute ->
+    /// `likelihood * affinita' di tier`. Il tier del modello CADUTO
+    /// (`current_tier`, o risolto dal catalog via `current_provider`/
+    /// `current_model`) e' una INDICAZIONE, mai un filtro: nessun pavimento, nessuna
+    /// catena posizionale. Accumulando `exclude` ad ogni salto la cascata prova in
+    /// sequenza tutti i provider sani disponibili invece di insistere su uno solo.
     ///
     /// `None` SOLO quando nessun provider sano resta (rete davvero esaurita ->
     /// chiusura `Error` onesta). FAIL-OPEN: un guasto di lettura -> `Ok(None)`
@@ -982,6 +982,9 @@ pub trait EscalationPort: Send + Sync {
     /// flusso normale. SOLA LETTURA: nessun gate `mode`.
     async fn failover_provider(
         &self,
+        current_provider: Option<&str>,
+        current_model: Option<&str>,
+        current_tier: Option<&str>,
         exclude: &[String],
     ) -> Result<Option<CrossProviderCandidate>, PortError>;
 }

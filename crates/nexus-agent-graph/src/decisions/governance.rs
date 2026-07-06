@@ -96,6 +96,12 @@ pub struct GovernancePolicy {
     /// Latenza (ms) di riferimento per la penalita' di latenza (tie-breaker):
     /// `avg_latency_ms / latency_ref_ms` scala la penalita' [0, cap].
     pub latency_ref_ms: i64,
+    /// Affinita' di tier nel FAILOVER (`pick_failover_model`): moltiplicatore
+    /// applicato per OGNI livello di tier SOTTO quello corrente (`penalty^delta`).
+    /// Il tier corrente e' un'INDICAZIONE, mai un filtro: un candidato piu'
+    /// debole ma con likelihood nettamente migliore puo' comunque vincere.
+    /// Range valido (0, 1]; 1.0 = indicazione disattivata.
+    pub failover_downgrade_penalty: f64,
 }
 
 impl Default for GovernancePolicy {
@@ -108,6 +114,7 @@ impl Default for GovernancePolicy {
             exclude_consecutive_failures: 2,
             min_recent_checks: 2,
             latency_ref_ms: 20_000,
+            failover_downgrade_penalty: 0.85,
         }
     }
 }

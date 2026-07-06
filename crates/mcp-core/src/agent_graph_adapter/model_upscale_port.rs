@@ -115,7 +115,7 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
                 return Ok(None);
             }
         };
-        let Some((provider, model)) = rows.into_iter().next() else {
+        let Some((provider, model, _)) = rows.into_iter().next() else {
             return Ok(None);
         };
         // Se il migliore coincide col modello corrente non c'e' upscale da fare.

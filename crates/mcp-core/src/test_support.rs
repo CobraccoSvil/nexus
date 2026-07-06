@@ -40,7 +40,11 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
              capabilities JSONB NOT NULL DEFAULT '[]', \
              context_window INTEGER NOT NULL DEFAULT 8192, \
              input_cost_per_million_tokens DOUBLE PRECISION NOT NULL DEFAULT 0, \
-             is_featured BOOLEAN NOT NULL DEFAULT false \
+             output_cost_per_million_tokens DOUBLE PRECISION NOT NULL DEFAULT 0, \
+             is_featured BOOLEAN NOT NULL DEFAULT false, \
+             speed_tier TEXT NOT NULL DEFAULT 'medium', \
+             consecutive_failures INT NOT NULL DEFAULT 0, \
+             consecutive_tool_failures INT NOT NULL DEFAULT 0 \
          )",
     )
     .execute(pool)

@@ -3165,12 +3165,11 @@ della finestra {effective_window} del modello {provider}/{model}"
                 // provider scelto NON e' disponibile ([`PortError::ProviderUnavailable`],
                 // = 500 `PROVIDER_ERROR`: tutti i provider risolti per QUESTA richiesta
                 // in cooldown), NON chiudere il run con `StopReason::Error`: RIPIEGA su
-                // un provider SANO delegando al PUNTO UNICO del routing iniziale
-                // ([`EscalationPort::failover_provider`] -> `select_agentic_model`), la
-                // STESSA selezione che il rilancio manuale userebbe. NON usa piu' il
-                // `loop_fallback_default` (un solo candidato statico, senza filtro
-                // cooldown, che non faceva cascata: o coincideva col corrente -> None,
-                // o puntava a un provider a crediti zero -> loop fino a Error). Se c'e'
+                // un SOSTITUTO scelto AGENTICAMENTE dalla porta
+                // ([`EscalationPort::failover_provider`] -> `pick_failover_model`):
+                // TUTTI i candidati agentici sani (ogni tier, niente pavimento ne'
+                // catena), ordinati salute -> likelihood da telemetria, col tier del
+                // modello caduto come INDICAZIONE (mai un filtro). Se c'e'
                 // un provider sano, promuoviamo lo sticky e usciamo con `G1Escalated`:
                 // il self-loop rientra nell'executor col provider nuovo (stesso pattern
                 // del ramo G1). I provider gia' provati sono accumulati in
@@ -3204,13 +3203,21 @@ della finestra {effective_window} del modello {provider}/{model}"
                         if !tried.iter().any(|p| p == &provider) {
                             tried.push(provider.clone());
                         }
-                        // Punto unico (regola L): il MIGLIOR provider agentico SANO
-                        // escludendo i gia' provati. DELEGA alla STESSA selezione del
-                        // routing iniziale (`select_agentic_model`, che esclude da se'
-                        // anche i cooldown) -> la rete scala IN-RUN, senza che l'utente
-                        // debba ri-lanciare. Fail-open: errore -> None -> chiusura Error.
-                        if let Ok(Some(pick)) =
-                            self.escalation.failover_provider(&tried).await
+                        // Punto unico (regola L): selezione AGENTICA del SOSTITUTO
+                        // (tutti i tier, telemetria strutturata, esclusi i gia' provati
+                        // e i cooldown). Il tier del modello caduto viaggia come
+                        // INDICAZIONE, non come filtro -> la rete scala IN-RUN, senza
+                        // che l'utente debba ri-lanciare. Fail-open: errore -> None ->
+                        // chiusura Error.
+                        if let Ok(Some(pick)) = self
+                            .escalation
+                            .failover_provider(
+                                Some(&provider),
+                                Some(&model),
+                                state.current_tier.as_deref(),
+                                &tried,
+                            )
+                            .await
                         {
                             tracing::warn!(
                                 target: "nexus_agent_graph::executor",

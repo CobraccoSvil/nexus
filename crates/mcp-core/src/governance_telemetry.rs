@@ -43,6 +43,10 @@ const GOVERNANCE_EXCLUDE_CONSECUTIVE_SETTING: &str = "agent.governance.exclude_c
 const GOVERNANCE_MIN_RECENT_CHECKS_SETTING: &str = "agent.governance.min_recent_checks";
 /// Latenza (ms) di riferimento per la penalita' di latenza (tie-breaker).
 const GOVERNANCE_LATENCY_REF_SETTING: &str = "agent.governance.latency_ref_ms";
+/// Affinita' di tier nel failover: penalita' moltiplicativa per livello di tier
+/// sotto quello corrente (`pick_failover_model`). Range valido (0, 1].
+const GOVERNANCE_FAILOVER_DOWNGRADE_PENALTY_SETTING: &str =
+    "agent.governance.failover_downgrade_penalty";
 
 /// Default della finestra di check recenti (mig 0523). Non un magic fallback su
 /// un modello (regola G non si applica): e' un parametro di calcolo locale, come
@@ -93,11 +97,17 @@ pub async fn load_governance_policy(db: &PgPool) -> GovernancePolicy {
         .await
         .filter(|v| *v > 0)
         .unwrap_or(def.latency_ref_ms);
+    let failover_downgrade_penalty =
+        setting_f64(db, GOVERNANCE_FAILOVER_DOWNGRADE_PENALTY_SETTING)
+            .await
+            .filter(|v| *v > 0.0 && *v <= 1.0)
+            .unwrap_or(def.failover_downgrade_penalty);
     GovernancePolicy {
         exclude_error_rate,
         exclude_consecutive_failures,
         min_recent_checks,
         latency_ref_ms,
+        failover_downgrade_penalty,
     }
 }
 

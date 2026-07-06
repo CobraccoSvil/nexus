@@ -192,13 +192,17 @@ fn is_media_capability(capability: &str) -> bool {
 /// duplicata tra `select_agentic_model` (SQL agentico) e il ramo non-agentico
 /// inline di `best_model_for_tier`. Propaga `Result` (regola H): l'errore SQL
 /// non e' piu' silenziato come "nessun modello".
+///
+/// Ritorna `(provider, model, performance_tier)`: il tier viaggia con la riga
+/// (i selettori tier-aware, es. il failover agentico, lo usano come indicazione
+/// senza un lookup extra); i caller che non ne hanno bisogno lo ignorano.
 pub(crate) async fn select_models_tierchain(
     db: &PgPool,
     filter: &EligibilityFilter<'_>,
     tier_chain: &[&str],
     order_by: &str,
     limit: i64,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String, Option<String>)>, String> {
     let excluded: Vec<String> = if filter.apply_cooldown {
         excluded_providers_lower(filter.exclude_providers)
     } else {
@@ -239,7 +243,7 @@ pub(crate) async fn select_models_tierchain(
         // del precedente select_agentic_model).
         let mut idx = 1;
         let mut sql = String::from(
-            "SELECT provider, model FROM ai_price_catalog \
+            "SELECT provider, model, performance_tier FROM ai_price_catalog \
              WHERE is_enabled = TRUE \
                AND LOWER(provider) <> ALL($1)",
         );
@@ -291,7 +295,7 @@ pub(crate) async fn select_models_tierchain(
         }
         sql.push_str(&format!(" LIMIT {limit}"));
 
-        let mut q = sqlx::query_as::<_, (String, String)>(&sql).bind(&excluded);
+        let mut q = sqlx::query_as::<_, (String, String, Option<String>)>(&sql).bind(&excluded);
         if let Some(t) = tier {
             q = q.bind(t);
         }
@@ -483,7 +487,14 @@ mod tests {
         .await
         .expect("ok");
         // Esclude no-tool; tra i tool-capable sceglie il piu' economico.
-        assert_eq!(out, vec![("openai".to_string(), "economico".to_string())]);
+        assert_eq!(
+            out,
+            vec![(
+                "openai".to_string(),
+                "economico".to_string(),
+                Some("heavy".to_string())
+            )]
+        );
     }
 
     #[sqlx::test]
@@ -517,7 +528,14 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(out, vec![("b".to_string(), "nativo".to_string())]);
+        assert_eq!(
+            out,
+            vec![(
+                "b".to_string(),
+                "nativo".to_string(),
+                Some("heavy".to_string())
+            )]
+        );
     }
 
     #[sqlx::test]
@@ -555,7 +573,14 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(out, vec![("a".to_string(), "forte".to_string())]);
+        assert_eq!(
+            out,
+            vec![(
+                "a".to_string(),
+                "forte".to_string(),
+                Some("medium".to_string())
+            )]
+        );
     }
 
     #[sqlx::test]
@@ -621,7 +646,14 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(out, vec![("a".to_string(), "medio".to_string())]);
+        assert_eq!(
+            out,
+            vec![(
+                "a".to_string(),
+                "medio".to_string(),
+                Some("medium".to_string())
+            )]
+        );
     }
 
     #[sqlx::test]
@@ -654,7 +686,14 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(out, vec![("b".to_string(), "vision".to_string())]);
+        assert_eq!(
+            out,
+            vec![(
+                "b".to_string(),
+                "vision".to_string(),
+                Some("medium".to_string())
+            )]
+        );
     }
 
     #[sqlx::test]
@@ -689,7 +728,14 @@ mod tests {
         .await
         .expect("ok");
         // Solo il chat: il media (image-gen) e' escluso dai purpose testuali.
-        assert_eq!(out, vec![("openai".to_string(), "gpt-4o".to_string())]);
+        assert_eq!(
+            out,
+            vec![(
+                "openai".to_string(),
+                "gpt-4o".to_string(),
+                Some("medium".to_string())
+            )]
+        );
     }
 
     #[sqlx::test]
@@ -725,7 +771,11 @@ mod tests {
         .expect("ok");
         assert_eq!(
             out,
-            vec![("openai".to_string(), "gpt-image-1".to_string())]
+            vec![(
+                "openai".to_string(),
+                "gpt-image-1".to_string(),
+                Some("light".to_string())
+            )]
         );
     }
 
