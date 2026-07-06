@@ -331,6 +331,16 @@ pub struct ExecutorConfig {
     /// `run_token_budget` chiude gia' prima (retro-compat 822e083). Regola G:
     /// DB-driven, mai hardcoded.
     pub run_token_hard_cap: u64,
+    /// Tetto di spesa in DOLLARI dell'INTERO run (`agent.run_cost_budget_usd`, default
+    /// 0 = disabilitato). Freno complementare al budget token: quando il costo
+    /// cumulativo REALE del run (`AgentState::run_cost_cumulative_usd`, somma dei costi
+    /// per-turno ciascuno col prezzo del proprio modello -> esatto anche dopo
+    /// un'escalation cross-tier) raggiunge (`>=`) questo valore, l'executor chiude
+    /// d'autorita' (`close_runaway`) come l'hard-cap token. A DIFFERENZA del budget
+    /// token NON si resetta all'escalation: e' il tetto dell'intero run, uniforme in
+    /// dollari invece che in token (400k token costano ~64x su gpt-5.5 vs
+    /// deepseek-flash). Regola G: DB-driven, mai hardcoded.
+    pub run_cost_budget_usd: f64,
     /// Turni solo-testo CONSECUTIVI oltre cui (`>=`) il run chiude deterministicamente
     /// (`agent.max_consecutive_text_only_turns`, default 3): fast-fail sul modello che
     /// DESCRIVE senza AGIRE (pattern gemini che ignora `force_tool_choice`). Un turno
@@ -570,6 +580,9 @@ impl Default for ExecutorConfig {
             // catastrofe: rilevante solo a stall_recovery_enabled=true (altrimenti
             // run_token_budget chiude gia' prima -> retro-compat 822e083).
             run_token_hard_cap: 800_000,
+            // 0 = disabilitato (bit-identico): il freno di spesa in dollari e' attivato
+            // dal setting DB agent.run_cost_budget_usd (mig 0533).
+            run_cost_budget_usd: 0.0,
             max_consecutive_text_only_turns: 3,
             loop_thresholds: LoopThresholds::default(),
             repetition: RepetitionThresholds::default(),
@@ -1231,6 +1244,39 @@ in modo piu' specifico, oppure riprova con un modello piu' capace.",
                     "run_token_hard_cap": self.cfg.run_token_hard_cap,
                 }),
             ));
+        }
+        // Freno di spesa in DOLLARI del RUN (audit selezione costi): il costo
+        // cumulativo REALE (ogni turno col prezzo del proprio modello, esatto anche
+        // dopo un'escalation cross-tier) ha superato il tetto in dollari. A differenza
+        // del budget token (per-turno, TRIGGER del giudice, si resetta all'escalation)
+        // questo e' il tetto dell'INTERO run e NON si resetta -> hard stop d'autorita'
+        // come l'hard-cap token. `0` = disabilitato (bit-identico). Prezzo ignoto ->
+        // costo non accumulato -> non scatta (best-effort, mai un cap spurio).
+        if self.cfg.run_cost_budget_usd > 0.0 {
+            let cost_used = state.run_cost_cumulative_usd.unwrap_or(0.0).max(0.0);
+            if cost_used >= self.cfg.run_cost_budget_usd {
+                let cost_text = format!(
+                    "Raggiunto il tetto di spesa del run (${:.2}, budget ${:.2}). \
+Interrompo d'autorita' per evitare un costo incontrollato: riformula la richiesta in \
+modo piu' specifico, oppure riprova con un modello piu' economico.",
+                    cost_used, self.cfg.run_cost_budget_usd
+                );
+                tracing::error!(
+                    target: "nexus_agent_graph::executor",
+                    cost_used_usd = cost_used,
+                    cost_budget_usd = self.cfg.run_cost_budget_usd,
+                    "CAP di spesa del run raggiunto -> chiusura d'autorita' (costo reale cumulativo)"
+                );
+                return Ok(self.close_runaway(
+                    iters_in,
+                    cost_text,
+                    "cost_budget_usd",
+                    json!({
+                        "run_cost_cumulative_usd": cost_used,
+                        "run_cost_budget_usd": self.cfg.run_cost_budget_usd,
+                    }),
+                ));
+            }
         }
         if self.cfg.run_token_budget > 0 && tokens_used_total >= self.cfg.run_token_budget {
             // Con il meta-reasoner ACCESO il budget morbido e' un TRIGGER del giudice
@@ -4005,6 +4051,12 @@ modello piu' capace.",
         //     provider che erra a raffica va chiuso anche via questo asse).
         let prev_tokens_total = state.tokens_used_total.unwrap_or(0).max(0);
         let new_tokens_total = prev_tokens_total.saturating_add(turn_total_tokens.max(0));
+        // Costo cumulativo REALE del run (freno di spesa in dollari): somma il costo
+        // del turno (dall'usage, gia' col prezzo del modello del turno) al totale
+        // portato dallo stato. Reducer overwrite (come i token). turn_total_cost None
+        // (prezzo ignoto o turno error) -> +0.0, il cumulativo resta invariato.
+        let prev_cost_total = state.run_cost_cumulative_usd.unwrap_or(0.0).max(0.0);
+        let new_cost_total = prev_cost_total + turn_total_cost.unwrap_or(0.0).max(0.0);
         let new_text_only_streak = if pending_tool_uses.is_empty() {
             state.consecutive_text_only_turns.unwrap_or(0).max(0) + 1
         } else {
@@ -4042,6 +4094,9 @@ modello piu' capace.",
             cache_read_tokens: Some(Some(turn_cache_read)),
             total_tokens: Some(Some(turn_total_tokens)),
             total_cost_usd: Some(turn_total_cost),
+            // Costo cumulativo del run (freno di spesa in dollari, NON si resetta
+            // all'escalation): reducer overwrite col totale accumulato.
+            run_cost_cumulative_usd: Some(Some(new_cost_total)),
             ..Default::default()
         };
         // Cutoff di generazione persistito solo al cambio fase (py:3458-3459).

@@ -406,6 +406,11 @@ pub struct StateDelta {
     /// l'executor scrive `Some(Some(prev + turn_total))` dopo ogni risposta LLM.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub tokens_used_total: Option<Option<i64>>,
+    /// Vedi `AgentState::run_cost_cumulative_usd`. Reducer overwrite (last-write):
+    /// l'executor scrive `Some(Some(prev + turn_cost))` dopo ogni risposta LLM (il
+    /// costo del turno arriva dall'usage, gia' col prezzo del modello del turno).
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub run_cost_cumulative_usd: Option<Option<f64>>,
     /// Vedi `AgentState::consecutive_text_only_turns`. Reducer overwrite: `0` al
     /// primo tool_use, `prev + 1` su turno solo-testo.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]

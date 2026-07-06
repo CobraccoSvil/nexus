@@ -135,7 +135,24 @@ impl LlmGateway for GatewayLlmAdapter {
             .complete(gw_req)
             .await
             .map_err(|e| classify_gateway_error(&e.to_string()))?;
-        Ok(map_gw_response(resp))
+        let mut mapped = map_gw_response(resp);
+        // Costo REALE del turno (regola M: token STRUTTURATI dell'usage x prezzo del
+        // modello EFFETTIVO dal catalog). Il gateway non lo riporta nella response
+        // (lo calcola solo per il ledger a valle), quindi map_gw_response lo lascia a
+        // None: lo popoliamo QUI, dove il catalog e' accessibile (self.db), cosi' il
+        // motore lo accumula per il cap in dollari del RUN. Best-effort: prezzo ignoto
+        // (modello non in catalog) -> resta None (nessun cap spurio, regola G).
+        if mapped.usage.total_cost_usd.is_none() {
+            if let Some(model) = mapped.model_used.clone() {
+                let provider = mapped
+                    .provider_used
+                    .clone()
+                    .unwrap_or_else(|| req.provider.clone());
+                mapped.usage.total_cost_usd =
+                    turn_cost_usd(&self.db, &provider, &model, &mapped.usage).await;
+            }
+        }
+        Ok(mapped)
     }
 }
 
@@ -344,6 +361,29 @@ fn normalize_gw_finish_reason(finish: &str) -> String {
 /// - `finish_reason` -> `stop_reason` NORMALIZZATO al vocabolario della porta
 ///   ([`normalize_gw_finish_reason`]): `tool_calls`->`tool_use` e' load-bearing per
 ///   instradare al `tool_dispatch` (vedi nota sul bug hollow).
+/// Costo in USD del turno = `prompt_tokens * prezzo_input + completion_tokens *
+/// prezzo_output` (per milione) dal catalog (regola G/M: prezzo dal DB, token dal
+/// segnale strutturato). `None` se il prezzo e' ignoto (modello non in catalog o
+/// errore) -> nessun cap spurio. Cast a `double precision` cosi' una colonna
+/// NUMERIC arriva come `f64`. Nessuna cache: una query leggera per turno LLM, che
+/// e' gia' latente in secondi (overhead trascurabile).
+async fn turn_cost_usd(db: &PgPool, provider: &str, model: &str, usage: &LlmUsage) -> Option<f64> {
+    let (in_cost, out_cost): (f64, f64) = sqlx::query_as(
+        "SELECT input_cost_per_million_tokens::double precision, \
+                output_cost_per_million_tokens::double precision \
+         FROM ai_price_catalog WHERE provider = $1 AND model = $2 LIMIT 1",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    let input = usage.prompt_tokens.max(0) as f64;
+    let output = usage.completion_tokens.max(0) as f64;
+    Some((input * in_cost + output * out_cost) / 1_000_000.0)
+}
+
 fn map_gw_response(resp: GwResponse) -> LlmResponse {
     let tool_calls: Vec<ToolUse> = resp
         .tool_calls

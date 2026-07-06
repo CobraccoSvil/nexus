@@ -432,6 +432,17 @@ pub struct AgentState {
     /// `None`/0 su un run appena avviato -> nessun runaway rilevato. `i64` per
     /// coerenza serde col resto dei contatori (letto/scritto come non-negativo).
     pub tokens_used_total: Option<i64>,
+    /// Costo CUMULATIVO in USD del run (somma di `LlmUsage.total_cost_usd` di ogni
+    /// turno, ognuno col prezzo del modello di QUEL turno -> esatto anche dopo
+    /// un'escalation cross-tier). Freno di spesa per-RUN: quando `>=
+    /// ExecutorConfig::run_cost_budget_usd` (se `> 0`) l'executor chiude
+    /// deterministicamente. A DIFFERENZA di `tokens_used_total` NON si azzera
+    /// all'escalation: e' il tetto dell'intero run, non del turno-modello (che resta
+    /// governato dal trigger token). Reducer overwrite (last-write): l'executor legge
+    /// il valore portato dallo stato, somma il costo del turno e riscrive il totale
+    /// (come `tokens_used_total`). `None` = nessun costo noto ancora (turno senza
+    /// prezzo in catalog o run appena avviato).
+    pub run_cost_cumulative_usd: Option<f64>,
     /// Turni solo-testo CONSECUTIVI del run (la risposta LLM non conteneva tool_use
     /// mentre il loop si aspettava azioni; segnale strutturato `LlmResponse.tool_calls`,
     /// regola M). Azzerato appena il modello emette un tool_use, incrementato quando

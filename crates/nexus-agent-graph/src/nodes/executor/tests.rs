@@ -4106,6 +4106,72 @@ async fn token_hard_cap_a_flag_on_chiude_diretto_senza_giudice() {
 }
 
 #[tokio::test]
+async fn run_cost_budget_oltre_soglia_chiude_diretto() {
+    // Freno di SPESA del run (costo cumulativo REALE >= run_cost_budget_usd):
+    // chiusura d'autorita' (close_runaway, reason "cost_budget_usd") come l'hard-cap
+    // token, senza chiamare il modello. run_token_budget/hard_cap=0 isolano il cost cap.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 3.0,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        run_cost_cumulative_usd: Some(3.5), // oltre i $3
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("meta_step anti_runaway (cost)");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("cost_budget_usd")
+    );
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn run_cost_budget_sotto_soglia_prosegue() {
+    // Sotto la soglia di spesa il ramo NON scatta: il turno prosegue (LLM chiamato).
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 3.0,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("ok"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        run_cost_cumulative_usd: Some(2.5), // sotto i $3
+        iterations: Some(5),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _out = apply(state, delta);
+    // Il ramo cost NON ha chiuso il run prima del modello: l'LLM e' stato chiamato.
+    assert!(!llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn runaway_budget_esaurito_a_flag_on_ricade_su_close_runaway() {
     // Meta-reasoner acceso ma budget consultazioni per-sessione esaurito: il gate
     // runaway NON emette StallReason (rete di sicurezza) e ricade sul backstop
