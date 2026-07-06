@@ -9,19 +9,19 @@
 //! `tool_result`, `end_turn`, `error`) in `AgentStepEvent` sullo stesso
 //! broadcast channel usato dalla UI — la web-ide non vede differenze.
 //!
-//! ## Stato verso zero-Python (regola H)
+//! ## Stato: QUARANTENA zero-Python (regola H)
 //!
-//! Con il motore nativo Rust come PRIMARIO (`Engine::Rust`), `run_via_brain`
-//! resta chiamabile come SOLO percorso di ROLLBACK: un run con `engine='python'`
-//! (per-sessione o globale nel DB) continua a girare sul brain. NON e' piu' il
-//! FALLBACK automatico su errore del nativo: un Err del grafo nativo finalizza il
-//! run come FAILED diagnosticato (vedi `native_engine_failure_result` in
-//! `agent_run.rs`), non cade silenziosamente sul Python.
-//!
-//! Quando il brain Python verra' eliminato (zero-Python), `run_via_brain` e il
-//! resume brain (`resume_run`) non avranno piu' un backend: a quel punto
-//! `engine='python'` non sara' piu' un rollback supportato e questo modulo andra'
-//! rimosso insieme al brain.
+//! Il brain Python E' STATO ELIMINATO (servizio fermato e disabilitato in mig
+//! 0462, settings orfane droppate in 0463, cutover motore versionato in 0532):
+//! `run_via_brain` e il resume brain (`resume_run`) NON hanno piu' un backend.
+//! Il modulo resta in quarantena solo perche' `engine='python'` e' ancora un
+//! valore ammesso dal CHECK di `nexus_orchestrator_engine` (riga per-scope
+//! esplicita): chi lo seleziona ottiene errori di connessione, non un motore.
+//! Il default difensivo di `select_engine` e' `Engine::Rust`. Nessun call site
+//! fa fallback automatico su questo modulo (un Err del grafo nativo finalizza
+//! il run come FAILED diagnosticato, vedi `native_engine_failure_result`).
+//! Prossimo passo pianificato: rimozione del modulo e del valore 'python' dal
+//! CHECK (vedi docs/nexus-provider-expansion-plan.md, Parte 0).
 
 use std::time::Duration;
 

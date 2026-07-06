@@ -74,7 +74,7 @@ pub type DependencyStatusRef = Arc<DependencyStatus>;
 /// Timeout HTTP per il probe Qdrant. 5s e' conservativo per un servizio locale.
 const QDRANT_PROBE_TIMEOUT_S: u64 = 5;
 
-/// Timeout per il probe embedder (gRPC al brain Python).
+/// Timeout per il probe embedder (in-process, via `Orchestrator::embed_text`).
 const EMBEDDER_PROBE_TIMEOUT_S: u64 = 10;
 
 /// Soglia per considerare un quality scan bloccato (5 minuti).
@@ -242,7 +242,7 @@ async fn run_cycle(
 
 // ── Auto-recovery ───────────────────────────────────────────────────────────
 
-async fn attempt_recovery(db: &PgPool, service: &str, probe: &ProbeResult) {
+async fn attempt_recovery(_db: &PgPool, service: &str, probe: &ProbeResult) {
     let kind = probe.error_kind.as_deref().unwrap_or("unknown");
     tracing::info!("task_watchdog: tentativo auto-recovery per {service} (errore: {kind})");
 
@@ -255,13 +255,16 @@ async fn attempt_recovery(db: &PgPool, service: &str, probe: &ProbeResult) {
             // Qdrant sovraccarico — restart del container
             try_restart_container("qdrant").await;
         }
-        ("embedder", "timeout") => {
-            // Il brain gRPC potrebbe avere il canale bloccato — restart del processo
-            try_restart_systemd_or_process(db, "brain").await;
-        }
-        ("embedder", "embed_error") => {
-            // Errore nell'embedding — potrebbe essere un crash parziale del modello
-            try_restart_systemd_or_process(db, "brain").await;
+        ("embedder", _) => {
+            // L'embedder e' in-process (ONNX in nexus-orchestrator, probe via
+            // Orchestrator::embed_text): non c'e' alcun servizio esterno da
+            // riavviare (il brain Python e' stato rimosso, mig 0462/0532; il
+            // vecchio restart di 'nexus-brain' rilanciava un servizio
+            // inesistente). Si logga per la diagnosi; il probe sopra ha gia'
+            // persistito lo stato in nexus_dependency_health.
+            tracing::warn!(
+                "task_watchdog: embedder in-process non sano ({kind}); nessun restart esterno applicabile"
+            );
         }
         ("gateway", _) => {
             // ADR 0028 L3: il gateway e' ora una unit systemd --system con
@@ -395,37 +398,10 @@ async fn try_restart_container(name_hint: &str) {
     }
 }
 
-/// Auto-recovery di un servizio core Nexus (es. brain) tramite il Sudo Manager
-/// (regola L: unico canale privilegiato verso root, mig 0289). Dopo ADR 0028 L3 i
-/// servizi core sono unit systemd --SYSTEM: il restart richiede root, ottenuto via
-/// il purpose sudo `<name_hint>-restart` (es. `brain-restart` -> `systemctl restart
-/// nexus-brain.service`, mig 0416). Il vecchio `systemctl --user restart` non
-/// toccava piu' il servizio giusto e il fallback (pgrep + log) non riavviava nulla.
-/// Best-effort: se il Sudo Manager non e' configurato logga WARN, non solleva mai;
-/// il safety net resta systemd (Restart=always) per le uscite del processo.
-async fn try_restart_systemd_or_process(db: &PgPool, name_hint: &str) {
-    let purpose = format!("{name_hint}-restart");
-    match crate::sudo_manager::execute(db, &purpose).await {
-        Ok(outcome) if outcome.success => {
-            tracing::info!(
-                "task_watchdog: recovery {name_hint}: riavviato via sudo_manager ({purpose}, {}ms)",
-                outcome.duration_ms
-            );
-        }
-        Ok(outcome) => {
-            tracing::warn!(
-                "task_watchdog: recovery {name_hint}: purpose {purpose} exit={} stderr={}",
-                outcome.exit_code,
-                outcome.stderr.trim()
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "task_watchdog: recovery {name_hint}: sudo_manager non disponibile per {purpose} ({e}); il servizio resta sotto gestione systemd (Restart=always)"
-            );
-        }
-    }
-}
+// NB: try_restart_systemd_or_process (restart via Sudo Manager, mig 0289/0416)
+// e' stata rimossa con la bonifica zero-Python (mig 0532): il suo unico
+// chiamante era il recovery dell'embedder verso il servizio 'brain', che non
+// esiste piu'. I servizi core restano sotto systemd (Restart=always).
 
 // ── Probe dipendenze ─────────────────────────────────────────────────────────
 

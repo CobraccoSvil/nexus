@@ -33,7 +33,7 @@ Distinguere sempre il canale di invocazione del prompt prima di decidere quanto 
 - Vietato ripetere "lavora autonomamente", "procedi senza chiedere conferma", "mostra il diff finale" — sono ridondanti e producono rumore (l'LLM puo' interpretarle come richiesta di "extra autonomia").
 - Esempio corretto (pulsante "Risolvi con Nexus" su un config_issue): solo descrizione del problema + fix suggerito + "valida che il fix sia corretto e applicalo, segnalando alternative".
 
-### Fuori chat (REST diretti al brain, worker schedulati, batch, reflection)
+### Fuori chat (REST diretti a mcp-core, worker schedulati, batch, reflection)
 - NESSUNA modalita' UI viene ereditata. Il prompt e' l'unico contratto.
 - Istruzioni di autonomia, anti-loop, output format, examples, reflection devono essere **esplicite** nel prompt stesso.
 - I prompt agente in `nexus_prompt_templates` (chiavi `agent.*`, `system.*`) seguono lo schema XML standard (`<role>` / `<contesto>` / `<autonomia>` / `<protocollo>` / `<tool_usage>` / `<anti_loop>` / `<output_format>` / `<examples>` / `<reflection>`) — vedi migrazione 0086.
@@ -193,7 +193,7 @@ nel prompt. Workflow:
    - `text|json|markdown|...` -> `nexus_read_attachment` con encoding=text
    - `binary` opaco -> ultimo resort `nexus_read_attachment` con encoding=base64
 
-Smart routing vision: se il messaggio utente contiene allegati `image/*` il brain router preferisce automaticamente un modello con `capabilities.vision=true` (override sulla routing matrix). Configurabile via `nexus_purpose_model` chiave `vision_describe`. Modello di default: `google/gemini-2.0-flash-exp` (mig 0194).
+Smart routing vision: se il messaggio utente contiene allegati `image/*` il router (mcp-core) preferisce automaticamente un modello con `capabilities.vision=true` (override sulla routing matrix). Configurabile via `nexus_purpose_model` chiave `vision_describe`. Modello di default: `google/gemini-2.0-flash-exp` (mig 0194).
 
 
 ## I. Pipeline allegati robusta (ADR 0012)
@@ -203,7 +203,7 @@ Quando l'utente carica un allegato (PDF, DOCX, Figma, ZIP, immagine, ecc.) l'age
 - **Pre-extraction automatica** (FIX 3): per PDF/DOCX/ZIP-con-canvas.fig il blocco <allegati> del primo messaggio gia' contiene un sub-blocco ### Pre-extracted content. Il modello NON deve chiamare nexus_inspect_attachment / nexus_extract_* per ottenere informazioni che sono gia' visibili.
 - **`nexus_inspect_attachment` quando serve**: il tool ora ritorna `next_action_recommended` con `{tool, input, rationale, expected_tokens_output}`. **Dopo** averlo chiamato, l'agente deve chiamare ESATTAMENTE quel tool con quegli input. Vietato chiamare `nexus_read_attachment` / `nexus_read_archive_entry` con offset crescenti su file binari.
 - **Cache deduplica** (FIX 2): chiamate identiche a read_attachment / read_archive_entry vengono servite dalla cache. Se il payload include `from_cache: true` + `hint`, l'agente deve cambiare strategia (passare a un tool di estrazione strutturata o a una entry diversa).
-- **Budget letture per sessione** (FIX 4): max 500 KB cumulativi (default DB) per nexus_read_attachment + nexus_read_archive_entry. Oltre la soglia il brain ritorna un tool_result sintetico che invita a usare gli estrattori strutturati.
+- **Budget letture per sessione** (FIX 4): max 500 KB cumulativi (default DB) per nexus_read_attachment + nexus_read_archive_entry. Oltre la soglia mcp-core ritorna un tool_result sintetico che invita a usare gli estrattori strutturati.
 - **Tuning DB-driven**: i 4 setting in `agent.attachment.*` (preextract_enabled, preextract_max_chars, session_read_budget_bytes, read_cache_ttl_seconds) governano l'intera pipeline. Niente fallback hardcoded nel codice (regola G).
 
 ## L. Punti unici di controllo (un solo punto di verita' per logica)

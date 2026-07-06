@@ -27,8 +27,11 @@ pub(crate) enum ClassifierEngine {
 }
 
 /// Punto unico (regola L): legge `routing.classifier_engine` dal DB e decide il
-/// motore. Default conservativo `Python` (motore stabile) per chiave assente o
-/// valore ignoto — niente magic-fallback nascosto, il degrado e' loggato.
+/// motore. Default difensivo `Rust` (il motore primario, in-process) per chiave
+/// assente o valore ignoto: il brain Python e' stato rimosso (mig 0462/0532),
+/// quindi un default 'python' punterebbe a un endpoint HTTP inesistente. Il
+/// valore esplicito 'python' resta rispettato (rollback storico, inerte) e il
+/// degrado e' loggato — niente magic-fallback nascosto.
 pub(crate) async fn select_classifier_engine(db: &PgPool) -> ClassifierEngine {
     match nexus_auth::get_setting(db, KEY_CLASSIFIER_ENGINE).await {
         Some(v) => match v.trim().to_lowercase().as_str() {
@@ -37,12 +40,12 @@ pub(crate) async fn select_classifier_engine(db: &PgPool) -> ClassifierEngine {
             other => {
                 tracing::warn!(
                     value = %other,
-                    "{KEY_CLASSIFIER_ENGINE}: valore non riconosciuto -> motore stabile (python)"
+                    "{KEY_CLASSIFIER_ENGINE}: valore non riconosciuto -> motore primario (rust)"
                 );
-                ClassifierEngine::Python
+                ClassifierEngine::Rust
             }
         },
-        None => ClassifierEngine::Python,
+        None => ClassifierEngine::Rust,
     }
 }
 
@@ -557,10 +560,11 @@ mod tests_classifier_engine {
     }
 
     #[sqlx::test]
-    async fn select_engine_default_python_se_setting_assente(pool: sqlx::PgPool) {
+    async fn select_engine_default_rust_se_setting_assente(pool: sqlx::PgPool) {
         create_settings_table(&pool).await;
-        // Nessuna riga settings -> default conservativo python.
-        assert_eq!(select_classifier_engine(&pool).await, ClassifierEngine::Python);
+        // Nessuna riga settings -> default difensivo rust (il classifier Python
+        // e' stato rimosso, mig 0462/0532: il path HTTP non ha piu' un backend).
+        assert_eq!(select_classifier_engine(&pool).await, ClassifierEngine::Rust);
     }
 
     #[sqlx::test]
@@ -586,16 +590,13 @@ mod tests_classifier_engine {
             ClassifierEngine::Python
         );
 
-        // Valore ignoto -> degrado conservativo python.
+        // Valore ignoto -> default difensivo rust (loggato).
         sqlx::query(
             "UPDATE settings SET value = 'boh' WHERE key = 'routing.classifier_engine'",
         )
         .execute(&pool)
         .await
         .expect("update setting ignoto");
-        assert_eq!(
-            select_classifier_engine(&pool).await,
-            ClassifierEngine::Python
-        );
+        assert_eq!(select_classifier_engine(&pool).await, ClassifierEngine::Rust);
     }
 }
