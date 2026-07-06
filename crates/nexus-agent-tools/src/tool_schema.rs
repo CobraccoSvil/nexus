@@ -1616,6 +1616,18 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   }
 ]"#;
 
+/// Tool del catalogo statico riservati ai SUB-agenti (esposti solo via
+/// `tool_whitelist` di `nexus_subagent_definitions`, mai nel catalogo del run
+/// principale): il seed del catalogo principale
+/// (`build_tools_json_for_agent`, mcp-core) li filtra. PUNTO UNICO (regola L)
+/// della conoscenza "chi non va al run principale" — vive accanto al catalogo
+/// cosi' un tool aggiunto qui e al JSON resta coerente in un solo posto.
+///
+/// `review_verdict` (Fase B ultracode): canale dichiarativo del kind `review`;
+/// al run principale non serve (nessun punto decisionale ne consuma il
+/// verdetto) e lo esporrebbe come rumore di catalogo.
+pub const SUBAGENT_ONLY_TOOLS: &[&str] = &["review_verdict"];
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -352,7 +352,27 @@ pub async fn build_tools_json_for_agent(
     .await
     .unwrap_or(0_i64);
 
-    let base_tools: Value = serde_json::from_str(AGENT_TOOLS_JSON).unwrap_or_else(|_| json!([]));
+    // Il catalogo del run PRINCIPALE esclude i tool riservati ai sub-agenti
+    // (SUBAGENT_ONLY_TOOLS, punto unico in nexus-agent-tools): quei tool
+    // arrivano SOLO via tool_whitelist di nexus_subagent_definitions
+    // (build_tools_json in subagent_native.rs).
+    let base_tools: Value = serde_json::from_str(AGENT_TOOLS_JSON)
+        .map(|v: Value| {
+            let filtered: Vec<Value> = v
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| {
+                    t.get("name")
+                        .and_then(Value::as_str)
+                        .map(|n| !nexus_agent_tools::tool_schema::SUBAGENT_ONLY_TOOLS.contains(&n))
+                        .unwrap_or(true)
+                })
+                .collect();
+            json!(filtered)
+        })
+        .unwrap_or_else(|_| json!([]));
 
     let full_tools = if mcp_tool_count < hard_limit && mcp_tool_count > 0 {
         // Catalogo piccolo: include le definizioni MCP direttamente

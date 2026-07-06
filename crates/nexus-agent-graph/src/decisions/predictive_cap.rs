@@ -22,11 +22,17 @@ use std::sync::LazyLock;
 /// guard testuale che la consuma (regola L).
 pub const PREDICTIVE_CAP_SENTINEL: &str = "[ERROR: chiamata bloccata da predictive context cap]";
 
-/// Tool di controllo/output-piccolo ESENTI dal cap (`_CAP_EXEMPT_TOOLS` Python, 1:1).
-/// Il loro risultato e' nullo o minuscolo: non puo' saturare il contesto.
+/// Tool di controllo/output-piccolo ESENTI dal cap (`_CAP_EXEMPT_TOOLS` Python, 1:1;
+/// `review_verdict` e' un'aggiunta nativa Rust — Fase B ultracode, nessuna
+/// controparte Python). Il loro risultato e' nullo o minuscolo: non puo' saturare
+/// il contesto. `review_verdict` in particolare e' il canale di CHIUSURA del
+/// revisore, chiamato per contratto come ultima azione (= al picco del contesto):
+/// senza esenzione il cap lo bloccherebbe proprio quando serve e il tentativo
+/// bloccato azzererebbe anche un verdetto precedente (invalidazione ADR 0034).
 static CAP_EXEMPT_TOOLS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     HashSet::from([
         "task_complete",
+        "review_verdict",
         "nexus_mcp_tool_call",
         "nexus_mcp_tool_search",
         "nexus_get_worklog",
@@ -103,6 +109,9 @@ mod tests {
     #[test]
     fn esenzione_tool() {
         assert!(is_cap_exempt("task_complete"));
+        // Canale di chiusura del revisore (Fase B): dichiarato per contratto
+        // come ultima azione, cioe' al picco del contesto — mai cap-ato.
+        assert!(is_cap_exempt("review_verdict"));
         assert!(is_cap_exempt("nexus_db_tables"));
         assert!(is_cap_exempt("dispatcher_foo"));
         assert!(!is_cap_exempt("read_file"));
