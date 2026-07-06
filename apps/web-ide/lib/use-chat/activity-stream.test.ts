@@ -564,3 +564,115 @@ test("batch parallelo: gli heartbeat INTERLACCIATI di sub-run diversi restano di
   assert.equal(workingA[0].elapsedS, 40, "resta l'heartbeat piu' recente di A");
   assert.equal(workingB[0].elapsedS, 40, "resta l'heartbeat piu' recente di B");
 });
+
+// ── 9. Provenienza (provider/model) del sub-agente ──────────────────────────
+// Il provider del blocco SUBAGENTE e' quello del FIGLIO (payload del ponte,
+// regola M), mai quello del segmento padre. Lo started, emesso prima che il
+// routing del figlio scelga il modello, si aggiorna retroattivamente col primo
+// progress che porta la provenienza; ignoto vero -> "unknown" (icona '?').
+
+test("la provenienza subagent viene dal payload del figlio, mai dal segmento padre", () => {
+  beforeEach();
+  const subRunId = "8f1e0b2a-0000-0000-0000-000000000009";
+  const metaSteps: MetaStepEntry[] = [
+    meta("executor_call", { iteration: 0, provider: "google", model: "gemini-2.5-pro" }),
+    meta(
+      "subagent_started",
+      { subagent_run_id: subRunId, subagent_kind: "coder", task: "fix" },
+      "Subagente coder avviato — fix",
+    ),
+    meta(
+      "subagent_progress",
+      {
+        phase: "tool", tool: "edit_file", is_error: false,
+        subagent_run_id: subRunId, subagent_kind: "coder",
+        provider: "anthropic", model: "claude-haiku-4-5",
+      },
+      "subagente coder: tool edit_file",
+    ),
+    meta(
+      "subagent_progress",
+      { phase: "working", elapsed_s: 20, subagent_run_id: subRunId, subagent_kind: "coder" },
+      "Subagente coder: al lavoro da 20s",
+    ),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const subs = s.segments
+    .flatMap((seg) => seg.events)
+    .filter((e): e is Extract<ActivityEvent, { type: "subagent" }> => e.type === "subagent");
+  assert.equal(subs.length, 3);
+  // Lo started si aggiorna RETROATTIVAMENTE col provider del primo progress.
+  assert.equal(subs[0].phase, "started");
+  assert.equal(subs[0].provider, "anthropic", "started eredita dal primo progress del figlio");
+  assert.equal(subs[0].model, "claude-haiku-4-5");
+  // Il progress porta la propria provenienza dal payload.
+  assert.equal(subs[1].provider, "anthropic");
+  // L'heartbeat senza payload eredita l'ultimo provider noto del run (forward).
+  assert.equal(subs[2].provider, "anthropic");
+  // MAI il provider del segmento padre (google).
+  assert.ok(subs.every((e) => e.provider !== "google"), "nessuna attribuzione al padre");
+});
+
+test("provenienza subagent davvero ignota degrada a 'unknown' (icona '?'), non al padre", () => {
+  beforeEach();
+  const subRunId = "8f1e0b2a-0000-0000-0000-00000000000a";
+  const metaSteps: MetaStepEntry[] = [
+    meta("executor_call", { iteration: 0, provider: "google", model: "gemini-2.5-pro" }),
+    meta("subagent_started", { subagent_run_id: subRunId, subagent_kind: "tester" }, "Subagente tester avviato"),
+    meta(
+      "subagent_progress",
+      { phase: "working", elapsed_s: 20, subagent_run_id: subRunId, subagent_kind: "tester" },
+      "Subagente tester: al lavoro da 20s",
+    ),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const subs = s.segments
+    .flatMap((seg) => seg.events)
+    .filter((e): e is Extract<ActivityEvent, { type: "subagent" }> => e.type === "subagent");
+  assert.ok(subs.length >= 2);
+  for (const ev of subs) {
+    assert.equal(ev.provider, "unknown", "ignoto vero -> unknown, mai google");
+  }
+});
+
+test("il pin allo start (model_purpose) e l'escalation del figlio restano per-evento", () => {
+  beforeEach();
+  const subRunId = "8f1e0b2a-0000-0000-0000-00000000000b";
+  const metaSteps: MetaStepEntry[] = [
+    // Pin gia' noto allo start (definition.model_purpose risolto).
+    meta(
+      "subagent_started",
+      { subagent_run_id: subRunId, subagent_kind: "coder", provider: "mistral", model: "devstral" },
+      "Subagente coder avviato",
+    ),
+    // Il figlio poi cambia modello (escalation interna): il progress porta il
+    // provider corrente e NON viene sovrascritto dalla propagazione.
+    meta(
+      "subagent_progress",
+      {
+        phase: "tool", tool: "run_command", is_error: false,
+        subagent_run_id: subRunId, subagent_kind: "coder",
+        provider: "anthropic", model: "claude-sonnet",
+      },
+      "subagente coder: tool run_command",
+    ),
+    meta(
+      "subagent_completed",
+      {
+        status: "completed", subagent_run_id: subRunId, subagent_kind: "coder",
+        provider: "anthropic", model: "claude-sonnet",
+      },
+      "Subagente coder completato",
+    ),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const subs = s.segments
+    .flatMap((seg) => seg.events)
+    .filter((e): e is Extract<ActivityEvent, { type: "subagent" }> => e.type === "subagent");
+  assert.equal(subs.length, 3);
+  assert.equal(subs[0].provider, "mistral", "lo started conserva il pin");
+  assert.equal(subs[0].model, "devstral");
+  assert.equal(subs[1].provider, "anthropic", "il progress conserva il provider corrente");
+  assert.equal(subs[2].provider, "anthropic");
+  assert.equal(subs[2].model, "claude-sonnet");
+});
