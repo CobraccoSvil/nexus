@@ -1,0 +1,23 @@
+-- Fase A ultracode (ponte esito strutturato sub-agente -> coordinatore):
+-- colonna `verdict` su nexus_subagent_runs con il blocco esito STRUTTURATO
+-- del sub-run (regola M / ADR 0034), distinto dallo `status` lifecycle.
+--
+-- Schema del blocco (punto unico NativeRunOutcome::structured_verdict, regola L):
+--   { verdict, success, declared, final_gate_passed, final_gate_unverified,
+--     final_gate_failed_pending, forced_close_unverified, error_class }
+-- `verdict` usa il vocabolario canonico AgentRunStatus::as_str; i rami terminali
+-- senza NativeRunOutcome (timeout / errore motore) scrivono la stessa forma via
+-- terminal_verdict (subagent_native.rs). Il fan-in asincrono (nexus_subagent_poll)
+-- e il tool_result dei finalizzatori la espongono come campo `outcome`.
+--
+-- `nexus_subagent_runs` e' una tabella MIGRATA: vive nei DB-PROGETTO (set
+-- db/migrations/project). Nel meta e' stata decommissionata (rename fail-fast,
+-- mig 0507): l'ALTER va qui, nel set project, mai nel meta.
+--
+-- NULL = sub-run non ancora finalizzato (fase running) o storico pre-migrazione:
+-- il coordinatore che legge NULL non deve dedurre nulla dalla prosa di
+-- final_summary (regola M), solo attendere/pollare.
+--
+-- Idempotente (ADD COLUMN IF NOT EXISTS): ri-applicabile senza effetti.
+ALTER TABLE public.nexus_subagent_runs
+    ADD COLUMN IF NOT EXISTS verdict JSONB;

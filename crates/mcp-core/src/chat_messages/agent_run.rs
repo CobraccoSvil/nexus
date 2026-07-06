@@ -1280,38 +1280,8 @@ async fn native_outcome_to_run_result(
         })
         .collect();
 
-    // Status canonico dall'esito del grafo. `forced_close_unverified` e' il
-    // segnale AUTORITATIVO (mig 0386): sopravvive alla riscrittura di
-    // stop_reason operata dal final_gate sul ramo forced_close (senza, un
-    // abort anti-loop ripulito dal final_gate finiva "completed" col testo di
-    // sistema come risposta — run b833a83d).
-    let forced_close = outcome.forced_close_unverified
-        || matches!(
-            outcome.stop_reason,
-            Some(
-                StopReason::LoopDetected
-                    | StopReason::LoopAbort
-                    | StopReason::G1Escalated
-                    | StopReason::G1CapReached
-            )
-        );
-    // Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
-    // MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
-    // (regola M). Ha precedenza sul forced_close: una dichiarazione onesta
-    // (es. blocked su credenziale mancante) e' piu' specifica del segnale
-    // generico di chiusura coordinata.
-    let declared_kind = outcome
-        .declared_outcome
-        .as_ref()
-        .and_then(|v| v.get("outcome"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let declared_refusal = outcome
-        .declared_outcome
-        .as_ref()
-        .and_then(|v| v.get("refusal"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // Il summary DICHIARATO via task_complete (ADR 0034) e' testo umano di
+    // display: fa da risposta quando il modello ha chiuso senza produrre testo.
     let declared_summary = outcome
         .declared_outcome
         .as_ref()
@@ -1320,48 +1290,11 @@ async fn native_outcome_to_run_result(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let status = if !outcome.completed && outcome.resume_at.is_some() {
-        AgentRunStatus::AwaitingConfirmation
-    } else if matches!(outcome.stop_reason, Some(StopReason::Error)) {
-        AgentRunStatus::Failed
-    } else if declared_refusal
-        || matches!(declared_kind.as_deref(), Some("blocked") | Some("needs_input"))
-    {
-        // Bloccato per causa esterna / serve input umano / rifiuto safety:
-        // esito canonico BlockedNeedsInput (parita' WAVE 3.2 del path brain).
-        AgentRunStatus::BlockedNeedsInput
-    } else if matches!(declared_kind.as_deref(), Some("partial")) {
-        // Lavoro dichiarato PARZIALE: onesto, non un successo (mai "completed"
-        // su una dichiarazione esplicita di incompletezza).
-        AgentRunStatus::FailedDiagnosed
-    } else if forced_close {
-        AgentRunStatus::FailedDiagnosed
-    } else if outcome.final_gate_passed == Some(false) {
-        // Verifica oggettiva pre-chiusura NON superata (final_gate al cap/forced):
-        // il verdetto STRUTTURATO del gate (regola M) prevale su una dichiarazione
-        // "done" ottimista del modello -> mai "completed" su un task la cui
-        // verifica e' fallita. Difesa in profondita' rispetto a `forced_close`:
-        // il cap del final_gate NON imposta forced_close_unverified.
-        AgentRunStatus::FailedDiagnosed
-    } else if outcome.final_gate_failed_pending {
-        // L'ULTIMO verdetto del final_gate e' una BOCCIATURA di ciclo intermedio
-        // (correzione rimandata all'executor) e il run e' morto PRIMA della
-        // ri-verifica — es. provider esauriti che bruciano i turni fino al cap
-        // iterazioni (run a5db0985: gate 1/2 fallito, regressione introdotta in
-        // correzione, gate 2/2 mai eseguito, chiusura 'completed' bugiarda). Il
-        // lavoro post-bocciatura non e' mai stato verificato e l'ultimo esito
-        // oggettivo noto e' un fallimento: mai `Completed` (regola M).
-        AgentRunStatus::FailedDiagnosed
-    } else if outcome.final_gate_unverified == Some(true) {
-        // Lavoro SVOLTO ma verifica tecnica NON eseguita (gate entrato senza
-        // profilo di verifica dell'ambiente): esito ONESTO distinto da un
-        // "completato" pieno. Successo (is_success=true) ma etichettato come non
-        // verificato -> l'utente sa che l'esito non e' stato confermato da un
-        // comando reale. Segnale strutturato dal gate (regola M).
-        AgentRunStatus::CompletedUnverified
-    } else {
-        AgentRunStatus::Completed
-    };
+    // Status canonico dal PUNTO UNICO della classificazione (regola L/M):
+    // `NativeRunOutcome::classify_status` — stessa funzione usata dal ponte
+    // esito del SUB-agente (`structured_verdict`), cosi' il verdetto che un
+    // coordinatore legge da un sub-run coincide con quello del run padre.
+    let status = outcome.classify_status();
 
     // stop_reason in forma snake_case (serde dell'enum) per la colonna agent_runs
     // / la telemetria: stesso vocabolario del path Python.
