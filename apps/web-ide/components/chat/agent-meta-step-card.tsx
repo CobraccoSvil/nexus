@@ -463,7 +463,10 @@ export function AgentMetaStepCard({
     (data.kind === "routing" ||
       data.kind === "tool_executed" ||
       data.kind === "fallback" ||
-      data.kind === "executor_call");
+      data.kind === "executor_call" ||
+      // Narrazione sub-agente: il payload porta provider/model del FIGLIO
+      // (arricchiti dal ponte, regola M) — mostrarli identifica chi lavora.
+      data.kind.startsWith("subagent_"));
 
   // Colore-accento della riga: per gli step di chiamata modello usa il colore del
   // PROVIDER (ripristina il colore-per-provider richiesto in UI); altrimenti il

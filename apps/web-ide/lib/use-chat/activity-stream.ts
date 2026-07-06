@@ -481,6 +481,11 @@ export function composeActivityStream(
             iterations: asNumber(p.iterations),
             costUsd: asNumber(p.cost_usd),
             elapsedS: asNumber(p.elapsed_s),
+            // Provenienza del FIGLIO dal payload del ponte (regola M): il pin
+            // allo start se noto, poi il provider corrente del sub-run stampato
+            // sui progress/chiusura. MAI il provider del segmento padre.
+            provider: asString(p.provider),
+            model: asString(p.model),
           };
           // Heartbeat "al lavoro": tiene UN SOLO working per sub-run, sempre in
           // coda (l'elapsed piu' recente). Cerchiamo il precedente working DELLO
@@ -536,11 +541,14 @@ export function composeActivityStream(
   // risalire al segmento. Per i TOOL usa il model EFFETTIVO della trace della
   // stessa iterazione (piu' preciso su upscale intra-segmento); altrimenti il
   // model del segmento. Le bande switch NON la ricevono (hanno i ProviderBadge).
+  // Gli eventi SUBAGENT sono esclusi: la loro provenienza e' quella del FIGLIO
+  // (dal payload del ponte), ereditare il provider del segmento PADRE sarebbe
+  // un'attribuzione falsa (il figlio ha il proprio routing).
   // Va fatto PRIMA del folding cosi' i tool interni al folded hanno gia' la
   // provenienza; il FoldedToolsEvent la eredita dal segmento subito dopo.
   for (const seg of segments) {
     for (const ev of seg.events) {
-      if (ev.type === "switch") continue;
+      if (ev.type === "switch" || ev.type === "subagent") continue;
       ev.provider = seg.provider;
       if (ev.type === "tool") {
         const tr = ev.iteration != null ? traceIter.get(ev.iteration) : undefined;
@@ -550,6 +558,9 @@ export function composeActivityStream(
       }
     }
   }
+
+  // Propaga la provenienza del FIGLIO tra gli eventi dello stesso sub-run.
+  propagateSubagentProvenance(segments);
 
   // Applica il collasso dei tool consecutivi ok dentro ogni segmento.
   for (const seg of segments) {
@@ -572,6 +583,58 @@ export function composeActivityStream(
  *  effettivo di una trace puo' ancora ri-allineare il provider di segmento. */
 function hasExecutedWork(seg: ActivitySegment): boolean {
   return seg.events.some((e) => e.type === "tool" || e.type === "folded_tools");
+}
+
+/**
+ * Propaga la provenienza (provider/model del FIGLIO) tra gli eventi dello
+ * stesso sub-run (chiave: subagentRunId). Lo `started` e' emesso PRIMA che il
+ * routing del figlio scelga il modello: quando il primo progress porta il
+ * provider (executor_call del figlio via ponte), la ricomposizione lo stampa
+ * retroattivamente anche sullo started ("il blocco si aggiorna"). I progress
+ * senza provenienza (heartbeat precedenti a nuovi segnali) ereditano l'ultimo
+ * provider noto del run. Solo se il provider resta DAVVERO ignoto degrada a
+ * "unknown" -> icona '?' (mai il provider del segmento padre).
+ */
+function propagateSubagentProvenance(segments: ActivitySegment[]): void {
+  const subEvents: SubagentEvent[] = [];
+  for (const seg of segments) {
+    for (const ev of seg.events) {
+      if (ev.type === "subagent") subEvents.push(ev);
+    }
+  }
+  // Forward: gli eventi senza provenienza ereditano l'ultimo noto del run.
+  const lastKnown = new Map<string, EventProvenance>();
+  for (const ev of subEvents) {
+    const key = ev.subagentRunId ?? "";
+    if (ev.provider) {
+      lastKnown.set(key, { provider: ev.provider, model: ev.model });
+    } else {
+      const known = lastKnown.get(key);
+      if (known) {
+        ev.provider = known.provider;
+        ev.model = known.model;
+      }
+    }
+  }
+  // Backward: lo started (prima del primo executor_call del figlio) eredita
+  // dal PRIMO evento successivo con provenienza nota; se nessuno la porta,
+  // il run e' davvero ignoto -> "unknown".
+  const nextKnown = new Map<string, EventProvenance>();
+  for (let i = subEvents.length - 1; i >= 0; i--) {
+    const ev = subEvents[i];
+    const key = ev.subagentRunId ?? "";
+    if (ev.provider) {
+      nextKnown.set(key, { provider: ev.provider, model: ev.model });
+    } else {
+      const known = nextKnown.get(key);
+      if (known) {
+        ev.provider = known.provider;
+        ev.model = known.model;
+      } else {
+        ev.provider = "unknown";
+      }
+    }
+  }
 }
 
 /** Formatta il contatore escalation "n/max" quando entrambi noti. */

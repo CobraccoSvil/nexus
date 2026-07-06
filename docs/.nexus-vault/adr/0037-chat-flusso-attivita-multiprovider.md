@@ -81,6 +81,15 @@ Il frontend li consuma se presenti, degrada pulito se assenti:
   meta-step `escalation`.
 - **C** - `Usage` porta provider/model per il breakdown costo senza dipendere
   dall'aggregazione delle trace.
+- **D** - i meta-step `subagent_*` (ponte narrazione, mig 0535) portano
+  provider/model del FIGLIO nel payload (`provider`/`model`). Lato frontend il
+  compositore del nastro attribuisce ai blocchi SUBAGENTE la provenienza del
+  FIGLIO letta dal payload (mai quella del segmento PADRE, che sarebbe
+  un'attribuzione falsa: il figlio ha il proprio routing), con propagazione
+  retroattiva allo `started` per `subagent_run_id` quando il provider arriva su
+  un progress successivo; provider davvero ignoto -> icona '?'. L'arricchimento
+  del payload alla fonte e' additivo e retro-compatibile: finche' i campi non
+  sono presenti, ogni blocco subagente degrada pulito a '?'.
 
 ### 5. Flag e sicurezza
 
