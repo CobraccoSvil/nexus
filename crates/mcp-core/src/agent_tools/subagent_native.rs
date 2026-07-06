@@ -1623,12 +1623,16 @@ impl<'a> SubRunClosure<'a> {
 /// [`NativeRunOutcome::structured_verdict`] cosi' il coordinatore e il poll
 /// leggono SEMPRE lo stesso schema. `verdict` usa il vocabolario canonico
 /// (`AgentRunStatus::as_str`: `timed_out` / `failed`), `success` e' sempre
-/// `false`.
+/// `false`. La parita' di FORMA con `structured_verdict` e' garantita dal test
+/// `terminal_verdict_stessa_forma_di_structured_verdict` (regola L: la forma e'
+/// duplicata per necessita' — qui non esiste un `NativeRunOutcome` — ma il
+/// drift e' un test rosso).
 fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
     json!({
         "verdict": verdict,
         "success": false,
         "declared": Value::Null,
+        "review": Value::Null,
         "final_gate_passed": Value::Null,
         "final_gate_unverified": Value::Null,
         "final_gate_failed_pending": false,
@@ -2338,5 +2342,51 @@ mod tests {
         assert_eq!(run.2, 7);
         assert_eq!(run.3, 1200, "total = prompt + completion");
         assert!(run.4, "completed_at valorizzato");
+    }
+
+    /// GUARD di forma (regola L): il blocco esito dei rami TERMINALI
+    /// (`terminal_verdict`, senza `NativeRunOutcome`) e quello del ramo normale
+    /// (`NativeRunOutcome::structured_verdict`) devono avere le STESSE chiavi —
+    /// il coordinatore e il poll leggono un unico schema. Un campo aggiunto a
+    /// uno solo dei due (com'era successo con `review` in Fase B) e' un drift
+    /// silenzioso: questo test lo rende un errore di build.
+    #[test]
+    fn terminal_verdict_stessa_forma_di_structured_verdict() {
+        use std::collections::BTreeSet;
+        let outcome = crate::native_engine::NativeRunOutcome {
+            completed: true,
+            final_answer: None,
+            stop_reason: None,
+            provider_used: None,
+            model_used: None,
+            resume_at: None,
+            iterations: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            total_cost: 0.0,
+            user_intent: None,
+            reasoning: None,
+            messages_json: None,
+            declared_outcome: None,
+            review_verdict: None,
+            error_class: None,
+            forced_close_unverified: false,
+            final_gate_passed: None,
+            final_gate_unverified: None,
+            final_gate_failed_pending: false,
+        };
+        let keys = |v: &Value| -> BTreeSet<String> {
+            v.as_object()
+                .expect("blocco esito e' un oggetto")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            keys(&terminal_verdict("failed", "engine_error")),
+            keys(&outcome.structured_verdict()),
+            "terminal_verdict e structured_verdict hanno chiavi divergenti"
+        );
     }
 }

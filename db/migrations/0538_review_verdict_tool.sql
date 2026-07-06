@@ -12,8 +12,10 @@
 -- (`nexus_subagent_poll`), senza parsare prosa.
 --
 -- Attivazione DB-driven (regola G, nessun flag runtime): il tool esiste nel
--- catalogo statico (AGENT_TOOLS_JSON) ma viene esposto SOLO ai kind che lo
--- whitelistano. Questa migrazione lo aggiunge al solo kind `review`.
+-- catalogo statico (AGENT_TOOLS_JSON) ma il catalogo del run PRINCIPALE lo
+-- filtra (SUBAGENT_ONLY_TOOLS in nexus-agent-tools, consumato da
+-- build_tools_json_for_agent); ai SUB-agenti arriva solo via tool_whitelist.
+-- Questa migrazione lo aggiunge al solo kind `review`.
 --
 -- Idempotente: array_append guardato da NOT ANY; append al prompt guardato da
 -- NOT LIKE.

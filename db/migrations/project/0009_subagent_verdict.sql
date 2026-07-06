@@ -3,8 +3,11 @@
 -- del sub-run (regola M / ADR 0034), distinto dallo `status` lifecycle.
 --
 -- Schema del blocco (punto unico NativeRunOutcome::structured_verdict, regola L):
---   { verdict, success, declared, final_gate_passed, final_gate_unverified,
---     final_gate_failed_pending, forced_close_unverified, error_class }
+--   { verdict, success, declared, review, final_gate_passed,
+--     final_gate_unverified, final_gate_failed_pending,
+--     forced_close_unverified, error_class }
+-- `review` (Fase B): verdetto strutturato del revisore via tool review_verdict
+-- ({verdict pass|fail|needs_changes, summary, findings[]}) o null.
 -- `verdict` usa il vocabolario canonico AgentRunStatus::as_str; i rami terminali
 -- senza NativeRunOutcome (timeout / errore motore) scrivono la stessa forma via
 -- terminal_verdict (subagent_native.rs). Il fan-in asincrono (nexus_subagent_poll)

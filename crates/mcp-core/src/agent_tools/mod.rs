@@ -120,4 +120,43 @@ mod adr0034_contract_tests {
             "enum blocker dello schema divergente da VALID_BLOCKERS"
         );
     }
+
+    /// Stesso legame cross-crate per il canale del REVISORE (Fase B ultracode):
+    /// gli enum di `review_verdict` nello schema (verdict, findings.severity)
+    /// devono coincidere con quelli del normalizzatore — un valore aggiunto
+    /// solo allo schema verrebbe dichiarato dal modello e scartato in silenzio
+    /// da `normalize_review_verdict`.
+    #[test]
+    fn enum_review_verdict_coerenti_con_normalize() {
+        let v: serde_json::Value =
+            serde_json::from_str(super::AGENT_TOOLS_JSON).expect("catalogo parsa");
+        let rv = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("review_verdict"))
+            .expect("review_verdict nel catalogo");
+        let schema = &rv["input_schema"]["properties"];
+        let set = |vals: &serde_json::Value| -> std::collections::BTreeSet<String> {
+            vals.as_array()
+                .expect("enum array")
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(str::to_string)
+                .collect()
+        };
+        let valid = |vals: &[&str]| -> std::collections::BTreeSet<String> {
+            vals.iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            set(&schema["verdict"]["enum"]),
+            valid(nexus_agent_graph::decisions::tool_dispatch::VALID_REVIEW_VERDICTS),
+            "enum verdict dello schema divergente da VALID_REVIEW_VERDICTS"
+        );
+        assert_eq!(
+            set(&schema["findings"]["items"]["properties"]["severity"]["enum"]),
+            valid(nexus_agent_graph::decisions::tool_dispatch::VALID_FINDING_SEVERITIES),
+            "enum severity dello schema divergente da VALID_FINDING_SEVERITIES"
+        );
+    }
 }
