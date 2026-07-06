@@ -70,6 +70,7 @@ pub mod predictive_cap;
 pub mod progress_controller;
 pub mod reward;
 pub mod scale_reason;
+pub mod text_repetition;
 pub mod tool_dispatch;
 pub mod turn_focus;
 
@@ -122,6 +123,7 @@ pub use scale_reason::{
     apply_hysteresis, build_scale_context, context_window_ok, scale_cache_key, scale_trigger,
     validate_scale_move, ScaleHysteresisConfig, ScaleTriggerConfig,
 };
+pub use text_repetition::{detect_repetition_collapse, RepetitionHit, RepetitionThresholds};
 pub use helpers::{
     action_oriented_for_intent, compute_iteration_budget, estimate_prompt_complexity,
     provider_style_supports_forcing, should_force_tool_choice, structural_unfulfilled_signal,

@@ -370,6 +370,14 @@ pub struct AgentState {
     /// `final_gate_node`; il ramo forced_close/cap NON lo imposta (resta
     /// FailedDiagnosed). Vedi `final_gate.py:521`.
     pub final_gate_passed: Option<bool>,
+    /// `true` quando il final gate e' ENTRATO (task software) ma NON ha potuto
+    /// eseguire la verifica tecnica dell'ambiente perche' il profilo di verifica
+    /// (ADR 0036) non e' disponibile: il lavoro c'e' ma non e' stato verificato.
+    /// Segnale STRUTTURATO (regola M) letto dal finalizzatore per l'esito ONESTO
+    /// `CompletedUnverified` (distinto da `Completed`/`CompletedVerified`): mai un
+    /// "completato" muto quando la verifica non e' stata proprio eseguita. `None`
+    /// = gate non entrato o verifica eseguita.
+    pub final_gate_unverified: Option<bool>,
     /// Ultimo risultato del verifier.
     pub verifier_last_result: Option<Value>,
     /// Contatore revisioni strutturali del plan.

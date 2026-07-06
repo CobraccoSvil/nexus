@@ -773,7 +773,7 @@ async fn load_executor_config(
             signature: setting_i64(db, "agent.loop.signature_threshold", d.loop_thresholds.signature as i64).await.max(1) as usize,
             cap: setting_i64(db, "agent.loop.recent_signatures_cap", d.loop_thresholds.cap as i64).await.max(1) as usize,
         },
-        // Anti repetition-collapse del testo (mig 0531, regola G): soglie della
+        // Anti repetition-collapse del testo (mig 0534, regola G): soglie della
         // rilevazione del turno degenere (stessa sottostringa ripetuta N+ volte).
         // `scan_tail_cap=0` disabilita -> bit-identico. Clamp non-negativo; le
         // lunghezze minime >=1 (0 sarebbe insensato).
@@ -1866,7 +1866,8 @@ fn canonical_stop_reason(raw: Option<&str>) -> &'static str {
         None => "none",
         Some(s) => match s.as_str() {
             // Vocabolario comune diretto.
-            "end_turn" | "endturn" | "stop" | "completed" | "completed_verified" => "end_turn",
+            "end_turn" | "endturn" | "stop" | "completed" | "completed_verified"
+            | "completed_unverified" => "end_turn",
             "tool_use" | "tooluse" => "tool_use",
             "error" | "failed" | "failed_diagnosed" => "failed",
             "interrupted" | "awaiting_confirmation" | "blocked_needs_input" => "interrupted",
@@ -1990,7 +1991,7 @@ async fn primary_canonical(db: &PgPool, primary_run_id: Uuid) -> anyhow::Result<
     let status_lc = status.as_deref().map(|s| s.to_ascii_lowercase());
     let completed = matches!(
         status_lc.as_deref(),
-        Some("completed") | Some("completed_verified")
+        Some("completed") | Some("completed_verified") | Some("completed_unverified")
     );
 
     Ok(make_canonical(
@@ -2609,6 +2610,7 @@ mod tests {
         // Python (status agent_runs) -> vocabolario comune.
         assert_eq!(canonical_stop_reason(Some("completed")), "end_turn");
         assert_eq!(canonical_stop_reason(Some("completed_verified")), "end_turn");
+        assert_eq!(canonical_stop_reason(Some("completed_unverified")), "end_turn");
         assert_eq!(canonical_stop_reason(Some("failed")), "failed");
         assert_eq!(canonical_stop_reason(Some("failed_diagnosed")), "failed");
         assert_eq!(

@@ -695,13 +695,23 @@ function SingleRunPanel({
         </div>
       )}
 
-      {(run.status === "completed" || run.status === "failed") && (
+      {(run.status === "completed" || run.status === "completed_verified" ||
+        run.status === "completed_unverified" || run.status === "failed" ||
+        run.status === "failed_diagnosed") && (
         <div style={{
           fontSize: 11,
-          color: run.status === "failed" ? tc.error : "#22c55e",
+          color: (run.status === "failed" || run.status === "failed_diagnosed")
+            ? tc.error
+            : run.status === "completed_unverified"
+              ? "#f59e0b"
+              : "#22c55e",
           fontWeight: 600,
         }}>
-          {run.status === "completed" ? "✓ Completato" : "✗ Fallito"} — {steps.length} step
+          {(run.status === "failed" || run.status === "failed_diagnosed")
+            ? "✗ Fallito"
+            : run.status === "completed_unverified"
+              ? "✓ Completato (verifica non eseguita)"
+              : "✓ Completato"} — {steps.length} step
         </div>
       )}
     </div>

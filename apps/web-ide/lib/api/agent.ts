@@ -57,7 +57,7 @@ interface AgentRunUsage {
 export interface AgentRunInfo {
   runId: string;
   sessionId: string;
-  status: "running" | "completed" | "awaiting_confirmation" | "failed" | "timed_out" | "cancelled" | "interrupted" | "loop_aborted" | "provider_unavailable" | "completed_verified" | "failed_diagnosed" | "blocked_needs_input";
+  status: "running" | "completed" | "awaiting_confirmation" | "failed" | "timed_out" | "cancelled" | "interrupted" | "loop_aborted" | "provider_unavailable" | "completed_verified" | "completed_unverified" | "failed_diagnosed" | "blocked_needs_input";
   automationMode: string;
   provider: string;
   model: string;
@@ -195,6 +195,8 @@ export function isAgentRunTerminal(status: string): boolean {
     status === "provider_unavailable" ||
     // Esiti canonici macchina a stati (mig 0386): terminali.
     status === "completed_verified" ||
+    // Svolto ma verifica tecnica non eseguita (mig 0531): terminale, successo onesto.
+    status === "completed_unverified" ||
     status === "failed_diagnosed" ||
     // ADR 0034: blocked_needs_input e' TERMINALE — run CONCLUSO con la
     // dichiarazione "serve input umano"; il prossimo messaggio crea un nuovo

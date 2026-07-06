@@ -7,8 +7,11 @@
 // progetto, con quali tool, con quale esito.
 //
 // Idempotenza: ogni run processato e' marcato con `agent_runs.kb_ingested`
-// (mig 0304). Il worker scansiona solo righe con `kb_ingested IS NULL` e
-// `status IN ('completed','failed','aborted')`.
+// (mig 0304). Il worker scansiona solo righe con `kb_ingested IS NULL` e uno
+// degli esiti TERMINALI canonici (mig project 0007): `completed`,
+// `completed_verified`, `completed_unverified`, `failed`, `failed_diagnosed`,
+// `aborted`. Gli esiti canonici (mig 0386) erano stati dimenticati qui: un run
+// verificato o diagnosticato non entrava nella memoria episodica.
 //
 // Settings DB-driven (mig 0305):
 //   - agent.wiki.run_summary_worker_enabled       (default true)
@@ -174,7 +177,10 @@ async fn scan_and_ingest(state: &WikiDeps, settings: &RunSummarySettings) -> Res
             FROM agent_runs ar
             WHERE ar.project_id = $1
               AND ar.kb_ingested IS NULL
-              AND ar.status IN ('completed', 'failed', 'aborted')
+              AND ar.status IN (
+                  'completed', 'completed_verified', 'completed_unverified',
+                  'failed', 'failed_diagnosed', 'aborted'
+              )
               AND ar.completed_at IS NOT NULL
             ORDER BY ar.completed_at ASC
             LIMIT $2

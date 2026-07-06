@@ -129,6 +129,13 @@ pub enum AgentRunStatus {
     /// Il task e' completato E verificato: final_gate passato (o non applicabile),
     /// almeno un'azione produttiva applicata, risposta finale non vuota.
     CompletedVerified,
+    /// Il task e' stato SVOLTO ma la verifica tecnica NON e' stata eseguita: il
+    /// final gate e' entrato senza un profilo di verifica dell'ambiente (ADR 0036),
+    /// quindi nessun comando di build/test reale ha confermato l'esito. E' un
+    /// successo ONESTO ma non verificato, distinto da `CompletedVerified` (verifica
+    /// eseguita e passata) e da `Completed` (verifica non applicabile). Segnale
+    /// strutturato dal gate (regola M), mai dedotto dal testo.
+    CompletedUnverified,
     /// Il task NON e' completato: il run e' stato chiuso da abort anti-loop, cap o budget,
     /// MA l'agente ha prodotto una diagnosi (perche' e' fallito, cosa lo blocca, prossimo
     /// passo). E' un esito definitivo e onesto, non un errore infrastrutturale.
@@ -154,6 +161,7 @@ impl AgentRunStatus {
             Self::LoopAborted => "loop_aborted",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::CompletedVerified => "completed_verified",
+            Self::CompletedUnverified => "completed_unverified",
             Self::FailedDiagnosed => "failed_diagnosed",
             Self::BlockedNeedsInput => "blocked_needs_input",
         }
@@ -162,8 +170,14 @@ impl AgentRunStatus {
     /// `true` se il run e' terminato con successo (con o senza verifica E2E).
     /// Punto unico della semantica "run riuscito": i call site usano questo invece
     /// di `matches!(status, Completed)`, cosi' l'esito verificato non viene perso.
+    /// `CompletedUnverified` E' un successo (il lavoro c'e'): la mancata verifica
+    /// e' un'annotazione onesta, non un fallimento -> non deve rompere i flussi
+    /// che dipendono da `is_success` (billing, learning, KB).
     pub fn is_success(&self) -> bool {
-        matches!(self, Self::Completed | Self::CompletedVerified)
+        matches!(
+            self,
+            Self::Completed | Self::CompletedVerified | Self::CompletedUnverified
+        )
     }
 
     /// Parsing inverso di `as_str` (punto unico, regola L): da stringa
@@ -183,6 +197,7 @@ impl AgentRunStatus {
             "loop_aborted" => Self::LoopAborted,
             "provider_unavailable" => Self::ProviderUnavailable,
             "completed_verified" => Self::CompletedVerified,
+            "completed_unverified" => Self::CompletedUnverified,
             "failed_diagnosed" => Self::FailedDiagnosed,
             "blocked_needs_input" => Self::BlockedNeedsInput,
             _ => Self::Running,
@@ -863,6 +878,7 @@ mod tests {
             AgentRunStatus::LoopAborted,
             AgentRunStatus::ProviderUnavailable,
             AgentRunStatus::CompletedVerified,
+            AgentRunStatus::CompletedUnverified,
             AgentRunStatus::FailedDiagnosed,
             AgentRunStatus::BlockedNeedsInput,
         ] {
@@ -890,6 +906,9 @@ mod tests {
         // era il bug del match inline in chat_agent.rs.
         assert!(AgentRunStatus::FailedDiagnosed.is_terminal());
         assert!(AgentRunStatus::CompletedVerified.is_terminal());
+        assert!(AgentRunStatus::CompletedUnverified.is_terminal());
+        // CompletedUnverified e' un successo (lavoro svolto, non verificato).
+        assert!(AgentRunStatus::CompletedUnverified.is_success());
         // Terminali classici.
         for st in [
             AgentRunStatus::Completed,

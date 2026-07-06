@@ -249,7 +249,11 @@ export function ChatPanel({
   const prevRunStatusRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!agentRun) return;
-    const isTerminal = ["completed", "failed", "timed_out", "cancelled", "interrupted"].includes(agentRun.status);
+    // Punto unico (regola L): delega a isStatusTerminal invece di un array
+    // hardcoded, che dimenticava gli esiti canonici (completed_verified/
+    // completed_unverified/failed_diagnosed/blocked_needs_input) -> onRunEnd non
+    // scattava e la telemetria di fine run si perdeva.
+    const isTerminal = isStatusTerminal(agentRun.status);
     if (isTerminal && prevRunStatusRef.current === "running") {
       onRunEnd?.({ provider: agentRun.provider, model: agentRun.model, status: agentRun.status });
     }

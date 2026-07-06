@@ -342,6 +342,7 @@ function RunStatusBadge({ status, tc }: { status: string; tc: ThemeColors }) {
   const config: Record<string, { label: string; color: string; bg: string }> = {
     completed: { label: "completato", color: "#22c55e", bg: "#22c55e18" },
     completed_verified: { label: "completato e verificato", color: "#22c55e", bg: "#22c55e18" },
+    completed_unverified: { label: "completato (non verificato)", color: "#f59e0b", bg: "#f59e0b18" },
     failed: { label: "non riuscito", color: tc.error, bg: `${tc.error}18` },
     failed_diagnosed: { label: "non riuscito (diagnosi)", color: tc.error, bg: `${tc.error}18` },
     timed_out: { label: "tempo scaduto", color: tc.error, bg: `${tc.error}18` },
@@ -725,15 +726,24 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
 
           {/* Footer esito (parita' col live): "Completato/Fallito - N step". */}
           {(runInfo.status === "completed" || runInfo.status === "completed_verified" ||
+            runInfo.status === "completed_unverified" ||
             runInfo.status === "failed" || runInfo.status === "failed_diagnosed") && (
             <div style={{
               padding: "5px 10px",
               borderTop: `1px solid ${tc.border}`,
               fontSize: 11,
               fontWeight: 600,
-              color: (runInfo.status === "failed" || runInfo.status === "failed_diagnosed") ? tc.error : "#22c55e",
+              color: (runInfo.status === "failed" || runInfo.status === "failed_diagnosed")
+                ? tc.error
+                : runInfo.status === "completed_unverified"
+                  ? "#f59e0b"
+                  : "#22c55e",
             }}>
-              {(runInfo.status === "failed" || runInfo.status === "failed_diagnosed") ? "✗ Fallito" : "✓ Completato"} — {steps.length} step
+              {(runInfo.status === "failed" || runInfo.status === "failed_diagnosed")
+                ? "✗ Fallito"
+                : runInfo.status === "completed_unverified"
+                  ? "✓ Completato (verifica non eseguita)"
+                  : "✓ Completato"} — {steps.length} step
             </div>
           )}
         </div>

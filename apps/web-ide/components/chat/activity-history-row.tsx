@@ -36,7 +36,11 @@ type ThemeColors = ReturnType<typeof useThemeColors>;
 /** Esito sintetico del turno storico (ok/errore) dallo stato del run. */
 function statusTone(runStatus: string | undefined): "ok" | "err" | "neutral" {
   if (!runStatus) return "neutral";
-  if (runStatus === "completed" || runStatus === "completed_verified") {
+  if (
+    runStatus === "completed" ||
+    runStatus === "completed_verified" ||
+    runStatus === "completed_unverified"
+  ) {
     return "ok";
   }
   if (

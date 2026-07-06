@@ -345,6 +345,9 @@ pub struct StateDelta {
     /// Vedi `AgentState::final_gate_passed`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub final_gate_passed: Option<Option<bool>>,
+    /// Vedi `AgentState::final_gate_unverified`.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub final_gate_unverified: Option<Option<bool>>,
     /// Vedi `AgentState::verifier_last_result`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub verifier_last_result: Option<Option<Value>>,

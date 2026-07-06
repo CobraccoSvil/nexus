@@ -51,6 +51,11 @@ export function buildTerminalRunSummary(run: AgentRunInfo): string {
       ? `Operazione completata e verificata. Ho eseguito ${completed} step.`
       : "Operazione completata e verificata.";
   }
+  if (run.status === "completed_unverified") {
+    return completed > 0
+      ? `Operazione completata in ${completed} step, ma la verifica tecnica non e' stata eseguita (profilo di verifica del progetto assente): l'esito non e' stato confermato da un comando reale.`
+      : "Operazione completata, ma la verifica tecnica non e' stata eseguita (profilo di verifica del progetto assente).";
+  }
   if (run.status === "failed_diagnosed") {
     return completed > 0
       ? `Operazione non completata dopo ${completed} step: ho interrotto e diagnosticato il blocco (esito e prossimo passo nel messaggio).`
