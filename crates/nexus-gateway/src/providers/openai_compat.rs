@@ -263,6 +263,19 @@ impl OpenAiCompatClient {
     /// regola L). Il parsing della risposta e' delegato a [`parse_models_response`]
     /// (puro, testabile senza rete).
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .list_models_meta()
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect())
+    }
+
+    /// Autodiscovery live CON METADATI: id + finestra di contesto dichiarata
+    /// dal provider quando il dialetto la espone (Mistral: `max_context_length`
+    /// in `data[]`; OpenAI/DeepSeek non la espongono -> `None`). Un solo fetch
+    /// (regola L): [`Self::list_models`] delega qui e proietta i soli id.
+    pub async fn list_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
         let url = format!("{}/models", self.base_url);
         let resp = self.http.get(url).bearer_auth(&self.api_key).send().await?;
         let status = resp.status();
@@ -272,7 +285,7 @@ impl OpenAiCompatClient {
             return Err(provider_http_error(&self.provider_name, resp).await.into());
         }
         let body: serde_json::Value = resp.json().await?;
-        Ok(parse_models_response(&body))
+        Ok(parse_models_meta_response(&body))
     }
 
     /// Genera immagini via `POST {base_url}/images/generations` (dialetto OpenAI
@@ -502,21 +515,43 @@ fn from_images_response(
 /// senza rete): salta gli elementi senza `id` non-vuoto, deduplica e ordina per
 /// output deterministico (parita' col brain `list_models_live`).
 pub fn parse_models_response(body: &serde_json::Value) -> Vec<String> {
-    let mut names: Vec<String> = body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
+    parse_models_meta_response(body)
+        .into_iter()
+        .map(|m| m.id)
+        .collect()
+}
+
+/// Variante CON METADATI di [`parse_models_response`] (punto unico del parsing,
+/// regola L: la versione nomi-soli vi delega). Oltre all'`id`, estrae la
+/// finestra di contesto DICHIARATA dal provider quando il dialetto la espone:
+/// Mistral usa `max_context_length` in `data[]` (OpenAI/DeepSeek non hanno il
+/// campo -> `None`). Valori non positivi sono trattati come non dichiarati:
+/// meglio "ignota" di una finestra inventata (regola H, incidente 2026-07-06).
+/// Ordinamento/dedup per id come la versione nomi-soli (output deterministico).
+pub fn parse_models_meta_response(body: &serde_json::Value) -> Vec<crate::provider::ModelMeta> {
+    let items = body.get("data").and_then(|d| d.as_array());
+    let mut metas: Vec<crate::provider::ModelMeta> = items
+        .map(|arr| arr.iter().filter_map(openai_model_meta_of).collect())
         .unwrap_or_default();
-    names.sort();
-    names.dedup();
-    names
+    metas.sort_by(|a, b| a.id.cmp(&b.id));
+    metas.dedup_by(|a, b| a.id == b.id);
+    metas
+}
+
+/// Mappa UN elemento di `data[]` (dialetto OpenAI) in [`ModelMeta`]: `id`
+/// trimmato non-vuoto obbligatorio; `max_context_length` (Mistral) come
+/// finestra dichiarata solo se positiva.
+fn openai_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelMeta> {
+    let id = m
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let context_window = m
+        .get("max_context_length")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|w| *w > 0);
+    Some(crate::provider::ModelMeta { id, context_window })
 }
 
 /// Parser SSE riusabile: accumula righe, le decodifica in [`LlmStreamChunk`] e
@@ -1453,6 +1488,28 @@ mod tests {
         let models = parse_models_response(&body);
         // Ordinato e deduplicato.
         assert_eq!(models, vec!["gpt-4o", "gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn parse_models_meta_estrae_finestra_dichiarata() {
+        // Dialetto Mistral: `max_context_length` in data[]. OpenAI/DeepSeek non
+        // hanno il campo -> None (finestra IGNOTA, mai inventata: regola H).
+        let body = serde_json::json!({
+            "object": "list",
+            "data": [
+                { "id": "mistral-medium-3", "max_context_length": 131072 },
+                { "id": "mistral-ocr-latest" },                     // senza campo
+                { "id": "mistral-rotto", "max_context_length": 0 }, // non positivo
+            ]
+        });
+        let metas = parse_models_meta_response(&body);
+        assert_eq!(metas.len(), 3);
+        assert_eq!(metas[0].id, "mistral-medium-3");
+        assert_eq!(metas[0].context_window, Some(131072));
+        assert_eq!(metas[1].id, "mistral-ocr-latest");
+        assert_eq!(metas[1].context_window, None);
+        // Valore non positivo = non dichiarato (mai una finestra inventata).
+        assert_eq!(metas[2].context_window, None);
     }
 
     #[test]

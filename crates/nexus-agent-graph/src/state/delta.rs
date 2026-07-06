@@ -454,6 +454,11 @@ pub struct StateDelta {
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub current_tier: Option<Option<String>>,
 
+    /// Vedi `AgentState::effective_context_window`. Scritto dall'executor a ogni
+    /// turno (finestra del modello effettivo del turno, post smart-upscale).
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub effective_context_window: Option<Option<i64>>,
+
     // ── Automazione ─────────────────────────────────────────────────────────────
     /// Vedi `AgentState::automation_mode`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]

@@ -265,6 +265,7 @@ pub async fn send_chat_message(
                AND status IN ('running', 'awaiting_confirmation') \
                AND created_at > NOW() - INTERVAL '15 minutes' \
                AND generation_ended_at IS NULL \
+               AND nexus_agent_type IS DISTINCT FROM 'subagent' \
              LIMIT 1",
         )
         .bind(context.session_id)

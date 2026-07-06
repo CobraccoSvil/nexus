@@ -75,6 +75,13 @@ impl LlmProvider for MistralProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         self.client.list_models().await
     }
+
+    /// Il dialetto Mistral dichiara la finestra (`max_context_length` in
+    /// `data[]`): la propaga cosi' il catalog sync scrive il valore REALE
+    /// invece di lasciare la finestra ignota (regola G/H).
+    async fn list_models_meta(&self) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
+        self.client.list_models_meta().await
+    }
 }
 
 #[cfg(test)]

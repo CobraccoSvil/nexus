@@ -282,6 +282,7 @@ pub async fn get_active_run_for_session(
          FROM agent_runs
          WHERE session_id = $1 AND user_id = $2
            AND status IN ('running', 'awaiting_confirmation')
+           AND nexus_agent_type IS DISTINCT FROM 'subagent'
          ORDER BY created_at DESC
          LIMIT 1",
     )
@@ -524,6 +525,7 @@ pub async fn get_session_meta_steps(
          WHERE m.run_id IN (
              SELECT id FROM agent_runs
              WHERE session_id = $1 AND user_id = $2
+               AND nexus_agent_type IS DISTINCT FROM 'subagent'
              ORDER BY created_at DESC
              LIMIT 30
          )

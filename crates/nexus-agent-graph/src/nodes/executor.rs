@@ -4121,6 +4121,11 @@ modello piu' capace.",
             sticky_provider: Some(sticky_provider),
             sticky_model: Some(sticky_model),
             current_tier: current_tier_delta,
+            // Finestra EFFETTIVA del turno (config o modello promosso dallo
+            // smart-upscale): il ToolDispatchNode la usa per il predictive cap
+            // al posto della finestra statica di config, cosi' il gate segue il
+            // modello reale del turno (regola H, incidente 2026-07-06).
+            effective_context_window: Some(Some(effective_window)),
             // Usage del turno (py:3476-3480), overwrite last-write come il Python.
             prompt_tokens: Some(Some(turn_prompt_tokens)),
             completion_tokens: Some(Some(turn_completion_tokens)),

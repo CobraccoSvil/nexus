@@ -498,6 +498,17 @@ pub struct AgentState {
     /// -> ogni consumatore (PR-B) ricade sul default `medium`.
     pub current_tier: Option<String>,
 
+    /// Finestra di contesto EFFETTIVA (token) dell'ultimo turno LLM eseguito:
+    /// quella del modello richiesto dalla config, oppure quella del modello
+    /// PROMOSSO quando lo smart-upscale e' scattato (context_overflow). Scritta
+    /// dall'executor a ogni turno; il ToolDispatchNode la usa per il predictive
+    /// context cap al posto della finestra statica di config (regola H,
+    /// incidente 2026-07-06: gate fermo alla finestra del modello di partenza
+    /// mentre le chiamate LLM giravano gia' sul modello promosso -> tutti i
+    /// tool bloccati per sempre). `None` (primo turno / checkpoint storici) o
+    /// `<=0` -> il gate ricade sulla finestra di config (comportamento storico).
+    pub effective_context_window: Option<i64>,
+
     // ── Automazione ─────────────────────────────────────────────────────────────
     /// Modalita' automazione del turno chat propagata da mcp-core.
     pub automation_mode: Option<AutomationMode>,

@@ -246,8 +246,10 @@ impl NexusGatewayClient {
     /// discovery: incapsula l'auth di ogni provider (incluso Vertex con
     /// Service Account), cosi' il worker catalog non deve replicare le
     /// chiamate dirette ne' delegare al brain per Google (regola L).
-    /// Ritorna la lista dei model id esposti dal provider.
-    pub async fn list_models(&self, provider: &str) -> Result<Vec<String>> {
+    /// Ritorna id + finestra di contesto dichiarata dal provider (dal campo
+    /// additivo `models_meta`; gateway senza il campo -> finestre `None`,
+    /// retro-compatibile).
+    pub async fn list_models(&self, provider: &str) -> Result<Vec<GwModelMeta>> {
         let resp = self
             .http
             .get(format!("{}/v1/models/{provider}", self.base_url))
@@ -265,9 +267,20 @@ impl NexusGatewayClient {
 
         resp.json::<GwModelsResponse>()
             .await
-            .map(|r| r.models)
+            .map(GwModelsResponse::into_metas)
             .map_err(|e| anyhow::anyhow!("Nexus Gateway models parse: {e}"))
     }
+}
+
+/// Metadati di un modello dal gateway (`models_meta` di
+/// `GET /v1/models/{provider}`): id + finestra dichiarata dal provider.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GwModelMeta {
+    pub id: String,
+    /// Finestra di contesto in token dichiarata dal provider; `None` se l'API
+    /// del provider non la espone (il catalogo scrive 0 = ignota, regola H).
+    #[serde(default)]
+    pub context_window: Option<i64>,
 }
 
 /// Risposta di `GET /v1/models/{provider}` del gateway.
@@ -276,6 +289,26 @@ struct GwModelsResponse {
     #[allow(dead_code)]
     provider: String,
     models: Vec<String>,
+    /// Campo additivo del gateway aggiornato; assente su gateway vecchio.
+    #[serde(default)]
+    models_meta: Vec<GwModelMeta>,
+}
+
+impl GwModelsResponse {
+    /// Proietta la risposta in metadati: usa `models_meta` quando presente,
+    /// altrimenti degrada agli id di `models` con finestra ignota (`None`).
+    fn into_metas(self) -> Vec<GwModelMeta> {
+        if !self.models_meta.is_empty() {
+            return self.models_meta;
+        }
+        self.models
+            .into_iter()
+            .map(|id| GwModelMeta {
+                id,
+                context_window: None,
+            })
+            .collect()
+    }
 }
 
 /// Mappa intent + behavior_mode all'alias definito in config/model-aliases.yaml.
@@ -301,10 +334,37 @@ mod tests {
     #[test]
     fn parse_models_response_per_provider() {
         // Forma di GET /v1/models/{provider}: {"provider":"...","models":[...]}.
+        // Gateway VECCHIO senza models_meta: degrada agli id con finestra None.
         let raw = r#"{"provider":"openai","models":["gpt-4o","gpt-4o-mini","o3"]}"#;
         let parsed: GwModelsResponse = serde_json::from_str(raw).expect("parse models response");
         assert_eq!(parsed.provider, "openai");
         assert_eq!(parsed.models, vec!["gpt-4o", "gpt-4o-mini", "o3"]);
+        let metas = parsed.into_metas();
+        assert_eq!(metas.len(), 3);
+        assert!(metas.iter().all(|m| m.context_window.is_none()));
+    }
+
+    #[test]
+    fn parse_models_meta_con_finestra_dichiarata() {
+        // Gateway aggiornato: models_meta porta la finestra dichiarata dal
+        // provider (Mistral max_context_length); id senza finestra -> None.
+        let raw = r#"{"provider":"mistral",
+            "models":["mistral-medium-3","mistral-ocr-latest"],
+            "models_meta":[
+                {"id":"mistral-medium-3","context_window":131072},
+                {"id":"mistral-ocr-latest"}
+            ]}"#;
+        let parsed: GwModelsResponse = serde_json::from_str(raw).expect("parse meta");
+        let metas = parsed.into_metas();
+        assert_eq!(metas.len(), 2);
+        assert_eq!(
+            metas[0],
+            GwModelMeta {
+                id: "mistral-medium-3".into(),
+                context_window: Some(131072)
+            }
+        );
+        assert_eq!(metas[1].context_window, None);
     }
 
     #[test]
