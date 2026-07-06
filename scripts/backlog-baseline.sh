@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
-cd /home/administrator/ideai
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 OUT=/tmp/backlog-closure
 mkdir -p "$OUT"
@@ -16,12 +16,6 @@ for d in crates/*/; do
   printf "%-40s unwrap=%4d expect=%4d\n" "$c" "$uw" "$ex" >> "$OUT/unwrap-baseline.txt"
 done
 cat "$OUT/unwrap-baseline.txt" | tee -a "$OUT/summary.log"
-
-echo "--- hardcoding modelli Python (fuori test) ---" | tee -a "$OUT/summary.log"
-grep -rnE '"(claude-(haiku|sonnet|opus)-[0-9]|mistral-(small|medium|large)-|gemini-[0-9]+\.[0-9]+|gpt-(4|3\.5)|deepseek-(chat|coder))' brain/ --include="*.py" 2>/dev/null \
-  | grep -v -E "/tests?/|_test\.py|test_|^.*#.*[Ee]sempio|^.*#.*[Dd]efault" \
-  > "$OUT/hardcoding-py.txt" || true
-wc -l "$OUT/hardcoding-py.txt" | tee -a "$OUT/summary.log"
 
 echo "--- hardcoding modelli Rust (fuori test) ---" | tee -a "$OUT/summary.log"
 grep -rnE '"(claude-(haiku|sonnet|opus)-[0-9]|mistral-(small|medium|large)-|gemini-[0-9]+\.[0-9]+|gpt-(4|3\.5)|deepseek-(chat|coder))' crates/ --include="*.rs" 2>/dev/null \
