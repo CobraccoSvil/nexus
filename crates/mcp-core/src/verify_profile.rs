@@ -56,6 +56,15 @@ pub struct VerifyProfileStep {
     pub gate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
+    /// Exit code dello step misurato sull'albero PRE-LAVORO (backfill lazy nel
+    /// punto d'innesto del run primario, MAI generato dall'LLM). Baseline del
+    /// gate delta-aware sui criteri: un fallimento IDENTICO alla baseline
+    /// (stesso exit non-zero, zero file localizzati) e' debito pre-esistente
+    /// dell'ambiente e non boccia il run. Additivo (`serde default`):
+    /// retro-compatibile coi profili gia' persistiti; una re-inferenza produce
+    /// step senza baseline -> ri-misura automatica al run successivo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_exit_code: Option<i64>,
 }
 
 /// Limiti di sicurezza dell'osservazione (bounded, non "intelligenza"):
@@ -171,6 +180,26 @@ pub fn environment_hash(root: &Path, listing: &[String], observed_files: &[Strin
         }
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Persiste gli step aggiornati (es. backfill delle baseline pre-lavoro) sul
+/// profilo esistente. UPDATE puro del JSONB: non tocca environment/hash/source,
+/// quindi non altera il cache-hit dell'inferenza. Idempotente sotto
+/// concorrenza (due primari misurano la stessa baseline).
+pub async fn persist_steps(meta_db: &PgPool, project_id: Uuid, steps: &[VerifyProfileStep]) {
+    let Ok(json) = serde_json::to_value(steps) else {
+        return;
+    };
+    if let Err(e) = sqlx::query(
+        "UPDATE project_verify_profiles SET steps = $2, updated_at = now() WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .bind(json)
+    .execute(meta_db)
+    .await
+    {
+        tracing::warn!(error = %e, %project_id, "verify_profile: persist_steps fallita (baseline non salvata)");
+    }
 }
 
 /// Legge gli step del profilo persistito (lettura pura, nessuna inferenza).

@@ -1114,8 +1114,11 @@ async fn build_native_engine(
 
     // Motore criteri del final_gate / verifier: delega al tool_executor (punto
     // unico, regola L) per i criteri run_command/list_files + DB per outputs_exist.
-    let criteria: Arc<dyn CriteriaRunner> =
+    // Il tipo CONCRETO resta visibile per la misura baseline pre-lavoro
+    // (measure_command_exit non fa parte del trait CriteriaRunner).
+    let criteria_adapter =
         Arc::new(FinalGateCriteriaRunnerAdapter::new(tools.clone(), run_db.clone()));
+    let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
     // ── Config dei nodi (DB-driven, regola G piena) ──────────────────────────
     // DEBITO 2 chiuso (TODO Fase 5): le config dei nodi che il brain Python legge
@@ -1155,7 +1158,7 @@ async fn build_native_engine(
             None => None,
         };
         if let (Some(pid), Some(root)) = (project_id, root.filter(|r| !r.trim().is_empty())) {
-            let steps = if role.is_shadow() {
+            let mut steps = if role.is_shadow() {
                 crate::verify_profile::profile_steps(&db, pid).await
             } else {
                 crate::verify_profile::ensure_profile(
@@ -1166,6 +1169,37 @@ async fn build_native_engine(
                 )
                 .await
             };
+            // ── Baseline PRE-LAVORO degli step gate (delta-aware sui criteri) ──
+            // SOLO nel primario e SOLO qui, PRIMA che l'executor tocchi file:
+            // per gli step gate senza baseline si misura l'exit code sull'albero
+            // corrente (= stato pre-lavoro di questo run) e lo si persiste nel
+            // profilo (backfill lazy, una tantum finche' il profilo non viene
+            // re-inferito). Il final_gate non bocciera' un criterio che fallisce
+            // IDENTICO alla baseline (fallimento pre-esistente dell'ambiente,
+            // es. `npx eslint` exit 2 per config assente — incidente run
+            // 695794af col build verde). Misura via il PUNTO UNICO del runner
+            // criteri (regola L/M: exit code strutturato). Un comando non
+            // misurabile resta senza baseline -> fail-closed come prima.
+            if !role.is_shadow() {
+                let mut measured = false;
+                for s in steps.iter_mut().filter(|s| s.gate && s.baseline_exit_code.is_none()) {
+                    if let Some(exit) = criteria_adapter
+                        .measure_command_exit(&s.command, s.working_dir.as_deref())
+                        .await
+                    {
+                        s.baseline_exit_code = Some(exit);
+                        measured = true;
+                        tracing::info!(
+                            step = %s.step,
+                            baseline_exit = exit,
+                            "verify_profile: baseline pre-lavoro misurata per lo step gate"
+                        );
+                    }
+                }
+                if measured {
+                    crate::verify_profile::persist_steps(&db, pid, &steps).await;
+                }
+            }
             final_gate_cfg.verify_profile_missing = steps.is_empty();
             final_gate_cfg.verify_steps = steps
                 .into_iter()
@@ -1174,6 +1208,7 @@ async fn build_native_engine(
                     step: s.step,
                     command: s.command,
                     working_dir: s.working_dir,
+                    baseline_exit_code: s.baseline_exit_code,
                 })
                 .collect();
         } else {

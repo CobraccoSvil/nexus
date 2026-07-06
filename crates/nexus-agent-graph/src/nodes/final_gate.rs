@@ -193,6 +193,16 @@ pub struct VerifyStepCmd {
     pub command: String,
     /// Working dir relativa alla root del progetto (monorepo). `None` = root.
     pub working_dir: Option<String>,
+    /// Exit code del comando misurato sull'albero PRE-LAVORO (all'innesto del
+    /// profilo, prima che il run tocchi file). Baseline del gate delta-aware
+    /// sui criteri: un criterio che fallisce ORA con lo STESSO exit code
+    /// non-zero della baseline e senza file d'errore localizzati e' un
+    /// fallimento PRE-ESISTENTE dell'ambiente (es. `npx eslint` exit 2 per
+    /// config assente), non una regressione del run: non boccia, viene
+    /// dichiarato. `None` = baseline non misurata -> fail-closed (criterio
+    /// assoluto, comportamento storico).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_exit_code: Option<i64>,
 }
 
 impl Default for FinalGateConfig {
@@ -478,6 +488,11 @@ impl FinalGateNode {
             spec.insert("touched_files".to_string(), json!(touched_files));
             if let Some(cwd) = &vs.working_dir {
                 spec.insert("working_dir".to_string(), json!(cwd));
+            }
+            // Baseline pre-lavoro dello step (delta-aware sui criteri): il
+            // criteria_runner non boccia un fallimento IDENTICO alla baseline.
+            if let Some(be) = vs.baseline_exit_code {
+                spec.insert("baseline_exit_code".to_string(), json!(be));
             }
             criteria.push(CriterionSpec {
                 criterion_type: "run_command".to_string(),
@@ -1211,11 +1226,13 @@ mod tests {
                 step: "typecheck".to_string(),
                 command: "npx tsc --noEmit".to_string(),
                 working_dir: None,
+                baseline_exit_code: None,
             },
             VerifyStepCmd {
                 step: "build".to_string(),
                 command: "pnpm build".to_string(),
                 working_dir: Some("app".to_string()),
+                baseline_exit_code: None,
             },
         ];
         let cfg = FinalGateConfig {

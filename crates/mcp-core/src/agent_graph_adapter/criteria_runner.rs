@@ -107,6 +107,26 @@ impl FinalGateCriteriaRunnerAdapter {
         })
     }
 
+    /// Misura l'exit code di un comando sull'albero CORRENTE (baseline
+    /// pre-lavoro degli step gate, delta-aware sui criteri). Riusa il PUNTO
+    /// UNICO `run_tool` + `extract_exit_code` (regola L/M: exit code
+    /// strutturato, mai parsing dell'output). `None` = comando non eseguibile
+    /// o exit non estraibile -> il chiamante NON persiste baseline (fail-closed
+    /// nel gate). Chiamata SOLO dal run primario, prima che l'executor tocchi
+    /// file.
+    pub async fn measure_command_exit(
+        &self,
+        command: &str,
+        working_dir: Option<&str>,
+    ) -> Option<i64> {
+        let mut tool_input = json!({ "command": command });
+        if let Some(wd) = working_dir {
+            tool_input["working_dir"] = json!(wd);
+        }
+        let raw = self.run_tool("run_command", tool_input, ExecMode::Real).await.ok()?;
+        crate::tool_runner_server::extract_exit_code(&raw).map(|e| e as i64)
+    }
+
     /// Esegue UN criterio. Parita' col `run_criterion` Python: il dispatch per
     /// `criterion_type` + il try/except che mappa un fallimento su
     /// `passed=false`/`evidence.error` (mai un panico). Il [`PortError`] risale solo
@@ -297,10 +317,30 @@ task_complete (outcome + summary)"
         let delta_applicable = !error_files.is_empty() && !touched.is_empty();
         let regression = !regressed_files.is_empty();
         let preexisting_files = error_files.len().saturating_sub(regressed_files.len());
+        // ── Delta-aware sui CRITERI (baseline pre-lavoro, regola H/M) ────────
+        // Un criterio che fallisce ORA con lo STESSO exit code non-zero
+        // misurato sull'albero PRE-lavoro (baseline all'innesto del profilo) e
+        // SENZA file d'errore localizzati e' un fallimento di BOOTSTRAP
+        // pre-esistente dell'ambiente (es. `npx eslint` exit 2 per config
+        // assente: incidente run 695794af, pnpm build verde ma gate bocciato
+        // per un criterio impossibile in QUALUNQUE stato del lavoro). Non e'
+        // una regressione del run: non boccia, viene dichiarato nel verdict.
+        // Condizioni STRETTE (solo segnali strutturati): exit non-zero
+        // IDENTICO alla baseline + zero error_files (se il comando localizza
+        // errori in file, decide il ramo delta sui touched_files). Se il run
+        // avesse ROTTO lui il bootstrap (es. config cancellata), la baseline
+        // sarebbe 0 e il confronto NON scatterebbe. `None` = fail-closed.
+        let baseline_exit = spec.get("baseline_exit_code").and_then(Value::as_i64);
+        let preexisting_bootstrap = !exit_ok
+            && error_files.is_empty()
+            && baseline_exit
+                .is_some_and(|b| b != 0 && actual_exit.map(|a| a as i64) == Some(b));
         let passed = if delta_applicable {
             // Chiude se il task non ha lasciato errori nei file che ha toccato,
             // anche se il progetto ha debito preesistente altrove.
             !regression
+        } else if preexisting_bootstrap {
+            true
         } else {
             // Fallback fail-closed: criterio assoluto (identico a prima).
             exit_ok && build_errors == 0
@@ -327,8 +367,15 @@ task_complete (outcome + summary)"
             "delta_applied": delta_applicable,
             "preexisting_error_files": preexisting_files,
             "regressed_files": regressed_files.clone(),
+            "baseline_exit_code": baseline_exit,
+            "preexisting_bootstrap": preexisting_bootstrap,
         });
-        if regression {
+        if preexisting_bootstrap {
+            ev["verdict"] = json!(format!(
+                "Criterio fallito con esito IDENTICO alla baseline pre-lavoro (exit {} gia' misurato all'innesto del profilo): fallimento PRE-ESISTENTE dell'ambiente (es. config del tool assente), non una regressione di questo run. Debito del progetto, non blocca la chiusura.",
+                baseline_exit.unwrap_or_default()
+            ));
+        } else if regression {
             // Il task ha lasciato errori nei file che ha modificato: blocca e dillo.
             ev["verdict"] = json!(format!(
                 "Verifica delta: errori nei file modificati da questo task ({}). Correggi TUTTI gli errori in questi file prima di chiudere; il debito preesistente in altri file non e' richiesto.",
@@ -817,6 +864,88 @@ mod tests {
         assert_eq!(res[0].evidence["exit_code"], json!(101));
         // output_excerpt presente (render_failed_block ramo build lo legge).
         assert!(res[0].evidence["output_excerpt"].is_string());
+    }
+
+    #[sqlx::test]
+    async fn run_command_bootstrap_identico_alla_baseline_non_boccia(pool: PgPool) {
+        // REGRESSIONE run 695794af: `npx eslint src` exit 2 per config assente
+        // (fallimento di bootstrap PRE-ESISTENTE, zero file localizzati) con
+        // baseline pre-lavoro identica NON deve bocciare il gate.
+        let exec = FakeToolExecutor::with(&[(
+            "run_command",
+            &["Oops! Something went wrong!\nESLint couldn't find a config file.\nEXIT CODE: 2"],
+        )]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "run_command",
+                    json!({ "command": "npx eslint src", "baseline_exit_code": 2, "touched_files": ["src/app/x.ts"] }),
+                    json!({ "exit_code": 0 }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(
+            res[0].passed,
+            "fallimento identico alla baseline pre-lavoro = debito ambiente, non regressione"
+        );
+        assert_eq!(res[0].evidence["preexisting_bootstrap"], json!(true));
+        let verdict = res[0].evidence["verdict"].as_str().unwrap_or_default();
+        assert!(verdict.contains("PRE-ESISTENTE"), "verdict dichiara il debito: {verdict}");
+    }
+
+    #[sqlx::test]
+    async fn run_command_fallimento_diverso_dalla_baseline_boccia(pool: PgPool) {
+        // Exit diverso dalla baseline = comportamento NUOVO (possibile rottura
+        // introdotta dal run, es. config cancellata): resta bloccante.
+        let exec = FakeToolExecutor::with(&[(
+            "run_command",
+            &["boom di bootstrap\nEXIT CODE: 2"],
+        )]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "run_command",
+                    json!({ "command": "npx eslint src", "baseline_exit_code": 1 }),
+                    json!({ "exit_code": 0 }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(!res[0].passed, "exit 2 con baseline 1: non identico -> boccia");
+        assert_eq!(res[0].evidence["preexisting_bootstrap"], json!(false));
+    }
+
+    #[sqlx::test]
+    async fn run_command_baseline_con_errori_localizzati_resta_delta_su_file(pool: PgPool) {
+        // Se l'output LOCALIZZA errori in file, decide il ramo delta sui
+        // touched_files (qui: errore in file TOCCATO -> regressione, boccia),
+        // MAI il ramo bootstrap anche con baseline identica.
+        let exec = FakeToolExecutor::with(&[(
+            "run_command",
+            &["src/app/x.ts(3,5): error TS2304: Cannot find name 'y'.\nEXIT CODE: 2"],
+        )]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "run_command",
+                    json!({ "command": "npx tsc --noEmit", "baseline_exit_code": 2, "touched_files": ["src/app/x.ts"] }),
+                    json!({ "exit_code": 0 }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(
+            !res[0].passed,
+            "errore localizzato in file toccato = regressione: la baseline non salva"
+        );
+        assert_eq!(res[0].evidence["preexisting_bootstrap"], json!(false));
     }
 
     // ── Gate DELTA-aware (regola H): regressione vs debito preesistente ──────────
