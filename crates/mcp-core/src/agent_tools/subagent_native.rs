@@ -49,6 +49,15 @@ fn err(msg: &str) -> String {
     format!("\u{274C} [dispatch_subagent] {msg}")
 }
 
+// Chiavi ricorrenti dei payload di narrazione/tool_result del sub-run: un solo
+// literal per chiave (i consumatori — frontend e test — leggono le stesse).
+const K_SUB_RUN_ID: &str = "subagent_run_id";
+const K_SUB_KIND: &str = "subagent_kind";
+const K_SUMMARY: &str = "summary";
+const K_TIMEOUT_S: &str = "timeout_s";
+const K_TARGET: &str = "target";
+const K_IS_ERROR: &str = "is_error";
+
 /// Soglie sub-agent lette dal DB (regola G). I default coincidono coi default del
 /// brain (`orchestrator_config` + mig 0153): safe-default se la chiave manca, MAI
 /// magic fallback sul comportamento.
@@ -94,35 +103,39 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<SubagentSettin
     for row in rows {
         let k: String = row.get("key");
         let v: String = row.get("value");
-        match k.as_str() {
-            "orchestrator.subagents_enabled" => {
-                s.enabled = matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on")
-            }
-            "orchestrator.subagent_kinds_whitelist" => {
-                s.whitelist = v
-                    .split(',')
-                    .map(|x| x.trim().to_string())
-                    .filter(|x| !x.is_empty())
-                    .collect()
-            }
-            "orchestrator.subagent_max_depth" => s.max_depth = v.trim().parse().unwrap_or(2),
-            "orchestrator.subagent_cost_cap_per_run_usd" => {
-                s.cost_cap_usd = v.trim().parse().unwrap_or(5.0)
-            }
-            "orchestrator.subagent_default_timeout_s" => {
-                s.default_timeout_s = v.trim().parse().unwrap_or(300)
-            }
-            "orchestrator.subagent_narration_enabled" => {
-                s.narration_enabled =
-                    matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on")
-            }
-            "orchestrator.subagent_narration_heartbeat_s" => {
-                s.narration_heartbeat_s = v.trim().parse().unwrap_or(20)
-            }
-            _ => {}
-        }
+        apply_subagent_setting(&mut s, &k, &v);
     }
     Ok(s)
+}
+
+/// Flag booleano nel formato accettato dalla tabella `settings`.
+fn settings_flag(v: &str) -> bool {
+    matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+}
+
+/// Applica UNA riga di `settings` alle soglie sub-agent (chiave ignota: no-op).
+fn apply_subagent_setting(s: &mut SubagentSettings, key: &str, value: &str) {
+    let v = value.trim();
+    match key {
+        "orchestrator.subagents_enabled" => s.enabled = settings_flag(v),
+        "orchestrator.subagent_kinds_whitelist" => {
+            s.whitelist = v
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        }
+        "orchestrator.subagent_max_depth" => s.max_depth = v.parse().unwrap_or(2),
+        "orchestrator.subagent_cost_cap_per_run_usd" => s.cost_cap_usd = v.parse().unwrap_or(5.0),
+        "orchestrator.subagent_default_timeout_s" => {
+            s.default_timeout_s = v.parse().unwrap_or(300)
+        }
+        "orchestrator.subagent_narration_enabled" => s.narration_enabled = settings_flag(v),
+        "orchestrator.subagent_narration_heartbeat_s" => {
+            s.narration_heartbeat_s = v.parse().unwrap_or(20)
+        }
+        _ => {}
+    }
 }
 
 /// Definition di un kind di sub-agent (`nexus_subagent_definitions`).
@@ -320,16 +333,7 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         // FASE 2: `write_scope` dichiarato dal task (aree file che il sub-run
         // scrive). Assente/vuoto -> `subtasks_are_disjoint` degradera' a false ->
         // ramo sequenziale (sicuro). Fonte: `Todo.write_scope` in `dispatch_wave`.
-        let write_scope: Vec<String> = t
-            .get("write_scope")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let write_scope = write_scope_of(t);
         parsed.push(ParsedTask {
             kind,
             task,
@@ -387,6 +391,21 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
 
 /// Un task del batch, parsato dall'input del tool. `write_scope` alimenta il gating
 /// dell'isolamento fisico (FASE 2).
+/// PUNTO UNICO (regola L) di estrazione del `write_scope` da un task del batch:
+/// lista di prefissi file dichiarati dal task; assente/non-array -> vuoto (il
+/// gating di isolamento degrada a sequenziale, ramo sicuro).
+fn write_scope_of(t: &Value) -> Vec<String> {
+    t.get("write_scope")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 struct ParsedTask {
     kind: String,
     task: String,
@@ -832,9 +851,59 @@ impl ParentNarrator {
             &self.store,
             nexus_agent_graph::runtime::ports::ExecMode::Real,
             kind,
+            Some(subagent_run_id.to_string()),
             title,
             payload,
-            Some(subagent_run_id.to_string()),
+        )
+        .await;
+    }
+
+    /// UN evento del sub-run sul ponte: memorizza il target dei ToolUse
+    /// `Running` e narra i tool CONCLUSI (`concluded_tool_step`, regola M).
+    /// Ritorna true se ha emesso un meta-step (azzera il silenzio heartbeat).
+    async fn bridge_step(
+        &self,
+        targets: &mut std::collections::HashMap<u32, String>,
+        ev: &crate::agent_types::AgentStepEvent,
+        sub_kind: &str,
+        sub_run_id: Uuid,
+    ) -> bool {
+        if let Some((idx, target)) = running_tool_target(ev) {
+            targets.insert(idx, target);
+        }
+        let Some((is_error, tool, idx)) = concluded_tool_step(ev) else {
+            return false;
+        };
+        let target = targets.remove(&idx);
+        let (title, payload) =
+            tool_progress_meta(sub_kind, sub_run_id, &tool, target.as_deref(), is_error);
+        self.say("subagent_progress", title, payload, sub_run_id).await;
+        true
+    }
+
+    /// Heartbeat "al lavoro" sul run padre, SOLO se il periodo e' trascorso in
+    /// silenzio (nessun progresso emesso dall'ultimo tick).
+    async fn maybe_heartbeat(
+        &self,
+        emitted_since_tick: bool,
+        sub_kind: &str,
+        sub_run_id: Uuid,
+        started: &std::time::Instant,
+    ) {
+        if emitted_since_tick {
+            return;
+        }
+        let elapsed = started.elapsed().as_secs();
+        self.say(
+            "subagent_progress",
+            format!("Subagente {sub_kind}: al lavoro da {elapsed}s"),
+            json!({
+                "phase": "working",
+                "elapsed_s": elapsed,
+                K_SUB_RUN_ID: sub_run_id.to_string(),
+                K_SUB_KIND: sub_kind,
+            }),
+            sub_run_id,
         )
         .await;
     }
@@ -893,10 +962,10 @@ fn tool_progress_meta(
     let payload = json!({
         "phase": "tool",
         "tool": tool,
-        "target": target,
-        "is_error": is_error,
-        "subagent_run_id": subagent_run_id.to_string(),
-        "subagent_kind": sub_kind,
+        K_TARGET: target,
+        K_IS_ERROR: is_error,
+        K_SUB_RUN_ID: subagent_run_id.to_string(),
+        K_SUB_KIND: sub_kind,
     });
     (title, payload)
 }
@@ -909,10 +978,11 @@ fn tool_progress_meta(
 fn spawn_narration_bridge(
     narrator: std::sync::Arc<ParentNarrator>,
     mut rx: tokio::sync::broadcast::Receiver<crate::agent_types::AgentStepEvent>,
-    subagent_run_id: Uuid,
+    sub_run_id: Uuid,
     sub_kind: String,
     heartbeat_s: i64,
 ) -> tokio::task::JoinHandle<()> {
+    use tokio::sync::broadcast::error::RecvError;
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let hb_enabled = heartbeat_s > 0;
@@ -928,48 +998,16 @@ fn spawn_narration_bridge(
         let mut emitted_since_tick = false;
         loop {
             tokio::select! {
-                ev = rx.recv() => match ev {
-                    Ok(ev) => {
-                        if let Some((idx, target)) = running_tool_target(&ev) {
-                            targets.insert(idx, target);
-                        }
-                        if let Some((is_error, tool, idx)) = concluded_tool_step(&ev) {
-                            let target = targets.remove(&idx);
-                            let (title, payload) = tool_progress_meta(
-                                &sub_kind,
-                                subagent_run_id,
-                                &tool,
-                                target.as_deref(),
-                                is_error,
-                            );
-                            narrator
-                                .say("subagent_progress", title, payload, subagent_run_id)
-                                .await;
-                            emitted_since_tick = true;
-                        }
-                    }
-                    // Lagged: il ponte e' narrazione best-effort, gli eventi
-                    // persi non fermano il run ne' il ponte.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                },
+                recv = rx.recv() => {
+                    // Canale chiuso = fine del sub-run. Lagged: il ponte e'
+                    // narrazione best-effort, gli eventi persi non lo fermano.
+                    if matches!(recv, Err(RecvError::Closed)) { break; }
+                    let Ok(ev) = recv else { continue };
+                    let said = narrator.bridge_step(&mut targets, &ev, &sub_kind, sub_run_id).await;
+                    emitted_since_tick = emitted_since_tick || said;
+                }
                 _ = tick.tick(), if hb_enabled => {
-                    if !emitted_since_tick {
-                        let elapsed = started.elapsed().as_secs();
-                        narrator
-                            .say(
-                                "subagent_progress",
-                                format!("Subagente {sub_kind}: al lavoro da {elapsed}s"),
-                                json!({
-                                    "phase": "working",
-                                    "elapsed_s": elapsed,
-                                    "subagent_run_id": subagent_run_id.to_string(),
-                                    "subagent_kind": sub_kind,
-                                }),
-                                subagent_run_id,
-                            )
-                            .await;
-                    }
+                    narrator.maybe_heartbeat(emitted_since_tick, &sub_kind, sub_run_id, &started).await;
                     emitted_since_tick = false;
                 }
             }
@@ -1068,27 +1106,7 @@ async fn run_single_subagent(
     }
     let tools_json = build_tools_json(&definition.tool_whitelist);
 
-    // Modello del worker dal model_purpose (regola G, tier-aware). Non risolto ->
-    // nessun override: l'executor usa il routing di default (parita' col brain).
-    let (provider, model) = if definition.model_purpose.trim().is_empty() {
-        (String::new(), String::new())
-    } else {
-        match crate::internal_routing::resolve_purpose_model_db(db, &definition.model_purpose).await
-        {
-            crate::internal_routing::PurposeResolution::Resolved {
-                provider, model, ..
-            } => (provider, model),
-            other => {
-                tracing::warn!(
-                    kind = %kind,
-                    model_purpose = %definition.model_purpose,
-                    resolution = ?other,
-                    "subagent_native: model_purpose non risolto, routing di default"
-                );
-                (String::new(), String::new())
-            }
-        }
-    };
+    let (provider, model) = resolve_worker_model(db, kind, &definition).await;
 
     let timeout_s = if definition.timeout_s > 0 {
         definition.timeout_s
@@ -1109,47 +1127,17 @@ async fn run_single_subagent(
 
     // ── Crea row in nexus_subagent_runs (status='running' subito: la catena depth
     //    si basa sui 'running'; il sub-run e' bloccante, non c'e' fase 'pending'
-    //    osservabile). Nel ramo ISOLATO l'id e' quello del worktree (allineamento
-    //    row DB <-> dir/branch) e persistiamo worktree_path/base_commit per
-    //    audit/reconcile; nel ramo sequenziale l'id lo genera il DB (DEFAULT). ─────
-    let insert_res = match isolation {
-        Some(slot) => sqlx::query_scalar::<_, Uuid>(
-            r#"INSERT INTO nexus_subagent_runs
-               (id, parent_run_id, project_id, kind, task_description, context_blob, expected_format,
-                status, is_background, depth, source, worktree_path, base_commit)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, 'running', false, $8, 'db', $9, $10)
-               RETURNING id"#,
-        )
-        .bind(slot.run_id)
-        .bind(anchor)
-        .bind(project_id)
-        .bind(kind)
-        .bind(task)
-        .bind(context_blob)
-        .bind(expected_format)
-        .bind(current_depth as i32)
-        .bind(slot.worktree_path.to_string_lossy().to_string())
-        .bind(&slot.base_commit)
-        .fetch_one(&proj_pool)
-        .await,
-        None => sqlx::query_scalar::<_, Uuid>(
-            r#"INSERT INTO nexus_subagent_runs
-               (parent_run_id, project_id, kind, task_description, context_blob, expected_format,
-                status, is_background, depth, source)
-               VALUES ($1, $2, $3, $4, $5, $6, 'running', false, $7, 'db')
-               RETURNING id"#,
-        )
-        .bind(anchor)
-        .bind(project_id)
-        .bind(kind)
-        .bind(task)
-        .bind(context_blob)
-        .bind(expected_format)
-        .bind(current_depth as i32)
-        .fetch_one(&proj_pool)
-        .await,
+    //    osservabile). ────────────────────────────────────────────────────────────
+    let insert = NewSubagentRun {
+        anchor,
+        project_id,
+        kind,
+        task,
+        context_blob,
+        expected_format,
+        depth: current_depth as i32,
     };
-    let subagent_run_id: Uuid = match insert_res {
+    let subagent_run_id: Uuid = match insert_subagent_run(&proj_pool, &insert, isolation).await {
         Ok(id) => id,
         Err(e) => return json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")}),
     };
@@ -1164,11 +1152,11 @@ async fn run_single_subagent(
             "subagent_started",
             format!("Subagente {kind} avviato — {task_head}"),
             json!({
-                "subagent_run_id": subagent_run_id.to_string(),
-                "subagent_kind": kind,
+                K_SUB_RUN_ID: subagent_run_id.to_string(),
+                K_SUB_KIND: kind,
                 "task": task_head,
                 "depth": current_depth,
-                "timeout_s": timeout_s,
+                K_TIMEOUT_S: timeout_s,
                 "isolated": isolation.is_some(),
             }),
             subagent_run_id,
@@ -1231,153 +1219,228 @@ async fn run_single_subagent(
     };
 
     // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).
+    // In OGNI ramo il ponte e' fermato e ATTESO (`stop_bridge`) prima del meta-step
+    // di chiusura: senza l'await, abort() e' cooperativo (cancella al prossimo poll)
+    // e un progress/heartbeat gia' dentro persist_meta_step potrebbe ottenere un
+    // NOW() > del completed -> ordine invertito nella timeline storica (ordinata
+    // per created_at). L'await del handle garantisce che nessuna INSERT del ponte
+    // segua quella di chiusura (race chiusa alla radice, regola H).
     let run_fut = crate::native_engine::run_native(&deps, &native_input);
     let outcome: anyhow::Result<NativeRunOutcome> =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await {
             Ok(res) => res,
             Err(_) => {
-                // Ponte fermato e ATTESO prima del meta-step di chiusura: senza
-                // l'await, abort() e' cooperativo (cancella al prossimo poll) e
-                // un progress/heartbeat gia' dentro persist_meta_step potrebbe
-                // ottenere un NOW() > del completed -> ordine invertito nella
-                // timeline storica (ordinata per created_at). L'await del handle
-                // garantisce che nessuna INSERT del ponte segua quella di
-                // chiusura (race chiusa alla radice, regola H).
-                if let Some(b) = bridge {
-                    b.abort();
-                    let _ = b.await;
-                }
-                let _ = mark_run(
-                    &proj_pool,
-                    subagent_run_id,
-                    "timeout",
-                    "[Sub-agent timeout]",
-                    0,
-                    0,
-                    0,
-                    0.0,
-                )
-                .await;
-                if let Some(n) = &narrator {
-                    n.say(
-                        "subagent_failed",
-                        format!("Subagente {kind} in timeout dopo {timeout_s}s"),
-                        json!({
-                            "subagent_run_id": subagent_run_id.to_string(),
-                            "subagent_kind": kind,
-                            "status": "timeout",
-                            "timeout_s": timeout_s,
-                        }),
-                        subagent_run_id,
-                    )
-                    .await;
-                }
-                return json!({
-                    "subagent_run_id": subagent_run_id.to_string(),
-                    "kind": kind,
-                    "status": "timeout",
-                    "error": "[Sub-agent timeout]",
-                });
+                stop_bridge(bridge).await;
+                return finalize_timeout(&proj_pool, narrator.as_deref(), subagent_run_id, kind, timeout_s).await;
             }
         };
+    stop_bridge(bridge).await;
 
-    // Ponte fermato e ATTESO prima del meta-step di chiusura (entrambi i rami):
-    // l'await del handle chiude la race abort-cooperativo/INSERT-in-volo, cosi'
-    // nessun progress puo' persistere dopo il completed/failed (regola H).
+    match outcome {
+        Ok(o) => {
+            finalize_success(&proj_pool, narrator.as_deref(), subagent_run_id, kind, current_depth, &o)
+                .await
+        }
+        Err(e) => finalize_failure(&proj_pool, narrator.as_deref(), subagent_run_id, kind, &e).await,
+    }
+}
+
+/// Modello del worker dal `model_purpose` della definition (regola G,
+/// tier-aware). Non risolto -> nessun override: l'executor usa il routing di
+/// default (parita' col brain).
+async fn resolve_worker_model(
+    db: &sqlx::PgPool,
+    kind: &str,
+    definition: &SubagentDefinition,
+) -> (String, String) {
+    if definition.model_purpose.trim().is_empty() {
+        return (String::new(), String::new());
+    }
+    match crate::internal_routing::resolve_purpose_model_db(db, &definition.model_purpose).await {
+        crate::internal_routing::PurposeResolution::Resolved {
+            provider, model, ..
+        } => (provider, model),
+        other => {
+            tracing::warn!(
+                kind = %kind,
+                model_purpose = %definition.model_purpose,
+                resolution = ?other,
+                "subagent_native: model_purpose non risolto, routing di default"
+            );
+            (String::new(), String::new())
+        }
+    }
+}
+
+/// Campi comuni della riga `nexus_subagent_runs` (i rami isolato/sequenziale
+/// differiscono solo per id/worktree, portati da `IsolationSlot`).
+struct NewSubagentRun<'a> {
+    anchor: Uuid,
+    project_id: Uuid,
+    kind: &'a str,
+    task: &'a str,
+    context_blob: &'a str,
+    expected_format: &'a str,
+    depth: i32,
+}
+
+/// INSERT della riga sub-run, query UNICA per i due rami. Ramo ISOLATO
+/// (`slot` presente): id = run_id del worktree (allineamento row DB <->
+/// dir/branch) + persistenza worktree_path/base_commit per audit/reconcile.
+/// Ramo sequenziale: id generato dal DB (`COALESCE(NULL, gen_random_uuid())` =
+/// stesso DEFAULT della tabella, mig 0151) e colonne worktree NULL (parita'
+/// con l'INSERT storico che non le elencava, mig project 0005 senza default).
+async fn insert_subagent_run(
+    pool: &sqlx::PgPool,
+    row: &NewSubagentRun<'_>,
+    slot: Option<&IsolationSlot>,
+) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO nexus_subagent_runs
+           (id, parent_run_id, project_id, kind, task_description, context_blob, expected_format,
+            status, is_background, depth, source, worktree_path, base_commit)
+           VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7,
+                   'running', false, $8, 'db', $9, $10)
+           RETURNING id"#,
+    )
+    .bind(slot.map(|s| s.run_id))
+    .bind(row.anchor)
+    .bind(row.project_id)
+    .bind(row.kind)
+    .bind(row.task)
+    .bind(row.context_blob)
+    .bind(row.expected_format)
+    .bind(row.depth)
+    .bind(slot.map(|s| s.worktree_path.to_string_lossy().to_string()))
+    .bind(slot.map(|s| s.base_commit.as_str()))
+    .fetch_one(pool)
+    .await
+}
+
+/// Ferma il ponte narrazione e ATTENDE che sia davvero finito (vedi commento
+/// sul timeout in `run_single_subagent`: chiude la race abort/INSERT-in-volo).
+async fn stop_bridge(bridge: Option<tokio::task::JoinHandle<()>>) {
     if let Some(b) = bridge {
         b.abort();
         let _ = b.await;
     }
+}
 
-    match outcome {
-        Ok(o) => {
-            let summary = o.final_answer.clone().unwrap_or_default();
-            let status = if o.completed { "completed" } else { "paused" };
-            let _ = mark_run(
-                &proj_pool,
-                subagent_run_id,
-                status,
-                &summary,
-                o.iterations,
-                o.prompt_tokens,
-                o.completion_tokens,
-                o.total_cost,
-            )
-            .await;
-            tracing::info!(
-                kind = %kind,
-                subagent_run_id = %subagent_run_id,
-                depth = current_depth,
-                completed = o.completed,
-                iterations = o.iterations,
-                summary_len = summary.len(),
-                "subagent_native: sub-run eseguito sul grafo nativo"
-            );
-            if let Some(n) = &narrator {
-                let title = if o.completed {
-                    format!("Subagente {kind} completato ({} iterazioni)", o.iterations)
-                } else {
-                    format!("Subagente {kind} in pausa ({} iterazioni)", o.iterations)
-                };
-                n.say(
-                    "subagent_completed",
-                    title,
-                    json!({
-                        "subagent_run_id": subagent_run_id.to_string(),
-                        "subagent_kind": kind,
-                        "status": status,
-                        "summary": compact_summary(&summary),
-                        "iterations": o.iterations,
-                        "cost_usd": o.total_cost,
-                    }),
-                    subagent_run_id,
-                )
-                .await;
-            }
+/// Chiusura del sub-run in TIMEOUT: mark_run + narrazione + tool_result.
+async fn finalize_timeout(
+    pool: &sqlx::PgPool,
+    narrator: Option<&ParentNarrator>,
+    sub_run_id: Uuid,
+    kind: &str,
+    timeout_s: i64,
+) -> Value {
+    let _ = mark_run(pool, sub_run_id, "timeout", "[Sub-agent timeout]", 0, 0, 0, 0.0).await;
+    if let Some(n) = narrator {
+        n.say(
+            "subagent_failed",
+            format!("Subagente {kind} in timeout dopo {timeout_s}s"),
             json!({
-                "subagent_run_id": subagent_run_id.to_string(),
-                "kind": kind,
+                K_SUB_RUN_ID: sub_run_id.to_string(),
+                K_SUB_KIND: kind,
+                "status": "timeout",
+                K_TIMEOUT_S: timeout_s,
+            }),
+            sub_run_id,
+        )
+        .await;
+    }
+    json!({
+        K_SUB_RUN_ID: sub_run_id.to_string(),
+        "kind": kind,
+        "status": "timeout",
+        "error": "[Sub-agent timeout]",
+    })
+}
+
+/// Chiusura del ramo OK del sub-run: mark_run + log + narrazione + tool_result
+/// (il main riceve SOLO questo summary, non l'intera conversazione del figlio).
+async fn finalize_success(
+    pool: &sqlx::PgPool, narrator: Option<&ParentNarrator>,
+    sub_run_id: Uuid, kind: &str, depth: i64, o: &NativeRunOutcome,
+) -> Value {
+    let summary = o.final_answer.clone().unwrap_or_default();
+    let status = if o.completed { "completed" } else { "paused" };
+    let _ = mark_run(
+        pool, sub_run_id, status, &summary,
+        o.iterations, o.prompt_tokens, o.completion_tokens, o.total_cost,
+    ).await;
+    tracing::info!(
+        kind = %kind,
+        subagent_run_id = %sub_run_id,
+        depth,
+        completed = o.completed,
+        iterations = o.iterations,
+        summary_len = summary.len(),
+        "subagent_native: sub-run eseguito sul grafo nativo"
+    );
+    if let Some(n) = narrator {
+        let esito = if o.completed { "completato" } else { "in pausa" };
+        n.say(
+            "subagent_completed",
+            format!("Subagente {kind} {esito} ({} iterazioni)", o.iterations),
+            json!({
+                K_SUB_RUN_ID: sub_run_id.to_string(),
+                K_SUB_KIND: kind,
                 "status": status,
-                "summary": compact_summary(&summary),
+                K_SUMMARY: compact_summary(&summary),
                 "iterations": o.iterations,
                 "cost_usd": o.total_cost,
-                "tokens": {
-                    "prompt": o.prompt_tokens,
-                    "completion": o.completion_tokens,
-                },
-            })
-        }
-        Err(e) => {
-            // Fallback onesto: sub-run fallito -> errore al chiamante (come oggi).
-            let msg = format!("[errore grafo nativo: {e}]");
-            let _ = mark_run(&proj_pool, subagent_run_id, "failed", &msg, 0, 0, 0, 0.0).await;
-            tracing::warn!(
-                kind = %kind,
-                subagent_run_id = %subagent_run_id,
-                error = %e,
-                "subagent_native: sub-run fallito"
-            );
-            if let Some(n) = &narrator {
-                n.say(
-                    "subagent_failed",
-                    format!("Subagente {kind} fallito"),
-                    json!({
-                        "subagent_run_id": subagent_run_id.to_string(),
-                        "subagent_kind": kind,
-                        "status": "failed",
-                        "error": compact_summary(&msg),
-                    }),
-                    subagent_run_id,
-                )
-                .await;
-            }
-            json!({
-                "error": msg,
-                "subagent_run_id": subagent_run_id.to_string(),
-                "kind": kind,
-            })
-        }
+            }),
+            sub_run_id,
+        )
+        .await;
     }
+    json!({
+        K_SUB_RUN_ID: sub_run_id.to_string(),
+        "kind": kind,
+        "status": status,
+        K_SUMMARY: compact_summary(&summary),
+        "iterations": o.iterations,
+        "cost_usd": o.total_cost,
+        "tokens": { "prompt": o.prompt_tokens, "completion": o.completion_tokens },
+    })
+}
+
+/// Chiusura del ramo ERRORE del sub-run (fallback onesto: errore al chiamante).
+async fn finalize_failure(
+    pool: &sqlx::PgPool,
+    narrator: Option<&ParentNarrator>,
+    sub_run_id: Uuid,
+    kind: &str,
+    e: &anyhow::Error,
+) -> Value {
+    let msg = format!("[errore grafo nativo: {e}]");
+    let _ = mark_run(pool, sub_run_id, "failed", &msg, 0, 0, 0, 0.0).await;
+    tracing::warn!(
+        kind = %kind,
+        subagent_run_id = %sub_run_id,
+        error = %e,
+        "subagent_native: sub-run fallito"
+    );
+    if let Some(n) = narrator {
+        n.say(
+            "subagent_failed",
+            format!("Subagente {kind} fallito"),
+            json!({
+                K_SUB_RUN_ID: sub_run_id.to_string(),
+                K_SUB_KIND: kind,
+                "status": "failed",
+                "error": compact_summary(&msg),
+            }),
+            sub_run_id,
+        )
+        .await;
+    }
+    json!({
+        "error": msg,
+        K_SUB_RUN_ID: sub_run_id.to_string(),
+        "kind": kind,
+    })
 }
 
 /// Marca una sub-run come conclusa (status + summary + metriche). Best-effort.
@@ -1450,7 +1513,7 @@ async fn build_native_deps_for_tool(ctx: &AgentToolContext) -> NativeDeps {
 /// `nexus_subagent_poll` — stato di una sub-run da `nexus_subagent_runs` (DB-only,
 /// niente brain). Il main lo usa per i kind background.
 pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> String {
-    let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
+    let run_id = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
             return "\u{274C} [nexus_subagent_poll] parametro 'subagent_run_id' obbligatorio"
@@ -1471,7 +1534,7 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
     .await;
     match row {
         Ok(Some(r)) => json!({
-            "subagent_run_id": r.try_get::<String, _>("id").unwrap_or_default(),
+            K_SUB_RUN_ID: r.try_get::<String, _>("id").unwrap_or_default(),
             "status": r.try_get::<String, _>("status").unwrap_or_default(),
             "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
             "summary": r.try_get::<Option<String>, _>("final_summary").unwrap_or(None),
@@ -1497,7 +1560,7 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
 /// su `nexus_graph_checkpoints`, ma la ripresa nativa qui ri-esegue il sub-run dal
 /// suo `run_id`: la stessa thread del grafo riprende dal checkpoint persistente).
 pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -> String {
-    let run_id_str = match input.get("subagent_run_id").and_then(Value::as_str) {
+    let run_id_str = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
             return "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"
@@ -1531,7 +1594,7 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     };
     let status: String = row.get("status");
     if !matches!(status.as_str(), "paused" | "running" | "timeout") {
-        return json!({"status": "noop", "subagent_run_id": run_id_str, "current_status": status})
+        return json!({"status": "noop", K_SUB_RUN_ID: run_id_str, "current_status": status})
             .to_string();
     }
     let kind: String = row.get("kind");
@@ -1558,6 +1621,11 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Nomi fixture ricorrenti dei test del ponte narrazione.
+    const T_EDIT: &str = "edit_file";
+    const T_RUN: &str = "run_command";
+    const FIX_PATH: &str = "src/a.rs";
 
     #[test]
     fn err_ha_marker_errore() {
@@ -1715,11 +1783,8 @@ mod tests {
             concluded_tool_step(&ok),
             Some((false, "read_file".to_string(), 3))
         );
-        let ko = step_event(S::Failed, "run_command", 5, json!({}));
-        assert_eq!(
-            concluded_tool_step(&ko),
-            Some((true, "run_command".to_string(), 5))
-        );
+        let ko = step_event(S::Failed, T_RUN, 5, json!({}));
+        assert_eq!(concluded_tool_step(&ko), Some((true, T_RUN.to_string(), 5)));
         let running = step_event(S::Running, "read_file", 1, json!({}));
         assert_eq!(concluded_tool_step(&running), None, "Running: doppione");
         let orfano = step_event(S::Completed, "", 2, json!({}));
@@ -1743,13 +1808,13 @@ mod tests {
         use crate::agent_types::AgentStepStatus as S;
         let ev = step_event(
             S::Running,
-            "edit_file",
+            T_EDIT,
             7,
-            json!({"id": "tu_1", "input": {"path": "src/a.rs"}}),
+            json!({"id": "tu_1", "input": {"path": FIX_PATH}}),
         );
-        assert_eq!(running_tool_target(&ev), Some((7, "src/a.rs".to_string())));
+        assert_eq!(running_tool_target(&ev), Some((7, FIX_PATH.to_string())));
         // Il Completed non porta l'input reale: nessun target da qui.
-        let done = step_event(S::Completed, "edit_file", 7, json!({"id": "tu_1"}));
+        let done = step_event(S::Completed, T_EDIT, 7, json!({"id": "tu_1"}));
         assert_eq!(running_tool_target(&done), None);
     }
 
@@ -1758,25 +1823,23 @@ mod tests {
     #[test]
     fn tool_progress_meta_compone_titolo_e_payload() {
         let id = Uuid::nil();
-        let (title, payload) =
-            tool_progress_meta("coder", id, "edit_file", Some("src/a.rs"), false);
+        let (title, payload) = tool_progress_meta("coder", id, T_EDIT, Some(FIX_PATH), false);
         assert_eq!(title, "subagente coder: tool edit_file — src/a.rs");
         assert_eq!(payload["phase"], json!("tool"));
-        assert_eq!(payload["tool"], json!("edit_file"));
-        assert_eq!(payload["target"], json!("src/a.rs"));
-        assert_eq!(payload["is_error"], json!(false));
-        assert_eq!(payload["subagent_kind"], json!("coder"));
-        assert_eq!(payload["subagent_run_id"], json!(id.to_string()));
+        assert_eq!(payload["tool"], json!(T_EDIT));
+        assert_eq!(payload[K_TARGET], json!(FIX_PATH));
+        assert_eq!(payload[K_IS_ERROR], json!(false));
+        assert_eq!(payload[K_SUB_KIND], json!("coder"));
+        assert_eq!(payload[K_SUB_RUN_ID], json!(id.to_string()));
 
-        let (title_err, payload_err) =
-            tool_progress_meta("tester", id, "run_command", None, true);
+        let (title_err, payload_err) = tool_progress_meta("tester", id, T_RUN, None, true);
         assert_eq!(title_err, "subagente tester: errore run_command");
-        assert_eq!(payload_err["is_error"], json!(true));
-        assert_eq!(payload_err["target"], json!(null));
+        assert_eq!(payload_err[K_IS_ERROR], json!(true));
+        assert_eq!(payload_err[K_TARGET], json!(null));
     }
 
-    /// Il parse dei task del batch estrae `write_scope` dal JSON (alimenta il
-    /// gating). Verifica la forma del Value costruito da `dispatch_wave`.
+    /// Il parse dei task del batch estrae `write_scope` dal JSON col punto
+    /// unico `write_scope_of` (alimenta il gating di isolamento).
     #[test]
     fn write_scope_parsato_dal_task_json() {
         let t = json!({
@@ -1784,31 +1847,75 @@ mod tests {
             "task": "x",
             "write_scope": ["crates/a", "docs/a.md"],
         });
-        let ws: Vec<String> = t
-            .get("write_scope")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert_eq!(ws, sc(&["crates/a", "docs/a.md"]));
+        assert_eq!(write_scope_of(&t), sc(&["crates/a", "docs/a.md"]));
 
         // Task senza write_scope -> vec vuoto -> gating degrada a sequenziale.
-        let t2 = json!({ "kind": "coder", "task": "y" });
-        let ws2: Vec<String> = t2
-            .get("write_scope")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let ws2 = write_scope_of(&json!({ "kind": "coder", "task": "y" }));
         assert!(ws2.is_empty());
         assert!(!should_isolate_batch(true, &[ws2]));
+    }
+
+    /// Tabella minima per i test di `insert_subagent_run` (colonne toccate
+    /// dall'INSERT; `id` col DEFAULT reale della mig 0151, worktree senza default
+    /// come la mig project 0005).
+    async fn create_subagent_runs_min(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_subagent_runs ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 parent_run_id UUID NOT NULL, project_id UUID NOT NULL, \
+                 kind TEXT NOT NULL, task_description TEXT NOT NULL, \
+                 context_blob TEXT, expected_format TEXT, status TEXT NOT NULL, \
+                 is_background BOOLEAN NOT NULL DEFAULT false, \
+                 depth INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL DEFAULT 'db', \
+                 worktree_path TEXT, base_commit TEXT )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_subagent_runs");
+    }
+
+    async fn fetch_worktree_cols(pool: &sqlx::PgPool, id: Uuid) -> (Option<String>, Option<String>) {
+        sqlx::query_as("SELECT worktree_path, base_commit FROM nexus_subagent_runs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch cols")
+    }
+
+    /// `insert_subagent_run` (query UNICA con COALESCE) deve produrre lo STESSO
+    /// esito dei due INSERT storici, blindando il refactor di de-duplicazione
+    /// (regola H): ramo sequenziale -> id generato dal DB (DEFAULT) + colonne
+    /// worktree NULL; ramo isolato -> id = run_id del worktree + worktree_path/
+    /// base_commit persistiti.
+    #[sqlx::test]
+    async fn insert_subagent_run_equivalenza_rami(pool: sqlx::PgPool) {
+        create_subagent_runs_min(&pool).await;
+        let row = NewSubagentRun {
+            anchor: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            kind: "coder",
+            task: "t",
+            context_blob: "",
+            expected_format: "",
+            depth: 1,
+        };
+
+        // Ramo sequenziale: id dal DB (non nil), colonne worktree NULL.
+        let seq_id = insert_subagent_run(&pool, &row, None).await.expect("insert seq");
+        assert!(!seq_id.is_nil(), "id generato dal DB non nullo");
+        assert_eq!(fetch_worktree_cols(&pool, seq_id).await, (None, None));
+
+        // Ramo isolato: id = run_id del worktree, colonne worktree persistite.
+        let slot = IsolationSlot {
+            run_id: Uuid::new_v4(),
+            worktree_path: std::path::PathBuf::from("/tmp/wt"),
+            base_commit: "abc123".to_string(),
+        };
+        let iso_id = insert_subagent_run(&pool, &row, Some(&slot)).await.expect("insert iso");
+        assert_eq!(iso_id, slot.run_id, "ramo isolato: id = run_id del worktree");
+        assert_eq!(
+            fetch_worktree_cols(&pool, iso_id).await,
+            (Some(slot.worktree_path.to_string_lossy().to_string()), Some(slot.base_commit)),
+        );
     }
 }
