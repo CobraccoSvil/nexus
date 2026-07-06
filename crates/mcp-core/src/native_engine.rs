@@ -365,6 +365,13 @@ pub struct NativeRunOutcome {
     /// partial -> FailedDiagnosed); il summary e' testo umano di display.
     /// `None` se il modello non ha dichiarato.
     pub declared_outcome: Option<serde_json::Value>,
+    /// Verdetto strutturato del REVISORE via tool `review_verdict` (Fase B
+    /// ultracode, campo `review_verdict` dello stato): dict normalizzato
+    /// {verdict, summary, findings[]} o `None` se il run non era una review o
+    /// il revisore non ha dichiarato. Viaggia oltre il confine sub-run dentro
+    /// [`Self::structured_verdict`] (campo `review`) cosi' un coordinatore
+    /// compone i verdetti dei giudici senza parsare prosa (regola M).
+    pub review_verdict: Option<serde_json::Value>,
     /// Classe d'errore STRUTTURATA del run (`extra.error_class` dello stato, es.
     /// `context_overflow` — ADR 0016 D2): segnale MACCHINA per il finalizzatore
     /// (regola M: mai dedotta dal testo). `None` se il run non ha classificato.
@@ -514,6 +521,9 @@ impl NativeRunOutcome {
             "verdict": status.as_str(),
             "success": status.is_success(),
             "declared": self.declared_outcome,
+            // Verdetto del REVISORE (Fase B ultracode): presente solo nei run
+            // di review col tool `review_verdict` whitelistato; `null` altrove.
+            "review": self.review_verdict,
             "final_gate_passed": self.final_gate_passed,
             "final_gate_unverified": self.final_gate_unverified,
             "final_gate_failed_pending": self.final_gate_failed_pending,
@@ -1938,6 +1948,7 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             serde_json::to_string(&state.messages).ok()
         },
         declared_outcome: state.declared_outcome.clone(),
+        review_verdict: state.review_verdict.clone(),
         error_class: state
             .extra
             .get("error_class")
@@ -3288,6 +3299,7 @@ mod tests {
             reasoning: None,
             messages_json: None,
             declared_outcome: None,
+            review_verdict: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,
@@ -3395,7 +3407,22 @@ mod tests {
         assert_eq!(v["verdict"], serde_json::json!("completed"));
         assert_eq!(v["success"], serde_json::json!(true));
         assert_eq!(v["declared"], serde_json::Value::Null);
+        assert_eq!(v["review"], serde_json::Value::Null);
         assert_eq!(v["final_gate_passed"], serde_json::Value::Null);
+
+        // Fase B: il verdetto del REVISORE attraversa il confine dentro il
+        // blocco (campo `review`), indipendente dallo status lifecycle.
+        let reviewer = NativeRunOutcome {
+            review_verdict: Some(serde_json::json!({
+                "verdict": "needs_changes",
+                "summary": "un fix richiesto",
+                "findings": [{"file": "a.rs", "severity": "media", "description": "bug"}]
+            })),
+            ..base_outcome()
+        };
+        let vr = reviewer.structured_verdict();
+        assert_eq!(vr["review"]["verdict"], serde_json::json!("needs_changes"));
+        assert_eq!(vr["review"]["findings"][0]["file"], serde_json::json!("a.rs"));
 
         // Gate fallito + dichiarazione "done" ottimista: il verdetto oggettivo
         // prevale (failed_diagnosed) e l'error_class strutturata viaggia col blocco.

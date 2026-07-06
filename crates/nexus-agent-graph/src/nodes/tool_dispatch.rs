@@ -97,6 +97,7 @@ use crate::decisions::predictive_cap::{is_cap_exempt, predictive_cap_check, PRED
 use crate::decisions::tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
     estimate_tool_result_size_bytes, extract_returned_bytes, normalize_declared_outcome,
+    normalize_review_verdict,
     ContextMessage,
 };
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
@@ -118,13 +119,25 @@ const TASK_COMPLETE_TOOL_NAME: &str = "task_complete";
 /// aggiorna il taccuino del run nello stato, non eseguito via ToolExecutor.
 const RUN_NOTES_TOOL_NAME: &str = "nexus_run_notes";
 
+/// Tool brain-only `review_verdict` (Fase B ultracode): il REVISORE dichiara il
+/// verdetto strutturato della review (gemello di `task_complete` per il canale
+/// del giudice). Non eseguito via ToolExecutor; registrato nello stato e
+/// propagato oltre il confine sub-run via `structured_verdict` (regola M).
+const REVIEW_VERDICT_TOOL_NAME: &str = "review_verdict";
+
 /// Tool di lettura allegato soggetti al budget cumulativo della sessione
 /// (`_ATTACHMENT_READ_TOOLS`, helpers.py:3647).
 const ATTACHMENT_READ_TOOLS: &[&str] = &["nexus_read_attachment", "nexus_read_archive_entry"];
 
 /// Tool brain-only sempre ammessi da M16 oltre la whitelist DB (Python:
-/// `{TASK_COMPLETE_TOOL_NAME, RUN_NOTES_TOOL_NAME}`).
-const M16_BRAIN_TOOLS: &[&str] = &[TASK_COMPLETE_TOOL_NAME, RUN_NOTES_TOOL_NAME];
+/// `{TASK_COMPLETE_TOOL_NAME, RUN_NOTES_TOOL_NAME}`; `review_verdict` aggiunto
+/// in Fase B: e' nel catalogo SOLO per i kind che lo whitelistano, ma quando
+/// c'e' M16 non deve mai filtrarlo — e' il canale di chiusura del revisore).
+const M16_BRAIN_TOOLS: &[&str] = &[
+    TASK_COMPLETE_TOOL_NAME,
+    RUN_NOTES_TOOL_NAME,
+    REVIEW_VERDICT_TOOL_NAME,
+];
 
 /// Config DB-driven del nodo tool_dispatch, PASSATA (regola G: nessuna lettura
 /// DB nel nodo, nessun fallback hardcoded nella logica decisionale).
@@ -379,6 +392,32 @@ impl ToolDispatchNode {
             };
         }
 
+        // ── review_verdict (brain-only, Fase B ultracode) ─────────────────────
+        if name == REVIEW_VERDICT_TOOL_NAME {
+            let decl = normalize_review_verdict(&input);
+            let verdict = decl
+                .as_ref()
+                .and_then(|d| d.get("verdict").cloned())
+                .unwrap_or(Value::Null);
+            let acknowledged = decl.is_some();
+            if let Some(d) = decl {
+                collector
+                    .review_verdicts
+                    .lock()
+                    .expect("lock review verdicts")
+                    .push(d);
+            }
+            return ToolResultBlock {
+                tool_use_id,
+                content: Value::String(py_dumps(
+                    &json!({"acknowledged": acknowledged, "verdict": verdict}),
+                )),
+                is_error: !acknowledged,
+                exit_code: None,
+                raw_content: None,
+            };
+        }
+
         // ── tool generico via ToolExecutor ────────────────────────────────────
         let call = ToolCall {
             id: tool_use_id.clone(),
@@ -430,6 +469,8 @@ impl ToolDispatchNode {
 struct RunCollector {
     /// Esiti dichiarati via task_complete (l'ultimo prevale).
     declared_outcomes: std::sync::Mutex<Vec<Value>>,
+    /// Verdetti dichiarati via review_verdict (l'ultimo prevale, Fase B).
+    review_verdicts: std::sync::Mutex<Vec<Value>>,
     /// tool_use_id dei task_complete del turno (guard blocked-da-cap).
     task_complete_ids: std::sync::Mutex<Vec<String>>,
     /// Taccuino del run (holder mutabile, P4). Inizializzato al valore di stato.
@@ -629,6 +670,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
 
         // ── (7) Guard blocked-da-cap (py:3924-3953) ───────────────────────────
         let declared_outcomes = collector.declared_outcomes.into_inner().expect("outcomes");
+        let review_verdicts = collector.review_verdicts.into_inner().expect("review verdicts");
         let task_complete_ids = collector.task_complete_ids.into_inner().expect("tc ids");
         let infra_error = collector.infra_error.into_inner().expect("infra");
         let final_run_notes = collector.run_notes.into_inner().expect("run_notes");
@@ -869,6 +911,15 @@ dell'utente.";
             // (il finalizzatore legge l'ULTIMA dichiarazione dallo stato).
             // `declared_done_count` resta cumulativo (gate done>=3 in testa).
             delta.declared_outcome = Some(None);
+        }
+
+        // Fase B (ultracode): verdetto del REVISORE — stessa semantica ADR 0034
+        // dell'esito dichiarato (l'ultimo prevale; se il run prosegue con altri
+        // tool dopo un verdetto, quel verdetto era intermedio e viene azzerato).
+        if let Some(last) = review_verdicts.last() {
+            delta.review_verdict = Some(Some(last.clone()));
+        } else if state.review_verdict.is_some() {
+            delta.review_verdict = Some(None);
         }
 
         // WAVE 2.2: errore infrastruttura tool (mcp-core NON scala i provider).

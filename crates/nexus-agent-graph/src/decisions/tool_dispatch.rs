@@ -178,6 +178,99 @@ pub fn normalize_declared_outcome(tool_input: &Value) -> Option<Value> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+//  normalize_review_verdict (review_verdict, Fase B ultracode)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Verdetti validi dichiarabili via `review_verdict` (segnale ENUM, regola M:
+/// mai dedotto dalla prosa della review).
+pub const VALID_REVIEW_VERDICTS: &[&str] = &["pass", "fail", "needs_changes"];
+
+/// Severita' valide di un finding. Fuori enum -> default `media` (il finding
+/// resta: la severita' e' un attributo, non un gate di validita').
+pub const VALID_FINDING_SEVERITIES: &[&str] = &["alta", "media", "bassa"];
+
+/// Cap sul numero di findings accettati (stesso razionale di
+/// [`FILES_TOUCHED_CAP`]: self-report bounded, mai illimitato).
+const FINDINGS_CAP: usize = 50;
+
+/// Valida/normalizza l'input di `review_verdict` (gemello di
+/// [`normalize_declared_outcome`] per il canale del REVISORE, Fase B ultracode).
+/// `None` se invalido (verdict fuori enum, input non-oggetto, oppure
+/// fail/needs_changes SENZA alcun finding valido: un verdetto negativo senza
+/// evidenza non e' componibile da un coordinatore e va rifiutato alla fonte).
+///
+/// L'output mantiene SEMPRE `verdict` e `summary` (anche vuoto); `findings` e'
+/// incluso solo se non vuoto dopo la sanificazione: ogni finding richiede
+/// `file` e `description` non vuoti, `severity` fuori enum ricade su `media`,
+/// `line` e' incluso solo se intero positivo. Cap [`FINDINGS_CAP`].
+pub fn normalize_review_verdict(tool_input: &Value) -> Option<Value> {
+    let obj = tool_input.as_object()?;
+    let verdict = obj
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !VALID_REVIEW_VERDICTS.contains(&verdict.as_str()) {
+        return None;
+    }
+    let summary = obj
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let findings: Vec<Value> = obj
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    let fo = f.as_object()?;
+                    let file = fo.get("file").and_then(Value::as_str)?.trim();
+                    let description = fo.get("description").and_then(Value::as_str)?.trim();
+                    if file.is_empty() || description.is_empty() {
+                        return None;
+                    }
+                    let severity = fo
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| VALID_FINDING_SEVERITIES.contains(&s.as_str()))
+                        .unwrap_or_else(|| "media".to_string());
+                    let mut out = serde_json::Map::new();
+                    out.insert("file".to_string(), Value::String(file.to_string()));
+                    if let Some(line) = fo.get("line").and_then(Value::as_i64) {
+                        if line > 0 {
+                            out.insert("line".to_string(), Value::from(line));
+                        }
+                    }
+                    out.insert("severity".to_string(), Value::String(severity));
+                    out.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+                    Some(Value::Object(out))
+                })
+                .take(FINDINGS_CAP)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Verdetto negativo senza evidenza: rifiutato alla fonte (regola M — il
+    // coordinatore non deve mai dover "credere" a un fail senza findings).
+    if verdict != "pass" && findings.is_empty() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("verdict".to_string(), Value::String(verdict));
+    out.insert("summary".to_string(), Value::String(summary));
+    if !findings.is_empty() {
+        out.insert("findings".to_string(), Value::Array(findings));
+    }
+    Some(Value::Object(out))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 //  estimate_tool_result_size_bytes (upper-bound per-tool)
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -519,6 +612,75 @@ mod tests {
         assert!(out.get("blocker").is_none());
         assert!(out.get("refusal").is_none());
         assert!(out.get("files_touched").is_none());
+    }
+
+    #[test]
+    fn normalize_review_verdict_pass_e_needs_changes() {
+        // pass senza findings: valido (nessun difetto trovato).
+        let pass = normalize_review_verdict(&json!({
+            "verdict": " PASS ",
+            "summary": "  tutto ok  "
+        }))
+        .unwrap();
+        assert_eq!(pass["verdict"], json!("pass"));
+        assert_eq!(pass["summary"], json!("tutto ok"));
+        assert!(pass.get("findings").is_none());
+
+        // needs_changes con finding completo: severita' normalizzata, line inclusa.
+        let nc = normalize_review_verdict(&json!({
+            "verdict": "needs_changes",
+            "summary": "un fix",
+            "findings": [{
+                "file": " src/a.rs ",
+                "line": 42,
+                "severity": "ALTA",
+                "description": " off-by-one nel cap "
+            }]
+        }))
+        .unwrap();
+        assert_eq!(nc["verdict"], json!("needs_changes"));
+        let f = &nc["findings"][0];
+        assert_eq!(f["file"], json!("src/a.rs"));
+        assert_eq!(f["line"], json!(42));
+        assert_eq!(f["severity"], json!("alta"));
+        assert_eq!(f["description"], json!("off-by-one nel cap"));
+    }
+
+    #[test]
+    fn normalize_review_verdict_invalidi() {
+        // verdict fuori enum -> None.
+        assert!(normalize_review_verdict(&json!({"verdict": "boh", "summary": "x"})).is_none());
+        // input non-oggetto -> None.
+        assert!(normalize_review_verdict(&json!("fail")).is_none());
+        // fail SENZA findings validi -> None (verdetto negativo senza evidenza).
+        assert!(normalize_review_verdict(&json!({"verdict": "fail", "summary": "brutto"}))
+            .is_none());
+        // fail con findings tutti invalidi (file/description vuoti) -> None.
+        assert!(normalize_review_verdict(&json!({
+            "verdict": "fail",
+            "summary": "brutto",
+            "findings": [{"file": "", "description": "x"}, {"file": "a.rs", "description": ""}]
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn normalize_review_verdict_sanifica_findings() {
+        // severita' fuori enum -> media; line non positiva -> assente; finding
+        // senza file -> scartato (il valido resta).
+        let out = normalize_review_verdict(&json!({
+            "verdict": "fail",
+            "summary": "difetti",
+            "findings": [
+                {"file": "a.rs", "line": 0, "severity": "critica", "description": "bug"},
+                {"description": "orfano senza file"}
+            ]
+        }))
+        .unwrap();
+        let findings = out["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["severity"], json!("media"));
+        assert!(findings[0].get("line").is_none());
     }
 
     #[test]
