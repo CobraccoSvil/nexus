@@ -527,11 +527,13 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
         let ttl_secs = (long_secs as i64).to_string();
         tokio::spawn(async move {
             if let Err(e) = sqlx::query(
-                "INSERT INTO nexus_provider_health (provider, billing_cooldown_until, last_error, updated_at) \
-                 VALUES ($1, NOW() + ($2 || ' seconds')::interval, $3, NOW()) \
+                "INSERT INTO nexus_provider_health \
+                   (provider, billing_cooldown_until, last_error, last_error_at, last_error_source, updated_at) \
+                 VALUES ($1, NOW() + ($2 || ' seconds')::interval, $3, NOW(), 'mcp-core', NOW()) \
                  ON CONFLICT (provider) DO UPDATE SET \
                    billing_cooldown_until = EXCLUDED.billing_cooldown_until, \
-                   last_error = EXCLUDED.last_error, updated_at = NOW()",
+                   last_error = EXCLUDED.last_error, last_error_at = NOW(), \
+                   last_error_source = 'mcp-core', updated_at = NOW()",
             )
             .bind(&provider)
             .bind(&ttl_secs)
