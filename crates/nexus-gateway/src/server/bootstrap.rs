@@ -270,12 +270,17 @@ pub async fn build_state(db: PgPool) -> Result<AppState> {
     let mcp_core_url =
         std::env::var("MCP_CORE_URL").unwrap_or_else(|_| "http://localhost:4000".to_string());
 
+    // Il pool collegato abilita la persistenza dell'ultimo errore per provider
+    // su nexus_provider_health / _history (migrazione 0536).
+    let cooldown = CooldownManager::new();
+    cooldown.attach_db(db.clone());
+
     Ok(AppState {
         db,
         service_token,
         jwt_secret,
         mcp_core_url,
-        cooldown: CooldownManager::new(),
+        cooldown,
         runtime: Arc::new(tokio::sync::RwLock::new(runtime)),
     })
 }

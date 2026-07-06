@@ -4,6 +4,17 @@
 # Log per-servizio in D:\IDEAI-runtime\dev-logs\. I PID vengono salvati per dev-stop.ps1.
 # NON richiede admin: lanciare processi non e' un'operazione privilegiata.
 #
+# Log: Start-Process TRONCA i file di redirect a ogni avvio, quindi PRIMA di
+# lanciare ogni servizio i log della sessione precedente vengono ruotati in
+# <nome>.log.1 / .2 / .3 (3 generazioni). Senza rotazione un riavvio cancellava
+# la sessione precedente e l'errore da diagnosticare con essa (incidente
+# 2026-07-06: PROVIDER_ERROR delle 16:30 perso dal restart delle 18:09).
+#
+# NB dimensione "0 KB": finche' un processo tiene aperto l'handle del proprio
+# log, la directory entry NTFS non viene aggiornata ed Explorer/Get-ChildItem
+# mostrano 0 byte anche se il file si sta riempiendo. Il contenuto reale si
+# legge con: Get-Content <file> -Tail 50 [-Wait].
+#
 # I database restano servizi Windows separati (postgresql-x64-17, nexus-pg-nexus,
 # nexus-pg-app) e NON sono gestiti qui: i dati devono persistere fra un test e l'altro.
 $ErrorActionPreference = 'Stop'
@@ -35,6 +46,33 @@ if (Test-Path $PIDFILE) {
 }
 
 New-Item -ItemType Directory -Force -Path $LOGDIR | Out-Null
+
+# Ruota i log della sessione precedente: <file>.log -> .log.1 -> .log.2 -> .log.3.
+# I file vuoti non vengono ruotati (Start-Process li ricrea comunque). Se un
+# handle e' ancora aperto (processo orfano) il Move-Item fallisce: warning e si
+# prosegue col troncamento, senza bloccare l'avvio dello stack.
+$LOG_GENERATIONS = 3
+function Invoke-DevLogRotation([string]$path) {
+  if (-not (Test-Path $path)) { return }
+  if ((Get-Item $path).Length -eq 0) { return }
+  # 2 tentativi con pausa: subito dopo dev-stop l'handle puo' essere ancora in
+  # rilascio (o lo scanner AV sta leggendo il file appena chiuso).
+  foreach ($attempt in 1, 2) {
+    try {
+      for ($i = $LOG_GENERATIONS - 1; $i -ge 1; $i--) {
+        $src = "$path.$i"
+        if (Test-Path $src) { Move-Item -Force $src "$path.$($i + 1)" }
+      }
+      Move-Item -Force $path "$path.1"
+      return
+    }
+    catch {
+      if ($attempt -eq 1) { Start-Sleep -Milliseconds 500; continue }
+      Write-Warning "rotazione log fallita per ${path}: $($_.Exception.Message) (handle ancora aperto? il file verra' troncato)"
+    }
+  }
+}
+
 $started = @()
 
 foreach ($id in $order) {
@@ -57,8 +95,19 @@ foreach ($id in $order) {
       Set-Item -Path "env:$($e.name)" -Value $e.value
     }
 
+    # RUST_LOG per il tracing dei binari Rust: i processi ereditano l'ambiente
+    # di questa shell e dotenvy NON sovrascrive variabili gia' presenti. Se ne'
+    # l'operatore ne' il manifest l'hanno impostata, propaga il default 'info'
+    # cosi' i log restano attivi anche se il .env della working dir ne e' privo.
+    if (-not (Test-Path env:RUST_LOG)) {
+      $saved['RUST_LOG'] = $null
+      Set-Item -Path env:RUST_LOG -Value 'info'
+    }
+
     $out = Join-Path $LOGDIR "$id.out.log"
     $err = Join-Path $LOGDIR "$id.err.log"
+    Invoke-DevLogRotation $out
+    Invoke-DevLogRotation $err
     $sp = @{
       FilePath               = $exe
       WorkingDirectory       = $cwd
@@ -98,3 +147,5 @@ if ($started.Count -lt $order.Count) {
 }
 Write-Host "Stack avviato ($($started.Count) processi). PID: $PIDFILE" -ForegroundColor Cyan
 Write-Host "Log: $LOGDIR   |   Stop: .\deploy\dev-stop.ps1" -ForegroundColor Cyan
+Write-Host "NB: Explorer mostra 0 KB finche' il processo tiene aperto l'handle del log (size NTFS pigra)." -ForegroundColor DarkGray
+Write-Host "    Leggere con: Get-Content $LOGDIR\<servizio>.out.log -Tail 50 [-Wait]" -ForegroundColor DarkGray

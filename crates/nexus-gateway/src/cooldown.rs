@@ -161,6 +161,10 @@ pub struct CooldownManager {
     states: Arc<DashMap<String, CooldownState>>,
     /// Cache delle durate lette dai settings (chiave unit: un solo set globale).
     durations: TtlCache<(), Durations>,
+    /// Pool DB per la persistenza dell'ultimo errore per provider
+    /// (`nexus_provider_health.last_error` + history, migrazione 0536).
+    /// Vuoto nei test unit: la persistenza diventa un no-op.
+    db: Arc<std::sync::OnceLock<PgPool>>,
 }
 
 impl Default for CooldownManager {
@@ -176,7 +180,14 @@ impl CooldownManager {
         Self {
             states: Arc::new(DashMap::new()),
             durations: TtlCache::new(SETTINGS_TTL),
+            db: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Collega il pool DB per la persistenza degli errori provider. Chiamato
+    /// una volta dal bootstrap; chiamate successive sono ignorate (OnceLock).
+    pub fn attach_db(&self, pool: PgPool) {
+        let _ = self.db.set(pool);
     }
 
     /// Durate correnti: da cache settings se valide, altrimenti fallback.
@@ -252,6 +263,7 @@ impl CooldownManager {
             duration_seconds,
             "gateway: provider in cooldown"
         );
+        self.persist_last_error(provider, reason, last_error.as_deref());
         self.states.insert(
             provider.to_string(),
             CooldownState {
@@ -260,6 +272,34 @@ impl CooldownManager {
                 last_error,
             },
         );
+    }
+
+    /// Persiste l'ultimo errore osservato per il provider (migrazione 0536):
+    /// UPSERT su `nexus_provider_health` (SOLO last_error/last_error_at/
+    /// last_error_source: `billing_cooldown_until` resta di proprieta'
+    /// esclusiva di mcp-core, writer unico regola L) + riga append-only in
+    /// `nexus_provider_health_history` con source='gateway'. Senza questa
+    /// persistenza l'errore HTTP esatto di un failover transiente non era
+    /// ricostruibile da nessuna parte (incidente run a5db0985, 2026-07-06).
+    ///
+    /// Fire-and-forget: nessun errore DB blocca la pipeline di routing. No-op
+    /// se il pool non e' collegato (test unit) o fuori da un runtime tokio.
+    fn persist_last_error(&self, provider: &str, reason: CooldownReason, last_error: Option<&str>) {
+        let Some(pool) = self.db.get().cloned() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // Regola F: e' il messaggio d'errore del provider (status+codice), mai
+        // prompt/response. Troncato a 500 char come la history del probe.
+        let message = truncate_chars(last_error.unwrap_or(""), 500);
+        handle.spawn(persist_provider_error(
+            pool,
+            provider.to_lowercase(),
+            reason.as_str(),
+            message,
+        ));
     }
 
     /// `true` se il provider e' in cooldown rispetto all'istante corrente.
@@ -413,6 +453,61 @@ impl CooldownManager {
                 );
             }
         }
+    }
+}
+
+/// Valore di `last_error_source` / `source` scritto dal gateway (mig 0536).
+const LAST_ERROR_SOURCE: &str = "gateway";
+
+/// Scrittura DB dell'errore provider (vedi [`CooldownManager::persist_last_error`]):
+/// UPSERT dell'ultimo errore + riga history append-only con source='gateway'.
+async fn persist_provider_error(pool: PgPool, provider: String, kind: &'static str, message: String) {
+    let upsert = sqlx::query(
+        "INSERT INTO nexus_provider_health \
+           (provider, last_error, last_error_at, last_error_source, updated_at) \
+         VALUES ($1, $2, NOW(), $3, NOW()) \
+         ON CONFLICT (provider) DO UPDATE SET \
+           last_error = EXCLUDED.last_error, \
+           last_error_at = NOW(), \
+           last_error_source = EXCLUDED.last_error_source, \
+           updated_at = NOW()",
+    )
+    .bind(&provider)
+    .bind(&message)
+    .bind(LAST_ERROR_SOURCE)
+    .execute(&pool)
+    .await;
+    let history = sqlx::query(
+        "INSERT INTO nexus_provider_health_history \
+           (provider, healthy, error_kind, error_message, source) \
+         VALUES ($1, false, $2, $3, $4)",
+    )
+    .bind(&provider)
+    .bind(kind)
+    .bind(&message)
+    .bind(LAST_ERROR_SOURCE)
+    .execute(&pool)
+    .await;
+    let esiti = [
+        ("UPSERT nexus_provider_health", upsert),
+        ("INSERT nexus_provider_health_history", history),
+    ];
+    for (what, res) in esiti {
+        if let Err(e) = res {
+            tracing::warn!(provider, error = %e, "gateway-cooldown: {} fallito", what);
+        }
+    }
+}
+
+/// Tronca a `max` caratteri rispettando i char boundary UTF-8 (uno slice di
+/// byte `&s[..max]` panica a meta' di un carattere multibyte).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max).collect();
+        t.push('…');
+        t
     }
 }
 
@@ -594,6 +689,31 @@ mod tests {
         let m = CooldownManager::new();
         assert!(!m.is_in_cooldown_at("ignoto", t0()));
         assert_eq!(m.seconds_remaining_at("ignoto", t0()), 0);
+    }
+
+    #[test]
+    fn truncate_chars_rispetta_i_char_boundary() {
+        assert_eq!(truncate_chars("ciao", 10), "ciao");
+        assert_eq!(truncate_chars("ciao mondo", 4), "ciao…");
+        // Multibyte: slicing per byte panicherebbe, per char no.
+        assert_eq!(truncate_chars("èèèèè", 3), "èèè…");
+    }
+
+    #[tokio::test]
+    async fn mark_senza_pool_dentro_runtime_e_noop_di_persistenza() {
+        // Con runtime tokio attivo ma senza pool collegato, mark_at non deve
+        // ne' panicare ne' bloccarsi: la persistenza e' un no-op e lo stato
+        // in-memory resta corretto.
+        let m = CooldownManager::new();
+        let now = t0();
+        m.mark_at(
+            "acme",
+            CooldownReason::Transient,
+            Some("HTTP 502 upstream".to_string()),
+            now,
+            30,
+        );
+        assert!(m.is_in_cooldown_at("acme", now));
     }
 
     #[test]
