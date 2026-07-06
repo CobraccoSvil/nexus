@@ -271,6 +271,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             input: json!({}),
+            thought_signature: None,
         }
     }
 

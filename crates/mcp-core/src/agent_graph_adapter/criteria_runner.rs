@@ -97,6 +97,7 @@ impl FinalGateCriteriaRunnerAdapter {
             id: Uuid::new_v4().to_string(),
             name: name.to_string(),
             input,
+            thought_signature: None,
         };
         let outcome = self.tool_executor.execute(call, mode).await?;
         // content e' tipicamente una stringa (output del tool); normalizziamo.

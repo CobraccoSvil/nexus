@@ -324,6 +324,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for UnderstandingNode {
                     "source_kinds": ["code", "kb", "chat_history"],
                     "top_k": self.cfg.topk,
                 }),
+                thought_signature: None,
             };
             match ctx.tools.execute(call, mode).await {
                 Ok(outcome) => {
@@ -356,6 +357,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for UnderstandingNode {
                     id: Uuid::new_v4().to_string(),
                     name: "dispatch_subagent".to_string(),
                     input: json!({ "kind": "explore", "task": sq }),
+                    thought_signature: None,
                 };
                 futs.push(ctx.tools.execute(call, mode));
             }

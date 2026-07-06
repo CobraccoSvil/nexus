@@ -170,9 +170,11 @@ fn ai_tool(name: &str, input: Value) -> Message {
             id: "c1".into(),
             name: name.into(),
             input,
+            thought_signature: None,
         }]),
         tool_calls: vec![],
         reasoning: None,
+        thinking_signature: None,
     }
 }
 
@@ -927,6 +929,7 @@ async fn happy_path_tool_use_produce_pending() {
             id: "tc1".into(),
             name: "write_file".into(),
             input: json!({"path": "a.rs"}),
+            thought_signature: None,
         }],
         usage: LlmUsage::default(),
         stop_reason: Some("tool_use".into()),
@@ -995,6 +998,7 @@ async fn executor_emette_tool_use_su_pending() {
             id: "tc1".into(),
             name: "write_file".into(),
             input: json!({"path": "a.rs"}),
+            thought_signature: None,
         }],
         usage: LlmUsage::default(),
         stop_reason: Some("tool_use".into()),
@@ -1751,6 +1755,7 @@ async fn signature_loop_escalation_riesegue() {
                         id: "tc1".into(),
                         name: "read_file".into(),
                         input: self.same_input.clone(),
+                        thought_signature: None,
                     }],
                     stop_reason: Some("tool_use".into()),
                     ..Default::default()
@@ -1843,6 +1848,7 @@ async fn signature_loop_escalation_non_forza_tool_choice() {
                         id: "tc1".into(),
                         name: "read_file".into(),
                         input: self.same_input.clone(),
+                        thought_signature: None,
                     }],
                     stop_reason: Some("tool_use".into()),
                     ..Default::default()
@@ -2330,6 +2336,7 @@ async fn g1_nudge_scatta_via_segnale_strutturale_senza_blacklist() {
                 content: MessageContent::text("Procedero' a creare il file di login."),
                 tool_calls: vec![],
                 reasoning: None,
+                thinking_signature: None,
             },
         ],
         // Turno precedente: end_turn SENZA tool call (segnale strutturale).
@@ -2447,6 +2454,7 @@ async fn g1_resta_closure_first_non_conta_se_closure_fulfilled() {
                 ),
                 tool_calls: vec![],
                 reasoning: None,
+                thinking_signature: None,
             },
         ],
         stop_reason: Some(StopReason::EndTurn),
@@ -2741,6 +2749,7 @@ fn ai(text: &str) -> Message {
         content: MessageContent::text(text),
         tool_calls: vec![],
         reasoning: None,
+        thinking_signature: None,
     }
 }
 
@@ -3402,6 +3411,7 @@ fn llm_tool_use(name: &str, input: Value) -> Arc<StubLlmGateway> {
                 id: "stub-tc".to_string(),
                 name: name.to_string(),
                 input,
+                thought_signature: None,
             }],
             usage: LlmUsage::default(),
             stop_reason: Some("tool_use".into()),
@@ -4457,6 +4467,7 @@ mod golden_end_turn {
                                             .unwrap_or("tool")
                                             .to_string(),
                                         input: b.get("input").cloned().unwrap_or(Value::Null),
+                                        thought_signature: None,
                                     })
                                 } else {
                                     None
@@ -4467,6 +4478,7 @@ mod golden_end_turn {
                             content: MessageContent::Blocks(blocks),
                             tool_calls: vec![],
                             reasoning: None,
+                            thinking_signature: None,
                         })
                     })
                     .collect()
@@ -4635,6 +4647,7 @@ mod multi_turn_wire {
                 content: MessageContent::text("risposta"),
                 tool_calls: vec![],
                 reasoning: None,
+                thinking_signature: None,
             },
         ];
         let hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();

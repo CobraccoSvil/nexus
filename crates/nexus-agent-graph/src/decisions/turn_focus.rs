@@ -161,6 +161,7 @@ mod tests {
             content: MessageContent::text(text),
             tool_calls: vec![],
             reasoning: None,
+            thinking_signature: None,
         }
     }
 
@@ -306,6 +307,7 @@ mod golden {
                         content,
                         tool_calls: vec![],
                         reasoning: None,
+                        thinking_signature: None,
                     },
                     "tool" => Message::Tool {
                         tool_call_id: "golden".to_string(),

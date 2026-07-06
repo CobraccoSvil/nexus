@@ -1297,6 +1297,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             id: tool_use_id.clone(),
             name: "nexus_todo_write".to_string(),
             input: tool_input,
+            thought_signature: None,
         };
         // CONTINUITA' tool_use/tool_result (planner_node.py:586-602): conserva la
         // tool_use di nexus_todo_write da appendere al `Message::Ai` finale. L'id
@@ -1309,6 +1310,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             id: call.id.clone(),
             name: call.name.clone(),
             input: call.input.clone(),
+            thought_signature: None,
         };
         let outcome = match ctx.tools.execute(call, ctx.exec_mode()).await {
             Ok(o) => o,
@@ -1384,6 +1386,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             // Assistant sintetico del planner (solo tool_use nexus_todo_write):
             // nessun reasoning del modello da ri-passare.
             reasoning: None,
+            thinking_signature: None,
         };
         let tool_result_msg = Message::Tool {
             tool_call_id: tool_use_id,
@@ -1641,6 +1644,7 @@ mod tests {
                 id: "tc-1".to_string(),
                 name: name.to_string(),
                 input,
+                thought_signature: None,
             }],
             usage: LlmUsage::default(),
             ..Default::default()
@@ -2612,6 +2616,7 @@ mod golden {
                         content,
                         tool_calls: vec![],
                         reasoning: None,
+                        thinking_signature: None,
                     },
                     _ => Message::Human { content },
                 });

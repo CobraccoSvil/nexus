@@ -48,6 +48,13 @@ pub struct GwMessage {
     /// `None` (turno senza reasoning / altri ruoli o provider).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Firma opaca del blocco `thinking` (Anthropic) di un turno `assistant`
+    /// precedente, da RI-PASSARE al gateway: il server la inoltra SOLO ad Anthropic
+    /// (vincolo HTTP 400 sui turni con tool). Allineata a
+    /// `LlmMessage::thinking_signature` del server (`nexus-gateway::types`). Omessa
+    /// quando `None` (turno senza thinking / altri ruoli o provider).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_signature: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -125,6 +132,14 @@ pub struct GwToolCall {
     #[serde(rename = "type", default)]
     pub kind: String,
     pub function: GwToolFunctionCall,
+    /// Firma opaca di reasoning (`thoughtSignature`) di Gemini 3, PER-CALL.
+    /// Combacia col campo omonimo di `LlmToolCall` (contratto gateway): il
+    /// gateway la emette in RISPOSTA su ogni tool-call e la esige di ritorno in
+    /// RICHIESTA sulla stessa `functionCall`, pena HTTP 400 INVALID_ARGUMENT.
+    /// Additivo/tollerante (`default` + skip se `None`): assente per gli altri
+    /// provider e retrocompatibile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Informazioni sul re-routing automatico per motivi di privacy.
@@ -162,9 +177,10 @@ pub struct GwResponse {
     #[allow(dead_code)]
     pub reasoning: Option<String>,
     /// Firma opaca del blocco `thinking` da ri-passare nei turni con tool
-    /// (Anthropic). `None` per gli altri provider. Vedi nota su `reasoning`.
+    /// (Anthropic). `None` per gli altri provider. Ora LETTA dall'adapter
+    /// (`map_gw_response`) e trasportata nel round-trip via
+    /// `Message::Ai::thinking_signature`.
     #[serde(default)]
-    #[allow(dead_code)]
     pub thinking_signature: Option<String>,
 }
 

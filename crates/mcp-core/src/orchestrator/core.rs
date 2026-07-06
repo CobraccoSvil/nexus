@@ -1296,6 +1296,7 @@ impl Orchestrator {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning: None,
+                    thinking_signature: None,
                 }],
                 max_tokens: Some(token_budget),
                 temperature: None,

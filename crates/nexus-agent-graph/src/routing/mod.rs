@@ -332,9 +332,11 @@ mod tests {
                 id: "c1".into(),
                 name: "nexus_run_notes".into(),
                 input: json!({"action": "set", "content": "fatto"}),
+                thought_signature: None,
             }]),
             tool_calls: vec![],
             reasoning: None,
+            thinking_signature: None,
         }
     }
 

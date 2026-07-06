@@ -602,6 +602,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
                 id: Uuid::new_v4().to_string(),
                 name: "list_files".to_string(),
                 input: json!({ "directory": "." }),
+                thought_signature: None,
             };
             match ctx.tools.execute(call, mode).await {
                 Ok(outcome) => {
@@ -798,6 +799,7 @@ mod tests {
                     id: "tc-1".to_string(),
                     name: "clarify_or_expand".to_string(),
                     input: input.clone(),
+                    thought_signature: None,
                 }],
                 None => vec![],
             };
@@ -1045,6 +1047,7 @@ mod tests {
                 content: MessageContent::text("risposta ai"),
                 tool_calls: vec![],
                 reasoning: None,
+                thinking_signature: None,
             },
             human("ultimo utente"),
             Message::Tool {
@@ -1383,6 +1386,7 @@ mod golden {
                                             content: mc,
                                             tool_calls: vec![],
                                             reasoning: None,
+                                            thinking_signature: None,
                                         },
                                         _ => Message::Tool {
                                             tool_call_id: "t".to_string(),

@@ -121,6 +121,12 @@ pub struct HistoryMessage {
     /// un messaggio degradato a sintesi non porta piu' il pensiero originale.
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Firma opaca del blocco `thinking` (Anthropic) del turno `assistant`,
+    /// preservata attraverso la riduzione di contesto per il round-trip (HTTP 400
+    /// senza). Gemella per-messaggio del `reasoning`; azzerata dalla compressione
+    /// (`rebuilt_human`). `None` per gli altri ruoli/provider.
+    #[serde(default)]
+    pub thinking_signature: Option<String>,
 }
 
 impl HistoryMessage {
@@ -143,6 +149,7 @@ impl HistoryMessage {
             // Il messaggio compresso e' un HumanMessage di sintesi: non porta piu'
             // il reasoning originale (vincolo round-trip DeepSeek non applicabile).
             reasoning: None,
+            thinking_signature: None,
         }
     }
 
@@ -1417,6 +1424,7 @@ pub fn apply_rolling_summary(
         is_tool: false,
         tool_call_id: None,
         reasoning: None,
+        thinking_signature: None,
     };
     let mut out: Vec<HistoryMessage> = Vec::with_capacity(hist.len() - upper + 1);
     out.push(summary);

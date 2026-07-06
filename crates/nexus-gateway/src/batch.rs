@@ -367,6 +367,9 @@ fn result_line_to_item(line: AnthropicResultLine) -> BatchResultItem {
                                 arguments: serde_json::to_string(&input)
                                     .unwrap_or_else(|_| "{}".to_string()),
                             },
+                            // Anthropic firma il blocco thinking a livello di
+                            // messaggio, non per-call: nessuna firma per-call qui.
+                            thought_signature: None,
                         });
                     }
                     AnthropicResultBlock::Other => {}

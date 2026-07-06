@@ -34,6 +34,15 @@ pub struct LlmToolCall {
     #[serde(rename = "type")]
     pub kind: String,
     pub function: ToolFunctionCall,
+    /// Firma opaca di reasoning (`thoughtSignature`) che Gemini 3 emette PER
+    /// OGNI `functionCall` e IMPONE di ri-passare sulla rispettiva part nei
+    /// turni con tool, altrimenti HTTP 400 INVALID_ARGUMENT ("Function call is
+    /// missing a thought_signature in functionCall parts"). A differenza di
+    /// Anthropic (una firma per blocco thinking, a livello di messaggio via
+    /// [`LlmMessage::thinking_signature`]) qui la firma e' PER-CALL.
+    /// Retrocompatibile: assente/`None` per tutti gli altri provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

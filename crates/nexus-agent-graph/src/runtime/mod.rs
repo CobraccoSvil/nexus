@@ -177,6 +177,7 @@ pub mod test_doubles {
                         id: "stub-tc".to_string(),
                         name: name.to_string(),
                         input,
+                        thought_signature: None,
                     }],
                     usage: LlmUsage::default(),
                     ..Default::default()

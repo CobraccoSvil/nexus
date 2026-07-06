@@ -60,6 +60,7 @@ pub fn to_lc(message: &Message) -> Value {
             content,
             tool_calls,
             reasoning,
+            thinking_signature,
         } => {
             let mut kwargs = Map::new();
             kwargs.insert("content".to_string(), content_to_value(content));
@@ -67,22 +68,38 @@ pub fn to_lc(message: &Message) -> Value {
             let lc_tool_calls: Vec<Value> = tool_calls
                 .iter()
                 .map(|tc| {
-                    json!({
+                    let mut v = json!({
                         "name": tc.name,
                         "args": tc.input,
                         "id": tc.id,
                         "type": "tool_call",
-                    })
+                    });
+                    // Firma PER-CALL (Gemini 3): persistita nel formato LangChain
+                    // (campo extra ignorato da LangChain) per sopravvivere al
+                    // round-trip dello stato / resume da checkpoint.
+                    if let Some(sig) = &tc.thought_signature {
+                        v["thought_signature"] = json!(sig);
+                    }
+                    v
                 })
                 .collect();
             kwargs.insert("tool_calls".to_string(), Value::Array(lc_tool_calls));
-            // Reasoning DeepSeek (thinking mode) in `additional_kwargs.reasoning_content`,
-            // la chiave usata dal brain Python: cosi' sopravvive al round-trip gRPC e
-            // puo' essere ri-passato all'API (vincolo HTTP 400). Omesso se assente.
+            // `additional_kwargs`: reasoning_content (DeepSeek) e/o thinking_signature
+            // (Anthropic), entrambi da RI-PASSARE nei turni successivi (vincolo HTTP
+            // 400). `reasoning_content` e' la chiave usata dal brain Python; la firma
+            // thinking viaggia come chiave extra tollerata. L'oggetto e' omesso se
+            // entrambi assenti.
+            let mut additional_kwargs = Map::new();
             if let Some(r) = reasoning {
+                additional_kwargs.insert("reasoning_content".to_string(), json!(r));
+            }
+            if let Some(sig) = thinking_signature {
+                additional_kwargs.insert("thinking_signature".to_string(), json!(sig));
+            }
+            if !additional_kwargs.is_empty() {
                 kwargs.insert(
                     "additional_kwargs".to_string(),
-                    json!({ "reasoning_content": r }),
+                    Value::Object(additional_kwargs),
                 );
             }
             kwargs.insert("type".to_string(), json!("ai"));
@@ -165,10 +182,21 @@ pub fn from_lc(value: &Value) -> Result<Message, LcSerdeError> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            // Firma thinking Anthropic: da `additional_kwargs.thinking_signature`
+            // (tollerante: anche top-level). Vuota/assente -> None.
+            let thinking_signature = kwargs
+                .get("additional_kwargs")
+                .and_then(|v| v.as_object())
+                .and_then(|ak| ak.get("thinking_signature"))
+                .or_else(|| kwargs.get("thinking_signature"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             Ok(Message::Ai {
                 content,
                 tool_calls,
                 reasoning,
+                thinking_signature,
             })
         }
         "ToolMessage" => {
@@ -227,7 +255,17 @@ fn parse_lc_tool_calls(value: Option<&Value>) -> Result<Vec<ToolUse>, LcSerdeErr
             .or_else(|| tc.get("input"))
             .cloned()
             .unwrap_or(Value::Object(Map::new()));
-        out.push(ToolUse { id, name, input });
+        // Firma PER-CALL (Gemini 3): riletta se presente nel checkpoint.
+        let thought_signature = tc
+            .get("thought_signature")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        out.push(ToolUse {
+            id,
+            name,
+            input,
+            thought_signature,
+        });
     }
     Ok(out)
 }
@@ -251,8 +289,10 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 input: json!({"path": "/tmp/x"}),
+                thought_signature: None,
             }],
             reasoning: None,
+            thinking_signature: None,
         };
         let tool = Message::Tool {
             tool_call_id: "call_1".to_string(),
@@ -266,6 +306,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn round_trip_preserva_thought_signature_per_call() {
+        // REGRESSIONE Gemini 3: la thoughtSignature per-call deve sopravvivere al
+        // round-trip dello stato, sia nella forma a BLOCCHI (autoritativa per il
+        // motore) sia nella forma OpenAI `tool_calls`.
+        let blocchi = Message::Ai {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "c1".to_string(),
+                name: "dispatch_subagent".to_string(),
+                input: json!({"task": "x"}),
+                thought_signature: Some("sig-block".to_string()),
+            }]),
+            tool_calls: vec![],
+            reasoning: None,
+            thinking_signature: None,
+        };
+        let openai = Message::Ai {
+            content: MessageContent::text(""),
+            tool_calls: vec![ToolUse {
+                id: "c2".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "/x"}),
+                thought_signature: Some("sig-oai".to_string()),
+            }],
+            reasoning: None,
+            thinking_signature: None,
+        };
+
+        for msg in [&blocchi, &openai] {
+            let back = from_lc(&to_lc(msg)).expect("from_lc deve ricostruire il messaggio");
+            assert_eq!(&back, msg, "la thoughtSignature per-call deve essere identica");
+        }
+    }
+
+    #[test]
+    fn round_trip_preserva_thinking_signature_anthropic() {
+        // REGRESSIONE Anthropic (gemello latente): la firma del blocco `thinking`
+        // (per-messaggio) deve sopravvivere al round-trip dello stato per essere
+        // ri-passata nei turni con tool (HTTP 400 senza).
+        let ai = Message::Ai {
+            content: MessageContent::text("ho ragionato e rispondo"),
+            tool_calls: vec![ToolUse {
+                id: "c1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "/x"}),
+                thought_signature: None,
+            }],
+            reasoning: None,
+            thinking_signature: Some("sig-thinking".to_string()),
+        };
+        let back = from_lc(&to_lc(&ai)).expect("from_lc deve ricostruire il messaggio");
+        assert_eq!(&back, &ai, "la thinking_signature deve sopravvivere al round-trip");
+    }
+
     /// Verifica la forma del JSON LangChain prodotto da `to_lc` per un AIMessage
     /// con tool_calls (campo `args`, non `input`; involucro `{lc,type,id,kwargs}`).
     #[test]
@@ -276,8 +370,10 @@ mod tests {
                 id: "c1".to_string(),
                 name: "edit_file".to_string(),
                 input: json!({"a": 1}),
+                thought_signature: None,
             }],
             reasoning: None,
+            thinking_signature: None,
         };
         let lc = to_lc(&ai);
         assert_eq!(lc["lc"], json!(1));

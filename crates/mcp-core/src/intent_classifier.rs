@@ -604,6 +604,7 @@ pub async fn classify(
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
+            thinking_signature: None,
         }],
         pin_provider: Some(provider.clone()),
         metadata: GwMetadata {

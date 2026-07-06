@@ -1367,8 +1367,10 @@ mod tests {
                 id: "c1".into(),
                 name: name.into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             reasoning: None,
+            thinking_signature: None,
         }
     }
 
@@ -1394,9 +1396,11 @@ mod tests {
                 id: "c1".into(),
                 name: name.into(),
                 input: json!({}),
+                thought_signature: None,
             }]),
             tool_calls: vec![],
             reasoning: None,
+            thinking_signature: None,
         }
     }
 
@@ -1429,9 +1433,11 @@ mod tests {
                 id: "c1".into(),
                 name: name.into(),
                 input,
+                thought_signature: None,
             }]),
             tool_calls: vec![],
             reasoning: None,
+            thinking_signature: None,
         }
     }
 
@@ -1542,6 +1548,7 @@ mod tests {
             content: MessageContent::text("solo testo"),
             tool_calls: vec![],
             reasoning: None,
+            thinking_signature: None,
         }]));
     }
 
@@ -2156,14 +2163,17 @@ mod golden {
                         id: "golden".into(),
                         name: name.clone(),
                         input: if input.is_null() { json!({}) } else { input.clone() },
+                        thought_signature: None,
                     }]),
                     tool_calls: vec![],
                     reasoning: None,
+                    thinking_signature: None,
                 },
                 RawMsg::AiText { text } => Message::Ai {
                     content: MessageContent::text(text.clone()),
                     tool_calls: vec![],
                     reasoning: None,
+                    thinking_signature: None,
                 },
                 RawMsg::Tool { text } => Message::Tool {
                     tool_call_id: "golden".into(),

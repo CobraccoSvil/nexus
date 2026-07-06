@@ -323,9 +323,11 @@ mod tests {
                 id: "c1".into(),
                 name: name.into(),
                 input,
+                thought_signature: None,
             }]),
             tool_calls: vec![],
             reasoning: None,
+            thinking_signature: None,
         }
     }
 

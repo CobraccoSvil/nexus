@@ -1053,6 +1053,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                         content: MessageContent::text(close_text.clone()),
                         tool_calls: vec![],
                         reasoning: None,
+                        thinking_signature: None,
                     }]),
                     result: Some(Some(close_text)),
                     pending_tool_uses: Some(Some(vec![])),
@@ -1196,6 +1197,7 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                     content: MessageContent::text(cap_text.clone()),
                     tool_calls: vec![],
                     reasoning: None,
+                    thinking_signature: None,
                 }]),
                 result: Some(Some(cap_text)),
                 pending_tool_uses: Some(Some(vec![])),
@@ -1624,6 +1626,7 @@ la richiesta in modo piu' specifico.",
                     content: MessageContent::text(cap_text.clone()),
                     tool_calls: vec![],
                     reasoning: None,
+                    thinking_signature: None,
                 }]),
                 result: Some(Some(cap_text)),
                 pending_tool_uses: Some(Some(vec![])),
@@ -1692,6 +1695,7 @@ la richiesta in modo piu' specifico.",
                         content: MessageContent::text(ff_msg.clone()),
                         tool_calls: vec![],
                         reasoning: None,
+                        thinking_signature: None,
                     }]),
                     result: Some(Some(ff_msg)),
                     pending_tool_uses: Some(Some(vec![])),
@@ -1896,6 +1900,7 @@ Chiudo passando per la verifica del flusso."
                             content: MessageContent::text(expl_text.clone()),
                             tool_calls: vec![],
                             reasoning: None,
+                            thinking_signature: None,
                         }]),
                         result: Some(Some(expl_text)),
                         pending_tool_uses: Some(Some(vec![])),
@@ -1928,6 +1933,7 @@ Riformula la richiesta in modo piu' specifico o usa un modello piu' capace."
                     content: MessageContent::text(expl_text.clone()),
                     tool_calls: vec![],
                     reasoning: None,
+                    thinking_signature: None,
                 }]),
                 result: Some(Some(expl_text)),
                 pending_tool_uses: Some(Some(vec![])),
@@ -2265,6 +2271,7 @@ indicalo esplicitamente."
                                 content: MessageContent::text(ra_text.clone()),
                                 tool_calls: vec![],
                                 reasoning: None,
+                                thinking_signature: None,
                             }]),
                             result: Some(Some(ra_text)),
                             pending_tool_uses: Some(Some(vec![])),
@@ -2436,6 +2443,7 @@ tool/le richieste a quella porta, senza allocarne di nuove."
                                 content: MessageContent::text(rp_text.clone()),
                                 tool_calls: vec![],
                                 reasoning: None,
+                                thinking_signature: None,
                             }]),
                             result: Some(Some(rp_text)),
                             pending_tool_uses: Some(Some(vec![])),
@@ -3045,6 +3053,7 @@ della finestra {effective_window} del modello {provider}/{model}"
                         content: MessageContent::text(text.clone()),
                         tool_calls: vec![],
                         reasoning: None,
+                        thinking_signature: None,
                     }]),
                     result: Some(Some(text)),
                     pending_tool_uses: Some(Some(vec![])),
@@ -3673,6 +3682,7 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
                     content: MessageContent::text(loop_msg.clone()),
                     tool_calls: vec![],
                     reasoning: None,
+                    thinking_signature: None,
                 };
                 pending_tool_uses = vec![];
                 stop_reason_str_resp = Some("loop_detected".to_string());
@@ -3734,6 +3744,7 @@ modello piu' capace.",
                     content: MessageContent::text(close_text.clone()),
                     tool_calls: vec![],
                     reasoning: None,
+                    thinking_signature: None,
                 };
                 pending_tool_uses = vec![];
                 // Riusa il vocabolario stop_reason del forced-close anti-loop
@@ -3890,6 +3901,7 @@ modello piu' capace.",
                     // Testo ripulito (rimozione <suggested_actions>): turno di chiusura
                     // testuale, nessun reasoning da ri-passare.
                     reasoning: None,
+                    thinking_signature: None,
                 };
             }
             // Derivazione scelte sul testo ripulito (best-effort). Il meta_step si
@@ -3945,6 +3957,7 @@ modello piu' capace.",
                     tool_calls: vec![],
                     // Resoconto onesto sostitutivo: turno testuale, nessun reasoning.
                     reasoning: None,
+                    thinking_signature: None,
                 };
             }
         }
@@ -4870,6 +4883,7 @@ con un tool call.",
                             content: MessageContent::text(question.clone()),
                             tool_calls: vec![],
                             reasoning: None,
+                            thinking_signature: None,
                         }]),
                         result: Some(Some(question)),
                         declared_outcome: Some(Some(outcome)),
@@ -4920,6 +4934,7 @@ al mio controllo e va risolta prima di continuare."
                             content: MessageContent::text(close_summary.clone()),
                             tool_calls: vec![],
                             reasoning: None,
+                            thinking_signature: None,
                         }]),
                         result: Some(Some(close_summary)),
                         declared_outcome: Some(Some(outcome)),
@@ -5902,6 +5917,7 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
                 content: MessageContent::text(close_text.clone()),
                 tool_calls: vec![],
                 reasoning: None,
+                thinking_signature: None,
             }]),
             result: Some(Some(close_text)),
             pending_tool_uses: Some(Some(vec![])),
@@ -5932,6 +5948,7 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
                 content: MessageContent::text(close_text.clone()),
                 tool_calls: vec![],
                 reasoning: None,
+                thinking_signature: None,
             }]),
             meta_steps: Some(vec![MetaStep {
                 kind: "anti_runaway".to_string(),
@@ -6079,6 +6096,13 @@ fn build_assistant_message(resp: &crate::runtime::ports::LlmResponse, result_tex
             // Reasoning del turno (DeepSeek thinking mode): preservato per il
             // round-trip al gateway (vincolo HTTP 400). Vuoto -> None.
             reasoning: resp.reasoning.as_ref().filter(|r| !r.is_empty()).cloned(),
+            // Firma thinking Anthropic (per-messaggio): preservata per il
+            // round-trip nei turni con tool. Vuota -> None.
+            thinking_signature: resp
+                .thinking_signature
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned(),
         };
     }
     // Forma minimale: testo + tool_calls (OpenAI-compat).
@@ -6086,6 +6110,11 @@ fn build_assistant_message(resp: &crate::runtime::ports::LlmResponse, result_tex
         content: MessageContent::text(result_text),
         tool_calls: resp.tool_calls.clone(),
         reasoning: resp.reasoning.as_ref().filter(|r| !r.is_empty()).cloned(),
+        thinking_signature: resp
+            .thinking_signature
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned(),
     }
 }
 
@@ -6095,7 +6124,7 @@ fn build_assistant_message(resp: &crate::runtime::ports::LlmResponse, result_tex
 fn message_to_history(m: &Message) -> HistoryMessage {
     match m {
         Message::Human { content } => history_from_content(content, true),
-        Message::Ai { content, tool_calls, reasoning } => {
+        Message::Ai { content, tool_calls, reasoning, thinking_signature } => {
             // Se l'AI porta tool_calls (forma OpenAI-compat) ma content testuale,
             // espandiamo i tool_use in anthropic_content per la dedup/compress.
             let mut hm = history_from_content(content, false);
@@ -6103,12 +6132,23 @@ fn message_to_history(m: &Message) -> HistoryMessage {
                 hm.anthropic_content = Value::Array(
                     tool_calls
                         .iter()
-                        .map(|t| json!({"type": "tool_use", "id": t.id, "name": t.name, "input": t.input}))
+                        .map(|t| {
+                            let mut b = json!({"type": "tool_use", "id": t.id, "name": t.name, "input": t.input});
+                            // Firma PER-CALL (Gemini 3): preservata nell'espansione
+                            // tool_calls -> anthropic_content per il round-trip.
+                            if let Some(sig) = &t.thought_signature {
+                                b["thought_signature"] = json!(sig);
+                            }
+                            b
+                        })
                         .collect(),
                 );
             }
             // Reasoning DeepSeek del turno: preservato per il round-trip al gateway.
             hm.reasoning = reasoning.clone();
+            // Firma thinking Anthropic (per-messaggio): preservata attraverso la
+            // riduzione di contesto per il round-trip nei turni con tool.
+            hm.thinking_signature = thinking_signature.clone();
             hm
         }
         // Il `ToolMessage` (risultato) preserva ruolo e id: `history_to_llm_messages`
@@ -6211,6 +6251,8 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
                         tool_calls: Some(tool_uses),
                         // Round-trip reasoning DeepSeek del turno assistant.
                         reasoning: m.reasoning.clone(),
+                        // Round-trip firma thinking Anthropic (per-messaggio).
+                        thinking_signature: m.thinking_signature.clone(),
                         ..Default::default()
                     });
                 }
@@ -6223,6 +6265,8 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
                 content: m.anthropic_content.clone(),
                 // Round-trip reasoning DeepSeek: solo sugli assistant (mai sugli user).
                 reasoning: if m.is_human { None } else { m.reasoning.clone() },
+                // Round-trip firma thinking Anthropic: solo sugli assistant.
+                thinking_signature: if m.is_human { None } else { m.thinking_signature.clone() },
                 ..Default::default()
             }];
         }
@@ -6235,6 +6279,8 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
         content: m.content.clone(),
         // Round-trip reasoning DeepSeek: solo sugli assistant (mai sugli user).
         reasoning: if m.is_human { None } else { m.reasoning.clone() },
+        // Round-trip firma thinking Anthropic: solo sugli assistant.
+        thinking_signature: if m.is_human { None } else { m.thinking_signature.clone() },
         ..Default::default()
     }]
 }
@@ -6249,7 +6295,18 @@ fn extract_tool_uses(blocks: &[Value]) -> Vec<ToolUse> {
             let id = b.get("id").and_then(Value::as_str)?.to_string();
             let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
             let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
-            Some(ToolUse { id, name, input })
+            // Firma PER-CALL (Gemini 3): estratta dal blocco tool_use per essere
+            // ri-passata sulla stessa functionCall nel round-trip verso il gateway.
+            let thought_signature = b
+                .get("thought_signature")
+                .and_then(Value::as_str)
+                .map(String::from);
+            Some(ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            })
         })
         .collect()
 }

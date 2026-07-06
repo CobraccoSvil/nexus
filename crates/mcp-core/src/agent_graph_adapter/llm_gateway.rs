@@ -204,6 +204,7 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning: None,
+                thinking_signature: None,
             });
         }
     }
@@ -226,6 +227,11 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
                         // arguments e' una STRINGA JSON (contratto OpenAI).
                         arguments: serde_json::to_string(&tc.input).unwrap_or_else(|_| "{}".to_string()),
                     },
+                    // ROUND-TRIP firma PER-CALL (Gemini 3): la thoughtSignature
+                    // catturata in risposta viaggia allegata alla ToolUse e va
+                    // ri-passata identica sulla stessa functionCall, altrimenti
+                    // HTTP 400 INVALID_ARGUMENT. Inerte per gli altri provider.
+                    thought_signature: tc.thought_signature.clone(),
                 })
                 .collect::<Vec<_>>()
         });
@@ -239,6 +245,10 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
             // server lo inoltra SOLO al dialetto DeepSeek; per gli altri provider
             // resta inerte. Speculare al thinking_signature Anthropic.
             reasoning: m.reasoning.clone(),
+            // ROUND-TRIP thinking_signature (Anthropic, per-messaggio): la firma
+            // del blocco thinking VA ri-passata nei turni con tool (HTTP 400
+            // senza). Il server la inoltra SOLO ad Anthropic; inerte altrove.
+            thinking_signature: m.thinking_signature.clone(),
         });
     }
 
@@ -394,6 +404,9 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
             name: tc.function.name,
             // arguments e' una STRINGA JSON: la parsiamo in Value; se vuota/invalida -> {}.
             input: serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({})),
+            // Firma PER-CALL (Gemini 3): la conserviamo sulla ToolUse cosi'
+            // fluisce nella history e viene ri-passata nel turno successivo.
+            thought_signature: tc.thought_signature,
         })
         .collect();
 
@@ -424,6 +437,9 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
         // Pensiero aggregato dal gateway (prima SCARTATO -> ThinkingBlock vuoto):
         // GwResponse.reasoning esiste, qui smettiamo solo di buttarlo (regola L).
         reasoning: resp.reasoning,
+        // Firma thinking Anthropic (per-messaggio): ora LETTA e propagata nella
+        // history per il round-trip (prima scartata: GwResponse era dead_code).
+        thinking_signature: resp.thinking_signature,
     }
 }
 
@@ -591,6 +607,7 @@ fn replay_response_for_group(group: &[ReplayStep], req: &LlmRequest) -> LlmRespo
             id: format!("replay-{}", s.step_index),
             name: s.tool_name.clone(),
             input: s.tool_input.clone(),
+            thought_signature: None,
         })
         .collect();
     let assistant_content = assistant_content_for_tool_calls("", &tool_calls);
@@ -612,6 +629,7 @@ fn replay_response_for_group(group: &[ReplayStep], req: &LlmRequest) -> LlmRespo
         assistant_content,
         stop_reason: Some("tool_use".to_string()),
         reasoning: None,
+        thinking_signature: None,
     }
 }
 
@@ -629,12 +647,18 @@ fn assistant_content_for_tool_calls(text: &str, tool_calls: &[ToolUse]) -> Vec<V
         blocks.push(json!({ "type": "text", "text": text }));
     }
     for tc in tool_calls {
-        blocks.push(json!({
+        let mut block = json!({
             "type": "tool_use",
             "id": tc.id,
             "name": tc.name,
             "input": tc.input,
-        }));
+        });
+        // Firma PER-CALL (Gemini 3): inclusa nel blocco tool_use SOLO se presente,
+        // cosi' `ContentBlock::ToolUse` la conserva e la history la ri-passa.
+        if let Some(sig) = &tc.thought_signature {
+            block["thought_signature"] = json!(sig);
+        }
+        blocks.push(block);
     }
     blocks
 }
@@ -997,6 +1021,7 @@ mistral (cooldown billing, 600s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}";
                     name: "edit_file".to_string(),
                     arguments: r#"{"path":"a.rs","content":"x"}"#.to_string(),
                 },
+                thought_signature: None,
             }]),
             usage: GwUsage {
                 input_tokens: 10,
@@ -1133,9 +1158,11 @@ mistral (cooldown billing, 600s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}";
                         id: "call_X".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "a.rs"}),
+                        thought_signature: None,
                     }]),
                     tool_call_id: None,
                     reasoning: None,
+                    thinking_signature: None,
                 },
                 LlmMessage {
                     role: "tool".to_string(),
@@ -1143,6 +1170,7 @@ mistral (cooldown billing, 600s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}";
                     tool_calls: None,
                     tool_call_id: Some("call_X".to_string()),
                     reasoning: None,
+                    thinking_signature: None,
                 },
             ],
             ..Default::default()

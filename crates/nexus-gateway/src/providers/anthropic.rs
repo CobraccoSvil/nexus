@@ -761,6 +761,9 @@ fn from_anthropic_message(
                         name,
                         arguments: serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()),
                     },
+                    // Anthropic firma il blocco thinking a livello di messaggio
+                    // (`thinking_signature`), non per-call.
+                    thought_signature: None,
                 });
             }
             AnthropicRespBlock::Other => {}
@@ -1324,6 +1327,7 @@ mod tests {
                 name: "do_thing".to_string(),
                 arguments: r#"{"a":1}"#.to_string(),
             },
+            thought_signature: None,
         }]);
         let req = LlmRequest {
             model: "claude-x".to_string(),
@@ -1699,6 +1703,7 @@ mod tests {
                 name: "do_thing".to_string(),
                 arguments: r#"{"a":1}"#.to_string(),
             },
+            thought_signature: None,
         }]);
         let req = LlmRequest {
             model: "claude-x".to_string(),
@@ -1737,6 +1742,7 @@ mod tests {
                 name: "f".to_string(),
                 arguments: "{}".to_string(),
             },
+            thought_signature: None,
         }]);
         let req = LlmRequest {
             model: "claude-x".to_string(),

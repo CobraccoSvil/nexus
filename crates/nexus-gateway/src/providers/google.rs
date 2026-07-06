@@ -1435,7 +1435,11 @@ fn tool_result_to_part(
 
 /// Costruisce il content `role="model"` per un assistant con tool-call: una part
 /// `functionCall` per ciascuna call (parita' Python ~807-817), preceduta
-/// dall'eventuale testo. La thought_signature va sulla PRIMA part del turno.
+/// dall'eventuale testo. Su Gemini 3 la `thoughtSignature` e' PER-CALL: va
+/// riattaccata alla SUA part `functionCall` (regola H/M), altrimenti HTTP 400
+/// INVALID_ARGUMENT "Function call is missing a thought_signature". La firma a
+/// livello di turno (`msg.thinking_signature`, pattern Anthropic / thought-text)
+/// resta il fallback sulla PRIMA part quando questa non e' gia' firmata per-call.
 /// Estratto da [`build_google_contents`].
 fn assistant_tool_call_content(msg: &crate::types::LlmMessage) -> GoogleContent {
     let mut parts: Vec<GooglePart> = Vec::new();
@@ -1450,13 +1454,20 @@ fn assistant_tool_call_content(msg: &crate::types::LlmMessage) -> GoogleContent 
         // in `args` (parita' col mapping Anthropic ~606-608).
         let args: serde_json::Value =
             serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
-        parts.push(GooglePart::function_call(tc.function.name.clone(), args));
+        let mut part = GooglePart::function_call(tc.function.name.clone(), args);
+        // Firma PER-CALL: ogni functionCall ri-passa la propria thoughtSignature.
+        part.thought_signature = tc.thought_signature.clone();
+        parts.push(part);
     }
     if parts.is_empty() {
         parts.push(GooglePart::text(String::new()));
     }
+    // Fallback a livello di turno: solo se la PRIMA part non porta gia' una
+    // firma per-call (es. testo-thought che precede le call, o parita' Anthropic).
     if let Some(first) = parts.first_mut() {
-        first.thought_signature = msg.thinking_signature.clone();
+        if first.thought_signature.is_none() {
+            first.thought_signature = msg.thinking_signature.clone();
+        }
     }
     GoogleContent {
         role: Some("model".to_string()),
@@ -1878,6 +1889,14 @@ fn collect_candidate_parts(candidate: Option<&GoogleCandidate>) -> CandidatePart
                     // Anthropic ~761): serializziamo l'oggetto args.
                     arguments: function_args_to_string(&fc.args),
                 },
+                // Gemini 3 lega la thoughtSignature alla SINGOLA functionCall:
+                // va catturata sulla SUA part (non a livello di turno) e
+                // ri-passata identica nel round-trip, altrimenti HTTP 400.
+                thought_signature: part
+                    .thought_signature
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .cloned(),
             });
             continue;
         }
@@ -3092,6 +3111,74 @@ mod tests {
     }
 
     #[test]
+    fn thought_signature_per_call_su_functioncall_rispettiva() {
+        // REGRESSIONE bug Gemini 3 (HTTP 400 "Function call is missing a
+        // thought_signature in functionCall parts"): con PIU' tool-call ogni
+        // functionCall deve ri-passare la SUA thoughtSignature sulla SUA part,
+        // non tutte sulla prima. Prima del fix la firma finiva solo sulla prima
+        // part (pattern Anthropic per-messaggio) e le altre functionCall
+        // restavano senza -> 400.
+        let assistant = LlmMessage {
+            role: "assistant".to_string(),
+            content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(vec![
+                LlmToolCall {
+                    id: "c1".to_string(),
+                    kind: "function".to_string(),
+                    function: ToolFunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    thought_signature: Some("sigA".to_string()),
+                },
+                LlmToolCall {
+                    id: "c2".to_string(),
+                    kind: "function".to_string(),
+                    function: ToolFunctionCall {
+                        name: "dispatch_subagent".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    thought_signature: Some("sigB".to_string()),
+                },
+            ]),
+            name: None,
+            thinking_signature: None,
+            reasoning: None,
+        };
+        let json =
+            serde_json::to_value(build_request_body(&req_with(assistant), GoogleThinking::Absent))
+                .unwrap();
+        let parts = &json["contents"][0]["parts"];
+        // Ogni functionCall porta la propria signature sulla propria part.
+        assert_eq!(parts[0]["functionCall"]["name"], "read_file");
+        assert_eq!(parts[0]["thoughtSignature"], "sigA");
+        assert_eq!(parts[1]["functionCall"]["name"], "dispatch_subagent");
+        assert_eq!(parts[1]["thoughtSignature"], "sigB");
+    }
+
+    #[test]
+    fn parsing_cattura_thought_signature_per_functioncall() {
+        // La thoughtSignature di una part `functionCall` in risposta deve finire
+        // sulla tool-call corrispondente (per-call), non solo a livello messaggio.
+        let raw = r#"{
+            "candidates": [{
+                "content": {"parts": [
+                    {"functionCall": {"name": "dispatch_subagent", "args": {}}, "thoughtSignature": "sig-fc"}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+        }"#;
+        let parsed: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let resp = from_generate_response(parsed, "gemini-x".to_string(), 0);
+        let tcs = resp.tool_calls.expect("tool_calls presenti");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "dispatch_subagent");
+        assert_eq!(tcs[0].thought_signature.as_deref(), Some("sig-fc"));
+    }
+
+    #[test]
     fn deserializza_response_con_thought_e_signature() {
         let raw = r#"{
             "candidates": [{
@@ -3486,6 +3573,7 @@ mod tests {
                 name: "read_file".to_string(),
                 arguments: r#"{"path":"x.rs"}"#.to_string(),
             },
+            thought_signature: None,
         }]);
         let req = req_with_tools(vec![a], true);
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
@@ -3509,6 +3597,7 @@ mod tests {
                 name: "read_file".to_string(),
                 arguments: "{}".to_string(),
             },
+            thought_signature: None,
         }]);
         let mut tool = msg("tool", "contenuto del file");
         tool.tool_call_id = Some("call_x".to_string());
@@ -3655,6 +3744,7 @@ mod tests {
                         name: (*name).to_string(),
                         arguments: "{}".to_string(),
                     },
+                    thought_signature: None,
                 })
                 .collect(),
         );

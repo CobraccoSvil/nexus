@@ -1017,9 +1017,11 @@ mod tests {
                 id: "c1".into(),
                 name: "write_file".into(),
                 input: json!({"path": "src/main.tsx"}),
+                thought_signature: None,
             }]),
             tool_calls: vec![],
             reasoning: None,
+            thinking_signature: None,
         }
     }
 
@@ -1556,6 +1558,7 @@ mod golden {
                                     id: format!("c{i}"),
                                     name: name.to_string(),
                                     input: json!({}),
+                                    thought_signature: None,
                                 });
                             }
                         }
@@ -1564,6 +1567,7 @@ mod golden {
                         content: MessageContent::Blocks(blocks),
                         tool_calls: vec![],
                         reasoning: None,
+                        thinking_signature: None,
                     });
                 } else if role == "user" || role == "human" {
                     let c = m.get("content").and_then(Value::as_str).unwrap_or("");

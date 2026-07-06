@@ -159,6 +159,7 @@ impl NeuralCoreClient {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning: None,
+                thinking_signature: None,
             }],
             pin_provider: Some(provider.to_string()),
             metadata: GwMetadata {
@@ -227,6 +228,7 @@ impl NeuralCoreClient {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning: None,
+                thinking_signature: None,
             });
         }
         all_messages.extend(messages);
@@ -530,6 +532,7 @@ fn gw_message_from_value(v: Value) -> GwMessage {
         tool_calls,
         tool_call_id,
         reasoning,
+        thinking_signature: None,
     }
 }
 
@@ -614,6 +617,7 @@ mod gateway_mapping_tests {
                 name: "nexus_probe_tool".to_string(),
                 arguments: r#"{"ok":true}"#.to_string(),
             },
+            thought_signature: None,
         }]);
         let v = agent_turn_value_from_gw("anthropic", "claude-x", &resp);
         // model_health_probe::evaluate_tool_probe: stop_reason + tool_use_blocks[].name.

@@ -1357,6 +1357,7 @@ fn history_entry_to_message(v: &serde_json::Value) -> Option<Message> {
             tool_calls: Vec::new(),
             // Ricostruzione da JSON minimale (role/content): nessun reasoning.
             reasoning: None,
+            thinking_signature: None,
         }),
         "tool" => {
             let tool_call_id = obj
@@ -2607,8 +2608,10 @@ mod tests {
                         id: "t1".to_string(),
                         name: "read_file".to_string(),
                         input: json!({}),
+                        thought_signature: None,
                     }],
                     reasoning: None,
+                    thinking_signature: None,
                 },
                 // Forma Anthropic: un edit_file inline (mutativo) -> produced_work.
                 Message::Ai {
@@ -2616,9 +2619,11 @@ mod tests {
                         id: "t2".to_string(),
                         name: "edit_file".to_string(),
                         input: json!({}),
+                        thought_signature: None,
                     }]),
                     tool_calls: vec![],
                     reasoning: None,
+                    thinking_signature: None,
                 },
             ],
             ..Default::default()
@@ -2639,6 +2644,7 @@ mod tests {
                 content: nexus_agent_graph::state::MessageContent::text("risposta testuale"),
                 tool_calls: vec![],
                 reasoning: None,
+                thinking_signature: None,
             }],
             ..Default::default()
         };
@@ -2748,8 +2754,10 @@ mod tests {
                     id: "t".to_string(),
                     name: "write_file".to_string(),
                     input: json!({}),
+                    thought_signature: None,
                 }],
                 reasoning: None,
+                thinking_signature: None,
             }],
             ..Default::default()
         };

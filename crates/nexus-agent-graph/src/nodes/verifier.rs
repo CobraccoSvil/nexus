@@ -1019,9 +1019,11 @@ mod tests {
                 id: "c1".into(),
                 name: "write_file".into(),
                 input: json!({"path": "src/main.tsx"}),
+                thought_signature: None,
             }]),
             tool_calls: vec![],
             reasoning: None,
+            thinking_signature: None,
         }
     }
 

@@ -444,6 +444,7 @@ impl TodoRunnerNode {
             id: uuid::Uuid::new_v4().to_string(),
             name: "dispatch_subagents".to_string(),
             input: json!({ "tasks": tasks, "max_parallel": 1 }),
+            thought_signature: None,
         };
 
         // Parita' 1:1 col `try/except Exception` di `todo_runner_node.py:179-190`,
@@ -544,6 +545,7 @@ impl TodoRunnerNode {
             id: uuid::Uuid::new_v4().to_string(),
             name: "dispatch_subagents".to_string(),
             input: json!({ "tasks": tasks }),
+            thought_signature: None,
         };
         let outcome = match self.tools.execute(call, mode).await {
             Ok(o) => o,

@@ -88,6 +88,8 @@ fn parse_xml_tool_calls(content: &str) -> Option<Vec<LlmToolCall>> {
                 name: tool_name.to_string(),
                 arguments,
             },
+            // Firma per-call specifica di Gemini: assente su DeepSeek.
+            thought_signature: None,
         });
     }
 
@@ -529,6 +531,7 @@ mod tests {
                 name: "native".to_string(),
                 arguments: "{}".to_string(),
             },
+            thought_signature: None,
         }]);
         let out = fixup_response(resp);
         // Tool-call native presenti: il content XML NON viene ripulito.

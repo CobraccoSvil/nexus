@@ -84,6 +84,13 @@ pub struct LlmMessage {
     /// wire `reasoning_content`). `None` su tutti gli altri ruoli/provider.
     /// Additivo (`Default`): retrocompatibile coi call site esistenti.
     pub reasoning: Option<String>,
+    /// Firma opaca del blocco `thinking` (Anthropic) di un turno `assistant`
+    /// precedente, da RI-PASSARE nei turni con tool: l'API la esige o risponde
+    /// HTTP 400. A livello di MESSAGGIO (una firma per blocco thinking del turno),
+    /// gemella del `reasoning` DeepSeek. Il gateway concreto la inoltra solo ad
+    /// Anthropic (`GwMessage::thinking_signature` -> `types::LlmMessage`). `None`
+    /// per gli altri ruoli/provider. Additivo (`Default`).
+    pub thinking_signature: Option<String>,
 }
 
 /// Richiesta minimale al gateway LLM.
@@ -214,6 +221,11 @@ pub struct LlmResponse {
     /// non lo riporta. L'executor lo emette come `SseEvent::ThinkingDelta` per
     /// mostrare il pensiero del modello in chat (visibilita' pre-porting).
     pub reasoning: Option<String>,
+    /// Firma opaca del blocco `thinking` (Anthropic) del turno, riportata dal
+    /// gateway per essere RI-PASSATA nel turno successivo con tool (HTTP 400
+    /// senza). Gemella per-messaggio del `reasoning`; `None` per gli altri
+    /// provider. Additivo (`Default`).
+    pub thinking_signature: Option<String>,
 }
 
 /// Astrazione del gateway LLM. mcp-core la implementera' delegando a

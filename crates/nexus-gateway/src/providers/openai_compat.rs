@@ -822,6 +822,9 @@ fn from_chat_completion(
                     name: tc.function.name,
                     arguments: tc.function.arguments,
                 },
+                // Firma per-call specifica di Gemini: assente sui provider
+                // OpenAI-compatibili.
+                thought_signature: None,
             })
             .collect()
     });

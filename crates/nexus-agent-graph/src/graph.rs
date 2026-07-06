@@ -458,6 +458,7 @@ mod tests {
                 id: "tc-1".to_string(),
                 name: "write_file".to_string(),
                 input: json!({"path": "src/main.rs", "content": "fn main() {}"}),
+                thought_signature: None,
             }],
             usage: LlmUsage::default(),
             stop_reason: Some("tool_use".to_string()),

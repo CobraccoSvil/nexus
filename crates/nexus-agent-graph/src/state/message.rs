@@ -47,6 +47,14 @@ pub enum Message {
         /// dello stato persistito.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
+        /// Firma opaca del blocco `thinking` (Anthropic) del turno, da RI-PASSARE
+        /// nei turni con tool (HTTP 400 senza). A livello di MESSAGGIO (una firma
+        /// per blocco thinking), gemella del `reasoning` DeepSeek: viaggia nella
+        /// history (`Message::Ai`) e nel round-trip verso il gateway. Additivo
+        /// (`serde(default)`): retrocompatibile con lo stato persistito e `None`
+        /// per gli altri provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking_signature: Option<String>,
     },
     /// Risultato dell'esecuzione di un tool, riferito alla richiesta via id.
     #[serde(rename = "tool")]
@@ -118,6 +126,14 @@ pub enum ContentBlock {
         name: String,
         /// Argomenti del tool (JSON arbitrario).
         input: Value,
+        /// Firma opaca di reasoning (`thoughtSignature`) di Gemini 3, PER-CALL.
+        /// La forma a BLOCCHI (`anthropic_content`) e' quella autoritativa della
+        /// history del motore: la firma DEVE viaggiare qui per essere ri-passata
+        /// sulla stessa `functionCall` nel round-trip (pena HTTP 400
+        /// INVALID_ARGUMENT). Additivo (`serde(default)`): retrocompatibile con
+        /// lo stato persistito e `None` per gli altri provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     /// Risultato di un tool inline (Anthropic-style).
     ToolResult {
@@ -147,6 +163,16 @@ pub struct ToolUse {
     pub name: String,
     /// Argomenti del tool (JSON arbitrario).
     pub input: Value,
+    /// Firma opaca di reasoning (`thoughtSignature`) che Gemini 3 emette PER
+    /// OGNI tool-call e IMPONE di ri-passare sulla rispettiva `functionCall` nei
+    /// turni successivi, altrimenti HTTP 400 INVALID_ARGUMENT ("Function call is
+    /// missing a thought_signature"). A differenza del `reasoning` DeepSeek (per
+    /// messaggio) qui la firma e' PER-CALL: viaggia allegata alla singola
+    /// `ToolUse` cosi' fluisce naturalmente nella history (`Message::Ai`) e nel
+    /// round-trip verso il gateway. Additivo (`serde(default)`): retrocompatibile
+    /// con lo stato persistito e `None` per tutti gli altri provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[cfg(test)]
@@ -170,6 +196,7 @@ mod tests {
                 id: "t1".to_string(),
                 name: "edit_file".to_string(),
                 input: Value::Null,
+                thought_signature: None,
             },
             ContentBlock::Text {
                 text: "secondo".to_string(),

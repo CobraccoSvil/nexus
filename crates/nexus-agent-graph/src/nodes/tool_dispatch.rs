@@ -384,6 +384,7 @@ impl ToolDispatchNode {
             id: tool_use_id.clone(),
             name: name.to_string(),
             input,
+            thought_signature: None,
         };
         match self.tools.execute(call, mode).await {
             Ok(outcome) => {
