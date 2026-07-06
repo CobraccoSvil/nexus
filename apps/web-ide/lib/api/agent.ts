@@ -181,6 +181,19 @@ export async function getProviderModels(provider: string): Promise<ProviderModel
   return fetchJsonNoAuth(`${NEURAL_BASE}/providers/${provider}/models`);
 }
 
+export interface ProvidersResponse {
+  status: string;
+  providers: string[];
+}
+
+/** Elenco dei provider attivi dal catalog DB (regola G): controparte di
+ *  getProviderModels. Alimenta il dropdown provider della chat cosi' che un
+ *  provider aggiunto o rimosso dal catalog/routing matrix si rifletta senza
+ *  liste hardcoded lato client. */
+export async function getProviders(): Promise<ProvidersResponse> {
+  return fetchJsonNoAuth(`${NEURAL_BASE}/providers`);
+}
+
 /** Stati terminali di un run agente (allineati al backend agent_runs.status:
  *  `AgentRunStatus::is_terminal`, punto unico regola L — l'omologo in
  *  use-chat/helpers.ts delega a questa funzione). */

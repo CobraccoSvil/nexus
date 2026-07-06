@@ -21,6 +21,9 @@ export interface ComposerProps {
   selectedModel: string;
   onModelChange: (value: string) => void;
   providerModels: string[];
+  /** Provider attivi dal catalog DB (regola G): niente elenco hardcoded.
+   *  Vuoto = solo "Auto" (caso vuoto, nessun fallback hardcoded). */
+  availableProviders: string[];
   runProvider?: string | null;
   runModel?: string | null;
   automationMode: "study" | "confirm" | "automatic";
@@ -64,6 +67,7 @@ export function Composer({
   selectedModel,
   onModelChange,
   providerModels,
+  availableProviders,
   runProvider = null,
   runModel = null,
   automationMode,
@@ -121,14 +125,32 @@ export function Composer({
     }
   };
 
-  const PROVIDER_OPTIONS = [
-    { value: "auto",      label: "⚡ Auto" },
-    { value: "openai",    label: "OpenAI" },
-    { value: "anthropic", label: "Anthropic" },
-    { value: "google",    label: "Google" },
-    { value: "deepseek",  label: "DeepSeek" },
-    { value: "mistral",   label: "Mistral" },
-  ] as const;
+  // Etichette "carine" per i provider noti: SOLO cosmesi, non governano quali
+  // provider esistono (la fonte e' availableProviders dal catalog DB, regola G).
+  // Un provider nuovo non mappato appare comunque, con label capitalizzato.
+  const PROVIDER_LABELS: Record<string, string> = {
+    openai: "OpenAI",
+    anthropic: "Anthropic",
+    google: "Google",
+    deepseek: "DeepSeek",
+    mistral: "Mistral",
+  };
+  const providerLabel = (value: string) =>
+    PROVIDER_LABELS[value] ?? value.charAt(0).toUpperCase() + value.slice(1);
+
+  // Opzioni dropdown: "Auto" (routing intelligente, sempre presente) + i provider
+  // attivi dal DB. Se il provider selezionato non e' (ancora) nella lista — fetch
+  // in corso o preferenza salvata su un provider poi rimosso — lo includiamo
+  // comunque per non lasciare il <select> con un value orfano.
+  const providerValues = ["auto", ...availableProviders];
+  if (selectedProvider !== "auto" && !providerValues.includes(selectedProvider)) {
+    providerValues.push(selectedProvider);
+  }
+  const PROVIDER_OPTIONS = providerValues.map((value) =>
+    value === "auto"
+      ? { value, label: "⚡ Auto" }
+      : { value, label: providerLabel(value) },
+  );
 
   const selectStyle = {
     borderRadius: 999,

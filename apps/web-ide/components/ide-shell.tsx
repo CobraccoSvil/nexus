@@ -20,6 +20,7 @@ import {
   getProjectProblems,
   getRunConfigs,
   getProviderModels,
+  getProviders,
   getWorkbenchState,
   openProject,
   analyzeProject,
@@ -488,9 +489,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       const m = localStorage.getItem("nexus:chatModel");
       const a = localStorage.getItem("nexus:chatAutomationMode") as "study" | "confirm" | "automatic" | null;
       const s = localStorage.getItem("nexus:chatSupervisorMode") as "none" | "anomaly" | "interleaved" | "continuous" | null;
-      // Accetta solo valori validi — resetta a "auto" se era rimasto un provider fisso
-      const validProviders = ["auto", "anthropic", "openai", "google"];
-      if (p && validProviders.includes(p)) setChatProvider(p); else localStorage.removeItem("nexus:chatProvider");
+      // Ripristina il provider salvato: niente lista hardcoded (regola G). Le
+      // opzioni valide arrivano dal catalog DB (availableProviders) e il composer
+      // mostra comunque, senza rompersi, un pin non piu' presente nel catalog.
+      if (p) setChatProvider(p);
       if (m) setChatModel(m);
       if (a) setChatAutomationMode(a);
       if (s) setChatSupervisorMode(s);
@@ -498,7 +500,25 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   }, []);
   const [showMemory, setShowMemory] = useState(false);
   const [chatProviderModels, setChatProviderModels] = useState<string[]>([]);
+  // Provider selezionabili nel dropdown chat: fetch dal catalog DB (regola G),
+  // niente elenco hardcoded. Vuoto = DB down/catalog vuoto -> il composer mostra
+  // solo "Auto" (caso vuoto gestito, nessun fallback hardcoded).
+  const [availableProviders, setAvailableProviders] = useState<string[]>([]);
   const [aiTraces, setAiTraces] = useState<AITraceEvent[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getProviders()
+      .then((r) => {
+        if (cancelled) return;
+        setAvailableProviders(r.providers ?? []);
+      })
+      .catch(() => {
+        // Rete/DB non raggiungibili: lista vuota, il dropdown resta su "Auto".
+        // Nessun fallback hardcoded (regola G).
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   // Profili
   const profilesMgr = useProfiles();
@@ -1553,6 +1573,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               selectedModel={chatModel}
               setSelectedModel={(v) => { setChatModel(v); try { localStorage.setItem("nexus:chatModel", v); } catch {} }}
               providerModels={chatProviderModels}
+              availableProviders={availableProviders}
               automationMode={chatAutomationMode}
               setAutomationMode={(v) => { setChatAutomationMode(v); try { localStorage.setItem("nexus:chatAutomationMode", v); } catch {} }}
               supervisorMode={chatSupervisorMode}

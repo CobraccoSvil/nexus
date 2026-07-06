@@ -109,6 +109,7 @@ export function ChatPanel({
   selectedModel,
   setSelectedModel,
   providerModels,
+  availableProviders,
   automationMode,
   setAutomationMode,
   supervisorMode = "none",
@@ -139,6 +140,7 @@ export function ChatPanel({
   selectedModel: string;
   setSelectedModel: (v: string) => void;
   providerModels: string[];
+  availableProviders: string[];
   automationMode: "study" | "confirm" | "automatic";
   setAutomationMode: (v: "study" | "confirm" | "automatic") => void;
   supervisorMode?: "none" | "anomaly" | "interleaved" | "continuous";
@@ -1455,6 +1457,7 @@ export function ChatPanel({
         selectedModel={selectedModel}
         onModelChange={setSelectedModel}
         providerModels={providerModels}
+        availableProviders={availableProviders}
         runProvider={agentRun?.provider ?? null}
         runModel={agentRun?.model ?? null}
         automationMode={automationMode}
