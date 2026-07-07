@@ -625,212 +625,97 @@ async fn connect_neural_core_with_retry(neural_core_url: &str) -> anyhow::Result
     }
 }
 
-#[tokio::main(worker_threads = 32)]
-async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+/// Cache di routing e registro porte inizializzate all'avvio, raggruppate per
+/// non moltiplicare i valori di ritorno di `init_routing_and_port_caches`
+/// (regola: helper <=6 parametri, niente tuple lunghe illeggibili).
+/// - `routing_matrix`/`thresholds`/`intent`/`slots` vengono passate/mosse
+///   nell'Orchestrator (vedi `build_orchestrator`).
+/// - `port_registry` sopravvive fino alla costruzione di `AppState`.
+struct RoutingAndPortCaches {
+    routing_matrix: routing_matrix::RoutingMatrixCache,
+    thresholds: routing_config::RoutingThresholdsCache,
+    intent: routing_config::IntentCapabilityCache,
+    slots: routing_slots::SlotsRoutingMatrixCache,
+    port_registry: port_registry::PortRegistryCache,
+}
 
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-        ))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable".to_string()
-    });
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let neural_core_url =
-        std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
-
-    nexus_tool_catalog::NexusToolCatalog::init_global();
-    if let Some(cat) = nexus_tool_catalog::NexusToolCatalog::global() {
-        tracing::info!(
-            "NexusToolCatalog initialized: {} tool specs ({} implemented)",
-            cat.len(),
-            cat.implemented_count()
-        );
-    }
-
-    let db = db::init_pool(&database_url).await?;
-
-    // Porta HTTP dal DB (regola G: unica fonte di verita', niente env/hardcoded).
-    // Risolta subito dopo il pool: se il DB e' down panica qui (coerente con
-    // RoutingMatrixCache::init poco sotto).
-    let mcp_http_port = nexus_auth::resolve_port(&db, "mcp_core_http_port").await;
-
-    // Inizializza NexusBridge con pool DB (Fase 6 + persistenza Q-values):
-    // - Router Q-Learning con persistenza asincrona su nexus_q_values
-    // - Caricamento Q-values esistenti in background (non blocca l'avvio)
-    // - Non invasivo: se qualche componente fallisce, il bridge resta non
-    //   inizializzato e i siti di chiamata fanno fallback silenzioso.
-    nexus_bridge::NexusBridge::init_global_with_pool(Arc::new(db.clone())).await;
-
-    // NOTA: `spawn_reattach_monitor` (Unix/Windows) e' stata estratta a livello
-    // di modulo (sopra `fn main`) per contenere la lunghezza/complessita di
-    // `main`. Comportamento invariato: e' un `fn` item (nessuna cattura
-    // dell'ambiente) chiamato solo da qui.
-
-    // Riconcilia i processi lasciati in stato 'running'/'starting' da un riavvio precedente.
-    // - PID non più vivo → status=failed
-    // - PID ancora vivo → rimane running, si rilancia un task di monitoring (OS-specifico)
-    //
-    // NOTA (separazione DB): `agent_processes` e' MIGRATA al DB per-progetto. Questo
-    // blocco opera sul META (storico / progetti NON migrati); a flag ON il meta e'
-    // quasi vuoto -> no-op benigno. La riconciliazione dei processi per-progetto a
-    // flag ON e' gestita dal blocco NUOVO (mark-only) DOPO init_global_pools, che
-    // itera list_all_project_ids + project_data_pool_from. NON duplicare qui.
-    {
-        use sqlx::Row;
-        let stale = sqlx::query(
-            "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')",
-        )
-        .fetch_all(&db)
-        .await
-        .unwrap_or_default();
-
-        for row in stale {
-            let id: uuid::Uuid = row.get("id");
-            let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
-            // Liveness cross-platform: punto unico process_util::process_alive
-            // (Unix: /proc/{pid}; Windows: OpenProcess). Sostituisce il vecchio
-            // `kill -0`, no-op silenzioso su Windows.
-            let still_alive = match pid {
-                Some(p) if p > 0 => crate::process_util::process_alive(p as u32),
-                _ => false,
-            };
-
-            if !still_alive {
-                let _ = sqlx::query(
-                    "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1",
-                )
-                .bind(id)
-                .execute(&db)
-                .await;
-                tracing::info!("Stale process {} (pid={:?}) marked failed", id, pid);
-            } else {
-                tracing::info!(
-                    "Process {} (pid={:?}) still running, re-attaching monitor",
-                    id,
-                    pid
-                );
-                // still_alive=true implica pid.is_some(); difensivamente saltiamo
-                // la re-attach se la condizione viene violata in futuro.
-                let Some(pid_val) = pid else {
-                    tracing::warn!("Process {} alive ma pid=None: skip re-attach", id);
-                    continue;
-                };
-                // Il monitoring di re-attach e' OS-specifico: su Unix segue stdout+stderr
-                // via /proc/{pid}/fd/1,2 con `tail`; su Windows /proc non esiste, quindi
-                // ci si limita a poll della liveness. Punto unico: spawn_reattach_monitor.
-                spawn_reattach_monitor(id, pid_val, db.clone());
-            }
-        }
-    }
-
-    // NOTA: il recovery dei run 'running' orfani (reap_orphaned_runs_at_boot) e'
-    // stato SPOSTATO dopo `init_global_pools` (vedi blocco piu' sotto). Con la
-    // separazione DB i run agentici vivono nei DB per-progetto; qui, prima
-    // dell'inizializzazione del registry globale dei pool, `project_data_pool_from`
-    // ricadeva sul meta-DB e l'UPDATE non toccava mai i run per-progetto -> run
-    // 'running' zombie sopravvissuti al restart (causa radice del bug "la chat
-    // resta cieca sul run finche' non fai refresh": la subscription SSE non
-    // riceve mai `agent_final` perche' il run non diventa terminale). Il cleanup
-    // dei processi 'running'/'starting' e' gia' gestito dal blocco di
-    // riconciliazione PID sopra (kill -0).
-
-    let redis = cache::init_redis(&redis_url).await?;
-
-    // Espone il client Redis a `provider_cooldown` per la persistenza dei
-    // cooldown lunghi (billing/quota). Senza questo, un restart di mcp-core
-    // perderebbe i cooldown in-memory e il LED tornerebbe verde anche se
-    // il provider e' realmente giu' (caso utente "LED openai verde").
-    crate::provider_cooldown::init_redis_client(redis.clone());
-
-    // Espone il pool DB a `provider_cooldown` per la persistenza TTL del billing
-    // cooldown su nexus_provider_health (fonte GIUSTA: ha scadenza, non disabilita
-    // il catalog). Sostituisce l'ex propagazione is_enabled=false/is_active=false.
-    crate::provider_cooldown::init_db_pool(db.clone());
-
-    // Ripristina cooldown billing provider sopravvissuti al riavvio (persistiti su Redis).
-    restore_billing_cooldowns_from_redis(redis.clone()).await;
-
-    // Restore COMPLEMENTARE dal DB persistente (ADR 0020): se Redis e' stato
-    // svuotato/riavviato, il blocco sopra non ripristina nulla e il gate parte
-    // VUOTO -> il primo run dopo il restart "scopre" i provider esausti
-    // chiamandoli (anthropic 400 / openai 429 ad ogni turno). nexus_provider_health
-    // e' la fonte persistente piu' affidabile: riallinea il gate allo stato noto
-    // cosi' il run li salta senza ri-testarli (il polling resta l'unico tester).
-    crate::provider_cooldown::restore_billing_cooldowns_from_db(&db).await;
-
-    let neural_client = connect_neural_core_with_retry(&neural_core_url).await?;
-    let template_cache = prompt_templates::TemplateCache::new();
-
+/// Inizializza le cache di routing (routing matrix, parametri routing, intent
+/// capability, matrice slot-based) e il registro porte, piu' il singleton globale
+/// del build graph. Estratta da `main` (comportamento e ordine di inizializzazione
+/// invariati). Le cache che panicano se il DB e' irraggiungibile (routing matrix,
+/// thresholds, intent) lo fanno qui, coerentemente con il comportamento pre-refactor.
+async fn init_routing_and_port_caches(db: &sqlx::PgPool) -> RoutingAndPortCaches {
     // Inizializza la cache routing matrix (legge da DB + spawn refresh background 60s).
     // Va inizializzata PRIMA di Orchestrator::new perche' viene clonata dentro l'orchestrator.
-    let routing_matrix_cache = routing_matrix::RoutingMatrixCache::init(db.clone()).await;
+    let routing_matrix = routing_matrix::RoutingMatrixCache::init(db.clone()).await;
 
     // Cache parametri routing (mig 0111) e intent capability (mig 0110).
     // Stesso pattern: retry 5x5s + panic se DB irraggiungibile.
-    let routing_thresholds_cache =
-        routing_config::RoutingThresholdsCache::init_thresholds(db.clone()).await;
-    let intent_capability_cache =
+    let thresholds = routing_config::RoutingThresholdsCache::init_thresholds(db.clone()).await;
+    let intent =
         routing_config::IntentCapabilityCache::init_intent_capability(db.clone()).await;
     // Cache matrice slot-based (mig 0133, Livello 4 NLU). Diversamente dalle
     // altre cache, non panica se assente: il routing classico (intent,mode)
     // resta il fallback predefinito quando la matrice slots non e' popolata.
-    let slots_matrix_cache = routing_slots::SlotsRoutingMatrixCache::init(&db).await;
+    let slots = routing_slots::SlotsRoutingMatrixCache::init(db).await;
 
     // Cache registro porte (mig 0114): porte TCP allocate ai progetti.
     // Non panica se tabella vuota (nessuna allocazione al primo avvio).
-    let port_registry_cache = port_registry::PortRegistryCache::init(db.clone()).await;
+    let port_registry = port_registry::PortRegistryCache::init(db.clone()).await;
 
     // ADR 0020: cache build graph (mig 0312). Inizializzata come singleton
     // globale, non panica se DB down (lazy: la prima get_or_compute provera').
     build_graph::BuildGraphCache::init_global(db.clone()).await;
     tracing::info!("build_graph::BuildGraphCache inizializzato (TTL configurabile via settings)");
     // Recovery: sincronizza registro con file .service esistenti su disco.
-    port_registry_cache.startup_recovery().await;
-    // GC periodico: rilascia le allocazioni porta dynamic orfane (nessun
-    // listener, oltre la grace period) lasciate dai tentativi falliti degli
-    // agenti. Intervallo/grace DB-driven con default sicuri.
-    {
-        let db_gc = db.clone();
-        let gc_interval = settings::get_setting(&db, "agent.port_gc.interval_seconds")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(120);
-        let gc_grace = settings::get_setting(&db, "agent.port_gc.grace_seconds")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(180);
-        tokio::spawn(async move {
-            port_registry::port_gc_loop(db_gc, gc_interval, gc_grace).await;
-        });
+    port_registry.startup_recovery().await;
+
+    RoutingAndPortCaches {
+        routing_matrix,
+        thresholds,
+        intent,
+        slots,
+        port_registry,
     }
+}
 
-    // ADR 0028: garanzia del systemd --user manager (cintura race-window).
-    // La garanzia di boot e' la unit --system nexus-user-manager.service; qui
-    // copriamo la finestra in cui mcp-core parte prima che quella oneshot
-    // completi (e ogni restart di mcp-core). Best-effort: non blocca l'avvio.
-    // Solo su Linux/systemd: su Windows non esiste un manager --user da
-    // risuscitare (i servizi sono processi gestiti in agent_processes), quindi
-    // eseguire la catena spawnerebbe systemctl/sudo inesistenti a vuoto.
-    #[cfg(not(windows))]
-    crate::project_workspace::user_manager::ensure_user_manager(&db).await;
+/// GC periodico delle porte: rilascia le allocazioni porta dynamic orfane (nessun
+/// listener, oltre la grace period) lasciate dai tentativi falliti degli agenti.
+/// Intervallo/grace DB-driven con default sicuri. Estratta dalla closure
+/// `tokio::spawn` in `main` (comportamento invariato).
+async fn spawn_port_gc(db: &sqlx::PgPool) {
+    let db_gc = db.clone();
+    let gc_interval = settings::get_setting(db, "agent.port_gc.interval_seconds")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(120);
+    let gc_grace = settings::get_setting(db, "agent.port_gc.grace_seconds")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(180);
+    tokio::spawn(async move {
+        port_registry::port_gc_loop(db_gc, gc_interval, gc_grace).await;
+    });
+}
 
-    // ADR 0017 v2 F8: rimosso `ensure_knowledge_collection` (collection
-    // legacy `knowledge_notes`). La collection unificata `wiki_content` viene
-    // garantita lazily dalle funzioni `vector_memory::ensure_wiki_content_collection`
-    // / `upsert_wiki_content_point` al primo write del re-ingest bootstrap.
-
+/// Costruisce l'Orchestrator: risolve URL/token del Nexus Gateway dal DB (regola
+/// G: niente env/hardcoded per la porta) e, se il gateway e' raggiungibile,
+/// attiva PATH A (gateway), altrimenti PATH B (Brain gRPC). Consuma le cache di
+/// routing (routing matrix/thresholds/intent mosse, slots clonata) e ritorna
+/// anche il registro porte che sopravvive nella `AppState`. Estratta da `main`
+/// (comportamento invariato); la struct di contesto tiene i parametri <=6.
+async fn build_orchestrator(
+    db: &sqlx::PgPool,
+    neural_client: NeuralCoreClient,
+    template_cache: prompt_templates::TemplateCache,
+    caches: RoutingAndPortCaches,
+) -> (Orchestrator, port_registry::PortRegistryCache) {
     // URL gateway dalla porta nel DB (regola G: niente env/hardcoded).
-    let gw_port = nexus_auth::resolve_port(&db, "nexus_gateway_port").await;
+    let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
     let gw_url = format!("http://127.0.0.1:{gw_port}");
     let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
         .unwrap_or_else(|_| "dev-internal-token".to_string());
@@ -838,11 +723,11 @@ async fn main() -> anyhow::Result<()> {
     let orchestrator = {
         let base = Orchestrator::new(
             neural_client,
-            template_cache.clone(),
-            routing_matrix_cache,
-            routing_thresholds_cache,
-            intent_capability_cache,
-            slots_matrix_cache.clone(),
+            template_cache,
+            caches.routing_matrix,
+            caches.thresholds,
+            caches.intent,
+            caches.slots.clone(),
         );
         if nexus_gw.is_healthy().await {
             tracing::info!("Nexus Gateway disponibile su {gw_url} — PATH A attivo");
@@ -852,23 +737,642 @@ async fn main() -> anyhow::Result<()> {
             base
         }
     };
+    (orchestrator, caches.port_registry)
+}
 
-    // Verifica disponibilità sandbox Docker all'avvio e imposta il flag globale
+/// Riconcilia i processi lasciati in stato 'running'/'starting' da un riavvio
+/// precedente (PID non piu' vivo -> status=failed; PID vivo -> resta running e si
+/// rilancia il monitoring OS-specifico). Estratta da `main` (comportamento
+/// invariato). NOTA (separazione DB): `agent_processes` e' MIGRATA al DB per-progetto.
+/// Questo blocco opera sul META (storico / progetti NON migrati); a flag ON il meta
+/// e' quasi vuoto -> no-op benigno. La riconciliazione dei processi per-progetto a
+/// flag ON e' gestita dal blocco NUOVO (mark-only) DOPO init_global_pools, che itera
+/// list_all_project_ids + project_data_pool_from. NON duplicare qui.
+async fn reconcile_stale_processes(db: &sqlx::PgPool) {
+    use sqlx::Row;
+    let stale =
+        sqlx::query("SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')")
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+
+    for row in stale {
+        let id: uuid::Uuid = row.get("id");
+        let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
+        // Liveness cross-platform: punto unico process_util::process_alive
+        // (Unix: /proc/{pid}; Windows: OpenProcess). Sostituisce il vecchio
+        // `kill -0`, no-op silenzioso su Windows.
+        let still_alive = match pid {
+            Some(p) if p > 0 => crate::process_util::process_alive(p as u32),
+            _ => false,
+        };
+
+        if !still_alive {
+            let _ = sqlx::query(
+                "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1",
+            )
+            .bind(id)
+            .execute(db)
+            .await;
+            tracing::info!("Stale process {} (pid={:?}) marked failed", id, pid);
+        } else {
+            tracing::info!(
+                "Process {} (pid={:?}) still running, re-attaching monitor",
+                id,
+                pid
+            );
+            // still_alive=true implica pid.is_some(); difensivamente saltiamo
+            // la re-attach se la condizione viene violata in futuro.
+            let Some(pid_val) = pid else {
+                tracing::warn!("Process {} alive ma pid=None: skip re-attach", id);
+                continue;
+            };
+            // Il monitoring di re-attach e' OS-specifico: su Unix segue stdout+stderr
+            // via /proc/{pid}/fd/1,2 con `tail`; su Windows /proc non esiste, quindi
+            // ci si limita a poll della liveness. Punto unico: spawn_reattach_monitor.
+            spawn_reattach_monitor(id, pid_val, db.clone());
+        }
+    }
+}
+
+/// Avvia tutti i worker fire-and-forget e i loop periodici DOPO la costruzione di
+/// `AppState`, nell'ordine ESATTO richiesto: compattazione vettoriale, seed/reindex
+/// tool, bootstrap/reingest wiki, triple extractor, watcher, chat-note, run-summary,
+/// link/title/code-docs worker, learned instructions, audit writer, catalog sync,
+/// reconciliation policy->catalog, port enforcer, resource linter, config
+/// health/cooldown provider + recovery loop, health probe, watchdog, observer,
+/// process resume, fanin, monitor seed, catalog/model health probe, deepseek balance,
+/// routing matrix auto-promoter, cache cleanup, retention, ToolRunner e AgentRouter
+/// gRPC server. Estratta da `main` per contenerne lunghezza/complessita
+/// (comportamento e ordine invariati). Riceve `&AppState`: ogni worker clona cio'
+/// che gli serve (`state.clone()` / `state.db.clone()` / `state.orchestrator.clone()`).
+async fn spawn_background_workers(state: &AppState) {
+    // L'ordine di avvio e' load-bearing e resta identico al pre-refactor; ogni
+    // gruppo tematico e' un sub-helper coeso (regola L). Le letture settings sono
+    // idempotenti e i valori indipendenti: distribuirle nei rispettivi helper non
+    // cambia il comportamento osservabile (stessi worker, stessi parametri).
+    seed_tools_and_learning(state).await;
+    spawn_wiki_and_learning_workers(state);
+    spawn_security_and_catalog_boot(state);
+    configure_http_and_classifier(state).await;
+    configure_provider_cooldown(state).await;
+    spawn_provider_and_model_probes(state).await;
+    spawn_infra_watchdogs(state);
+    spawn_catalog_and_retention_workers(state).await;
+    spawn_grpc_servers(state).await;
+}
+
+/// Compattazione vettoriale + seed dei tool builtin (await: deve completare prima
+/// del reindex) + reindex semantico Qdrant. Estratto per isolare l'unico `.await`
+/// bloccante mantenendo l'ordine originale (vector_compaction -> seed -> reindex).
+async fn seed_tools_and_learning(state: &AppState) {
+    chat_learning::spawn_vector_compaction_scheduler(state.clone());
+    nexus_builtin::seed_tools_and_server(&state.db).await;
+    // Reindex semantico Qdrant dei tool MCP (fire-and-forget, +30s delay).
+    // Indicizza solo i tool con embedding mancante o hash cambiato.
+    nexus_builtin::spawn_tool_reindex(state.db.clone());
+}
+
+/// Avvia i worker wiki/knowledge fire-and-forget (ADR 0017 v2): bootstrap re-ingest
+/// F3 + recompute link F4, triple extractor F5, vault watcher, chat-note/run-summary,
+/// link/title/code-docs worker e distiller delle learned instructions. Config
+/// DB-driven per ciascuno. Estratto da `spawn_background_workers` (ordine invariato).
+fn spawn_wiki_and_learning_workers(state: &AppState) {
+    // F3: re-ingest one-shot se `wiki_docs` e' vuota (bootstrap dai vault Markdown).
+    tokio::spawn(wiki_bootstrap_reingest_if_empty(state.clone()));
+    // F4: auto-recompute link al primo avvio post-F3 (attende 60s il re-ingest).
+    tokio::spawn(wiki_bootstrap_recompute_links(state.clone()));
+
+    // F5: worker periodico LLM triple extraction (batch DB-driven, cap diurni).
+    wiki::triple_extractor::start_triple_extractor_worker(state.wiki_deps());
+    // TODO 1: watcher bidirezionale vault->DB (docs/.nexus-vault + progetti al boot).
+    wiki::watcher::start_wiki_watcher(std::sync::Arc::new(state.wiki_deps()));
+    // TODO 6+7: chat-note (delay 60s) + run-summary (delay 90s) worker.
+    wiki::chat_note_worker::start_chat_note_worker(std::sync::Arc::new(state.wiki_deps()));
+    wiki::run_summary_worker::start_run_summary_worker(std::sync::Arc::new(state.wiki_deps()));
+    // Worker periodici link + titoli su scope meta E project (cap diurno per-scope).
+    wiki::links_worker::start_links_worker(std::sync::Arc::new(state.wiki_deps()));
+    wiki::title_gen::start_title_gen_worker(std::sync::Arc::new(state.wiki_deps()));
+    // Arricchimento LLM dei wiki_docs kind=code (placeholder -> scheda + embedding).
+    wiki::code_docs_enricher::start_code_docs_enricher_worker(std::sync::Arc::new(state.wiki_deps()));
+    // Distiller learned instructions (livello 2 continuita', mig 0412).
+    learned_instructions::spawn_learned_instructions_distiller(state.clone());
+}
+
+/// Avvia audit writer + catalog sync/reconcile al boot + port enforcer + resource
+/// linter. Il catalog_sync_loop (mig 0182) mantiene ai_price_catalog allineato ai
+/// modelli realmente esposti; la reconciliation policy->catalog al boot (regola H/L)
+/// allinea subito is_enabled evitando che il primo routing scarti modelli capaci.
+/// Estratto da `spawn_background_workers` (ordine e comportamento invariati).
+fn spawn_security_and_catalog_boot(state: &AppState) {
+    // Audit writer: batch INSERT in nexus_resource_audit (ogni 100 eventi o 5s).
+    security::audit::start_writer(state.db.clone());
+
+    let db_sync = state.db.clone();
+    let orch_sync = std::sync::Arc::new(state.orchestrator.clone());
+    tokio::spawn(async move {
+        model_catalog_sync::catalog_sync_loop(db_sync, Some(orch_sync)).await;
+    });
+
+    let db_recon = state.db.clone();
+    tokio::spawn(async move {
+        match model_catalog_sync::reconcile_catalog_with_policy(&db_recon).await {
+            Ok(stats) => tracing::info!(
+                "boot policy reconciliation: enabled={} disabled={}",
+                stats.enabled,
+                stats.disabled,
+            ),
+            Err(e) => tracing::warn!("boot reconcile_catalog_with_policy fallito: {e}"),
+        }
+    });
+
+    // Port enforcer: killa processi di progetto fuori dal bucket porte assegnato.
+    tokio::spawn(security::port_enforcer::port_enforcer_loop(state.clone()));
+    // Resource linter: diagnosi + auto-fix di porte/URL hardcoded (mig 0397/0398).
+    security::resource_linter::spawn_resource_linter(state.clone());
+}
+
+/// Inizializza il flag AtomicBool del classificatore LLM e la config HTTP globale
+/// (timeout, pool) dal DB. Env var come override d'emergenza. Estratto da
+/// `spawn_background_workers` (comportamento invariato).
+async fn configure_http_and_classifier(state: &AppState) {
+    let (s_llm_classifier, s_http_timeout, s_http_pool) = tokio::join!(
+        settings::get_setting(&state.db, "llm_classifier_enabled"),
+        settings::get_setting(&state.db, "http_timeout_secs"),
+        settings::get_setting(&state.db, "http_pool_max"),
+    );
+
+    let llm_classifier_db = setting_flag_enabled(s_llm_classifier.ok().flatten(), true);
+    crate::orchestrator::set_llm_classifier_enabled(llm_classifier_db);
+    tracing::info!(
+        "llm_classifier_enabled: {} (fonte: DB{})",
+        llm_classifier_db,
+        if std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").is_ok() {
+            " + env override attivo"
+        } else {
+            ""
+        }
+    );
+
+    let http_timeout = s_http_timeout
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let http_pool = s_http_pool
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    nexus_http::init_global_config(http_timeout, http_pool);
+}
+
+/// Config health/cooldown provider DB-driven (regola G, mig 0252): legge i timings
+/// (vedi `fetch_provider_health_timings`), li applica come stato globale e avvia il
+/// billing_cooldown_recovery_loop (probe-then-reenable). Estratto da
+/// `spawn_background_workers`.
+async fn configure_provider_cooldown(state: &AppState) {
+    let pht = fetch_provider_health_timings(&state.db).await;
+    provider_cooldown::init_provider_health_timings(pht);
+    tracing::info!(
+        "provider health timings (DB): recovery_interval={}s probe_timeout={}s cooldown_long={}s outage_threshold={}",
+        pht.billing_recovery_interval_s, pht.recovery_probe_timeout_s,
+        pht.cooldown_long_s, pht.outage_threshold,
+    );
+
+    let db_billing = state.db.clone();
+    let orch_billing = std::sync::Arc::new(state.orchestrator.clone());
+    let recov_interval = pht.billing_recovery_interval_s;
+    tokio::spawn(async move {
+        provider_cooldown::billing_cooldown_recovery_loop(orch_billing, db_billing, recov_interval)
+            .await;
+    });
+}
+
+/// Legge i tempi health/cooldown provider dai settings (mig 0252): default storici,
+/// sovrascrive solo le chiavi presenti (setting mancante = invariato). Estratto da
+/// `configure_provider_cooldown`.
+async fn fetch_provider_health_timings(db: &sqlx::PgPool) -> provider_cooldown::ProviderHealthTimings {
+    let mut pht = provider_cooldown::ProviderHealthTimings::default();
+    // Ordine allineato all'assegnazione sotto (indici 0..12); u64 tranne
+    // circuit_breaker_threshold (7) e outage_threshold (11), letti come usize.
+    let (a, b, c, d, e, f, g, h, i, j, k, l) = tokio::join!(
+        settings::get_setting(db, "provider.billing_recovery_interval_s"),
+        settings::get_setting(db, "provider.recovery_probe_timeout_s"),
+        settings::get_setting(db, "provider.cooldown_default_s"),
+        settings::get_setting(db, "provider.cooldown_min_s"),
+        settings::get_setting(db, "provider.cooldown_max_s"),
+        settings::get_setting(db, "provider.cooldown_long_s"),
+        settings::get_setting(db, "provider.circuit_breaker_window_s"),
+        settings::get_setting(db, "provider.circuit_breaker_threshold"),
+        settings::get_setting(db, "provider.circuit_breaker_extended_cooldown_s"),
+        settings::get_setting(db, "provider.health_probe_timeout_s"),
+        settings::get_setting(db, "provider.slow_cooldown_s"),
+        settings::get_setting(db, "provider.outage_threshold"),
+    );
+    let u = |o: anyhow::Result<Option<String>>, d: u64| parse_u64_or(o.ok().flatten(), d);
+    let z = |o: anyhow::Result<Option<String>>, d: usize| parse_usize_or(o.ok().flatten(), d);
+    pht.billing_recovery_interval_s = u(a, pht.billing_recovery_interval_s);
+    pht.recovery_probe_timeout_s = u(b, pht.recovery_probe_timeout_s);
+    pht.cooldown_default_s = u(c, pht.cooldown_default_s);
+    pht.cooldown_min_s = u(d, pht.cooldown_min_s);
+    pht.cooldown_max_s = u(e, pht.cooldown_max_s);
+    pht.cooldown_long_s = u(f, pht.cooldown_long_s);
+    pht.circuit_breaker_window_s = u(g, pht.circuit_breaker_window_s);
+    pht.circuit_breaker_threshold = z(h, pht.circuit_breaker_threshold);
+    pht.circuit_breaker_extended_cooldown_s = u(i, pht.circuit_breaker_extended_cooldown_s);
+    pht.health_probe_timeout_s = u(j, pht.health_probe_timeout_s);
+    pht.slow_cooldown_s = u(k, pht.slow_cooldown_s);
+    pht.outage_threshold = z(l, pht.outage_threshold);
+
+    apply_adaptive_ttl_settings(db, &mut pht).await;
+    pht
+}
+
+/// Applica il TTL adattivo del cooldown lungo per tipo d'errore (governance, mig 0523,
+/// default OFF -> cooldown lungo invariato). Estratto da `fetch_provider_health_timings`.
+async fn apply_adaptive_ttl_settings(
+    db: &sqlx::PgPool,
+    pht: &mut provider_cooldown::ProviderHealthTimings,
+) {
+    let (s_adaptive_ttl, s_adaptive_ttl_min) = tokio::join!(
+        settings::get_setting(db, "agent.governance.cooldown_adaptive_ttl"),
+        settings::get_setting(db, "agent.governance.cooldown_adaptive_ttl_min_s"),
+    );
+    pht.adaptive_billing_cooldown_enabled = parse_bool_or(
+        s_adaptive_ttl.ok().flatten(),
+        pht.adaptive_billing_cooldown_enabled,
+    );
+    pht.adaptive_billing_cooldown_min_s = parse_u64_or(
+        s_adaptive_ttl_min.ok().flatten(),
+        pht.adaptive_billing_cooldown_min_s,
+    );
+}
+
+/// Avvia i probe periodici provider (`provider_health_probe`, interval default 300s)
+/// e modello (`model_health_probe`, interval 1800s, auto-disable dopo N fallimenti).
+/// Rilevano cooldown/quota e modelli broken PRIMA del primo errore utente. Config
+/// DB-driven, env come override. Estratto da `spawn_background_workers`.
+async fn spawn_provider_and_model_probes(state: &AppState) {
+    let (s_probe_enabled, s_probe_interval, s_model_enabled, s_model_interval, s_model_threshold) = tokio::join!(
+        settings::get_setting(&state.db, "provider_health_probe_enabled"),
+        settings::get_setting(&state.db, "provider_health_probe_interval_s"),
+        settings::get_setting(&state.db, "model_health_probe_enabled"),
+        settings::get_setting(&state.db, "model_health_probe_interval_s"),
+        settings::get_setting(&state.db, "model_health_probe_failure_threshold"),
+    );
+
+    let probe_enabled = setting_flag_enabled(s_probe_enabled.ok().flatten(), true);
+    let probe_interval = parse_u64_or(s_probe_interval.ok().flatten(), 300);
+    provider_health_probe::spawn_health_probe(
+        std::sync::Arc::new(state.orchestrator.clone()),
+        state.db.clone(),
+        probe_enabled,
+        probe_interval,
+    );
+
+    let model_probe_enabled = setting_flag_enabled(s_model_enabled.ok().flatten(), true);
+    let model_probe_interval = parse_u64_or(s_model_interval.ok().flatten(), 1800);
+    let model_probe_threshold = s_model_threshold
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(3);
+    model_health_probe::spawn_model_health_probe(
+        std::sync::Arc::new(state.orchestrator.clone()),
+        state.db.clone(),
+        model_probe_enabled,
+        model_probe_interval,
+        model_probe_threshold,
+    );
+}
+
+/// Avvia i watchdog/observer infrastrutturali fire-and-forget: task_watchdog
+/// (dipendenze Qdrant/embedder + task bloccati), services_watchdog (microservizi
+/// Nexus), service_observer (app utente), process_resume, fanin_worker (ripresa run
+/// padre su fan-in subagenti) e monitor_seed. Config DB-driven. Estratto da
+/// `spawn_background_workers` (ordine invariato).
+fn spawn_infra_watchdogs(state: &AppState) {
+    task_watchdog::spawn_task_watchdog(
+        state.db.clone(),
+        std::sync::Arc::new(state.orchestrator.clone()),
+        state.dependency_status.clone(),
+        state.agent_channels.clone(),
+    );
+    services_watchdog::spawn_services_watchdog(state.db.clone());
+    crate::project_workspace::service_observer::spawn_service_observer(state.clone());
+    process_resume::spawn_process_resume_worker(state.clone());
+    fanin_worker::spawn_fanin_worker(state.clone());
+    crate::project_workspace::monitor_seed::spawn_monitor_seed_worker(state.clone());
+}
+
+/// Avvia i worker catalogo/telemetria/retention: catalog_sync (ai_price_catalog dal
+/// JSON LiteLLM, default 12h), deepseek_balance_sync (/user/balance, 15min),
+/// routing_matrix_auto_promoter (ricostruisce la matrix dal catalog ogni 6h,
+/// preserva manual_override), tool-result cache cleanup e db_retention (pota
+/// checkpoint + telemetria). Config DB-driven. Estratto da `spawn_background_workers`.
+async fn spawn_catalog_and_retention_workers(state: &AppState) {
+    let (s_catalog_enabled, s_catalog_interval, s_ap_enabled, s_ap_interval) = tokio::join!(
+        settings::get_setting(&state.db, "model_catalog_sync_enabled"),
+        settings::get_setting(&state.db, "model_catalog_sync_interval_s"),
+        settings::get_setting(&state.db, "routing_matrix_auto_promote_enabled"),
+        settings::get_setting(&state.db, "routing_matrix_auto_promote_interval_s"),
+    );
+
+    let catalog_sync_enabled = setting_flag_enabled(s_catalog_enabled.ok().flatten(), true);
+    let catalog_sync_interval = parse_u64_or(s_catalog_interval.ok().flatten(), 43200);
+    catalog_sync_worker::spawn_catalog_sync_worker(
+        state.db.clone(),
+        catalog_sync_enabled,
+        catalog_sync_interval,
+    );
+
+    deepseek_balance_sync::spawn_deepseek_balance_sync(state.db.clone(), true, 900);
+
+    let ap_enabled = setting_flag_enabled(s_ap_enabled.ok().flatten(), true);
+    let ap_interval = parse_u64_or(s_ap_interval.ok().flatten(), 21600);
+    routing_matrix_auto_promoter::spawn_routing_matrix_auto_promoter(
+        state.db.clone(),
+        ap_enabled,
+        ap_interval,
+    );
+
+    agent_tool_result_cache::start_cleanup_worker(state.db.clone());
+    // Retention DB (regola H): pota checkpoint dei run terminali + TTL telemetria.
+    db_retention::start_retention_worker(state.db.clone());
+}
+
+/// Avvia i server gRPC opzionali (ToolRunner + AgentRouter) nell'ordine originale.
+/// Estratto da `spawn_background_workers` (comportamento invariato).
+async fn spawn_grpc_servers(state: &AppState) {
+    spawn_tool_runner_grpc(state).await;
+    spawn_agent_router_grpc(state).await;
+}
+
+/// ToolRunner gRPC server (Fase 1, tool read_file/str_replace/...). Priorita'
+/// abilitazione: env ENABLE_TOOL_RUNNER=1 > settings DB > default OFF. Indirizzo:
+/// env TOOL_RUNNER_ADDR > DB > hardcoded. Estratto da `spawn_grpc_servers`.
+async fn spawn_tool_runner_grpc(state: &AppState) {
+    let env_tr = std::env::var("ENABLE_TOOL_RUNNER").ok().as_deref() == Some("1");
+    let (s_tr_enabled, s_tr_addr) = tokio::join!(
+        settings::get_setting(&state.db, "tool_runner_enabled"),
+        settings::get_setting(&state.db, "tool_runner_addr"),
+    );
+    let tr_db_enabled = s_tr_enabled
+        .ok()
+        .flatten()
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !(env_tr || tr_db_enabled) {
+        tracing::info!("ToolRunner gRPC: disabilitato (tool_runner_enabled=false in DB)");
+        return;
+    }
+    let tool_runner_addr_str = std::env::var("TOOL_RUNNER_ADDR")
+        .ok()
+        .or_else(|| s_tr_addr.ok().flatten().map(|v| v.trim().to_string()))
+        .unwrap_or_else(|| "127.0.0.1:50071".to_string());
+    let addr: SocketAddr = tool_runner_addr_str
+        .parse()
+        .expect("tool_runner_addr (DB o env TOOL_RUNNER_ADDR) non valido");
+    let deps = tool_runner_server::ToolRunnerDeps {
+        db: state.db.clone(),
+        neural: state.orchestrator.neural.clone(),
+        playwright_channels: state.playwright_channels.clone(),
+        dependency_status: state.dependency_status.clone(),
+        project_channels: state.project_channels.clone(),
+        monitor_registry: state.monitor_registry.clone(),
+        port_registry: state.port_registry.clone(),
+    };
+    if let Err(e) = tool_runner_server::spawn_tool_runner_server(deps, addr).await {
+        tracing::error!("ToolRunner server: avvio fallito: {e}");
+    }
+}
+
+/// AgentRouter gRPC server (Fase 5f, Q-Learning router). Priorita' abilitazione:
+/// env ENABLE_AGENT_ROUTER=1 > settings DB > default OFF. Indirizzo: env
+/// AGENT_ROUTER_ADDR > DB > hardcoded. Estratto da `spawn_grpc_servers`.
+async fn spawn_agent_router_grpc(state: &AppState) {
+    let env_ar = std::env::var("ENABLE_AGENT_ROUTER").ok().as_deref() == Some("1");
+    let ar_db_enabled = settings::get_setting(&state.db, "agent_router_enabled")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !(env_ar || ar_db_enabled) {
+        tracing::info!("AgentRouter gRPC: disabilitato (agent_router_enabled=false in DB)");
+        return;
+    }
+    let db_agent_addr = settings::get_setting(&state.db, "agent_router_addr")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string());
+    let agent_router_addr_str = std::env::var("AGENT_ROUTER_ADDR")
+        .ok()
+        .or(db_agent_addr)
+        .unwrap_or_else(|| "127.0.0.1:50501".to_string());
+    let addr: SocketAddr = agent_router_addr_str
+        .parse()
+        .expect("agent_router_addr (DB o env AGENT_ROUTER_ADDR) non valido");
+    if let Err(e) = agent_router_server::spawn_agent_router_server(addr).await {
+        tracing::error!("AgentRouter server: avvio fallito: {e}");
+    }
+}
+
+/// Parsa un `Option<String>` (valore setting) a `u64`, con default se assente/non valido.
+fn parse_u64_or(opt: Option<String>, default: u64) -> u64 {
+    opt.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Parsa un `Option<String>` (valore setting) a `usize`, con default se assente/non valido.
+fn parse_usize_or(opt: Option<String>, default: usize) -> usize {
+    opt.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// Interpreta un `Option<String>` (valore setting) come booleano ("true"/"1"/"yes"/"on"),
+/// con default se assente.
+fn parse_bool_or(opt: Option<String>, default: bool) -> bool {
+    opt.map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        )
+    })
+    .unwrap_or(default)
+}
+
+
+/// Applica il single-instance guard (Unix: flock esclusivo per porta; su Windows
+/// e' garantito dal Service Manager, quindi cfg-gated), binda il listener HTTP con
+/// socket NON ereditabile (Windows), installa il graceful shutdown (SIGTERM/Ctrl-C
+/// -> flush NexusBridge + safety-net force-exit 10s) e serve l'app axum. Estratta
+/// da `main` (comportamento invariato): ritorna l'errore di bind/serve che `main`
+/// propaga con `?`.
+async fn serve_http(state: AppState, mcp_http_port: u16) -> anyhow::Result<()> {
+    let app = routes::build_app_router(state, build_cors());
+
+    // Single-instance guard (vedi `acquire_single_instance_lock`, solo Unix).
+    #[cfg(unix)]
+    acquire_single_instance_lock(mcp_http_port);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], mcp_http_port));
+    tracing::info!("mcp-core listening on {}", addr);
+
+    // Bind via std::net per marcare il socket NON ereditabile su Windows PRIMA che
+    // l'agente spawni figli (dev server): altrimenti un figlio eredita l'handle di
+    // :4000 e, orfano dopo un crash/restart, blocca il re-bind (WSAEADDRINUSE,
+    // os error 10048 -> crash loop WinSW). Punto unico: sandbox::make_socket_non_inheritable.
+    let listener = {
+        let std_listener = std::net::TcpListener::bind(addr)?;
+        std_listener.set_nonblocking(true)?;
+        #[cfg(windows)]
+        crate::sandbox::make_socket_non_inheritable(&std_listener);
+        tokio::net::TcpListener::from_std(std_listener)?
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(graceful_shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+/// Layer CORS per il frontend (origin da `FRONTEND_URL`, default localhost:3000).
+/// Estratto da `serve_http` (comportamento invariato).
+fn build_cors() -> CorsLayer {
+    let frontend_origin =
+        std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    CorsLayer::new()
+        .allow_origin(frontend_origin.parse::<HeaderValue>().unwrap())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+        ])
+        .allow_headers([
+            http_header::CONTENT_TYPE,
+            http_header::AUTHORIZATION,
+            http_header::ACCEPT,
+            http_header::COOKIE,
+        ])
+        .allow_credentials(true)
+}
+
+/// Single-instance guard (regola L): un flock esclusivo non-bloccante legato alla
+/// porta garantisce UNA sola istanza di mcp-core; se un'altra e' gia' viva usciamo
+/// SUBITO invece di coesistere sulla porta servendo richieste da codice vecchio.
+/// Il File viene "dimenticato" cosi' il lock resta tenuto per tutta la vita del
+/// processo (il kernel lo rilascia alla terminazione). Solo Unix: su Windows il
+/// single-instance e' gia' garantito dal Service Manager (WinSW/SCM). Estratto da
+/// `serve_http` (comportamento invariato).
+#[cfg(unix)]
+fn acquire_single_instance_lock(mcp_http_port: u16) {
+    use std::os::unix::io::AsRawFd;
+    let lock_path = std::env::var("NEXUS_MCP_CORE_LOCK")
+        .unwrap_or_else(|_| format!("/tmp/nexus-mcp-core-{mcp_http_port}.lock"));
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(lock_file) => {
+            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                eprintln!(
+                    "mcp-core: un'altra istanza e' gia' attiva (lock {lock_path} occupato). \
+                     Esco per non coesistere sulla porta {mcp_http_port} (evita richieste \
+                     servite a caso da codice vecchio). Ferma il processo vecchio e riprova."
+                );
+                std::process::exit(1);
+            }
+            std::mem::forget(lock_file); // tieni il lock per tutta la vita del processo
+            tracing::info!("mcp-core: single-instance lock acquisito ({lock_path})");
+        }
+        Err(e) => {
+            tracing::warn!(
+                "mcp-core: impossibile aprire il lock file {lock_path}: {e} (proseguo senza guard)"
+            );
+        }
+    }
+}
+
+/// Attende SIGTERM/Ctrl-C, poi arma un force-exit di sicurezza a 10s (limite ASSOLUTO
+/// dello shutdown: se il flush o SSE/long-poll in-flight si bloccano il processo esce
+/// comunque — la unit systemd ha TimeoutStopSec=15 come ulteriore rete) e fa il flush
+/// best-effort del NexusBridge (Q-table + replication:pending) con timeout proprio di
+/// 5s, cosi' un DB lento non tiene in ostaggio il processo. Estratto da `serve_http`
+/// (comportamento invariato); su Unix diagnostica l'origine del SIGTERM.
+async fn graceful_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Ctrl-C ricevuto — avvio graceful shutdown");
+            },
+            _ = terminate.recv() => {
+                tracing::warn!(
+                    "SIGTERM ricevuto — avvio graceful shutdown.{}",
+                    diagnose_signal_origin()
+                );
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl-C ricevuto — avvio graceful shutdown");
+    }
+
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tracing::warn!(
+            "shutdown timeout 10s superato (flush appeso o SSE/long-poll in-flight), force-exit"
+        );
+        std::process::exit(0);
+    });
+
+    if let Some(bridge) = nexus_bridge::NexusBridge::global() {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), bridge.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "NexusBridge.shutdown() oltre 5s (DB lento o lock conteso): \
+                 procedo con lo shutdown senza attendere il flush"
+            );
+        }
+    }
+}
+/// Verifica la disponibilita' della sandbox Docker (imposta il flag globale),
+/// costruisce la `AppState`, inizializza il registry globale dei pool per-progetto
+/// (separazione DB) ed esegue il boot-recovery: reap dei run 'running' orfani (await,
+/// deve concludere PRIMA del bind HTTP) + mark-only dei processi per-progetto stale
+/// (tokio::spawn). Estratta da `main` (ordine e side-effect invariati). Consuma db,
+/// redis, orchestrator, template_cache e il registro porte; ritorna la `AppState`.
+async fn build_app_state(
+    db: PgPool,
+    redis: redis::aio::MultiplexedConnection,
+    orchestrator: Orchestrator,
+    template_cache: prompt_templates::TemplateCache,
+    port_registry_cache: port_registry::PortRegistryCache,
+) -> AppState {
+    // Verifica disponibilità sandbox Docker all'avvio e imposta il flag globale.
     let sandbox_available = sandbox::is_sandbox_available().await;
     sandbox::set_sandbox_available(sandbox_available);
+    let (stato_sb, effetto_sb) = if sandbox_available {
+        ("attiva", "isolato in container nexus-sandbox")
+    } else {
+        ("non disponibile", "eseguito con env filtrato (fallback)")
+    };
     tracing::info!(
         sandbox = sandbox_available,
-        "Sandbox Docker {}: ogni processo agente sarà {}",
-        if sandbox_available {
-            "attiva"
-        } else {
-            "non disponibile"
-        },
-        if sandbox_available {
-            "isolato in container nexus-sandbox"
-        } else {
-            "eseguito con env filtrato (fallback)"
-        }
+        "Sandbox Docker {stato_sb}: ogni processo agente sarà {effetto_sb}"
     );
 
     let state = AppState {
@@ -895,691 +1399,157 @@ async fn main() -> anyhow::Result<()> {
     // per-progetto (insert_message, ...) non aprono pool doppi.
     project_db_routes::init_global_pools(state.project_meta_pools.clone());
 
-    // Recovery run 'running' orfani (mig 0392) — spostato QUI dopo init_global_pools
-    // (regola H: causa radice del bug "chat cieca sul run dopo restart del backend").
-    // Con la separazione DB i run agentici vivono nei DB per-progetto; il registry
-    // globale dei pool DEVE essere gia' inizializzato, altrimenti
-    // reap_orphaned_runs_at_boot -> project_data_pool_from ricade sul meta-DB e
-    // l'UPDATE non tocca mai i run per-progetto, lasciandoli 'running' zombie. Un run
-    // zombie non diventa mai terminale, quindi la (ri)connessione SSE non riceve
-    // `agent_final` e la UI resta bloccata sul run finche' l'utente non fa refresh.
-    // Await (non tokio::spawn): deve concludere PRIMA del bind del listener HTTP —
-    // ogni 'running' e' per definizione un orfano del processo precedente e va
-    // marcato 'interrupted' prima di accettare nuovi run (sblocca il gate 409 /
-    // session_has_active_run). Esclude 'awaiting_confirmation' (resumibile).
+    // Boot-recovery run/processi orfani (vedi `run_boot_recovery`), DOPO
+    // init_global_pools (regola H).
+    run_boot_recovery(&state).await;
+
+    state
+}
+
+/// Boot-recovery dopo `init_global_pools`: reap dei run 'running' orfani (mig 0392,
+/// await: deve concludere PRIMA del bind HTTP — ogni 'running' e' orfano del processo
+/// precedente e va marcato 'interrupted' per sbloccare il gate 409; esclude
+/// 'awaiting_confirmation' resumibile) + mark-only dei processi per-progetto stale
+/// (tokio::spawn, non blocca l'avvio; il re-attach dei processi vivi resta al
+/// watchdog periodico). Il registry pool DEVE essere gia' inizializzato, altrimenti
+/// `project_data_pool_from` ricade sul meta-DB lasciando i run per-progetto zombie
+/// (causa radice del bug "chat cieca sul run dopo restart"). Estratta da `build_app_state`.
+async fn run_boot_recovery(state: &AppState) {
     let _ = run_reaper::reap_orphaned_runs_at_boot(&state.db).await;
+    let db_recover = state.db.clone();
+    tokio::spawn(mark_stale_project_processes_failed(db_recover));
+}
 
-    // Boot-recovery per-progetto (separazione DB): il blocco di riconciliazione PID
-    // sopra opera sul meta; i processi agent dei progetti migrati vivono nei DB
-    // per-progetto (separazione sempre attiva, cutover chiuso mig 0525/0527). Qui,
-    // DOPO init_global_pools (registry pool pronto), iteriamo i progetti e marchiamo
-    // 'failed' i processi 'running'/'starting' il cui PID non e' piu' vivo.
-    // tokio::spawn: non blocca l'avvio e un errore non impedisce il boot. Mark-only:
-    // NON re-attacha il monitor (per non replicare il side-effect non idempotente di
-    // spawn_reattach_monitor); il re-attach dei processi VIVI per-progetto resta coperto
-    // dal watchdog periodico (residuo noto, degrada non corrompe).
-    {
-        let db_recover = state.db.clone();
-        tokio::spawn(mark_stale_project_processes_failed(db_recover));
-    }
+/// Inizializza observability (tracing), variabili d'ambiente infrastrutturali,
+/// catalog tool globale, pool DB e NexusBridge. Ritorna il pool DB e la porta HTTP
+/// risolta dal DB (regola G). Estratta da `main` (ordine e comportamento invariati);
+/// se il DB e' irraggiungibile propaga l'errore che `main` gestisce con `?`.
+async fn init_infrastructure() -> anyhow::Result<(PgPool, u16)> {
+    dotenvy::dotenv().ok();
 
-    chat_learning::spawn_vector_compaction_scheduler(state.clone());
-    nexus_builtin::seed_tools_and_server(&state.db).await;
-    // Reindex semantico Qdrant dei tool MCP (fire-and-forget, +30s delay).
-    // Indicizza solo i tool con embedding mancante o hash cambiato.
-    nexus_builtin::spawn_tool_reindex(state.db.clone());
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+        ))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    // ── ADR 0017 v2 F3 — re-ingest automatico se `wiki_docs` e' vuota ─────
-    // Bootstrap one-shot: alla prima esecuzione dopo la migrazione 0295 la
-    // tabella e' vuota e i vault Markdown sono la sola fonte di verita'.
-    // Lo lanciamo come task background (non blocca lo startup HTTP) e logga
-    // il `ReingestReport` al termine.
-    {
-        let state_bootstrap = state.clone();
-        tokio::spawn(wiki_bootstrap_reingest_if_empty(state_bootstrap));
-    }
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable".to_string()
+    });
 
-    // ── ADR 0017 v2 F4 — auto-recompute link al primo avvio post-F3 ───────
-    // Se `wiki_docs > 0` ma `wiki_links == 0` significa che la mig 0295 e' stata
-    // applicata, F3 ha popolato i doc, ma F4 non e' mai stato eseguito. Lo
-    // lanciamo in background per non bloccare l'HTTP. Il task aspetta 60s per
-    // dare tempo al re-ingest F3 di completare (se in corso).
-    {
-        let state_links = state.clone();
-        tokio::spawn(wiki_bootstrap_recompute_links(state_links));
-    }
-
-    // ── ADR 0017 v2 F5 — worker periodico LLM triple extraction ───────────
-    // Non lanciamo full re-extract automatica al primo boot (costo ~$0.14):
-    // l'admin la triggera manualmente via POST /api/wiki/extract-triples?wait=true
-    // o lascia che il worker periodico processi un batch ogni interval_secs
-    // rispettando i cap diurni configurati in settings.
-    wiki::triple_extractor::start_triple_extractor_worker(state.wiki_deps());
-
-    // ── ADR 0017 v2 TODO 1 — watcher bidirezionale vault->DB ──────────────
-    // Osserva `docs/.nexus-vault/` e `<project_root>/.nexus-vault/` per i
-    // progetti registrati al boot. Su evento Create/Modify di un file `.md`
-    // chiama `wiki::reingest::reingest_path`. Settings DB-driven (mig 0301).
-    // TODO: i progetti registrati post-startup vengono osservati solo dopo un
-    // restart di mcp-core (vedi nota in `wiki::watcher`).
-    wiki::watcher::start_wiki_watcher(std::sync::Arc::new(state.wiki_deps()));
-
-    // ── ADR 0017 v2 TODO 6+7 — chat-note + run-summary worker ─────────────
-    // Due loop periodici (delay iniziale rispettivamente 60s e 90s) che
-    // ingestano i messaggi chat utente e i resoconti dei run terminali come
-    // wiki_docs (kind='chat_note' / 'run_summary'). Settings DB-driven sotto
-    // chiave `agent.wiki.chat_note_*` e `agent.wiki.run_summary_*` (mig 0305).
-    wiki::chat_note_worker::start_chat_note_worker(std::sync::Arc::new(state.wiki_deps()));
-    wiki::run_summary_worker::start_run_summary_worker(std::sync::Arc::new(state.wiki_deps()));
-
-    // ── ADR 0017 v2 — worker periodici link + titoli su TUTTI gli scope ───
-    // Loop DB-driven (interval `agent.wiki.link_worker_interval_secs` /
-    // `agent.wiki.title_gen_interval_secs`) che processano scope=meta E lo
-    // scope=project di ogni progetto registrato. Prima esisteva solo il
-    // bootstrap one-shot dei link (scope=meta) e gli endpoint manuali: i
-    // progetti restavano senza link/titoli finche' non triggerati a mano. Il
-    // cap diurno del title_gen resta applicato per-scope (no spam LLM).
-    wiki::links_worker::start_links_worker(std::sync::Arc::new(state.wiki_deps()));
-    wiki::title_gen::start_title_gen_worker(std::sync::Arc::new(state.wiki_deps()));
-    // Arricchimento LLM dei wiki_docs kind=code (placeholder -> scheda + embedding).
-    // Modello come categoria/tier configurabile da admin (mig 0331, regola G/L).
-    wiki::code_docs_enricher::start_code_docs_enricher_worker(std::sync::Arc::new(state.wiki_deps()));
-    // Distiller delle learned instructions (livello 2 continuita', mig 0412):
-    // regole durature di progetto dagli eventi worklog + wiki_docs.
-    learned_instructions::spawn_learned_instructions_distiller(state.clone());
-
-    // ── PR hardening: avvio writer audit centralizzato + port enforcer ───
-    // Audit writer: consuma il canale `record_audit(...)` e fa batch INSERT
-    // in `nexus_resource_audit` ogni 100 eventi o 5s.
-    security::audit::start_writer(state.db.clone());
-    // Port enforcer: scansiona porte TCP in LISTEN ogni 5s, killa processi
-    // di progetto che bindano porte fuori dal bucket assegnato.
-    // Bug 7 fix (mig 0182): worker che sincronizza ai_price_catalog con i
-    // modelli realmente esposti dalle API provider. Evita che la routing
-    // matrix punti a modelli deprecati (es. DeepSeek v3 ora rimosso dall'API).
-    {
-        let db_sync = state.db.clone();
-        let orch_sync = std::sync::Arc::new(state.orchestrator.clone());
-        tokio::spawn(async move {
-            model_catalog_sync::catalog_sync_loop(db_sync, Some(orch_sync)).await;
-        });
-    }
-
-    // Reconciliation policy->catalog al boot (regola H/L): i tick di sync hanno
-    // warm-up lungo (30s/5min). Allineare subito is_enabled alla
-    // model_selection_policy evita che il primo routing dopo l'avvio scarti
-    // modelli capaci ma rimasti disabilitati nel catalog statico (incidente
-    // google: gemini chat capaci is_enabled=false -> routing ripiega su modelli
-    // con context window insufficiente). Idempotente: no-op se gia' allineato.
-    {
-        let db_recon = state.db.clone();
-        tokio::spawn(async move {
-            match model_catalog_sync::reconcile_catalog_with_policy(&db_recon).await {
-                Ok(stats) => tracing::info!(
-                    "boot policy reconciliation: enabled={} disabled={}",
-                    stats.enabled,
-                    stats.disabled,
-                ),
-                Err(e) => tracing::warn!("boot reconcile_catalog_with_policy fallito: {e}"),
-            }
-        });
-    }
-
-    tokio::spawn(security::port_enforcer::port_enforcer_loop(state.clone()));
-
-    // Linter periodico di governance risorse (porte/URL hardcoded nei sorgenti):
-    // apre diagnosi policy_violation e innesca la riparazione automatica delle
-    // violazioni correggibili (mig 0397/0398, flag DB-driven).
-    security::resource_linter::spawn_resource_linter(state.clone());
-
-    // Lo sweep periodico dei run orfani e' delegato al task_watchdog (gia'
-    // periodico): chiama run_reaper::reap_stale_runs come punto unico (regola L).
-    // Copre anche l'orfano da restart del SOLO brain (mcp-core resta su).
-
-    // Il worker billing_cooldown_recovery_loop viene avviato piu' sotto, dopo
-    // aver inizializzato la config health/cooldown provider DB-driven (cosi'
-    // riceve l'interval dai settings invece di un valore hardcoded).
-
-    // ── Lettura batch settings DB ────────────────────────────────────────────
-    // Leggiamo in parallelo tutti i flag comportamentali dalla tabella settings.
-    // I valori sono usati nei blocchi successivi. Le env var restano come
-    // override di emergenza con priorita' piu' alta (gestita in ogni blocco).
-    let (
-        s_llm_classifier,
-        s_health_probe_enabled,
-        s_health_probe_interval,
-        s_tool_runner,
-        s_tool_runner_addr,
-        s_http_timeout,
-        s_http_pool,
-        s_model_health_enabled,
-        s_model_health_interval,
-        s_model_health_threshold,
-        s_catalog_sync_enabled,
-        s_catalog_sync_interval,
-    ) = tokio::join!(
-        settings::get_setting(&state.db, "llm_classifier_enabled"),
-        settings::get_setting(&state.db, "provider_health_probe_enabled"),
-        settings::get_setting(&state.db, "provider_health_probe_interval_s"),
-        settings::get_setting(&state.db, "tool_runner_enabled"),
-        settings::get_setting(&state.db, "tool_runner_addr"),
-        settings::get_setting(&state.db, "http_timeout_secs"),
-        settings::get_setting(&state.db, "http_pool_max"),
-        settings::get_setting(&state.db, "model_health_probe_enabled"),
-        settings::get_setting(&state.db, "model_health_probe_interval_s"),
-        settings::get_setting(&state.db, "model_health_probe_failure_threshold"),
-        settings::get_setting(&state.db, "model_catalog_sync_enabled"),
-        settings::get_setting(&state.db, "model_catalog_sync_interval_s"),
-    );
-
-    // Indirizzo ToolRunner: env var (override emergenza) > DB > hardcoded.
-    let tool_runner_addr_str = std::env::var("TOOL_RUNNER_ADDR")
-        .ok()
-        .or_else(|| {
-            s_tool_runner_addr
-                .ok()
-                .flatten()
-                .map(|v| v.trim().to_string())
-        })
-        .unwrap_or_else(|| "127.0.0.1:50071".to_string());
-
-    // Inizializza il flag AtomicBool per il classificatore LLM.
-    let llm_classifier_db = setting_flag_enabled(s_llm_classifier.ok().flatten(), true);
-    crate::orchestrator::set_llm_classifier_enabled(llm_classifier_db);
-    tracing::info!(
-        "llm_classifier_enabled: {} (fonte: DB{})",
-        llm_classifier_db,
-        if std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").is_ok() {
-            " + env override attivo"
-        } else {
-            ""
-        }
-    );
-
-    // Inizializza la configurazione HTTP globale (timeout, pool) dal DB.
-    let http_timeout = s_http_timeout
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    let http_pool = s_http_pool
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<usize>().ok());
-    nexus_http::init_global_config(http_timeout, http_pool);
-
-    // ── Config health/cooldown provider DB-driven (regola G, migrazione 0252) ──
-    // Tempi di cooldown, circuit breaker, timeout probe e cadenza del recovery
-    // loop letti dalla tabella settings. Partiamo dai default storici e
-    // sovrascriviamo solo le chiavi presenti, cosi' un setting mancante non
-    // cambia il comportamento.
-    {
-        let mut pht = provider_cooldown::ProviderHealthTimings::default();
-        let p_u64 = |opt: Option<String>, d: u64| -> u64 {
-            opt.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(d)
-        };
-        let p_usize = |opt: Option<String>, d: usize| -> usize {
-            opt.and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(d)
-        };
-        let p_bool = |opt: Option<String>, d: bool| -> bool {
-            opt.map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes" | "on"
-                )
-            })
-            .unwrap_or(d)
-        };
-        let (
-            s_recov_interval,
-            s_recov_probe_to,
-            s_cd_default,
-            s_cd_min,
-            s_cd_max,
-            s_cd_long,
-            s_cb_window,
-            s_cb_threshold,
-            s_cb_ext,
-            s_probe_to,
-            s_slow_cd,
-            s_outage,
-        ) = tokio::join!(
-            settings::get_setting(&state.db, "provider.billing_recovery_interval_s"),
-            settings::get_setting(&state.db, "provider.recovery_probe_timeout_s"),
-            settings::get_setting(&state.db, "provider.cooldown_default_s"),
-            settings::get_setting(&state.db, "provider.cooldown_min_s"),
-            settings::get_setting(&state.db, "provider.cooldown_max_s"),
-            settings::get_setting(&state.db, "provider.cooldown_long_s"),
-            settings::get_setting(&state.db, "provider.circuit_breaker_window_s"),
-            settings::get_setting(&state.db, "provider.circuit_breaker_threshold"),
-            settings::get_setting(&state.db, "provider.circuit_breaker_extended_cooldown_s"),
-            settings::get_setting(&state.db, "provider.health_probe_timeout_s"),
-            settings::get_setting(&state.db, "provider.slow_cooldown_s"),
-            settings::get_setting(&state.db, "provider.outage_threshold"),
-        );
-        pht.billing_recovery_interval_s = p_u64(
-            s_recov_interval.ok().flatten(),
-            pht.billing_recovery_interval_s,
-        );
-        pht.recovery_probe_timeout_s = p_u64(
-            s_recov_probe_to.ok().flatten(),
-            pht.recovery_probe_timeout_s,
-        );
-        pht.cooldown_default_s = p_u64(s_cd_default.ok().flatten(), pht.cooldown_default_s);
-        pht.cooldown_min_s = p_u64(s_cd_min.ok().flatten(), pht.cooldown_min_s);
-        pht.cooldown_max_s = p_u64(s_cd_max.ok().flatten(), pht.cooldown_max_s);
-        pht.cooldown_long_s = p_u64(s_cd_long.ok().flatten(), pht.cooldown_long_s);
-        pht.circuit_breaker_window_s =
-            p_u64(s_cb_window.ok().flatten(), pht.circuit_breaker_window_s);
-        pht.circuit_breaker_threshold =
-            p_usize(s_cb_threshold.ok().flatten(), pht.circuit_breaker_threshold);
-        pht.circuit_breaker_extended_cooldown_s = p_u64(
-            s_cb_ext.ok().flatten(),
-            pht.circuit_breaker_extended_cooldown_s,
-        );
-        pht.health_probe_timeout_s = p_u64(s_probe_to.ok().flatten(), pht.health_probe_timeout_s);
-        pht.slow_cooldown_s = p_u64(s_slow_cd.ok().flatten(), pht.slow_cooldown_s);
-        pht.outage_threshold = p_usize(s_outage.ok().flatten(), pht.outage_threshold);
-        // Governance: TTL adattivo del cooldown lungo per tipo d'errore (opt-in,
-        // mig 0523). Default OFF -> cooldown lungo invariato (bit-identico).
-        let (s_adaptive_ttl, s_adaptive_ttl_min) = tokio::join!(
-            settings::get_setting(&state.db, "agent.governance.cooldown_adaptive_ttl"),
-            settings::get_setting(&state.db, "agent.governance.cooldown_adaptive_ttl_min_s"),
-        );
-        pht.adaptive_billing_cooldown_enabled = p_bool(
-            s_adaptive_ttl.ok().flatten(),
-            pht.adaptive_billing_cooldown_enabled,
-        );
-        pht.adaptive_billing_cooldown_min_s = p_u64(
-            s_adaptive_ttl_min.ok().flatten(),
-            pht.adaptive_billing_cooldown_min_s,
-        );
-        provider_cooldown::init_provider_health_timings(pht);
+    nexus_tool_catalog::NexusToolCatalog::init_global();
+    if let Some(cat) = nexus_tool_catalog::NexusToolCatalog::global() {
         tracing::info!(
-            "provider health timings (DB): recovery_interval={}s probe_timeout={}s cooldown_long={}s outage_threshold={}",
-            pht.billing_recovery_interval_s, pht.recovery_probe_timeout_s,
-            pht.cooldown_long_s, pht.outage_threshold,
+            "NexusToolCatalog initialized: {} tool specs ({} implemented)",
+            cat.len(),
+            cat.implemented_count()
         );
-
-        // Worker billing_cooldown_recovery_loop: riabilita i provider a cooldown
-        // scaduto SOLO dopo un probe attivo andato a buon fine (probe-then-reenable).
-        let db_billing = state.db.clone();
-        let orch_billing = std::sync::Arc::new(state.orchestrator.clone());
-        let recov_interval = pht.billing_recovery_interval_s;
-        tokio::spawn(async move {
-            provider_cooldown::billing_cooldown_recovery_loop(
-                orch_billing,
-                db_billing,
-                recov_interval,
-            )
-            .await;
-        });
     }
 
-    // Worker `provider_health_probe`: pinga periodicamente i provider LLM
-    // per rilevare cooldown / quota esaurita PRIMA del primo errore utente.
-    // Valore canonico: settings.provider_health_probe_enabled/interval_s nel DB.
-    // Override emergenza: NEXUS_PROVIDER_HEALTH_PROBE_ENABLED, NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S.
-    let probe_enabled = setting_flag_enabled(s_health_probe_enabled.ok().flatten(), true);
-    let probe_interval = s_health_probe_interval
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(300);
-    provider_health_probe::spawn_health_probe(
-        std::sync::Arc::new(state.orchestrator.clone()),
-        state.db.clone(),
-        probe_enabled,
-        probe_interval,
-    );
+    let db = db::init_pool(&database_url).await?;
 
-    // Worker `task_watchdog`: monitora proattivamente le dipendenze
-    // infrastrutturali (Qdrant, embedder) e rileva task background bloccati.
-    // Disattivabile via env NEXUS_TASK_WATCHDOG_ENABLED=false.
-    task_watchdog::spawn_task_watchdog(
-        state.db.clone(),
-        std::sync::Arc::new(state.orchestrator.clone()),
-        state.dependency_status.clone(),
-        state.agent_channels.clone(),
-    );
+    // Porta HTTP dal DB (regola G: unica fonte di verita', niente env/hardcoded).
+    // Risolta subito dopo il pool: se il DB e' down panica qui (coerente con
+    // RoutingMatrixCache::init poco sotto).
+    let mcp_http_port = nexus_auth::resolve_port(&db, "mcp_core_http_port").await;
 
-    // Worker `services_watchdog`: in dev/WSL (senza systemd Restart=on-failure)
-    // monitora i microservizi Nexus (brain, gateway, *-service, web-ide) via TCP
-    // probe e li riavvia se cadono. Config DB-driven (agent.watchdog.*, mig 0272),
-    // gating runtime via agent.watchdog.enabled. mcp-core escluso (ospita il loop).
-    services_watchdog::spawn_services_watchdog(state.db.clone());
+    // Inizializza NexusBridge con pool DB (Fase 6 + persistenza Q-values):
+    // - Router Q-Learning con persistenza asincrona su nexus_q_values
+    // - Caricamento Q-values esistenti in background (non blocca l'avvio)
+    // - Non invasivo: se qualche componente fallisce, il bridge resta non
+    //   inizializzato e i siti di chiamata fanno fallback silenzioso.
+    nexus_bridge::NexusBridge::init_global_with_pool(Arc::new(db.clone())).await;
 
-    // Worker `service_observer`: osservabilita' runtime delle APP UTENTE
-    // (metriche /proc, anomalie, crash -> auto-debug). Scope disgiunto dal
-    // watchdog (servizi {slug}-* del progetto). Config DB-driven
-    // (agent.observer.*, mig 0355/0356), gating runtime agent.observer.enabled.
-    crate::project_workspace::service_observer::spawn_service_observer(state.clone());
+    Ok((db, mcp_http_port))
+}
 
-    // Worker `process_resume`: cablaggio process-completion -> agent-resume.
-    // Quando un agent_process tracciato con sessione termina, risveglia l'agente
-    // del run per dare l'aggiornamento promesso ("ti aggiorno appena termina").
-    // Config DB-driven (agent.process_resume.*, mig 0360).
-    process_resume::spawn_process_resume_worker(state.clone());
+/// Inizializza Redis ed espone client Redis + pool DB a `provider_cooldown`, poi
+/// ripristina i cooldown billing sopravvissuti al riavvio (da Redis e, complementare,
+/// dal DB persistente `nexus_provider_health`). Ritorna la connessione Redis.
+/// Estratta da `main` (ordine e comportamento invariati); propaga l'errore di init
+/// Redis con `?`.
+async fn init_redis_and_cooldowns(
+    db: &sqlx::PgPool,
+    redis_url: &str,
+) -> anyhow::Result<redis::aio::MultiplexedConnection> {
+    let redis = cache::init_redis(redis_url).await?;
 
-    // Worker `fanin_worker` (Fase D Slice 3): TRIGGER che RIPRENDE il run padre
-    // sospeso su `awaiting_subagents` quando i sub-run background completano.
-    // Drena la coda durevole META `subagent_fanin_resume_queue` (mig 0542) con un
-    // CAS `awaiting_subagents -> running` (race-free, restart-safe, idempotente).
-    // Config DB-driven (orchestrator.background_fanin_enabled, default ON ma
-    // INERTE finche' un padre non dispatcha figli background).
-    fanin_worker::spawn_fanin_worker(state.clone());
+    // Espone il client Redis a `provider_cooldown` per la persistenza dei
+    // cooldown lunghi (billing/quota). Senza questo, un restart di mcp-core
+    // perderebbe i cooldown in-memory e il LED tornerebbe verde anche se
+    // il provider e' realmente giu' (caso utente "LED openai verde").
+    crate::provider_cooldown::init_redis_client(redis.clone());
 
-    // Worker `monitor_seed`: popola il pannello Monitor con KPI di default
-    // (servizi attivi, container up, porte allocate, problemi aperti) cosi' il
-    // pannello e' utile anche senza che l'agente chiami `dispatcher_update_monitor`.
-    // Config DB-driven (monitor.seed.*).
-    crate::project_workspace::monitor_seed::spawn_monitor_seed_worker(state.clone());
+    // Espone il pool DB a `provider_cooldown` per la persistenza TTL del billing
+    // cooldown su nexus_provider_health (fonte GIUSTA: ha scadenza, non disabilita
+    // il catalog). Sostituisce l'ex propagazione is_enabled=false/is_active=false.
+    crate::provider_cooldown::init_db_pool(db.clone());
 
-    // Worker `catalog_sync`: aggiorna periodicamente ai_price_catalog dal
-    // JSON LiteLLM. Cadenza configurabile via settings.model_catalog_sync_interval_s
-    // (default 12h, minimo 1h). Disabilitabile via settings.model_catalog_sync_enabled.
-    let catalog_sync_enabled = setting_flag_enabled(s_catalog_sync_enabled.ok().flatten(), true);
-    let catalog_sync_interval = s_catalog_sync_interval
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(43200);
-    catalog_sync_worker::spawn_catalog_sync_worker(
-        state.db.clone(),
-        catalog_sync_enabled,
-        catalog_sync_interval,
-    );
+    // Ripristina cooldown billing provider sopravvissuti al riavvio (persistiti su Redis).
+    restore_billing_cooldowns_from_redis(redis.clone()).await;
 
-    // Worker `model_health_probe`: pinga ogni modello enabled in ai_price_catalog
-    // per rilevare modelli broken model-specific (model_not_found, hollow_completion,
-    // unsupported, ecc.). Auto-disable dopo N fallimenti consecutivi
-    // (settings.model_health_probe_failure_threshold, default 3).
-    let model_probe_enabled = setting_flag_enabled(s_model_health_enabled.ok().flatten(), true);
-    let model_probe_interval = s_model_health_interval
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(1800);
-    let model_probe_threshold = s_model_health_threshold
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<i32>().ok())
-        .unwrap_or(3);
-    model_health_probe::spawn_model_health_probe(
-        std::sync::Arc::new(state.orchestrator.clone()),
-        state.db.clone(),
-        model_probe_enabled,
-        model_probe_interval,
-        model_probe_threshold,
-    );
+    // Restore COMPLEMENTARE dal DB persistente (ADR 0020): se Redis e' stato
+    // svuotato/riavviato, il blocco sopra non ripristina nulla e il gate parte
+    // VUOTO -> il primo run dopo il restart "scopre" i provider esausti
+    // chiamandoli (anthropic 400 / openai 429 ad ogni turno). nexus_provider_health
+    // e' la fonte persistente piu' affidabile: riallinea il gate allo stato noto
+    // cosi' il run li salta senza ri-testarli (il polling resta l'unico tester).
+    crate::provider_cooldown::restore_billing_cooldowns_from_db(db).await;
 
-    // Worker `deepseek_balance_sync`: DeepSeek e' l'unico provider con
-    // endpoint pubblico /user/balance. Sincronizza provider_budget_status
-    // con il dato reale ogni 15 min (default).
-    deepseek_balance_sync::spawn_deepseek_balance_sync(state.db.clone(), true, 900);
+    Ok(redis)
+}
 
-    // Worker `routing_matrix_auto_promoter`: ricostruisce le righe della
-    // routing matrix dal catalog modelli ogni 6h (default), promuovendo i
-    // nuovi modelli appena rilasciati e sostituendo quelli auto-disabled
-    // dal model_health_probe. Le righe con manual_override=true (admin) NON
-    // vengono toccate. Vedi `routing_matrix_auto_promoter.rs`.
-    let auto_promote_enabled: Option<String> =
-        settings::get_setting(&state.db, "routing_matrix_auto_promote_enabled")
-            .await
-            .ok()
-            .flatten();
-    let auto_promote_interval: Option<String> =
-        settings::get_setting(&state.db, "routing_matrix_auto_promote_interval_s")
-            .await
-            .ok()
-            .flatten();
-    let ap_enabled = setting_flag_enabled(auto_promote_enabled, true);
-    let ap_interval = auto_promote_interval
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(21600);
-    routing_matrix_auto_promoter::spawn_routing_matrix_auto_promoter(
-        state.db.clone(),
-        ap_enabled,
-        ap_interval,
-    );
+#[tokio::main(worker_threads = 32)]
+async fn main() -> anyhow::Result<()> {
+    // Orchestratore d'avvio: ogni fase e' un helper di modulo coeso (init infra,
+    // riconciliazione processi, redis+cooldown, cache routing, orchestrator,
+    // AppState+boot-recovery, worker background, HTTP). L'ordine di inizializzazione
+    // e' load-bearing e resta identico al pre-refactor.
+    let (db, mcp_http_port) = init_infrastructure().await?;
 
-    // ADR 0017 v2 F8: i worker legacy `knowledge_workers::*` (link_inference,
-    // cleanup, promote) e `meta_docs_*` (watcher bidirezionale + refresh) sono
-    // stati rimossi assieme ai moduli `knowledge/` e `meta_docs/`. Le tabelle
-    // backing sono droppate dalla mig 0295. La funzione "auto-link" e' ora
-    // gestita da `wiki::links_worker` (vedi mod.rs F4); il "vault watcher"
-    // bidirezionale per `docs/.nexus-vault/` e' un TODO ADR 0017 — finche'
-    // non viene reimplementato come `wiki::watcher`, gli edit Obsidian
-    // restano in sincrono solo via `POST /api/wiki/reingest`.
-    agent_tool_result_cache::start_cleanup_worker(state.db.clone());
-    // Retention DB (regola H): pota i checkpoint dei run terminali
-    // (nexus_graph_checkpoints cresce ~10MB/run senza pruning) + TTL sulla
-    // telemetria provider (*_health_history). Finestre DB-driven (regola G).
-    db_retention::start_retention_worker(state.db.clone());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let neural_core_url =
+        std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
-    // NexusAutoFixAgent RIMOSSO (audit settings 2026-06-11): il worker
-    // pollava nexus_e2e_runs ogni 300s, ma NESSUN codice ha mai scritto in
-    // quella tabella (il runner E2E del vault meta-docs non fu mai
-    // implementato; sistema sostituito dal wiki unificato, ADR 0017 v2).
-    // Girava a vuoto dalla nascita. Vedi mig 0406 per il cleanup settings.
+    // Riconciliazione META dei processi 'running'/'starting' stale (vedi
+    // `reconcile_stale_processes`). Il reap dei run orfani e' in `build_app_state`,
+    // DOPO init_global_pools (regola H).
+    reconcile_stale_processes(&db).await;
 
-    // ToolRunner gRPC server (Fase 1 refactor orchestrazione LangGraph).
-    // Valore canonico: settings.tool_runner_enabled nel DB (admin panel).
-    // Override emergenza: ENABLE_TOOL_RUNNER=1 (priorita' piu' alta del DB).
-    {
-        let env_override = std::env::var("ENABLE_TOOL_RUNNER").ok().as_deref() == Some("1");
-        let db_enabled = s_tool_runner
-            .ok()
-            .flatten()
-            .map(|v| v.trim().eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if env_override || db_enabled {
-            let addr: SocketAddr = tool_runner_addr_str
-                .parse()
-                .expect("tool_runner_addr (DB o env TOOL_RUNNER_ADDR) non valido");
-            let deps = tool_runner_server::ToolRunnerDeps {
-                db: state.db.clone(),
-                neural: state.orchestrator.neural.clone(),
-                playwright_channels: state.playwright_channels.clone(),
-                dependency_status: state.dependency_status.clone(),
-                project_channels: state.project_channels.clone(),
-                monitor_registry: state.monitor_registry.clone(),
-                port_registry: state.port_registry.clone(),
-            };
-            if let Err(e) = tool_runner_server::spawn_tool_runner_server(deps, addr).await {
-                tracing::error!("ToolRunner server: avvio fallito: {e}");
-            }
-        } else {
-            tracing::info!("ToolRunner gRPC: disabilitato (tool_runner_enabled=false in DB)");
-        }
-    }
+    // Redis + esposizione a provider_cooldown + restore cooldown billing.
+    let redis = init_redis_and_cooldowns(&db, &redis_url).await?;
 
-    // AgentRouter gRPC server (Fase 5f refactor): espone il Q-Learning
-    // router di nexus-orchestrator al brain.
-    // Priorita' abilitazione: env ENABLE_AGENT_ROUTER=1 (override emergenza)
-    // > settings.agent_router_enabled nel DB (admin panel) > default false.
-    {
-        let env_override = std::env::var("ENABLE_AGENT_ROUTER").ok().as_deref() == Some("1");
-        let db_enabled = settings::get_setting(&state.db, "agent_router_enabled")
-            .await
-            .ok()
-            .flatten()
-            .map(|v| v.trim().eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if env_override || db_enabled {
-            // Indirizzo: env var (override emergenza) > DB (canonico) > hardcoded.
-            let db_agent_addr = settings::get_setting(&state.db, "agent_router_addr")
-                .await
-                .ok()
-                .flatten()
-                .map(|v| v.trim().to_string());
-            let agent_router_addr_str = std::env::var("AGENT_ROUTER_ADDR")
-                .ok()
-                .or(db_agent_addr)
-                .unwrap_or_else(|| "127.0.0.1:50501".to_string());
-            let addr: SocketAddr = agent_router_addr_str
-                .parse()
-                .expect("agent_router_addr (DB o env AGENT_ROUTER_ADDR) non valido");
-            if let Err(e) = agent_router_server::spawn_agent_router_server(addr).await {
-                tracing::error!("AgentRouter server: avvio fallito: {e}");
-            }
-        } else {
-            tracing::info!("AgentRouter gRPC: disabilitato (agent_router_enabled=false in DB)");
-        }
-    }
+    let neural_client = connect_neural_core_with_retry(&neural_core_url).await?;
+    let template_cache = prompt_templates::TemplateCache::new();
 
-    let frontend_origin =
-        std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    // Cache di routing/porte + singleton build graph (vedi `init_routing_and_port_caches`).
+    let caches = init_routing_and_port_caches(&db).await;
 
-    let cors = CorsLayer::new()
-        .allow_origin(frontend_origin.parse::<HeaderValue>().unwrap())
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::PATCH,
-        ])
-        .allow_headers([
-            http_header::CONTENT_TYPE,
-            http_header::AUTHORIZATION,
-            http_header::ACCEPT,
-            http_header::COOKIE,
-        ])
-        .allow_credentials(true);
+    // GC periodico delle porte dynamic orfane (vedi `spawn_port_gc`).
+    spawn_port_gc(&db).await;
 
-    let app = routes::build_app_router(state, cors);
+    // ADR 0028: cintura race-window del systemd --user manager (solo Linux/systemd).
+    #[cfg(not(windows))]
+    crate::project_workspace::user_manager::ensure_user_manager(&db).await;
 
-    // Single-instance guard (regola L: un solo punto di verita' per "istanza
-    // attiva"). Un flock esclusivo non-bloccante legato alla porta garantisce
-    // UNA sola istanza di mcp-core: se un'altra e' gia' viva (es. un restart che
-    // ha lasciato il vecchio processo appeso), usciamo SUBITO con un messaggio
-    // chiaro invece di rischiare due processi che servono richieste a
-    // intermittenza (route vecchie vs nuove). Difesa indipendente dal deploy.
-    // Il File viene "dimenticato" cosi' il lock resta tenuto per tutta la vita
-    // del processo; il kernel lo rilascia automaticamente alla terminazione.
-    //
-    // Adattamento Windows (ri-applicato dopo recupero della base da WSL):
-    // flock/libc/raw-fd non esistono su Windows e il single-instance e' gia'
-    // garantito dal Service Manager (WinSW/SCM avvia UNA sola istanza di
-    // nexus-mcp-core), quindi questo guard e' compilato solo su Unix.
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let lock_path = std::env::var("NEXUS_MCP_CORE_LOCK")
-            .unwrap_or_else(|_| format!("/tmp/nexus-mcp-core-{mcp_http_port}.lock"));
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
-            Ok(lock_file) => {
-                let rc =
-                    unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                if rc != 0 {
-                    eprintln!(
-                        "mcp-core: un'altra istanza e' gia' attiva (lock {lock_path} occupato). \
-                         Esco per non coesistere sulla porta {mcp_http_port} (evita richieste \
-                         servite a caso da codice vecchio). Ferma il processo vecchio e riprova."
-                    );
-                    std::process::exit(1);
-                }
-                std::mem::forget(lock_file); // tieni il lock per tutta la vita del processo
-                tracing::info!("mcp-core: single-instance lock acquisito ({lock_path})");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "mcp-core: impossibile aprire il lock file {lock_path}: {e} (proseguo senza guard)"
-                );
-            }
-        }
-    }
+    // Orchestrator (gateway PATH A/B) consumando le cache; ritorna anche il registro
+    // porte che sopravvive nella AppState (vedi `build_orchestrator`).
+    let (orchestrator, port_registry_cache) =
+        build_orchestrator(&db, neural_client, template_cache.clone(), caches).await;
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], mcp_http_port));
-    tracing::info!("mcp-core listening on {}", addr);
+    // Sandbox + AppState + init_global_pools + boot-recovery (vedi `build_app_state`).
+    let state =
+        build_app_state(db, redis, orchestrator, template_cache, port_registry_cache).await;
 
-    // Bind via std::net per marcare il socket NON ereditabile su Windows PRIMA che
-    // l'agente spawni figli (dev server): altrimenti un figlio eredita l'handle di
-    // :4000 e, orfano dopo un crash/restart, blocca il re-bind (WSAEADDRINUSE,
-    // os error 10048 -> crash loop WinSW). Punto unico: sandbox::make_socket_non_inheritable.
-    let listener = {
-        let std_listener = std::net::TcpListener::bind(addr)?;
-        std_listener.set_nonblocking(true)?;
-        #[cfg(windows)]
-        crate::sandbox::make_socket_non_inheritable(&std_listener);
-        tokio::net::TcpListener::from_std(std_listener)?
-    };
+    // Worker fire-and-forget e loop periodici, nell'ordine esatto (vedi
+    // `spawn_background_workers`).
+    spawn_background_workers(&state).await;
 
-    // NOTA: `diagnose_signal_origin` (Unix) e' stata estratta a livello di modulo
-    // (sopra `fn main`). Era un `fn` nested senza cattura d'ambiente, chiamato solo
-    // dal ramo SIGTERM piu' sotto: comportamento invariato.
-
-    // Graceful shutdown: SIGTERM o Ctrl-C → flush NexusBridge (Q-table + replication)
-    // prima che il processo termini, per evitare perdita dati in-flight.
-    let shutdown_signal = async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut terminate =
-                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Ctrl-C ricevuto — avvio graceful shutdown");
-                },
-                _ = terminate.recv() => {
-                    tracing::warn!(
-                        "SIGTERM ricevuto — avvio graceful shutdown.{}",
-                        diagnose_signal_origin()
-                    );
-                },
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("Ctrl-C ricevuto — avvio graceful shutdown");
-        }
-
-        // Safety net force-exit (Bug D fix #80 + fix shutdown-hang 2026-06-10):
-        // spawnato PRIMA di qualunque flush. Il bug storico: il watchdog partiva
-        // DOPO `bridge.shutdown().await`, quindi se era proprio il flush a
-        // bloccarsi (acquire del pool sqlx senza timeout: 2 flush x ~30s = il
-        // "deactivating 1+ min" osservato, porta 4000 occupata, serviva
-        // pkill -9) il timer di sicurezza non partiva mai. Ora il limite
-        // massimo ASSOLUTO dello shutdown e' 10s dal segnale, qualunque cosa
-        // si blocchi dopo (flush, SSE/long-poll in-flight, lock contesi).
-        // La unit systemd (nexus-mcp-core.service) ha TimeoutStopSec=15 come
-        // ulteriore safety net (SIGKILL dopo 15s).
-        tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            tracing::warn!(
-                "shutdown timeout 10s superato (flush appeso o SSE/long-poll in-flight), force-exit"
-            );
-            std::process::exit(0);
-        });
-
-        // Flush NexusBridge state (Q-table + replication:pending → PostgreSQL).
-        // Best-effort con timeout proprio: un DB lento/irraggiungibile durante lo
-        // shutdown non deve tenere in ostaggio il processo (i flush periodici in
-        // esercizio hanno gia' persistito quasi tutto; questo e' l'ultimo delta).
-        if let Some(bridge) = nexus_bridge::NexusBridge::global() {
-            if tokio::time::timeout(std::time::Duration::from_secs(5), bridge.shutdown())
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    "NexusBridge.shutdown() oltre 5s (DB lento o lock conteso): \
-                     procedo con lo shutdown senza attendere il flush"
-                );
-            }
-        }
-    };
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await?;
-    Ok(())
+    // CORS + router + single-instance guard + bind + graceful shutdown + serve
+    // (vedi `serve_http`, comportamento invariato).
+    serve_http(state, mcp_http_port).await
 }
 
 /// Probe TCP rapido (500ms) al ToolRunner gRPC: senza questo l'AI non puo'
