@@ -327,72 +327,41 @@ async fn find_duplicate_instance_anywhere(
     }))
 }
 
-async fn get_catalog_by_install_request(
-    db: &PgPool,
-    body: &InstallPluginRequest,
-) -> Result<CatalogConfig, (StatusCode, Json<Value>)> {
-    let row = if let Some(id_raw) = body.catalog_item_id.as_deref() {
-        let catalog_id = Uuid::parse_str(id_raw)
-            .map_err(|_| api_error(StatusCode::BAD_REQUEST, "catalogItemId non valido"))?;
-        sqlx::query(
-            r#"
-            SELECT c.id, c.slug, c.name, c.description, c.transport, c.http_url, c.stdio_command,
-                c.stdio_args, c.required_secret_refs, c.default_scope,
-                c.allowed_commands, c.default_tool_policy, c.is_allowlisted, c.enabled,
-                r.id AS release_id, r.version AS release_version
-            FROM plugin_catalog_items c
-            LEFT JOIN LATERAL (
-                SELECT id, version FROM plugin_releases
-                WHERE catalog_item_id = c.id AND is_stable = true
-                ORDER BY created_at DESC LIMIT 1
-            ) r ON TRUE
-            WHERE c.id = $1
-            "#,
-        )
-        .bind(catalog_id)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        let slug = body
-            .slug
-            .as_deref()
-            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "slug o catalogItemId richiesto"))?;
-        sqlx::query(
-            r#"
-            SELECT c.id, c.slug, c.name, c.description, c.transport, c.http_url, c.stdio_command,
-                c.stdio_args, c.required_secret_refs, c.default_scope,
-                c.allowed_commands, c.default_tool_policy, c.is_allowlisted, c.enabled,
-                r.id AS release_id, r.version AS release_version
-            FROM plugin_catalog_items c
-            LEFT JOIN LATERAL (
-                SELECT id, version FROM plugin_releases
-                WHERE catalog_item_id = c.id AND is_stable = true
-                ORDER BY created_at DESC LIMIT 1
-            ) r ON TRUE
-            WHERE c.slug = $1
-            "#,
-        )
-        .bind(slug)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+// Lookup catalog per id: stessa proiezione della variante per slug, cambia solo
+// la clausola WHERE. Query complete literal (niente concatenazione dinamica di SQL).
+const CATALOG_SELECT_BY_ID_SQL: &str = r#"
+    SELECT c.id, c.slug, c.name, c.description, c.transport, c.http_url, c.stdio_command,
+        c.stdio_args, c.required_secret_refs, c.default_scope,
+        c.allowed_commands, c.default_tool_policy, c.is_allowlisted, c.enabled,
+        r.id AS release_id, r.version AS release_version
+    FROM plugin_catalog_items c
+    LEFT JOIN LATERAL (
+        SELECT id, version FROM plugin_releases
+        WHERE catalog_item_id = c.id AND is_stable = true
+        ORDER BY created_at DESC LIMIT 1
+    ) r ON TRUE
+    WHERE c.id = $1
+    "#;
 
-    let Some(row) = row else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Plugin catalog item non trovato"));
-    };
+// Lookup catalog per slug (gemello di CATALOG_SELECT_BY_ID_SQL con WHERE su slug).
+const CATALOG_SELECT_BY_SLUG_SQL: &str = r#"
+    SELECT c.id, c.slug, c.name, c.description, c.transport, c.http_url, c.stdio_command,
+        c.stdio_args, c.required_secret_refs, c.default_scope,
+        c.allowed_commands, c.default_tool_policy, c.is_allowlisted, c.enabled,
+        r.id AS release_id, r.version AS release_version
+    FROM plugin_catalog_items c
+    LEFT JOIN LATERAL (
+        SELECT id, version FROM plugin_releases
+        WHERE catalog_item_id = c.id AND is_stable = true
+        ORDER BY created_at DESC LIMIT 1
+    ) r ON TRUE
+    WHERE c.slug = $1
+    "#;
 
-    let is_allowlisted: bool = row.try_get("is_allowlisted").unwrap_or(false);
-    let enabled: bool = row.try_get("enabled").unwrap_or(false);
-    if !enabled || !is_allowlisted {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "Plugin non installabile: non presente nella allowlist",
-        ));
-    }
-
-    Ok(CatalogConfig {
+// Costruisce il `CatalogConfig` dalla riga risolta, applicando i default per
+// ogni colonna. Estratto per tenere il lookup sotto soglia (comportamento invariato).
+fn catalog_config_from_row(row: &sqlx::postgres::PgRow) -> CatalogConfig {
+    CatalogConfig {
         id: row.try_get("id").unwrap_or(Uuid::nil()),
         slug: row.try_get("slug").unwrap_or_default(),
         name: row.try_get("name").unwrap_or_default(),
@@ -409,7 +378,47 @@ async fn get_catalog_by_install_request(
             .unwrap_or(json!({"mode":"allowlist","tools":[],"blockedTools":[]})),
         release_id: row.try_get("release_id").unwrap_or(None),
         release_version: row.try_get("release_version").unwrap_or(None),
-    })
+    }
+}
+
+async fn get_catalog_by_install_request(
+    db: &PgPool,
+    body: &InstallPluginRequest,
+) -> Result<CatalogConfig, (StatusCode, Json<Value>)> {
+    let row = if let Some(id_raw) = body.catalog_item_id.as_deref() {
+        let catalog_id = Uuid::parse_str(id_raw)
+            .map_err(|_| api_error(StatusCode::BAD_REQUEST, "catalogItemId non valido"))?;
+        sqlx::query(CATALOG_SELECT_BY_ID_SQL)
+            .bind(catalog_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        let slug = body
+            .slug
+            .as_deref()
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "slug o catalogItemId richiesto"))?;
+        sqlx::query(CATALOG_SELECT_BY_SLUG_SQL)
+            .bind(slug)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    let Some(row) = row else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Plugin catalog item non trovato"));
+    };
+
+    let is_allowlisted: bool = row.try_get("is_allowlisted").unwrap_or(false);
+    let enabled: bool = row.try_get("enabled").unwrap_or(false);
+    if !enabled || !is_allowlisted {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Plugin non installabile: non presente nella allowlist",
+        ));
+    }
+
+    Ok(catalog_config_from_row(&row))
 }
 
 async fn resolve_plugin_instance_for_user(
@@ -452,6 +461,89 @@ async fn resolve_plugin_instance_for_user(
     row.ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Plugin installato non trovato"))
 }
 
+// Inserisce il valore `authorization` normalizzando il prefisso `Bearer `:
+// se il segreto non lo ha gia', lo antepone. Punto unico per header e Figma.
+fn insert_authorization_header(headers: &mut HashMap<String, String>, name: &str, secret: String) {
+    if secret.to_lowercase().starts_with("bearer ") {
+        headers.insert(name.to_string(), secret);
+    } else {
+        headers.insert(name.to_string(), format!("Bearer {secret}"));
+    }
+}
+
+// Redis MCP stdio: se `REDIS_URL` non e' configurato, usa la setting
+// infrastrutturale `redis_url`. Evita "health unknown"/test falliti per
+// default non-informativi.
+async fn apply_redis_default_env(db: &PgPool, plugin_slug: &str, env_vars: &mut HashMap<String, String>) {
+    if plugin_slug.eq_ignore_ascii_case("redis-stdio") && !env_vars.contains_key("REDIS_URL") {
+        if let Some(url) = get_setting(db, "redis_url").await {
+            if !url.trim().is_empty() {
+                env_vars.insert("REDIS_URL".to_string(), url);
+            }
+        }
+    }
+}
+
+// Applica i binding secret dichiarati nell'instance a header ed env vars.
+// I secret sono risolti dalla tabella settings; l'header `authorization`
+// riceve la normalizzazione del prefisso Bearer.
+async fn apply_secret_bindings(
+    db: &PgPool,
+    secret_bindings: &Value,
+    headers: &mut HashMap<String, String>,
+    env_vars: &mut HashMap<String, String>,
+) {
+    if let Some(bindings_headers) = get_json_object(secret_bindings, "headers") {
+        for (header_name, setting_key_raw) in bindings_headers {
+            if let Some(setting_key) = setting_key_raw.as_str() {
+                if let Some(secret) = resolve_secret_value(db, setting_key).await {
+                    if header_name.eq_ignore_ascii_case("authorization") {
+                        insert_authorization_header(headers, header_name, secret);
+                    } else {
+                        headers.insert(header_name.clone(), secret);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(bindings_env) = get_json_object(secret_bindings, "envVars") {
+        for (env_name, setting_key_raw) in bindings_env {
+            if let Some(setting_key) = setting_key_raw.as_str() {
+                if let Some(secret) = resolve_secret_value(db, setting_key).await {
+                    env_vars.insert(env_name.clone(), secret);
+                }
+            }
+        }
+    }
+}
+
+// Compatibilita' Figma HTTP: popola X-Figma-Token, Authorization e
+// X-Figma-Region solo se non gia' presenti tra gli header risolti.
+async fn apply_figma_http_headers(
+    db: &PgPool,
+    figma_token: Option<&str>,
+    headers: &mut HashMap<String, String>,
+) {
+    let has_auth = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+    let has_figma_tok = headers.keys().any(|k| k.eq_ignore_ascii_case("x-figma-token"));
+    let has_figma_reg = headers.keys().any(|k| k.eq_ignore_ascii_case("x-figma-region"));
+
+    if let Some(secret) = figma_token {
+        if !has_figma_tok {
+            headers.insert("X-Figma-Token".to_string(), secret.to_string());
+        }
+        if !has_auth {
+            insert_authorization_header(headers, "Authorization", secret.to_string());
+        }
+    }
+    if !has_figma_reg {
+        if let Some(region) = resolve_secret_value(db, "figma_region").await {
+            headers.insert("X-Figma-Region".to_string(), region);
+        }
+    }
+}
+
 async fn resolve_plugin_runtime_config(
     db: &PgPool,
     mcp_server_row: &sqlx::postgres::PgRow,
@@ -473,79 +565,61 @@ async fn resolve_plugin_runtime_config(
 
     let mut headers = value_to_string_map(static_headers.as_object());
     let mut env_vars = value_to_string_map(static_env.as_object());
-    let mut figma_token = resolve_secret_value(db, "figma_oauth_token").await;
+    let figma_token = resolve_secret_value(db, "figma_oauth_token").await;
 
-    // Redis MCP stdio: se non configurato, usa la setting infrastrutturale `redis_url`.
-    // Questo evita "health unknown"/test falliti per default non-informativi.
-    if plugin_slug.eq_ignore_ascii_case("redis-stdio") && !env_vars.contains_key("REDIS_URL") {
-        if let Some(url) = get_setting(db, "redis_url").await {
-            if !url.trim().is_empty() {
-                env_vars.insert("REDIS_URL".to_string(), url);
-            }
-        }
-    }
+    apply_redis_default_env(db, &plugin_slug, &mut env_vars).await;
+    apply_secret_bindings(db, secret_bindings, &mut headers, &mut env_vars).await;
 
-    if let Some(bindings_headers) = get_json_object(secret_bindings, "headers") {
-        for (header_name, setting_key_raw) in bindings_headers {
-            if let Some(setting_key) = setting_key_raw.as_str() {
-                if let Some(secret) = resolve_secret_value(db, setting_key).await {
-                    if header_name.eq_ignore_ascii_case("authorization") {
-                        if secret.to_lowercase().starts_with("bearer ") {
-                            headers.insert(header_name.clone(), secret);
-                        } else {
-                            headers.insert(header_name.clone(), format!("Bearer {secret}"));
-                        }
-                    } else {
-                        headers.insert(header_name.clone(), secret);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(bindings_env) = get_json_object(secret_bindings, "envVars") {
-        for (env_name, setting_key_raw) in bindings_env {
-            if let Some(setting_key) = setting_key_raw.as_str() {
-                if let Some(secret) = resolve_secret_value(db, setting_key).await {
-                    env_vars.insert(env_name.clone(), secret);
-                }
-            }
-        }
-    }
-
-    // Figma compatibility
     if plugin_slug.eq_ignore_ascii_case("figma-http") {
-        let has_auth = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
-        let has_figma_tok = headers.keys().any(|k| k.eq_ignore_ascii_case("x-figma-token"));
-        let has_figma_reg = headers.keys().any(|k| k.eq_ignore_ascii_case("x-figma-region"));
-
-        if let Some(secret) = figma_token.clone() {
-            if !has_figma_tok {
-                headers.insert("X-Figma-Token".to_string(), secret.clone());
-            }
-            if !has_auth {
-                if secret.to_lowercase().starts_with("bearer ") {
-                    headers.insert("Authorization".to_string(), secret);
-                } else {
-                    headers.insert("Authorization".to_string(), format!("Bearer {secret}"));
-                }
-            }
-        }
-        if !has_figma_reg {
-            if let Some(region) = resolve_secret_value(db, "figma_region").await {
-                headers.insert("X-Figma-Region".to_string(), region);
-            }
-        }
+        apply_figma_http_headers(db, figma_token.as_deref(), &mut headers).await;
     }
 
     let prefer_figma_stdio = plugin_slug.eq_ignore_ascii_case("figma-http")
         && resolve_bool_setting(db, "figma_mcp_prefer_stdio", true).await;
 
-    let transport_cfg = if prefer_figma_stdio {
-        if figma_token.is_none() {
-            figma_token = resolve_secret_value(db, "figma_oauth_token").await;
-        }
-        if let Some(token) = figma_token {
+    let transport_cfg = select_mcp_transport(
+        db,
+        TransportInputs { transport: transport.as_str(), command, args: &args, url },
+        prefer_figma_stdio,
+        figma_token,
+        env_vars,
+        headers,
+    )
+    .await;
+
+    McpServerConfig {
+        id: mcp_server_id.to_string(),
+        name: mcp_server_name,
+        transport: transport_cfg,
+        enabled: true,
+    }
+}
+
+// Input non-secret per la scelta del transport, raggruppati per non superare la
+// soglia di parametri (comportamento invariato).
+struct TransportInputs<'a> {
+    transport: &'a str,
+    command: Option<String>,
+    args: &'a Value,
+    url: Option<String>,
+}
+
+// Sceglie il transport MCP: stdio Figma preferito, altrimenti stdio/http dal
+// record mcp_server. Estratto da `resolve_plugin_runtime_config` (invariato).
+async fn select_mcp_transport(
+    db: &PgPool,
+    inputs: TransportInputs<'_>,
+    prefer_figma_stdio: bool,
+    figma_token: Option<String>,
+    mut env_vars: HashMap<String, String>,
+    headers: HashMap<String, String>,
+) -> McpTransport {
+    if prefer_figma_stdio {
+        let token = match figma_token {
+            Some(t) => Some(t),
+            None => resolve_secret_value(db, "figma_oauth_token").await,
+        };
+        if let Some(token) = token {
             env_vars.insert("FIGMA_API_KEY".to_string(), token.clone());
             env_vars.insert("FIGMA_OAUTH_TOKEN".to_string(), token);
         }
@@ -554,24 +628,17 @@ async fn resolve_plugin_runtime_config(
             args: vec!["-y".into(), "figma-developer-mcp".into(), "--stdio".into(), "--json".into()],
             env_vars,
         }
-    } else if transport == "stdio" {
+    } else if inputs.transport == "stdio" {
         McpTransport::Stdio {
-            command: command.unwrap_or_default(),
-            args: parse_string_array(&args),
+            command: inputs.command.unwrap_or_default(),
+            args: parse_string_array(inputs.args),
             env_vars,
         }
     } else {
         McpTransport::Http {
-            url: url.unwrap_or_default(),
+            url: inputs.url.unwrap_or_default(),
             headers,
         }
-    };
-
-    McpServerConfig {
-        id: mcp_server_id.to_string(),
-        name: mcp_server_name,
-        transport: transport_cfg,
-        enabled: true,
     }
 }
 
@@ -762,39 +829,185 @@ pub async fn list_installed_plugins(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let items: Vec<Value> = rows.iter().map(|row| {
-        let sb = row.try_get::<Value, _>("secret_bindings").unwrap_or(json!({}));
-        let has_sb = sb.as_object().map(|o| !o.is_empty()).unwrap_or(false);
-        json!({
-            "id": row.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
-            "catalogItemId": row.try_get::<Uuid, _>("catalog_item_id").ok().map(|v| v.to_string()),
-            "releaseId": row.try_get::<Option<Uuid>, _>("release_id").unwrap_or(None).map(|v| v.to_string()),
-            "version": row.try_get::<Option<String>, _>("version").unwrap_or(None),
-            "slug": row.try_get::<String, _>("slug").unwrap_or_default(),
-            "catalogName": row.try_get::<String, _>("catalog_name").unwrap_or_default(),
-            "catalogDescription": row.try_get::<String, _>("catalog_description").unwrap_or_default(),
-            "transport": row.try_get::<String, _>("transport").unwrap_or_else(|_| "http".into()),
-            "scope": row.try_get::<String, _>("scope").unwrap_or_else(|_| "global".into()),
-            "projectId": row.try_get::<Option<Uuid>, _>("project_id").unwrap_or(None).map(|v| v.to_string()),
-            "name": row.try_get::<String, _>("name").unwrap_or_default(),
-            "enabled": row.try_get::<bool, _>("enabled").unwrap_or(true),
-            "healthStatus": row.try_get::<String, _>("health_status").unwrap_or_else(|_| "unknown".into()),
-            "lastHealthMessage": row.try_get::<Option<String>, _>("last_health_message").unwrap_or(None),
-            "lastTestedAt": row.try_get::<Option<DateTime<Utc>>, _>("last_tested_at").unwrap_or(None).map(|v| v.to_rfc3339()),
-            "mcpServerId": row.try_get::<Option<Uuid>, _>("mcp_server_id").unwrap_or(None).map(|v| v.to_string()),
-            "toolPolicy": {
-                "mode": row.try_get::<Option<String>, _>("policy_mode").unwrap_or(Some("all".into())),
-                "tools": row.try_get::<Value, _>("policy_tools").unwrap_or(json!([])),
-                "blockedTools": row.try_get::<Value, _>("policy_blocked_tools").unwrap_or(json!([])),
-            },
-            "secretBindingsMasked": has_sb,
-            "createdAt": row.try_get::<DateTime<Utc>, _>("created_at").ok().map(|v| v.to_rfc3339()),
-            "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at").ok().map(|v| v.to_rfc3339()),
-            "canManage": can_manage_instance(row, user_id, &claims.role),
-        })
-    }).collect();
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| installed_plugin_to_json(row, user_id, &claims.role))
+        .collect();
 
     Ok(Json(json!({ "items": items })))
+}
+
+// Serializza una riga della query `list_installed_plugins` nel JSON di risposta.
+// Estratto dalla closure di mapping per tenere l'handler sotto soglia
+// (comportamento invariato).
+fn installed_plugin_to_json(row: &sqlx::postgres::PgRow, user_id: Uuid, role: &str) -> Value {
+    let sb = row.try_get::<Value, _>("secret_bindings").unwrap_or(json!({}));
+    let has_sb = sb.as_object().map(|o| !o.is_empty()).unwrap_or(false);
+    json!({
+        "id": row.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
+        "catalogItemId": row.try_get::<Uuid, _>("catalog_item_id").ok().map(|v| v.to_string()),
+        "releaseId": row.try_get::<Option<Uuid>, _>("release_id").unwrap_or(None).map(|v| v.to_string()),
+        "version": row.try_get::<Option<String>, _>("version").unwrap_or(None),
+        "slug": row.try_get::<String, _>("slug").unwrap_or_default(),
+        "catalogName": row.try_get::<String, _>("catalog_name").unwrap_or_default(),
+        "catalogDescription": row.try_get::<String, _>("catalog_description").unwrap_or_default(),
+        "transport": row.try_get::<String, _>("transport").unwrap_or_else(|_| "http".into()),
+        "scope": row.try_get::<String, _>("scope").unwrap_or_else(|_| "global".into()),
+        "projectId": row.try_get::<Option<Uuid>, _>("project_id").unwrap_or(None).map(|v| v.to_string()),
+        "name": row.try_get::<String, _>("name").unwrap_or_default(),
+        "enabled": row.try_get::<bool, _>("enabled").unwrap_or(true),
+        "healthStatus": row.try_get::<String, _>("health_status").unwrap_or_else(|_| "unknown".into()),
+        "lastHealthMessage": row.try_get::<Option<String>, _>("last_health_message").unwrap_or(None),
+        "lastTestedAt": row.try_get::<Option<DateTime<Utc>>, _>("last_tested_at").unwrap_or(None).map(|v| v.to_rfc3339()),
+        "mcpServerId": row.try_get::<Option<Uuid>, _>("mcp_server_id").unwrap_or(None).map(|v| v.to_string()),
+        "toolPolicy": {
+            "mode": row.try_get::<Option<String>, _>("policy_mode").unwrap_or(Some("all".into())),
+            "tools": row.try_get::<Value, _>("policy_tools").unwrap_or(json!([])),
+            "blockedTools": row.try_get::<Value, _>("policy_blocked_tools").unwrap_or(json!([])),
+        },
+        "secretBindingsMasked": has_sb,
+        "createdAt": row.try_get::<DateTime<Utc>, _>("created_at").ok().map(|v| v.to_rfc3339()),
+        "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at").ok().map(|v| v.to_rfc3339()),
+        "canManage": can_manage_instance(row, user_id, role),
+    })
+}
+
+// Verifica che tutti i secret richiesti dal catalog siano configurati in
+// settings. Ritorna BAD_REQUEST elencando le chiavi mancanti.
+async fn ensure_required_secrets(
+    db: &PgPool,
+    catalog: &CatalogConfig,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let required_keys = parse_string_array(&catalog.required_secret_refs);
+    if required_keys.is_empty() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    for key in required_keys {
+        if resolve_secret_value(db, &key).await.is_none() {
+            missing.push(key);
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(api_error(StatusCode::BAD_REQUEST, format!("Chiavi mancanti: {}", missing.join(", "))))
+    }
+}
+
+// Risolve release id/versione da usare per l'installazione: se `version` e'
+// specificata cerca la release esatta, altrimenti ricade sui default del catalog.
+async fn resolve_install_release(
+    db: &PgPool,
+    catalog: &CatalogConfig,
+    version: Option<&str>,
+) -> Result<(Option<Uuid>, String), (StatusCode, Json<Value>)> {
+    let release_row = if let Some(version) = version {
+        sqlx::query("SELECT id, version FROM plugin_releases WHERE catalog_item_id = $1 AND version = $2")
+            .bind(catalog.id).bind(version).fetch_optional(db).await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        None
+    };
+    let release_id = release_row.as_ref().and_then(|r| r.try_get::<Uuid, _>("id").ok()).or(catalog.release_id);
+    let release_version = release_row.as_ref().and_then(|r| r.try_get::<String, _>("version").ok())
+        .or(catalog.release_version.clone()).unwrap_or_else(|| "1.0.0".into());
+    Ok((release_id, release_version))
+}
+
+// Upsert della tool policy iniziale dell'instance dai default del catalog.
+// L'errore e' ignorato come nell'originale (best-effort, non blocca l'install).
+async fn seed_default_tool_policy(db: &PgPool, plugin_instance_id: Uuid, catalog: &CatalogConfig, user_id: Uuid) {
+    let pm = catalog.default_tool_policy.get("mode").and_then(Value::as_str).unwrap_or("allowlist").to_string();
+    let pt = catalog.default_tool_policy.get("tools").cloned().unwrap_or(json!([]));
+    let pb = catalog.default_tool_policy.get("blockedTools").cloned().unwrap_or(json!([]));
+    let _ = sqlx::query(
+        "INSERT INTO plugin_instance_tool_policies (plugin_instance_id, mode, tools, blocked_tools, updated_by_user_id) VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (plugin_instance_id) DO UPDATE SET mode=EXCLUDED.mode, tools=EXCLUDED.tools, blocked_tools=EXCLUDED.blocked_tools, updated_by_user_id=EXCLUDED.updated_by_user_id, updated_at=NOW()"
+    ).bind(plugin_instance_id).bind(&pm).bind(&pt).bind(&pb).bind(user_id).execute(db).await;
+}
+
+// Per transport stdio con allowlist di comandi non vuota, verifica che il
+// comando runtime sia consentito. Estratto da `install_plugin` (invariato).
+fn validate_stdio_command(
+    catalog: &CatalogConfig,
+    runtime_command: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if catalog.transport != "stdio" {
+        return Ok(());
+    }
+    let allowed: HashSet<String> = parse_string_array(&catalog.allowed_commands).into_iter().map(|s| s.to_lowercase()).collect();
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    let candidate = runtime_command.unwrap_or_default().to_lowercase();
+    if allowed.contains(&candidate) {
+        Ok(())
+    } else {
+        Err(api_error(StatusCode::FORBIDDEN, "Command stdio non consentito"))
+    }
+}
+
+// Inserisce il record mcp_server associato all'instance e ritorna il suo id.
+// Estratto da `install_plugin` per tenere l'handler sotto soglia (invariato).
+#[allow(clippy::too_many_arguments)]
+async fn insert_mcp_server(
+    db: &PgPool,
+    plugin_instance_id: Uuid,
+    user_id: Uuid,
+    project_id: Option<Uuid>,
+    catalog: &CatalogConfig,
+    scope: &str,
+    instance_name: &str,
+    config: &Value,
+    runtime_command: Option<String>,
+) -> Result<Uuid, (StatusCode, Json<Value>)> {
+    let config_url = config.get("url").and_then(Value::as_str).map(str::to_string).or(catalog.http_url.clone());
+    let config_args = config.get("args").cloned().unwrap_or_else(|| catalog.stdio_args.clone());
+    let config_headers = config.get("headers").cloned().unwrap_or(json!({}));
+    let config_env = config.get("envVars").cloned().unwrap_or(json!({}));
+
+    let ms_row = sqlx::query(
+        "INSERT INTO mcp_servers (plugin_instance_id, user_id, project_id, name, description, transport, url, command, args, env_vars, headers, enabled, scope)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE,$12) RETURNING id",
+    )
+    .bind(plugin_instance_id).bind(user_id).bind(project_id).bind(instance_name).bind(Some(catalog.description.clone()))
+    .bind(&catalog.transport).bind(config_url).bind(runtime_command).bind(config_args).bind(config_env).bind(config_headers).bind(scope)
+    .fetch_one(db).await.map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(ms_row.try_get("id").unwrap_or(Uuid::nil()))
+}
+
+// Per scope "project" valida e autorizza il projectId; per gli altri scope
+// ritorna None. Estratto da `install_plugin` (comportamento invariato).
+async fn resolve_install_project_id(
+    db: &PgPool,
+    user_id: Uuid,
+    scope: &str,
+    project_id_raw: Option<&str>,
+) -> Result<Option<Uuid>, (StatusCode, Json<Value>)> {
+    if scope != "project" {
+        return Ok(None);
+    }
+    let raw = project_id_raw
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "projectId richiesto per scope project"))?;
+    let parsed = Uuid::parse_str(raw).map_err(|_| api_error(StatusCode::BAD_REQUEST, "projectId non valido"))?;
+    ensure_project_access(db, user_id, parsed).await?;
+    Ok(Some(parsed))
+}
+
+// Rifiuta l'installazione se esiste gia' un'instance per lo stesso catalog/slug
+// (ovunque nel sistema). Estratto da `install_plugin` (comportamento invariato).
+async fn reject_if_duplicate(
+    db: &PgPool,
+    catalog: &CatalogConfig,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Some((eid, es, ep, eu)) = find_duplicate_instance_anywhere(db, catalog.id, &catalog.slug).await? {
+        let mut d = format!("scope={es}");
+        if let Some(p) = ep { d.push_str(&format!(", projectId={p}")); }
+        if let Some(u) = eu { d.push_str(&format!(", ownerUserId={u}")); }
+        return Err(api_error(StatusCode::CONFLICT, format!("Plugin gia' installato (instance: {}, {})", eid, d)));
+    }
+    Ok(())
 }
 
 /// POST /api/plugins/install
@@ -810,53 +1023,19 @@ pub async fn install_plugin(
         return Err(api_error(StatusCode::FORBIDDEN, "Solo admin puo' installare plugin globali"));
     }
 
-    let project_id = if scope == "project" {
-        let raw = body.project_id.as_deref()
-            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "projectId richiesto per scope project"))?;
-        let parsed = Uuid::parse_str(raw).map_err(|_| api_error(StatusCode::BAD_REQUEST, "projectId non valido"))?;
-        ensure_project_access(&state.db, user_id, parsed).await?;
-        Some(parsed)
-    } else { None };
-
-    if let Some((eid, es, ep, eu)) = find_duplicate_instance_anywhere(&state.db, catalog.id, &catalog.slug).await? {
-        let mut d = format!("scope={es}");
-        if let Some(p) = ep { d.push_str(&format!(", projectId={p}")); }
-        if let Some(u) = eu { d.push_str(&format!(", ownerUserId={u}")); }
-        return Err(api_error(StatusCode::CONFLICT, format!("Plugin gia' installato (instance: {}, {})", eid, d)));
-    }
-
-    let required_keys = parse_string_array(&catalog.required_secret_refs);
-    if !required_keys.is_empty() {
-        let mut missing = Vec::new();
-        for key in required_keys { if resolve_secret_value(&state.db, &key).await.is_none() { missing.push(key); } }
-        if !missing.is_empty() {
-            return Err(api_error(StatusCode::BAD_REQUEST, format!("Chiavi mancanti: {}", missing.join(", "))));
-        }
-    }
+    let project_id = resolve_install_project_id(&state.db, user_id, &scope, body.project_id.as_deref()).await?;
+    reject_if_duplicate(&state.db, &catalog).await?;
+    ensure_required_secrets(&state.db, &catalog).await?;
 
     let config = body.config.clone().unwrap_or_else(|| json!({}));
     let secret_bindings = body.secret_bindings.clone().unwrap_or_else(|| json!({}));
 
-    let release_row = if let Some(version) = body.version.as_deref() {
-        sqlx::query("SELECT id, version FROM plugin_releases WHERE catalog_item_id = $1 AND version = $2")
-            .bind(catalog.id).bind(version).fetch_optional(&state.db).await
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else { None };
-    let release_id = release_row.as_ref().and_then(|r| r.try_get::<Uuid, _>("id").ok()).or(catalog.release_id);
-    let release_version = release_row.as_ref().and_then(|r| r.try_get::<String, _>("version").ok())
-        .or(catalog.release_version.clone()).unwrap_or_else(|| "1.0.0".into());
+    let (release_id, release_version) =
+        resolve_install_release(&state.db, &catalog, body.version.as_deref()).await?;
 
     let runtime_command = config.get("command").and_then(Value::as_str).map(str::to_string).or(catalog.stdio_command.clone());
 
-    if catalog.transport == "stdio" {
-        let allowed: HashSet<String> = parse_string_array(&catalog.allowed_commands).into_iter().map(|s| s.to_lowercase()).collect();
-        if !allowed.is_empty() {
-            let candidate = runtime_command.clone().unwrap_or_default().to_lowercase();
-            if !allowed.contains(&candidate) {
-                return Err(api_error(StatusCode::FORBIDDEN, "Command stdio non consentito"));
-            }
-        }
-    }
+    validate_stdio_command(&catalog, runtime_command.as_deref())?;
 
     let instance_name = body.name.clone().unwrap_or_else(|| format!("{} ({release_version})", catalog.name));
 
@@ -868,27 +1047,11 @@ pub async fn install_plugin(
     .fetch_one(&state.db).await.map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let plugin_instance_id: Uuid = pi_row.try_get("id").unwrap_or(Uuid::nil());
 
-    let pm = catalog.default_tool_policy.get("mode").and_then(Value::as_str).unwrap_or("allowlist").to_string();
-    let pt = catalog.default_tool_policy.get("tools").cloned().unwrap_or(json!([]));
-    let pb = catalog.default_tool_policy.get("blockedTools").cloned().unwrap_or(json!([]));
-    let _ = sqlx::query(
-        "INSERT INTO plugin_instance_tool_policies (plugin_instance_id, mode, tools, blocked_tools, updated_by_user_id) VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (plugin_instance_id) DO UPDATE SET mode=EXCLUDED.mode, tools=EXCLUDED.tools, blocked_tools=EXCLUDED.blocked_tools, updated_by_user_id=EXCLUDED.updated_by_user_id, updated_at=NOW()"
-    ).bind(plugin_instance_id).bind(&pm).bind(&pt).bind(&pb).bind(user_id).execute(&state.db).await;
+    seed_default_tool_policy(&state.db, plugin_instance_id, &catalog, user_id).await;
 
-    let config_url = config.get("url").and_then(Value::as_str).map(str::to_string).or(catalog.http_url.clone());
-    let config_args = config.get("args").cloned().unwrap_or_else(|| catalog.stdio_args.clone());
-    let config_headers = config.get("headers").cloned().unwrap_or(json!({}));
-    let config_env = config.get("envVars").cloned().unwrap_or(json!({}));
-
-    let ms_row = sqlx::query(
-        "INSERT INTO mcp_servers (plugin_instance_id, user_id, project_id, name, description, transport, url, command, args, env_vars, headers, enabled, scope)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE,$12) RETURNING id",
-    )
-    .bind(plugin_instance_id).bind(user_id).bind(project_id).bind(&instance_name).bind(Some(catalog.description.clone()))
-    .bind(&catalog.transport).bind(config_url).bind(runtime_command).bind(config_args).bind(config_env).bind(config_headers).bind(&scope)
-    .fetch_one(&state.db).await.map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mcp_server_id: Uuid = ms_row.try_get("id").unwrap_or(Uuid::nil());
+    let mcp_server_id = insert_mcp_server(
+        &state.db, plugin_instance_id, user_id, project_id, &catalog, &scope, &instance_name, &config, runtime_command,
+    ).await?;
 
     write_plugin_audit(&state.db, Some(plugin_instance_id), Some(user_id), project_id, "install", "ok",
         Some(format!("Plugin {} installato ({})", catalog.slug, release_version)),
@@ -941,6 +1104,48 @@ pub async fn toggle_plugin(State(state): State<AppState>, Extension(claims): Ext
 }
 
 /// POST /api/plugins/:id/test
+// Persiste i tool scoperti dal test e auto-popola l'allowlist se vuota; ritorna
+// il payload JSON dei tool. Estratto dal ramo Ok di `test_plugin`.
+async fn persist_discovered_tools(
+    state: &AppState,
+    pid: Uuid,
+    resolution: &PluginResolution,
+    tools: &[nexus_mcp_client::McpTool],
+) -> Vec<Value> {
+    for tool in tools {
+        let schema = serde_json::to_value(&tool.input_schema).unwrap_or(json!({}));
+        let _ = sqlx::query("INSERT INTO mcp_server_tools (server_id, tool_name, description, input_schema, discovered_at) VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (server_id, tool_name) DO UPDATE SET description=$3, input_schema=$4, discovered_at=NOW()")
+            .bind(resolution.mcp_server_id).bind(&tool.name).bind(&tool.description).bind(schema).execute(&state.db).await;
+    }
+    // Auto-populate allowlist if empty
+    if let Ok(Some(pr)) = sqlx::query("SELECT mode, tools FROM plugin_instance_tool_policies WHERE plugin_instance_id=$1").bind(pid).fetch_optional(&state.db).await {
+        let mode: String = pr.try_get("mode").unwrap_or_else(|_| "all".into());
+        let ct: Value = pr.try_get("tools").unwrap_or(json!([]));
+        if mode == "allowlist" && ct.as_array().map(|a| a.len()).unwrap_or(0) == 0 {
+            let discovered: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+            let _ = sqlx::query("UPDATE plugin_instance_tool_policies SET tools=$2, updated_at=NOW() WHERE plugin_instance_id=$1")
+                .bind(pid).bind(json!(discovered)).execute(&state.db).await;
+        }
+    }
+    tools.iter().map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.input_schema})).collect()
+}
+
+// Traduce l'errore del list_tools in un messaggio compatto, con hint dedicato
+// al caso Figma HTTP 401 (token PAT vs OAuth). Estratto dal ramo Err di `test_plugin`.
+async fn describe_test_failure(state: &AppState, resolution: &PluginResolution, error: &nexus_mcp_client::McpError) -> String {
+    let raw = error.to_string();
+    let mut msg = format_compact_error(&raw);
+    if resolution.plugin_slug.eq_ignore_ascii_case("figma-http") && raw.contains("HTTP 401") {
+        let th = resolve_secret_value(&state.db, "figma_oauth_token").await;
+        msg = if th.as_deref().map(is_figma_pat).unwrap_or(false) {
+            "MCP Figma 401. Verifica token e riesegui il test.".into()
+        } else {
+            "MCP Figma 401. Verifica OAuth app Figma.".into()
+        };
+    }
+    msg
+}
+
 pub async fn test_plugin(State(state): State<AppState>, Extension(claims): Extension<Claims>, AxumPath(id): AxumPath<String>) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
     let pid = Uuid::parse_str(&id).map_err(|_| api_error(StatusCode::BAD_REQUEST, "Plugin id non valido"))?;
@@ -952,35 +1157,11 @@ pub async fn test_plugin(State(state): State<AppState>, Extension(claims): Exten
     let stdio_timeout = nexus_mcp_client::resolve_stdio_timeout(&state.db).await;
     let (success, tool_count, error_message, tools_payload) = match mcp_client::list_tools(&resolution.config, stdio_timeout).await {
         Ok(tools) => {
-            for tool in &tools {
-                let schema = serde_json::to_value(&tool.input_schema).unwrap_or(json!({}));
-                let _ = sqlx::query("INSERT INTO mcp_server_tools (server_id, tool_name, description, input_schema, discovered_at) VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (server_id, tool_name) DO UPDATE SET description=$3, input_schema=$4, discovered_at=NOW()")
-                    .bind(resolution.mcp_server_id).bind(&tool.name).bind(&tool.description).bind(schema).execute(&state.db).await;
-            }
-            // Auto-populate allowlist if empty
-            if let Ok(Some(pr)) = sqlx::query("SELECT mode, tools FROM plugin_instance_tool_policies WHERE plugin_instance_id=$1").bind(pid).fetch_optional(&state.db).await {
-                let mode: String = pr.try_get("mode").unwrap_or_else(|_| "all".into());
-                let ct: Value = pr.try_get("tools").unwrap_or(json!([]));
-                if mode == "allowlist" && ct.as_array().map(|a| a.len()).unwrap_or(0) == 0 {
-                    let discovered: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
-                    let _ = sqlx::query("UPDATE plugin_instance_tool_policies SET tools=$2, updated_at=NOW() WHERE plugin_instance_id=$1")
-                        .bind(pid).bind(json!(discovered)).execute(&state.db).await;
-                }
-            }
-            let payload: Vec<Value> = tools.iter().map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.input_schema})).collect();
+            let payload = persist_discovered_tools(&state, pid, &resolution, &tools).await;
             (true, payload.len() as i32, None, payload)
         }
         Err(error) => {
-            let raw = error.to_string();
-            let mut msg = format_compact_error(&raw);
-            if resolution.plugin_slug.eq_ignore_ascii_case("figma-http") && raw.contains("HTTP 401") {
-                let th = resolve_secret_value(&state.db, "figma_oauth_token").await;
-                msg = if th.as_deref().map(is_figma_pat).unwrap_or(false) {
-                    "MCP Figma 401. Verifica token e riesegui il test.".into()
-                } else {
-                    "MCP Figma 401. Verifica OAuth app Figma.".into()
-                };
-            }
+            let msg = describe_test_failure(&state, &resolution, &error).await;
             (false, 0, Some(msg), Vec::new())
         }
     };
@@ -1051,6 +1232,22 @@ pub async fn update_plugin_tool_policy(State(state): State<AppState>, Extension(
 }
 
 /// POST /api/plugins/:id/migrate-legacy
+// Autorizza la migrazione di un mcp_server legacy: consentita al proprietario
+// oppure a un admin su scope global. Ritorna lo scope normalizzato (lowercase).
+fn authorize_legacy_migration(
+    row: &sqlx::postgres::PgRow,
+    user_id: Uuid,
+    role: &str,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
+    let scope: String = row.try_get::<String, _>("scope").unwrap_or_else(|_| "user".to_string()).to_lowercase();
+    if owner == Some(user_id) || (scope == "global" && role == "admin") {
+        Ok(scope)
+    } else {
+        Err(api_error(StatusCode::FORBIDDEN, "Server MCP non gestibile"))
+    }
+}
+
 pub async fn migrate_legacy_mcp_server(State(state): State<AppState>, Extension(claims): Extension<Claims>, AxumPath(server_id): AxumPath<String>) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
     let sid = Uuid::parse_str(&server_id).map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server MCP id non valido"))?;
@@ -1059,11 +1256,7 @@ pub async fn migrate_legacy_mcp_server(State(state): State<AppState>, Extension(
         .bind(sid).fetch_optional(&state.db).await.map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let Some(row) = row else { return Err(api_error(StatusCode::NOT_FOUND, "Server MCP legacy non trovato")); };
 
-    let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
-    let scope: String = row.try_get::<String, _>("scope").unwrap_or_else(|_| "user".to_string()).to_lowercase();
-    if !(owner == Some(user_id) || (scope == "global" && claims.role == "admin")) {
-        return Err(api_error(StatusCode::FORBIDDEN, "Server MCP non gestibile"));
-    }
+    let scope = authorize_legacy_migration(&row, user_id, &claims.role)?;
 
     if let Some(pid) = row.try_get::<Option<Uuid>, _>("plugin_instance_id").unwrap_or(None) {
         return Ok(Json(json!({"ok": true, "alreadyMigrated": true, "pluginInstanceId": pid.to_string()})));
@@ -1145,18 +1338,33 @@ pub async fn start_figma_oauth(State(state): State<AppState>, Extension(claims):
 }
 
 /// GET /auth/figma/mcp/callback
+// Valida lo `state` firmato del callback OAuth Figma: lo decodifica col segreto
+// JWT e ne estrae le claim. In caso di errore ritorna direttamente il redirect.
+// Estratto da `figma_oauth_callback` (comportamento invariato).
+async fn verify_figma_oauth_state(
+    db: &PgPool,
+    raw_state: Option<&str>,
+) -> Result<FigmaOAuthStateClaims, Response> {
+    let default_return = FIGMA_DEFAULT_RETURN_TO.to_string();
+    let Some(raw_state) = raw_state else {
+        return Err(redirect_with_status(&default_return, "error", Some("State OAuth mancante")));
+    };
+    let jwt_secret = match get_or_create_jwt_secret(db).await {
+        Ok(s) => s,
+        Err(e) => return Err(redirect_with_status(&default_return, "error", Some(&format!("JWT: {e}")))),
+    };
+    match decode::<FigmaOAuthStateClaims>(raw_state, &DecodingKey::from_secret(jwt_secret.as_bytes()), &Validation::default()) {
+        Ok(d) => Ok(d.claims),
+        Err(_) => Err(redirect_with_status(&default_return, "error", Some("State non valido"))),
+    }
+}
+
 pub async fn figma_oauth_callback(State(state): State<AppState>, Query(query): Query<FigmaOAuthCallbackQuery>) -> Response {
-    let mut return_to = FIGMA_DEFAULT_RETURN_TO.to_string();
-    let Some(raw_state) = query.state.as_deref() else {
-        return redirect_with_status(&return_to, "error", Some("State OAuth mancante"));
+    let state_claims = match verify_figma_oauth_state(&state.db, query.state.as_deref()).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
     };
-    let jwt_secret = match get_or_create_jwt_secret(&state.db).await {
-        Ok(s) => s, Err(e) => return redirect_with_status(&return_to, "error", Some(&format!("JWT: {e}"))),
-    };
-    let state_claims = match decode::<FigmaOAuthStateClaims>(raw_state, &DecodingKey::from_secret(jwt_secret.as_bytes()), &Validation::default()) {
-        Ok(d) => d.claims, Err(_) => return redirect_with_status(&return_to, "error", Some("State non valido")),
-    };
-    return_to = sanitize_return_to(Some(&state_claims.return_to));
+    let return_to = sanitize_return_to(Some(&state_claims.return_to));
 
     if let Some(error) = query.error.as_deref() {
         let msg = query.error_description.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or(error);
@@ -1194,17 +1402,24 @@ pub async fn figma_oauth_callback(State(state): State<AppState>, Query(query): Q
         return redirect_with_status(&return_to, "error", Some(&m));
     }
 
+    let token_type = persist_figma_tokens(&state.db, tp).await;
+    redirect_with_status(&return_to, "ok", Some(&format!("OAuth Figma collegato ({token_type}).")))
+}
+
+// Persiste su settings i token Figma ottenuti dallo scambio OAuth e azzera
+// l'ultimo errore. Ritorna il token_type per il messaggio di successo.
+async fn persist_figma_tokens(db: &PgPool, tp: FigmaOAuthTokenResponse) -> String {
     let at = tp.access_token.as_deref().unwrap_or_default().trim().to_string();
     let rt = tp.refresh_token.as_deref().unwrap_or_default().trim().to_string();
     let sc = tp.scope.unwrap_or_else(|| "mcp:connect".into());
     let tt = tp.token_type.unwrap_or_else(|| "Bearer".into());
     let ea = tp.expires_in.map(|s| (Utc::now() + Duration::seconds(s.max(0))).to_rfc3339());
 
-    let _ = upsert_setting_value(&state.db, "figma_oauth_token", &at, "connectors", "Token Figma", true).await;
-    let _ = upsert_setting_value(&state.db, "figma_refresh_token", &rt, "connectors", "Refresh token Figma", true).await;
-    let _ = upsert_setting_value(&state.db, "figma_token_scope", &sc, "connectors", "Scope token Figma", false).await;
-    let _ = upsert_setting_value(&state.db, "figma_token_expires_at", ea.as_deref().unwrap_or(""), "connectors", "Scadenza token Figma", false).await;
-    let _ = upsert_setting_value(&state.db, "figma_last_oauth_error", "", "connectors", "Ultimo errore OAuth Figma", false).await;
+    let _ = upsert_setting_value(db, "figma_oauth_token", &at, "connectors", "Token Figma", true).await;
+    let _ = upsert_setting_value(db, "figma_refresh_token", &rt, "connectors", "Refresh token Figma", true).await;
+    let _ = upsert_setting_value(db, "figma_token_scope", &sc, "connectors", "Scope token Figma", false).await;
+    let _ = upsert_setting_value(db, "figma_token_expires_at", ea.as_deref().unwrap_or(""), "connectors", "Scadenza token Figma", false).await;
+    let _ = upsert_setting_value(db, "figma_last_oauth_error", "", "connectors", "Ultimo errore OAuth Figma", false).await;
 
-    redirect_with_status(&return_to, "ok", Some(&format!("OAuth Figma collegato ({tt}).")))
+    tt
 }
