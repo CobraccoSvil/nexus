@@ -104,6 +104,7 @@ mod session_worklog;
 mod settings;
 mod static_preview;
 mod sudo_manager;
+mod system_services;
 mod sudo_routes;
 mod task_watchdog;
 #[cfg(test)]

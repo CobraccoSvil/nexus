@@ -63,30 +63,34 @@ export interface NexusServiceInfo {
   name: string;
   label: string;
   port: number;
-  description: string;
-  /** LED della statusbar controllato da questo servizio (es. "Tools", "Core", "OpenAI · Anthropic · …"). */
+  description?: string;
+  /** LED della statusbar alimentato da questo servizio (es. "Core", "Redis", "DB"). */
   led?: string;
-  /** Servizio system (postgres, redis): mostrabile ma non controllabile senza root. */
+  /** Servizio infra readonly (postgres, redis): mostrato ma senza pulsanti di controllo. */
   readonly?: boolean;
+  /** true se start/stop/restart sono ammessi (campo `controllable` del catalogo). */
+  controllable?: boolean;
   state: "active" | "inactive" | "failed" | "activating" | "unknown";
   sub_state?: string;
-  /** true se la porta TCP risponde, indipendentemente dallo stato systemd. */
+  /** true se la porta TCP risponde. Coincide con state === "active": segnale
+   *  onesto, non un override che maschera "unknown". */
   port_alive?: boolean;
 }
 
 /** Recupera lo stato di tutti i servizi di sistema Nexus.
- *  Usa URL relativo (non API_BASE) perché l'endpoint è su Next.js,
- *  non su mcp-core. Funziona anche quando mcp-core è offline. */
+ *  Il route Next.js proxya verso mcp-core, che calcola lo stato in modo
+ *  platform-aware (TCP probe della porta dal catalogo DB). Se mcp-core e'
+ *  offline il pannello mantiene l'ultimo stato noto. */
 export async function getNexusServicesStatus(): Promise<{ services: NexusServiceInfo[] }> {
   return fetchJsonNoAuth(`/api/system/services`, undefined, 20000);
 }
 
-/** Avvia, stoppa o riavvia un servizio Nexus.
- *  Usa URL relativo (non API_BASE) per lo stesso motivo. */
+/** Avvia, stoppa o riavvia un servizio Nexus (proxy verso mcp-core, controllo
+ *  platform-aware: systemctl su Unix, deploy/dev-service.ps1 su Windows). */
 export async function controlNexusService(
   service: string,
   action: "start" | "stop" | "restart"
-): Promise<{ ok: boolean; unit: string; action: string; stdout: string; stderr: string }> {
+): Promise<{ ok: boolean; service?: string; action: string; stdout?: string; stderr?: string }> {
   return fetchJsonNoAuth(`/api/system/services/${encodeURIComponent(service)}/${action}`, {
     method: "POST",
   }, 30000);

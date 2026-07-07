@@ -29,7 +29,10 @@
 //! mcp-core NON e' monitorato: e' il processo che ospita questo watchdog.
 //!
 //! Tutta la config e' DB-driven (regola G), niente porte/comandi hardcoded
-//! oltre i default in migrazione `0272_services_watchdog.sql`.
+//! oltre i default in migrazione `0272_services_watchdog.sql`. La LISTA dei
+//! servizi monitorati non e' piu' dedicata: arriva dal catalogo unico
+//! `system.services_catalog` (migrazione 0541) filtrando `watchdog_managed`
+//! (regola L, punto unico condiviso con l'endpoint `/api/system/services`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -46,7 +49,8 @@ const PROBE_TIMEOUT_MS: u64 = 1_500;
 /// Attesa iniziale prima del primo ciclo (lascia stabilizzare l'avvio).
 const STARTUP_DELAY_S: u64 = 20;
 
-/// Voce della lista servizi monitorati (da `agent.watchdog.services`).
+/// Voce della lista servizi monitorati, derivata dalle voci `watchdog_managed`
+/// del catalogo unico `system.services_catalog` (regola L).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WatchedService {
     /// Nome per `deploy-local.sh --service <name>` (allineato a SERVICES_CATALOG).
@@ -177,12 +181,27 @@ async fn load_config(db: &PgPool) -> WatchdogConfig {
         .unwrap_or(5)
         .max(1);
 
-    let services = get("agent.watchdog.services")
+    // Fonte UNICA (regola L): le voci `watchdog_managed` del catalogo servizi
+    // (`system.services_catalog`, migrazione 0541), non piu' una lista dedicata
+    // `agent.watchdog.services`. mcp-core ha watchdog_managed=false (ospita il
+    // watchdog). Solo le voci con `port_setting_key` sono monitorabili (serve la
+    // porta per il probe).
+    let services = crate::system_services::load_catalog(db)
         .await
-        .ok()
-        .flatten()
-        .and_then(|v| serde_json::from_str::<Vec<WatchedService>>(&v).ok())
-        .unwrap_or_default();
+        .into_iter()
+        .filter(|e| e.watchdog_managed)
+        .filter_map(|e| {
+            let crate::system_services::CatalogEntry {
+                name,
+                port_setting_key,
+                ..
+            } = e;
+            port_setting_key.map(|port_setting_key| WatchedService {
+                name,
+                port_setting_key,
+            })
+        })
+        .collect();
 
     WatchdogConfig {
         enabled,
@@ -210,11 +229,13 @@ async fn resolve_port(db: &PgPool, port_setting_key: &str) -> Option<u16> {
 /// supervisori diversi):
 /// - Unix/WSL: `deploy-local.sh --service <name> --debug` detached (setsid nohup);
 ///   lo script conosce env/porte/build di ogni kind di servizio.
-/// - Windows: i microservizi sono Windows Services `nexus-<name>` (WinSW) gestiti
-///   dall'SCM, quindi si invoca `Restart-Service` (la shell Unix e lo script .sh
-///   non esistono nativamente su Windows).
+/// - Windows: delega a `system_services::control_service` (punto unico), che
+///   invoca `deploy/dev-service.ps1` — copre sia i Windows Services WinSW sia il
+///   modello a processi di `dev-start.ps1` e mappa il nome canonico sul
+///   `winsw_id` corretto dal catalogo (prima si assumeva erroneamente
+///   `nexus-<name>`, rotto per `admin-service` -> `nexus-admin-service`).
 #[cfg(unix)]
-async fn restart_service(name: &str) -> bool {
+async fn restart_service(_db: &sqlx::PgPool, name: &str) -> bool {
     let root = std::env::var("NEXUS_REPO_ROOT")
         .unwrap_or_else(|_| "/home/administrator/ideai".to_string());
     let script = format!("{root}/deploy/deploy-local.sh");
@@ -252,33 +273,25 @@ async fn restart_service(name: &str) -> bool {
     }
 }
 
-/// Variante Windows: riavvio via SCM (`Restart-Service nexus-<name>`). I nomi
-/// `WatchedService.name` (gateway, admin, chat, ...) mappano sui servizi WinSW
-/// `nexus-<name>` definiti in deploy-local.ps1.
+/// Variante Windows: delega al punto unico `system_services::control_service`
+/// (regola L), che risolve il `winsw_id` dal catalogo e invoca
+/// `deploy/dev-service.ps1`. Non riavvia in modalita' detached: il watchdog
+/// vuole l'esito dello spawn per il conteggio dei tentativi.
 #[cfg(windows)]
-async fn restart_service(name: &str) -> bool {
-    let svc = format!("nexus-{name}");
-    match tokio::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("Restart-Service -Name '{svc}' -Force -ErrorAction Stop"),
-        ])
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => true,
+async fn restart_service(db: &sqlx::PgPool, name: &str) -> bool {
+    use crate::system_services::{control_service, Action};
+    match control_service(db, name, Action::Restart).await {
         Ok(o) => {
-            tracing::warn!(
-                "services_watchdog: Restart-Service {svc} fallito ({}): {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            false
+            if !o.ok {
+                tracing::warn!(
+                    "services_watchdog: restart {name} non riuscito: {}",
+                    o.stderr.trim()
+                );
+            }
+            o.ok
         }
         Err(e) => {
-            tracing::warn!("services_watchdog: exec Restart-Service per {svc} fallito: {e}");
+            tracing::warn!("services_watchdog: restart {name} fallito: {e:?}");
             false
         }
     }
@@ -383,7 +396,7 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
                     port,
                     st.failed_restarts + 1
                 );
-                let spawned = restart_service(&svc.name).await;
+                let spawned = restart_service(db, &svc.name).await;
                 st.last_restart_ts = now_ts;
                 // Conteggio del riavvio come "fallito" finche' il prossimo ciclo
                 // (dopo cooldown) non conferma up; verra' azzerato al recupero.
