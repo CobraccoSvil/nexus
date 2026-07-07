@@ -2028,7 +2028,8 @@ pub(crate) async fn spawn_agent_run(
             .load(std::sync::atomic::Ordering::Relaxed);
     let recent_history = if vec_deps_ok {
         build_vectorized_conversation_history(
-            &msgs_pool,
+            &msgs_pool,  // pool progetto: chat_messages (raw fallback + finestra recente)
+            &state.db,   // meta-DB: setting globali qdrant_url/collection (regola G/L)
             &state.orchestrator.neural,
             params.session_id,
             &params.content,
