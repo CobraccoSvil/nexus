@@ -37,6 +37,7 @@ mod documents;
 mod docx_render;
 mod domain;
 mod environment;
+mod fanin_worker;
 mod file_mutations;
 mod github;
 mod http_metrics;
@@ -1153,6 +1154,14 @@ async fn main() -> anyhow::Result<()> {
     // del run per dare l'aggiornamento promesso ("ti aggiorno appena termina").
     // Config DB-driven (agent.process_resume.*, mig 0360).
     process_resume::spawn_process_resume_worker(state.clone());
+
+    // Worker `fanin_worker` (Fase D Slice 3): TRIGGER che RIPRENDE il run padre
+    // sospeso su `awaiting_subagents` quando i sub-run background completano.
+    // Drena la coda durevole META `subagent_fanin_resume_queue` (mig 0541) con un
+    // CAS `awaiting_subagents -> running` (race-free, restart-safe, idempotente).
+    // Config DB-driven (orchestrator.background_fanin_enabled, default ON ma
+    // INERTE finche' un padre non dispatcha figli background).
+    fanin_worker::spawn_fanin_worker(state.clone());
 
     // Worker `monitor_seed`: popola il pannello Monitor con KPI di default
     // (servizi attivi, container up, porte allocate, problemi aperti) cosi' il

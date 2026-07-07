@@ -315,8 +315,15 @@ pub(crate) async fn resolve_classifier_fields(
 #[derive(Debug, Clone)]
 pub struct NativeRunOutcome {
     /// `true` se il run e' arrivato a `End` (Completed); `false` se si e' fermato
-    /// su un interrupt HITL (`awaiting_confirmation`).
+    /// su un interrupt HITL (`awaiting_confirmation`) o fan-in
+    /// (`awaiting_subagents`).
     pub completed: bool,
+    /// `true` se l'interrupt che ha fermato il run e' l'attesa dei sub-run
+    /// background (fan-in deterministico, Fase D): distingue questo interrupt da
+    /// quello HITL (`awaiting_confirmation`). Popolato da `map_outcome` leggendo
+    /// `state.is_awaiting_subagents()`. Letto da `classify_status` per mappare
+    /// `AwaitingSubagents` invece di `AwaitingConfirmation` sul ramo interrotto.
+    pub awaiting_subagents: bool,
     /// Risposta finale (campo `result` dello stato a fine run).
     pub final_answer: Option<String>,
     /// Motivo di stop dell'ultimo turno, se valorizzato.
@@ -498,7 +505,16 @@ impl NativeRunOutcome {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !self.completed && self.resume_at.is_some() {
-            AgentRunStatus::AwaitingConfirmation
+            // Ramo INTERROTTO (run SOSPESO, resumibile): due motivi di
+            // interrupt-resume oggi. Il fan-in dei sub-run background (Fase D)
+            // porta il segnale strutturato `awaiting_subagents` (regola M); il
+            // resto e' l'attesa di conferma umana (HITL). Discriminati qui cosi'
+            // il worker fan-in seleziona SOLO i propri run (CAS su questo status).
+            if self.awaiting_subagents {
+                AgentRunStatus::AwaitingSubagents
+            } else {
+                AgentRunStatus::AwaitingConfirmation
+            }
         } else if matches!(self.stop_reason, Some(StopReason::Error)) {
             AgentRunStatus::Failed
         } else if declared_refusal
@@ -1880,6 +1896,45 @@ fn build_resume_delta(resume_message: &str) -> nexus_graph::StateDelta {
     typed.into_opaque()
 }
 
+/// Costruisce il delta opaco del runtime che sblocca l'interrupt FAN-IN (Fase D):
+/// azzera `awaiting_subagents` (`Some(Some(false))`, load-bearing per non
+/// re-interrompere sul checkpoint ancora-in-attesa) e inietta i `subagent_results`
+/// dei figli background completati. Gemello di [`build_resume_delta`] (regola L):
+/// la differenza dall'HITL e' il MOTIVO di interrupt azzerato e il payload
+/// iniettato (risultati strutturati vs messaggio umano di approvazione). Il delta
+/// e' TIPIZZATO e passa per il reducer (`into_opaque`): non si scrivono i campi a
+/// mano. `subagent_results` sono i verdetti strutturati (regola M) letti dalle
+/// righe `nexus_subagent_runs`, non prosa.
+fn build_resume_delta_subagents(subagent_results: Vec<Value>) -> nexus_graph::StateDelta {
+    let typed = nexus_agent_graph::state::StateDelta {
+        // Azzera il predicato di interrupt fan-in: senza, il motore si
+        // re-interrompe sul checkpoint ancora-in-attesa (loop di fan-in).
+        awaiting_subagents: Some(Some(false)),
+        // Inietta gli esiti dei sub-run background: l'executor li rilegge nello
+        // stato (`subagent_results`) al riavvio del turno. Segnali strutturati
+        // (verdict/status), mai prosa (regola M).
+        subagent_results: Some(Some(subagent_results)),
+        ..Default::default()
+    };
+    typed.into_opaque()
+}
+
+/// RESUME FAN-IN di un run nativo PRIMARIO sospeso su `awaiting_subagents`
+/// (Fase D). Gemello di [`resume_native`] (regola L): riparte dal checkpoint
+/// Postgres via [`run_engine`] con `RunMode::Resume`, ma applicando il delta
+/// fan-in (azzera `awaiting_subagents` + inietta `subagent_results`) invece del
+/// delta HITL. Gli `input` portano provider/model/session/step_tx del run
+/// originale; il GRAFO riparte dal nodo salvato nel checkpoint.
+pub async fn resume_native_fanin(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+    subagent_results: Vec<Value>,
+) -> anyhow::Result<NativeRunOutcome> {
+    let resume_delta = build_resume_delta_subagents(subagent_results);
+    let outcome = run_engine(deps, input, RunMode::Resume { resume_delta }, RunRole::Primary).await?;
+    Ok(map_outcome(outcome))
+}
+
 /// Esegue il grafo nativo end-to-end e ritorna lo [`StepOutcome`] COMPLETO (lo
 /// stato finale, non solo il sommario): il run shadow ne ha bisogno per la
 /// proiezione canonica (conteggio tool, produced_work). Punto unico (regola L)
@@ -2023,6 +2078,10 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
     };
     NativeRunOutcome {
         completed,
+        // Fan-in (Fase D): l'interrupt e' l'attesa dei sub-run background se lo
+        // stato porta ancora `awaiting_subagents=true`. Segnale strutturato
+        // (regola M) letto dallo stato, non dedotto dal `resume_at`.
+        awaiting_subagents: state.is_awaiting_subagents(),
         final_answer: state.result.clone(),
         stop_reason: state.stop_reason,
         provider_used: state.provider_used.clone(),
@@ -2865,6 +2924,52 @@ mod tests {
     }
 
     #[test]
+    fn build_resume_delta_subagents_azzera_await_e_inietta_risultati() {
+        use nexus_graph::GraphState;
+        // Stato sospeso su fan-in (Fase D) con un messaggio pregresso.
+        let mut state = AgentState {
+            awaiting_subagents: Some(true),
+            messages: vec![Message::Human {
+                content: nexus_agent_graph::state::MessageContent::text("task iniziale"),
+            }],
+            ..Default::default()
+        };
+        // Risultati strutturati dei figli background (forma tool_result poll,
+        // regola M: verdict/status, non prosa).
+        let results = vec![
+            serde_json::json!({
+                "subagent_run_id": "aaa",
+                "kind": "coder",
+                "status": "completed",
+                "summary": "fatto",
+                "outcome": {"verdict": "completed_verified", "success": true},
+            }),
+            serde_json::json!({
+                "subagent_run_id": "bbb",
+                "kind": "review",
+                "status": "completed",
+                "summary": "ok",
+                "outcome": {"verdict": "completed", "success": true},
+            }),
+        ];
+        let delta = build_resume_delta_subagents(results.clone());
+        state.merge(delta);
+
+        assert!(
+            !state.is_awaiting_subagents(),
+            "il delta deve azzerare awaiting_subagents (sblocca l'interrupt fan-in)"
+        );
+        // I risultati sono OVERWRITE nello stato (non append come i messaggi).
+        assert_eq!(
+            state.subagent_results.as_ref().map(|r| r.len()),
+            Some(2),
+            "i risultati dei sub-run sono iniettati nello stato"
+        );
+        // I messaggi NON sono toccati dal delta fan-in (nessun turno umano).
+        assert_eq!(state.messages.len(), 1, "nessun messaggio umano accodato");
+    }
+
+    #[test]
     fn parse_automation_mode_robusto() {
         // Una modalita' nota deve parsare; una ignota -> None (nessun panic).
         let known = parse_automation_mode("automatic");
@@ -3386,6 +3491,7 @@ mod tests {
     fn base_outcome() -> NativeRunOutcome {
         NativeRunOutcome {
             completed: true,
+            awaiting_subagents: false,
             final_answer: Some("fatto".to_string()),
             stop_reason: None,
             provider_used: None,
@@ -3422,6 +3528,28 @@ mod tests {
             ..base_outcome()
         };
         assert_eq!(o.classify_status(), AgentRunStatus::AwaitingConfirmation);
+    }
+
+    #[test]
+    fn classify_status_awaiting_subagents_fan_in() {
+        // Fase D fan-in: stesso ramo INTERROTTO (completed=false, resume_at
+        // valorizzato) di AwaitingConfirmation, ma il segnale strutturato
+        // `awaiting_subagents` (regola M) discrimina l'interrupt fan-in.
+        let fanin = NativeRunOutcome {
+            completed: false,
+            awaiting_subagents: true,
+            resume_at: Some(NodeId::ToolDispatch.as_label().to_string()),
+            ..base_outcome()
+        };
+        assert_eq!(fanin.classify_status(), AgentRunStatus::AwaitingSubagents);
+        // Senza il flag, lo stesso interrupt resta HITL (parita' regressione).
+        let hitl = NativeRunOutcome {
+            completed: false,
+            awaiting_subagents: false,
+            resume_at: Some(NodeId::ToolDispatch.as_label().to_string()),
+            ..base_outcome()
+        };
+        assert_eq!(hitl.classify_status(), AgentRunStatus::AwaitingConfirmation);
     }
 
     #[test]

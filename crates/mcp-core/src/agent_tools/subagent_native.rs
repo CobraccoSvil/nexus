@@ -1347,6 +1347,9 @@ async fn run_single_subagent(
         // qui `working_root` porta il worktree solo per il ramo sequenziale isolato.
         working_root: isolation.map(|s| s.worktree_path.clone()),
         isolated: isolation.is_some(),
+        // Fase D fan-in: il ramo background enqueue il parent al termine se e'
+        // l'ultimo figlio background terminale (vedi execute_subagent_run).
+        is_background,
     };
 
     if is_background {
@@ -1401,6 +1404,11 @@ struct SubagentExecInputs {
     /// `true` = ramo isolato (payload narrazione avvio). Il background e' sempre
     /// `false` (isolamento non supportato in background).
     isolated: bool,
+    /// `true` = figlio dispatchato in BACKGROUND (Fase D fan-in): al termine, se
+    /// e' l'ULTIMO background terminale del suo parent, accoda il parent nella
+    /// coda META `subagent_fanin_resume_queue` (il worker fan-in lo riprende).
+    /// `false` (sincrono/sequenziale) -> nessun enqueue (il padre non e' sospeso).
+    is_background: bool,
 }
 
 /// Parte "execute" di un sub-run (PUNTO UNICO, regola L): narrazione avvio ->
@@ -1430,6 +1438,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         narration_heartbeat_s,
         working_root,
         isolated,
+        is_background,
     } = exec;
 
     // ── NARRAZIONE sul run PADRE (ADR 0037): avvio ────────────────────────────
@@ -1524,18 +1533,120 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
             Ok(res) => res,
             Err(_) => {
                 stop_bridge(bridge).await;
-                return finalize_timeout(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, timeout_s).await;
+                // Il timeout marca comunque la riga TERMINALE (status='timeout'):
+                // deve passare per l'enqueue fan-in come gli altri rami (senza,
+                // un parent con l'ultimo figlio andato in timeout resterebbe
+                // sospeso per sempre). Non esce con return diretto.
+                let out = finalize_timeout(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, timeout_s).await;
+                maybe_enqueue_fanin_resume(&ctx, &proj_pool, anchor, session_id, is_background).await;
+                return out;
             }
         };
     stop_bridge(bridge).await;
 
-    match outcome {
+    let out = match outcome {
         Ok(o) => {
             finalize_success(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, current_depth, &o)
                 .await
         }
         Err(e) => finalize_failure(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, &e).await,
+    };
+    // Fan-in (Fase D): il figlio si e' marcato TERMINALE nel finalize sopra. Se e'
+    // il ramo background e nessun altro figlio background del parent e' ancora
+    // attivo, accoda il parent nella coda META (il worker fan-in lo riprende).
+    maybe_enqueue_fanin_resume(&ctx, &proj_pool, anchor, session_id, is_background).await;
+    out
+}
+
+/// Enqueue idempotente del parent nella coda fan-in META
+/// (`subagent_fanin_resume_queue`) al completamento di un figlio BACKGROUND, SOLO
+/// se e' l'ULTIMO background terminale del suo parent (Fase D Slice 3).
+///
+/// Race-free by design: il figlio si e' gia' marcato terminale (mark_run nel
+/// finalize precede questa chiamata), quindi la COUNT dei background ancora
+/// attivi (`running`/`paused`) NON conta se stesso. Se 0 -> tutti i background
+/// del parent hanno finito -> accoda il parent. L'INSERT e' idempotente (PK
+/// `parent_run_id`, `ON CONFLICT DO NOTHING`): se piu' figli chiudono in
+/// concorrenza e vedono 0 rimasti, la coda ha comunque UNA sola riga.
+///
+/// Best-effort (regola: non deve far fallire il figlio): ogni errore e' loggato
+/// WARN e ignorato. La coda vive nel META (`ctx.core.db`); i background del parent
+/// si contano sul PROJECT pool (`proj_pool`, dove vive `nexus_subagent_runs`).
+async fn maybe_enqueue_fanin_resume(
+    ctx: &AgentToolContext,
+    proj_pool: &sqlx::PgPool,
+    anchor: Uuid,
+    session_id: Uuid,
+    is_background: bool,
+) {
+    if !is_background {
+        return;
     }
+    // Deriva project_id e coda META dal ctx; la meccanica DB (COUNT + INSERT) e'
+    // nel punto unico testabile `fanin_enqueue_if_last`.
+    if let Err(e) = fanin_enqueue_if_last(
+        &ctx.core.db,
+        proj_pool,
+        anchor,
+        ctx.core.project_id,
+        session_id,
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "mcp_core::subagent_native",
+            parent_run_id = %anchor,
+            error = %e,
+            "fan-in: enqueue del parent fallito (best-effort, il worker ritentera' al prossimo figlio)"
+        );
+    }
+}
+
+/// Se e' l'ULTIMO figlio background TERMINALE del parent, accoda il parent nella
+/// coda META `subagent_fanin_resume_queue` (idempotente). Punto unico testabile
+/// della meccanica DB del fan-in (regola L): COUNT background non-terminali sul
+/// PROJECT pool + INSERT ON CONFLICT sulla coda META. Ritorna `Ok(true)` se ha
+/// accodato (o la riga esisteva gia'), `Ok(false)` se altri background sono
+/// ancora attivi. Il chiamante e' gia' terminale (mark_run eseguito prima), per
+/// cui la COUNT non conta se stesso: 0 rimasti -> tutti finiti.
+async fn fanin_enqueue_if_last(
+    meta: &sqlx::PgPool,
+    proj_pool: &sqlx::PgPool,
+    parent_run_id: Uuid,
+    project_id: Uuid,
+    session_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    // "Tutti i figli background del parent terminali?" — segnale strutturato
+    // (status lifecycle, regola M): 0 in stato non-terminale ('running'/'paused')
+    // = tutti hanno finito.
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM nexus_subagent_runs \
+         WHERE parent_run_id = $1 AND is_background = true \
+           AND status IN ('running', 'paused')",
+    )
+    .bind(parent_run_id)
+    .fetch_one(proj_pool)
+    .await?;
+    if remaining > 0 {
+        return Ok(false); // altri background ancora attivi: aspetta l'ultimo
+    }
+    // Ultimo background terminale: accoda il parent (idempotente via PK).
+    let res = sqlx::query(
+        "INSERT INTO subagent_fanin_resume_queue (parent_run_id, project_id, session_id) \
+         VALUES ($1, $2, $3) ON CONFLICT (parent_run_id) DO NOTHING",
+    )
+    .bind(parent_run_id)
+    .bind(project_id)
+    .bind(session_id)
+    .execute(meta)
+    .await?;
+    tracing::info!(
+        target: "mcp_core::subagent_native",
+        parent_run_id = %parent_run_id,
+        inserted = res.rows_affected() > 0,
+        "fan-in: ultimo sub-run background terminato, parent accodato alla coda di resume"
+    );
+    Ok(true)
 }
 
 /// Modello del worker dal `model_purpose` della definition (regola G,
@@ -2751,6 +2862,7 @@ mod tests {
         use std::collections::BTreeSet;
         let outcome = crate::native_engine::NativeRunOutcome {
             completed: true,
+            awaiting_subagents: false,
             final_answer: None,
             stop_reason: None,
             provider_used: None,
@@ -2784,5 +2896,98 @@ mod tests {
             keys(&outcome.structured_verdict()),
             "terminal_verdict e structured_verdict hanno chiavi divergenti"
         );
+    }
+
+    /// Schema minimo (bare DB del `#[sqlx::test]`) per il fan-in: `nexus_subagent_
+    /// runs` con `parent_run_id`/`is_background`/`status` + la coda META. In un DB
+    /// reale i due vivono su pool diversi (project/meta); qui lo stesso pool fa da
+    /// entrambi: la funzione riceve i due handle separati e il test passa lo
+    /// stesso, cosi' si verifica la meccanica SQL (COUNT + INSERT ON CONFLICT).
+    async fn create_fanin_tables(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_subagent_runs ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 parent_run_id UUID NOT NULL, \
+                 is_background BOOLEAN NOT NULL DEFAULT false, \
+                 status TEXT NOT NULL )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_subagent_runs");
+        sqlx::query(
+            "CREATE TABLE subagent_fanin_resume_queue ( \
+                 parent_run_id UUID PRIMARY KEY, \
+                 project_id UUID NOT NULL, \
+                 session_id UUID NOT NULL, \
+                 enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
+        )
+        .execute(pool)
+        .await
+        .expect("create subagent_fanin_resume_queue");
+    }
+
+    async fn insert_child(pool: &sqlx::PgPool, parent: Uuid, is_bg: bool, status: &str) {
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs (parent_run_id, is_background, status) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(parent)
+        .bind(is_bg)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert child");
+    }
+
+    async fn queue_len(pool: &sqlx::PgPool, parent: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM subagent_fanin_resume_queue WHERE parent_run_id = $1")
+            .bind(parent)
+            .fetch_one(pool)
+            .await
+            .expect("count queue")
+    }
+
+    /// Con un figlio background ancora `running`, l'enqueue NON scatta: si aspetta
+    /// l'ULTIMO. Quando tutti i background sono terminali, accoda (idempotente).
+    #[sqlx::test]
+    async fn fanin_enqueue_solo_quando_tutti_background_terminali(pool: sqlx::PgPool) {
+        create_fanin_tables(&pool).await;
+        let parent = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4();
+
+        // Due figli background: uno completed, uno ancora running.
+        insert_child(&pool, parent, true, "completed").await;
+        insert_child(&pool, parent, true, "running").await;
+        // Un figlio NON-background terminale non deve influenzare il conteggio.
+        insert_child(&pool, parent, false, "completed").await;
+
+        // Ancora uno running -> non accoda.
+        let enq = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
+            .await
+            .expect("enqueue query ok");
+        assert!(!enq, "con un background ancora running non deve accodare");
+        assert_eq!(queue_len(&pool, parent).await, 0);
+
+        // L'ultimo background diventa terminale.
+        sqlx::query("UPDATE nexus_subagent_runs SET status = 'timeout' WHERE parent_run_id = $1 AND status = 'running'")
+            .bind(parent)
+            .execute(&pool)
+            .await
+            .expect("chiudi ultimo bg");
+
+        // Ora tutti terminali -> accoda.
+        let enq2 = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
+            .await
+            .expect("enqueue query ok");
+        assert!(enq2, "tutti i background terminali -> accoda");
+        assert_eq!(queue_len(&pool, parent).await, 1);
+
+        // Idempotente: un secondo enqueue non duplica (PK parent_run_id).
+        let enq3 = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
+            .await
+            .expect("enqueue query ok");
+        assert!(enq3, "ancora tutti terminali -> ritorna true");
+        assert_eq!(queue_len(&pool, parent).await, 1, "nessun duplicato in coda");
     }
 }

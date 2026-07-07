@@ -4486,6 +4486,209 @@ pub(crate) async fn confirm_native_run(
     Ok(status)
 }
 
+/// Risultati strutturati dei figli BACKGROUND di un parent, nella STESSA forma
+/// del tool_result di `nexus_subagent_poll` (regola L): un `Value` per figlio
+/// con `{subagent_run_id, kind, status, summary, outcome}`. `outcome` e' il
+/// verdetto STRUTTURATO persistito (`nexus_subagent_runs.verdict`, regola M),
+/// mai prosa. Iniettati nello stato al resume fan-in (`build_resume_delta_
+/// subagents`) cosi' il padre compone i verdetti dei figli deterministicamente.
+///
+/// Query sul PROJECT pool (dove vive `nexus_subagent_runs`), ordinata per
+/// `created_at` (ordine stabile di dispatch). Best-effort: su errore ritorna
+/// `vec![]` (il resume prosegue con risultati vuoti, meglio che bloccare).
+async fn fetch_subagent_fanin_results(proj_pool: &PgPool, parent_run_id: Uuid) -> Vec<Value> {
+    let rows = sqlx::query(
+        "SELECT id::text AS sub_id, kind, status, final_summary, verdict \
+         FROM nexus_subagent_runs \
+         WHERE parent_run_id = $1 AND is_background = true \
+         ORDER BY created_at ASC",
+    )
+    .bind(parent_run_id)
+    .fetch_all(proj_pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|r| {
+            use sqlx::Row;
+            serde_json::json!({
+                "subagent_run_id": r.try_get::<String, _>("sub_id").unwrap_or_default(),
+                "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
+                "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                "summary": r.try_get::<Option<String>, _>("final_summary").unwrap_or(None),
+                // Verdetto ESITO strutturato (mig project/0009): il padre legge
+                // success/verdict qui, mai dalla prosa di `summary` (regola M).
+                "outcome": r.try_get::<Option<Value>, _>("verdict").unwrap_or(None),
+            })
+        })
+        .collect()
+}
+
+/// RESUME FAN-IN completo di un run nativo (Engine::Rust) sospeso su
+/// `awaiting_subagents` (Fase D Slice 3). Gemello di [`confirm_native_run`]
+/// (regola L), ma innescato dal WORKER fan-in (non dall'utente) quando l'ultimo
+/// figlio background del parent completa. Differenze dall'HITL:
+/// - provider/model/session sono LETTI da `agent_runs` (il worker ha solo gli id
+///   della coda), non passati come parametri;
+/// - il delta iniettato porta i `subagent_results` (via `resume_native_fanin`),
+///   non un messaggio umano di approvazione;
+/// - il flag di interrupt azzerato e' `awaiting_subagents`, non
+///   `awaiting_confirmation`.
+///
+/// Il CAS che garantisce UN solo resume (`awaiting_subagents -> running`) e' del
+/// worker chiamante: questa funzione presuppone di aver vinto il CAS. Riprende il
+/// grafo dal checkpoint Postgres (`resume_native_fanin`), mappa l'esito col
+/// mapping unico (`native_outcome_to_run_result`), persiste lo stato terminale +
+/// emette `is_final` sul canale SSE. Su un nuovo interrupt fan-in il run torna
+/// `awaiting_subagents` (un ulteriore giro di figli background) e sara' ri-accodato
+/// dai loro finalize. Su errore del motore -> `failed` ONESTO (regola H: nessun
+/// fallback al brain).
+pub(crate) async fn resume_fanin(
+    state: &AppState,
+    parent_run_id: Uuid,
+    project_id: Uuid,
+    session_id: Uuid,
+) -> Result<crate::agent_types::AgentRunStatus, String> {
+    // Pool del progetto (separazione DB): agent_runs / nexus_subagent_runs sono
+    // migrate. Risolto UNA volta, riusato per lettura provider/model, risultati
+    // dei figli e UPDATE di finalize.
+    let cn_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
+    // provider/model del run originale dal DB (il worker ha solo gli id): servono
+    // a popolare ctx + porte I/O del resume (il grafo riparte comunque dal
+    // checkpoint). Se il run non esiste piu' (stale), esce senza resume.
+    let row = sqlx::query(
+        "SELECT provider, model FROM agent_runs WHERE id = $1",
+    )
+    .bind(parent_run_id)
+    .fetch_optional(&cn_pool)
+    .await
+    .map_err(|e| format!("lookup run padre fallito: {e}"))?;
+    let (provider, model) = match row {
+        Some(r) => {
+            use sqlx::Row;
+            (
+                r.try_get::<Option<String>, _>("provider").ok().flatten().unwrap_or_default(),
+                r.try_get::<Option<String>, _>("model").ok().flatten().unwrap_or_default(),
+            )
+        }
+        None => return Err(format!("run padre {parent_run_id} non trovato (stale)")),
+    };
+
+    // Risultati strutturati dei figli background da iniettare nello stato.
+    let subagent_results = fetch_subagent_fanin_results(&cn_pool, parent_run_id).await;
+
+    // Canale SSE del run: riusa quello esistente (client agganciati) o creane uno
+    // nuovo (dopo un restart) cosi' l'is_final finale sblocca i reattach.
+    let tx = match state.agent_channels.get(&parent_run_id) {
+        Some(ch) => ch.clone(),
+        None => {
+            let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
+            state.agent_channels.insert(parent_run_id, tx.clone());
+            tx
+        }
+    };
+
+    // Input MINIMO per il resume (come confirm_native_run): il grafo riparte dal
+    // checkpoint, quindi prompt/tools/history NON servono. Restano provider/model/
+    // session per ctx + porte e il canale SSE.
+    let input = crate::native_engine::NativeRunInput {
+        run_id: parent_run_id,
+        session_id,
+        provider,
+        model,
+        system_text: String::new(),
+        initial_msg: String::new(),
+        conversation_history: Vec::new(),
+        tools_json: serde_json::json!([]),
+        intent_hint: None,
+        requires_tools: None,
+        agentic_score: None,
+        authorizes_changes: None,
+        classifier_resolved: false,
+        action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
+        // Il resume fan-in del run principale eredita l'automazione del run
+        // originale via checkpoint; qui basta un valore coerente per il ctx.
+        automation_mode: "automatic".to_string(),
+        step_tx: tx.clone(),
+        parent_run_id: None,
+        subagent_depth: None,
+        // Resume del run principale sulla root del progetto: nessun isolamento.
+        working_root: None,
+    };
+
+    // Costruisce le NativeDeps da AppState (PUNTO UNICO build_native_deps, regola
+    // L: stesso cablaggio infra di run_via_native / confirm_native_run) e delega
+    // al motore la meccanica di resume col delta fan-in.
+    let deps = build_native_deps(state).await;
+    let outcome =
+        crate::native_engine::resume_native_fanin(&deps, &input, subagent_results).await;
+
+    let status = match outcome {
+        Ok(outcome) => {
+            let mut result = native_outcome_to_run_result(&cn_pool, parent_run_id, outcome).await;
+            // Riconciliazione costo/token dal ledger (stesso punto unico dello
+            // spawn/confirm): senza, l'UPDATE azzererebbe total_cost/total_tokens.
+            let ledger_totals = fetch_ledger_totals(&state.db, parent_run_id).await;
+            let _ = reconcile_run_cost_from_ledger(&mut result, &ledger_totals);
+            let status_str = result.status.as_str();
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
+                 prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
+                 nexus_task_type=$9, provider=$10, model=$11, \
+                 messages_json=COALESCE($12, messages_json), completed_at=NOW() \
+                 WHERE id=$1",
+            )
+            .bind(parent_run_id)
+            .bind(status_str)
+            .bind(result.final_answer.as_deref())
+            .bind(result.iteration_count as i32)
+            .bind(result.prompt_tokens as i32)
+            .bind(result.completion_tokens as i32)
+            .bind(result.total_tokens as i32)
+            .bind(result.total_cost)
+            .bind(result.nexus_task_type.as_deref())
+            .bind(&result.provider)
+            .bind(&result.model)
+            .bind(result.messages_json.as_deref())
+            .execute(&cn_pool)
+            .await;
+            result.status
+        }
+        Err(e) => {
+            tracing::error!(run_id = %parent_run_id, "resume_fanin: resume nativo fallito");
+            let msg = format!(
+                "Il resume fan-in del run e' fallito ({}). Il run e' stato chiuso come non riuscito.",
+                crate::brain_agent_client::sanitize_error_for_user(&e.to_string())
+            );
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET status='failed', final_answer=$2, completed_at=NOW() \
+                 WHERE id=$1",
+            )
+            .bind(parent_run_id)
+            .bind(&msg)
+            .execute(&cn_pool)
+            .await;
+            crate::agent_types::AgentRunStatus::Failed
+        }
+    };
+
+    // is_final sul canale SSE: sblocca i client agganciati (terminale o nuovo
+    // awaiting_subagents). Best-effort: nessun subscriber -> ignorato.
+    let _ = tx.send(AgentStepEvent {
+        run_id: parent_run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: true,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: None,
+    });
+    state.agent_channels.remove(&parent_run_id);
+
+    Ok(status)
+}
+
 /// Assembla le `NativeDeps` (ToolRunner in-process + client gateway) da
 /// `AppState`. PUNTO UNICO (regola L): sia il run nativo primario
 /// (`run_via_native`) sia lo shadow (`run_shadow_for_state`) lo riusano, niente
@@ -4672,6 +4875,7 @@ mod tests_select_engine {
     fn outcome_base() -> crate::native_engine::NativeRunOutcome {
         crate::native_engine::NativeRunOutcome {
             completed: true,
+            awaiting_subagents: false,
             final_answer: Some("fatto".to_string()),
             stop_reason: Some(StopReason::EndTurn),
             provider_used: Some("anthropic".to_string()),
