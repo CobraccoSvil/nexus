@@ -242,16 +242,18 @@ async fn resolve_purpose_core(
     db: &PgPool,
     purpose: &str,
     tier_rule: Option<crate::routing_matrix::PurposeTierRule>,
+    exclude_providers: &[String],
 ) -> PurposeResolution {
     let Some(rule) = tier_rule else {
         tracing::warn!(purpose = %purpose, "resolve_purpose: purpose privo di tier (tier-only)");
         return PurposeResolution::NotFound;
     };
-    match crate::orchestrator::best_model_for_tier(
+    match crate::orchestrator::best_model_for_tier_excluding(
         db,
         &rule.tier,
         rule.capability.as_deref(),
         rule.requires_tool_use,
+        exclude_providers,
     )
     .await
     {
@@ -278,7 +280,7 @@ pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeRe
         Ok(m) => m,
         Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
     };
-    resolve_purpose_core(&state.db, purpose, matrix.purpose_tier(purpose)).await
+    resolve_purpose_core(&state.db, purpose, matrix.purpose_tier(purpose), &[]).await
 }
 
 /// Adapter da `&PgPool`: legge la tier-rule direttamente da `nexus_purpose_model`
@@ -287,6 +289,19 @@ pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeRe
 /// `&PgPool`). Stessa decisione di `resolve_purpose_model`, senza re-implementarla
 /// (regola L): la fonte e' il DB invece della matrix cache.
 pub async fn resolve_purpose_model_db(db: &PgPool, purpose: &str) -> PurposeResolution {
+    resolve_purpose_model_db_excluding(db, purpose, &[]).await
+}
+
+/// Variante di [`resolve_purpose_model_db`] che ESCLUDE un insieme di provider
+/// dalla selezione per tier (Fase C2: vincolo giudice != worker). PUNTO UNICO
+/// (regola L): `resolve_purpose_model_db` vi delega con `exclude_providers = &[]`,
+/// cosi' i suoi ~25 chiamanti storici restano invariati. Un sub-run di review
+/// passa qui il provider del run padre da escludere.
+pub async fn resolve_purpose_model_db_excluding(
+    db: &PgPool,
+    purpose: &str,
+    exclude_providers: &[String],
+) -> PurposeResolution {
     let purpose = purpose.trim();
     let row = match sqlx::query_as::<_, (Option<String>, Option<String>, bool)>(
         "SELECT tier, required_capability, requires_tool_use \
@@ -310,7 +325,7 @@ pub async fn resolve_purpose_model_db(db: &PgPool, purpose: &str) -> PurposeReso
         requires_tool_use,
     });
 
-    resolve_purpose_core(db, purpose, tier_rule).await
+    resolve_purpose_core(db, purpose, tier_rule, exclude_providers).await
 }
 
 /// Handler `GET /api/internal/routing/purpose?purpose=...`

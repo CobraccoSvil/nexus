@@ -389,25 +389,61 @@ pub async fn best_model_for_tier(
     capability: Option<&str>,
     requires_tool_use: bool,
 ) -> Option<(String, String)> {
-    // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
-    // applica l'eleggibilita' agentica + cooldown in un solo posto.
-    if requires_tool_use {
-        return select_agentic_model(db, &[tier], capability, 0, &[], AGENTIC_COST_FIRST_ORDER)
-            .await;
-    }
+    // Vista senza esclusioni sul PUNTO UNICO parametrico (regola L): estende
+    // automaticamente tutti i ~20 chiamanti storici senza toccarli.
+    best_model_for_tier_excluding(db, tier, capability, requires_tool_use, &[]).await
+}
 
-    // Caso NON-agentico (es. purpose vision/chat/embedding): vista sottile sul
-    // punto unico (FASE 2). `require_tool_use=false` e `require_thinking_non_exclude=false`
-    // -> nessun filtro tool_use/policy e nessun pre-ordinamento non-thinking
-    // (coerente con il comportamento precedente di questo ramo). La vision e' via
-    // `supports_vision`, le altre capability via jsonb. Il blocco SQL inline (il
-    // TERZO selettore duplicato) e' stato eliminato (regola L).
+/// Variante di [`best_model_for_tier`] che ESCLUDE un insieme di provider dalla
+/// selezione (oltre al cooldown). PUNTO UNICO (regola L): `best_model_for_tier`
+/// vi delega con `exclude_providers = &[]`. Usata per il vincolo giudice != worker
+/// (Fase C2): un sub-run di review risolve il proprio modello ESCLUDENDO il
+/// provider del run padre (worker), cosi' la verifica avversaria gira su un
+/// provider diverso — indipendenza reale, non due modelli dello stesso provider
+/// con bias/failure-mode condivisi. Se l'esclusione svuota il pool il chiamante
+/// applica il fallback (preferenza forte, non hard filter).
+pub async fn best_model_for_tier_excluding(
+    db: &PgPool,
+    tier: &str,
+    capability: Option<&str>,
+    requires_tool_use: bool,
+    exclude_providers: &[String],
+) -> Option<(String, String)> {
+    // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
+    // applica l'eleggibilita' agentica + cooldown in un solo posto. L'esclusione
+    // provider passa dal parametro `exclude_providers` gia' previsto.
+    if requires_tool_use {
+        return select_agentic_model(
+            db,
+            &[tier],
+            capability,
+            0,
+            exclude_providers,
+            AGENTIC_COST_FIRST_ORDER,
+        )
+        .await;
+    }
+    best_non_agentic_model(db, tier, capability, exclude_providers).await
+}
+
+/// Ramo NON-agentico di [`best_model_for_tier_excluding`] (purpose
+/// vision/chat/embedding): vista sottile sul punto unico (FASE 2).
+/// `require_tool_use=false` e `require_thinking_non_exclude=false` -> nessun
+/// filtro tool_use/policy e nessun pre-ordinamento non-thinking. La vision e' via
+/// `supports_vision`, le altre capability via jsonb. Il blocco SQL inline (il
+/// TERZO selettore duplicato) e' stato eliminato (regola L).
+async fn best_non_agentic_model(
+    db: &PgPool,
+    tier: &str,
+    capability: Option<&str>,
+    exclude_providers: &[String],
+) -> Option<(String, String)> {
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: false,
         require_thinking_non_exclude: false,
         capability,
         min_context_window: 0,
-        exclude_providers: &[],
+        exclude_providers,
         apply_cooldown: true,
     };
     // Pre-ordinamento anti "reasoner puro" (incidente 2026-06-10): i modelli
