@@ -298,8 +298,9 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         Some(a) if !a.is_empty() => a.clone(),
         _ => return err("parametro 'tasks' (array non vuoto) obbligatorio"),
     };
-    if tasks.len() > 8 {
-        return err("troppi task in un batch (max 8)");
+    let batch_max_tasks = read_batch_max_tasks(ctx).await;
+    if tasks.len() as u64 > batch_max_tasks {
+        return err(&format!("troppi task in un batch (max {batch_max_tasks})"));
     }
     let configured_max = read_max_parallel_subagents(ctx).await;
     let max_parallel = input
@@ -453,11 +454,16 @@ fn isolation_flag_cache() -> &'static nexus_cache::TtlCache<(), bool> {
 /// Legge il flag `orchestrator.subagent_isolation_enabled` (default false) con
 /// cache 60s. DB down o chiave assente -> `false` (fail-safe: nessun isolamento,
 /// ramo sequenziale come oggi).
-async fn isolation_flag_enabled(ctx: &AgentToolContext) -> bool {
+/// PUNTO UNICO (regola L) della lettura del flag: lo condividono il batch tool
+/// (`compute_isolation_available`) e il run-init del grafo
+/// (`native_engine::compute_run_isolation_available`), cosi' il gate del planner e
+/// l'esecuzione reale dell'isolamento vedono lo STESSO valore. Prende `&PgPool`
+/// (unico bisogno reale): DB down o chiave assente -> `false` (fail-safe).
+pub(crate) async fn isolation_flag_enabled(db: &sqlx::PgPool) -> bool {
     if let Some(v) = isolation_flag_cache().get(&()) {
         return v;
     }
-    let enabled = nexus_auth::get_bool_setting(&ctx.core.db, ISOLATION_ENABLED_SETTING)
+    let enabled = nexus_auth::get_bool_setting(db, ISOLATION_ENABLED_SETTING)
         .await
         .ok()
         .flatten()
@@ -473,7 +479,7 @@ async fn isolation_flag_enabled(ctx: &AgentToolContext) -> bool {
 /// (nessun I/O sul path caldo su progetti non-git). Flag OFF -> `false` senza
 /// alcun probe.
 async fn compute_isolation_available(ctx: &AgentToolContext) -> bool {
-    if !isolation_flag_enabled(ctx).await {
+    if !isolation_flag_enabled(&ctx.core.db).await {
         return false;
     }
     if !ctx.core.is_git_repo {
@@ -810,6 +816,26 @@ async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
     v.and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(3)
         .clamp(1, MAX_PARALLEL_HARD_CAP)
+}
+
+/// Backstop assoluto al numero di task di UN batch `dispatch_subagents`: previene
+/// che un valore di setting insensato faccia esplodere il numero di sub-run.
+const BATCH_MAX_TASKS_HARD_CAP: u64 = 32;
+
+/// Numero massimo di task in UN batch `dispatch_subagents` (regola G: DB-driven,
+/// niente literal hardcoded). Default 8, clampato al backstop
+/// [`BATCH_MAX_TASKS_HARD_CAP`]. Sostituisce il vecchio `tasks.len() > 8` fisso.
+async fn read_batch_max_tasks(ctx: &AgentToolContext) -> u64 {
+    let v: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings WHERE key = 'orchestrator.subagent_batch_max_tasks'",
+    )
+    .fetch_optional(&*ctx.core.db)
+    .await
+    .ok()
+    .flatten();
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(8)
+        .clamp(1, BATCH_MAX_TASKS_HARD_CAP)
 }
 
 /// Policy del quorum del panel di review (Fase C, regola G: DB-driven, niente

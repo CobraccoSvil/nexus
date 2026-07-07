@@ -776,11 +776,12 @@ impl PlannerNode {
             state.subagent_cost_cumulative_usd.unwrap_or(0.0),
             0.0,
             false,
-            // FASE 1: isolamento fisico dei sub-run non disponibile (worktree e' una
-            // fase infra successiva). Hardwired false -> ParallelIsolated degrada a
-            // Sequential in validate_orch_move (comportamento invariato). Il call site
-            // che conosce project_root/is_git_repo lo calcolera' nei PR successivi.
-            false,
+            // Fase C3 Part B: disponibilita' REALE dell'isolamento fisico dei
+            // sub-run (worktree git), risolta a run-init da mcp-core
+            // (compute_run_isolation_available: flag ON + root git isolabile) e
+            // passata nel ctx (regola M: il planner non fa I/O). `false` ->
+            // ParallelIsolated degrada a Sequential in validate_orch_move.
+            ctx.isolation_available,
         );
 
         match self.reasoner.orchestrate(orch_ctx, ctx.exec_mode()).await {
@@ -1742,6 +1743,10 @@ mod tests {
     struct SpyReasoner {
         move_out: Option<crate::runtime::ports::OrchestrationMove>,
         orchestrate_calls: Mutex<usize>,
+        /// Ultimo `isolation_available` OSSERVATO nell'OrchestrationContext
+        /// ricevuto da `orchestrate` (Fase C3 Part B: verifica il wiring
+        /// ctx -> gate, regola M: segnale strutturato, non testo).
+        isolation_seen: Mutex<Option<bool>>,
     }
 
     impl SpyReasoner {
@@ -1749,6 +1754,7 @@ mod tests {
             Self {
                 move_out,
                 orchestrate_calls: Mutex::new(0),
+                isolation_seen: Mutex::new(None),
             }
         }
     }
@@ -1765,10 +1771,11 @@ mod tests {
 
         async fn orchestrate(
             &self,
-            _ctx: crate::runtime::ports::OrchestrationContext,
+            ctx: crate::runtime::ports::OrchestrationContext,
             _mode: ExecMode,
         ) -> Result<Option<crate::runtime::ports::OrchestrationMove>, PortError> {
             *self.orchestrate_calls.lock().unwrap() += 1;
+            *self.isolation_seen.lock().unwrap() = Some(ctx.isolation_available);
             Ok(self.move_out.clone())
         }
 
@@ -1792,6 +1799,7 @@ mod tests {
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy");
         AgentNodeCtx {
+            isolation_available: false,
             db: pool,
             llm,
             tools,
@@ -1929,6 +1937,33 @@ mod tests {
         assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
         // Ok(None) -> is_eligible (plan_phase OFF) -> skip.
         assert_eq!(out.plan_phase_active, Some(false));
+    }
+
+    #[tokio::test]
+    async fn orchestration_gate_riceve_isolation_available_dal_ctx() {
+        // Fase C3 Part B: il gate deve passare `ctx.isolation_available`
+        // all'OrchestrationContext (prima era hardwired false). Con un ctx Real
+        // isolabile, lo spy osserva `isolation_available = true`; con un ctx a
+        // false osserva false -> il wiring e' vivo, non un letterale.
+        for iso in [true, false] {
+            let spy = Arc::new(SpyReasoner::new(None));
+            let store = Arc::new(StubTodoStore::with_todos(vec![]));
+            let cfg = PlannerConfig {
+                orchestration_enabled: true,
+                ..Default::default()
+            };
+            let node = node_with_reasoner(cfg, store, spy.clone());
+            let mut ctx = gate_ctx(false); // Real (non shadow)
+            ctx.isolation_available = iso;
+            let st = eligible_state();
+            let _ = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
+            assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
+            assert_eq!(
+                *spy.isolation_seen.lock().unwrap(),
+                Some(iso),
+                "l'OrchestrationContext deve rispecchiare ctx.isolation_available"
+            );
+        }
     }
 
     #[tokio::test]

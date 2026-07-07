@@ -48,6 +48,15 @@ pub struct AgentNodeCtx {
     /// `true` se questo e' un run SHADOW (read-only, tool in Replay, no eventi):
     /// confronta col primario senza side-effect ne' output verso l'utente.
     pub shadow: bool,
+    /// `true` se l'isolamento fisico dei sub-run (worktree git effimeri) e'
+    /// DISPONIBILE per questo run: flag `orchestrator.subagent_isolation_enabled`
+    /// ON E la root del progetto e' un repo git isolabile (probe fail-closed).
+    /// Calcolato UNA volta da mcp-core al init del run (I/O: settings + probe git,
+    /// regola M) e passato qui; i nodi puri (planner -> gate di orchestrazione)
+    /// lo LEGGONO senza fare I/O. `false` (default) -> ogni `ParallelIsolated`
+    /// degrada a `Sequential` (comportamento invariato). Con flag OFF il probe
+    /// NON viene eseguito (corto-circuito): costo zero sul percorso normale.
+    pub isolation_available: bool,
 }
 
 impl AgentNodeCtx {

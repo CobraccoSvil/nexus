@@ -55,6 +55,7 @@ fn ctx_with_emit(
         .connect_lazy("postgres://test:test@127.0.0.1:1/test")
         .expect("connect_lazy");
     AgentNodeCtx {
+        isolation_available: false,
         db: pool,
         llm,
         tools: Arc::new(StubToolExecutor::with_success(json!("{}"))),

@@ -1146,6 +1146,11 @@ async fn build_native_engine(
     Arc<dyn LlmGateway>,
     Arc<dyn ToolExecutor>,
     Arc<dyn EventSink>,
+    // `isolation_available`: worktree git effimeri disponibili per questo run
+    // (flag ON + root git isolabile). Alimenta il gate di orchestrazione del
+    // planner (Fase C3 Part B); `false` di default -> ParallelIsolated degrada a
+    // Sequential (invariato).
+    bool,
 )> {
     let db = deps.db.clone();
 
@@ -1169,6 +1174,13 @@ async fn build_native_engine(
     // ai_price_catalog, nexus_prompt_templates, routing matrix) restano su `db`.
     let run_db = crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id)
         .await;
+
+    // Fase C3 Part B: disponibilita' dell'isolamento fisico (worktree git) per
+    // questo run, calcolata UNA volta qui e passata al ctx (i nodi puri non fanno
+    // I/O). Corto-circuito su flag OFF (default) -> nessun probe git: zero costo
+    // aggiunto al percorso normale. Vedi `compute_run_isolation_available`.
+    let isolation_available =
+        compute_run_isolation_available(&db, &run_db, input.session_id, role).await;
 
     // ── Porte I/O concrete (14 impl FASE 2) ──────────────────────────────────
     // Gateway LLM: dipende dal ruolo (regola L, punto unico, stesso switch del
@@ -1324,25 +1336,9 @@ async fn build_native_engine(
     // (regola G), si innestano nel final_gate gli step gate=true. In SHADOW
     // niente inferenza (zero side-effect/costo): sola lettura del persistito.
     if final_gate_cfg.enabled {
-        let project_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT project_id FROM chat_sessions WHERE id = $1")
-                .bind(input.session_id)
-                .fetch_optional(&run_db)
-                .await
-                .ok()
-                .flatten();
-        let root: Option<String> = match project_id {
-            Some(pid) => sqlx::query_scalar(
-                "SELECT repository_root_path FROM projects WHERE id = $1",
-            )
-            .bind(pid)
-            .fetch_optional(&db)
-            .await
-            .ok()
-            .flatten(),
-            None => None,
-        };
-        if let (Some(pid), Some(root)) = (project_id, root.filter(|r| !r.trim().is_empty())) {
+        if let Some((pid, root)) =
+            resolve_session_project_root(&run_db, &db, input.session_id).await
+        {
             let mut steps = if role.is_shadow() {
                 crate::verify_profile::profile_steps(&db, pid).await
             } else {
@@ -1555,7 +1551,73 @@ async fn build_native_engine(
         };
 
     let engine = build_agent_graph(nodes, routing_cfg.clone(), planner_cfg, checkpointer);
-    Ok((engine, routing_cfg, llm, tools, emit))
+    Ok((engine, routing_cfg, llm, tools, emit, isolation_available))
+}
+
+/// Risolve `(project_id, repository_root_path)` di una sessione. PUNTO UNICO
+/// (regola L) della catena `chat_sessions.project_id` (sul DB del progetto,
+/// `run_db`) -> `projects.repository_root_path` (sul meta-DB): riusato dal setup
+/// del final_gate e dal compute dell'isolamento. `None` se la sessione non e'
+/// mappata a un progetto o la root e' vuota/assente.
+async fn resolve_session_project_root(
+    run_db: &PgPool,
+    meta_db: &PgPool,
+    session_id: Uuid,
+) -> Option<(Uuid, String)> {
+    let project_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT project_id FROM chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(run_db)
+            .await
+            .ok()
+            .flatten();
+    let pid = project_id?;
+    let root: Option<String> =
+        sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = $1")
+            .bind(pid)
+            .fetch_optional(meta_db)
+            .await
+            .ok()
+            .flatten();
+    root.filter(|r| !r.trim().is_empty()).map(|r| (pid, r))
+}
+
+/// Isolamento fisico DISPONIBILE per questo run (Fase C3 Part B). Ordine dei
+/// corto-circuiti scelto per NON aggiungere I/O al percorso normale:
+///   1. run SHADOW -> `false` (nessuna orchestrazione delegata in replay);
+///   2. flag `orchestrator.subagent_isolation_enabled` OFF (default) -> `false`
+///      SENZA risolvere la root ne' fare il probe git (costo zero);
+///   3. root del progetto non risolvibile -> `false`;
+///   4. `probe_isolatable` (FAIL-CLOSED) sulla root: `git worktree` utilizzabile.
+/// Riusa gli STESSI punti unici del batch tool (`isolation_flag_enabled`,
+/// `probe_isolatable`), cosi' il gate del planner e l'esecuzione reale
+/// dell'isolamento vedono lo stesso verdetto.
+///
+/// ATTENZIONE ai pool: il flag `orchestrator.subagent_isolation_enabled` e' un
+/// setting GLOBALE di piattaforma -> tabella `settings`, che vive SOLO nel
+/// META-DB (`meta_db`), non nei DB-progetto (`run_db`, `<slug>_nexus`: con
+/// separazione DB ON non ha affatto la tabella `settings`). Va quindi letto da
+/// `meta_db`, coerentemente col batch tool che legge da `ctx.core.db` (= meta).
+/// Solo la catena `chat_sessions -> projects` di `resolve_session_project_root`
+/// usa `run_db` per `chat_sessions` (dominio run) e `meta_db` per `projects`.
+async fn compute_run_isolation_available(
+    meta_db: &PgPool,
+    run_db: &PgPool,
+    session_id: Uuid,
+    role: RunRole,
+) -> bool {
+    if role.is_shadow() {
+        return false;
+    }
+    // Flag GLOBALE -> meta_db (NON run_db: li' `settings` non esiste a
+    // separazione DB ON e la query fallirebbe mascherandosi come flag OFF).
+    if !crate::agent_tools::subagent_native::isolation_flag_enabled(meta_db).await {
+        return false;
+    }
+    let Some((_pid, root)) = resolve_session_project_root(run_db, meta_db, session_id).await else {
+        return false;
+    };
+    nexus_tool_kit::worktree::probe_isolatable(std::path::Path::new(&root)).await
 }
 
 /// Converte una entry della history compatta `{"role","content"}` in `Message`.
@@ -1833,7 +1895,8 @@ async fn run_engine(
     mode: RunMode,
     role: RunRole,
 ) -> anyhow::Result<StepOutcome<AgentState>> {
-    let (engine, routing_cfg, llm, tools, emit) = build_native_engine(deps, input, role).await?;
+    let (engine, routing_cfg, llm, tools, emit, isolation_available) =
+        build_native_engine(deps, input, role).await?;
 
     let ctx = AgentNodeCtx {
         db: deps.db.clone(),
@@ -1849,6 +1912,9 @@ async fn run_engine(
         // unico AgentNodeCtx::exec_mode) -> tutti gli store gatati no-op, zero
         // side-effect. Il primario e' Real.
         shadow: role.is_shadow(),
+        // Fase C3 Part B: isolamento fisico dei sub-run disponibile (calcolato in
+        // build_native_engine, flag-gated). Alimenta il gate di orchestrazione.
+        isolation_available,
     };
 
     // Avvio nuovo: parte da `entry` con l'initial_state dal prompt.
