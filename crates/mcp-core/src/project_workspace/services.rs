@@ -392,6 +392,74 @@ pub(super) async fn list_services_windows(
         .collect()
 }
 
+/// Vero se il servizio e' in crash-loop: momentaneamente `active` ma con
+/// `NRestarts > 2` (es. `dotnet run` che impiega ~40s a buildare prima di fallire).
+/// Non applicabile se gia' `is_failing`. Estratto da `get_project_services_status`.
+async fn service_is_crash_looping(unit: &str, active: &str, is_failing: bool) -> bool {
+    if is_failing || active != "active" {
+        return false;
+    }
+    // Controlla NRestarts: se > 2, il servizio sta ciclando
+    tokio::process::Command::new("systemctl")
+        .args(["--user", "show", unit, "--property=NRestarts"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            s.trim()
+                .strip_prefix("NRestarts=")
+                .and_then(|v| v.parse::<u32>().ok())
+        })
+        .is_some_and(|n| n > 2)
+}
+
+/// Se il servizio `unit` e' failing o in crash-loop, legge il journal e annota su
+/// `entry` `last_error`/`suggestion`/`error_kind` (+ `crash_loop`). Diagnosi via
+/// punto unico DB (`diagnose_log_db`) con fallback euristico. Estratto da
+/// `get_project_services_status` per tenerla sotto soglia (comportamento invariato).
+async fn annotate_service_diagnosis(
+    db: &sqlx::PgPool,
+    unit: &str,
+    active: &str,
+    sub: &str,
+    root: &std::path::Path,
+    entry: &mut serde_json::Value,
+) {
+    // Rileva anche servizi momentaneamente "active" ma con NRestarts elevato.
+    let is_failing = (active == "activating" && sub == "auto-restart") || active == "failed";
+    let is_crash_looping = service_is_crash_looping(unit, active, is_failing).await;
+
+    if !is_failing && !is_crash_looping {
+        return;
+    }
+    let Ok(journal) = tokio::process::Command::new("journalctl")
+        .args(["--user", "-u", unit, "--no-pager", "-n", "20", "-o", "cat"])
+        .output()
+        .await
+    else {
+        return;
+    };
+    let log = String::from_utf8_lossy(&journal.stdout).to_string();
+    // Punto unico (regola L): prova prima i pattern configurabili in
+    // nexus_dev_diagnostics (DB, hot-reload); fallback all'euristica hardcoded
+    // come rete di sicurezza se nessun pattern DB matcha.
+    let (err, sugg, kind) = match crate::agent_tools::dev_diagnostics::diagnose_log_db(db, &log).await
+    {
+        Some((desc, fix, cat)) => (desc, fix, cat),
+        None => {
+            let d = diagnose_service_failure(&log, unit, root);
+            (d.error, d.suggestion, d.kind.to_string())
+        }
+    };
+    entry["last_error"] = json!(err);
+    entry["suggestion"] = json!(sugg);
+    entry["error_kind"] = json!(kind);
+    if is_crash_looping && !is_failing {
+        entry["crash_loop"] = json!(true);
+    }
+}
+
 // ── POST /api/projects/:id/services/:service/:action ─────────────────────────
 // service: "backend" | "brain" | "frontend"
 // action:  "start" | "stop" | "restart"
@@ -458,9 +526,31 @@ pub async fn get_project_services_status(
         })));
     }
 
-    let prefix = format!("{}-", slug);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut services =
+        parse_systemctl_services(&state.db, &stdout, &slug, &context.root_path).await;
 
+    // Merge con gli unit FILE su disco (servizi non caricati nel manager).
+    merge_missing_unit_files(&mut services, &slug, &context.root_path).await;
+
+    Ok(Json(json!({
+        "services": services,
+        "slug": slug,
+        "manager_unavailable": false,
+    })))
+}
+
+/// Parsa lo stdout di `systemctl --user list-units` filtrando le unit del progetto
+/// (`{slug}-*.service`) e ne costruisce le voci JSON, annotando la diagnosi per
+/// quelle failing/crash-loop. Estratto da `get_project_services_status`
+/// (comportamento invariato).
+async fn parse_systemctl_services(
+    db: &sqlx::PgPool,
+    stdout: &str,
+    slug: &str,
+    root_path: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    let prefix = format!("{}-", slug);
     let mut services: Vec<serde_json::Value> = Vec::new();
     for line in stdout.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
@@ -487,89 +577,40 @@ pub async fn get_project_services_status(
             "sub":    sub,
         });
 
-        // Se il servizio e' in crash-loop o failed, leggi il journal per diagnosticare.
-        // Rileva anche servizi momentaneamente "active" ma con NRestarts elevato
-        // (es. dotnet run che impiega 40s per la build prima di fallire).
-        let is_failing = (active == "activating" && sub == "auto-restart") || active == "failed";
-        let is_crash_looping = if !is_failing && active == "active" {
-            // Controlla NRestarts: se > 2, il servizio sta ciclando
-            tokio::process::Command::new("systemctl")
-                .args(["--user", "show", unit, "--property=NRestarts"])
-                .output()
-                .await
-                .ok()
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout).to_string();
-                    s.trim()
-                        .strip_prefix("NRestarts=")
-                        .and_then(|v| v.parse::<u32>().ok())
-                })
-                .is_some_and(|n| n > 2)
-        } else {
-            false
-        };
-
-        if is_failing || is_crash_looping {
-            if let Ok(journal) = tokio::process::Command::new("journalctl")
-                .args(["--user", "-u", unit, "--no-pager", "-n", "20", "-o", "cat"])
-                .output()
-                .await
-            {
-                let log = String::from_utf8_lossy(&journal.stdout).to_string();
-                // Punto unico (regola L): prova prima i pattern configurabili in
-                // nexus_dev_diagnostics (DB, hot-reload); fallback all'euristica
-                // hardcoded come rete di sicurezza se nessun pattern DB matcha.
-                let (err, sugg, kind) =
-                    match crate::agent_tools::dev_diagnostics::diagnose_log_db(&state.db, &log)
-                        .await
-                    {
-                        Some((desc, fix, cat)) => (desc, fix, cat),
-                        None => {
-                            let d = diagnose_service_failure(&log, unit, &context.root_path);
-                            (d.error, d.suggestion, d.kind.to_string())
-                        }
-                    };
-                entry["last_error"] = json!(err);
-                entry["suggestion"] = json!(sugg);
-                entry["error_kind"] = json!(kind);
-                if is_crash_looping && !is_failing {
-                    entry["crash_loop"] = json!(true);
-                }
-            }
-        }
+        // Se il servizio e' in crash-loop o failed, annota la diagnosi dal journal.
+        annotate_service_diagnosis(db, unit, active, sub, root_path, &mut entry).await;
 
         services.push(entry);
     }
+    services
+}
 
-    // Merge con gli unit FILE su disco: `systemctl --user list-units` puo' NON
-    // elencare servizi installati quando il manager utente era giu' al momento
-    // dell'install (tipico WSL: il file .service esiste in ~/.config/systemd/user/
-    // ma non e' caricato nel manager). Uniamo gli unit file mancanti, cosi' il
-    // pannello mostra SEMPRE tutti i servizi del progetto, non solo quelli noti
-    // a systemctl.
-    {
-        let known: std::collections::HashSet<String> = services
-            .iter()
-            .filter_map(|s| s.get("unit").and_then(|u| u.as_str()).map(String::from))
-            .collect();
-        for fb in list_services_fallback(&slug, &context.root_path).await {
-            let unit = fb
-                .get("unit")
-                .and_then(|u| u.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !unit.is_empty() && !known.contains(&unit) {
-                services.push(fb);
-            }
+/// Unisce a `services` gli unit file su disco non gia' elencati da systemctl:
+/// `systemctl --user list-units` puo' NON elencare servizi installati quando il
+/// manager utente era giu' all'install (tipico WSL: il file .service esiste in
+/// ~/.config/systemd/user/ ma non e' caricato nel manager). Cosi' il pannello
+/// mostra SEMPRE tutti i servizi del progetto. Riordina per `short`. Estratto da
+/// `get_project_services_status` (comportamento invariato).
+async fn merge_missing_unit_files(
+    services: &mut Vec<serde_json::Value>,
+    slug: &str,
+    root_path: &std::path::Path,
+) {
+    let known: std::collections::HashSet<String> = services
+        .iter()
+        .filter_map(|s| s.get("unit").and_then(|u| u.as_str()).map(String::from))
+        .collect();
+    for fb in list_services_fallback(slug, root_path).await {
+        let unit = fb
+            .get("unit")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !unit.is_empty() && !known.contains(&unit) {
+            services.push(fb);
         }
-        services.sort_by(|a, b| a["short"].as_str().cmp(&b["short"].as_str()));
     }
-
-    Ok(Json(json!({
-        "services": services,
-        "slug": slug,
-        "manager_unavailable": false,
-    })))
+    services.sort_by(|a, b| a["short"].as_str().cmp(&b["short"].as_str()));
 }
 
 /// Controlla un servizio del progetto: start | stop | restart.
@@ -590,6 +631,93 @@ pub async fn control_project_service(
     #[cfg(not(windows))]
     {
         control_project_service_systemd(state, claims, id, service, action).await
+    }
+}
+
+/// STOP esplicito di una label servizio Windows: taskkill /T /F dei soli processi
+/// `running` di QUELLA label e marca `stopped` in agent_processes. Non tocca gli
+/// altri servizi. Estratto da `control_project_service_windows` (comportamento invariato).
+#[cfg(windows)]
+async fn stop_windows_service_label(proj_pool: &sqlx::PgPool, project_id: Uuid, short: &str) {
+    let running: Vec<(Option<i32>,)> = sqlx::query_as(
+        "SELECT pid FROM agent_processes \
+         WHERE project_id = $1 AND label = $2 AND kind = 'service' AND status = 'running'",
+    )
+    .bind(project_id)
+    .bind(short)
+    .fetch_all(proj_pool)
+    .await
+    .unwrap_or_default();
+    for (pid,) in running {
+        if let Some(p) = pid {
+            let _ = tokio::process::Command::new("taskkill")
+                .args(["/PID", &p.to_string(), "/T", "/F"])
+                .output()
+                .await;
+        }
+    }
+    let _ = sqlx::query(
+        "UPDATE agent_processes SET status = 'stopped', stopped_at = now() \
+         WHERE project_id = $1 AND label = $2 AND kind = 'service' AND status = 'running'",
+    )
+    .bind(project_id)
+    .bind(short)
+    .execute(proj_pool)
+    .await;
+}
+
+/// Alloca (o riusa) la porta stabile del bucket per un web service Windows e la
+/// ritorna come env `PORT`/`HOST` da iniettare nello spawn. Collega l'allocazione
+/// al service_unit (preservazione dal GC, fix f0057b0). Ritorna None per i worker
+/// non-web o se l'allocazione fallisce (avvio senza PORT iniettato). Estratto da
+/// `control_project_service_windows` per tenerla sotto soglia (comportamento invariato).
+#[cfg(windows)]
+async fn allocate_web_service_port_env(
+    state: &AppState,
+    project_id: Uuid,
+    slug: &str,
+    short: &str,
+    command: &str,
+) -> Option<std::collections::HashMap<String, String>> {
+    // Gate sull'euristica web-service (stessa di run_service, regola L): un
+    // worker non-web resta invariato, senza PORT iniettato.
+    if !crate::agent_tools::service::looks_like_web_service(command) {
+        return None;
+    }
+    // Instrada il servizio managed sul percorso ALLOCA+INIETTA (regola L, riuso
+    // di find_or_allocate) invece del detect-path: Nexus assegna la porta stabile
+    // del bucket PRIMA dello spawn e la inietta come env PORT/HOST, cosi' il
+    // servizio non sceglie piu' una porta propria che poi verrebbe soltanto
+    // "rilevata" (allocation_mode='auto' con service_unit NULL -> rilasciata dal
+    // GC -> drift 31792->31798, incidente Beaty-Book).
+    match super::find_or_allocate_port(&state.db, &state.port_registry, project_id, short).await {
+        Ok(alloc) => {
+            let unit_name = format!("{slug}-{short}.service");
+            super::allocate_port::link_allocation_to_service_unit(
+                &state.db,
+                project_id,
+                short,
+                &unit_name,
+            )
+            .await;
+            tracing::info!(
+                port = alloc.port,
+                label = %short,
+                mode = alloc.mode,
+                "control_service_windows: PORT alloc+iniettato e service_unit collegato"
+            );
+            let mut env = std::collections::HashMap::new();
+            env.insert("PORT".to_string(), alloc.port.to_string());
+            env.insert("HOST".to_string(), "0.0.0.0".to_string());
+            Some(env)
+        }
+        Err(e) => {
+            tracing::warn!(
+                label = %short,
+                "control_service_windows: find_or_allocate fallita ({e}); avvio senza PORT iniettato"
+            );
+            None
+        }
     }
 }
 
@@ -632,124 +760,12 @@ async fn control_project_service_windows(
     // start/restart la parte di stop e' delegata al punto unico piu' sotto,
     // che copre anche le varianti simili della stessa label.
     if action == "stop" {
-        let running: Vec<(Option<i32>,)> = sqlx::query_as(
-            "SELECT pid FROM agent_processes \
-             WHERE project_id = $1 AND label = $2 AND kind = 'service' AND status = 'running'",
-        )
-        .bind(project_id)
-        .bind(&short)
-        .fetch_all(&proj_pool)
-        .await
-        .unwrap_or_default();
-        for (pid,) in running {
-            if let Some(p) = pid {
-                let _ = tokio::process::Command::new("taskkill")
-                    .args(["/PID", &p.to_string(), "/T", "/F"])
-                    .output()
-                    .await;
-            }
-        }
-        let _ = sqlx::query(
-            "UPDATE agent_processes SET status = 'stopped', stopped_at = now() \
-             WHERE project_id = $1 AND label = $2 AND kind = 'service' AND status = 'running'",
-        )
-        .bind(project_id)
-        .bind(&short)
-        .execute(&proj_pool)
-        .await;
+        stop_windows_service_label(&proj_pool, project_id, &short).await;
     }
 
     // START (anche seconda parte di RESTART): ri-spawn dalla definizione piu' recente.
     if action == "start" || action == "restart" {
-        // PUNTO UNICO anti-duplicato (regola L): ferma la label esatta E le
-        // varianti dello stesso scopo ("frontend-dev" quando riavvii
-        // "frontend") prima dello spawn. Senza questo, start/restart dal
-        // pannello accumulava server duplicati sulla stessa codebase.
-        let _ = crate::agent_processes::stop_similar_running_services(
-            &state.db,
-            project_id,
-            &short,
-        )
-        .await;
-        let def: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT command, working_dir FROM agent_processes \
-             WHERE project_id = $1 AND label = $2 AND kind = 'service' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(&short)
-        .fetch_optional(&proj_pool)
-        .await
-        .ok()
-        .flatten();
-        let (command, working_dir) = def.ok_or_else(|| {
-            api_error(StatusCode::NOT_FOUND, format!("Servizio '{short}' non trovato"))
-        })?;
-        let cwd = working_dir
-            .filter(|w| !w.trim().is_empty())
-            .unwrap_or_else(|| context.root_path.to_string_lossy().to_string());
-
-        // Instrada il servizio managed sul percorso ALLOCA+INIETTA (regola L, riuso
-        // di find_or_allocate) invece del detect-path: Nexus assegna la porta stabile
-        // del bucket PRIMA dello spawn e la inietta come env PORT/HOST, cosi' il
-        // servizio non sceglie piu' una porta propria che poi verrebbe soltanto
-        // "rilevata" (allocation_mode='auto' con service_unit NULL -> rilasciata dal
-        // GC -> drift 31792->31798, incidente Beaty-Book). L'allocazione viene
-        // annotata col service_unit del servizio: la sua PRESENZA e' cio' che la
-        // preserva dal GC su Windows (service_unit_reserves_port, fix f0057b0).
-        // Gate sull'euristica web-service (stessa di run_service, regola L): un
-        // worker non-web resta invariato, senza PORT iniettato.
-        let port_env = if crate::agent_tools::service::looks_like_web_service(&command) {
-            match super::find_or_allocate_port(&state.db, &state.port_registry, project_id, &short)
-                .await
-            {
-                Ok(alloc) => {
-                    let unit_name = format!("{slug}-{short}.service");
-                    super::allocate_port::link_allocation_to_service_unit(
-                        &state.db,
-                        project_id,
-                        &short,
-                        &unit_name,
-                    )
-                    .await;
-                    tracing::info!(
-                        port = alloc.port,
-                        label = %short,
-                        mode = alloc.mode,
-                        "control_service_windows: PORT alloc+iniettato e service_unit collegato"
-                    );
-                    let mut env = std::collections::HashMap::new();
-                    env.insert("PORT".to_string(), alloc.port.to_string());
-                    env.insert("HOST".to_string(), "0.0.0.0".to_string());
-                    Some(env)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        label = %short,
-                        "control_service_windows: find_or_allocate fallita ({e}); avvio senza PORT iniettato"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        crate::agent_processes::spawn_agent_process(
-            &state.db,
-            project_id,
-            None,
-            &short,
-            &command,
-            &cwd,
-            Some(context.root_path.clone()),
-            port_env, // porta del bucket iniettata come PORT/HOST per i web service (alloca+inietta)
-            false,    // niente sandbox Docker su Windows
-            "service",
-            None,
-        )
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Avvio fallito: {e}")))?;
+        start_windows_service(&state, &context, &proj_pool, project_id, &slug, &short).await?;
     }
 
     Ok(Json(json!({
@@ -758,6 +774,62 @@ async fn control_project_service_windows(
         "action": action,
         "manager_mode": "windows-process",
     })))
+}
+
+/// Avvia (o riavvia) un servizio Windows: ferma le varianti duplicate della label,
+/// carica la definizione piu' recente da agent_processes, alloca la porta del
+/// bucket per i web service e fa lo spawn. Estratto da
+/// `control_project_service_windows` per tenerla sotto soglia (comportamento invariato).
+#[cfg(windows)]
+async fn start_windows_service(
+    state: &AppState,
+    context: &crate::projects::ProjectContext,
+    proj_pool: &sqlx::PgPool,
+    project_id: Uuid,
+    slug: &str,
+    short: &str,
+) -> Result<(), ApiError> {
+    // PUNTO UNICO anti-duplicato (regola L): ferma la label esatta E le
+    // varianti dello stesso scopo ("frontend-dev" quando riavvii "frontend")
+    // prima dello spawn. Senza questo, start/restart dal pannello accumulava
+    // server duplicati sulla stessa codebase.
+    let _ = crate::agent_processes::stop_similar_running_services(&state.db, project_id, short).await;
+    let def: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT command, working_dir FROM agent_processes \
+         WHERE project_id = $1 AND label = $2 AND kind = 'service' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(short)
+    .fetch_optional(proj_pool)
+    .await
+    .ok()
+    .flatten();
+    let (command, working_dir) = def.ok_or_else(|| {
+        api_error(StatusCode::NOT_FOUND, format!("Servizio '{short}' non trovato"))
+    })?;
+    let cwd = working_dir
+        .filter(|w| !w.trim().is_empty())
+        .unwrap_or_else(|| context.root_path.to_string_lossy().to_string());
+
+    let port_env = allocate_web_service_port_env(state, project_id, slug, short, &command).await;
+
+    crate::agent_processes::spawn_agent_process(
+        &state.db,
+        project_id,
+        None,
+        short,
+        &command,
+        &cwd,
+        Some(context.root_path.clone()),
+        port_env, // porta del bucket iniettata come PORT/HOST per i web service (alloca+inietta)
+        false,    // niente sandbox Docker su Windows
+        "service",
+        None,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Avvio fallito: {e}")))?;
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -1054,6 +1126,127 @@ pub(super) fn is_protected_nexus_listener(pid: u32, port: u16, own_pid: u32) -> 
     pid == 0 || pid == 1 || pid == own_pid || NEXUS_RESERVED_PORTS.contains(&port)
 }
 
+/// PUNTO UNICO (regola L) dell'enumerazione delle unit systemd `--user` di un
+/// progetto: `systemctl --user list-units` e filtro dei nomi che iniziano con
+/// `prefix` (tipicamente `{slug}-`). Ritorna la lista dei nomi unit; vuota se il
+/// comando non e' eseguibile (il chiamante decide se e' un errore o un fallback).
+async fn list_project_service_units(prefix: &str) -> Vec<String> {
+    let list_out = tokio::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+        ])
+        .output()
+        .await;
+    let Ok(list_out) = list_out else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&list_out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let unit = line.split_whitespace().next()?;
+            unit.starts_with(prefix).then(|| unit.to_string())
+        })
+        .collect()
+}
+
+/// MainPID (> 0) letto dallo stdout di `systemctl --user show <unit>
+/// --property=MainPID`. None se assente o non valido. Punto unico del parsing
+/// `MainPID=` (regola L).
+fn parse_main_pid_stdout(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|line| {
+        line.strip_prefix("MainPID=")
+            .and_then(|val| val.trim().parse::<u32>().ok())
+            .filter(|&pid| pid > 0)
+    })
+}
+
+/// Insieme dei PID protetti dal reset porte di un progetto: i MainPID dei servizi
+/// systemd `{slug}-*.service` piu' tutti i loro discendenti (BFS su /proc).
+/// Estratto da `cleanup_project_ports` per tenerla sotto soglia; comportamento
+/// invariato.
+async fn collect_protected_project_pids(
+    slug: &str,
+) -> Result<std::collections::HashSet<u32>, String> {
+    let prefix = format!("{}-", slug);
+    let units = list_project_service_units(&prefix).await;
+
+    let mut protected_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for unit in &units {
+        let show_out = tokio::process::Command::new("systemctl")
+            .args(["--user", "show", unit, "--property=MainPID"])
+            .output()
+            .await
+            .ok();
+        if let Some(o) = show_out {
+            if let Some(pid) = parse_main_pid_stdout(&String::from_utf8_lossy(&o.stdout)) {
+                protected_pids.insert(pid);
+            }
+        }
+    }
+
+    // Espande PID protetti con tutti i discendenti (BFS) per non ucciderli per sbaglio.
+    // Scan /proc sincrono → spawn_blocking per non bloccare il runtime tokio. La
+    // mappa parent->children e' costruita dal punto unico `build_children_map`.
+    let children: std::collections::HashMap<u32, Vec<u32>> =
+        tokio::task::spawn_blocking(|| build_children_map(&[]))
+            .await
+            .unwrap_or_default();
+    let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
+    while let Some(pid) = queue.pop_front() {
+        if let Some(kids) = children.get(&pid) {
+            for &c in kids {
+                if protected_pids.insert(c) {
+                    queue.push_back(c);
+                }
+            }
+        }
+    }
+    Ok(protected_pids)
+}
+
+/// Termina i listener non protetti tra quelli passati, rispettando la whitelist
+/// `target_ports` (vuota = tutte) e l'anti-suicidio Nexus. Ritorna `(killed,
+/// skipped)` come liste di oggetti JSON. Estratto da `cleanup_project_ports`
+/// (comportamento invariato).
+async fn kill_unprotected_listeners(
+    listening: Vec<(u16, u32, String)>,
+    target_ports: &std::collections::HashSet<u16>,
+    protected_pids: &std::collections::HashSet<u32>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut killed = Vec::new();
+    let mut skipped = Vec::new();
+    for (port, pid, program) in listening {
+        // Se è stata data una whitelist di porte, applica il filtro
+        if !target_ports.is_empty() && !target_ports.contains(&port) {
+            continue;
+        }
+        // ANTI-SUICIDIO (regola E): mai terminare mcp-core ne' altra
+        // infrastruttura Nexus. Senza questo guard, in WSL (dove protected_pids
+        // resta vuoto perche' `systemctl --user` non e' attivo) un reset porte
+        // uccideva mcp-core stesso sulla 4000 -> "il core muore" dal pannello.
+        if is_protected_nexus_listener(pid, port, std::process::id()) {
+            skipped.push(json!({ "port": port, "pid": pid, "program": program, "reason": "protetto (infrastruttura Nexus o PID non terminabile)" }));
+            continue;
+        }
+        if protected_pids.contains(&pid) {
+            skipped.push(json!({ "port": port, "pid": pid, "program": program, "reason": "protetto (servizio del progetto)" }));
+            continue;
+        }
+        // Terminazione via punto unico cross-platform (regola L): su Unix
+        // esegue TERM+KILL con attesa e ricontrollo liveness incapsulati; su
+        // Windows fa taskkill /T /F. Il precedente `kill` inline era no-op su
+        // Windows (comando inesistente) -> porte mai liberate dal pannello.
+        crate::process_util::kill_pid(pid).await;
+        killed.push(json!({ "port": port, "pid": pid, "program": program }));
+    }
+    (killed, skipped)
+}
+
 pub async fn cleanup_project_ports(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -1081,90 +1274,11 @@ pub async fn cleanup_project_ports(
         None => std::collections::HashSet::new(),
     };
 
-    // Raccoglie i MainPID dei servizi systemd del progetto (PID protetti)
-    let prefix = format!("{}-", slug);
-    let list_out = tokio::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "list-units",
-            "--type=service",
-            "--all",
-            "--no-legend",
-            "--no-pager",
-        ])
-        .output()
+    // Raccoglie i MainPID dei servizi systemd del progetto (PID protetti) e i loro
+    // discendenti (BFS), per non ucciderli per sbaglio nel reset porte.
+    let protected_pids = collect_protected_project_pids(&slug)
         .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let list_str = String::from_utf8_lossy(&list_out.stdout);
-    let units: Vec<String> = list_str
-        .lines()
-        .filter_map(|line| {
-            let unit = line.split_whitespace().next()?;
-            if unit.starts_with(&prefix) {
-                Some(unit.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut protected_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for unit in &units {
-        let show_out = tokio::process::Command::new("systemctl")
-            .args(["--user", "show", unit, "--property=MainPID"])
-            .output()
-            .await
-            .ok();
-        if let Some(o) = show_out {
-            let s = String::from_utf8_lossy(&o.stdout);
-            for line in s.lines() {
-                if let Some(val) = line.strip_prefix("MainPID=") {
-                    if let Ok(pid) = val.trim().parse::<u32>() {
-                        if pid > 0 {
-                            protected_pids.insert(pid);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Espande PID protetti con tutti i discendenti (BFS) per non ucciderli per sbaglio.
-    // Scan /proc sincrono → spawn_blocking per non bloccare il runtime tokio.
-    let children: std::collections::HashMap<u32, Vec<u32>> = tokio::task::spawn_blocking(|| {
-        let mut map: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-        if let Ok(proc_entries) = std::fs::read_dir("/proc") {
-            for entry in proc_entries.flatten() {
-                let n = entry.file_name();
-                let s = n.to_string_lossy();
-                if let Ok(pid) = s.parse::<u32>() {
-                    if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
-                        for line in content.lines() {
-                            if let Some(rest) = line.strip_prefix("PPid:") {
-                                if let Ok(ppid) = rest.trim().parse::<u32>() {
-                                    map.entry(ppid).or_default().push(pid);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        map
-    })
-    .await
-    .unwrap_or_default();
-    let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
-    while let Some(pid) = queue.pop_front() {
-        if let Some(kids) = children.get(&pid) {
-            for &c in kids {
-                if protected_pids.insert(c) {
-                    queue.push_back(c);
-                }
-            }
-        }
-    }
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Trova tutti i processi che ascoltano sulle porte e killa quelli non protetti
     let listening = match read_listening_ports_ss().await {
@@ -1174,32 +1288,7 @@ pub async fn cleanup_project_ports(
             .unwrap_or_default(),
     };
 
-    let mut killed = Vec::new();
-    let mut skipped = Vec::new();
-    for (port, pid, program) in listening {
-        // Se è stata data una whitelist di porte, applica il filtro
-        if !target_ports.is_empty() && !target_ports.contains(&port) {
-            continue;
-        }
-        // ANTI-SUICIDIO (regola E): mai terminare mcp-core ne' altra
-        // infrastruttura Nexus. Senza questo guard, in WSL (dove protected_pids
-        // resta vuoto perche' `systemctl --user` non e' attivo) un reset porte
-        // uccideva mcp-core stesso sulla 4000 -> "il core muore" dal pannello.
-        if is_protected_nexus_listener(pid, port, std::process::id()) {
-            skipped.push(json!({ "port": port, "pid": pid, "program": program, "reason": "protetto (infrastruttura Nexus o PID non terminabile)" }));
-            continue;
-        }
-        if protected_pids.contains(&pid) {
-            skipped.push(json!({ "port": port, "pid": pid, "program": program, "reason": "protetto (servizio del progetto)" }));
-            continue;
-        }
-        // Terminazione via punto unico cross-platform (regola L): su Unix
-        // esegue TERM+KILL con attesa e ricontrollo liveness incapsulati; su
-        // Windows fa taskkill /T /F. Il precedente `kill` inline era no-op su
-        // Windows (comando inesistente) -> porte mai liberate dal pannello.
-        crate::process_util::kill_pid(pid).await;
-        killed.push(json!({ "port": port, "pid": pid, "program": program }));
-    }
+    let (killed, skipped) = kill_unprotected_listeners(listening, &target_ports, &protected_pids).await;
 
     // Rilascia (DB + cache registry) le allocazioni delle porte EFFETTIVAMENTE
     // liberate, tramite il punto unico PortRegistryCache::release (regola L).
@@ -1275,6 +1364,108 @@ pub async fn get_project_ports(
     Ok(Json(json!({ "ports": ports })))
 }
 
+/// MainPID dei servizi systemd `--user` `{slug}-*.service` vivi, con la mappa
+/// pid->short_name associata. Estratto da `detect_project_ports` (blocco 2a) per
+/// tenerla sotto soglia di lunghezza/complessita: interroga `systemctl --user
+/// list-units` per l'elenco unit e `systemctl --user show ... MainPID` per ogni
+/// unit, filtrando i pid vivi. Comportamento invariato.
+async fn systemd_main_pids_by_service(
+    slug: &str,
+) -> (Vec<u32>, std::collections::HashMap<u32, String>) {
+    let svc_prefix = format!("{}-", slug);
+    let mut pid_to_service: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
+    let units = list_project_service_units(&svc_prefix).await;
+
+    let mut pids = Vec::new();
+    for unit in &units {
+        let short = unit
+            .strip_prefix(&svc_prefix)
+            .unwrap_or(unit)
+            .strip_suffix(".service")
+            .unwrap_or(unit)
+            .to_string();
+        let show_out = tokio::process::Command::new("systemctl")
+            .args(["--user", "show", unit, "--property=MainPID"])
+            .output()
+            .await
+            .unwrap_or_else(|_| std::process::Output {
+                status: std::process::ExitStatus::default(),
+                stdout: vec![],
+                stderr: vec![],
+            });
+        // Solo i MainPID di processi ancora vivi (punto unico process_alive).
+        if let Some(pid) =
+            parse_main_pid_stdout(&String::from_utf8_lossy(&show_out.stdout))
+                .filter(|&pid| crate::process_util::process_alive(pid))
+        {
+            pids.push(pid);
+            pid_to_service.insert(pid, short);
+        }
+    }
+    (pids, pid_to_service)
+}
+
+/// Propaga l'associazione pid->service ai discendenti: BFS che parte SOLO dai
+/// pid gia' mappati (i MainPID systemd, unici con service noto a priori) e scende
+/// l'albero `children`, ignorando l'appartenenza ad altri set — cosi' l'ordine
+/// delle passate non perde i match anche se un figlio era gia' stato raccolto via
+/// cwd. Estratto da `detect_project_ports` (comportamento invariato).
+fn propagate_service_to_descendants(
+    pid_to_service: &mut std::collections::HashMap<u32, String>,
+    children: &std::collections::HashMap<u32, Vec<u32>>,
+) {
+    let initial_svc_pids: Vec<u32> = pid_to_service.keys().copied().collect();
+    let mut svc_queue: std::collections::VecDeque<u32> = initial_svc_pids.into_iter().collect();
+    while let Some(pid) = svc_queue.pop_front() {
+        let Some(parent_svc) = pid_to_service.get(&pid).cloned() else {
+            continue;
+        };
+        if let Some(kids) = children.get(&pid) {
+            for &child in kids {
+                let was_new = !pid_to_service.contains_key(&child);
+                pid_to_service
+                    .entry(child)
+                    .or_insert_with(|| parent_svc.clone());
+                if was_new {
+                    svc_queue.push_back(child);
+                }
+            }
+        }
+    }
+}
+
+/// Converte le terne `(porta, pid, programma)` in ascolto nelle voci JSON del
+/// pannello Porte, tenendo solo i pid appartenenti al progetto (`all_pids`) e
+/// annotando il service dal `pid_to_service`. Estratto da `detect_project_ports`
+/// (comportamento invariato).
+fn listening_ports_to_json(
+    listening: Vec<(u16, u32, String)>,
+    all_pids: &std::collections::HashSet<u32>,
+    pid_to_service: &std::collections::HashMap<u32, String>,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for (port_num, pid, program) in listening {
+        if !all_pids.contains(&pid) {
+            continue;
+        }
+        let label = if program.is_empty() {
+            format!("Porta {}", port_num)
+        } else {
+            program.clone()
+        };
+        out.push(json!({
+            "port": port_num,
+            "label": label,
+            "pid": pid,
+            "state": "LISTEN",
+            "url": format!("http://localhost:{}", port_num),
+            "service": pid_to_service.get(&pid).cloned(),
+        }));
+    }
+    out
+}
+
 /// Rileva le porte TCP in ascolto associate ai processi del progetto.
 /// Strategia:
 /// 1. Legge i PID dei processi agent_processes in esecuzione per il progetto
@@ -1317,70 +1508,7 @@ pub(super) async fn detect_project_ports(
             .collect();
 
     // 2a. MainPID dei servizi systemd --user `{slug}-*.service` + mappa pid→short_name
-    let svc_prefix = format!("{}-", slug);
-    let mut pid_to_service: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
-    let systemd_pids: Vec<u32> = {
-        let list_out = tokio::process::Command::new("systemctl")
-            .args([
-                "--user",
-                "list-units",
-                "--type=service",
-                "--all",
-                "--no-legend",
-                "--no-pager",
-            ])
-            .output()
-            .await
-            .unwrap_or_else(|_| std::process::Output {
-                status: std::process::ExitStatus::default(),
-                stdout: vec![],
-                stderr: vec![],
-            });
-        let list_str = String::from_utf8_lossy(&list_out.stdout);
-        let units: Vec<String> = list_str
-            .lines()
-            .filter_map(|line| {
-                let unit = line.split_whitespace().next()?;
-                if unit.starts_with(&svc_prefix) {
-                    Some(unit.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut pids = Vec::new();
-        for unit in &units {
-            let short = unit
-                .strip_prefix(&svc_prefix)
-                .unwrap_or(unit)
-                .strip_suffix(".service")
-                .unwrap_or(unit)
-                .to_string();
-            let show_out = tokio::process::Command::new("systemctl")
-                .args(["--user", "show", unit, "--property=MainPID"])
-                .output()
-                .await
-                .unwrap_or_else(|_| std::process::Output {
-                    status: std::process::ExitStatus::default(),
-                    stdout: vec![],
-                    stderr: vec![],
-                });
-            let show_str = String::from_utf8_lossy(&show_out.stdout);
-            for line in show_str.lines() {
-                if let Some(val) = line.strip_prefix("MainPID=") {
-                    if let Ok(pid) = val.trim().parse::<u32>() {
-                        if pid > 0 && crate::process_util::process_alive(pid) {
-                            pids.push(pid);
-                            pid_to_service.insert(pid, short.clone());
-                        }
-                    }
-                }
-            }
-        }
-        pids
-    };
+    let (systemd_pids, mut pid_to_service) = systemd_main_pids_by_service(slug).await;
 
     // 2a-bis. Servizi DETACHED (WSL/no systemd --user): il MainPID non esiste, ma
     // il wrapper avviato da spawn_detached_service e' rintracciabile via pgrep
@@ -1423,29 +1551,8 @@ pub(super) async fn detect_project_ports(
         }
     }
 
-    // Propagazione `pid_to_service` ai discendenti: BFS dedicata che parte SOLO dai MainPID
-    // systemd (gli unici che hanno un service noto a priori) e scende l'albero processi
-    // ignorando l'appartenenza a all_pids — così l'ordine delle passate non perde i match
-    // anche se un figlio era già stato raccolto via cwd_match.
-    let initial_svc_pids: Vec<u32> = pid_to_service.keys().copied().collect();
-    let mut svc_queue: std::collections::VecDeque<u32> = initial_svc_pids.into_iter().collect();
-    while let Some(pid) = svc_queue.pop_front() {
-        let parent_svc = match pid_to_service.get(&pid).cloned() {
-            Some(s) => s,
-            None => continue,
-        };
-        if let Some(kids) = children.get(&pid) {
-            for &child in kids {
-                let was_new = !pid_to_service.contains_key(&child);
-                pid_to_service
-                    .entry(child)
-                    .or_insert_with(|| parent_svc.clone());
-                if was_new {
-                    svc_queue.push_back(child);
-                }
-            }
-        }
-    }
+    // Propagazione `pid_to_service` ai discendenti (BFS dedicata dai MainPID systemd).
+    propagate_service_to_descendants(&mut pid_to_service, &children);
 
     if all_pids.is_empty() {
         return ports;
@@ -1459,90 +1566,86 @@ pub(super) async fn detect_project_ports(
             .unwrap_or_default(),
     };
 
-    for (port_num, pid, program) in listening {
-        if all_pids.contains(&pid) {
-            let label = if program.is_empty() {
-                format!("Porta {}", port_num)
-            } else {
-                program.clone()
-            };
-            let url = format!("http://localhost:{}", port_num);
-            let service = pid_to_service.get(&pid).cloned();
-            ports.push(json!({
-                "port": port_num,
-                "label": label,
-                "pid": pid,
-                "state": "LISTEN",
-                "url": url,
-                "service": service,
-            }));
-        }
-    }
+    ports.extend(listening_ports_to_json(listening, &all_pids, &pid_to_service));
 
     // 4. Container Docker associati ai servizi del progetto: nome con prefisso slug
-    if let Ok(docker_out) = tokio::process::Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}|{{.Ports}}"])
-        .output()
-        .await
-    {
-        let docker_str = String::from_utf8_lossy(&docker_out.stdout);
-        let docker_prefix1 = format!("{}-", slug);
-        let docker_prefix2 = format!("{}_", slug);
-        for line in docker_str.lines() {
-            let parts: Vec<&str> = line.splitn(2, '|').collect();
-            if parts.len() != 2 {
-                continue;
-            }
-            let cname = parts[0].trim();
-            // Filtra container appartenenti al progetto (per nome o per project label di docker-compose)
-            if !cname.starts_with(&docker_prefix1)
-                && !cname.starts_with(&docker_prefix2)
-                && !cname.contains(slug)
-            {
-                continue;
-            }
-            // Esempio porte: "0.0.0.0:5215->8080/tcp, [::]:5215->8080/tcp"
-            for entry in parts[1].split(',') {
-                let entry = entry.trim();
-                // Estrae la porta host: cerca pattern host_port->container_port
-                if let Some(arrow_pos) = entry.find("->") {
-                    let host_part = &entry[..arrow_pos];
-                    let host_port: u16 = host_part
-                        .rsplit(':')
-                        .next()
-                        .and_then(|p| p.parse().ok())
-                        .unwrap_or(0);
-                    if host_port > 0 {
-                        // Tenta di derivare lo "short" del servizio dal nome container:
-                        // redemptor-backend-dev → "backend"; redemptor-sqlserver-dev → "sqlserver"
-                        let svc_guess = cname
-                            .strip_prefix(&docker_prefix1)
-                            .or_else(|| cname.strip_prefix(&docker_prefix2))
-                            .map(|rest| {
-                                rest.trim_end_matches("-dev")
-                                    .trim_end_matches("-prod")
-                                    .trim_end_matches("_dev")
-                                    .trim_end_matches("_prod")
-                                    .to_string()
-                            });
-                        ports.push(json!({
-                            "port":    host_port,
-                            "label":   format!("docker:{}", cname),
-                            "pid":     0,
-                            "state":   "LISTEN",
-                            "url":     format!("http://localhost:{}", host_port),
-                            "service": svc_guess,
-                        }));
-                    }
-                }
-            }
-        }
-    }
+    ports.extend(docker_container_ports_for_slug(slug).await);
 
     // Dedup per porta
     ports.sort_by_key(|p| p["port"].as_u64().unwrap_or(0));
     ports.dedup_by_key(|p| p["port"].as_u64().unwrap_or(0));
     ports
+}
+
+/// Porte pubblicate dai container Docker del progetto (nome con prefisso
+/// `{slug}-`/`{slug}_` o contenente lo slug). Interroga `docker ps` e mappa ogni
+/// pubblicazione `host->container` a una voce porta con `svc_guess` derivato dal
+/// nome container. Estratto da `detect_project_ports` (blocco 4) per tenerla sotto
+/// soglia; comportamento invariato. Vec vuoto se docker non e' raggiungibile.
+async fn docker_container_ports_for_slug(slug: &str) -> Vec<serde_json::Value> {
+    let Ok(docker_out) = tokio::process::Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}|{{.Ports}}"])
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    let docker_str = String::from_utf8_lossy(&docker_out.stdout);
+    let docker_prefix1 = format!("{}-", slug);
+    let docker_prefix2 = format!("{}_", slug);
+    let mut out = Vec::new();
+    for line in docker_str.lines() {
+        let parts: Vec<&str> = line.splitn(2, '|').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let cname = parts[0].trim();
+        // Filtra container appartenenti al progetto (per nome o per project label di docker-compose)
+        if !cname.starts_with(&docker_prefix1)
+            && !cname.starts_with(&docker_prefix2)
+            && !cname.contains(slug)
+        {
+            continue;
+        }
+        // Esempio porte: "0.0.0.0:5215->8080/tcp, [::]:5215->8080/tcp"
+        for entry in parts[1].split(',') {
+            let entry = entry.trim();
+            // Estrae la porta host: cerca pattern host_port->container_port
+            let Some(arrow_pos) = entry.find("->") else {
+                continue;
+            };
+            let host_part = &entry[..arrow_pos];
+            let host_port: u16 = host_part
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(0);
+            if host_port == 0 {
+                continue;
+            }
+            // Tenta di derivare lo "short" del servizio dal nome container:
+            // redemptor-backend-dev → "backend"; redemptor-sqlserver-dev → "sqlserver"
+            let svc_guess = cname
+                .strip_prefix(&docker_prefix1)
+                .or_else(|| cname.strip_prefix(&docker_prefix2))
+                .map(|rest| {
+                    rest.trim_end_matches("-dev")
+                        .trim_end_matches("-prod")
+                        .trim_end_matches("_dev")
+                        .trim_end_matches("_prod")
+                        .to_string()
+                });
+            out.push(json!({
+                "port":    host_port,
+                "label":   format!("docker:{}", cname),
+                "pid":     0,
+                "state":   "LISTEN",
+                "url":     format!("http://localhost:{}", host_port),
+                "service": svc_guess,
+            }));
+        }
+    }
+    out
 }
 
 /// Rilevazione porte live su Windows. I servizi sono processi gestiti
@@ -2015,73 +2118,77 @@ async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
     freed
 }
 
+/// Estrae il numero di porta dalla coda di una stringa host:porta (es.
+/// `http://+:5215`, `0.0.0.0:5215`): prende le cifre ASCII subito dopo l'ultimo
+/// `:`. Ritorna None se non c'e' porta valida (> 0).
+fn port_after_last_colon(s: &str) -> Option<u16> {
+    let colon_pos = s.rfind(':')?;
+    let after = &s[colon_pos + 1..];
+    let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num_str.parse::<u16>().ok().filter(|&p| p > 0)
+}
+
+/// Estrae le porte da una riga `Environment=...` di un unit file. Riconosce sia
+/// la forma diretta (`PORT=5215`) sia gli URL con porta (`ASPNETCORE_URLS=http://+:5215`),
+/// eventualmente separati da `;`.
+fn ports_from_environment_line(rest: &str, ports: &mut Vec<u16>) {
+    // Es: PORT=5215, ASPNETCORE_URLS=http://+:5215, SERVER_PORT=8080
+    for segment in rest.split_whitespace() {
+        let Some(val) = segment.split('=').nth(1) else {
+            continue;
+        };
+        // Porta diretta (es. PORT=5215)
+        if let Ok(p) = val.parse::<u16>() {
+            if p > 0 {
+                ports.push(p);
+                continue;
+            }
+        }
+        // URL con porta (es. http://+:5215 o http://0.0.0.0:5215)
+        for part in val.split(';') {
+            if let Some(p) = port_after_last_colon(part) {
+                ports.push(p);
+            }
+        }
+    }
+}
+
+/// Estrae le porte da una riga `ExecStart=...` di un unit file. Riconosce
+/// `--port 5215`, `-p 5215`, `--server.port 5215`, `--urls http://+:5215` e la
+/// forma inline `--port=5215` / `-p=5215`.
+fn ports_from_exec_start_line(rest: &str, ports: &mut Vec<u16>) {
+    // Pattern: --port 5215, -p 5215, --urls http://+:5215
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        let next = tokens.get(i + 1);
+        if matches!(*tok, "--port" | "-p" | "--server.port") {
+            if let Some(p) = next.and_then(|v| v.parse::<u16>().ok()).filter(|&p| p > 0) {
+                ports.push(p);
+            }
+        }
+        if *tok == "--urls" {
+            if let Some(p) = next.and_then(|v| port_after_last_colon(v)) {
+                ports.push(p);
+            }
+        }
+        // --port=5215
+        if tok.starts_with("--port=") || tok.starts_with("-p=") {
+            if let Some(p) = tok.split('=').nth(1).and_then(|v| v.parse::<u16>().ok()).filter(|&p| p > 0) {
+                ports.push(p);
+            }
+        }
+    }
+}
+
 pub(super) fn extract_ports_from_unit(content: &str) -> Vec<u16> {
     let mut ports = Vec::new();
     for line in content.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Environment=") {
-            // Es: PORT=5215, ASPNETCORE_URLS=http://+:5215, SERVER_PORT=8080
-            for segment in rest.split_whitespace() {
-                if let Some(val) = segment.split('=').nth(1) {
-                    // Porta diretta (es. PORT=5215)
-                    if let Ok(p) = val.parse::<u16>() {
-                        if p > 0 {
-                            ports.push(p);
-                            continue;
-                        }
-                    }
-                    // URL con porta (es. http://+:5215 o http://0.0.0.0:5215)
-                    for part in val.split(';') {
-                        if let Some(colon_pos) = part.rfind(':') {
-                            let after = &part[colon_pos + 1..];
-                            let num_str: String =
-                                after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                            if let Ok(p) = num_str.parse::<u16>() {
-                                if p > 0 {
-                                    ports.push(p);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            ports_from_environment_line(rest, &mut ports);
         }
         if let Some(rest) = line.strip_prefix("ExecStart=") {
-            // Pattern: --port 5215, -p 5215, --urls http://+:5215
-            let tokens: Vec<&str> = rest.split_whitespace().collect();
-            for (i, tok) in tokens.iter().enumerate() {
-                if (*tok == "--port" || *tok == "-p" || *tok == "--server.port")
-                    && i + 1 < tokens.len()
-                {
-                    if let Ok(p) = tokens[i + 1].parse::<u16>() {
-                        if p > 0 {
-                            ports.push(p);
-                        }
-                    }
-                }
-                if *tok == "--urls" && i + 1 < tokens.len() {
-                    if let Some(colon_pos) = tokens[i + 1].rfind(':') {
-                        let after = &tokens[i + 1][colon_pos + 1..];
-                        let num_str: String =
-                            after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                        if let Ok(p) = num_str.parse::<u16>() {
-                            if p > 0 {
-                                ports.push(p);
-                            }
-                        }
-                    }
-                }
-                // --port=5215
-                if tok.starts_with("--port=") || tok.starts_with("-p=") {
-                    if let Some(val) = tok.split('=').nth(1) {
-                        if let Ok(p) = val.parse::<u16>() {
-                            if p > 0 {
-                                ports.push(p);
-                            }
-                        }
-                    }
-                }
-            }
+            ports_from_exec_start_line(rest, &mut ports);
         }
     }
     ports.sort();
@@ -2095,6 +2202,31 @@ struct ServiceDiagnosis {
     error: String,
     suggestion: String,
     kind: &'static str,
+}
+
+/// Diagnosi per "modulo Node.js non trovato": distingue tra dipendenze del tutto
+/// assenti e un singolo modulo mancante controllando la presenza di `node_modules`
+/// (nella root o in una sotto-dir). Estratto da `diagnose_service_failure`.
+fn diagnose_missing_node_module(root: &std::path::Path) -> ServiceDiagnosis {
+    // Verifica se node_modules esiste
+    let has_node_modules = root.join("node_modules").exists()
+        || std::fs::read_dir(root)
+            .ok()
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.path().is_dir() && e.path().join("node_modules").exists())
+            })
+            .unwrap_or(false);
+    let suggestion = if has_node_modules {
+        "Un modulo non e' installato. Esegui 'npm install' o 'pnpm install' nel terminale del progetto."
+    } else {
+        "Le dipendenze non sono installate. Esegui 'npm install' nel terminale del progetto prima di avviare il servizio."
+    };
+    ServiceDiagnosis {
+        error: "Modulo Node.js non trovato — dipendenze mancanti".into(),
+        suggestion: suggestion.into(),
+        kind: "missing_dependencies",
+    }
 }
 
 fn diagnose_service_failure(log: &str, _unit: &str, root: &std::path::Path) -> ServiceDiagnosis {
@@ -2131,66 +2263,70 @@ fn diagnose_service_failure(log: &str, _unit: &str, root: &std::path::Path) -> S
         || log_lc.contains("module not found")
         || log_lc.contains("err_module_not_found")
     {
-        // Verifica se node_modules esiste
-        let has_node_modules = root.join("node_modules").exists()
-            || std::fs::read_dir(root)
-                .ok()
-                .map(|d| {
-                    d.flatten()
-                        .any(|e| e.path().is_dir() && e.path().join("node_modules").exists())
-                })
-                .unwrap_or(false);
-        let suggestion = if has_node_modules {
-            "Un modulo non e' installato. Esegui 'npm install' o 'pnpm install' nel terminale del progetto."
-        } else {
-            "Le dipendenze non sono installate. Esegui 'npm install' nel terminale del progetto prima di avviare il servizio."
-        };
-        return ServiceDiagnosis {
-            error: "Modulo Node.js non trovato — dipendenze mancanti".into(),
-            suggestion: suggestion.into(),
-            kind: "missing_dependencies",
-        };
+        return diagnose_missing_node_module(root);
     }
 
+    // 4-7. Euristiche a diagnosi statica (SDK .NET, build .NET, porta occupata,
+    // permessi): raggruppate in un helper per tenere questa funzione sotto soglia.
+    if let Some(d) = diagnose_static_heuristics(&log_lc) {
+        return d;
+    }
+
+    // 8. Fallback: nessuna euristica ha matchato, riassumi le righe di errore.
+    diagnose_service_failure_fallback(log)
+}
+
+/// Euristiche di diagnosi a esito statico (nessuna ispezione del filesystem):
+/// SDK .NET mancante, build .NET fallita, porta occupata, permessi insufficienti.
+/// Ritorna la prima che matcha su `log_lc` (gia' in minuscolo), None altrimenti.
+/// Estratto da `diagnose_service_failure` (comportamento e ordine invariati).
+fn diagnose_static_heuristics(log_lc: &str) -> Option<ServiceDiagnosis> {
     // 4. SDK .NET mancante
     if log_lc.contains("dotnet")
         && (log_lc.contains("not found") || log_lc.contains("command not found"))
     {
-        return ServiceDiagnosis {
+        return Some(ServiceDiagnosis {
             error: "Il .NET SDK non e' installato o non e' nel PATH".into(),
             suggestion: "Installa il .NET SDK con 'sudo apt install dotnet-sdk-9.0' oppure usa la versione Docker del servizio.".into(),
             kind: "missing_sdk",
-        };
+        });
     }
 
     // 5. Build .NET fallita
     if log_lc.contains("build failed") || log_lc.contains("msbuild") && log_lc.contains("error") {
-        return ServiceDiagnosis {
+        return Some(ServiceDiagnosis {
             error: "La build .NET e' fallita".into(),
             suggestion: "Esegui 'dotnet build' manualmente nel terminale per vedere gli errori di compilazione.".into(),
             kind: "build_failed",
-        };
+        });
     }
 
     // 6. Porta occupata
     if log_lc.contains("address already in use") || log_lc.contains("eaddrinuse") {
-        return ServiceDiagnosis {
+        return Some(ServiceDiagnosis {
             error: "La porta richiesta e' gia' occupata da un altro processo".into(),
             suggestion: "Usa il pulsante 'X Porte' per liberare le porte conflittuali, poi riavvia il servizio.".into(),
             kind: "port_in_use",
-        };
+        });
     }
 
     // 7. Permessi insufficienti
     if log_lc.contains("permission denied") || log_lc.contains("eacces") {
-        return ServiceDiagnosis {
+        return Some(ServiceDiagnosis {
             error: "Permessi insufficienti per eseguire il servizio".into(),
             suggestion: "Verifica i permessi dei file del progetto. Potresti dover eseguire 'chmod +x' sul file eseguibile.".into(),
             kind: "permission_denied",
-        };
+        });
     }
 
-    // 8. Fallback: mostra le ultime righe del log
+    None
+}
+
+/// Riassunto diagnostico di fallback quando nessuna euristica specifica matcha:
+/// mostra fino a 3 righe di errore (o le ultime 3 righe se non ce ne sono).
+/// Estratto da `diagnose_service_failure` per tenerla sotto soglia (comportamento
+/// invariato).
+fn diagnose_service_failure_fallback(log: &str) -> ServiceDiagnosis {
     let last_lines: Vec<&str> = log
         .lines()
         .filter(|l| {
@@ -2236,17 +2372,8 @@ async fn get_service_main_pid(unit_name: &str) -> Option<u32> {
         .output()
         .await
         .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    for line in s.lines() {
-        if let Some(val) = line.strip_prefix("MainPID=") {
-            if let Ok(pid) = val.trim().parse::<u32>() {
-                if pid > 0 {
-                    return Some(pid);
-                }
-            }
-        }
-    }
-    None
+    // Punto unico del parsing `MainPID=` (regola L).
+    parse_main_pid_stdout(&String::from_utf8_lossy(&out.stdout))
 }
 
 // ── API Gestione Porte Allocate ──────────────────────────────────────────────
