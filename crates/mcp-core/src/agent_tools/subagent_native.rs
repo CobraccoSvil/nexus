@@ -1412,6 +1412,11 @@ async fn prepare_subagent_run(
     //    osservabile). ────────────────────────────────────────────────────────────
     let insert = NewSubagentRun {
         anchor,
+        // Run CORRENTE che dispatcha: isola i figli DIRETTI per COUNT/fetch del
+        // fan-in (mig project 0010). E' lo STESSO id che finisce in
+        // `fanin_parent_run_id` (il target del resume): la COUNT sui figli con
+        // dispatcher = questo run e la coda che punta a questo run coincidono.
+        dispatcher_run_id: fanin_target_run_id(ctx, anchor),
         project_id,
         kind,
         task,
@@ -1713,13 +1718,12 @@ async fn maybe_enqueue_fanin_resume(
         return;
     }
     // Deriva project_id e coda META dal ctx; la meccanica DB (COUNT + INSERT) e'
-    // nel punto unico testabile `fanin_enqueue_if_last`. `anchor` conta i figli
-    // (parent_run_id in nexus_subagent_runs); `resume_run_id` e' il run CORRENTE
-    // da accodare (quello che il CAS del worker riprende).
+    // nel punto unico testabile `fanin_enqueue_if_last`. `resume_run_id` e' il run
+    // CORRENTE (= dispatcher_run_id dei figli): la COUNT filtra sui SUOI figli
+    // diretti e la coda punta a lui (quello che il CAS del worker riprende).
     if let Err(e) = fanin_enqueue_if_last(
         &ctx.core.db,
         proj_pool,
-        anchor,
         resume_run_id,
         ctx.core.project_id,
         session_id,
@@ -1736,31 +1740,34 @@ async fn maybe_enqueue_fanin_resume(
     }
 }
 
-/// Se e' l'ULTIMO figlio background TERMINALE del parent, accoda il parent nella
-/// coda META `subagent_fanin_resume_queue` (idempotente). Punto unico testabile
-/// della meccanica DB del fan-in (regola L): COUNT background non-terminali sul
-/// PROJECT pool + INSERT ON CONFLICT sulla coda META. Ritorna `Ok(true)` se ha
-/// accodato (o la riga esisteva gia'), `Ok(false)` se altri background sono
-/// ancora attivi. Il chiamante e' gia' terminale (mark_run eseguito prima), per
-/// cui la COUNT non conta se stesso: 0 rimasti -> tutti finiti.
+/// Se e' l'ULTIMO figlio background DIRETTO di `resume_run_id` a terminare,
+/// accoda quel run nella coda META `subagent_fanin_resume_queue` (idempotente).
+/// Punto unico testabile della meccanica DB del fan-in (regola L): COUNT background
+/// non-terminali con `dispatcher_run_id = resume_run_id` sul PROJECT pool + INSERT
+/// ON CONFLICT sulla coda META. Ritorna `Ok(true)` se ha accodato (o la riga
+/// esisteva gia'), `Ok(false)` se altri background diretti sono ancora attivi. Il
+/// chiamante e' gia' terminale (mark_run eseguito prima), per cui la COUNT non
+/// conta se stesso: 0 rimasti -> tutti i figli DIRETTI finiti (i nipoti annidati
+/// hanno un dispatcher diverso e NON entrano nella COUNT: ALTA 1).
 async fn fanin_enqueue_if_last(
     meta: &sqlx::PgPool,
     proj_pool: &sqlx::PgPool,
-    anchor: Uuid,
     resume_run_id: Uuid,
     project_id: Uuid,
     session_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    // "Tutti i figli background del parent terminali?" — segnale strutturato
+    // "Tutti i figli DIRETTI di QUESTO run terminali?" — segnale strutturato
     // (status lifecycle, regola M): 0 in stato non-terminale ('running'/'paused')
-    // = tutti hanno finito. La COUNT usa `anchor` (i figli hanno parent_run_id =
-    // anchor in nexus_subagent_runs).
+    // = tutti hanno finito. La COUNT filtra su `dispatcher_run_id = resume_run_id`
+    // (i figli dispatchati DA QUESTO run), NON su parent_run_id = anchor (che
+    // degenera in session_id e includerebbe nipoti annidati di altri figli:
+    // ALTA 1, mig project 0010). `resume_run_id` = ctx.core.run_id = il dispatcher.
     let remaining: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM nexus_subagent_runs \
-         WHERE parent_run_id = $1 AND is_background = true \
+         WHERE dispatcher_run_id = $1 AND is_background = true \
            AND status IN ('running', 'paused')",
     )
-    .bind(anchor)
+    .bind(resume_run_id)
     .fetch_one(proj_pool)
     .await?;
     if remaining > 0 {
@@ -1781,9 +1788,8 @@ async fn fanin_enqueue_if_last(
     tracing::info!(
         target: "mcp_core::subagent_native",
         parent_run_id = %resume_run_id,
-        anchor = %anchor,
         inserted = res.rows_affected() > 0,
-        "fan-in: ultimo sub-run background terminato, parent accodato alla coda di resume"
+        "fan-in: ultimo sub-run background diretto terminato, dispatcher accodato alla coda di resume"
     );
     Ok(true)
 }
@@ -1865,6 +1871,11 @@ async fn parent_provider(db: &sqlx::PgPool, anchor: Uuid) -> Option<String> {
 /// differiscono solo per id/worktree, portati da `IsolationSlot`).
 struct NewSubagentRun<'a> {
     anchor: Uuid,
+    /// Run CORRENTE che dispatcha questo figlio (`ctx.core.run_id` via
+    /// [`fanin_target_run_id`]): isola i figli DIRETTI di un run per COUNT/fetch
+    /// del fan-in (mig project 0010). Distinto da `anchor` (depth-chain di
+    /// famiglia): l'anchor degenera in session_id, il dispatcher no.
+    dispatcher_run_id: Uuid,
     project_id: Uuid,
     kind: &'a str,
     task: &'a str,
@@ -1890,9 +1901,9 @@ async fn insert_subagent_run(
     sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO nexus_subagent_runs
            (id, parent_run_id, project_id, kind, task_description, context_blob, expected_format,
-            status, is_background, depth, source, worktree_path, base_commit)
+            status, is_background, depth, source, worktree_path, base_commit, dispatcher_run_id)
            VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7,
-                   'running', $9, $8, 'db', $10, $11)
+                   'running', $9, $8, 'db', $10, $11, $12)
            RETURNING id"#,
     )
     .bind(slot.map(|s| s.run_id))
@@ -1906,6 +1917,7 @@ async fn insert_subagent_run(
     .bind(row.is_background)
     .bind(slot.map(|s| s.worktree_path.to_string_lossy().to_string()))
     .bind(slot.map(|s| s.base_commit.as_str()))
+    .bind(row.dispatcher_run_id)
     .fetch_one(pool)
     .await
 }
@@ -2641,7 +2653,7 @@ mod tests {
                  context_blob TEXT, expected_format TEXT, status TEXT NOT NULL, \
                  is_background BOOLEAN NOT NULL DEFAULT false, \
                  depth INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL DEFAULT 'db', \
-                 worktree_path TEXT, base_commit TEXT )",
+                 worktree_path TEXT, base_commit TEXT, dispatcher_run_id UUID )",
         )
         .execute(pool)
         .await
@@ -2666,6 +2678,7 @@ mod tests {
         create_subagent_runs_min(&pool).await;
         let row = NewSubagentRun {
             anchor: Uuid::new_v4(),
+            dispatcher_run_id: Uuid::new_v4(),
             project_id: Uuid::new_v4(),
             kind: "coder",
             task: "t",
@@ -3047,6 +3060,7 @@ mod tests {
             "CREATE TABLE nexus_subagent_runs ( \
                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
                  parent_run_id UUID NOT NULL, \
+                 dispatcher_run_id UUID, \
                  is_background BOOLEAN NOT NULL DEFAULT false, \
                  status TEXT NOT NULL )",
         )
@@ -3065,12 +3079,29 @@ mod tests {
         .expect("create subagent_fanin_resume_queue");
     }
 
-    async fn insert_child(pool: &sqlx::PgPool, parent: Uuid, is_bg: bool, status: &str) {
+    /// Inserisce un figlio con `parent_run_id = dispatcher_run_id = dispatcher`
+    /// (il caso comune: dispatcher e anchor coincidono nei test non-annidati).
+    async fn insert_child(pool: &sqlx::PgPool, dispatcher: Uuid, is_bg: bool, status: &str) {
+        insert_child_of(pool, dispatcher, dispatcher, is_bg, status).await;
+    }
+
+    /// Inserisce un figlio distinguendo `parent_run_id` (anchor depth-chain) da
+    /// `dispatcher_run_id` (run che ha dispatchato): serve al test di ANNIDAMENTO,
+    /// dove i nipoti hanno lo STESSO anchor dei figli (session_id) ma un dispatcher
+    /// diverso (il figlio annidato).
+    async fn insert_child_of(
+        pool: &sqlx::PgPool,
+        anchor: Uuid,
+        dispatcher: Uuid,
+        is_bg: bool,
+        status: &str,
+    ) {
         sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, is_background, status) \
-             VALUES ($1, $2, $3)",
+            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
+             VALUES ($1, $2, $3, $4)",
         )
-        .bind(parent)
+        .bind(anchor)
+        .bind(dispatcher)
         .bind(is_bg)
         .bind(status)
         .execute(pool)
@@ -3102,28 +3133,28 @@ mod tests {
         insert_child(&pool, parent, false, "completed").await;
 
         // Ancora uno running -> non accoda.
-        let enq = fanin_enqueue_if_last(&pool, &pool, parent, parent, project, session)
+        let enq = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
             .await
             .expect("enqueue query ok");
         assert!(!enq, "con un background ancora running non deve accodare");
         assert_eq!(queue_len(&pool, parent).await, 0);
 
         // L'ultimo background diventa terminale.
-        sqlx::query("UPDATE nexus_subagent_runs SET status = 'timeout' WHERE parent_run_id = $1 AND status = 'running'")
+        sqlx::query("UPDATE nexus_subagent_runs SET status = 'timeout' WHERE dispatcher_run_id = $1 AND status = 'running'")
             .bind(parent)
             .execute(&pool)
             .await
             .expect("chiudi ultimo bg");
 
         // Ora tutti terminali -> accoda.
-        let enq2 = fanin_enqueue_if_last(&pool, &pool, parent, parent, project, session)
+        let enq2 = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
             .await
             .expect("enqueue query ok");
         assert!(enq2, "tutti i background terminali -> accoda");
         assert_eq!(queue_len(&pool, parent).await, 1);
 
         // Idempotente: un secondo enqueue non duplica (PK parent_run_id).
-        let enq3 = fanin_enqueue_if_last(&pool, &pool, parent, parent, project, session)
+        let enq3 = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
             .await
             .expect("enqueue query ok");
         assert!(enq3, "ancora tutti terminali -> ritorna true");
@@ -3167,10 +3198,13 @@ mod tests {
             .await
             .expect("insert run corrente");
 
-        // Un solo figlio background, gia' terminale: e' l'ultimo -> accoda.
-        insert_child(&pool, anchor, true, "completed").await;
+        // Un solo figlio background, gia' terminale: e' l'ultimo -> accoda. Il
+        // figlio ha anchor (session_id) DISTINTO dal dispatcher (run corrente):
+        // e' proprio il caso reale di un run principale (ctx.parent_run_id=None ->
+        // anchor=session_id; ctx.run_id=resume_run_id -> dispatcher).
+        insert_child_of(&pool, anchor, resume_run_id, true, "completed").await;
 
-        let enq = fanin_enqueue_if_last(&pool, &pool, anchor, resume_run_id, project, session)
+        let enq = fanin_enqueue_if_last(&pool, &pool, resume_run_id, project, session)
             .await
             .expect("enqueue query ok");
         assert!(enq, "ultimo background terminale -> accoda");
@@ -3227,7 +3261,7 @@ mod tests {
         // SCENARIO BUGGY (insert-one-at-a-time): solo il 1o figlio e' inserito, poi
         // "termina". Con COUNT sui soli inseriti, remaining=0 -> enqueue prematuro.
         insert_child(&pool, anchor, true, "completed").await;
-        let premature = fanin_enqueue_if_last(&pool, &pool, anchor, anchor, project, session)
+        let premature = fanin_enqueue_if_last(&pool, &pool, anchor, project, session)
             .await
             .expect("enqueue query ok");
         assert!(
@@ -3251,13 +3285,13 @@ mod tests {
         // Il 1o figlio finisce (finalize -> mark_run terminale).
         sqlx::query(
             "UPDATE nexus_subagent_runs SET status = 'completed' WHERE ctid IN \
-             (SELECT ctid FROM nexus_subagent_runs WHERE parent_run_id = $1 AND status = 'running' LIMIT 1)",
+             (SELECT ctid FROM nexus_subagent_runs WHERE dispatcher_run_id = $1 AND status = 'running' LIMIT 1)",
         )
         .bind(anchor)
         .execute(&pool)
         .await
         .expect("chiudi 1o figlio");
-        let after_first = fanin_enqueue_if_last(&pool, &pool, anchor, anchor, project, session)
+        let after_first = fanin_enqueue_if_last(&pool, &pool, anchor, project, session)
             .await
             .expect("enqueue query ok");
         assert!(
@@ -3269,5 +3303,66 @@ mod tests {
             0,
             "nessun enqueue prematuro col fix prepare-all"
         );
+    }
+
+    /// SCENARIO 2 (ALTA 1, isolamento per-run della COUNT): con l'annidamento entro
+    /// subagent_max_depth, P dispatcha Cp1,Cp2 (dispatcher = P) e Cp1 dispatcha Cs1
+    /// (dispatcher = Cp1). TUTTI condividono `parent_run_id = session` (anchor
+    /// degenere). Quando Cp1,Cp2 terminano ma Cs1 e' ANCORA running, la COUNT di P
+    /// (dispatcher = P) deve essere 0 -> P si accoda; il nipote Cs1 (dispatcher =
+    /// Cp1) NON entra nella COUNT di P. Senza il fix (COUNT su `parent_run_id =
+    /// anchor = session`) Cs1 conterebbe come figlio di P -> P NON si accoderebbe
+    /// (solo il backstop lo salverebbe) e il fetch inietterebbe il nipote.
+    #[sqlx::test]
+    async fn fanin_annidamento_count_isolata_per_dispatcher(pool: sqlx::PgPool) {
+        create_fanin_tables(&pool).await;
+        let session = Uuid::new_v4(); // anchor condiviso da TUTTI i sub-run
+        let p_run = Uuid::new_v4();
+        let cp1_run = Uuid::new_v4();
+        let project = Uuid::new_v4();
+
+        // Cp1, Cp2: figli DIRETTI di P (anchor=session, dispatcher=P), terminali.
+        insert_child_of(&pool, session, p_run, true, "completed").await;
+        insert_child_of(&pool, session, p_run, true, "completed").await;
+        // Cs1: NIPOTE, figlio DIRETTO di Cp1 (anchor=session, dispatcher=Cp1),
+        // ANCORA running (Cp1 e' detached e vivo, entro max_depth=2).
+        insert_child_of(&pool, session, cp1_run, true, "running").await;
+
+        // COUNT di P (dispatcher=P): i suoi 2 figli sono terminali, Cs1 (dispatcher
+        // diverso) NON conta -> P si ACCODA.
+        let enq_p = fanin_enqueue_if_last(&pool, &pool, p_run, project, session)
+            .await
+            .expect("enqueue P ok");
+        assert!(
+            enq_p,
+            "ALTA 1: COUNT di P isolata per dispatcher -> P si accoda anche col nipote Cs1 running"
+        );
+        assert_eq!(queue_len(&pool, p_run).await, 1, "in coda c'e' P");
+
+        // Contro-prova: la COUNT su `parent_run_id = session` (vecchio filtro rotto)
+        // vedrebbe Cs1 running -> NON accoderebbe. Verifico che i sub-run con quel
+        // filtro siano 3 (P conterebbe il nipote), mentre col dispatcher sono 2.
+        let via_anchor: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM nexus_subagent_runs WHERE parent_run_id = $1 AND is_background = true",
+        )
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .expect("count anchor");
+        assert_eq!(via_anchor, 3, "il vecchio filtro per anchor vedeva anche il nipote");
+        let via_dispatcher: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM nexus_subagent_runs WHERE dispatcher_run_id = $1 AND is_background = true",
+        )
+        .bind(p_run)
+        .fetch_one(&pool)
+        .await
+        .expect("count dispatcher");
+        assert_eq!(via_dispatcher, 2, "il fix per dispatcher vede SOLO i figli diretti di P");
+
+        // Cp1 NON si accoda ancora: il suo figlio diretto Cs1 e' running.
+        let enq_cp1 = fanin_enqueue_if_last(&pool, &pool, cp1_run, project, session)
+            .await
+            .expect("enqueue Cp1 ok");
+        assert!(!enq_cp1, "Cp1 ha Cs1 ancora running -> non si accoda");
     }
 }

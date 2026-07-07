@@ -4496,34 +4496,22 @@ pub(crate) async fn confirm_native_run(
 /// Query sul PROJECT pool (dove vive `nexus_subagent_runs`), ordinata per
 /// `created_at` (ordine stabile di dispatch). Best-effort: su errore ritorna
 /// `vec![]` (il resume prosegue con risultati vuoti, meglio che bloccare).
-/// Anchor con cui i figli background del run `run_id` sono registrati in
-/// `nexus_subagent_runs` (PUNTO UNICO della correlazione fan-in, regola L): coincide
-/// con `parent_anchor` del ctx che li ha dispatchati = `COALESCE(agent_runs.
-/// parent_run_id, agent_runs.session_id)`. Poiche' il ctx dei tool porta sempre
-/// `parent_run_id=None`, in pratica l'anchor e' la `session_id`; leggerlo da
-/// agent_runs copre comunque il caso (futuro) in cui il ctx portasse un parent_run_
-/// id reale. Fallback al `session_id` passato se il run non e' leggibile.
-async fn fanin_children_anchor(proj_pool: &PgPool, run_id: Uuid, session_id: Uuid) -> Uuid {
-    sqlx::query_scalar::<_, Option<Uuid>>(
-        "SELECT COALESCE(parent_run_id, session_id) FROM agent_runs WHERE id = $1",
-    )
-    .bind(run_id)
-    .fetch_optional(proj_pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten()
-    .unwrap_or(session_id)
-}
-
-async fn fetch_subagent_fanin_results(proj_pool: &PgPool, anchor: Uuid) -> Vec<Value> {
+///
+/// Correla via `dispatcher_run_id = dispatcher_run_id` (mig project 0010): i figli
+/// DIRETTI del run che si e' sospeso (`dispatcher_run_id` = `ctx.core.run_id` di
+/// quel run, cioe' il `parent_run_id` della coda di resume). NON via
+/// `parent_run_id = COALESCE(...)` = anchor (che degenera in session_id e
+/// inietterebbe anche i NIPOTI annidati dispatchati da un altro figlio ancora vivo:
+/// ALTA 1). Il `parent_run_id` della coda E' gia' il dispatcher (accodato da
+/// `fanin_enqueue_if_last` sul run corrente), quindi nessuna derivazione d'anchor.
+async fn fetch_subagent_fanin_results(proj_pool: &PgPool, dispatcher_run_id: Uuid) -> Vec<Value> {
     let rows = sqlx::query(
         "SELECT id::text AS sub_id, kind, status, final_summary, verdict \
          FROM nexus_subagent_runs \
-         WHERE parent_run_id = $1 AND is_background = true \
+         WHERE dispatcher_run_id = $1 AND is_background = true \
          ORDER BY created_at ASC",
     )
-    .bind(anchor)
+    .bind(dispatcher_run_id)
     .fetch_all(proj_pool)
     .await
     .unwrap_or_default();
@@ -4596,14 +4584,13 @@ pub(crate) async fn resume_fanin(
     };
 
     // Risultati strutturati dei figli background da iniettare nello stato. I figli
-    // sono registrati in nexus_subagent_runs con `parent_run_id = ANCHOR`
-    // (= COALESCE(parent_run_id, session_id) del ctx del run che li ha dispatchati:
-    // il ctx dei tool porta sempre parent_run_id=None, quindi l'anchor e' la
-    // session_id). NON con `parent_run_id = questo run` (che e' il target del
-    // resume, diverso dall'anchor: vedi fanin_target_run_id in subagent_native).
-    // Correlo quindi via l'anchor derivato dal run corrente, non via il suo id.
-    let anchor = fanin_children_anchor(&cn_pool, parent_run_id, session_id).await;
-    let subagent_results = fetch_subagent_fanin_results(&cn_pool, anchor).await;
+    // DIRETTI di questo run sono registrati con `dispatcher_run_id = parent_run_id`
+    // (= ctx.core.run_id del run che li ha dispatchati, cioe' proprio QUESTO run
+    // sospeso e ripreso ora; mig project 0010). NON via `parent_run_id = anchor`
+    // (COALESCE che degenera in session_id e inietterebbe anche i NIPOTI annidati
+    // dispatchati da un altro figlio ancora vivo: ALTA 1). La coda porta gia' il
+    // dispatcher (il run corrente), quindi il fetch usa direttamente il suo id.
+    let subagent_results = fetch_subagent_fanin_results(&cn_pool, parent_run_id).await;
 
     // Canale SSE del run: riusa quello esistente (client agganciati) o creane uno
     // nuovo (dopo un restart) cosi' l'is_final finale sblocca i reattach.
@@ -5880,62 +5867,79 @@ mod tests_finalize_turn {
         assert_eq!(short_file_label("a/b/c/d.ts"), ".../c/d.ts");
     }
 
-    /// BUG #1 (correlazione risultati): dopo il fix, la coda porta il RUN CORRENTE
-    /// (target del resume), ma i figli sono registrati con `parent_run_id = ANCHOR`
-    /// (= COALESCE(parent_run_id, session_id)). `fanin_children_anchor` deriva
-    /// l'anchor dal run cosi' `fetch_subagent_fanin_results` ritrova i figli. Senza
-    /// questa derivazione (cercando i figli col run_id corrente) la raccolta
-    /// risultati sarebbe VUOTA.
+    /// ALTA 1 (isolamento per-run del FETCH): con l'annidamento tutti i sub-run
+    /// condividono `parent_run_id = session_id` (anchor), ma il fetch del padre P
+    /// deve iniettare SOLO i suoi figli DIRETTI (dispatcher_run_id = P), MAI i
+    /// nipoti Cs1 dispatchati da un figlio Cp1 (dispatcher_run_id = Cp1). Il fetch
+    /// filtra su `dispatcher_run_id` (mig project 0010): riproduce il bug perche'
+    /// col vecchio filtro `parent_run_id = anchor` la lista di P conterrebbe ANCHE
+    /// Cs1 (nipote mai dispatchato da P).
     #[sqlx::test]
-    async fn fanin_children_anchor_deriva_dal_run(pool: sqlx::PgPool) {
+    async fn fetch_fanin_isola_per_dispatcher_non_anchor(pool: sqlx::PgPool) {
         sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 session_id UUID NOT NULL, \
-                 parent_run_id UUID )",
+            "CREATE TABLE nexus_subagent_runs ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 parent_run_id UUID NOT NULL, \
+                 dispatcher_run_id UUID, \
+                 kind TEXT NOT NULL DEFAULT 'coder', \
+                 status TEXT NOT NULL, \
+                 final_summary TEXT, \
+                 verdict JSONB, \
+                 is_background BOOLEAN NOT NULL DEFAULT false, \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
         )
         .execute(&pool)
         .await
-        .expect("create agent_runs");
+        .expect("create nexus_subagent_runs");
 
+        // Annidamento: tutti i sub-run hanno parent_run_id = session (anchor
+        // degenere), ma dispatcher distinto. P dispatcha Cp1,Cp2; Cp1 dispatcha Cs1.
         let session = Uuid::new_v4();
-        let fallback = Uuid::new_v4();
+        let p_run = Uuid::new_v4();
+        let cp1_run = Uuid::new_v4();
+        let insert = |anchor: Uuid, dispatcher: Uuid, status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO nexus_subagent_runs \
+                     (parent_run_id, dispatcher_run_id, status, is_background) \
+                     VALUES ($1, $2, $3, true)",
+                )
+                .bind(anchor)
+                .bind(dispatcher)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .expect("insert sub-run");
+            }
+        };
+        // Cp1, Cp2: figli DIRETTI di P (dispatcher = P), terminali.
+        insert(session, p_run, "completed").await;
+        insert(session, p_run, "completed").await;
+        // Cs1: NIPOTE, figlio di Cp1 (dispatcher = Cp1), ancora running.
+        insert(session, cp1_run, "running").await;
 
-        // Caso run principale: parent_run_id NULL -> anchor = session_id.
-        let main_run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, session_id, parent_run_id) VALUES ($1,$2,NULL)")
-            .bind(main_run)
-            .bind(session)
-            .execute(&pool)
-            .await
-            .expect("insert main run");
+        // Fetch di P: deve vedere SOLO i suoi 2 figli diretti, NON il nipote Cs1.
+        let results_p = fetch_subagent_fanin_results(&pool, p_run).await;
         assert_eq!(
-            fanin_children_anchor(&pool, main_run, fallback).await,
-            session,
-            "run principale: anchor = session_id"
+            results_p.len(),
+            2,
+            "il fetch di P deve iniettare SOLO Cp1,Cp2 (dispatcher=P), non il nipote Cs1"
+        );
+        assert!(
+            results_p
+                .iter()
+                .all(|r| r["status"] == serde_json::json!("completed")),
+            "i figli diretti di P sono entrambi completed"
         );
 
-        // Caso sub-run con parent_run_id reale -> anchor = parent_run_id.
-        let sub_parent = Uuid::new_v4();
-        let sub_run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, session_id, parent_run_id) VALUES ($1,$2,$3)")
-            .bind(sub_run)
-            .bind(session)
-            .bind(sub_parent)
-            .execute(&pool)
-            .await
-            .expect("insert sub run");
+        // Fetch di Cp1: deve vedere SOLO il suo figlio diretto Cs1.
+        let results_cp1 = fetch_subagent_fanin_results(&pool, cp1_run).await;
         assert_eq!(
-            fanin_children_anchor(&pool, sub_run, fallback).await,
-            sub_parent,
-            "sub-run: anchor = parent_run_id"
+            results_cp1.len(),
+            1,
+            "il fetch di Cp1 deve iniettare SOLO Cs1 (dispatcher=Cp1)"
         );
-
-        // Run inesistente -> fallback al session_id passato.
-        assert_eq!(
-            fanin_children_anchor(&pool, Uuid::new_v4(), fallback).await,
-            fallback,
-            "run assente: fallback al session_id"
-        );
+        assert_eq!(results_cp1[0]["status"], serde_json::json!("running"));
     }
 }

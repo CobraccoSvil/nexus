@@ -75,19 +75,6 @@ fn action_from_parent_status(status: Option<&str>) -> QueueAction {
     }
 }
 
-/// PUNTO UNICO (regola L/M) della decisione post-resume: la riga di coda va
-/// TENUTA (non cancellata) se e solo se il resume ha RI-SOSPESO il padre su una
-/// nuova ondata di figli background (`AwaitingSubagents`). Decisione dal SEGNALE
-/// STRUTTURATO `status` (regola M), mai dalla prosa.
-///
-/// - `Some(AwaitingSubagents)` -> tieni: il padre riprendera' al prossimo giro.
-/// - `Some(altro terminale)` -> cancella: run finalizzato, lavoro consumato.
-/// - `None` (resume fallito, run gia' marcato failed dal resume) -> cancella: non
-///   riprendera' da questa coda.
-fn keep_row_after_resume(resume_status: Option<&AgentRunStatus>) -> bool {
-    matches!(resume_status, Some(AgentRunStatus::AwaitingSubagents))
-}
-
 pub fn spawn_fanin_worker(state: AppState) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(STARTUP_DELAY_S)).await;
@@ -200,9 +187,9 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
 }
 
 /// Un padre `awaiting_subagents` candidato al backstop, letto da un PROJECT pool.
-/// `anchor` = COALESCE(parent_run_id, session_id): la chiave con cui i suoi figli
-/// sono registrati in `nexus_subagent_runs` (vedi `parent_anchor` in
-/// subagent_native).
+/// I suoi figli background DIRETTI sono quelli con `dispatcher_run_id = run_id`
+/// (mig project 0010): la correlazione per dispatcher isola i figli diretti dai
+/// nipoti annidati (ALTA 1).
 #[derive(Debug)]
 struct BackstopParent {
     run_id: Uuid,
@@ -274,21 +261,25 @@ async fn backstop_project(meta: &PgPool, proj: &PgPool, orphan_timeout_s: i64) -
         return 0;
     }
 
-    // (2) Padri `awaiting_subagents` i cui figli background (parent_run_id = anchor,
-    //     anchor = COALESCE(ar.parent_run_id, ar.session_id)) sono TUTTI terminali,
-    //     con ALMENO un figlio background (altrimenti non e' un fan-in): candidati
-    //     al re-enqueue. Segnale strutturato (status lifecycle, regola M).
+    // (2) Padri `awaiting_subagents` i cui figli background DIRETTI
+    //     (dispatcher_run_id = ar.id, cioe' il run che li ha dispatchati; mig
+    //     project 0010) sono TUTTI terminali, con ALMENO un figlio background
+    //     (altrimenti non e' un fan-in): candidati al re-enqueue. Correlare per
+    //     dispatcher_run_id (NON COALESCE(parent_run_id, session_id) = anchor)
+    //     isola i figli diretti dai NIPOTI annidati (ALTA 1): senza, un nipote
+    //     ancora `running` di un altro figlio bloccherebbe il re-enqueue del padre.
+    //     Segnale strutturato (status lifecycle, regola M).
     let candidates: Vec<BackstopParent> = match sqlx::query(
         "SELECT ar.id AS run_id, ar.session_id AS session_id \
          FROM agent_runs ar \
          WHERE ar.status = 'awaiting_subagents' \
            AND EXISTS ( \
                  SELECT 1 FROM nexus_subagent_runs s \
-                 WHERE s.parent_run_id = COALESCE(ar.parent_run_id, ar.session_id) \
+                 WHERE s.dispatcher_run_id = ar.id \
                    AND s.is_background = true) \
            AND NOT EXISTS ( \
                  SELECT 1 FROM nexus_subagent_runs s \
-                 WHERE s.parent_run_id = COALESCE(ar.parent_run_id, ar.session_id) \
+                 WHERE s.dispatcher_run_id = ar.id \
                    AND s.is_background = true \
                    AND s.status IN ('running', 'paused'))",
     )
@@ -406,24 +397,31 @@ async fn process_queue_row(state: &AppState, row: QueueRow) {
     };
 
     if won {
-        // Il CAS ha portato il parent a `running`: esegue il resume fan-in. Il
-        // resume ritorna lo status FINALE strutturato (regola M). La decisione
-        // "cancellare o tenere la riga" e' nel punto unico puro
-        // `keep_row_after_resume`: se lo status e' `AwaitingSubagents` il padre si
-        // e' RI-SOSPESO (2a ondata di figli background) -> la riga NON va cancellata
-        // (i figli della 2a ondata fanno un nuovo enqueue con ON CONFLICT DO NOTHING
-        // = no-op sulla riga esistente; se cancellassimo qui, il loro enqueue
-        // avrebbe gia' fatto no-op e il risveglio andrebbe perso -> padre appeso).
-        // La riga resta e il prossimo giro la ri-processa quando il CAS ritrovera'
-        // `awaiting_subagents`.
-        let resume = crate::chat_messages::resume_fanin(state, parent_run_id, project_id, session_id).await;
+        // Il CAS ha portato il parent a `running`. DELETE della riga SUBITO, PRIMA
+        // del resume (ALTA 2, regola H race-free): se il resume RI-SOSPENDE il padre
+        // su una 2a ondata di figli background, quei figli — che si spawnano DOPO,
+        // durante/dopo il resume — faranno un enqueue FRESCO (riga nuova) quando il
+        // loro ULTIMO terminera'. Tenere la riga vecchia (vecchio keep_row_after_
+        // resume) faceva ri-vincere il CAS al giro dopo con la 2a ondata ANCORA
+        // `running` -> resume con risultati PARZIALI. Con delete-al-CAS la riga
+        // vecchia sparisce e solo il completamento della 2a ondata crea la riga che
+        // riprende il padre: nessun risveglio prematuro, nessun lost-wakeup (la 2a
+        // ondata enqueua sempre una riga nuova, mai un no-op su una riga stantia).
+        delete_queue_row(&state.db, parent_run_id).await;
+
+        // Resume: ritorna lo status FINALE strutturato (regola M). Se ri-sospende
+        // (`AwaitingSubagents`) NON tocchiamo la coda: i figli della 2a ondata
+        // accoderanno una riga fresca al loro completamento. Su errore il resume ha
+        // gia' marcato il run `failed`: la riga era gia' cancellata, coerente.
+        let resume =
+            crate::chat_messages::resume_fanin(state, parent_run_id, project_id, session_id).await;
         match &resume {
             Ok(status) => tracing::info!(
                 target: "mcp_core::fanin_worker",
                 parent_run_id = %parent_run_id,
                 status = status.as_str(),
                 re_suspended = *status == AgentRunStatus::AwaitingSubagents,
-                "fan-in: run padre ripreso"
+                "fan-in: run padre ripreso (riga di coda gia' cancellata al CAS)"
             ),
             Err(e) => tracing::warn!(
                 target: "mcp_core::fanin_worker",
@@ -432,11 +430,6 @@ async fn process_queue_row(state: &AppState, row: QueueRow) {
                 "fan-in: resume del run padre fallito (run gia' marcato failed dal resume)"
             ),
         }
-        if keep_row_after_resume(resume.as_ref().ok()) {
-            // Padre ri-sospeso: riga riusata per il prossimo giro fan-in, niente DELETE.
-            return;
-        }
-        delete_queue_row(&state.db, parent_run_id).await;
         return;
     }
 
@@ -551,35 +544,6 @@ mod tests {
         );
     }
 
-    /// BUG #2 (ALTA): il worker cancellava la riga INCONDIZIONATAMENTE dopo il
-    /// resume. Se il resume RI-SOSPENDE il padre (2a ondata background), la riga
-    /// deve RESTARE (i figli della 2a ondata fanno enqueue ON CONFLICT DO NOTHING =
-    /// no-op sulla riga vecchia). Il punto unico `keep_row_after_resume` decide dal
-    /// segnale strutturato: tieni solo se `AwaitingSubagents`.
-    #[test]
-    fn keep_row_solo_se_ri_sospeso() {
-        assert!(
-            keep_row_after_resume(Some(&AgentRunStatus::AwaitingSubagents)),
-            "resume che ri-sospende -> riga TENUTA (no delete)"
-        );
-        // Ogni esito terminale -> riga cancellata (lavoro consumato).
-        for s in [
-            AgentRunStatus::Completed,
-            AgentRunStatus::CompletedVerified,
-            AgentRunStatus::CompletedUnverified,
-            AgentRunStatus::Failed,
-            AgentRunStatus::FailedDiagnosed,
-            AgentRunStatus::Cancelled,
-        ] {
-            assert!(
-                !keep_row_after_resume(Some(&s)),
-                "resume terminale {} -> riga cancellata",
-                s.as_str()
-            );
-        }
-        // Resume fallito (None) -> cancella (non riprende da questa coda).
-        assert!(!keep_row_after_resume(None), "resume fallito -> cancella");
-    }
 
     /// Crea le tabelle minime per i test del backstop: `agent_runs` +
     /// `nexus_subagent_runs` + la coda. Un solo pool fa da project e da meta (in
@@ -601,6 +565,7 @@ mod tests {
             "CREATE TABLE nexus_subagent_runs ( \
                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
                  parent_run_id UUID NOT NULL, \
+                 dispatcher_run_id UUID, \
                  is_background BOOLEAN NOT NULL DEFAULT false, \
                  status TEXT NOT NULL, \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
@@ -643,14 +608,16 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert padre");
-        // Due figli background, entrambi TERMINALI, ancorati alla session (anchor).
-        // La coda e' VUOTA (l'enqueue non e' mai avvenuto).
+        // Due figli background, entrambi TERMINALI, ancorati alla session (anchor
+        // depth-chain) ma DISPATCHATI dal run `parent` (dispatcher_run_id). La coda
+        // e' VUOTA (l'enqueue non e' mai avvenuto).
         for st in ["completed", "timeout"] {
             sqlx::query(
-                "INSERT INTO nexus_subagent_runs (parent_run_id, is_background, status) \
-                 VALUES ($1, true, $2)",
+                "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
+                 VALUES ($1, $2, true, $3)",
             )
             .bind(session)
+            .bind(parent)
             .bind(st)
             .execute(&pool)
             .await
@@ -703,11 +670,13 @@ mod tests {
         .await
         .expect("insert padre");
         // Figlio background RUNNING vecchio (created_at 30 min fa): orfano.
+        // Ancorato a session (anchor), dispatchato dal run `parent`.
         sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, is_background, status, created_at) \
-             VALUES ($1, true, 'running', NOW() - interval '30 minutes')",
+            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status, created_at) \
+             VALUES ($1, $2, true, 'running', NOW() - interval '30 minutes')",
         )
         .bind(session)
+        .bind(parent)
         .execute(&pool)
         .await
         .expect("insert figlio orfano");
@@ -736,5 +705,271 @@ mod tests {
         .await
         .expect("status figlio");
         assert_eq!(status, "timeout", "la sub-run orfana e' marcata timeout");
+    }
+
+    /// Replica LOCALE della meccanica di `fanin_enqueue_if_last` (privata in
+    /// subagent_native): "se tutti i figli DIRETTI (dispatcher_run_id = dispatcher)
+    /// background sono terminali, accoda il dispatcher (idempotente)". Serve ai test
+    /// E2E del ciclo per simulare l'enqueue che i finalize dei figli eseguono, senza
+    /// dipendere dal modulo privato. Ritorna true se ha accodato/gia' in coda.
+    async fn enqueue_if_all_direct_terminal(
+        pool: &sqlx::PgPool,
+        dispatcher: Uuid,
+        project: Uuid,
+        session: Uuid,
+    ) -> bool {
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM nexus_subagent_runs \
+             WHERE dispatcher_run_id = $1 AND is_background = true \
+               AND status IN ('running', 'paused')",
+        )
+        .bind(dispatcher)
+        .fetch_one(pool)
+        .await
+        .expect("count remaining");
+        if remaining > 0 {
+            return false;
+        }
+        sqlx::query(
+            "INSERT INTO subagent_fanin_resume_queue (parent_run_id, project_id, session_id) \
+             VALUES ($1, $2, $3) ON CONFLICT (parent_run_id) DO NOTHING",
+        )
+        .bind(dispatcher)
+        .bind(project)
+        .bind(session)
+        .execute(pool)
+        .await
+        .expect("enqueue");
+        true
+    }
+
+    /// Il CAS + DELETE-al-vincere del worker (ALTA 2): estrae la sequenza che
+    /// `process_queue_row` esegue quando vince il CAS, cosi' i test E2E possono
+    /// riprodurla senza AppState/resume_fanin. Ritorna true se ha vinto il CAS
+    /// (parent era `awaiting_subagents`), avendo gia' cancellato la riga di coda.
+    async fn cas_and_delete_on_win(pool: &sqlx::PgPool, parent: Uuid) -> bool {
+        let won = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE agent_runs SET status = 'running' \
+             WHERE id = $1 AND status = 'awaiting_subagents' RETURNING id",
+        )
+        .bind(parent)
+        .fetch_optional(pool)
+        .await
+        .expect("cas")
+        .is_some();
+        if won {
+            // Delete-al-CAS (il fix ALTA 2): la riga sparisce PRIMA del resume.
+            sqlx::query("DELETE FROM subagent_fanin_resume_queue WHERE parent_run_id = $1")
+                .bind(parent)
+                .execute(pool)
+                .await
+                .expect("delete queue row");
+        }
+        won
+    }
+
+    /// SCENARIO 1 (CICLO COMPLETO): parent `awaiting_subagents` + 1 figlio bg
+    /// (dispatcher = parent). Il figlio diventa terminale -> l'enqueue (dispatcher-
+    /// based) accoda il PARENT -> il worker vince il CAS -> il fetch dei figli
+    /// (dispatcher = parent) ritorna SOLO i figli di quel dispatcher.
+    #[sqlx::test]
+    async fn fanin_ciclo_completo_dispatcher_based(pool: sqlx::PgPool) {
+        create_backstop_tables(&pool).await;
+        let parent = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        let altro_run = Uuid::new_v4(); // un ALTRO run della stessa sessione
+
+        sqlx::query(
+            "INSERT INTO agent_runs (id, session_id, project_id, parent_run_id, status) \
+             VALUES ($1, $2, $3, NULL, 'awaiting_subagents')",
+        )
+        .bind(parent)
+        .bind(session)
+        .bind(project)
+        .execute(&pool)
+        .await
+        .expect("insert padre");
+
+        // Figlio bg del PARENT (dispatcher=parent), ancora running.
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
+             VALUES ($1, $2, true, 'running')",
+        )
+        .bind(session) // anchor degenere
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("insert figlio del parent");
+        // Un figlio di un ALTRO run della stessa sessione (dispatcher=altro_run),
+        // running: NON deve influenzare la COUNT/fetch del parent (isolamento).
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
+             VALUES ($1, $2, true, 'running')",
+        )
+        .bind(session)
+        .bind(altro_run)
+        .execute(&pool)
+        .await
+        .expect("insert figlio altro run");
+
+        // Figlio del parent ancora running -> NON accoda.
+        assert!(
+            !enqueue_if_all_direct_terminal(&pool, parent, project, session).await,
+            "figlio del parent running -> no enqueue"
+        );
+
+        // Il figlio del parent diventa terminale (finalize). Il figlio dell'altro
+        // run resta running: NON deve bloccare il parent (dispatcher diverso).
+        sqlx::query(
+            "UPDATE nexus_subagent_runs SET status = 'completed' \
+             WHERE dispatcher_run_id = $1",
+        )
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("chiudi figlio parent");
+        assert!(
+            enqueue_if_all_direct_terminal(&pool, parent, project, session).await,
+            "tutti i figli DIRETTI del parent terminali -> accoda (l'altro run non conta)"
+        );
+
+        // Coda: contiene il PARENT.
+        let queued: Option<Uuid> =
+            sqlx::query_scalar("SELECT parent_run_id FROM subagent_fanin_resume_queue")
+                .fetch_optional(&pool)
+                .await
+                .expect("select queued");
+        assert_eq!(queued, Some(parent), "in coda il run parent (dispatcher)");
+
+        // Il worker vince il CAS e cancella la riga (delete-al-CAS).
+        assert!(cas_and_delete_on_win(&pool, parent).await, "CAS vinto sul parent");
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subagent_fanin_resume_queue")
+            .fetch_one(&pool)
+            .await
+            .expect("count after cas");
+        assert_eq!(after, 0, "riga cancellata al CAS (ALTA 2)");
+
+        // Fetch dei figli del parent (dispatcher=parent): SOLO 1, l'altro run e' escluso.
+        let n_figli_parent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM nexus_subagent_runs \
+             WHERE dispatcher_run_id = $1 AND is_background = true",
+        )
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .expect("count figli parent");
+        assert_eq!(
+            n_figli_parent, 1,
+            "il fan-in del parent vede SOLO il suo figlio diretto, non quello dell'altro run"
+        );
+    }
+
+    /// SCENARIO 3 (ALTA 2): il worker vince il CAS e cancella la riga PRIMA del
+    /// resume. Il resume ri-sospende il padre (2a ondata) con un figlio ancora
+    /// `running`. Verifica che NON esista una riga di coda che riprenderebbe il
+    /// padre finche' la 2a ondata non e' terminale (solo il loro completamento crea
+    /// una riga FRESCA). Col vecchio keep-row la riga vecchia resterebbe e ri-
+    /// vincerebbe il CAS con la 2a ondata `running` -> resume PARZIALE.
+    #[sqlx::test]
+    async fn fanin_no_ripresa_prematura_seconda_ondata(pool: sqlx::PgPool) {
+        create_backstop_tables(&pool).await;
+        let parent = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let project = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO agent_runs (id, session_id, project_id, parent_run_id, status) \
+             VALUES ($1, $2, $3, NULL, 'awaiting_subagents')",
+        )
+        .bind(parent)
+        .bind(session)
+        .bind(project)
+        .execute(&pool)
+        .await
+        .expect("insert padre");
+
+        // 1a ONDATA: un figlio bg del parent, gia' terminale -> enqueue.
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
+             VALUES ($1, $2, true, 'completed')",
+        )
+        .bind(session)
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("insert figlio 1a ondata");
+        assert!(enqueue_if_all_direct_terminal(&pool, parent, project, session).await);
+
+        // Il worker vince il CAS e CANCELLA la riga (fix ALTA 2), poi (simulato) il
+        // resume ri-sospende il padre e spawna la 2a ondata ANCORA running.
+        assert!(cas_and_delete_on_win(&pool, parent).await, "CAS 1a ondata");
+        sqlx::query("UPDATE agent_runs SET status = 'awaiting_subagents' WHERE id = $1")
+            .bind(parent)
+            .execute(&pool)
+            .await
+            .expect("resume ri-sospende");
+        // 2a ondata: figlio del parent ANCORA running (spawnato dopo il resume).
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
+             VALUES ($1, $2, true, 'running')",
+        )
+        .bind(session)
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("insert figlio 2a ondata");
+
+        // INVARIANTE (ALTA 2): la coda e' VUOTA (la riga vecchia e' stata cancellata
+        // al CAS e la 2a ondata non ha ancora accodato: il suo figlio e' running).
+        // Col vecchio keep-row la riga vecchia sarebbe ancora qui -> ripresa
+        // prematura al giro dopo.
+        let in_coda: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subagent_fanin_resume_queue")
+            .fetch_one(&pool)
+            .await
+            .expect("count coda");
+        assert_eq!(
+            in_coda, 0,
+            "ALTA 2: nessuna riga di coda mentre la 2a ondata e' running (no ripresa prematura)"
+        );
+        // Un tentativo di enqueue ora NON accoda (figlio 2a ondata running).
+        assert!(
+            !enqueue_if_all_direct_terminal(&pool, parent, project, session).await,
+            "2a ondata running -> nessun enqueue"
+        );
+        // Il worker NON riprende il padre: nessuna riga da processare, quindi il
+        // padre resta `awaiting_subagents` (non ripreso con risultati parziali).
+        let status: String = sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .expect("status padre");
+        assert_eq!(
+            status, "awaiting_subagents",
+            "padre ancora sospeso: la 2a ondata non e' terminale"
+        );
+
+        // La 2a ondata COMPLETA -> enqueue FRESCO -> ora il worker puo' riprendere.
+        sqlx::query(
+            "UPDATE nexus_subagent_runs SET status = 'completed' \
+             WHERE dispatcher_run_id = $1 AND status = 'running'",
+        )
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("chiudi 2a ondata");
+        assert!(
+            enqueue_if_all_direct_terminal(&pool, parent, project, session).await,
+            "2a ondata terminale -> enqueue fresco"
+        );
+        let in_coda2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subagent_fanin_resume_queue")
+            .fetch_one(&pool)
+            .await
+            .expect("count coda 2");
+        assert_eq!(in_coda2, 1, "riga fresca creata solo al completamento della 2a ondata");
+        assert!(
+            cas_and_delete_on_win(&pool, parent).await,
+            "ora il CAS vince e riprende il padre con la 2a ondata TERMINALE"
+        );
     }
 }
