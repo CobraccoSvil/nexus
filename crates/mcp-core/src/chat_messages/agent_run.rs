@@ -4506,11 +4506,24 @@ pub(crate) async fn confirm_native_run(
 /// ALTA 1). Il `parent_run_id` della coda E' gia' il dispatcher (accodato da
 /// `fanin_enqueue_if_last` sul run corrente), quindi nessuna derivazione d'anchor.
 async fn fetch_subagent_fanin_results(proj_pool: &PgPool, dispatcher_run_id: Uuid) -> Vec<Value> {
+    // UPDATE ... RETURNING dentro una CTE (non piu' SELECT): marca ATOMICAMENTE
+    // `fanin_consumed_at = NOW()` sui figli NON ancora consumati e li ritorna
+    // ordinati. Discrimina l'ONDATA (ALTA-2, mig project 0011): `dispatcher_run_id`
+    // e' COSTANTE tra le ondate (stesso run che si ri-sospende), quindi senza il
+    // filtro `fanin_consumed_at IS NULL` la 2a ondata rifetcherebbe anche la 1a e il
+    // modello la rivedrebbe come nuova (doppia iniezione). Marcando al fetch, ogni
+    // figlio e' iniettato ESATTAMENTE una volta. La CTE preserva l'ordine di
+    // dispatch (`created_at`), non garantito da UPDATE ... RETURNING nudo.
     let rows = sqlx::query(
-        "SELECT id::text AS sub_id, kind, status, final_summary, verdict \
-         FROM nexus_subagent_runs \
-         WHERE dispatcher_run_id = $1 AND is_background = true \
-         ORDER BY created_at ASC",
+        "WITH claimed AS ( \
+             UPDATE nexus_subagent_runs \
+             SET fanin_consumed_at = NOW() \
+             WHERE dispatcher_run_id = $1 AND is_background = true \
+               AND fanin_consumed_at IS NULL \
+             RETURNING id, kind, status, final_summary, verdict, created_at \
+         ) \
+         SELECT id::text AS sub_id, kind, status, final_summary, verdict \
+         FROM claimed ORDER BY created_at ASC",
     )
     .bind(dispatcher_run_id)
     .fetch_all(proj_pool)
@@ -5887,6 +5900,7 @@ mod tests_finalize_turn {
                  final_summary TEXT, \
                  verdict JSONB, \
                  is_background BOOLEAN NOT NULL DEFAULT false, \
+                 fanin_consumed_at TIMESTAMPTZ, \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
         )
         .execute(&pool)
@@ -5942,5 +5956,66 @@ mod tests_finalize_turn {
             "il fetch di Cp1 deve iniettare SOLO Cs1 (dispatcher=Cp1)"
         );
         assert_eq!(results_cp1[0]["status"], serde_json::json!("running"));
+    }
+
+    /// ALTA-2 (discriminazione d'ondata): `dispatcher_run_id` e' COSTANTE tra le
+    /// ondate (lo stesso run che si ri-sospende). Senza il consumo, la 2a fetch
+    /// dello stesso dispatcher rifetcherebbe anche i figli della 1a ondata (doppia
+    /// iniezione nel modello). Con `fanin_consumed_at` (mig project 0011) la 1a
+    /// fetch li marca e la 2a NON li rivede; solo i figli NUOVI vengono iniettati.
+    #[sqlx::test]
+    async fn fetch_fanin_consuma_e_non_re_inietta_seconda_ondata(pool: sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_subagent_runs ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 parent_run_id UUID NOT NULL, \
+                 dispatcher_run_id UUID, \
+                 kind TEXT NOT NULL DEFAULT 'coder', \
+                 status TEXT NOT NULL, \
+                 final_summary TEXT, \
+                 verdict JSONB, \
+                 is_background BOOLEAN NOT NULL DEFAULT false, \
+                 fanin_consumed_at TIMESTAMPTZ, \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create nexus_subagent_runs");
+
+        let session = Uuid::new_v4();
+        let dispatcher = Uuid::new_v4();
+        let insert = |status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO nexus_subagent_runs \
+                     (parent_run_id, dispatcher_run_id, status, is_background) \
+                     VALUES ($1, $2, $3, true)",
+                )
+                .bind(session)
+                .bind(dispatcher)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .expect("insert sub-run");
+            }
+        };
+        // 1a ondata: 2 figli diretti terminali.
+        insert("completed").await;
+        insert("completed").await;
+
+        // 1a fetch: vede e CONSUMA i 2 figli.
+        let wave1 = fetch_subagent_fanin_results(&pool, dispatcher).await;
+        assert_eq!(wave1.len(), 2, "la 1a ondata inietta i 2 figli");
+
+        // 2a fetch SENZA nuovi figli: 0 (gia' consumati) -> nessuna ri-iniezione.
+        let repeat = fetch_subagent_fanin_results(&pool, dispatcher).await;
+        assert_eq!(repeat.len(), 0, "figli gia' consumati: mai ri-iniettati");
+
+        // 2a ondata: un NUOVO figlio dello stesso dispatcher.
+        insert("failed").await;
+        let wave2 = fetch_subagent_fanin_results(&pool, dispatcher).await;
+        assert_eq!(wave2.len(), 1, "la 2a ondata inietta SOLO il figlio nuovo");
+        assert_eq!(wave2[0]["status"], serde_json::json!("failed"));
     }
 }

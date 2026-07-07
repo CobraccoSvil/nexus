@@ -129,9 +129,12 @@ async fn replay_idempotent_send(
     // anti-run-concorrente): se presente, e' il run avviato dal primo
     // tentativo di questa stessa POST.
     let active_run: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
+        // `awaiting_subagents` (Fase D fan-in): il run e' sospeso-VIVO in attesa dei
+        // figli background (gemello di `awaiting_confirmation`), quindi il replay
+        // idempotente deve ritrovarlo come run attivo del primo tentativo.
         "SELECT id, status, provider, model FROM agent_runs \
          WHERE session_id = $1 \
-           AND status IN ('running', 'awaiting_confirmation') \
+           AND status IN ('running', 'awaiting_confirmation', 'awaiting_subagents') \
            AND created_at > NOW() - INTERVAL '15 minutes' \
          ORDER BY created_at DESC \
          LIMIT 1",
@@ -260,9 +263,15 @@ pub async fn send_chat_message(
 
     if parse_automation_mode(body.automation_mode.as_deref()) != AutomationMode::Study {
         let active_run: Option<Uuid> = sqlx::query_scalar(
+            // `awaiting_subagents` (Fase D fan-in) e' un'interruzione MID-TURN, gemella
+            // di `awaiting_confirmation`: il run e' sospeso-vivo in attesa dei figli
+            // background e NON ha emesso end_turn (generation_ended_at IS NULL resta
+            // vero), quindi deve restare bloccante come pausa-conferma. Senza, un nuovo
+            // messaggio sulla sessione col padre sospeso avvierebbe un 2o run parallelo
+            // che ruba lo stream SSE.
             "SELECT id FROM agent_runs \
              WHERE session_id = $1 \
-               AND status IN ('running', 'awaiting_confirmation') \
+               AND status IN ('running', 'awaiting_confirmation', 'awaiting_subagents') \
                AND created_at > NOW() - INTERVAL '15 minutes' \
                AND generation_ended_at IS NULL \
                AND nexus_agent_type IS DISTINCT FROM 'subagent' \

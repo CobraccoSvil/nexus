@@ -1898,75 +1898,58 @@ fn build_resume_delta(resume_message: &str) -> nexus_graph::StateDelta {
 
 /// Costruisce il delta opaco del runtime che sblocca l'interrupt FAN-IN (Fase D):
 /// azzera `awaiting_subagents` (`Some(Some(false))`, load-bearing per non
-/// re-interrompere sul checkpoint ancora-in-attesa) e inietta i `subagent_results`
+/// re-interrompere sul checkpoint ancora-in-attesa) e CONSEGNA al modello gli esiti
 /// dei figli background completati. Gemello di [`build_resume_delta`] (regola L):
-/// la differenza dall'HITL e' il MOTIVO di interrupt azzerato e il payload
-/// iniettato (risultati strutturati vs messaggio umano di approvazione). Il delta
-/// e' TIPIZZATO e passa per il reducer (`into_opaque`): non si scrivono i campi a
-/// mano. `subagent_results` sono i verdetti strutturati (regola M) letti dalle
-/// righe `nexus_subagent_runs`, non prosa.
+/// la differenza dall'HITL e' il MOTIVO di interrupt azzerato.
+///
+/// CONSEGNA via `messages` (append), NON solo via `subagent_results`: il nodo che
+/// riprende e' l'`executor` (`interrupt_before=["executor"]`), che costruisce il
+/// prompt LLM da `state.messages` e NON legge il campo `subagent_results` (letto
+/// solo dal `todo_runner`). Iniettare solo nel campo lascerebbe il resume INERTE —
+/// il padre riprenderebbe CIECO sugli esiti (in history solo il marker
+/// `background_dispatched`). Il Message porta i verdetti STRUTTURATI (regola M).
+/// `subagent_results` resta valorizzato nel campo per osservabilita' / eventuali
+/// consumatori non-executor. Il delta e' TIPIZZATO e passa per il reducer
+/// (`into_opaque`): non si scrivono i campi a mano.
 fn build_resume_delta_subagents(subagent_results: Vec<Value>) -> nexus_graph::StateDelta {
     use nexus_agent_graph::state::{Message, MessageContent};
-    // Messaggio che PRESENTA i risultati al modello (campo `messages`, reducer
-    // append). Gemello dell'HITL (`build_resume_delta` accoda l'approvazione umana):
-    // senza questo, i `subagent_results` restano un campo di stato letto SOLO dal
-    // todo_runner (percorso pianificato) e nel percorso agentico diretto il modello
-    // non li vede mai -> al resume dice "attendo ancora il summary" e fallisce.
-    let fanin_message = format_fanin_results_message(&subagent_results);
+    let results_msg = format_fanin_results_message(&subagent_results);
     let typed = nexus_agent_graph::state::StateDelta {
         // Azzera il predicato di interrupt fan-in: senza, il motore si
         // re-interrompe sul checkpoint ancora-in-attesa (loop di fan-in).
         awaiting_subagents: Some(Some(false)),
-        // Inietta gli esiti dei sub-run background nel campo di stato: il todo_runner
-        // li rilegge per `<todo_gia_eseguiti>`. Segnali strutturati (regola M).
+        // Campo di stato (osservabilita' / consumatori non-executor). NON e' il
+        // canale che il modello legge: quello e' `messages` qui sotto.
         subagent_results: Some(Some(subagent_results)),
-        // E li rende VISIBILI al modello come ultimo turno (percorso agentico
-        // diretto senza piano): reducer append, cosi' il modello ripreso vede i
-        // risultati e prosegue invece di attenderli.
+        // Turno utente coi risultati: l'executor lo rilegge come ultimo messaggio
+        // della history al riavvio del turno (stesso canale del resume HITL).
         messages: Some(vec![Message::Human {
-            content: MessageContent::text(fanin_message),
+            content: MessageContent::text(results_msg),
         }]),
         ..Default::default()
     };
     typed.into_opaque()
 }
 
-/// Formatta i risultati dei sub-run background in un messaggio leggibile dal
-/// modello al resume fan-in. Legge i CAMPI strutturati (`summary`/`status`/`kind`,
-/// regola M), mai prosa non strutturata. Punto unico del rendering fan-in->prompt.
+/// Formatta i risultati strutturati dei figli background nel testo del turno utente
+/// iniettato al resume fan-in (`build_resume_delta_subagents`). I segnali
+/// autoritativi (`status`/`outcome`) sono serializzati come JSON (regola M:
+/// struttura, non prosa); `summary` e' descrittivo. Array vuoto -> nota esplicita
+/// (il modello riprende comunque non cieco). Delimitatori `<subagent_results>` per
+/// un parsing robusto lato modello.
 fn format_fanin_results_message(results: &[Value]) -> String {
     if results.is_empty() {
-        return "I sub-agent delegati in background sono terminati senza produrre \
-                risultati. Procedi tenendone conto."
+        return "I sub-agenti in background che avevi dispatchato sono terminati \
+                (nessun nuovo esito strutturato da riportare)."
             .to_string();
     }
-    let mut out = String::from(
-        "I sub-agent che hai delegato in background hanno completato. \
-         Ecco i loro risultati:\n\n",
-    );
-    for (i, r) in results.iter().enumerate() {
-        let kind = r.get("kind").and_then(Value::as_str).unwrap_or("subagent");
-        let status = r.get("status").and_then(Value::as_str).unwrap_or("?");
-        let id = r
-            .get("subagent_run_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let short_id = id.get(..8).unwrap_or(id);
-        let summary = r
-            .get("summary")
-            .and_then(Value::as_str)
-            .unwrap_or("(nessun summary prodotto)");
-        out.push_str(&format!(
-            "### Sub-agent {} — {} (run {}, stato: {})\n{}\n\n",
-            i + 1,
-            kind,
-            short_id,
-            status,
-            summary
-        ));
-    }
-    out.push_str("Usa questi risultati per completare il task richiesto.");
-    out
+    let json = serde_json::to_string_pretty(results).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "I sub-agenti in background che avevi dispatchato sono terminati. Ecco i \
+         loro esiti (un oggetto per figlio; `status`/`outcome` sono i segnali \
+         autoritativi, `summary` e' descrittivo):\n\
+         <subagent_results>\n{json}\n</subagent_results>"
+    )
 }
 
 /// RESUME FAN-IN di un run nativo PRIMARIO sospeso su `awaiting_subagents`
@@ -3009,28 +2992,40 @@ mod tests {
             !state.is_awaiting_subagents(),
             "il delta deve azzerare awaiting_subagents (sblocca l'interrupt fan-in)"
         );
-        // I risultati sono OVERWRITE nello stato (non append come i messaggi):
-        // il todo_runner li rilegge da qui per `<todo_gia_eseguiti>`.
+        // I risultati sono OVERWRITE nel campo di stato (osservabilita').
         assert_eq!(
             state.subagent_results.as_ref().map(|r| r.len()),
             Some(2),
-            "i risultati dei sub-run sono iniettati nello stato"
+            "i risultati dei sub-run sono iniettati nel campo di stato"
         );
-        // FIX Fase D (regressione E2E): il delta fan-in accoda ANCHE un messaggio
-        // che PRESENTA i risultati al modello (append al messaggio pregresso), cosi'
-        // nel percorso agentico diretto (senza piano/todo) il modello ripreso VEDE i
-        // summary e prosegue invece di dire "attendo ancora il summary". Senza questo
-        // i risultati restavano solo nel campo di stato, letto dal solo todo_runner.
+        // FIX B1 (resume non piu' inerte): il delta ACCODA un turno utente coi
+        // risultati, cioe' il canale che l'executor legge davvero (state.messages,
+        // reducer append). Senza, il padre riprenderebbe CIECO sugli esiti (l'executor
+        // NON legge il campo subagent_results, letto solo dal todo_runner).
         assert_eq!(
             state.messages.len(),
             2,
-            "il delta fan-in accoda un messaggio coi risultati (visibile al modello)"
+            "messaggio pregresso + turno coi risultati fan-in accodato"
         );
-        let injected = serde_json::to_string(state.messages.last().unwrap()).unwrap();
-        assert!(
-            injected.contains("fatto") && injected.contains("ok"),
-            "il messaggio iniettato deve contenere i summary dei sub-run: {injected}"
-        );
+        match state.messages.last() {
+            Some(Message::Human { content }) => {
+                let txt = serde_json::to_string(content).unwrap_or_default();
+                assert!(
+                    txt.contains("subagent_results") && txt.contains("completed_verified"),
+                    "il turno iniettato deve portare gli esiti STRUTTURATI dei figli: {txt}"
+                );
+            }
+            other => panic!("atteso Human coi risultati in coda, trovato {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_fanin_results_message_vuoto_non_e_cieco() {
+        // Array vuoto -> nota esplicita (il modello riprende comunque non cieco),
+        // niente blocco <subagent_results> spurio.
+        let msg = format_fanin_results_message(&[]);
+        assert!(msg.contains("terminati"), "nota di completamento: {msg}");
+        assert!(!msg.contains("<subagent_results>"), "niente blocco vuoto: {msg}");
     }
 
     #[test]

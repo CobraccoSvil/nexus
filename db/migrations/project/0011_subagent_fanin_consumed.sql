@@ -1,0 +1,28 @@
+-- Fase D fan-in (discriminazione d'ondata): colonna `fanin_consumed_at` su
+-- nexus_subagent_runs = timestamp in cui i risultati del figlio background sono
+-- stati INIETTATI nel padre al resume fan-in. NULL = non ancora consumato.
+--
+-- MOTIVAZIONE (ALTA-2, re-review): al resume il padre inietta i risultati dei
+-- figli come Message leggibile dal modello (build_resume_delta_subagents). La
+-- fetch correlava per `dispatcher_run_id` + `is_background` SENZA discriminare
+-- l'ONDATA. Ma `dispatcher_run_id` e' COSTANTE tra le ondate (lo stesso run che
+-- si ri-sospende su una 2a ondata di figli background mantiene il suo id): alla 2a
+-- ondata la fetch rifetchava 1a + 2a insieme -> il modello rivedeva i figli della
+-- 1a ondata RI-INIETTATI come nuovi (doppia iniezione). Marcando `consumed` al
+-- momento dell'iniezione e filtrando `fanin_consumed_at IS NULL`, ogni ondata
+-- inietta i suoi figli ESATTAMENTE UNA VOLTA.
+--
+-- `nexus_subagent_runs` vive nei DB-PROGETTO (set db/migrations/project; nel meta
+-- decommissionata, mig 0507). La 0010 (dispatcher_run_id) e' GIA' APPLICATA:
+-- questa e' una mig NUOVA (0011), non una modifica alla 0010 (regola: le
+-- migrazioni applicate sono IMMUTABILI).
+--
+-- Backfill NON necessario: feature nuova opt-in. NULL = non consumato, default
+-- corretto per le righe esistenti (nessun resume le ha ancora iniettate).
+--
+-- Nessun indice: la fetch gira una volta per resume su una cardinalita' piccola
+-- (i figli DIRETTI di un singolo run), correlata gia' per dispatcher_run_id.
+--
+-- Idempotente (ADD COLUMN IF NOT EXISTS): ri-applicabile.
+ALTER TABLE public.nexus_subagent_runs
+    ADD COLUMN IF NOT EXISTS fanin_consumed_at TIMESTAMPTZ;
