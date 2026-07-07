@@ -357,6 +357,7 @@ mod tests {
     fn real_ctx() -> AgentNodeCtx {
         let run_id = Uuid::new_v4();
         AgentNodeCtx {
+            isolation_available: false,
             db: lazy_pool(),
             llm: Arc::new(crate::runtime::test_doubles::StubLlmGateway::with_text("")),
             tools: Arc::new(StubToolNoop),

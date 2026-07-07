@@ -454,11 +454,16 @@ fn isolation_flag_cache() -> &'static nexus_cache::TtlCache<(), bool> {
 /// Legge il flag `orchestrator.subagent_isolation_enabled` (default false) con
 /// cache 60s. DB down o chiave assente -> `false` (fail-safe: nessun isolamento,
 /// ramo sequenziale come oggi).
-async fn isolation_flag_enabled(ctx: &AgentToolContext) -> bool {
+/// PUNTO UNICO (regola L) della lettura del flag: lo condividono il batch tool
+/// (`compute_isolation_available`) e il run-init del grafo
+/// (`native_engine::compute_run_isolation_available`), cosi' il gate del planner e
+/// l'esecuzione reale dell'isolamento vedono lo STESSO valore. Prende `&PgPool`
+/// (unico bisogno reale): DB down o chiave assente -> `false` (fail-safe).
+pub(crate) async fn isolation_flag_enabled(db: &sqlx::PgPool) -> bool {
     if let Some(v) = isolation_flag_cache().get(&()) {
         return v;
     }
-    let enabled = nexus_auth::get_bool_setting(&ctx.core.db, ISOLATION_ENABLED_SETTING)
+    let enabled = nexus_auth::get_bool_setting(db, ISOLATION_ENABLED_SETTING)
         .await
         .ok()
         .flatten()
@@ -474,7 +479,7 @@ async fn isolation_flag_enabled(ctx: &AgentToolContext) -> bool {
 /// (nessun I/O sul path caldo su progetti non-git). Flag OFF -> `false` senza
 /// alcun probe.
 async fn compute_isolation_available(ctx: &AgentToolContext) -> bool {
-    if !isolation_flag_enabled(ctx).await {
+    if !isolation_flag_enabled(&ctx.core.db).await {
         return false;
     }
     if !ctx.core.is_git_repo {
