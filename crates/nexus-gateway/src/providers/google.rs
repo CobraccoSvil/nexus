@@ -567,6 +567,32 @@ impl GoogleProvider {
         .await
     }
 
+    /// Mappa basename -> finestra dichiarata dall'endpoint Gemini direct, usata
+    /// per ARRICCHIRE il discovery Vertex (che non espone `inputTokenLimit`). Il
+    /// `base_url` resta l'endpoint Gemini ufficiale anche in backend Vertex (che
+    /// costruisce i suoi URL a parte), quindi la fonte e' interrogabile finche'
+    /// c'e' una API key Gemini. Vuota se la key manca o la chiamata fallisce
+    /// (degrado grazioso: nessun arricchimento, mai un errore che abbatte il
+    /// discovery Vertex). Fonte REALE (regola G/H): niente finestra inventata.
+    async fn gemini_declared_windows(&self) -> std::collections::HashMap<String, i64> {
+        if self.api_key.trim().is_empty() {
+            return std::collections::HashMap::new();
+        }
+        match self.list_gemini_models_meta().await {
+            Ok(metas) => metas
+                .into_iter()
+                .filter_map(|m| m.context_window.map(|w| (m.id, w)))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "google discovery: arricchimento finestre da Gemini direct fallito; i modelli Vertex senza finestra restano ignoti (0)"
+                );
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
     /// Loop di paginazione condiviso dai listing modelli Google (punto unico,
     /// regola L: Gemini direct e Vertex differiscono solo per URL/auth della
     /// singola pagina, costruita da `build_page_req` SENZA i parametri di
@@ -910,15 +936,21 @@ impl LlmProvider for GoogleProvider {
                 discovery_locations,
                 auth,
                 ..
-            } => Ok(self
-                .list_vertex_models(discovery_locations, auth)
-                .await?
-                .into_iter()
-                .map(|id| crate::provider::ModelMeta {
-                    id,
-                    context_window: None,
-                })
-                .collect()),
+            } => {
+                // L'elenco Vertex e' AUTOREVOLE per la disponibilita' dei modelli
+                // nel progetto, ma il listing `publisherModels` NON dichiara
+                // `inputTokenLimit` -> finestra ignota. L'endpoint Gemini direct
+                // (`{base}/models?key=`) la dichiara: se una API key Gemini e'
+                // configurata, ARRICCHIAMO le finestre per basename da quella
+                // fonte REALE (regola G/H: mai un placeholder inventato). I
+                // modelli che nessuna fonte Google dichiara (alias Vertex-only
+                // deprecati) restano `context_window=None` = 0 ignota, e il
+                // pre-check agentico li re-instrada (fail-safe). Un errore Gemini
+                // direct NON fa fallire il discovery Vertex (degrado grazioso).
+                let ids = self.list_vertex_models(discovery_locations, auth).await?;
+                let declared_windows = self.gemini_declared_windows().await;
+                Ok(merge_ids_with_declared_windows(ids, &declared_windows))
+            }
         }
     }
 
@@ -1300,6 +1332,24 @@ fn google_model_meta_of(m: &serde_json::Value) -> Option<crate::provider::ModelM
         .and_then(serde_json::Value::as_i64)
         .filter(|w| *w > 0);
     Some(crate::provider::ModelMeta { id, context_window })
+}
+
+/// Fonde l'elenco (autorevole) dei modelli Vertex con le finestre di contesto
+/// DICHIARATE dall'endpoint Gemini direct (mappa basename -> finestra). Ogni id
+/// Vertex prende la finestra dalla mappa se presente, altrimenti `None`
+/// (0 = ignota): mai un valore inventato (regola G/H). Funzione PURA (regola L,
+/// testabile senza rete), usata da [`list_models_meta`](LlmProvider::list_models_meta)
+/// nel ramo Vertex.
+fn merge_ids_with_declared_windows(
+    ids: Vec<String>,
+    declared_windows: &std::collections::HashMap<String, i64>,
+) -> Vec<crate::provider::ModelMeta> {
+    ids.into_iter()
+        .map(|id| {
+            let context_window = declared_windows.get(&id).copied();
+            crate::provider::ModelMeta { id, context_window }
+        })
+        .collect()
 }
 
 /// Esito della risoluzione del thinking Gemini per una richiesta.
@@ -2821,6 +2871,42 @@ mod tests {
                 context_window: None,
             }]
         );
+    }
+
+    #[test]
+    fn merge_vertex_ids_arricchisce_solo_i_dichiarati() {
+        // L'elenco Vertex e' autorevole; le finestre arrivano dalla mappa Gemini
+        // direct (fonte reale). Un modello presente nella mappa prende la finestra
+        // REALE; uno assente (nessuna fonte lo dichiara) resta ignoto (None), mai
+        // un valore inventato (regola G/H).
+        let ids = vec![
+            "gemini-omni-flash-preview".to_string(), // dichiarato da Gemini direct
+            "gemini-2.5-flash".to_string(),          // dichiarato
+            "gemma3".to_string(),                    // alias Vertex-only: nessuna fonte
+        ];
+        let mut windows = std::collections::HashMap::new();
+        windows.insert("gemini-omni-flash-preview".to_string(), 131_072_i64);
+        windows.insert("gemini-2.5-flash".to_string(), 1_048_576_i64);
+        let metas = merge_ids_with_declared_windows(ids, &windows);
+        let win = |id: &str| {
+            metas
+                .iter()
+                .find(|m| m.id == id)
+                .and_then(|m| m.context_window)
+        };
+        assert_eq!(win("gemini-omni-flash-preview"), Some(131_072));
+        assert_eq!(win("gemini-2.5-flash"), Some(1_048_576));
+        assert_eq!(win("gemma3"), None, "nessuna fonte dichiara: resta ignota");
+        assert_eq!(metas.len(), 3, "l'elenco Vertex non viene ne' filtrato ne' esteso");
+    }
+
+    #[test]
+    fn merge_vertex_ids_mappa_vuota_tutti_ignoti() {
+        // Nessuna API key Gemini / chiamata fallita -> mappa vuota -> comportamento
+        // storico: tutti i modelli Vertex a finestra ignota (degrado grazioso).
+        let ids = vec!["gemini-2.5-pro".to_string(), "gemma".to_string()];
+        let metas = merge_ids_with_declared_windows(ids, &std::collections::HashMap::new());
+        assert!(metas.iter().all(|m| m.context_window.is_none()));
     }
 
     #[test]
