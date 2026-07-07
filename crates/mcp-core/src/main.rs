@@ -582,6 +582,10 @@ async fn main() -> anyhow::Result<()> {
     // La garanzia di boot e' la unit --system nexus-user-manager.service; qui
     // copriamo la finestra in cui mcp-core parte prima che quella oneshot
     // completi (e ogni restart di mcp-core). Best-effort: non blocca l'avvio.
+    // Solo su Linux/systemd: su Windows non esiste un manager --user da
+    // risuscitare (i servizi sono processi gestiti in agent_processes), quindi
+    // eseguire la catena spawnerebbe systemctl/sudo inesistenti a vuoto.
+    #[cfg(not(windows))]
     crate::project_workspace::user_manager::ensure_user_manager(&db).await;
 
     // ADR 0017 v2 F8: rimosso `ensure_knowledge_collection` (collection

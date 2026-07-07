@@ -21,6 +21,11 @@ pub mod service_observer;
 pub mod service_observer_remediation;
 pub mod services;
 pub mod terminal_ws;
+// Apparato interamente systemd --user (ADR 0028): non ha senso su Windows, dove
+// i servizi sono processi gestiti in agent_processes e non esiste un manager
+// utente da risuscitare. Gated per non compilare gli spawn di systemctl/sudo
+// inesistenti (evita i WARN fuorvianti e il consumo cooldown al boot).
+#[cfg(not(windows))]
 pub mod user_manager;
 pub mod wizard;
 pub mod workbench;

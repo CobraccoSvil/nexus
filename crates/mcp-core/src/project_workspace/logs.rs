@@ -867,7 +867,7 @@ pub async fn get_output_events(
             jobs_channel_events(&proj_pool, project_id, &channel, limit).await?
         }
         ch if ch.starts_with("agent:") => agent_channel_events(&proj_pool, ch, &channel).await?,
-        "System" => system_channel_events(&context).await,
+        "System" => system_channel_events(&state.db, &context).await,
         ch if ch.starts_with("svc:") => {
             svc_channel_events(&context, &proj_pool, ch, &channel, limit).await
         }
@@ -1016,32 +1016,45 @@ async fn agent_channel_events(
     })])
 }
 
-/// Evento del canale "System": stato di TUTTI i servizi systemd del progetto
-/// rilevati dinamicamente ({slug}-*.service), piu' nome progetto e root.
-async fn system_channel_events(context: &crate::projects::ProjectContext) -> Vec<Value> {
-    let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
-    let prefix = format!("{}-", slug);
+/// Evento del canale "System": stato di TUTTI i servizi di progetto rilevati
+/// dinamicamente, piu' nome progetto e root.
+///
+/// Enumerazione via PUNTO UNICO `service_manager::active().list(&ctx)` (regola L):
+/// su Linux delega al backend systemd, su Windows ai processi gestiti in
+/// `agent_processes`. Prima l'enumerazione era via `systemctl --user` diretto e
+/// non gated: su Windows (niente systemd) restituiva sempre lista vuota e il
+/// canale mentiva con "Nessun servizio trovato".
+async fn system_channel_events(
+    db: &sqlx::PgPool,
+    context: &crate::projects::ProjectContext,
+) -> Vec<Value> {
+    use crate::project_workspace::service_manager::{self, ServiceBackend, ServiceContext};
+    use crate::project_workspace::services::project_service_slug;
+
+    let slug = project_service_slug(&context.details.name);
     let mut lines = Vec::new();
 
-    if let Ok(list_out) = tokio::process::Command::new("systemctl")
-        .args(["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
-        .output()
-        .await
-    {
-        let list_str = String::from_utf8_lossy(&list_out.stdout);
-        for line in list_str.lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 4 { continue; }
-            let unit = cols[0].trim_start_matches('●').trim();
-            if !unit.starts_with(&prefix) || !unit.ends_with(".service") { continue; }
-            let active = cols[2];
-            let sub    = cols[3];
-            lines.push(format!("{}: {} ({})", unit, active, sub));
-        }
+    let ctx = ServiceContext {
+        db,
+        port_registry: None,
+        project_id: context.project_id,
+        slug: &slug,
+        project_root: &context.repository_root_path,
+    };
+    // `id` = unit completo (Linux) o label (Windows); `state` e' gia' normalizzato
+    // (regola M: stato da enum strutturato, non da parsing di prosa). Riproduco la
+    // shape testuale "{id}: {stato}" storica, con lo stato normalizzato al posto
+    // della coppia grezza active/sub di systemd.
+    for entry in service_manager::active().list(&ctx).await {
+        let state = serde_json::to_value(entry.state)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "unknown".to_string());
+        lines.push(format!("{}: {} [{}]", entry.id, state, entry.managed_by));
     }
 
     if lines.is_empty() {
-        lines.push(format!("Nessun servizio trovato con prefisso '{}'.", prefix));
+        lines.push(format!("Nessun servizio trovato per il progetto '{}'.", slug));
     }
 
     lines.push(String::new());
