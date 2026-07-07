@@ -1099,6 +1099,14 @@ impl ProviderHttpError {
         self.retry_after_seconds = secs;
         self
     }
+
+    /// Messaggio diagnostico STRUTTURATO (`error.message`) estratto dal body,
+    /// per il solo logging/display (regola M): dice COSA e' invalido senza
+    /// dumpare il body grezzo (`message`, che puo' contenere JSON di contorno).
+    /// `None` se il body non e' JSON o non espone il campo.
+    pub fn structured_message(&self) -> Option<String> {
+        extract_structured_error_message(&self.message)
+    }
 }
 
 /// Parsa l'header `Retry-After` in secondi. RFC 7231: gestiamo il formato
@@ -1139,6 +1147,28 @@ fn extract_structured_error_code(body: &str) -> Option<String> {
         if let Some(s) = c.as_str() {
             if !s.is_empty() {
                 return Some(s.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// Estrae il MESSAGGIO d'errore leggibile dal body JSON di errore provider, per
+/// la DIAGNOSI (regola M): il campo `message` del contratto d'errore dice COSA
+/// e' invalido (es. Google: quale argomento e il limite atteso). Cerca (in
+/// ordine) `error.message` e il `message` top-level. E' diagnostico, mai usato
+/// per classificare (la classificazione resta su status + codice strutturato).
+/// Ritorna `None` se il body non e' JSON o non ha un campo `message`.
+fn extract_structured_error_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    for c in [v.pointer("/error/message"), v.get("message")]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(s) = c.as_str() {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
             }
         }
     }
@@ -2234,6 +2264,32 @@ mod tests {
         );
         // Body non-JSON o senza campi: None.
         assert_eq!(extract_structured_error_code("502 Bad Gateway (html)"), None);
+    }
+
+    #[test]
+    fn extract_structured_error_message_da_json() {
+        // Google: error.message dice QUALE argomento e' invalido (regola M).
+        assert_eq!(
+            extract_structured_error_message(
+                r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"List of found errors:\t1.Field: page_size; Message: Page size should be non-negative and the maximum size is 300.\t"}}"#
+            )
+            .as_deref(),
+            Some("List of found errors:\t1.Field: page_size; Message: Page size should be non-negative and the maximum size is 300.")
+        );
+        // Fallback sul message top-level (alcuni provider non annidano in error).
+        assert_eq!(
+            extract_structured_error_message(r#"{"message":"bad request"}"#).as_deref(),
+            Some("bad request")
+        );
+        // Body non-JSON o senza campo message: None.
+        assert_eq!(
+            extract_structured_error_message(r#"{"error":{"code":400}}"#),
+            None
+        );
+        assert_eq!(
+            extract_structured_error_message("502 Bad Gateway (html)"),
+            None
+        );
     }
 
     #[test]
