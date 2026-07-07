@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 use super::AgentToolContext;
 use crate::native_engine::{verdict_keys, NativeDeps, NativeRunInput, NativeRunOutcome};
+use nexus_agent_graph::decisions::QuorumPolicy;
 
 /// Marker d'errore (stesso contratto di `subagent.rs`: prefisso U+274C ->
 /// `tool_result_is_error` deriva `is_error=true`).
@@ -382,13 +383,28 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     }
 
     let ok = results.iter().filter(|r| r.get("error").is_none()).count();
-    json!({
+    let mut out = json!({
         "count": results.len(),
         "ok": ok,
         "failed": results.len() - ok,
         "results": results,
-    })
-    .to_string()
+    });
+    // Fase C (coordinatore avversario, regola L/M): se il batch e' un PANEL di
+    // review (almeno un sub-run ha dichiarato un `review`), compone il verdetto
+    // aggregato dai segnali strutturati `outcome.review` — mai dalla prosa. I
+    // sub-run non-review non hanno `review` e il panel non viene aggiunto. Le
+    // review sono read-only (write_scope vuoto) -> restano nel ramo sequenziale.
+    let outcomes: Vec<Value> = results
+        .iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
+    if let Some(panel) = nexus_agent_graph::decisions::compose_panel_verdict(
+        &outcomes,
+        &read_quorum_policy(ctx).await,
+    ) {
+        out["panel_verdict"] = panel.to_value();
+    }
+    out.to_string()
 }
 
 /// Un task del batch, parsato dall'input del tool. `write_scope` alimenta il gating
@@ -794,6 +810,38 @@ async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
     v.and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(3)
         .clamp(1, MAX_PARALLEL_HARD_CAP)
+}
+
+/// Policy del quorum del panel di review (Fase C, regola G: DB-driven, niente
+/// hardcode). Safe-default coincidente con `QuorumPolicy::default` se le chiavi
+/// mancano: 1 voto valido conclusivo, veto avversario su high-severity attivo.
+async fn read_quorum_policy(ctx: &AgentToolContext) -> QuorumPolicy {
+    let rows = sqlx::query(
+        "SELECT key, value FROM settings WHERE key IN (
+            'orchestrator.review_quorum_min_valid',
+            'orchestrator.review_fail_on_high_severity'
+        )",
+    )
+    .fetch_all(&*ctx.core.db)
+    .await
+    .unwrap_or_default();
+    let mut policy = QuorumPolicy::default();
+    for row in rows {
+        let k: String = row.get("key");
+        let v: String = row.get("value");
+        match k.as_str() {
+            "orchestrator.review_quorum_min_valid" => {
+                if let Ok(n) = v.trim().parse::<usize>() {
+                    policy.min_valid_verdicts = n.max(1);
+                }
+            }
+            "orchestrator.review_fail_on_high_severity" => {
+                policy.fail_on_high_severity = settings_flag(v.trim());
+            }
+            _ => {}
+        }
+    }
+    policy
 }
 
 // ─── Narrazione del sub-run sul run PADRE (ADR 0037) ───────────────────────
