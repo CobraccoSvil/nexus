@@ -362,11 +362,51 @@ pub(super) fn visible_windows_services(
     visible
 }
 
+/// Riconciliazione stato servizi (pura, testabile). Regola M: "running" implica un
+/// processo VIVO; la stringa `status` in DB puo' restare stale (un processo muore
+/// senza aggiornare la riga: crash, kill esterno, riavvio host). Una riga
+/// running/starting il cui pid non e' piu' vivo viene corretta a "stopped".
+/// Ritorna le righe corrette (per `visible_windows_services`) e i pid morti da
+/// persistere come stopped. Punto unico della regola (regola L).
+///
+/// Limite noto (riciclo PID): `is_alive` puo' dare falso positivo se il pid e'
+/// stato riusato da un processo estraneo -> la riga resta 'running'. E' l'edge che
+/// l'observer risolve con la validazione dello started_at; qui la liveness copre il
+/// caso comune (pid morto e non riusato) ed e' comunque un miglioramento netto.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn reconcile_dead_service_rows(
+    rows: Vec<(String, String, Option<i32>, chrono::DateTime<chrono::Utc>)>,
+    is_alive: impl Fn(i32) -> bool,
+) -> (
+    Vec<(String, String, chrono::DateTime<chrono::Utc>)>,
+    Vec<i32>,
+) {
+    let mut dead_pids = Vec::new();
+    let reconciled = rows
+        .into_iter()
+        .map(|(label, status, pid, created)| {
+            let running = matches!(status.as_str(), "running" | "starting");
+            let alive = pid.map(|p| p > 0 && is_alive(p)).unwrap_or(false);
+            if running && !alive {
+                if let Some(p) = pid {
+                    if p > 0 {
+                        dead_pids.push(p);
+                    }
+                }
+                (label, "stopped".to_string(), created)
+            } else {
+                (label, status, created)
+            }
+        })
+        .collect();
+    (reconciled, dead_pids)
+}
+
 /// Windows: elenca i servizi di progetto come processi gestiti (agent_processes
 /// kind='service'), nella STESSA shape di list_services_fallback. Su Windows non
 /// esistono unit systemd: l'install (install_service_windows) registra i servizi
 /// qui. Voci calcolate da visible_windows_services (dedup per label, voci
-/// fantasma nascoste).
+/// fantasma nascoste). Riconcilia (e persiste) le righe stale prima del display.
 #[cfg(windows)]
 pub(super) async fn list_services_windows(
     db: &sqlx::PgPool,
@@ -376,16 +416,40 @@ pub(super) async fn list_services_windows(
     // Separazione DB per-progetto: agent_processes e' tabella migrata, instrada
     // sul pool del progetto (flag OFF -> ritorna il meta-pool, behavior-preserving).
     let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-    let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT label, status, created_at FROM agent_processes \
-         WHERE project_id = $1 AND kind = 'service' \
-         ORDER BY label, created_at DESC",
-    )
-    .bind(project_id)
-    .fetch_all(&proj_pool)
-    .await
-    .unwrap_or_default();
-    visible_windows_services(&rows)
+    let rows: Vec<(String, String, Option<i32>, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            "SELECT label, status, pid, created_at FROM agent_processes \
+             WHERE project_id = $1 AND kind = 'service' \
+             ORDER BY label, created_at DESC",
+        )
+        .bind(project_id)
+        .fetch_all(&proj_pool)
+        .await
+        .unwrap_or_default();
+
+    // Self-heal: una riga running/starting con pid morto diventa 'stopped' sia nel
+    // display sia in DB, cosi' il pannello non mostra 'running' un processo defunto
+    // (stato stale) e gli altri consumer leggono uno stato veritiero.
+    let (reconciled, dead_pids) =
+        reconcile_dead_service_rows(rows, |p| crate::process_util::process_alive(p as u32));
+    if !dead_pids.is_empty() {
+        let _ = sqlx::query(
+            "UPDATE agent_processes SET status = 'stopped', stopped_at = now() \
+             WHERE project_id = $1 AND kind = 'service' \
+               AND status IN ('running', 'starting') AND pid = ANY($2)",
+        )
+        .bind(project_id)
+        .bind(&dead_pids)
+        .execute(&proj_pool)
+        .await;
+        tracing::info!(
+            project_id = %project_id,
+            count = dead_pids.len(),
+            "list_services_windows: servizi con pid morto riconciliati a stopped"
+        );
+    }
+
+    visible_windows_services(&reconciled)
         .into_iter()
         .map(|(label, running)| {
             json!({
@@ -3125,5 +3189,30 @@ mod tests {
         assert_eq!(ports[0]["service"].as_str(), Some("backend"));
         assert_eq!(ports[1]["service"].as_str(), Some("frontend-dev"));
         assert!(ports[2].get("service").and_then(|v| v.as_str()).is_none());
+    }
+
+    #[test]
+    fn reconcile_dead_service_rows_marca_stopped_solo_i_running_morti() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rows = vec![
+            // running con pid MORTO -> stopped, pid raccolto
+            ("backend".to_string(), "running".to_string(), Some(200), base),
+            // running con pid VIVO -> invariato
+            ("frontend".to_string(), "running".to_string(), Some(100), base),
+            // gia' stopped (pid morto) -> invariato, NON raccolto (non era running)
+            ("worker".to_string(), "stopped".to_string(), Some(200), base),
+            // starting senza pid -> non vivo -> stopped, ma nessun pid da persistere
+            ("api".to_string(), "starting".to_string(), None, base),
+        ];
+        let alive = |p: i32| p == 100 || p == 300;
+        let (reconciled, dead) = super::reconcile_dead_service_rows(rows, alive);
+        assert_eq!(reconciled[0], ("backend".to_string(), "stopped".to_string(), base));
+        assert_eq!(reconciled[1], ("frontend".to_string(), "running".to_string(), base));
+        assert_eq!(reconciled[2], ("worker".to_string(), "stopped".to_string(), base));
+        assert_eq!(reconciled[3], ("api".to_string(), "stopped".to_string(), base));
+        // Solo il pid 200 della riga RUNNING va persistito come stopped.
+        assert_eq!(dead, vec![200]);
     }
 }
