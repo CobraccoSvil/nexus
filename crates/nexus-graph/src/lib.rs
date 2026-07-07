@@ -68,7 +68,7 @@ mod tests {
             }
         }
 
-        fn is_awaiting_confirmation(&self) -> bool {
+        fn is_awaiting_interrupt(&self) -> bool {
             self.awaiting_confirmation
         }
     }

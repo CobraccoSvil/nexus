@@ -467,10 +467,13 @@ pub struct StateDelta {
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub automation_mode: Option<Option<AutomationMode>>,
 
-    // ── HITL (predicati di interrupt) ───────────────────────────────────────────
+    // ── Interrupt-resume (HITL + fan-in) ─────────────────────────────────────────
     /// Vedi `AgentState::awaiting_confirmation`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub awaiting_confirmation: Option<Option<bool>>,
+    /// Vedi `AgentState::awaiting_subagents` (fan-in deterministico, Fase D).
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub awaiting_subagents: Option<Option<bool>>,
 
     // ── Schema aperto ───────────────────────────────────────────────────────────
     /// Overwrite della mappa `extra` (campo NORMALE, niente flatten): `Some(map)`
