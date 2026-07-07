@@ -266,6 +266,17 @@ async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
     .unwrap_or(0.0)
 }
 
+/// Legge il flag OPT-IN NASCOSTO `background` (bool, default false) dall'input di
+/// `dispatch_subagent`/`dispatch_subagents` (PUNTO UNICO, regola L + M: campo
+/// strutturato, mai parsing di prosa). Non e' nello schema del tool: resta
+/// disabilitato finche' un chiamante non lo passa esplicitamente (Fase D fan-in).
+fn read_background_flag(input: &Value) -> bool {
+    input
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Handler del tool `dispatch_subagent` (singolo sub-run nativo).
 pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> String {
     let kind = match input.get("kind").and_then(Value::as_str) {
@@ -286,8 +297,12 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // OPT-IN NASCOSTO (Fase D fan-in): dispatch asincrono. Non documentato nello
+    // schema del tool (default false) -> comportamento invariato finche' nessuno
+    // lo passa. Letto come CAMPO strutturato (regola M).
+    let background = read_background_flag(input);
 
-    run_single_subagent(ctx, &kind, &task, &context_blob, &expected_format, None)
+    run_single_subagent(ctx, &kind, &task, &context_blob, &expected_format, None, background)
         .await
         .to_string()
 }
@@ -308,6 +323,13 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         .and_then(|v| v.as_u64())
         .unwrap_or(configured_max)
         .clamp(1, configured_max) as usize;
+    // OPT-IN NASCOSTO (Fase D fan-in): dispatch asincrono dell'intero batch. Il
+    // ramo ISOLATO non supporta il background (l'apply serializzato dei worktree
+    // esige che i sub-run siano TERMINATI prima di promuovere): quando
+    // `background=true` il batch salta l'isolamento e va sempre sul ramo
+    // sequenziale con `is_background=true` (scelta piu' semplice e sicura). Letto
+    // come CAMPO strutturato (regola M).
+    let background = read_background_flag(input);
 
     let mut parsed: Vec<ParsedTask> = Vec::with_capacity(tasks.len());
     for (i, t) in tasks.iter().enumerate() {
@@ -365,23 +387,37 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     // I/O (flag DB + probe git) separato dalla decisione pura: il probe scatta solo
     // se il flag e' ON (compute_isolation_available corto-circuita), poi la
     // disgiunzione e' pura e testabile (should_isolate_batch).
-    let isolation_available = compute_isolation_available(ctx).await;
+    // Il background salta l'isolamento (vedi doc sopra): il ramo isolato esige
+    // sub-run terminati per l'apply serializzato, incompatibile con il fire-and-forget.
+    let isolation_available = !background && compute_isolation_available(ctx).await;
     if should_isolate_batch(isolation_available, &scopes) {
         return run_batch_isolated(ctx, &parsed, max_parallel).await;
     }
 
-    // ── Ramo sequenziale/condiviso (invariato) ────────────────────────────────
+    // ── Ramo sequenziale/condiviso (invariato con background=false) ────────────
     // Esecuzione a ondate concorrenti (cap conservativo). I guard per-sub
     // (enabled/whitelist/depth/cost) sono valutati per ogni sub-run; nel batch
-    // il cost cap e' best-effort (race tollerata dato il cap conservativo).
+    // il cost cap e' best-effort (race tollerata dato il cap conservativo). Con
+    // `background=true` ogni figlio ritorna subito `background_dispatched` e
+    // l'esecuzione prosegue in task detached (fan-in via poll DB).
     let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
     for wave in parsed.chunks(max_parallel) {
         let futs = wave.iter().map(|p| {
-            run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None)
+            run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None, background)
         });
         let wave_res = futures::future::join_all(futs).await;
         results.extend(wave_res);
     }
+
+    // Fan-in (regola M): raccogli i figli che hanno risposto col SEGNALE
+    // STRUTTURATO `background_dispatched` (mai parsing di prosa) + i loro run_id,
+    // cosi' il padre si sospende e riprende quando i sub-run background terminano.
+    let child_run_ids: Vec<Value> = results
+        .iter()
+        .filter(|r| r.get("background_dispatched").and_then(Value::as_bool) == Some(true))
+        .filter_map(|r| r.get(K_SUB_RUN_ID).cloned())
+        .collect();
+    let any_background = !child_run_ids.is_empty();
 
     let ok = results.iter().filter(|r| r.get("error").is_none()).count();
     let mut out = json!({
@@ -390,6 +426,10 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         "failed": results.len() - ok,
         "results": results,
     });
+    if any_background {
+        out["background_dispatched"] = json!(true);
+        out["child_run_ids"] = json!(child_run_ids);
+    }
     // Fase C (coordinatore avversario, regola L/M): se il batch e' un PANEL di
     // review (almeno un sub-run ha dichiarato un `review`), compone il verdetto
     // aggregato dai segnali strutturati `outcome.review` — mai dalla prosa. I
@@ -614,6 +654,9 @@ async fn run_batch_isolated(
                     &p.context_blob,
                     &p.expected,
                     Some(&slot),
+                    // Ramo ISOLATO: mai background (l'apply serializzato esige
+                    // sub-run terminati).
+                    false,
                 )
                 .await
             }
@@ -711,7 +754,9 @@ async fn run_batch_sequential(
     let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
     for wave in parsed.chunks(max_parallel) {
         let futs = wave.iter().map(|p| {
-            run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None)
+            // Degrado dell'isolamento a sequenziale: mai background (questo ramo e'
+            // raggiunto solo dal fallback dell'isolato, che esclude il background).
+            run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None, false)
         });
         let wave_res = futures::future::join_all(futs).await;
         results.extend(wave_res);
@@ -1159,6 +1204,7 @@ async fn run_single_subagent(
     context_blob: &str,
     expected_format: &str,
     isolation: Option<&IsolationSlot>,
+    is_background: bool,
 ) -> Value {
     let db = &*ctx.core.db;
     let project_id = ctx.core.project_id;
@@ -1248,6 +1294,7 @@ async fn run_single_subagent(
         context_blob,
         expected_format,
         depth: current_depth as i32,
+        is_background,
     };
     let subagent_run_id: Uuid = match insert_subagent_run(&proj_pool, &insert, isolation).await {
         Ok(id) => id,
@@ -1275,11 +1322,123 @@ async fn run_single_subagent(
     )
     .await;
 
+    // ── Input OWNED della parte "execute" (regola L: punto unico condiviso dai
+    //    due rami sync/background). Tutto e' `'static` (String/Uuid/Value/PgPool
+    //    clonabile): l'helper puo' essere `await`ato inline oppure spostato in un
+    //    task detached senza catturare riferimenti allo stack del chiamante. ─────
+    let exec = SubagentExecInputs {
+        ctx: ctx.clone(),
+        proj_pool,
+        subagent_run_id,
+        session_id,
+        anchor,
+        kind: kind.to_string(),
+        task: task.to_string(),
+        provider,
+        model,
+        system_text,
+        initial_msg,
+        tools_json,
+        current_depth,
+        timeout_s,
+        narration_enabled: settings.narration_enabled,
+        narration_heartbeat_s: settings.narration_heartbeat_s,
+        // Il ramo background NON supporta isolamento (vedi doc su tool_dispatch_*):
+        // qui `working_root` porta il worktree solo per il ramo sequenziale isolato.
+        working_root: isolation.map(|s| s.worktree_path.clone()),
+        isolated: isolation.is_some(),
+    };
+
+    if is_background {
+        // ── Dispatch ASINCRONO (Fase D fan-in): il padre non attende. L'insert +
+        //    ensure_child (guard sincroni, fail-fast) sono gia' avvenuti: l'id
+        //    esiste e la row e' `running`. L'ESECUZIONE (narrazione + run_native +
+        //    finalize) parte in un task DETACHED con input owned `'static` (nessun
+        //    riferimento allo stack del chiamante). Il padre si sospende e riprende
+        //    al fan-in leggendo la row (`nexus_subagent_poll` legge status/verdict).
+        //    Il Value ritornato porta il SEGNALE STRUTTURATO `background_dispatched`
+        //    (regola M) che il ToolDispatchNode legge per sospendere il motore. ────
+        let kind_out = exec.kind.clone();
+        tokio::spawn(async move {
+            let _ = execute_subagent_run(exec).await;
+        });
+        return json!({
+            "background_dispatched": true,
+            K_SUB_RUN_ID: subagent_run_id.to_string(),
+            "kind": kind_out,
+            "status": "running",
+        });
+    }
+
+    execute_subagent_run(exec).await
+}
+
+/// Input OWNED (`'static`) della parte "execute" di un sub-run: narrazione avvio ->
+/// grafo nativo -> finalize. Raggruppa i parametri gia' risolti da
+/// [`run_single_subagent`] cosi' l'helper puo' essere `await`ato inline (ramo
+/// sincrono) o spostato in un `tokio::spawn` (ramo background) senza catturare
+/// riferimenti allo stack del chiamante (Fase D fan-in). Tutti i campi sono owned
+/// e clonabili -> il task detached e' `'static`.
+struct SubagentExecInputs {
+    ctx: AgentToolContext,
+    proj_pool: sqlx::PgPool,
+    subagent_run_id: Uuid,
+    session_id: Uuid,
+    anchor: Uuid,
+    kind: String,
+    task: String,
+    provider: String,
+    model: String,
+    system_text: String,
+    initial_msg: String,
+    tools_json: Value,
+    current_depth: i64,
+    timeout_s: i64,
+    narration_enabled: bool,
+    narration_heartbeat_s: i64,
+    /// Root del sub-run (worktree isolato) o `None` (root condivisa / background).
+    working_root: Option<std::path::PathBuf>,
+    /// `true` = ramo isolato (payload narrazione avvio). Il background e' sempre
+    /// `false` (isolamento non supportato in background).
+    isolated: bool,
+}
+
+/// Parte "execute" di un sub-run (PUNTO UNICO, regola L): narrazione avvio ->
+/// esecuzione sul grafo nativo -> finalize. Riusata IDENTICA dal ramo sincrono
+/// (`await` inline) e dal ramo background (`tokio::spawn`). Prende input OWNED
+/// (`SubagentExecInputs`, `'static`) cosi' il task detached non cattura riferimenti
+/// allo stack del chiamante. Ritorna il `Value` tool_result del sub-run (summary /
+/// timeout / failure); nel ramo background il valore e' scartato (il fan-in legge
+/// la row DB), ma tutti gli effetti (mark_run, narrazione) avvengono comunque.
+async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
+    let SubagentExecInputs {
+        ctx,
+        proj_pool,
+        subagent_run_id,
+        session_id,
+        anchor,
+        kind,
+        task,
+        provider,
+        model,
+        system_text,
+        initial_msg,
+        tools_json,
+        current_depth,
+        timeout_s,
+        narration_enabled,
+        narration_heartbeat_s,
+        working_root,
+        isolated,
+    } = exec;
+
     // ── NARRAZIONE sul run PADRE (ADR 0037): avvio ────────────────────────────
-    // Il dispatch e' bloccante e puo' durare minuti: senza questi meta-step la
-    // chat resta muta e il run padre sembra bloccato mentre il figlio lavora.
+    // Il dispatch (sincrono) e' bloccante e puo' durare minuti: senza questi
+    // meta-step la chat resta muta e il run padre sembra bloccato mentre il figlio
+    // lavora. Nel ramo background la narrazione racconta il progresso del figlio
+    // sul run padre gia' sospeso (il fan-in arrivera' via poll).
     let narrator =
-        ParentNarrator::from_ctx(ctx, &proj_pool, settings.narration_enabled, &provider, &model);
+        ParentNarrator::from_ctx(&ctx, &proj_pool, narration_enabled, &provider, &model);
     if let Some(n) = &narrator {
         let task_head: String = task.trim().chars().take(160).collect();
         n.say(
@@ -1291,7 +1450,7 @@ async fn run_single_subagent(
                 "task": task_head,
                 "depth": current_depth,
                 K_TIMEOUT_S: timeout_s,
-                "isolated": isolation.is_some(),
+                "isolated": isolated,
             })),
             subagent_run_id,
         )
@@ -1303,7 +1462,7 @@ async fn run_single_subagent(
     // STESSA session_id del parent (eredita root/permessi/canali). Lo stato porta
     // parent_run_id + subagent_depth -> il grafo applica i guard di annidamento
     // (UnderstandingNode salta il fan-out explore se depth>=1).
-    let deps = build_native_deps_for_tool(ctx).await;
+    let deps = build_native_deps_for_tool(&ctx).await;
     // Canale SSE proprio del sub-run: NON instrada al frontend (l'output utente
     // resta quello del main, che riceve solo il summary). Il receiver alimenta
     // il PONTE narrazione verso il padre (prima era scartato: feature muta);
@@ -1314,8 +1473,8 @@ async fn run_single_subagent(
             n.clone(),
             sub_rx,
             subagent_run_id,
-            kind.to_string(),
-            settings.narration_heartbeat_s,
+            kind.clone(),
+            narration_heartbeat_s,
         )
     });
 
@@ -1344,12 +1503,12 @@ async fn run_single_subagent(
         step_tx: sub_tx,
         parent_run_id: Some(anchor),
         subagent_depth: Some(current_depth),
-        // FASE 2: override root del sub-run. `None` (ramo sequenziale/condiviso) ->
-        // scrive sulla root del progetto, comportamento invariato. `Some(worktree)`
-        // (ramo ISOLATO, valorizzato dal batch parallelo di
+        // FASE 2: override root del sub-run. `None` (ramo sequenziale/condiviso o
+        // background) -> scrive sulla root del progetto, comportamento invariato.
+        // `Some(worktree)` (ramo ISOLATO, valorizzato dal batch parallelo di
         // `tool_dispatch_subagents`) -> scrive nel worktree effimero, ctx isolato
         // (autocommit/reindex soppressi, PR3). L'apply serializzato e' del batch.
-        working_root: isolation.map(|s| s.worktree_path.clone()),
+        working_root,
     };
 
     // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).
@@ -1365,17 +1524,17 @@ async fn run_single_subagent(
             Ok(res) => res,
             Err(_) => {
                 stop_bridge(bridge).await;
-                return finalize_timeout(&proj_pool, narrator.as_deref(), subagent_run_id, kind, timeout_s).await;
+                return finalize_timeout(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, timeout_s).await;
             }
         };
     stop_bridge(bridge).await;
 
     match outcome {
         Ok(o) => {
-            finalize_success(&proj_pool, narrator.as_deref(), subagent_run_id, kind, current_depth, &o)
+            finalize_success(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, current_depth, &o)
                 .await
         }
-        Err(e) => finalize_failure(&proj_pool, narrator.as_deref(), subagent_run_id, kind, &e).await,
+        Err(e) => finalize_failure(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, &e).await,
     }
 }
 
@@ -1462,6 +1621,9 @@ struct NewSubagentRun<'a> {
     context_blob: &'a str,
     expected_format: &'a str,
     depth: i32,
+    /// Dispatch asincrono opt-in (Fase D fan-in): il padre NON attende il sub-run,
+    /// si sospende e riprende al fan-in. `false` = comportamento bloccante storico.
+    is_background: bool,
 }
 
 /// INSERT della riga sub-run, query UNICA per i due rami. Ramo ISOLATO
@@ -1480,7 +1642,7 @@ async fn insert_subagent_run(
            (id, parent_run_id, project_id, kind, task_description, context_blob, expected_format,
             status, is_background, depth, source, worktree_path, base_commit)
            VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7,
-                   'running', false, $8, 'db', $9, $10)
+                   'running', $9, $8, 'db', $10, $11)
            RETURNING id"#,
     )
     .bind(slot.map(|s| s.run_id))
@@ -1491,6 +1653,7 @@ async fn insert_subagent_run(
     .bind(row.context_blob)
     .bind(row.expected_format)
     .bind(row.depth)
+    .bind(row.is_background)
     .bind(slot.map(|s| s.worktree_path.to_string_lossy().to_string()))
     .bind(slot.map(|s| s.base_commit.as_str()))
     .fetch_one(pool)
@@ -1973,7 +2136,9 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     // del dispatch (guard + grafo nativo): semantica onesta, niente notifica brain.
     // Il resume gira SEMPRE sulla root condivisa (nessun isolamento fisico): la
     // ripresa di un singolo sub-run non e' un batch parallelo-che-scrive.
-    let res = run_single_subagent(ctx, &kind, &task, &context_blob, &expected, None).await;
+    // Il resume e' SINCRONO (bloccante): riprende un singolo sub-run e ne attende
+    // l'esito, non e' un dispatch background.
+    let res = run_single_subagent(ctx, &kind, &task, &context_blob, &expected, None, false).await;
     res.to_string()
 }
 
@@ -2257,6 +2422,7 @@ mod tests {
             context_blob: "",
             expected_format: "",
             depth: 1,
+            is_background: false,
         };
 
         // Ramo sequenziale: id dal DB (non nil), colonne worktree NULL.

@@ -125,6 +125,15 @@ const RUN_NOTES_TOOL_NAME: &str = "nexus_run_notes";
 /// propagato oltre il confine sub-run via `structured_verdict` (regola M).
 const REVIEW_VERDICT_TOOL_NAME: &str = "review_verdict";
 
+/// Tool di dispatch sub-agente (singolo/batch). Il loro tool_result puo' portare
+/// il SEGNALE STRUTTURATO `background_dispatched: true` (Fase D fan-in): il padre
+/// NON attende l'esito, si sospende e riprende al fan-in dei sub-run background.
+const DISPATCH_SUBAGENT_TOOLS: &[&str] = &["dispatch_subagent", "dispatch_subagents"];
+
+/// Chiave del segnale strutturato (regola M) emesso da `dispatch_subagent(s)` in
+/// modalita' background: `true` -> il padre si sospende in attesa del fan-in.
+const BACKGROUND_DISPATCHED_KEY: &str = "background_dispatched";
+
 /// Tool di lettura allegato soggetti al budget cumulativo della sessione
 /// (`_ATTACHMENT_READ_TOOLS`, helpers.py:3647).
 const ATTACHMENT_READ_TOOLS: &[&str] = &["nexus_read_attachment", "nexus_read_archive_entry"];
@@ -432,6 +441,17 @@ impl ToolDispatchNode {
                 if outcome.is_infrastructure {
                     *collector.infra_error.lock().expect("lock infra") = true;
                 }
+                // Fase D fan-in (regola M): un `dispatch_subagent(s)` in modalita'
+                // background risponde subito col segnale strutturato
+                // `background_dispatched` (mai prosa). Raccolto nel collector come
+                // gli esiti brain-only; a WAVE 3 diventa `awaiting_subagents` nel
+                // delta -> il motore sospende il padre fino al fan-in.
+                if DISPATCH_SUBAGENT_TOOLS.contains(&name)
+                    && !outcome.is_error
+                    && content_signals_background(&outcome.content)
+                {
+                    *collector.awaiting_subagents.lock().expect("lock awaiting") = true;
+                }
                 // Il content del tool e' gia' JSON (stringa o struttura). Il
                 // troncamento `tool_result_max_chars` + offload e' applicato A
                 // VALLE su content stringa (parita' con _smart_truncate_lossless
@@ -477,6 +497,10 @@ struct RunCollector {
     run_notes: std::sync::Mutex<Option<String>>,
     /// `true` se almeno un tool e' fallito per infrastruttura (WAVE 2.2).
     infra_error: std::sync::Mutex<bool>,
+    /// `true` se almeno un `dispatch_subagent(s)` ha risposto col segnale
+    /// strutturato `background_dispatched` (Fase D fan-in): il padre si sospende
+    /// (`awaiting_subagents`) e il motore lo interrompe fino al fan-in.
+    awaiting_subagents: std::sync::Mutex<bool>,
 }
 
 #[async_trait]
@@ -673,6 +697,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
         let review_verdicts = collector.review_verdicts.into_inner().expect("review verdicts");
         let task_complete_ids = collector.task_complete_ids.into_inner().expect("tc ids");
         let infra_error = collector.infra_error.into_inner().expect("infra");
+        let awaiting_subagents = collector.awaiting_subagents.into_inner().expect("awaiting");
         let final_run_notes = collector.run_notes.into_inner().expect("run_notes");
 
         let mut declared_outcomes = declared_outcomes;
@@ -926,6 +951,13 @@ dell'utente.";
         if infra_error {
             delta.tool_infra_error = Some(Some(true));
         }
+        // Fase D fan-in: almeno un `dispatch_subagent(s)` background ha risposto col
+        // segnale strutturato -> il padre si sospende. Il motore interrompe su
+        // `is_awaiting_interrupt` (Slice 1) e riprende al fan-in (Slice 3). Scritto
+        // solo quando true (nessun azzeramento qui: il resume lo gestisce Slice 3).
+        if awaiting_subagents {
+            delta.awaiting_subagents = Some(Some(true));
+        }
         // Guard blocked-da-cap: marca il flag (la 2a dichiarazione sara' onorata).
         if blocked_cap_rejected_now {
             delta.blocked_cap_rejected = Some(Some(true));
@@ -1163,6 +1195,24 @@ fn value_as_json_string(v: &Value) -> String {
     }
 }
 
+/// `true` se il content di un tool_result di `dispatch_subagent(s)` porta il
+/// SEGNALE STRUTTURATO `background_dispatched: true` (regola M: campo booleano,
+/// MAI parsing di prosa). Il content di questi tool arriva dal `ToolExecutor` come
+/// stringa JSON (il tool ritorna `String`): si parsa la stringa in `Value` e si
+/// legge il campo. Se il content e' gia' un oggetto (forma strutturata) lo si
+/// legge diretto. Qualunque forma inattesa (parse fallito, campo assente) -> false
+/// (fail-safe: nessuna sospensione -> comportamento bloccante storico).
+fn content_signals_background(content: &Value) -> bool {
+    let field = match content {
+        Value::Object(_) => content.get(BACKGROUND_DISPATCHED_KEY).cloned(),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|v| v.get(BACKGROUND_DISPATCHED_KEY).cloned()),
+        _ => None,
+    };
+    field.and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 /// Serializza un `Value` come `json.dumps(v, ensure_ascii=False)` di Python
 /// (PUNTO UNICO [`py_json_dumps`], regola L): separatori `", "`/`": "` con
 /// SPAZIO, ordine d'inserimento. I content dei tool_result brain-only
@@ -1197,6 +1247,47 @@ mod tests {
         let mut s = base;
         s.merge(delta);
         s
+    }
+
+    /// Fase D fan-in (regola M): `content_signals_background` legge il segnale
+    /// STRUTTURATO `background_dispatched` da entrambe le forme di content
+    /// (stringa JSON come la produce il tool, oggetto JSON), MAI dalla prosa.
+    /// Forme inattese / assenza / `false` -> `false` (fail-safe: nessuna
+    /// sospensione, comportamento bloccante storico).
+    #[test]
+    fn content_signals_background_da_segnale_strutturato() {
+        // Forma reale: il tool ritorna una String JSON.
+        let as_string = Value::String(
+            json!({"background_dispatched": true, "subagent_run_id": "abc", "kind": "coder"})
+                .to_string(),
+        );
+        assert!(content_signals_background(&as_string));
+
+        // Forma oggetto (content gia' strutturato).
+        let as_object = json!({"background_dispatched": true, "kind": "review"});
+        assert!(content_signals_background(&as_object));
+
+        // Batch: segnale presente accanto agli altri campi.
+        let batch = Value::String(
+            json!({"count": 2, "background_dispatched": true, "child_run_ids": ["a", "b"]})
+                .to_string(),
+        );
+        assert!(content_signals_background(&batch));
+
+        // Assenza del campo -> false (dispatch sincrono classico).
+        let sync_result = Value::String(json!({"subagent_run_id": "x", "status": "completed"}).to_string());
+        assert!(!content_signals_background(&sync_result));
+
+        // Segnale esplicitamente false -> false.
+        let explicit_false = json!({"background_dispatched": false});
+        assert!(!content_signals_background(&explicit_false));
+
+        // Stringa non-JSON (prosa) -> false, MAI matching di testo.
+        let prose = Value::String("dispatch background completato con successo".into());
+        assert!(!content_signals_background(&prose));
+
+        // Forma inattesa (numero) -> false.
+        assert!(!content_signals_background(&json!(42)));
     }
 
     /// Esecutore di tool a coda per il dispatch: mappa per nome del tool a un
