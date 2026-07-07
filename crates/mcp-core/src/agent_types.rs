@@ -122,7 +122,7 @@ pub enum AgentRunStatus {
     /// deterministico, Fase D). Gemello di `AwaitingConfirmation` (run SOSPESO,
     /// non-terminale, resumibile), ma il resume e' innescato dal completamento
     /// dell'ULTIMO figlio background (via `subagent_fanin_resume_queue`, mig
-    /// 0541), non da un'azione utente. Distinto da `AwaitingConfirmation` cosi'
+    /// 0542), non da un'azione utente. Distinto da `AwaitingConfirmation` cosi'
     /// il worker fan-in seleziona SOLO i propri run (CAS su questo status).
     AwaitingSubagents,
     Failed,

@@ -28,13 +28,23 @@
 //!
 //! ## Anti-ricorsione (depth DB-driven)
 //!
-//! Il proto del ToolRunner porta solo `session_id`, non il `run_id` corrente: il
-//! `AgentToolContext` non sa se il run che invoca il tool e' gia' un sub-run. La
-//! profondita' corrente e' percio' derivata dalla CATENA in `nexus_subagent_runs`:
-//! il depth del nuovo sub-run e' `1 + max(depth)` tra i sub-run con stesso
-//! `parent_anchor` ancora `running`. Cosi' un sub-agente che chiama un altro
-//! sub-agente incrementa il depth e, al raggiungimento di `max_depth`, il dispatch
-//! viene rifiutato: niente loop infinito di sub-agenti che si chiamano.
+//! La catena di sub-run e' ancorata a `parent_anchor` = `parent_run_id.or(session_
+//! id)` (raggruppamento per famiglia). La profondita' corrente e' derivata dalla
+//! CATENA in `nexus_subagent_runs`: il depth del nuovo sub-run e' `1 + max(depth)`
+//! tra i sub-run con stesso `parent_anchor` ancora `running`. Cosi' un sub-agente
+//! che chiama un altro sub-agente incrementa il depth e, al raggiungimento di
+//! `max_depth`, il dispatch viene rifiutato: niente loop infinito.
+//!
+//! ## Fan-in background: il run CORRENTE, non l'anchor
+//!
+//! Il path Real del grafo (`ToolRunnerExecutorAdapter::execute_real`) valorizza
+//! `ctx.core.run_id` col run CORRENTE che invoca il tool (dalla narrazione del run
+//! invocante). Per il fan-in background e' QUESTO il run che il motore sospende
+//! (`awaiting_subagents`) e che il worker deve riprendere: l'enqueue usa
+//! [`fanin_target_run_id`] (= `ctx.core.run_id`), NON `parent_anchor` (che punta
+//! alla sessione per i sub-run di primo livello). Sono concern distinti: l'anchor
+//! raggruppa la famiglia (depth/cost/COUNT figli), il run corrente e' il target del
+//! resume.
 
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -226,14 +236,28 @@ fn build_tools_json(whitelist: &[String]) -> Value {
 }
 
 /// Ancora del parent per la catena di sub-run: il run genitore se noto, altrimenti
-/// la sessione (il ctx del tool NON porta il run_id corrente; per i sub-run di
-/// primo livello l'ancora e' la sessione, come nel codice originale). `Uuid::nil`
-/// solo se manca anche la sessione (caso degenere).
+/// la sessione (usata per depth-chain / cost-cap / ensure_child, valori raggruppati
+/// per famiglia di sub-run). `Uuid::nil` solo se manca anche la sessione (caso
+/// degenere). NON e' il target del fan-in: quello e' il run CORRENTE (vedi
+/// [`fanin_target_run_id`]).
 fn parent_anchor(ctx: &AgentToolContext) -> Uuid {
     ctx.core
         .parent_run_id
         .or(ctx.core.session_id)
         .unwrap_or_else(Uuid::nil)
+}
+
+/// PUNTO UNICO (regola L) del run da RIPRENDERE nel fan-in background: il run
+/// CORRENTE che ha invocato `dispatch_subagents` (`ctx.core.run_id`), cioe' l'id
+/// che il motore marca `awaiting_subagents` e che il worker fan-in cerca con il
+/// CAS `agent_runs.id = parent_run_id`. Diverso da [`parent_anchor`] (che e'
+/// `parent_run_id.or(session_id)`, usato per la catena depth/cost): accodare
+/// l'anchor romperebbe il CAS (il run sospeso e' il chiamante, non l'anchor).
+/// `None` fuori dal grafo Real (dove il background non e' comunque attivo): in tal
+/// caso ricade su `anchor` per non regredire (best-effort) — ma nel flusso reale
+/// il grafo Real valorizza sempre `run_id`.
+fn fanin_target_run_id(ctx: &AgentToolContext, anchor: Uuid) -> Uuid {
+    ctx.core.run_id.unwrap_or(anchor)
 }
 
 /// Profondita' corrente DERIVATA dalla catena `nexus_subagent_runs` (anti-ricorsione,
@@ -397,17 +421,28 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     // ── Ramo sequenziale/condiviso (invariato con background=false) ────────────
     // Esecuzione a ondate concorrenti (cap conservativo). I guard per-sub
     // (enabled/whitelist/depth/cost) sono valutati per ogni sub-run; nel batch
-    // il cost cap e' best-effort (race tollerata dato il cap conservativo). Con
-    // `background=true` ogni figlio ritorna subito `background_dispatched` e
-    // l'esecuzione prosegue in task detached (fan-in via poll DB).
-    let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
-    for wave in parsed.chunks(max_parallel) {
-        let futs = wave.iter().map(|p| {
-            run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None, background)
-        });
-        let wave_res = futures::future::join_all(futs).await;
-        results.extend(wave_res);
-    }
+    // il cost cap e' best-effort (race tollerata dato il cap conservativo).
+    let results: Vec<Value> = if background {
+        // BACKGROUND: PREPARE-ALL poi SPAWN-ALL (bug fan-in prematuro). Se
+        // preparassimo+spawnassimo una alla volta, il 1o figlio potrebbe terminare
+        // (task detached) mentre gli altri non sono ancora in nexus_subagent_runs
+        // -> la COUNT del fan-in vedrebbe 0 rimasti -> enqueue PREMATURO del parent.
+        // Inserendo TUTTE le row (running, is_background=true) PRIMA di spawnare
+        // qualunque esecuzione, la COUNT e' corretta gia' quando il 1o figlio
+        // chiude. I guard falliti producono un Value di errore (nessuna row
+        // inserita, nessuno spawn per quel task).
+        run_batch_background(ctx, &parsed).await
+    } else {
+        let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
+        for wave in parsed.chunks(max_parallel) {
+            let futs = wave.iter().map(|p| {
+                run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None, false)
+            });
+            let wave_res = futures::future::join_all(futs).await;
+            results.extend(wave_res);
+        }
+        results
+    };
 
     // Fan-in (regola M): raccogli i figli che hanno risposto col SEGNALE
     // STRUTTURATO `background_dispatched` (mai parsing di prosa) + i loro run_id,
@@ -741,6 +776,41 @@ async fn run_batch_isolated(
         "results": results,
     })
     .to_string()
+}
+
+/// Ramo BATCH BACKGROUND (Fase D fan-in): PREPARE-ALL poi SPAWN-ALL. Insersce
+/// TUTTE le row `nexus_subagent_runs` (running, is_background=true) PRIMA di
+/// spawnare qualunque esecuzione, cosi' la COUNT del fan-in (`fanin_enqueue_if_
+/// last`) e' corretta anche se il 1o figlio termina prestissimo (bug enqueue
+/// prematuro). Ordine dei risultati = ordine dei task. I task il cui prepare
+/// fallisce (guard non superato / INSERT fallito) non generano row ne' spawn: il
+/// loro Value di errore entra tra i risultati e NON conta nel fan-in.
+///
+/// PARALLELISMO: nel background non c'e' `max_parallel` da rispettare qui — il
+/// prepare e' sequenziale (guard depth/cost coerenti, catena `running`), poi
+/// OGNI figlio gira nel proprio task detached (il concorrere e' del runtime, non
+/// di questo loop). Il padre e' sospeso comunque finche' l'ultimo non chiude.
+async fn run_batch_background(ctx: &AgentToolContext, parsed: &[ParsedTask]) -> Vec<Value> {
+    // (1) PREPARE-ALL: guard + INSERT + ensure_child, SEQUENZIALE. Ogni Ok porta un
+    //     SubagentExecInputs (row gia' inserita, `running`); ogni Err un Value di
+    //     errore da restituire in ordine. Nessuno spawn ancora.
+    let mut prepared: Vec<Result<SubagentExecInputs, Value>> = Vec::with_capacity(parsed.len());
+    for p in parsed {
+        prepared.push(
+            prepare_subagent_run(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None, true)
+                .await,
+        );
+    }
+    // (2) SPAWN-ALL: solo ORA che TUTTE le row sono inserite, spawna le esecuzioni.
+    //     Il 1o figlio che chiude vede in nexus_subagent_runs anche gli altri
+    //     (ancora `running`) -> COUNT>0 -> nessun enqueue prematuro.
+    prepared
+        .into_iter()
+        .map(|r| match r {
+            Ok(exec) => spawn_background_subagent(exec),
+            Err(err) => err,
+        })
+        .collect()
 }
 
 /// Ramo sequenziale/condiviso estratto per il degrado dall'isolamento (stessa
@@ -1206,11 +1276,65 @@ async fn run_single_subagent(
     isolation: Option<&IsolationSlot>,
     is_background: bool,
 ) -> Value {
+    // FASE PREPARE (guard + INSERT + ensure_child, tutto SINCRONO fail-fast): il
+    // punto unico condiviso dal ramo singolo e dal batch background (regola L).
+    let exec = match prepare_subagent_run(
+        ctx,
+        kind,
+        task,
+        context_blob,
+        expected_format,
+        isolation,
+        is_background,
+    )
+    .await
+    {
+        Ok(exec) => exec,
+        Err(err) => return err,
+    };
+
+    if is_background {
+        // ── Dispatch ASINCRONO (Fase D fan-in): il padre non attende. Il prepare
+        //    (insert + ensure_child) e' gia' avvenuto: l'id esiste e la row e'
+        //    `running`. L'ESECUZIONE parte in un task DETACHED (input owned
+        //    `'static`). Il Value ritornato porta il SEGNALE STRUTTURATO
+        //    `background_dispatched` (regola M) che il ToolDispatchNode legge per
+        //    sospendere il motore. ─────────────────────────────────────────────
+        return spawn_background_subagent(exec);
+    }
+
+    execute_subagent_run(exec).await
+}
+
+/// FASE PREPARE di un sub-run (PUNTO UNICO, regola L): guard settings/whitelist/
+/// depth/cost + INSERT `nexus_subagent_runs` (status='running') + `ensure_child_
+/// agent_run`. Tutto SINCRONO e fail-fast: al ritorno `Ok` la row esiste ed e'
+/// `running`, cosi' la catena depth/cost e il fan-in COUNT la vedono. Ritorna
+/// `Err(Value)` con l'errore da restituire al chiamante (guard non superato /
+/// INSERT fallito).
+///
+/// PERCHE' e' separata dallo spawn (bug fan-in prematuro nel batch background): il
+/// batch DEVE inserire TUTTE le row PRIMA di spawnare qualunque esecuzione. Se
+/// inserisse+spawnasse una alla volta, il 1o figlio potrebbe terminare (task
+/// detached) mentre gli altri non sono ancora in `nexus_subagent_runs` -> la COUNT
+/// del fan-in vedrebbe 0 rimasti -> enqueue PREMATURO del parent (riesumato senza
+/// i risultati degli altri figli). Inserendo tutte le row prima, la COUNT e'
+/// corretta appena il 1o figlio chiude.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_subagent_run(
+    ctx: &AgentToolContext,
+    kind: &str,
+    task: &str,
+    context_blob: &str,
+    expected_format: &str,
+    isolation: Option<&IsolationSlot>,
+    is_background: bool,
+) -> Result<SubagentExecInputs, Value> {
     let db = &*ctx.core.db;
     let project_id = ctx.core.project_id;
     let session_id = match ctx.core.session_id {
         Some(s) => s,
-        None => return json!({"error": "sub-agent richiede una sessione chat (session_id assente)"}),
+        None => return Err(json!({"error": "sub-agent richiede una sessione chat (session_id assente)"})),
     };
     // Routing separazione DB: nexus_subagent_runs e' tabella migrata, vive nel DB
     // del progetto. Risolvo una volta il pool per_progetto e lo riuso per la catena
@@ -1220,47 +1344,47 @@ async fn run_single_subagent(
     // ── Guard 1: settings (enabled / whitelist / depth / cost) ────────────────
     let settings = match read_subagent_settings(ctx).await {
         Ok(v) => v,
-        Err(e) => return json!({"error": format!("lettura settings fallita: {e}")}),
+        Err(e) => return Err(json!({"error": format!("lettura settings fallita: {e}")})),
     };
     if !settings.enabled {
-        return json!({"error": "sub-agents disabilitati (orchestrator.subagents_enabled=false)"});
+        return Err(json!({"error": "sub-agents disabilitati (orchestrator.subagents_enabled=false)"}));
     }
     if !settings.whitelist.iter().any(|w| w == kind) {
-        return json!({"error": format!("kind '{kind}' non in whitelist: {:?}", settings.whitelist)});
+        return Err(json!({"error": format!("kind '{kind}' non in whitelist: {:?}", settings.whitelist)}));
     }
 
     // ── Guard 2: definition del kind ──────────────────────────────────────────
     let definition = match fetch_definition(ctx, kind).await {
         Ok(Some(d)) => d,
         Ok(None) => {
-            return json!({"error": format!("kind '{kind}' non trovato in nexus_subagent_definitions")})
+            return Err(json!({"error": format!("kind '{kind}' non trovato in nexus_subagent_definitions")}))
         }
-        Err(e) => return json!({"error": e}),
+        Err(e) => return Err(json!({"error": e})),
     };
 
     // ── Guard 3: anti-ricorsione (depth DB-driven dalla catena) ───────────────
     let anchor = parent_anchor(ctx);
     let current_depth = current_chain_depth(&proj_pool, anchor).await + 1;
     if current_depth > settings.max_depth {
-        return json!({"error": format!(
+        return Err(json!({"error": format!(
             "depth {current_depth} > max {}: annidamento sub-agent eccessivo (anti-ricorsione)",
             settings.max_depth
-        )});
+        )}));
     }
 
     // ── Guard 4: cost cap cumulativo per parent ───────────────────────────────
     let spent = cumulative_cost(&proj_pool, anchor).await;
     if spent >= settings.cost_cap_usd {
-        return json!({"error": format!(
+        return Err(json!({"error": format!(
             "cost cap raggiunto per parent={anchor} ({spent:.4} >= {:.4})",
             settings.cost_cap_usd
-        )});
+        )}));
     }
 
     // ── Risoluzione system_text + tools + modello worker (DB-driven) ──────────
     let system_text = resolve_system_text(ctx, &definition.prompt_key).await;
     if system_text.trim().is_empty() {
-        return json!({"error": format!("prompt '{}' non trovato o vuoto", definition.prompt_key)});
+        return Err(json!({"error": format!("prompt '{}' non trovato o vuoto", definition.prompt_key)}));
     }
     let tools_json = build_tools_json(&definition.tool_whitelist);
 
@@ -1298,7 +1422,7 @@ async fn run_single_subagent(
     };
     let subagent_run_id: Uuid = match insert_subagent_run(&proj_pool, &insert, isolation).await {
         Ok(id) => id,
-        Err(e) => return json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")}),
+        Err(e) => return Err(json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")})),
     };
 
     // ── Riga agent_runs del SUB-run (osservabilita', regola M) ────────────────
@@ -1326,7 +1450,7 @@ async fn run_single_subagent(
     //    due rami sync/background). Tutto e' `'static` (String/Uuid/Value/PgPool
     //    clonabile): l'helper puo' essere `await`ato inline oppure spostato in un
     //    task detached senza catturare riferimenti allo stack del chiamante. ─────
-    let exec = SubagentExecInputs {
+    Ok(SubagentExecInputs {
         ctx: ctx.clone(),
         proj_pool,
         subagent_run_id,
@@ -1350,31 +1474,31 @@ async fn run_single_subagent(
         // Fase D fan-in: il ramo background enqueue il parent al termine se e'
         // l'ultimo figlio background terminale (vedi execute_subagent_run).
         is_background,
-    };
-
-    if is_background {
-        // ── Dispatch ASINCRONO (Fase D fan-in): il padre non attende. L'insert +
-        //    ensure_child (guard sincroni, fail-fast) sono gia' avvenuti: l'id
-        //    esiste e la row e' `running`. L'ESECUZIONE (narrazione + run_native +
-        //    finalize) parte in un task DETACHED con input owned `'static` (nessun
-        //    riferimento allo stack del chiamante). Il padre si sospende e riprende
-        //    al fan-in leggendo la row (`nexus_subagent_poll` legge status/verdict).
-        //    Il Value ritornato porta il SEGNALE STRUTTURATO `background_dispatched`
-        //    (regola M) che il ToolDispatchNode legge per sospendere il motore. ────
-        let kind_out = exec.kind.clone();
-        tokio::spawn(async move {
-            let _ = execute_subagent_run(exec).await;
-        });
-        return json!({
-            "background_dispatched": true,
-            K_SUB_RUN_ID: subagent_run_id.to_string(),
-            "kind": kind_out,
-            "status": "running",
-        });
-    }
-
-    execute_subagent_run(exec).await
+        // Run da riprendere nel fan-in: il run CORRENTE (sospeso su
+        // awaiting_subagents), NON l'anchor depth-chain (bug: il CAS del worker
+        // cerca agent_runs.id = questo id).
+        fanin_parent_run_id: fanin_target_run_id(ctx, anchor),
+    })
 }
+
+/// Spawna l'esecuzione DETACHED di un sub-run gia' preparato (row inserita) e
+/// ritorna subito il SEGNALE STRUTTURATO `background_dispatched` (regola M). Punto
+/// unico (regola L) del ramo background, riusato dal singolo e dal batch: cosi' il
+/// batch puo' preparare TUTTE le row (COUNT fan-in corretta) e POI spawnare tutte.
+fn spawn_background_subagent(exec: SubagentExecInputs) -> Value {
+    let subagent_run_id = exec.subagent_run_id;
+    let kind_out = exec.kind.clone();
+    tokio::spawn(async move {
+        let _ = execute_subagent_run(exec).await;
+    });
+    json!({
+        "background_dispatched": true,
+        K_SUB_RUN_ID: subagent_run_id.to_string(),
+        "kind": kind_out,
+        "status": "running",
+    })
+}
+
 
 /// Input OWNED (`'static`) della parte "execute" di un sub-run: narrazione avvio ->
 /// grafo nativo -> finalize. Raggruppa i parametri gia' risolti da
@@ -1409,6 +1533,10 @@ struct SubagentExecInputs {
     /// coda META `subagent_fanin_resume_queue` (il worker fan-in lo riprende).
     /// `false` (sincrono/sequenziale) -> nessun enqueue (il padre non e' sospeso).
     is_background: bool,
+    /// Run da RIPRENDERE nel fan-in (= run CORRENTE che ha dispatchato, marcato
+    /// `awaiting_subagents`). PUNTO UNICO [`fanin_target_run_id`]: e' l'id che il
+    /// CAS del worker cerca in `agent_runs`, NON l'`anchor` (depth-chain).
+    fanin_parent_run_id: Uuid,
 }
 
 /// Parte "execute" di un sub-run (PUNTO UNICO, regola L): narrazione avvio ->
@@ -1439,6 +1567,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         working_root,
         isolated,
         is_background,
+        fanin_parent_run_id,
     } = exec;
 
     // ── NARRAZIONE sul run PADRE (ADR 0037): avvio ────────────────────────────
@@ -1538,7 +1667,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
                 // un parent con l'ultimo figlio andato in timeout resterebbe
                 // sospeso per sempre). Non esce con return diretto.
                 let out = finalize_timeout(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, timeout_s).await;
-                maybe_enqueue_fanin_resume(&ctx, &proj_pool, anchor, session_id, is_background).await;
+                maybe_enqueue_fanin_resume(&ctx, &proj_pool, anchor, fanin_parent_run_id, session_id, is_background).await;
                 return out;
             }
         };
@@ -1554,7 +1683,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // Fan-in (Fase D): il figlio si e' marcato TERMINALE nel finalize sopra. Se e'
     // il ramo background e nessun altro figlio background del parent e' ancora
     // attivo, accoda il parent nella coda META (il worker fan-in lo riprende).
-    maybe_enqueue_fanin_resume(&ctx, &proj_pool, anchor, session_id, is_background).await;
+    maybe_enqueue_fanin_resume(&ctx, &proj_pool, anchor, fanin_parent_run_id, session_id, is_background).await;
     out
 }
 
@@ -1576,6 +1705,7 @@ async fn maybe_enqueue_fanin_resume(
     ctx: &AgentToolContext,
     proj_pool: &sqlx::PgPool,
     anchor: Uuid,
+    resume_run_id: Uuid,
     session_id: Uuid,
     is_background: bool,
 ) {
@@ -1583,11 +1713,14 @@ async fn maybe_enqueue_fanin_resume(
         return;
     }
     // Deriva project_id e coda META dal ctx; la meccanica DB (COUNT + INSERT) e'
-    // nel punto unico testabile `fanin_enqueue_if_last`.
+    // nel punto unico testabile `fanin_enqueue_if_last`. `anchor` conta i figli
+    // (parent_run_id in nexus_subagent_runs); `resume_run_id` e' il run CORRENTE
+    // da accodare (quello che il CAS del worker riprende).
     if let Err(e) = fanin_enqueue_if_last(
         &ctx.core.db,
         proj_pool,
         anchor,
+        resume_run_id,
         ctx.core.project_id,
         session_id,
     )
@@ -1595,7 +1728,8 @@ async fn maybe_enqueue_fanin_resume(
     {
         tracing::warn!(
             target: "mcp_core::subagent_native",
-            parent_run_id = %anchor,
+            parent_run_id = %resume_run_id,
+            anchor = %anchor,
             error = %e,
             "fan-in: enqueue del parent fallito (best-effort, il worker ritentera' al prossimo figlio)"
         );
@@ -1612,37 +1746,42 @@ async fn maybe_enqueue_fanin_resume(
 async fn fanin_enqueue_if_last(
     meta: &sqlx::PgPool,
     proj_pool: &sqlx::PgPool,
-    parent_run_id: Uuid,
+    anchor: Uuid,
+    resume_run_id: Uuid,
     project_id: Uuid,
     session_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     // "Tutti i figli background del parent terminali?" — segnale strutturato
     // (status lifecycle, regola M): 0 in stato non-terminale ('running'/'paused')
-    // = tutti hanno finito.
+    // = tutti hanno finito. La COUNT usa `anchor` (i figli hanno parent_run_id =
+    // anchor in nexus_subagent_runs).
     let remaining: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM nexus_subagent_runs \
          WHERE parent_run_id = $1 AND is_background = true \
            AND status IN ('running', 'paused')",
     )
-    .bind(parent_run_id)
+    .bind(anchor)
     .fetch_one(proj_pool)
     .await?;
     if remaining > 0 {
         return Ok(false); // altri background ancora attivi: aspetta l'ultimo
     }
-    // Ultimo background terminale: accoda il parent (idempotente via PK).
+    // Ultimo background terminale: accoda il RUN CORRENTE (idempotente via PK).
+    // `resume_run_id` (non `anchor`) e' l'id marcato `awaiting_subagents` che il
+    // CAS del worker cerca in agent_runs: e' quello da riprendere.
     let res = sqlx::query(
         "INSERT INTO subagent_fanin_resume_queue (parent_run_id, project_id, session_id) \
          VALUES ($1, $2, $3) ON CONFLICT (parent_run_id) DO NOTHING",
     )
-    .bind(parent_run_id)
+    .bind(resume_run_id)
     .bind(project_id)
     .bind(session_id)
     .execute(meta)
     .await?;
     tracing::info!(
         target: "mcp_core::subagent_native",
-        parent_run_id = %parent_run_id,
+        parent_run_id = %resume_run_id,
+        anchor = %anchor,
         inserted = res.rows_affected() > 0,
         "fan-in: ultimo sub-run background terminato, parent accodato alla coda di resume"
     );
@@ -2963,7 +3102,7 @@ mod tests {
         insert_child(&pool, parent, false, "completed").await;
 
         // Ancora uno running -> non accoda.
-        let enq = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
+        let enq = fanin_enqueue_if_last(&pool, &pool, parent, parent, project, session)
             .await
             .expect("enqueue query ok");
         assert!(!enq, "con un background ancora running non deve accodare");
@@ -2977,17 +3116,158 @@ mod tests {
             .expect("chiudi ultimo bg");
 
         // Ora tutti terminali -> accoda.
-        let enq2 = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
+        let enq2 = fanin_enqueue_if_last(&pool, &pool, parent, parent, project, session)
             .await
             .expect("enqueue query ok");
         assert!(enq2, "tutti i background terminali -> accoda");
         assert_eq!(queue_len(&pool, parent).await, 1);
 
         // Idempotente: un secondo enqueue non duplica (PK parent_run_id).
-        let enq3 = fanin_enqueue_if_last(&pool, &pool, parent, project, session)
+        let enq3 = fanin_enqueue_if_last(&pool, &pool, parent, parent, project, session)
             .await
             .expect("enqueue query ok");
         assert!(enq3, "ancora tutti terminali -> ritorna true");
         assert_eq!(queue_len(&pool, parent).await, 1, "nessun duplicato in coda");
+    }
+
+    /// BUG #1 (ALTA FATALE): l'enqueue deve accodare il RUN CORRENTE
+    /// (`resume_run_id`), NON l'`anchor` depth-chain. I figli sono registrati con
+    /// `parent_run_id = anchor` (COUNT su anchor), ma la coda deve puntare al run
+    /// sospeso su `awaiting_subagents`, che il CAS del worker cerca in `agent_runs.
+    /// id`. Se accodasse l'anchor (= session_id per i sub-run di primo livello) il
+    /// CAS non troverebbe mai il run -> padre appeso per sempre.
+    ///
+    /// Senza il fix `fanin_enqueue_if_last` accodava `parent_run_id` (unico id, =
+    /// anchor): questo test — con anchor != resume_run_id — fallirebbe perche' in
+    /// coda ci sarebbe l'anchor e il CAS sul run corrente non lo troverebbe.
+    #[sqlx::test]
+    async fn fanin_enqueue_usa_run_corrente_non_anchor(pool: sqlx::PgPool) {
+        create_fanin_tables(&pool).await;
+        // Tabella agent_runs minima per simulare il CAS del worker.
+        sqlx::query(
+            "CREATE TABLE agent_runs ( \
+                 id UUID PRIMARY KEY, \
+                 status TEXT NOT NULL )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create agent_runs");
+
+        // anchor (famiglia figli) e run corrente (sospeso) DISTINTI: e' il caso del
+        // run principale (anchor = session_id, run corrente = agent_runs.id).
+        let anchor = Uuid::new_v4();
+        let resume_run_id = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        let session = anchor; // per un run di primo livello l'anchor E' la sessione
+
+        // Il run corrente e' sospeso su awaiting_subagents (lo marca il finalize).
+        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'awaiting_subagents')")
+            .bind(resume_run_id)
+            .execute(&pool)
+            .await
+            .expect("insert run corrente");
+
+        // Un solo figlio background, gia' terminale: e' l'ultimo -> accoda.
+        insert_child(&pool, anchor, true, "completed").await;
+
+        let enq = fanin_enqueue_if_last(&pool, &pool, anchor, resume_run_id, project, session)
+            .await
+            .expect("enqueue query ok");
+        assert!(enq, "ultimo background terminale -> accoda");
+
+        // La coda deve contenere il RUN CORRENTE, non l'anchor.
+        let queued_resume: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subagent_fanin_resume_queue WHERE parent_run_id = $1",
+        )
+        .bind(resume_run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count resume");
+        assert_eq!(queued_resume, 1, "la coda deve puntare al run CORRENTE");
+        let queued_anchor: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subagent_fanin_resume_queue WHERE parent_run_id = $1",
+        )
+        .bind(anchor)
+        .fetch_one(&pool)
+        .await
+        .expect("count anchor");
+        assert_eq!(queued_anchor, 0, "la coda NON deve puntare all'anchor");
+
+        // Il CAS del worker (awaiting_subagents -> running su parent_run_id) trova
+        // il run corrente accodato: senza il fix cercherebbe l'anchor e mancherebbe.
+        let cas: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE agent_runs SET status = 'running' \
+             WHERE id = (SELECT parent_run_id FROM subagent_fanin_resume_queue LIMIT 1) \
+               AND status = 'awaiting_subagents' RETURNING id",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("cas ok");
+        assert_eq!(
+            cas,
+            Some(resume_run_id),
+            "il CAS deve trovare e vincere sul run corrente accodato"
+        );
+    }
+
+    /// BUG #4 (ALTA): nel batch background le row vanno INSERITE tutte PRIMA di
+    /// spawnare, altrimenti il 1o figlio che finisce vede COUNT=0 (gli altri non
+    /// ancora inseriti) e accoda il parent PREMATURAMENTE. Questo test riproduce la
+    /// meccanica al livello di `fanin_enqueue_if_last`: con un solo figlio inserito
+    /// (scenario insert-one-at-a-time) l'enqueue scatta (rischio); con TUTTE le row
+    /// inserite PRIMA (come fa `run_batch_background` prepare-all/spawn-all) il 1o
+    /// che termina NON accoda (ne restano 2).
+    #[sqlx::test]
+    async fn fanin_batch_background_no_enqueue_prematuro(pool: sqlx::PgPool) {
+        create_fanin_tables(&pool).await;
+        let anchor = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4();
+
+        // SCENARIO BUGGY (insert-one-at-a-time): solo il 1o figlio e' inserito, poi
+        // "termina". Con COUNT sui soli inseriti, remaining=0 -> enqueue prematuro.
+        insert_child(&pool, anchor, true, "completed").await;
+        let premature = fanin_enqueue_if_last(&pool, &pool, anchor, anchor, project, session)
+            .await
+            .expect("enqueue query ok");
+        assert!(
+            premature,
+            "con un solo figlio inserito la COUNT dice 0 rimasti (mostra il rischio)"
+        );
+
+        // Ripulisco e ricreo lo SCENARIO FIXATO (prepare-all): TUTTI e 3 i figli
+        // inseriti PRIMA che il 1o termini.
+        sqlx::query("DELETE FROM subagent_fanin_resume_queue")
+            .execute(&pool)
+            .await
+            .expect("clear queue");
+        sqlx::query("DELETE FROM nexus_subagent_runs")
+            .execute(&pool)
+            .await
+            .expect("clear children");
+        insert_child(&pool, anchor, true, "running").await;
+        insert_child(&pool, anchor, true, "running").await;
+        insert_child(&pool, anchor, true, "running").await;
+        // Il 1o figlio finisce (finalize -> mark_run terminale).
+        sqlx::query(
+            "UPDATE nexus_subagent_runs SET status = 'completed' WHERE ctid IN \
+             (SELECT ctid FROM nexus_subagent_runs WHERE parent_run_id = $1 AND status = 'running' LIMIT 1)",
+        )
+        .bind(anchor)
+        .execute(&pool)
+        .await
+        .expect("chiudi 1o figlio");
+        let after_first = fanin_enqueue_if_last(&pool, &pool, anchor, anchor, project, session)
+            .await
+            .expect("enqueue query ok");
+        assert!(
+            !after_first,
+            "con tutte le row gia' inserite, il 1o figlio che chiude NON accoda (ne restano 2)"
+        );
+        assert_eq!(
+            queue_len(&pool, anchor).await,
+            0,
+            "nessun enqueue prematuro col fix prepare-all"
+        );
     }
 }

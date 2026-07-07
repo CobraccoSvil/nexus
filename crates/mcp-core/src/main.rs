@@ -1157,7 +1157,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Worker `fanin_worker` (Fase D Slice 3): TRIGGER che RIPRENDE il run padre
     // sospeso su `awaiting_subagents` quando i sub-run background completano.
-    // Drena la coda durevole META `subagent_fanin_resume_queue` (mig 0541) con un
+    // Drena la coda durevole META `subagent_fanin_resume_queue` (mig 0542) con un
     // CAS `awaiting_subagents -> running` (race-free, restart-safe, idempotente).
     // Config DB-driven (orchestrator.background_fanin_enabled, default ON ma
     // INERTE finche' un padre non dispatcha figli background).
