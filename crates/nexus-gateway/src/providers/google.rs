@@ -563,6 +563,7 @@ impl GoogleProvider {
                     .query(&[("key", self.api_key.as_str())])
             },
             "gemini",
+            GEMINI_MODELS_PAGE_SIZE,
         )
         .await
     }
@@ -596,20 +597,25 @@ impl GoogleProvider {
     /// Loop di paginazione condiviso dai listing modelli Google (punto unico,
     /// regola L: Gemini direct e Vertex differiscono solo per URL/auth della
     /// singola pagina, costruita da `build_page_req` SENZA i parametri di
-    /// paginazione, aggiunti qui). Segue `nextPageToken` accumulando le pagine
-    /// parsate dal parser puro; su pagina non-2xx propaga l'errore STRUTTURATO
-    /// (regola M) senza ritornare liste parziali: sarebbe il troncamento
-    /// silenzioso che la paginazione elimina. Guard anti-loop: al tetto
-    /// `GOOGLE_MODELS_MAX_PAGES` logga WARN (mai troncamento muto).
+    /// paginazione, aggiunti qui). La `pageSize` e' un PARAMETRO esplicito perche'
+    /// il tetto e' per-API (Gemini `models.list` max 1000, Vertex
+    /// `publishers.models.list` max 300): un valore condiviso >300 fa fallire
+    /// Vertex con 400 INVALID_ARGUMENT (regola L: punto unico parametrico, non
+    /// una costante valida "per un solo ramo"). Segue `nextPageToken` accumulando
+    /// le pagine parsate dal parser puro; su pagina non-2xx propaga l'errore
+    /// STRUTTURATO (regola M) senza ritornare liste parziali: sarebbe il
+    /// troncamento silenzioso che la paginazione elimina. Guard anti-loop: al
+    /// tetto `GOOGLE_MODELS_MAX_PAGES` logga WARN (mai troncamento muto).
     async fn fetch_google_models_pages(
         &self,
         build_page_req: impl Fn() -> reqwest::RequestBuilder,
         scope: &str,
+        page_size: &str,
     ) -> anyhow::Result<Vec<crate::provider::ModelMeta>> {
         let mut metas: Vec<crate::provider::ModelMeta> = Vec::new();
         let mut page_token: Option<String> = None;
         for page in 0..GOOGLE_MODELS_MAX_PAGES {
-            let mut req = build_page_req().query(&[("pageSize", GOOGLE_MODELS_PAGE_SIZE)]);
+            let mut req = build_page_req().query(&[("pageSize", page_size)]);
             if let Some(tok) = page_token.as_deref() {
                 req = req.query(&[("pageToken", tok)]);
             }
@@ -672,7 +678,11 @@ impl GoogleProvider {
             // Una pagina fallita fa fallire la region INTERA (warn+skip sotto):
             // una region parziale sarebbe un troncamento mascherato da successo.
             match self
-                .fetch_google_models_pages(|| self.http.get(&url).bearer_auth(&token), "vertex")
+                .fetch_google_models_pages(
+                    || self.http.get(&url).bearer_auth(&token),
+                    "vertex",
+                    VERTEX_MODELS_PAGE_SIZE,
+                )
                 .await
             {
                 Ok(metas) => {
@@ -681,13 +691,16 @@ impl GoogleProvider {
                     all.extend(metas.into_iter().map(|m| m.id));
                     ok_regions += 1;
                 }
-                // Log dei soli segnali strutturati (status+codice via downcast,
-                // regola M), mai il body (regola F).
+                // Log dei segnali strutturati: status + codice via downcast e il
+                // messaggio diagnostico strutturato (`error.message`, regola M)
+                // che dice QUALE argomento e' invalido; mai il body grezzo /
+                // payload utente (regola F).
                 Err(err) => match err.downcast_ref::<super::ProviderHttpError>() {
                     Some(he) => tracing::warn!(
                         region = %region,
                         status = he.status,
                         code = he.code.as_deref().unwrap_or(""),
+                        message = he.structured_message().as_deref().unwrap_or(""),
                         "vertex discovery: GET models non-2xx, salto la region"
                     ),
                     None => tracing::warn!(
@@ -1255,10 +1268,21 @@ fn build_discovery_locations(csv: &str, location: &str) -> Vec<String> {
     out
 }
 
-/// Dimensione pagina richiesta ai listing modelli Google (`pageSize`): massimo
-/// documentato dall'API Gemini `models.list`; oltre il massimo il server la
-/// riduce da se' (AIP-158). Senza il parametro il default e' 50.
-const GOOGLE_MODELS_PAGE_SIZE: &str = "1000";
+/// Dimensione pagina per la Gemini API `models.list` (`pageSize`): massimo
+/// documentato 1000; oltre il massimo il server la riduce da se' (AIP-158).
+/// Senza il parametro il default e' 50 (troncamento silenzioso sopra i 50
+/// modelli).
+const GEMINI_MODELS_PAGE_SIZE: &str = "1000";
+
+/// Dimensione pagina per Vertex `publishers.models.list` (`pageSize`): il tetto
+/// e' 300 e Vertex e' STRETTO — un valore superiore viene RIFIUTATO con 400
+/// INVALID_ARGUMENT ("Field: page_size; Message: Page size should be
+/// non-negative and the maximum size is 300", verificato live 2026-07-07),
+/// diversamente dalla Gemini API (max 1000) che invece lo clampa. Costante
+/// distinta perche' il tetto e' per-API: condividere `1000` faceva fallire OGNI
+/// region del discovery Vertex (regola H: il tetto vero, non un valore valido
+/// "per un solo ramo").
+const VERTEX_MODELS_PAGE_SIZE: &str = "300";
 
 /// Tetto di sicurezza sulle pagine seguite per singolo listing: previene il
 /// loop infinito se il server ripetesse lo stesso `nextPageToken`. 20 pagine
@@ -3960,6 +3984,31 @@ mod tests {
     }
 
     // --- Discovery + fallback di region Vertex (mig 0476) ------------------
+
+    #[test]
+    fn page_size_vertex_entro_il_tetto_di_300() {
+        // Vertex publishers.models.list RIFIUTA con 400 INVALID_ARGUMENT una
+        // pageSize > 300 (verificato live 2026-07-07: "Page size should be
+        // non-negative and the maximum size is 300"). Sentinella di regressione:
+        // se qualcuno ri-condivide la costante Gemini (1000) o alza il tetto, il
+        // discovery Vertex torna a fallire su ogni region -> questo test lo blocca.
+        let vertex: u32 = VERTEX_MODELS_PAGE_SIZE
+            .parse()
+            .expect("pageSize Vertex numerica");
+        assert!(
+            (1..=300).contains(&vertex),
+            "pageSize Vertex fuori dal tetto [1,300]: {vertex}"
+        );
+        // La Gemini API tollera fino a 1000 (oltre, clampa): la costante non deve
+        // superare quel massimo documentato.
+        let gemini: u32 = GEMINI_MODELS_PAGE_SIZE
+            .parse()
+            .expect("pageSize Gemini numerica");
+        assert!(
+            (1..=1000).contains(&gemini),
+            "pageSize Gemini fuori da [1,1000]: {gemini}"
+        );
+    }
 
     #[test]
     fn discovery_locations_da_csv_ordinato_e_dedup() {
