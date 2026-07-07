@@ -524,6 +524,12 @@ pub struct AgentState {
     /// SOSPENDE lo stesso run con `Interrupted`). Distinto da `pending_clarify`,
     /// che e' uno stato TERMINALE gestito dalla topologia (edge a `End`).
     pub awaiting_confirmation: Option<bool>,
+    /// `true` quando lo stato attende il completamento dei sub-run BACKGROUND
+    /// dispatchati (fan-in deterministico, Fase D). Secondo motivo di
+    /// interrupt-resume gemello di `awaiting_confirmation`: il motore sospende lo
+    /// STESSO run; il resume (innescato dal completamento dell'ultimo figlio, non
+    /// da un'azione utente) azzera questo flag e inietta i `subagent_results`.
+    pub awaiting_subagents: Option<bool>,
 
     // ── Schema aperto ───────────────────────────────────────────────────────────
     /// Campi runtime non promossi a campi nativi (`iteration_budget`,
@@ -538,6 +544,12 @@ impl AgentState {
     /// `true` se lo stato richiede una conferma umana prima di proseguire.
     pub fn is_awaiting_confirmation(&self) -> bool {
         self.awaiting_confirmation.unwrap_or(false)
+    }
+
+    /// `true` se lo stato attende il completamento dei sub-run background
+    /// (fan-in deterministico, Fase D).
+    pub fn is_awaiting_subagents(&self) -> bool {
+        self.awaiting_subagents.unwrap_or(false)
     }
 
     /// `true` se lo stato attende un chiarimento dall'utente (disambiguazione).
@@ -575,8 +587,11 @@ impl nexus_graph::GraphState for AgentState {
         }
     }
 
-    fn is_awaiting_confirmation(&self) -> bool {
-        AgentState::is_awaiting_confirmation(self)
+    fn is_awaiting_interrupt(&self) -> bool {
+        // PUNTO UNICO (regola L): il motore sospende su QUALSIASI motivo di
+        // interrupt-resume. Oggi due: conferma umana (HITL) e attesa dei sub-run
+        // background (fan-in, Fase D). Il resume azzera il flag specifico.
+        AgentState::is_awaiting_confirmation(self) || AgentState::is_awaiting_subagents(self)
     }
 }
 
@@ -584,6 +599,36 @@ impl nexus_graph::GraphState for AgentState {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Fase D: il predicato di interrupt del motore (`is_awaiting_interrupt`,
+    /// PUNTO UNICO) compone conferma umana (HITL) E attesa dei sub-run background.
+    /// `Some(false)` (azzeramento esplicito del resume) NON sospende.
+    #[test]
+    fn is_awaiting_interrupt_compone_conferma_e_subagents() {
+        use nexus_graph::GraphState;
+        assert!(
+            !GraphState::is_awaiting_interrupt(&AgentState::default()),
+            "nessun flag -> nessun interrupt"
+        );
+        assert!(GraphState::is_awaiting_interrupt(&AgentState {
+            awaiting_confirmation: Some(true),
+            ..Default::default()
+        }));
+        let fanin = AgentState {
+            awaiting_subagents: Some(true),
+            ..Default::default()
+        };
+        assert!(GraphState::is_awaiting_interrupt(&fanin), "fan-in sospende");
+        assert!(fanin.is_awaiting_subagents());
+        assert!(!fanin.is_awaiting_confirmation(), "flag indipendenti");
+        assert!(
+            !GraphState::is_awaiting_interrupt(&AgentState {
+                awaiting_subagents: Some(false),
+                ..Default::default()
+            }),
+            "Some(false) azzera l'interrupt (load-bearing per il resume)"
+        );
+    }
 
     /// Round-trip serde di `AgentState`: serialize -> deserialize identico, con
     /// un campo extra SCONOSCIUTO preservato (flatten dello schema aperto).

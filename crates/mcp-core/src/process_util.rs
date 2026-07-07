@@ -253,22 +253,38 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 #[cfg(windows)]
 pub(crate) fn process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     if pid == 0 {
         return false;
     }
-    // In windows-sys 0.52 HANDLE e' un isize; OpenProcess ritorna 0 su fallimento
-    // (accesso negato o PID inesistente), non INVALID_HANDLE_VALUE.
-    // SAFETY: `pid` e' un intero senza vincoli; OpenProcess restituisce 0 in caso di
-    // fallimento (gestito sotto). L'handle non-nullo viene subito rilasciato con
-    // CloseHandle. Nessun puntatore a memoria condivisa, nessun aliasing.
+    // ATTENZIONE (fix root-cause): `OpenProcess` da solo NON basta a decidere la
+    // liveness su Windows. Riesce (handle non-zero) anche su un processo GIA'
+    // USCITO, finche' un handle al suo process object resta aperto altrove (es. la
+    // shell padre che l'ha lanciato): il PID non e' riusato ma il processo e'
+    // morto (zombie non-reaped, invisibile a Get-Process). Il vecchio codice
+    // ritornava true in questo caso -> falso positivo su TUTTI i processi
+    // terminati-non-reaped, e i consumer (riconciliazione stato servizi, detect
+    // porte, cleanup) trattavano i morti come vivi. Serve il codice di uscita:
+    // `GetExitCodeProcess` ritorna STILL_ACTIVE (259) solo se il processo e'
+    // ancora in esecuzione. Edge noto e trascurabile: un processo che esce con
+    // codice esattamente 259 verrebbe riportato vivo (i dev server escono con 0 o
+    // il codice di crash, mai 259).
+    // In windows-sys 0.52 HANDLE e' un isize; OpenProcess ritorna 0 su fallimento.
+    // SAFETY: `pid` e' un intero senza vincoli; OpenProcess/GetExitCodeProcess
+    // gestiscono il fallimento (handle 0 / ritorno 0). L'handle viene sempre
+    // rilasciato con CloseHandle. Nessun puntatore a memoria condivisa.
+    const STILL_ACTIVE: u32 = 259;
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle == 0 {
             return false;
         }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
         CloseHandle(handle);
-        true
+        ok != 0 && exit_code == STILL_ACTIVE
     }
 }
 
@@ -364,5 +380,38 @@ mod tests {
     #[test]
     fn start_unix_pid_inesistente_none() {
         assert!(process_start_unix(u32::MAX).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn processo_uscito_con_handle_aperto_non_e_vivo() {
+        // Regressione (fix falso positivo Windows): OpenProcess riesce anche su un
+        // processo GIA' USCITO finche' un handle al process object resta aperto
+        // (qui lo tiene lo std::process::Child NON reaped). process_alive deve
+        // comunque riportarlo morto grazie al check del codice di uscita. Col
+        // vecchio codice (solo OpenProcess) sarebbe rimasto "vivo" per sempre e il
+        // loop andrebbe in timeout -> assert fallito.
+        use std::process::Command;
+        use std::time::Duration;
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("spawn del processo di test");
+        let pid = child.id();
+        // Attendi (senza reap: l'handle resta aperto nel Child) che process_alive
+        // rilevi l'uscita. Timeout 3s: deterministico, non dipende dall'ordine.
+        let mut dead = false;
+        for _ in 0..60 {
+            if !process_alive(pid) {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.wait();
+        assert!(
+            dead,
+            "un processo uscito (handle ancora aperto) deve risultare morto entro il timeout"
+        );
     }
 }

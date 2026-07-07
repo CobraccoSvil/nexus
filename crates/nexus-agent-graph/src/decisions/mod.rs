@@ -54,6 +54,7 @@
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
+pub mod adversarial_review;
 pub mod clarify_signature;
 pub mod context_reduction;
 pub mod dag_scheduler;
@@ -74,6 +75,9 @@ pub mod text_repetition;
 pub mod tool_dispatch;
 pub mod turn_focus;
 
+pub use adversarial_review::{
+    compose_panel_verdict, PanelOutcome, PanelVerdict, QuorumPolicy, ReviewVerdict,
+};
 pub use clarify_signature::{clarify_signature, normalize_question};
 pub use context_reduction::{
     apply_token_brake, compress_old_tool_results, dedup_tool_results,

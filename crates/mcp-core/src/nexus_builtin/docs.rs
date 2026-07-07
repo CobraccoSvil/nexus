@@ -1,6 +1,6 @@
 //! Handler per il gruppo `documents` del server Nexus Builtin.
 //! Gestisce generazione, aggiornamento, lista, ricerca e stato dei documenti.
-//! Include le utility `bump_version` e `get_project_slug`.
+//! Include l'utility `bump_version`.
 
 use super::*;
 
@@ -20,19 +20,6 @@ pub(super) fn bump_version(version: &str, bump_type: &str) -> String {
         "minor" => format!("{}.{}.0", major, minor + 1),
         _ => format!("{}.{}.{}", major, minor, patch + 1),
     }
-}
-
-pub(super) async fn get_project_slug(db: &PgPool, project_id: Uuid) -> Result<String, String> {
-    let row = sqlx::query("SELECT name FROM projects WHERE id = $1")
-        .bind(project_id)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| format!("[DB] {}", e))?;
-    let name: String = row
-        .ok_or_else(|| "[Errore] Progetto non trovato".to_string())?
-        .try_get::<String, _>("name")
-        .map_err(|e| format!("[DB] {}", e))?;
-    Ok(name.to_lowercase().replace([' ', '_'], "-"))
 }
 
 // ---------------------------------------------------------------------------

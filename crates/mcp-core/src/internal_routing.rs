@@ -242,16 +242,20 @@ async fn resolve_purpose_core(
     db: &PgPool,
     purpose: &str,
     tier_rule: Option<crate::routing_matrix::PurposeTierRule>,
+    exclude_providers: &[String],
+    only_provider: Option<&str>,
 ) -> PurposeResolution {
     let Some(rule) = tier_rule else {
         tracing::warn!(purpose = %purpose, "resolve_purpose: purpose privo di tier (tier-only)");
         return PurposeResolution::NotFound;
     };
-    match crate::orchestrator::best_model_for_tier(
+    match crate::orchestrator::best_model_for_tier_pinned(
         db,
         &rule.tier,
         rule.capability.as_deref(),
         rule.requires_tool_use,
+        exclude_providers,
+        only_provider,
     )
     .await
     {
@@ -278,7 +282,7 @@ pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeRe
         Ok(m) => m,
         Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
     };
-    resolve_purpose_core(&state.db, purpose, matrix.purpose_tier(purpose)).await
+    resolve_purpose_core(&state.db, purpose, matrix.purpose_tier(purpose), &[], None).await
 }
 
 /// Adapter da `&PgPool`: legge la tier-rule direttamente da `nexus_purpose_model`
@@ -287,6 +291,50 @@ pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeRe
 /// `&PgPool`). Stessa decisione di `resolve_purpose_model`, senza re-implementarla
 /// (regola L): la fonte e' il DB invece della matrix cache.
 pub async fn resolve_purpose_model_db(db: &PgPool, purpose: &str) -> PurposeResolution {
+    resolve_purpose_model_db_excluding(db, purpose, &[]).await
+}
+
+/// Variante di [`resolve_purpose_model_db`] che ESCLUDE un insieme di provider
+/// dalla selezione per tier (Fase C2: vincolo giudice != worker). PUNTO UNICO
+/// (regola L): `resolve_purpose_model_db` vi delega con `exclude_providers = &[]`,
+/// cosi' i suoi ~25 chiamanti storici restano invariati. Un sub-run di review
+/// passa qui il provider del run padre da escludere.
+pub async fn resolve_purpose_model_db_excluding(
+    db: &PgPool,
+    purpose: &str,
+    exclude_providers: &[String],
+) -> PurposeResolution {
+    resolve_purpose_model_db_inner(db, purpose, exclude_providers, None).await
+}
+
+/// Variante di [`resolve_purpose_model_db`] che RESTRINGE la selezione per tier a
+/// un SOLO provider (`only_provider`): PIN provider tier-aware. PUNTO UNICO
+/// (regola L): gemella di `_excluding`, entrambe delegano a
+/// [`resolve_purpose_model_db_inner`] (unica query DB della tier-rule). Usata per
+/// la propagazione del PIN del provider ai sub-agenti worker: se il provider
+/// pinnato non offre un modello capable del tier (o e' in cooldown) l'esito e'
+/// `NoCapableModel`/`NotFound` e il chiamante decide il fallback SENZA pin
+/// (preferenza forte, non hard filter). NON propaga alcun `preferred_model` (regola
+/// L: il pin e' SOLO il provider; il modello si deriva sempre dal tier via catalog,
+/// regola G).
+pub async fn resolve_purpose_model_db_pinned(
+    db: &PgPool,
+    purpose: &str,
+    only_provider: Option<&str>,
+) -> PurposeResolution {
+    resolve_purpose_model_db_inner(db, purpose, &[], only_provider).await
+}
+
+/// PUNTO UNICO (regola L) della lettura tier-rule da `nexus_purpose_model` + delega
+/// al core decisionale. `_excluding` e `_pinned` sono viste su questa funzione con
+/// combinazioni diverse di `exclude_providers`/`only_provider`: la query DB della
+/// tier-rule vive in un solo posto.
+async fn resolve_purpose_model_db_inner(
+    db: &PgPool,
+    purpose: &str,
+    exclude_providers: &[String],
+    only_provider: Option<&str>,
+) -> PurposeResolution {
     let purpose = purpose.trim();
     let row = match sqlx::query_as::<_, (Option<String>, Option<String>, bool)>(
         "SELECT tier, required_capability, requires_tool_use \
@@ -310,7 +358,7 @@ pub async fn resolve_purpose_model_db(db: &PgPool, purpose: &str) -> PurposeReso
         requires_tool_use,
     });
 
-    resolve_purpose_core(db, purpose, tier_rule).await
+    resolve_purpose_core(db, purpose, tier_rule, exclude_providers, only_provider).await
 }
 
 /// Handler `GET /api/internal/routing/purpose?purpose=...`

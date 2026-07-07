@@ -176,6 +176,12 @@ impl ToolRunnerExecutorAdapter {
         // del grafo): i tool a lunga durata (dispatch_subagents) la usano per
         // emettere meta-step sul run padre mentre lavorano. Solo path Real.
         ctx.parent_narration = self.parent_narration.clone();
+        // Run CORRENTE del grafo (quello che il motore SOSPENDE su
+        // `awaiting_subagents` e che il fan-in deve RIPRENDERE): lo porta la
+        // narrazione del run invocante (unica fonte del run_id nel path Real).
+        // `dispatch_subagents` background lo usa per accodare il PARENT giusto
+        // nella coda fan-in (non session_id/parent_anchor).
+        ctx.core.run_id = self.parent_narration.as_ref().map(|n| n.run_id);
 
         // Esecuzione IN-PROCESS: la STESSA funzione del dispatch gRPC, non una
         // chiamata di rete a se' stessi (regola: mcp-core E' il ToolRunner).

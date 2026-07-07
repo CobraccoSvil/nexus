@@ -625,6 +625,7 @@ mod tests {
         run_id: Uuid,
     ) -> AgentNodeCtx {
         AgentNodeCtx {
+            isolation_available: false,
             db: lazy_pool(),
             llm,
             tools,

@@ -53,19 +53,25 @@ impl StateDelta {
 /// Il runtime usa solo questi due metodi: NON conosce i campi concreti dello
 /// stato. `merge` e' il reducer (punto unico, regola L).
 ///
-/// L'UNICO predicato di interrupt-resume del runtime e' `is_awaiting_confirmation`
-/// (HITL vero: il run si SOSPENDE e riprende dallo stesso punto). NON esiste un
-/// predicato `is_pending_clarify` nel contratto del runtime: `pending_clarify` e'
-/// uno stato TERMINALE (il run CHIUDE con `Completed`, il prossimo input avvia un
-/// nuovo run dall'entry), gestito dalla TOPOLOGIA con un edge condizionale a
-/// `End`, non dal motore. Replica 1:1 `brain/agents/graph.py`
-/// (`_route_after_clarify_or_expand` -> END vs `interrupt_before=["executor"]`).
+/// L'UNICO predicato di interrupt-resume del runtime e' `is_awaiting_interrupt`
+/// (il run si SOSPENDE e riprende dallo stesso punto). Il motore resta AGNOSTICO
+/// al MOTIVO dell'interrupt (conferma umana HITL, attesa dei sub-run background,
+/// ...): lo stato concreto compone i propri flag in questo unico predicato e il
+/// resume azzera quello giusto. NON esiste un predicato `is_pending_clarify` nel
+/// contratto del runtime: `pending_clarify` e' uno stato TERMINALE (il run CHIUDE
+/// con `Completed`, il prossimo input avvia un nuovo run dall'entry), gestito
+/// dalla TOPOLOGIA con un edge condizionale a `End`, non dal motore. Replica 1:1
+/// `brain/agents/graph.py` (`_route_after_clarify_or_expand` -> END vs
+/// `interrupt_before=["executor"]`).
 pub trait GraphState: Send + Sync {
     /// Applica un delta allo stato secondo la semantica di canale (append vs
     /// overwrite). Implementazione concreta nel crate dei nodi.
     fn merge(&mut self, delta: StateDelta);
 
-    /// `true` se lo stato richiede una conferma umana prima di proseguire
-    /// (HITL): il motore sospende con `Interrupted` e riprende lo stesso run.
-    fn is_awaiting_confirmation(&self) -> bool;
+    /// `true` se lo stato deve SOSPENDERE il run in attesa di un evento esterno
+    /// che lo riprendera' dallo stesso punto (conferma umana HITL oppure
+    /// completamento dei sub-run background). Il motore sospende con `Interrupted`
+    /// senza conoscere il motivo; il resume inietta il delta che azzera il flag
+    /// specifico. PUNTO UNICO dell'interrupt-resume (regola L).
+    fn is_awaiting_interrupt(&self) -> bool;
 }

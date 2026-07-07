@@ -4,7 +4,6 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_CORRECTIONS_COLLECTION: &str = "prompt_corrections";
 const DEFAULT_PROJECT_CONTEXT_COLLECTION: &str = "project_context";
 const DEFAULT_CODE_INDEX_COLLECTION: &str = "project_code_index";
@@ -66,9 +65,7 @@ async fn search_response_to_hits(
 }
 
 async fn qdrant_config(db: &PgPool) -> anyhow::Result<(String, String)> {
-    let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
-    });
+    let url = crate::settings::resolve_qdrant_url(db).await;
 
     let collection = get_setting(db, "qdrant_prompt_corrections_collection")
         .await?
@@ -79,9 +76,7 @@ async fn qdrant_config(db: &PgPool) -> anyhow::Result<(String, String)> {
 }
 
 async fn qdrant_project_context_config(db: &PgPool) -> anyhow::Result<(String, String)> {
-    let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
-    });
+    let url = crate::settings::resolve_qdrant_url(db).await;
 
     let collection = get_setting(db, "qdrant_project_context_collection")
         .await?
@@ -506,9 +501,7 @@ pub async fn project_context_collection_name(db: &PgPool) -> anyhow::Result<Stri
 // ── Code Index collection ────────────────────────────────────────────────────
 
 async fn qdrant_code_index_config(db: &PgPool) -> anyhow::Result<(String, String)> {
-    let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
-    });
+    let url = crate::settings::resolve_qdrant_url(db).await;
 
     let collection = get_setting(db, "qdrant_code_index_collection")
         .await?
@@ -740,11 +733,7 @@ pub async fn delete_code_index_file_points(
 const DEFAULT_DOCS_COLLECTION: &str = "project_docs";
 
 async fn qdrant_docs_config(db: &PgPool) -> anyhow::Result<(String, String)> {
-    let url = crate::settings::get_setting(db, "qdrant_url")
-        .await?
-        .unwrap_or_else(|| {
-            std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
-        });
+    let url = crate::settings::resolve_qdrant_url(db).await;
     Ok((url, DEFAULT_DOCS_COLLECTION.to_string()))
 }
 
@@ -1117,9 +1106,7 @@ pub async fn delete_doc_points_by_ids(db: &PgPool, point_ids: &[String]) -> anyh
 const DEFAULT_CONVERSATION_CONTEXT_COLLECTION: &str = "conversation_context";
 
 async fn qdrant_conversation_context_config(db: &PgPool) -> anyhow::Result<(String, String)> {
-    let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
-    });
+    let url = crate::settings::resolve_qdrant_url(db).await;
     let collection = get_setting(db, "qdrant_conversation_context_collection")
         .await?
         .unwrap_or_else(|| DEFAULT_CONVERSATION_CONTEXT_COLLECTION.to_string());

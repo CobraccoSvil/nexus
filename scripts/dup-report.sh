@@ -18,9 +18,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-OUT_DIR="$ROOT_DIR/.dup-report"
+# Path RELATIVI alla root (cwd appena impostata): su Windows/Git Bash i path
+# POSIX assoluti (/d/...) non sono risolvibili dal node nativo dentro -e,
+# mentre i relativi funzionano identici su Windows e Linux/CI.
+OUT_DIR="./.dup-report"
 REPORT_JSON="$OUT_DIR/jscpd-report.json"
-BASELINE="$ROOT_DIR/.dup-baseline.json"
+BASELINE="./.dup-baseline.json"
 
 YELLOW="\033[0;33m"; GREEN="\033[0;32m"; RED="\033[0;31m"; NC="\033[0m"
 
@@ -40,7 +43,7 @@ echo -e "${YELLOW}==> dup-report: esecuzione jscpd${NC}"
 pnpm exec jscpd --silent --reporters json --output "$OUT_DIR" \
     --min-lines 15 --min-tokens 100 \
     --ignore "**/generated/**,**/_pb2.py,**/_pb2_grpc.py,**/*_pb2.py,**/*_pb2_grpc.py,**/*.pb.rs,**/*.backup*,**/tests/**,**/__tests__/**,**/test_*.py,**/*_test.py,**/*.test.ts,**/*.test.tsx,**/*.test.js,**/*.test.jsx,**/*.spec.ts,**/*.spec.tsx,**/*.spec.js,**/*.spec.jsx,**/e2e/**,**/profiles/*.yaml,**/profiles/*.yml,**/fixtures/**,**/mocks/**,**/__mocks__/**,**/*.example.*,**/examples/**,docs/**" \
-    apps packages crates brain || true
+    apps packages crates || true
 
 if [[ ! -f "$REPORT_JSON" ]]; then
   echo -e "${RED}!! dup-report: report jscpd non generato ($REPORT_JSON)${NC}" >&2

@@ -25,7 +25,7 @@ export function WizardOverlay({
     /* ════════════════════════════════ C: WIZARD ═══════════════════════ */
     /* Overlay assoluto: copre l'intero pannello run quando aperto.
         Risolve il problema di spazio insufficiente quando le sezioni
-        sopra (Nexus, systemd, porte) occupano tutto il pannello.
+        sopra (Nexus, servizi del progetto, porte) occupano tutto il pannello.
         Backdrop semi-trasparente + pannello centrale scrollabile. */
     <div style={{
       position: "absolute",
@@ -50,12 +50,12 @@ export function WizardOverlay({
         boxShadow: "0 8px 24px rgba(0,0,0,0.3)",
       }}>
       <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderBottom:`1px solid ${tc.border}`,background:tc.bgHeader,borderRadius:"6px 6px 0 0" }}>
-        <div style={{ fontSize:12,fontWeight:600,color:tc.text }}>Wizard — installa servizi systemd</div>
+        <div style={{ fontSize:12,fontWeight:600,color:tc.text }}>Wizard — installa servizi del progetto</div>
         <button onClick={()=>setWizardOpen(false)} title="Chiudi wizard" style={{ background:"none",border:"none",color:tc.textMuted,cursor:"pointer",fontSize:18,padding:"0 4px",lineHeight:1 }}>✕</button>
       </div>
       <div style={{ flex:1, overflowY:"auto", padding:"8px 12px" }}>
       <div style={{ fontSize:10,color:tc.textMuted,marginBottom:8,padding:"6px 8px",background:tc.bgCard,border:`1px solid ${tc.border}`,borderRadius:4 }}>
-        Crea unit systemd in <code>~/.config/systemd/user/</code> per avviare automaticamente i servizi del progetto. Per comandi <em>on-demand</em> (script di build, test, dev manuale) usa invece la sezione <strong>Run Configurations</strong> nella sidebar a sinistra.
+        Installa i servizi gestiti del progetto per avviarli automaticamente. Per comandi <em>on-demand</em> (script di build, test, dev manuale) usa invece la sezione <strong>Run Configurations</strong> nella sidebar a sinistra.
       </div>
 
       {wizardLoading && <div style={{ color:tc.textMuted,fontSize:12 }}>Analisi in corso…</div>}
@@ -132,7 +132,7 @@ export function WizardOverlay({
                         fontSize: 10, color: tc.textMuted, overflow: "hidden",
                         textOverflow: "ellipsis", whiteSpace: "nowrap",
                       }}>
-                        unit: {svc.unit}
+                        servizio: {svc.short || svc.unit}
                       </div>
                     </div>
                     {svc.existing ? (
@@ -165,7 +165,7 @@ export function WizardOverlay({
 
       {!wizardLoading && suggestions.length > 0 && (
         <div style={{ fontSize:10,color:tc.textMuted,marginTop:8 }}>
-          I servizi vengono installati come unit systemd --user. Puoi modificarli in <code>~/.config/systemd/user/</code>.
+          I servizi vengono registrati e gestiti dal pannello Run &amp; Debug del progetto.
         </div>
       )}
       </div>{/* /scroll area */}

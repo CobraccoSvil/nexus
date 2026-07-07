@@ -94,6 +94,7 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
             min_context_window: required_tokens,
             exclude_providers: &[],
             apply_cooldown: true,
+            only_provider: None,
         };
         let rows = match select_models_tierchain(
             &self.db,

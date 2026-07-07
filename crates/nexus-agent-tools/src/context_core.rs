@@ -57,6 +57,13 @@ pub struct ToolContextCore {
     pub run_db: Arc<PgPool>,
     /// ID del run padre (per agenti figlio lanciati da dispatch_subtask).
     pub parent_run_id: Option<Uuid>,
+    /// ID del run CORRENTE che sta eseguendo i tool (il run del grafo nativo che
+    /// ha invocato il tool). Diverso da `parent_run_id`/`session_id`: e' il run
+    /// che il motore SOSPENDE (`awaiting_subagents`) quando dispatcha figli in
+    /// background e che il fan-in deve RIPRENDERE. Valorizzato SOLO dal path Real
+    /// del grafo (`ToolRunnerExecutorAdapter::execute_real`, dalla narrazione del
+    /// run invocante); `None` fuori dal grafo (server gRPC, dispatch legacy, test).
+    pub run_id: Option<Uuid>,
     /// Pattern long-running caricati dal DB (pre-fetched all'inizio del run).
     pub long_running_patterns: Vec<String>,
     /// Ruolo utente corrente ("admin" | "editor" | "viewer") — usato dai tool nexus_builtin.

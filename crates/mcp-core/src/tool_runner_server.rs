@@ -188,6 +188,11 @@ impl ToolRunnerService {
                 db: Arc::new(self.deps.db.clone()),
                 run_db: Arc::new(run_db),
                 parent_run_id: None,
+                // Il run CORRENTE non e' noto a questo punto (il ctx e' costruito
+                // dalla sola sessione): lo valorizza il path Real del grafo
+                // (`ToolRunnerExecutorAdapter::execute_real`) dalla narrazione del
+                // run invocante. Fuori dal grafo resta `None`.
+                run_id: None,
                 long_running_patterns,
                 user_role: info.user_role.clone(),
                 is_nexus_operator: matches!(info.user_role.as_str(), "owner" | "admin"),

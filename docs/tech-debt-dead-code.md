@@ -19,9 +19,11 @@ Rilevatori:
   bonifica) + `cargo machete` per le dipendenze.
 - **TypeScript**: `knip` su `apps/web-ide` (config in `apps/web-ide/knip.json`:
   gli spec Playwright sono entrypoint, non file morti).
-- **Python**: `vulture brain/ --min-confidence 80` con whitelist dei falsi
-  positivi da framework in `brain/.vulture_whitelist.py` (checkpointer
-  LangGraph, servicer gRPC, handler FastAPI, campi Pydantic/AgentState).
+
+Il rilevatore Python (`vulture brain/`) e' stato rimosso insieme al campo
+`py_issues` della baseline: `brain/` non esiste piu' dal porting del motore in
+Rust (commit 75a6d62). I riferimenti a vulture nella cronaca della bonifica
+2026-06-11 qui sotto restano come storia.
 
 Il gate ratchet (`.dead-code-baseline.json`) ammette solo conteggi in discesa,
 come il gate jscpd. On-demand + CI; NON in pre-commit (troppo lento).

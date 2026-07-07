@@ -17,6 +17,8 @@ nexus_meta_version: 1
 
 # ADR 0022 — Bus systemd utente irraggiungibile vs zero servizi
 
+> **Relativizzato da** [[0038-modello-servizi-progetto-multipiattaforma]]: la distinzione "bus down vs zero servizi" resta valida ma diventa un dettaglio interno del backend systemd/Linux, modellata dal segnale strutturato `ManagerStatus::Unavailable { hint }` invece dell'euristica `contains()` sullo stderr. Contenuto storico invariato.
+
 > **Status**: implementato (verificato 2026-07-02)
 > **Aggiornamento 2026-07-02 (as-built)**: backend `manager_unavailable` in `crates/mcp-core/src/project_workspace/services.rs` + frontend `systemd-services-section.tsx`; adattato a Windows (`manager_mode` = "windows").
 > **Decisori**: team Nexus

@@ -13,13 +13,13 @@ Commands:
   setup            [root] Install system dependencies (one-time, run as root)
   status           Show processes, listening ports, and Docker infra containers
   build            Install JS deps if needed and rebuild the Rust binary
-  restart          Restart neural core, mcp-core, and web IDE
-  restart-backend  Restart neural core and mcp-core only
+  restart          Restart mcp-core and web IDE
+  restart-backend  Restart mcp-core only
   restart-web      Restart the web IDE only
   deploy-web       Build web IDE and restart (use after deploying files)
-  stop             Stop neural core, mcp-core, and web IDE
+  stop             Stop mcp-core and web IDE
   health           Query local health endpoints
-  logs [service]   Tail logs for one service: neural | mcp | web
+  logs [service]   Tail logs for one service: mcp | web
 EOF
 }
 
@@ -174,10 +174,10 @@ restart_web() {
 
 status() {
   echo "== Processes =="
-  ps -ef | grep -E "brain\\.grpc_server.main|mcp-core|next dev -H 0.0.0.0|next start -H 0.0.0.0 -p 3000|next-server" | grep -v grep || true
+  ps -ef | grep -E "mcp-core|next dev -H 0.0.0.0|next start -H 0.0.0.0 -p 3000|next-server" | grep -v grep || true
   echo
   echo "== Ports =="
-  ss -tlnp | grep -E "3000|4000|50051|8001|5432|6379|6333|6334" || true
+  ss -tlnp | grep -E "3000|4000|50051|5432|6379|6333|6334" || true
   echo
   echo "== Docker =="
   docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | sed -n '1,20p'
@@ -208,9 +208,6 @@ build() {
 health() {
   echo "== MCP Core =="
   curl -fsS http://127.0.0.1:4000/api/health 2>/dev/null || echo "non risponde"
-  echo
-  echo "== Neural Core =="
-  curl -fsS http://127.0.0.1:8001/health 2>/dev/null || echo "non risponde"
   echo
   echo "== Web IDE =="
   local version_json
@@ -270,11 +267,10 @@ logs() {
   local service="${1:-}"
   local lines="${LINES:-120}"
   case "$service" in
-    neural) tail -n "$lines" "$LOG_DIR/neural.log" ;;
     mcp) tail -n "$lines" "$LOG_DIR/mcp.log" ;;
     web) tail -n "$lines" "$LOG_DIR/webide.log" ;;
     *)
-      echo "Choose one service: neural | mcp | web" >&2
+      echo "Choose one service: mcp | web" >&2
       exit 1
       ;;
   esac

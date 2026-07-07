@@ -12,6 +12,20 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
         .route("/health", get(health))
         .route("/api/health", get(health))
         .route("/api/dashboard", get(dashboard))
+        // Stato + controllo dei microservizi infrastruttura Nexus (pannello
+        // "Servizi Nexus" del web-ide, via proxy Next.js). No-auth come gli
+        // altri endpoint di stato di sistema: mcp-core ascolta su 127.0.0.1 e i
+        // due route Next.js chiamano senza credenziali (fetchJsonNoAuth).
+        // Piattaforma gestita in mcp-core (regola L), niente systemctl nel
+        // frontend. Vedi crate::system_services + migrazione 0541.
+        .route(
+            "/api/system/services",
+            get(crate::system_services::get_system_services),
+        )
+        .route(
+            "/api/system/services/:service/:action",
+            post(crate::system_services::post_system_service_action),
+        )
         // Server statico integrato per progetti HTML (no auth: deve essere
         // apribile in una nuova scheda del browser, che non porta il JWT).
         // Il path e' confinato rigorosamente alla project_root in

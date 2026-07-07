@@ -344,6 +344,7 @@ pub(crate) async fn agentic_failover_candidates(
         min_context_window: 0,
         exclude_providers: exclude,
         apply_cooldown: true,
+        only_provider: None,
     };
     // tier_chain VUOTA = nessun filtro tier (query singola su tutti i tier).
     match crate::orchestrator::select_models_tierchain(
@@ -389,26 +390,96 @@ pub async fn best_model_for_tier(
     capability: Option<&str>,
     requires_tool_use: bool,
 ) -> Option<(String, String)> {
-    // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
-    // applica l'eleggibilita' agentica + cooldown in un solo posto.
-    if requires_tool_use {
-        return select_agentic_model(db, &[tier], capability, 0, &[], AGENTIC_COST_FIRST_ORDER)
-            .await;
-    }
+    // Vista senza esclusioni sul PUNTO UNICO parametrico (regola L): estende
+    // automaticamente tutti i ~20 chiamanti storici senza toccarli.
+    best_model_for_tier_excluding(db, tier, capability, requires_tool_use, &[]).await
+}
 
-    // Caso NON-agentico (es. purpose vision/chat/embedding): vista sottile sul
-    // punto unico (FASE 2). `require_tool_use=false` e `require_thinking_non_exclude=false`
-    // -> nessun filtro tool_use/policy e nessun pre-ordinamento non-thinking
-    // (coerente con il comportamento precedente di questo ramo). La vision e' via
-    // `supports_vision`, le altre capability via jsonb. Il blocco SQL inline (il
-    // TERZO selettore duplicato) e' stato eliminato (regola L).
+/// Variante di [`best_model_for_tier`] che ESCLUDE un insieme di provider dalla
+/// selezione (oltre al cooldown). PUNTO UNICO (regola L): `best_model_for_tier`
+/// vi delega con `exclude_providers = &[]`. Usata per il vincolo giudice != worker
+/// (Fase C2): un sub-run di review risolve il proprio modello ESCLUDENDO il
+/// provider del run padre (worker), cosi' la verifica avversaria gira su un
+/// provider diverso — indipendenza reale, non due modelli dello stesso provider
+/// con bias/failure-mode condivisi. Se l'esclusione svuota il pool il chiamante
+/// applica il fallback (preferenza forte, non hard filter).
+pub async fn best_model_for_tier_excluding(
+    db: &PgPool,
+    tier: &str,
+    capability: Option<&str>,
+    requires_tool_use: bool,
+    exclude_providers: &[String],
+) -> Option<(String, String)> {
+    // Vista senza PIN sul punto unico parametrico (regola L): tutti i chiamanti
+    // storici (`best_model_for_tier`, review-excluding, ...) restano invariati.
+    best_model_for_tier_pinned(
+        db,
+        tier,
+        capability,
+        requires_tool_use,
+        exclude_providers,
+        None,
+    )
+    .await
+}
+
+/// Variante di [`best_model_for_tier_excluding`] che RESTRINGE la selezione a un
+/// SOLO provider (`only_provider`) oltre alle esclusioni. PUNTO UNICO (regola L):
+/// `best_model_for_tier_excluding` vi delega con `only_provider = None`. Usata per
+/// la propagazione del PIN del provider ai sub-agenti worker: il pin e' una
+/// preferenza-forte tier-aware (tier + capability + tool_use INVARIATI, solo il
+/// provider e' vincolato). Ritorna `None` se nessun modello del provider pinnato
+/// soddisfa il tier/capability (o e' in cooldown): il chiamante applica il
+/// fallback SENZA pin (preferenza forte, non hard filter — regola H fail-loud lato
+/// chiamante). Il filtro provider passa da [`EligibilityFilter::only_provider`],
+/// UNICA sorgente del vincolo (regola L): niente seconda query dedicata.
+pub async fn best_model_for_tier_pinned(
+    db: &PgPool,
+    tier: &str,
+    capability: Option<&str>,
+    requires_tool_use: bool,
+    exclude_providers: &[String],
+    only_provider: Option<&str>,
+) -> Option<(String, String)> {
+    // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
+    // applica l'eleggibilita' agentica + cooldown in un solo posto. L'esclusione
+    // provider passa da `exclude_providers`; il pin da `only_provider`.
+    if requires_tool_use {
+        return select_agentic_model_pinned(
+            db,
+            &[tier],
+            capability,
+            0,
+            exclude_providers,
+            AGENTIC_COST_FIRST_ORDER,
+            only_provider,
+        )
+        .await;
+    }
+    best_non_agentic_model(db, tier, capability, exclude_providers, only_provider).await
+}
+
+/// Ramo NON-agentico di [`best_model_for_tier_excluding`] (purpose
+/// vision/chat/embedding): vista sottile sul punto unico (FASE 2).
+/// `require_tool_use=false` e `require_thinking_non_exclude=false` -> nessun
+/// filtro tool_use/policy e nessun pre-ordinamento non-thinking. La vision e' via
+/// `supports_vision`, le altre capability via jsonb. Il blocco SQL inline (il
+/// TERZO selettore duplicato) e' stato eliminato (regola L).
+async fn best_non_agentic_model(
+    db: &PgPool,
+    tier: &str,
+    capability: Option<&str>,
+    exclude_providers: &[String],
+    only_provider: Option<&str>,
+) -> Option<(String, String)> {
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: false,
         require_thinking_non_exclude: false,
         capability,
         min_context_window: 0,
-        exclude_providers: &[],
+        exclude_providers,
         apply_cooldown: true,
+        only_provider,
     };
     // Pre-ordinamento anti "reasoner puro" (incidente 2026-06-10): i modelli
     // con uses_thinking_mode=TRUE e supports_tool_use=FALSE (es. deepseek-v4-flash)
@@ -475,11 +546,34 @@ pub(crate) async fn select_agentic_model(
     exclude_providers: &[String],
     order_by: &str,
 ) -> Option<(String, String)> {
-    // Vista sottile sul punto unico (FASE 2): l'eleggibilita' agentica
-    // (supports_tool_use=TRUE, agentic_thinking_policy<>'exclude', cooldown,
-    // pre-ordinamento non-thinking) e' definita una sola volta in
-    // `EligibilityFilter` + `select_models_tierchain`. La firma di questa
-    // funzione resta invariata: i ~6 call site non cambiano.
+    // Vista SENZA pin sul punto unico interno: i ~6 call site storici non cambiano.
+    select_agentic_model_pinned(
+        db,
+        tier_chain,
+        capability,
+        min_context_window,
+        exclude_providers,
+        order_by,
+        None,
+    )
+    .await
+}
+
+/// Variante di [`select_agentic_model`] che RESTRINGE la selezione a un solo
+/// provider (`only_provider`), propagato a [`EligibilityFilter::only_provider`].
+/// PUNTO UNICO interno (regola L): `select_agentic_model` vi delega con
+/// `only_provider = None` (comportamento bit-identico). Usata dalla risoluzione
+/// pinnata dei purpose worker (propagazione del PIN provider ai sub-agenti). La
+/// WHERE di eleggibilita' resta definita una sola volta in `select_models_tierchain`.
+async fn select_agentic_model_pinned(
+    db: &PgPool,
+    tier_chain: &[&str],
+    capability: Option<&str>,
+    min_context_window: i64,
+    exclude_providers: &[String],
+    order_by: &str,
+    only_provider: Option<&str>,
+) -> Option<(String, String)> {
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: true,
         require_thinking_non_exclude: true,
@@ -487,6 +581,7 @@ pub(crate) async fn select_agentic_model(
         min_context_window,
         exclude_providers,
         apply_cooldown: true,
+        only_provider,
     };
     match crate::orchestrator::select_models_tierchain(db, &filter, tier_chain, order_by, 1).await {
         Ok(mut v) => v.drain(..).next().map(|(p, m, _)| (p, m)),
@@ -552,6 +647,7 @@ pub(crate) async fn select_agentic_model_governed(
         min_context_window,
         exclude_providers,
         apply_cooldown: true,
+        only_provider: None,
     };
     let candidates: Vec<(String, String)> = match crate::orchestrator::select_models_tierchain(
         db,

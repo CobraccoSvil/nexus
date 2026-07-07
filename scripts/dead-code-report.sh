@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # scripts/dead-code-report.sh — Punto unico di misura del dead code (regola L).
 #
-# Tre rilevatori + gate "ratchet" (i conteggi possono solo SCENDERE rispetto a
+# Due rilevatori + gate "ratchet" (i conteggi possono solo SCENDERE rispetto a
 # .dead-code-baseline.json, come il gate jscpd di dup-report.sh):
 #   - Rust:   warning dead_code del compilatore (su CARGO_TARGET_DIR separata
 #             con RUSTFLAGS="" perche' .cargo/config.toml potrebbe cappare i
 #             lint) + dipendenze inutilizzate via cargo-machete (se installato)
 #   - TS:     knip su apps/web-ide (file + export inutilizzati)
-#   - Python: vulture su brain/ (confidence 80, whitelist in
-#             brain/.vulture_whitelist.py se presente)
+# La fase Python (vulture su brain/) e' stata rimossa col porting del brain
+# in Rust (commit 75a6d62): brain/ non esiste piu' nel repo.
 #
 # Uso:
 #   bash scripts/dead-code-report.sh                    # misura + gate ratchet
@@ -50,17 +50,10 @@ echo -e "${YELLOW}==> dead-code: TypeScript (knip su web-ide)${NC}"
 TS_ISSUES=$(pnpm dlx knip --directory apps/web-ide --reporter compact --no-progress 2>/dev/null \
     | grep -vcE "^(Unused|Unlisted|$)" || true)
 
-echo -e "${YELLOW}==> dead-code: Python (vulture su brain/)${NC}"
-VULTURE_ARGS=(brain/ --min-confidence 80 --exclude "*/generated/*,*/__pycache__/*")
-if [ -f brain/.vulture_whitelist.py ]; then
-    VULTURE_ARGS+=(brain/.vulture_whitelist.py)
-fi
-PY_ISSUES=$(python3 -m vulture "${VULTURE_ARGS[@]}" 2>/dev/null | wc -l || true)
+echo -e "${YELLOW}==> dead-code: rust_warnings=${RUST_WARN} rust_deps=${RUST_DEPS} ts_issues=${TS_ISSUES}${NC}"
 
-echo -e "${YELLOW}==> dead-code: rust_warnings=${RUST_WARN} rust_deps=${RUST_DEPS} ts_issues=${TS_ISSUES} py_issues=${PY_ISSUES}${NC}"
-
-CURRENT_JSON=$(printf '{"rust_warnings": %d, "rust_deps": %d, "ts_issues": %d, "py_issues": %d}\n' \
-    "$RUST_WARN" "$RUST_DEPS" "$TS_ISSUES" "$PY_ISSUES")
+CURRENT_JSON=$(printf '{"rust_warnings": %d, "rust_deps": %d, "ts_issues": %d}\n' \
+    "$RUST_WARN" "$RUST_DEPS" "$TS_ISSUES")
 
 if [[ "$MODE" == "update" ]]; then
     echo "$CURRENT_JSON" > "$BASELINE"
@@ -79,7 +72,7 @@ fi
 
 echo "$CURRENT_JSON" | node -e "
 const cur = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-const base = require('$BASELINE');
+const base = require('./.dead-code-baseline.json');
 const regress = Object.keys(cur).filter(k => cur[k] > (base[k] ?? 0));
 if (regress.length) {
   console.error('dead-code AUMENTATO: ' + regress.map(k => k + ' ' + cur[k] + '>' + base[k]).join(', '));

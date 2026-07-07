@@ -2028,7 +2028,8 @@ pub(crate) async fn spawn_agent_run(
             .load(std::sync::atomic::Ordering::Relaxed);
     let recent_history = if vec_deps_ok {
         build_vectorized_conversation_history(
-            &msgs_pool,
+            &msgs_pool,  // pool progetto: chat_messages (raw fallback + finestra recente)
+            &state.db,   // meta-DB: setting globali qdrant_url/collection (regola G/L)
             &state.orchestrator.neural,
             params.session_id,
             &params.content,
@@ -4486,6 +4487,236 @@ pub(crate) async fn confirm_native_run(
     Ok(status)
 }
 
+/// Risultati strutturati dei figli BACKGROUND di un parent, nella STESSA forma
+/// del tool_result di `nexus_subagent_poll` (regola L): un `Value` per figlio
+/// con `{subagent_run_id, kind, status, summary, outcome}`. `outcome` e' il
+/// verdetto STRUTTURATO persistito (`nexus_subagent_runs.verdict`, regola M),
+/// mai prosa. Iniettati nello stato al resume fan-in (`build_resume_delta_
+/// subagents`) cosi' il padre compone i verdetti dei figli deterministicamente.
+///
+/// Query sul PROJECT pool (dove vive `nexus_subagent_runs`), ordinata per
+/// `created_at` (ordine stabile di dispatch). Best-effort: su errore ritorna
+/// `vec![]` (il resume prosegue con risultati vuoti, meglio che bloccare).
+/// Anchor con cui i figli background del run `run_id` sono registrati in
+/// `nexus_subagent_runs` (PUNTO UNICO della correlazione fan-in, regola L): coincide
+/// con `parent_anchor` del ctx che li ha dispatchati = `COALESCE(agent_runs.
+/// parent_run_id, agent_runs.session_id)`. Poiche' il ctx dei tool porta sempre
+/// `parent_run_id=None`, in pratica l'anchor e' la `session_id`; leggerlo da
+/// agent_runs copre comunque il caso (futuro) in cui il ctx portasse un parent_run_
+/// id reale. Fallback al `session_id` passato se il run non e' leggibile.
+async fn fanin_children_anchor(proj_pool: &PgPool, run_id: Uuid, session_id: Uuid) -> Uuid {
+    sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT COALESCE(parent_run_id, session_id) FROM agent_runs WHERE id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(proj_pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or(session_id)
+}
+
+async fn fetch_subagent_fanin_results(proj_pool: &PgPool, anchor: Uuid) -> Vec<Value> {
+    let rows = sqlx::query(
+        "SELECT id::text AS sub_id, kind, status, final_summary, verdict \
+         FROM nexus_subagent_runs \
+         WHERE parent_run_id = $1 AND is_background = true \
+         ORDER BY created_at ASC",
+    )
+    .bind(anchor)
+    .fetch_all(proj_pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|r| {
+            use sqlx::Row;
+            serde_json::json!({
+                "subagent_run_id": r.try_get::<String, _>("sub_id").unwrap_or_default(),
+                "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
+                "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                "summary": r.try_get::<Option<String>, _>("final_summary").unwrap_or(None),
+                // Verdetto ESITO strutturato (mig project/0009): il padre legge
+                // success/verdict qui, mai dalla prosa di `summary` (regola M).
+                "outcome": r.try_get::<Option<Value>, _>("verdict").unwrap_or(None),
+            })
+        })
+        .collect()
+}
+
+/// RESUME FAN-IN completo di un run nativo (Engine::Rust) sospeso su
+/// `awaiting_subagents` (Fase D Slice 3). Gemello di [`confirm_native_run`]
+/// (regola L), ma innescato dal WORKER fan-in (non dall'utente) quando l'ultimo
+/// figlio background del parent completa. Differenze dall'HITL:
+/// - provider/model/session sono LETTI da `agent_runs` (il worker ha solo gli id
+///   della coda), non passati come parametri;
+/// - il delta iniettato porta i `subagent_results` (via `resume_native_fanin`),
+///   non un messaggio umano di approvazione;
+/// - il flag di interrupt azzerato e' `awaiting_subagents`, non
+///   `awaiting_confirmation`.
+///
+/// Il CAS che garantisce UN solo resume (`awaiting_subagents -> running`) e' del
+/// worker chiamante: questa funzione presuppone di aver vinto il CAS. Riprende il
+/// grafo dal checkpoint Postgres (`resume_native_fanin`), mappa l'esito col
+/// mapping unico (`native_outcome_to_run_result`), persiste lo stato terminale +
+/// emette `is_final` sul canale SSE. Su un nuovo interrupt fan-in il run torna
+/// `awaiting_subagents` (un ulteriore giro di figli background) e sara' ri-accodato
+/// dai loro finalize. Su errore del motore -> `failed` ONESTO (regola H: nessun
+/// fallback al brain).
+pub(crate) async fn resume_fanin(
+    state: &AppState,
+    parent_run_id: Uuid,
+    project_id: Uuid,
+    session_id: Uuid,
+) -> Result<crate::agent_types::AgentRunStatus, String> {
+    // Pool del progetto (separazione DB): agent_runs / nexus_subagent_runs sono
+    // migrate. Risolto UNA volta, riusato per lettura provider/model, risultati
+    // dei figli e UPDATE di finalize.
+    let cn_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+
+    // provider/model del run originale dal DB (il worker ha solo gli id): servono
+    // a popolare ctx + porte I/O del resume (il grafo riparte comunque dal
+    // checkpoint). Se il run non esiste piu' (stale), esce senza resume.
+    let row = sqlx::query(
+        "SELECT provider, model FROM agent_runs WHERE id = $1",
+    )
+    .bind(parent_run_id)
+    .fetch_optional(&cn_pool)
+    .await
+    .map_err(|e| format!("lookup run padre fallito: {e}"))?;
+    let (provider, model) = match row {
+        Some(r) => {
+            use sqlx::Row;
+            (
+                r.try_get::<Option<String>, _>("provider").ok().flatten().unwrap_or_default(),
+                r.try_get::<Option<String>, _>("model").ok().flatten().unwrap_or_default(),
+            )
+        }
+        None => return Err(format!("run padre {parent_run_id} non trovato (stale)")),
+    };
+
+    // Risultati strutturati dei figli background da iniettare nello stato. I figli
+    // sono registrati in nexus_subagent_runs con `parent_run_id = ANCHOR`
+    // (= COALESCE(parent_run_id, session_id) del ctx del run che li ha dispatchati:
+    // il ctx dei tool porta sempre parent_run_id=None, quindi l'anchor e' la
+    // session_id). NON con `parent_run_id = questo run` (che e' il target del
+    // resume, diverso dall'anchor: vedi fanin_target_run_id in subagent_native).
+    // Correlo quindi via l'anchor derivato dal run corrente, non via il suo id.
+    let anchor = fanin_children_anchor(&cn_pool, parent_run_id, session_id).await;
+    let subagent_results = fetch_subagent_fanin_results(&cn_pool, anchor).await;
+
+    // Canale SSE del run: riusa quello esistente (client agganciati) o creane uno
+    // nuovo (dopo un restart) cosi' l'is_final finale sblocca i reattach.
+    let tx = match state.agent_channels.get(&parent_run_id) {
+        Some(ch) => ch.clone(),
+        None => {
+            let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
+            state.agent_channels.insert(parent_run_id, tx.clone());
+            tx
+        }
+    };
+
+    // Input MINIMO per il resume (come confirm_native_run): il grafo riparte dal
+    // checkpoint, quindi prompt/tools/history NON servono. Restano provider/model/
+    // session per ctx + porte e il canale SSE.
+    let input = crate::native_engine::NativeRunInput {
+        run_id: parent_run_id,
+        session_id,
+        provider,
+        model,
+        system_text: String::new(),
+        initial_msg: String::new(),
+        conversation_history: Vec::new(),
+        tools_json: serde_json::json!([]),
+        intent_hint: None,
+        requires_tools: None,
+        agentic_score: None,
+        authorizes_changes: None,
+        classifier_resolved: false,
+        action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
+        // Il resume fan-in del run principale eredita l'automazione del run
+        // originale via checkpoint; qui basta un valore coerente per il ctx.
+        automation_mode: "automatic".to_string(),
+        step_tx: tx.clone(),
+        parent_run_id: None,
+        subagent_depth: None,
+        // Resume del run principale sulla root del progetto: nessun isolamento.
+        working_root: None,
+    };
+
+    // Costruisce le NativeDeps da AppState (PUNTO UNICO build_native_deps, regola
+    // L: stesso cablaggio infra di run_via_native / confirm_native_run) e delega
+    // al motore la meccanica di resume col delta fan-in.
+    let deps = build_native_deps(state).await;
+    let outcome =
+        crate::native_engine::resume_native_fanin(&deps, &input, subagent_results).await;
+
+    let status = match outcome {
+        Ok(outcome) => {
+            let mut result = native_outcome_to_run_result(&cn_pool, parent_run_id, outcome).await;
+            // Riconciliazione costo/token dal ledger (stesso punto unico dello
+            // spawn/confirm): senza, l'UPDATE azzererebbe total_cost/total_tokens.
+            let ledger_totals = fetch_ledger_totals(&state.db, parent_run_id).await;
+            let _ = reconcile_run_cost_from_ledger(&mut result, &ledger_totals);
+            let status_str = result.status.as_str();
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
+                 prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
+                 nexus_task_type=$9, provider=$10, model=$11, \
+                 messages_json=COALESCE($12, messages_json), completed_at=NOW() \
+                 WHERE id=$1",
+            )
+            .bind(parent_run_id)
+            .bind(status_str)
+            .bind(result.final_answer.as_deref())
+            .bind(result.iteration_count as i32)
+            .bind(result.prompt_tokens as i32)
+            .bind(result.completion_tokens as i32)
+            .bind(result.total_tokens as i32)
+            .bind(result.total_cost)
+            .bind(result.nexus_task_type.as_deref())
+            .bind(&result.provider)
+            .bind(&result.model)
+            .bind(result.messages_json.as_deref())
+            .execute(&cn_pool)
+            .await;
+            result.status
+        }
+        Err(e) => {
+            tracing::error!(run_id = %parent_run_id, "resume_fanin: resume nativo fallito");
+            let msg = format!(
+                "Il resume fan-in del run e' fallito ({}). Il run e' stato chiuso come non riuscito.",
+                crate::brain_agent_client::sanitize_error_for_user(&e.to_string())
+            );
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET status='failed', final_answer=$2, completed_at=NOW() \
+                 WHERE id=$1",
+            )
+            .bind(parent_run_id)
+            .bind(&msg)
+            .execute(&cn_pool)
+            .await;
+            crate::agent_types::AgentRunStatus::Failed
+        }
+    };
+
+    // is_final sul canale SSE: sblocca i client agganciati (terminale o nuovo
+    // awaiting_subagents). Best-effort: nessun subscriber -> ignorato.
+    let _ = tx.send(AgentStepEvent {
+        run_id: parent_run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: true,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: None,
+    });
+    state.agent_channels.remove(&parent_run_id);
+
+    Ok(status)
+}
+
 /// Assembla le `NativeDeps` (ToolRunner in-process + client gateway) da
 /// `AppState`. PUNTO UNICO (regola L): sia il run nativo primario
 /// (`run_via_native`) sia lo shadow (`run_shadow_for_state`) lo riusano, niente
@@ -4672,6 +4903,7 @@ mod tests_select_engine {
     fn outcome_base() -> crate::native_engine::NativeRunOutcome {
         crate::native_engine::NativeRunOutcome {
             completed: true,
+            awaiting_subagents: false,
             final_answer: Some("fatto".to_string()),
             stop_reason: Some(StopReason::EndTurn),
             provider_used: Some("anthropic".to_string()),
@@ -5647,5 +5879,64 @@ mod tests_finalize_turn {
         assert_eq!(short_file_label("a/b"), "a/b");
         assert_eq!(short_file_label("solo.ts"), "solo.ts");
         assert_eq!(short_file_label("a/b/c/d.ts"), ".../c/d.ts");
+    }
+
+    /// BUG #1 (correlazione risultati): dopo il fix, la coda porta il RUN CORRENTE
+    /// (target del resume), ma i figli sono registrati con `parent_run_id = ANCHOR`
+    /// (= COALESCE(parent_run_id, session_id)). `fanin_children_anchor` deriva
+    /// l'anchor dal run cosi' `fetch_subagent_fanin_results` ritrova i figli. Senza
+    /// questa derivazione (cercando i figli col run_id corrente) la raccolta
+    /// risultati sarebbe VUOTA.
+    #[sqlx::test]
+    async fn fanin_children_anchor_deriva_dal_run(pool: sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE agent_runs ( \
+                 id UUID PRIMARY KEY, \
+                 session_id UUID NOT NULL, \
+                 parent_run_id UUID )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create agent_runs");
+
+        let session = Uuid::new_v4();
+        let fallback = Uuid::new_v4();
+
+        // Caso run principale: parent_run_id NULL -> anchor = session_id.
+        let main_run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id, session_id, parent_run_id) VALUES ($1,$2,NULL)")
+            .bind(main_run)
+            .bind(session)
+            .execute(&pool)
+            .await
+            .expect("insert main run");
+        assert_eq!(
+            fanin_children_anchor(&pool, main_run, fallback).await,
+            session,
+            "run principale: anchor = session_id"
+        );
+
+        // Caso sub-run con parent_run_id reale -> anchor = parent_run_id.
+        let sub_parent = Uuid::new_v4();
+        let sub_run = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (id, session_id, parent_run_id) VALUES ($1,$2,$3)")
+            .bind(sub_run)
+            .bind(session)
+            .bind(sub_parent)
+            .execute(&pool)
+            .await
+            .expect("insert sub run");
+        assert_eq!(
+            fanin_children_anchor(&pool, sub_run, fallback).await,
+            sub_parent,
+            "sub-run: anchor = parent_run_id"
+        );
+
+        // Run inesistente -> fallback al session_id passato.
+        assert_eq!(
+            fanin_children_anchor(&pool, Uuid::new_v4(), fallback).await,
+            fallback,
+            "run assente: fallback al session_id"
+        );
     }
 }

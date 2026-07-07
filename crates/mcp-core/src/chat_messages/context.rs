@@ -388,8 +388,19 @@ pub(crate) fn spawn_embed_conversation_turn(
 /// ultimi `recent_count` messaggi raw (contesto immediato) + top-K
 /// messaggi semanticamente rilevanti dalla collection Qdrant.
 /// I risultati vengono deduplicati e ordinati cronologicamente.
+///
+/// Due pool distinti (separazione DB per-progetto):
+/// - `db`: pool del PROGETTO (`<slug>_nexus`), dove vive la tabella
+///   `chat_messages` letta dal raw fallback e dalla finestra recente.
+/// - `meta_db`: pool del META-DB, unica fonte dei setting GLOBALI (regola L,
+///   sezione G). La ricerca Qdrant risolve `qdrant_url` /
+///   `qdrant_conversation_context_collection` da qui: il DB progetto non ha la
+///   tabella `settings`, quindi passargli il pool progetto degradava sempre al
+///   raw fallback ("la relazione settings non esiste"). Stesso pattern del fix
+///   Fase C3 (leggere i flag globali dal meta, mai dal pool progetto).
 pub(crate) async fn build_vectorized_conversation_history(
     db: &PgPool,
+    meta_db: &PgPool,
     neural: &crate::orchestrator::NeuralCoreClient,
     session_id: Uuid,
     current_message: &str,
@@ -479,8 +490,10 @@ pub(crate) async fn build_vectorized_conversation_history(
             }
         };
 
+    // La ricerca Qdrant risolve i setting globali (qdrant_url, collection) dal
+    // META-DB: `db` e' il pool del progetto e non ha la tabella `settings`.
     let semantic_hits = match vector_memory::search_conversation_context(
-        db,
+        meta_db,
         &vector,
         session_id,
         semantic_top_k,

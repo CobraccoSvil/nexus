@@ -315,8 +315,15 @@ pub(crate) async fn resolve_classifier_fields(
 #[derive(Debug, Clone)]
 pub struct NativeRunOutcome {
     /// `true` se il run e' arrivato a `End` (Completed); `false` se si e' fermato
-    /// su un interrupt HITL (`awaiting_confirmation`).
+    /// su un interrupt HITL (`awaiting_confirmation`) o fan-in
+    /// (`awaiting_subagents`).
     pub completed: bool,
+    /// `true` se l'interrupt che ha fermato il run e' l'attesa dei sub-run
+    /// background (fan-in deterministico, Fase D): distingue questo interrupt da
+    /// quello HITL (`awaiting_confirmation`). Popolato da `map_outcome` leggendo
+    /// `state.is_awaiting_subagents()`. Letto da `classify_status` per mappare
+    /// `AwaitingSubagents` invece di `AwaitingConfirmation` sul ramo interrotto.
+    pub awaiting_subagents: bool,
     /// Risposta finale (campo `result` dello stato a fine run).
     pub final_answer: Option<String>,
     /// Motivo di stop dell'ultimo turno, se valorizzato.
@@ -498,7 +505,16 @@ impl NativeRunOutcome {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !self.completed && self.resume_at.is_some() {
-            AgentRunStatus::AwaitingConfirmation
+            // Ramo INTERROTTO (run SOSPESO, resumibile): due motivi di
+            // interrupt-resume oggi. Il fan-in dei sub-run background (Fase D)
+            // porta il segnale strutturato `awaiting_subagents` (regola M); il
+            // resto e' l'attesa di conferma umana (HITL). Discriminati qui cosi'
+            // il worker fan-in seleziona SOLO i propri run (CAS su questo status).
+            if self.awaiting_subagents {
+                AgentRunStatus::AwaitingSubagents
+            } else {
+                AgentRunStatus::AwaitingConfirmation
+            }
         } else if matches!(self.stop_reason, Some(StopReason::Error)) {
             AgentRunStatus::Failed
         } else if declared_refusal
@@ -1146,6 +1162,11 @@ async fn build_native_engine(
     Arc<dyn LlmGateway>,
     Arc<dyn ToolExecutor>,
     Arc<dyn EventSink>,
+    // `isolation_available`: worktree git effimeri disponibili per questo run
+    // (flag ON + root git isolabile). Alimenta il gate di orchestrazione del
+    // planner (Fase C3 Part B); `false` di default -> ParallelIsolated degrada a
+    // Sequential (invariato).
+    bool,
 )> {
     let db = deps.db.clone();
 
@@ -1169,6 +1190,13 @@ async fn build_native_engine(
     // ai_price_catalog, nexus_prompt_templates, routing matrix) restano su `db`.
     let run_db = crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id)
         .await;
+
+    // Fase C3 Part B: disponibilita' dell'isolamento fisico (worktree git) per
+    // questo run, calcolata UNA volta qui e passata al ctx (i nodi puri non fanno
+    // I/O). Corto-circuito su flag OFF (default) -> nessun probe git: zero costo
+    // aggiunto al percorso normale. Vedi `compute_run_isolation_available`.
+    let isolation_available =
+        compute_run_isolation_available(&db, &run_db, input.session_id, role).await;
 
     // ── Porte I/O concrete (14 impl FASE 2) ──────────────────────────────────
     // Gateway LLM: dipende dal ruolo (regola L, punto unico, stesso switch del
@@ -1324,25 +1352,9 @@ async fn build_native_engine(
     // (regola G), si innestano nel final_gate gli step gate=true. In SHADOW
     // niente inferenza (zero side-effect/costo): sola lettura del persistito.
     if final_gate_cfg.enabled {
-        let project_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT project_id FROM chat_sessions WHERE id = $1")
-                .bind(input.session_id)
-                .fetch_optional(&run_db)
-                .await
-                .ok()
-                .flatten();
-        let root: Option<String> = match project_id {
-            Some(pid) => sqlx::query_scalar(
-                "SELECT repository_root_path FROM projects WHERE id = $1",
-            )
-            .bind(pid)
-            .fetch_optional(&db)
-            .await
-            .ok()
-            .flatten(),
-            None => None,
-        };
-        if let (Some(pid), Some(root)) = (project_id, root.filter(|r| !r.trim().is_empty())) {
+        if let Some((pid, root)) =
+            resolve_session_project_root(&run_db, &db, input.session_id).await
+        {
             let mut steps = if role.is_shadow() {
                 crate::verify_profile::profile_steps(&db, pid).await
             } else {
@@ -1555,7 +1567,73 @@ async fn build_native_engine(
         };
 
     let engine = build_agent_graph(nodes, routing_cfg.clone(), planner_cfg, checkpointer);
-    Ok((engine, routing_cfg, llm, tools, emit))
+    Ok((engine, routing_cfg, llm, tools, emit, isolation_available))
+}
+
+/// Risolve `(project_id, repository_root_path)` di una sessione. PUNTO UNICO
+/// (regola L) della catena `chat_sessions.project_id` (sul DB del progetto,
+/// `run_db`) -> `projects.repository_root_path` (sul meta-DB): riusato dal setup
+/// del final_gate e dal compute dell'isolamento. `None` se la sessione non e'
+/// mappata a un progetto o la root e' vuota/assente.
+async fn resolve_session_project_root(
+    run_db: &PgPool,
+    meta_db: &PgPool,
+    session_id: Uuid,
+) -> Option<(Uuid, String)> {
+    let project_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT project_id FROM chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(run_db)
+            .await
+            .ok()
+            .flatten();
+    let pid = project_id?;
+    let root: Option<String> =
+        sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = $1")
+            .bind(pid)
+            .fetch_optional(meta_db)
+            .await
+            .ok()
+            .flatten();
+    root.filter(|r| !r.trim().is_empty()).map(|r| (pid, r))
+}
+
+/// Isolamento fisico DISPONIBILE per questo run (Fase C3 Part B). Ordine dei
+/// corto-circuiti scelto per NON aggiungere I/O al percorso normale:
+///   1. run SHADOW -> `false` (nessuna orchestrazione delegata in replay);
+///   2. flag `orchestrator.subagent_isolation_enabled` OFF (default) -> `false`
+///      SENZA risolvere la root ne' fare il probe git (costo zero);
+///   3. root del progetto non risolvibile -> `false`;
+///   4. `probe_isolatable` (FAIL-CLOSED) sulla root: `git worktree` utilizzabile.
+/// Riusa gli STESSI punti unici del batch tool (`isolation_flag_enabled`,
+/// `probe_isolatable`), cosi' il gate del planner e l'esecuzione reale
+/// dell'isolamento vedono lo stesso verdetto.
+///
+/// ATTENZIONE ai pool: il flag `orchestrator.subagent_isolation_enabled` e' un
+/// setting GLOBALE di piattaforma -> tabella `settings`, che vive SOLO nel
+/// META-DB (`meta_db`), non nei DB-progetto (`run_db`, `<slug>_nexus`: con
+/// separazione DB ON non ha affatto la tabella `settings`). Va quindi letto da
+/// `meta_db`, coerentemente col batch tool che legge da `ctx.core.db` (= meta).
+/// Solo la catena `chat_sessions -> projects` di `resolve_session_project_root`
+/// usa `run_db` per `chat_sessions` (dominio run) e `meta_db` per `projects`.
+async fn compute_run_isolation_available(
+    meta_db: &PgPool,
+    run_db: &PgPool,
+    session_id: Uuid,
+    role: RunRole,
+) -> bool {
+    if role.is_shadow() {
+        return false;
+    }
+    // Flag GLOBALE -> meta_db (NON run_db: li' `settings` non esiste a
+    // separazione DB ON e la query fallirebbe mascherandosi come flag OFF).
+    if !crate::agent_tools::subagent_native::isolation_flag_enabled(meta_db).await {
+        return false;
+    }
+    let Some((_pid, root)) = resolve_session_project_root(run_db, meta_db, session_id).await else {
+        return false;
+    };
+    nexus_tool_kit::worktree::probe_isolatable(std::path::Path::new(&root)).await
 }
 
 /// Converte una entry della history compatta `{"role","content"}` in `Message`.
@@ -1818,6 +1896,45 @@ fn build_resume_delta(resume_message: &str) -> nexus_graph::StateDelta {
     typed.into_opaque()
 }
 
+/// Costruisce il delta opaco del runtime che sblocca l'interrupt FAN-IN (Fase D):
+/// azzera `awaiting_subagents` (`Some(Some(false))`, load-bearing per non
+/// re-interrompere sul checkpoint ancora-in-attesa) e inietta i `subagent_results`
+/// dei figli background completati. Gemello di [`build_resume_delta`] (regola L):
+/// la differenza dall'HITL e' il MOTIVO di interrupt azzerato e il payload
+/// iniettato (risultati strutturati vs messaggio umano di approvazione). Il delta
+/// e' TIPIZZATO e passa per il reducer (`into_opaque`): non si scrivono i campi a
+/// mano. `subagent_results` sono i verdetti strutturati (regola M) letti dalle
+/// righe `nexus_subagent_runs`, non prosa.
+fn build_resume_delta_subagents(subagent_results: Vec<Value>) -> nexus_graph::StateDelta {
+    let typed = nexus_agent_graph::state::StateDelta {
+        // Azzera il predicato di interrupt fan-in: senza, il motore si
+        // re-interrompe sul checkpoint ancora-in-attesa (loop di fan-in).
+        awaiting_subagents: Some(Some(false)),
+        // Inietta gli esiti dei sub-run background: l'executor li rilegge nello
+        // stato (`subagent_results`) al riavvio del turno. Segnali strutturati
+        // (verdict/status), mai prosa (regola M).
+        subagent_results: Some(Some(subagent_results)),
+        ..Default::default()
+    };
+    typed.into_opaque()
+}
+
+/// RESUME FAN-IN di un run nativo PRIMARIO sospeso su `awaiting_subagents`
+/// (Fase D). Gemello di [`resume_native`] (regola L): riparte dal checkpoint
+/// Postgres via [`run_engine`] con `RunMode::Resume`, ma applicando il delta
+/// fan-in (azzera `awaiting_subagents` + inietta `subagent_results`) invece del
+/// delta HITL. Gli `input` portano provider/model/session/step_tx del run
+/// originale; il GRAFO riparte dal nodo salvato nel checkpoint.
+pub async fn resume_native_fanin(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+    subagent_results: Vec<Value>,
+) -> anyhow::Result<NativeRunOutcome> {
+    let resume_delta = build_resume_delta_subagents(subagent_results);
+    let outcome = run_engine(deps, input, RunMode::Resume { resume_delta }, RunRole::Primary).await?;
+    Ok(map_outcome(outcome))
+}
+
 /// Esegue il grafo nativo end-to-end e ritorna lo [`StepOutcome`] COMPLETO (lo
 /// stato finale, non solo il sommario): il run shadow ne ha bisogno per la
 /// proiezione canonica (conteggio tool, produced_work). Punto unico (regola L)
@@ -1833,7 +1950,8 @@ async fn run_engine(
     mode: RunMode,
     role: RunRole,
 ) -> anyhow::Result<StepOutcome<AgentState>> {
-    let (engine, routing_cfg, llm, tools, emit) = build_native_engine(deps, input, role).await?;
+    let (engine, routing_cfg, llm, tools, emit, isolation_available) =
+        build_native_engine(deps, input, role).await?;
 
     let ctx = AgentNodeCtx {
         db: deps.db.clone(),
@@ -1849,6 +1967,9 @@ async fn run_engine(
         // unico AgentNodeCtx::exec_mode) -> tutti gli store gatati no-op, zero
         // side-effect. Il primario e' Real.
         shadow: role.is_shadow(),
+        // Fase C3 Part B: isolamento fisico dei sub-run disponibile (calcolato in
+        // build_native_engine, flag-gated). Alimenta il gate di orchestrazione.
+        isolation_available,
     };
 
     // Avvio nuovo: parte da `entry` con l'initial_state dal prompt.
@@ -1957,6 +2078,10 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
     };
     NativeRunOutcome {
         completed,
+        // Fan-in (Fase D): l'interrupt e' l'attesa dei sub-run background se lo
+        // stato porta ancora `awaiting_subagents=true`. Segnale strutturato
+        // (regola M) letto dallo stato, non dedotto dal `resume_at`.
+        awaiting_subagents: state.is_awaiting_subagents(),
         final_answer: state.result.clone(),
         stop_reason: state.stop_reason,
         provider_used: state.provider_used.clone(),
@@ -2799,6 +2924,52 @@ mod tests {
     }
 
     #[test]
+    fn build_resume_delta_subagents_azzera_await_e_inietta_risultati() {
+        use nexus_graph::GraphState;
+        // Stato sospeso su fan-in (Fase D) con un messaggio pregresso.
+        let mut state = AgentState {
+            awaiting_subagents: Some(true),
+            messages: vec![Message::Human {
+                content: nexus_agent_graph::state::MessageContent::text("task iniziale"),
+            }],
+            ..Default::default()
+        };
+        // Risultati strutturati dei figli background (forma tool_result poll,
+        // regola M: verdict/status, non prosa).
+        let results = vec![
+            serde_json::json!({
+                "subagent_run_id": "aaa",
+                "kind": "coder",
+                "status": "completed",
+                "summary": "fatto",
+                "outcome": {"verdict": "completed_verified", "success": true},
+            }),
+            serde_json::json!({
+                "subagent_run_id": "bbb",
+                "kind": "review",
+                "status": "completed",
+                "summary": "ok",
+                "outcome": {"verdict": "completed", "success": true},
+            }),
+        ];
+        let delta = build_resume_delta_subagents(results.clone());
+        state.merge(delta);
+
+        assert!(
+            !state.is_awaiting_subagents(),
+            "il delta deve azzerare awaiting_subagents (sblocca l'interrupt fan-in)"
+        );
+        // I risultati sono OVERWRITE nello stato (non append come i messaggi).
+        assert_eq!(
+            state.subagent_results.as_ref().map(|r| r.len()),
+            Some(2),
+            "i risultati dei sub-run sono iniettati nello stato"
+        );
+        // I messaggi NON sono toccati dal delta fan-in (nessun turno umano).
+        assert_eq!(state.messages.len(), 1, "nessun messaggio umano accodato");
+    }
+
+    #[test]
     fn parse_automation_mode_robusto() {
         // Una modalita' nota deve parsare; una ignota -> None (nessun panic).
         let known = parse_automation_mode("automatic");
@@ -3320,6 +3491,7 @@ mod tests {
     fn base_outcome() -> NativeRunOutcome {
         NativeRunOutcome {
             completed: true,
+            awaiting_subagents: false,
             final_answer: Some("fatto".to_string()),
             stop_reason: None,
             provider_used: None,
@@ -3356,6 +3528,28 @@ mod tests {
             ..base_outcome()
         };
         assert_eq!(o.classify_status(), AgentRunStatus::AwaitingConfirmation);
+    }
+
+    #[test]
+    fn classify_status_awaiting_subagents_fan_in() {
+        // Fase D fan-in: stesso ramo INTERROTTO (completed=false, resume_at
+        // valorizzato) di AwaitingConfirmation, ma il segnale strutturato
+        // `awaiting_subagents` (regola M) discrimina l'interrupt fan-in.
+        let fanin = NativeRunOutcome {
+            completed: false,
+            awaiting_subagents: true,
+            resume_at: Some(NodeId::ToolDispatch.as_label().to_string()),
+            ..base_outcome()
+        };
+        assert_eq!(fanin.classify_status(), AgentRunStatus::AwaitingSubagents);
+        // Senza il flag, lo stesso interrupt resta HITL (parita' regressione).
+        let hitl = NativeRunOutcome {
+            completed: false,
+            awaiting_subagents: false,
+            resume_at: Some(NodeId::ToolDispatch.as_label().to_string()),
+            ..base_outcome()
+        };
+        assert_eq!(hitl.classify_status(), AgentRunStatus::AwaitingConfirmation);
     }
 
     #[test]

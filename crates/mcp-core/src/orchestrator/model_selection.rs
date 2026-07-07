@@ -147,6 +147,14 @@ pub(crate) struct EligibilityFilter<'a> {
     pub exclude_providers: &'a [String],
     /// `true` => esclude anche i provider attualmente in cooldown (snapshot).
     pub apply_cooldown: bool,
+    /// `Some(p)` => RESTRINGE la selezione al SOLO provider `p` (filtro POSITIVO
+    /// `AND LOWER(provider) = LOWER(p)`), oltre a tutti gli altri filtri. Usato
+    /// per la propagazione del PIN del provider ai sub-agenti worker: il pin e'
+    /// una preferenza-forte tier-aware (tier+capability+tool_use invariati, solo
+    /// il provider e' vincolato). `None` (default storico) => nessuna restrizione,
+    /// comportamento bit-identico per i ~13 costruttori esistenti. Il valore e'
+    /// BINDATO (mai interpolato): niente SQL injection.
+    pub only_provider: Option<&'a str>,
 }
 
 /// PUNTO UNICO (regola L) del mapping capability -> colonna booleana canonica
@@ -277,6 +285,13 @@ pub(crate) async fn select_models_tierchain(
             idx += 1;
             sql.push_str(&format!(" AND context_window >= ${idx}"));
         }
+        if filter.only_provider.is_some() {
+            // PIN provider (filtro POSITIVO): restringe al solo provider pinnato.
+            // Ultimo placeholder DOPO min_context_window per preservare lo schema
+            // idx incrementale; il valore e' bindato lowercase (no interpolazione).
+            idx += 1;
+            sql.push_str(&format!(" AND LOWER(provider) = ${idx}"));
+        }
         // ORDER BY: capacita'/costo (`order_by`) e' il criterio PRIMARIO. Il
         // pre-ordinamento ADR 0025 (preferire i modelli nativamente non-thinking,
         // `policy='none'`) e' declassato a TIE-BREAKER finale. Razionale (regola H,
@@ -304,6 +319,10 @@ pub(crate) async fn select_models_tierchain(
         }
         if filter.min_context_window > 0 {
             q = q.bind(filter.min_context_window);
+        }
+        if let Some(p) = filter.only_provider {
+            // Stesso ordine dei placeholder: bind DOPO min_context_window.
+            q = q.bind(p.to_lowercase());
         }
         let rows = q
             .fetch_all(db)
@@ -476,6 +495,7 @@ mod tests {
             min_context_window: 0,
             exclude_providers: &[],
             apply_cooldown: false,
+            only_provider: None,
         };
         let out = select_models_tierchain(
             &pool,
@@ -495,6 +515,91 @@ mod tests {
                 Some("heavy".to_string())
             )]
         );
+    }
+
+    /// TEST 6 — only_provider (PIN): `Some(p)` RESTRINGE la selezione al solo
+    /// provider `p` (filtro positivo bindato); `None` = query identica alla
+    /// precedente (nessuna regressione per i chiamanti storici). Discriminante:
+    /// senza pin vince il piu' economico (mistral); col pin='openai' vince openai
+    /// anche se piu' caro (il pin e' preferenza-forte tier-aware).
+    #[sqlx::test]
+    async fn tierchain_only_provider_restringe_e_none_invariato(pool: sqlx::PgPool) {
+        create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, input_cost_per_million_tokens) VALUES \
+             ('mistral', 'm-economico', true, 'none', 'heavy', 2.0), \
+             ('openai', 'o-caro', true, 'none', 'heavy', 10.0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        // None: nessuna restrizione -> il piu' economico (mistral).
+        let f_none = EligibilityFilter {
+            require_tool_use: true,
+            require_thinking_non_exclude: true,
+            capability: None,
+            min_context_window: 0,
+            exclude_providers: &[],
+            apply_cooldown: false,
+            only_provider: None,
+        };
+        let out_none = select_models_tierchain(
+            &pool,
+            &f_none,
+            &["heavy"],
+            "input_cost_per_million_tokens ASC",
+            1,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(
+            out_none,
+            vec![(
+                "mistral".to_string(),
+                "m-economico".to_string(),
+                Some("heavy".to_string())
+            )],
+            "None: query invariata, vince il piu' economico"
+        );
+        // Some('openai'): restringe a openai anche se piu' caro.
+        let f_pin = EligibilityFilter {
+            only_provider: Some("openai"),
+            ..f_none.clone()
+        };
+        let out_pin = select_models_tierchain(
+            &pool,
+            &f_pin,
+            &["heavy"],
+            "input_cost_per_million_tokens ASC",
+            1,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(
+            out_pin,
+            vec![(
+                "openai".to_string(),
+                "o-caro".to_string(),
+                Some("heavy".to_string())
+            )],
+            "Some('openai'): filtro positivo, solo openai"
+        );
+        // Some di un provider ASSENTE dal catalog -> nessun candidato (pool vuoto).
+        let f_absent = EligibilityFilter {
+            only_provider: Some("deepseek"),
+            ..f_none.clone()
+        };
+        let out_absent = select_models_tierchain(
+            &pool,
+            &f_absent,
+            &["heavy"],
+            "input_cost_per_million_tokens ASC",
+            1,
+        )
+        .await
+        .expect("ok");
+        assert!(out_absent.is_empty(), "provider pinnato assente -> pool vuoto");
     }
 
     #[sqlx::test]
@@ -518,6 +623,7 @@ mod tests {
             min_context_window: 0,
             exclude_providers: &[],
             apply_cooldown: false,
+            only_provider: None,
         };
         let out = select_models_tierchain(
             &pool,
@@ -563,6 +669,7 @@ mod tests {
             min_context_window: 0,
             exclude_providers: &[],
             apply_cooldown: false,
+            only_provider: None,
         };
         let out = select_models_tierchain(
             &pool,
@@ -601,6 +708,7 @@ mod tests {
             min_context_window: 0,
             exclude_providers: &[],
             apply_cooldown: false,
+            only_provider: None,
         };
         let out = select_models_tierchain(
             &pool,
@@ -636,6 +744,7 @@ mod tests {
             min_context_window: 0,
             exclude_providers: &[],
             apply_cooldown: false,
+            only_provider: None,
         };
         let out = select_models_tierchain(
             &pool,
@@ -676,6 +785,7 @@ mod tests {
             min_context_window: 0,
             exclude_providers: &[],
             apply_cooldown: false,
+            only_provider: None,
         };
         let out = select_models_tierchain(
             &pool,
@@ -717,6 +827,7 @@ mod tests {
             min_context_window: 0,
             exclude_providers: &[],
             apply_cooldown: false,
+            only_provider: None,
         };
         let out = select_models_tierchain(
             &pool,
@@ -759,6 +870,7 @@ mod tests {
             min_context_window: 0,
             exclude_providers: &[],
             apply_cooldown: false,
+            only_provider: None,
         };
         let out = select_models_tierchain(
             &pool,

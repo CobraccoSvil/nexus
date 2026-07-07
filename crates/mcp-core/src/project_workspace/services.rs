@@ -8,7 +8,7 @@ use super::*;
 /// giu' stdout e' vuoto e il chiamante, senza questo check, mostrerebbe il
 /// messaggio fuorviante "Nessun servizio trovato" anche quando i file .service
 /// esistono. Vedi ADR 0022.
-fn user_manager_unavailable(output: &std::process::Output) -> bool {
+pub(super) fn user_manager_unavailable(output: &std::process::Output) -> bool {
     if output.status.success() {
         return false;
     }
@@ -17,6 +17,13 @@ fn user_manager_unavailable(output: &std::process::Output) -> bool {
         || stderr.contains("connection refused")
         || stderr.contains("failed to get d-bus connection")
         || stderr.contains("refusing to operate")
+}
+
+/// Suggerimento operativo mostrato quando il manager systemd utente e' giu'.
+/// Espone `USER_MANAGER_HINT` per il nuovo `service_manager` senza duplicarne
+/// il testo (regola L).
+pub(super) fn user_manager_hint() -> &'static str {
+    USER_MANAGER_HINT
 }
 
 /// Suggerimento operativo mostrato in UI quando il manager utente e' giu'.
@@ -355,11 +362,51 @@ pub(super) fn visible_windows_services(
     visible
 }
 
+/// Riconciliazione stato servizi (pura, testabile). Regola M: "running" implica un
+/// processo VIVO; la stringa `status` in DB puo' restare stale (un processo muore
+/// senza aggiornare la riga: crash, kill esterno, riavvio host). Una riga
+/// running/starting il cui pid non e' piu' vivo viene corretta a "stopped".
+/// Ritorna le righe corrette (per `visible_windows_services`) e i pid morti da
+/// persistere come stopped. Punto unico della regola (regola L).
+///
+/// Limite noto (riciclo PID): `is_alive` puo' dare falso positivo se il pid e'
+/// stato riusato da un processo estraneo -> la riga resta 'running'. E' l'edge che
+/// l'observer risolve con la validazione dello started_at; qui la liveness copre il
+/// caso comune (pid morto e non riusato) ed e' comunque un miglioramento netto.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn reconcile_dead_service_rows(
+    rows: Vec<(String, String, Option<i32>, chrono::DateTime<chrono::Utc>)>,
+    is_alive: impl Fn(i32) -> bool,
+) -> (
+    Vec<(String, String, chrono::DateTime<chrono::Utc>)>,
+    Vec<i32>,
+) {
+    let mut dead_pids = Vec::new();
+    let reconciled = rows
+        .into_iter()
+        .map(|(label, status, pid, created)| {
+            let running = matches!(status.as_str(), "running" | "starting");
+            let alive = pid.map(|p| p > 0 && is_alive(p)).unwrap_or(false);
+            if running && !alive {
+                if let Some(p) = pid {
+                    if p > 0 {
+                        dead_pids.push(p);
+                    }
+                }
+                (label, "stopped".to_string(), created)
+            } else {
+                (label, status, created)
+            }
+        })
+        .collect();
+    (reconciled, dead_pids)
+}
+
 /// Windows: elenca i servizi di progetto come processi gestiti (agent_processes
 /// kind='service'), nella STESSA shape di list_services_fallback. Su Windows non
 /// esistono unit systemd: l'install (install_service_windows) registra i servizi
 /// qui. Voci calcolate da visible_windows_services (dedup per label, voci
-/// fantasma nascoste).
+/// fantasma nascoste). Riconcilia (e persiste) le righe stale prima del display.
 #[cfg(windows)]
 pub(super) async fn list_services_windows(
     db: &sqlx::PgPool,
@@ -369,16 +416,40 @@ pub(super) async fn list_services_windows(
     // Separazione DB per-progetto: agent_processes e' tabella migrata, instrada
     // sul pool del progetto (flag OFF -> ritorna il meta-pool, behavior-preserving).
     let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-    let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT label, status, created_at FROM agent_processes \
-         WHERE project_id = $1 AND kind = 'service' \
-         ORDER BY label, created_at DESC",
-    )
-    .bind(project_id)
-    .fetch_all(&proj_pool)
-    .await
-    .unwrap_or_default();
-    visible_windows_services(&rows)
+    let rows: Vec<(String, String, Option<i32>, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(
+            "SELECT label, status, pid, created_at FROM agent_processes \
+             WHERE project_id = $1 AND kind = 'service' \
+             ORDER BY label, created_at DESC",
+        )
+        .bind(project_id)
+        .fetch_all(&proj_pool)
+        .await
+        .unwrap_or_default();
+
+    // Self-heal: una riga running/starting con pid morto diventa 'stopped' sia nel
+    // display sia in DB, cosi' il pannello non mostra 'running' un processo defunto
+    // (stato stale) e gli altri consumer leggono uno stato veritiero.
+    let (reconciled, dead_pids) =
+        reconcile_dead_service_rows(rows, |p| crate::process_util::process_alive(p as u32));
+    if !dead_pids.is_empty() {
+        let _ = sqlx::query(
+            "UPDATE agent_processes SET status = 'stopped', stopped_at = now() \
+             WHERE project_id = $1 AND kind = 'service' \
+               AND status IN ('running', 'starting') AND pid = ANY($2)",
+        )
+        .bind(project_id)
+        .bind(&dead_pids)
+        .execute(&proj_pool)
+        .await;
+        tracing::info!(
+            project_id = %project_id,
+            count = dead_pids.len(),
+            "list_services_windows: servizi con pid morto riconciliati a stopped"
+        );
+    }
+
+    visible_windows_services(&reconciled)
         .into_iter()
         .map(|(label, running)| {
             json!({
@@ -1005,46 +1076,63 @@ async fn control_project_service_systemd(
 /// `control_project_service` (free_ports_for_unit, fallback detached WSL) — punto
 /// unico a livello di helper (regola L).
 pub async fn restart_project_unit(state: &AppState, project_id: Uuid, unit: &str) {
+    use super::service_manager::{self, ServiceBackend};
+
     if unit.contains('/') || unit.contains("..") || !unit.ends_with(".service") {
         tracing::warn!(unit = %unit, "restart_project_unit: nome unit non valido, skip");
         return;
     }
-    // Pre-restart: libera eventuali porte occupate da processi estranei.
-    free_ports_for_unit(unit).await;
 
-    let out = tokio::process::Command::new("systemctl")
-        .args(["--user", "restart", unit])
-        .output()
-        .await;
-    let needs_detached = match &out {
-        Ok(o) => user_manager_unavailable(o),
-        Err(_) => true,
-    };
-    if needs_detached {
-        // Manager --user giu' (WSL): avvio detached leggendo l'unit file.
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
-        let unit_path = format!("{home}/.config/systemd/user/{unit}");
-        if let Ok(content) = tokio::fs::read_to_string(&unit_path).await {
-            let exec_start = unit_exec_start(&content);
-            let cwd = unit_working_dir(&content);
-            if !exec_start.is_empty() && !cwd.is_empty() {
-                let env_map = unit_env_map(&content);
-                if let Err(e) =
-                    super::wizard::spawn_detached_service(unit, &cwd, &env_map, &exec_start).await
-                {
-                    tracing::warn!(unit = %unit, error = %e, "restart_project_unit: spawn detached fallito");
-                }
-            }
+    // Carica nome + root del progetto per costruire il contesto del ServiceManager
+    // (chiamata interna senza user: query diretta su projects).
+    let proj: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, repository_root_path FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    let (name, root_opt) = match proj {
+        Some(p) => p,
+        None => {
+            tracing::warn!(unit = %unit, %project_id, "restart_project_unit: progetto non trovato, skip");
+            return;
         }
-    }
-    nexus_events::dispatcher::emit(
-        &state.project_channels,
+    };
+    let slug = project_service_slug(&name);
+    let root = std::path::PathBuf::from(root_opt.unwrap_or_default());
+    let short = unit
+        .strip_prefix(&format!("{slug}-"))
+        .unwrap_or(unit)
+        .strip_suffix(".service")
+        .unwrap_or(unit);
+
+    // Punto unico (regola L): delega al ServiceManager della piattaforma (Windows:
+    // agent_processes; Linux: systemctl --user + fallback detached, con pre-free
+    // porte incapsulato nel backend). L'evento ServiceRestarted si emette SOLO se
+    // l'azione e' avvenuta davvero (outcome.acted, regola M): chiude il bug per cui
+    // su Windows, dove systemctl e' assente, la funzione non riavviava nulla ma
+    // emetteva comunque ServiceRestarted, mentendo al loop di auto-remediation.
+    let ctx = service_manager::ServiceContext {
+        db: &state.db,
+        port_registry: Some(&state.port_registry),
         project_id,
-        nexus_events::event::ProjectEvent::ServiceRestarted {
-            name: unit.to_string(),
-        },
-    );
-    tracing::info!(unit = %unit, "restart_project_unit: riavvio richiesto (auto-remediation)");
+        slug: &slug,
+        project_root: &root,
+    };
+    let outcome = service_manager::active().restart(&ctx, short).await;
+    if outcome.acted {
+        nexus_events::dispatcher::emit(
+            &state.project_channels,
+            project_id,
+            nexus_events::event::ProjectEvent::ServiceRestarted {
+                name: unit.to_string(),
+            },
+        );
+        tracing::info!(unit = %unit, msg = %outcome.message, "restart_project_unit: riavvio effettuato (auto-remediation)");
+    } else {
+        tracing::warn!(unit = %unit, msg = %outcome.message, "restart_project_unit: riavvio NON effettuato, nessun evento emesso");
+    }
 }
 
 // ── POST /api/projects/:id/services/restart-all ─────────────────────────────
@@ -1054,55 +1142,36 @@ pub async fn restart_all_project_services(
     Extension(claims): Extension<Claims>,
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult {
+    use super::service_manager::{self, ServiceBackend};
+
     let user_id = parse_user_id(&claims)?;
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let context = load_project_context(&state.db, project_id, user_id).await?;
-    let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
+    let slug = project_service_slug(&context.details.name);
 
-    // Lista delle unit del progetto
-    let prefix = format!("{}-", slug);
-    let list = tokio::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "list-units",
-            "--type=service",
-            "--all",
-            "--no-legend",
-            "--no-pager",
-        ])
-        .output()
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let list_str = String::from_utf8_lossy(&list.stdout);
-    let units: Vec<String> = list_str
-        .lines()
-        .filter_map(|line| {
-            let unit = line.split_whitespace().next()?;
-            if unit.starts_with(&prefix) {
-                Some(unit.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
+    // Punto unico (regola L): enumera e riavvia i servizi del progetto tramite il
+    // ServiceManager della piattaforma. Su Windows usa agent_processes (prima
+    // ritornava HTTP 500 perche' `systemctl` non esiste); su Linux usa i file unit
+    // + systemctl con pre-free porte incapsulato nel backend. L'esito per servizio
+    // e' `acted` (segnale strutturato, regola M), non lo stderr di un comando.
+    let ctx = service_manager::ServiceContext {
+        db: &state.db,
+        port_registry: Some(&state.port_registry),
+        project_id,
+        slug: &slug,
+        project_root: &context.root_path,
+    };
+    let mgr = service_manager::active();
     let mut results = Vec::new();
-    for unit in &units {
-        let freed = free_ports_for_unit(unit).await;
-        let out = tokio::process::Command::new("systemctl")
-            .args(["--user", "restart", unit])
-            .output()
-            .await;
-        match out {
-            Ok(o) => results.push(json!({
-                "unit": unit,
-                "ok": o.status.success(),
-                "stderr": String::from_utf8_lossy(&o.stderr).to_string(),
-                "freed_ports": freed,
-            })),
-            Err(e) => results.push(json!({ "unit": unit, "ok": false, "stderr": e.to_string() })),
-        }
+    for entry in mgr.list(&ctx).await {
+        let outcome = mgr.restart(&ctx, &entry.label).await;
+        results.push(json!({
+            "unit": entry.id,
+            "short": entry.label,
+            "ok": outcome.acted,
+            "message": outcome.message,
+        }));
     }
     Ok(Json(json!({ "slug": slug, "restarted": results })))
 }
@@ -1163,50 +1232,6 @@ fn parse_main_pid_stdout(stdout: &str) -> Option<u32> {
             .and_then(|val| val.trim().parse::<u32>().ok())
             .filter(|&pid| pid > 0)
     })
-}
-
-/// Insieme dei PID protetti dal reset porte di un progetto: i MainPID dei servizi
-/// systemd `{slug}-*.service` piu' tutti i loro discendenti (BFS su /proc).
-/// Estratto da `cleanup_project_ports` per tenerla sotto soglia; comportamento
-/// invariato.
-async fn collect_protected_project_pids(
-    slug: &str,
-) -> Result<std::collections::HashSet<u32>, String> {
-    let prefix = format!("{}-", slug);
-    let units = list_project_service_units(&prefix).await;
-
-    let mut protected_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for unit in &units {
-        let show_out = tokio::process::Command::new("systemctl")
-            .args(["--user", "show", unit, "--property=MainPID"])
-            .output()
-            .await
-            .ok();
-        if let Some(o) = show_out {
-            if let Some(pid) = parse_main_pid_stdout(&String::from_utf8_lossy(&o.stdout)) {
-                protected_pids.insert(pid);
-            }
-        }
-    }
-
-    // Espande PID protetti con tutti i discendenti (BFS) per non ucciderli per sbaglio.
-    // Scan /proc sincrono → spawn_blocking per non bloccare il runtime tokio. La
-    // mappa parent->children e' costruita dal punto unico `build_children_map`.
-    let children: std::collections::HashMap<u32, Vec<u32>> =
-        tokio::task::spawn_blocking(|| build_children_map(&[]))
-            .await
-            .unwrap_or_default();
-    let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
-    while let Some(pid) = queue.pop_front() {
-        if let Some(kids) = children.get(&pid) {
-            for &c in kids {
-                if protected_pids.insert(c) {
-                    queue.push_back(c);
-                }
-            }
-        }
-    }
-    Ok(protected_pids)
 }
 
 /// Termina i listener non protetti tra quelli passati, rispettando la whitelist
@@ -1274,18 +1299,156 @@ pub async fn cleanup_project_ports(
         None => std::collections::HashSet::new(),
     };
 
-    // Raccoglie i MainPID dei servizi systemd del progetto (PID protetti) e i loro
-    // discendenti (BFS), per non ucciderli per sbaglio nel reset porte.
-    let protected_pids = collect_protected_project_pids(&slug)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // PID protetti: i servizi del progetto (e i loro discendenti) non vanno mai
+    // uccisi dal reset porte. La sorgente e' platform-specific (punto unico a
+    // livello di concern, regola L): su Windows i servizi sono processi gestiti in
+    // agent_processes; su Linux sono i MainPID delle unit systemd `{slug}-*`.
+    let mut protected_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
-    // Trova tutti i processi che ascoltano sulle porte e killa quelli non protetti
-    let listening = match read_listening_ports_ss().await {
-        Ok(v) => v,
-        Err(_) => tokio::task::spawn_blocking(read_listening_ports_proc)
+    #[cfg(windows)]
+    {
+        // Windows: pid vivi dei servizi del progetto (agent_processes) + tutti i
+        // discendenti risalendo l'albero processi Win32 (windows_process_parents).
+        let proj_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+        let svc_pids: Vec<(Option<i32>,)> = sqlx::query_as(
+            "SELECT pid FROM agent_processes \
+             WHERE project_id = $1 AND kind = 'service' \
+               AND status IN ('running', 'starting') AND pid IS NOT NULL",
+        )
+        .bind(project_id)
+        .fetch_all(&proj_pool)
+        .await
+        .unwrap_or_default();
+        for (pid,) in svc_pids {
+            if let Some(p) = pid {
+                if p > 0 && crate::process_util::process_alive(p as u32) {
+                    protected_pids.insert(p as u32);
+                }
+            }
+        }
+        // Espansione ai discendenti: mappa parent->children (Win32 invertita).
+        let child_to_parent = windows_process_parents().await;
+        let mut parent_to_children: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
+        for (child, parent) in &child_to_parent {
+            parent_to_children.entry(*parent).or_default().push(*child);
+        }
+        let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
+        while let Some(pid) = queue.pop_front() {
+            if let Some(kids) = parent_to_children.get(&pid) {
+                for &c in kids {
+                    if protected_pids.insert(c) {
+                        queue.push_back(c);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // Linux: MainPID dei servizi systemd `{slug}-*` del progetto (PID protetti).
+        let prefix = format!("{}-", slug);
+        let list_out = tokio::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--type=service",
+                "--all",
+                "--no-legend",
+                "--no-pager",
+            ])
+            .output()
             .await
-            .unwrap_or_default(),
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let list_str = String::from_utf8_lossy(&list_out.stdout);
+        let units: Vec<String> = list_str
+            .lines()
+            .filter_map(|line| {
+                let unit = line.split_whitespace().next()?;
+                if unit.starts_with(&prefix) {
+                    Some(unit.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for unit in &units {
+            let show_out = tokio::process::Command::new("systemctl")
+                .args(["--user", "show", unit, "--property=MainPID"])
+                .output()
+                .await
+                .ok();
+            if let Some(o) = show_out {
+                let s = String::from_utf8_lossy(&o.stdout);
+                for line in s.lines() {
+                    if let Some(val) = line.strip_prefix("MainPID=") {
+                        if let Ok(pid) = val.trim().parse::<u32>() {
+                            if pid > 0 {
+                                protected_pids.insert(pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Espande PID protetti con tutti i discendenti (BFS) per non ucciderli per sbaglio.
+        // Scan /proc sincrono -> spawn_blocking per non bloccare il runtime tokio.
+        let children: std::collections::HashMap<u32, Vec<u32>> = tokio::task::spawn_blocking(|| {
+            let mut map: std::collections::HashMap<u32, Vec<u32>> =
+                std::collections::HashMap::new();
+            if let Ok(proc_entries) = std::fs::read_dir("/proc") {
+                for entry in proc_entries.flatten() {
+                    let n = entry.file_name();
+                    let s = n.to_string_lossy();
+                    if let Ok(pid) = s.parse::<u32>() {
+                        if let Ok(content) =
+                            std::fs::read_to_string(format!("/proc/{}/status", pid))
+                        {
+                            for line in content.lines() {
+                                if let Some(rest) = line.strip_prefix("PPid:") {
+                                    if let Ok(ppid) = rest.trim().parse::<u32>() {
+                                        map.entry(ppid).or_default().push(pid);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            map
+        })
+        .await
+        .unwrap_or_default();
+        let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
+        while let Some(pid) = queue.pop_front() {
+            if let Some(kids) = children.get(&pid) {
+                for &c in kids {
+                    if protected_pids.insert(c) {
+                        queue.push_back(c);
+                    }
+                }
+            }
+        }
+    }
+
+    // Trova tutti i processi che ascoltano sulle porte e killa quelli non protetti.
+    // Punto unico (regola L): il ServiceManager della piattaforma fornisce le terne
+    // (porta, pid, programma) — su Windows via Get-NetTCPConnection, su Linux via
+    // ss/proc. Prima usava solo ss/proc -> lista vuota su Windows -> il reset non
+    // liberava nulla.
+    let listening: Vec<(u16, u32, String)> = {
+        use super::service_manager::ServiceBackend;
+        super::service_manager::active()
+            .listening_ports()
+            .await
+            .into_iter()
+            .map(|l| (l.port, l.pid, l.program))
+            .collect()
     };
 
     let (killed, skipped) = kill_unprotected_listeners(listening, &target_ports, &protected_pids).await;
@@ -1340,7 +1503,8 @@ pub async fn get_project_ports(
         }
     }
 
-    // Aggiungi le allocazioni in DB non gia presenti come live
+    // Allocazioni port<->servizio dal DB: sono la FONTE AUTORITATIVA del mapping
+    // (Nexus alloca la porta a una label PRIMA dello spawn, regola L). Le usiamo per due cose.
     let allocations: Vec<(i32, String, String)> = sqlx::query_as::<_, (i32, String, String)>(
         "SELECT port, COALESCE(label, ''), allocation_mode \
          FROM nexus_port_allocations WHERE project_id = $1",
@@ -1349,6 +1513,20 @@ pub async fn get_project_ports(
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
+
+    // (1) Arricchisci le porte LIVE il cui `service` NON e' stato risolto dall'albero
+    // processi con la label dell'allocazione. Senza questo, un dev server orfano
+    // (avviato fuori da Nexus, o il cui pid di servizio e' morto e non e' piu'
+    // antenato del listener) restava con service=null -> il pannello non mostrava il
+    // link URL, pur sapendo Nexus a quale servizio la porta e' allocata.
+    let alloc_label_by_port: std::collections::HashMap<i32, String> = allocations
+        .iter()
+        .filter(|(_, label, _)| !label.trim().is_empty())
+        .map(|(port, label, _)| (*port, label.clone()))
+        .collect();
+    assign_service_from_allocations(&mut ports, &alloc_label_by_port);
+
+    // (2) Aggiungi le allocazioni non ancora live.
     for (port, label, mode) in allocations {
         if !live_ports.contains(&port) {
             ports.push(json!({
@@ -1430,6 +1608,33 @@ fn propagate_service_to_descendants(
                 if was_new {
                     svc_queue.push_back(child);
                 }
+            }
+        }
+    }
+}
+
+/// Assegna il campo `service` alle porte LIVE prive di risoluzione dall'albero
+/// processi, usando la mappa autoritativa port->label di `nexus_port_allocations`
+/// (regola L). Non sovrascrive un `service` gia' risolto. Pura e testabile.
+pub(super) fn assign_service_from_allocations(
+    ports: &mut [serde_json::Value],
+    alloc_label_by_port: &std::collections::HashMap<i32, String>,
+) {
+    for p in ports.iter_mut() {
+        let Some(obj) = p.as_object_mut() else {
+            continue;
+        };
+        let has_service = obj
+            .get("service")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if has_service {
+            continue;
+        }
+        if let Some(port_num) = obj.get("port").and_then(|v| v.as_i64()) {
+            if let Some(label) = alloc_label_by_port.get(&(port_num as i32)) {
+                obj.insert("service".to_string(), json!(label));
             }
         }
     }
@@ -2018,7 +2223,10 @@ pub(crate) fn is_web_service_script(script_name: &str) -> bool {
 /// Prima di avviare un servizio systemd, estrae le porte dal file .service
 /// (Environment= e ExecStart) e libera quelle occupate da processi estranei
 /// (inclusi container Docker). Ritorna le porte effettivamente liberate.
-async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
+///
+/// `pub(super)` per essere richiamata dal punto unico `service_manager`
+/// (SystemdUserBackend) che ne preserva il pre-start su Linux (regola L).
+pub(super) async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let unit_path = format!("{}/.config/systemd/user/{}", home, unit_name);
     let unit_content = match tokio::fs::read_to_string(&unit_path).await {
@@ -2584,7 +2792,18 @@ pub struct PortBinding {
 ///
 /// Usata dal `port_enforcer` per individuare violazioni: processi di progetto
 /// che bindano porte fuori dal bucket assegnato.
+///
+/// Windows nativo: niente `ss`/`/proc`. La rilevazione usa il percorso dedicato
+/// `detect_all_port_bindings_windows` (Get-NetTCPConnection + albero processi
+/// Win32). Senza questo dispatch la lista usciva SEMPRE vuota -> il port_enforcer
+/// e il kill di `delete_port_allocation`/`cleanup_project_ports` erano ciechi.
+#[cfg_attr(windows, allow(unreachable_code))]
 pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBinding>, String> {
+    #[cfg(windows)]
+    {
+        return detect_all_port_bindings_windows(db).await;
+    }
+
     // 1. Ottieni tutte le porte in ascolto con PID.
     //    `ss -tlnp` via tokio::process (async). Fallback: /proc/net/tcp via spawn_blocking.
     let listening = match read_listening_ports_ss().await {
@@ -2710,6 +2929,82 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
         .collect();
 
     Ok(bindings)
+}
+
+/// Windows: variante di `detect_all_port_bindings` senza `ss`/`/proc`. Porte in
+/// ascolto via `windows_listening_ports` (Get-NetTCPConnection, PUNTO UNICO
+/// Windows), mappa pid->project_id da `agent_processes` aggregando i DB progetto,
+/// e risalita dell'albero processi Win32 (`windows_process_parents`) per associare
+/// il pid in ascolto (node/vite) al pid del servizio noto (npm/pnpm) e quindi al
+/// progetto. Stessa strategia di `detect_project_ports_windows`.
+#[cfg(windows)]
+async fn detect_all_port_bindings_windows(
+    db: &sqlx::PgPool,
+) -> Result<Vec<PortBinding>, String> {
+    use std::collections::HashMap;
+
+    let listening = windows_listening_ports().await;
+    if listening.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // pid -> project_id da agent_processes (la tabella e' migrata: aggreghiamo i
+    // DB progetto, come fa il ramo Unix). Un DB progetto irraggiungibile degrada
+    // senza azzerare gli altri.
+    let mut pid_to_project: HashMap<u32, uuid::Uuid> = HashMap::new();
+    for proj in crate::project_db_routes::list_all_project_ids(db).await {
+        let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
+        let rows: Vec<(Option<i32>, uuid::Uuid)> = sqlx::query_as(
+            "SELECT pid, project_id FROM agent_processes \
+             WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for (pid_opt, proj_id) in rows {
+            if let Some(pid) = pid_opt {
+                if pid > 0 {
+                    pid_to_project.insert(pid as u32, proj_id);
+                }
+            }
+        }
+    }
+
+    // Albero processi (figlio -> genitore) per risalire dal listener al servizio.
+    let child_to_parent = windows_process_parents().await;
+
+    let bindings = listening
+        .into_iter()
+        .map(|(port, pid, program)| PortBinding {
+            port,
+            pid,
+            program,
+            project_id: resolve_project_ancestor(pid, &pid_to_project, &child_to_parent),
+        })
+        .collect();
+    Ok(bindings)
+}
+
+/// Risale la catena dei genitori da `pid` finche' trova un pid mappato a un
+/// progetto. Cap a 12 hop (robustezza contro cicli/pid riusati). Gemello di
+/// `resolve_service_ancestor` ma ritorna il `project_id` invece della label.
+#[cfg(windows)]
+fn resolve_project_ancestor(
+    pid: u32,
+    pid_to_project: &std::collections::HashMap<u32, uuid::Uuid>,
+    child_to_parent: &std::collections::HashMap<u32, u32>,
+) -> Option<uuid::Uuid> {
+    let mut current = pid;
+    for _ in 0..12 {
+        if let Some(proj) = pid_to_project.get(&current) {
+            return Some(*proj);
+        }
+        match child_to_parent.get(&current) {
+            Some(&parent) if parent != current && parent != 0 => current = parent,
+            _ => break,
+        }
+    }
+    None
 }
 
 /// Risolve PID -> project_id leggendo /proc/<pid>/cwd e confrontando con
@@ -2997,5 +3292,89 @@ mod tests {
                 ("frontend".to_string(), true)
             ]
         );
+    }
+
+    // Regressione Windows (Wave 1): la risoluzione porta->progetto per il
+    // port_enforcer risale l'albero processi dal listener (node/vite) fino al pid
+    // del servizio noto. Senza, la lista bindings usciva vuota e l'enforcement era
+    // cieco su Windows.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_project_ancestor_risale_al_servizio_noto() {
+        use std::collections::HashMap;
+        let proj = uuid::Uuid::from_u128(7);
+        let mut pid_to_project: HashMap<u32, uuid::Uuid> = HashMap::new();
+        pid_to_project.insert(100, proj); // 100 = servizio noto (es. npm/pnpm)
+        let mut child_to_parent: HashMap<u32, u32> = HashMap::new();
+        child_to_parent.insert(200, 150); // listener node -> figlio intermedio
+        child_to_parent.insert(150, 100); // intermedio -> servizio noto
+
+        // Il listener 200 risale la catena fino al servizio 100 -> mappa al progetto.
+        assert_eq!(
+            super::resolve_project_ancestor(200, &pid_to_project, &child_to_parent),
+            Some(proj)
+        );
+        // Un pid senza antenati noti non mappa a nessun progetto.
+        assert_eq!(
+            super::resolve_project_ancestor(999, &pid_to_project, &child_to_parent),
+            None
+        );
+        // Cap anti-ciclo: una catena che cicla non manda in loop infinito.
+        let mut cyclic: HashMap<u32, u32> = HashMap::new();
+        cyclic.insert(1, 2);
+        cyclic.insert(2, 1);
+        assert_eq!(
+            super::resolve_project_ancestor(1, &HashMap::new(), &cyclic),
+            None
+        );
+    }
+
+    #[test]
+    fn assign_service_da_allocazione_solo_se_mancante() {
+        use std::collections::HashMap;
+        // Mappa autoritativa port->servizio (nexus_port_allocations).
+        let mut alloc: HashMap<i32, String> = HashMap::new();
+        alloc.insert(31776, "backend".to_string());
+        alloc.insert(31798, "frontend".to_string());
+        let mut ports = vec![
+            // Porta live senza service risolto dall'albero processi (dev server
+            // orfano): deve ricevere "backend" dall'allocazione -> il pannello
+            // mostra il link.
+            json!({ "port": 31776, "service": serde_json::Value::Null, "live": true }),
+            // Porta live con service GIA' risolto: non va sovrascritta dalla label
+            // (la risoluzione dall'albero processi e' piu' specifica).
+            json!({ "port": 31798, "service": "frontend-dev", "live": true }),
+            // Porta senza allocazione: resta senza service.
+            json!({ "port": 31800, "live": true }),
+        ];
+        super::assign_service_from_allocations(&mut ports, &alloc);
+        assert_eq!(ports[0]["service"].as_str(), Some("backend"));
+        assert_eq!(ports[1]["service"].as_str(), Some("frontend-dev"));
+        assert!(ports[2].get("service").and_then(|v| v.as_str()).is_none());
+    }
+
+    #[test]
+    fn reconcile_dead_service_rows_marca_stopped_solo_i_running_morti() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rows = vec![
+            // running con pid MORTO -> stopped, pid raccolto
+            ("backend".to_string(), "running".to_string(), Some(200), base),
+            // running con pid VIVO -> invariato
+            ("frontend".to_string(), "running".to_string(), Some(100), base),
+            // gia' stopped (pid morto) -> invariato, NON raccolto (non era running)
+            ("worker".to_string(), "stopped".to_string(), Some(200), base),
+            // starting senza pid -> non vivo -> stopped, ma nessun pid da persistere
+            ("api".to_string(), "starting".to_string(), None, base),
+        ];
+        let alive = |p: i32| p == 100 || p == 300;
+        let (reconciled, dead) = super::reconcile_dead_service_rows(rows, alive);
+        assert_eq!(reconciled[0], ("backend".to_string(), "stopped".to_string(), base));
+        assert_eq!(reconciled[1], ("frontend".to_string(), "running".to_string(), base));
+        assert_eq!(reconciled[2], ("worker".to_string(), "stopped".to_string(), base));
+        assert_eq!(reconciled[3], ("api".to_string(), "stopped".to_string(), base));
+        // Solo il pid 200 della riga RUNNING va persistito come stopped.
+        assert_eq!(dead, vec![200]);
     }
 }
