@@ -8,7 +8,7 @@ use super::*;
 /// giu' stdout e' vuoto e il chiamante, senza questo check, mostrerebbe il
 /// messaggio fuorviante "Nessun servizio trovato" anche quando i file .service
 /// esistono. Vedi ADR 0022.
-fn user_manager_unavailable(output: &std::process::Output) -> bool {
+pub(super) fn user_manager_unavailable(output: &std::process::Output) -> bool {
     if output.status.success() {
         return false;
     }
@@ -17,6 +17,13 @@ fn user_manager_unavailable(output: &std::process::Output) -> bool {
         || stderr.contains("connection refused")
         || stderr.contains("failed to get d-bus connection")
         || stderr.contains("refusing to operate")
+}
+
+/// Suggerimento operativo mostrato quando il manager systemd utente e' giu'.
+/// Espone `USER_MANAGER_HINT` per il nuovo `service_manager` senza duplicarne
+/// il testo (regola L).
+pub(super) fn user_manager_hint() -> &'static str {
+    USER_MANAGER_HINT
 }
 
 /// Suggerimento operativo mostrato in UI quando il manager utente e' giu'.
