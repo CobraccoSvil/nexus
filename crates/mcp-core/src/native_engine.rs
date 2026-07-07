@@ -421,6 +421,46 @@ pub struct NativeRunOutcome {
     pub final_gate_failed_pending: bool,
 }
 
+/// Chiavi del blocco esito STRUTTURATO ([`NativeRunOutcome::structured_verdict`]).
+/// PUNTO UNICO (regola L): il produttore, il poll (`tool_nexus_subagent_poll`),
+/// i rami degradati/terminali di `subagent_native` e i test riferiscono le
+/// STESSE chiavi, mai literal sparsi che divergono nel tempo (era proprio il
+/// drift che aveva reso `terminal_verdict` incoerente da `structured_verdict`).
+pub(crate) mod verdict_keys {
+    /// Status canonico (`AgentRunStatus` snake_case), sempre presente.
+    pub const VERDICT: &str = "verdict";
+    /// Semantica di successo (`AgentRunStatus::is_success`), sempre presente.
+    pub const SUCCESS: &str = "success";
+    /// Dict ADR 0034 normalizzato passato as-is (null se non dichiarato).
+    pub const DECLARED: &str = "declared";
+    /// Verdetto strutturato del REVISORE (Fase B) via `review_verdict`
+    /// ({verdict, summary, findings[]}); null nei run non-review.
+    pub const REVIEW: &str = "review";
+    /// Segnali strutturati grezzi del final_gate / chiusura (ADR 0036).
+    pub const FINAL_GATE_PASSED: &str = "final_gate_passed";
+    pub const FINAL_GATE_UNVERIFIED: &str = "final_gate_unverified";
+    pub const FINAL_GATE_FAILED_PENDING: &str = "final_gate_failed_pending";
+    pub const FORCED_CLOSE_UNVERIFIED: &str = "forced_close_unverified";
+    pub const ERROR_CLASS: &str = "error_class";
+}
+
+/// Stop_reason che denotano una chiusura coordinata anti-loop/forced: elenco
+/// piatto (array + `contains`) invece di un `matches!` multi-variante, cosi'
+/// `classify_status` resta senza annidamento profondo. Il segnale AUTORITATIVO
+/// resta `forced_close_unverified` (mig 0386); questa lista lo integra quando
+/// lo stop e' esplicito.
+const FORCED_CLOSE_STOPS: [StopReason; 4] = [
+    StopReason::LoopDetected,
+    StopReason::LoopAbort,
+    StopReason::G1Escalated,
+    StopReason::G1CapReached,
+];
+
+/// Chiave dell'esito DICHIARATO dal modello nel dict normalizzato (ADR 0034,
+/// `normalize_declared_outcome`): valori ammessi in `nexus_agent_graph`
+/// `VALID_OUTCOMES` (`done`/`blocked`/`needs_input`/`partial`).
+const DECLARED_OUTCOME_KEY: &str = "outcome";
+
 impl NativeRunOutcome {
     /// Status CANONICO del run dai segnali strutturati dell'esito (regola M).
     /// PUNTO UNICO (regola L) della classificazione: estratto dal finalizzatore
@@ -438,15 +478,9 @@ impl NativeRunOutcome {
         // final_gate finiva "completed" col testo di sistema come risposta —
         // run b833a83d).
         let forced_close = self.forced_close_unverified
-            || matches!(
-                self.stop_reason,
-                Some(
-                    StopReason::LoopDetected
-                        | StopReason::LoopAbort
-                        | StopReason::G1Escalated
-                        | StopReason::G1CapReached
-                )
-            );
+            || self
+                .stop_reason
+                .is_some_and(|s| FORCED_CLOSE_STOPS.contains(&s));
         // Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
         // MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
         // (regola M). Ha precedenza sul forced_close: una dichiarazione onesta
@@ -455,7 +489,7 @@ impl NativeRunOutcome {
         let declared_kind = self
             .declared_outcome
             .as_ref()
-            .and_then(|v| v.get("outcome"))
+            .and_then(|v| v.get(DECLARED_OUTCOME_KEY))
             .and_then(Value::as_str);
         let declared_refusal = self
             .declared_outcome
@@ -516,19 +550,20 @@ impl NativeRunOutcome {
     /// otterrebbe sugli stessi segnali. `declared` e' il dict gia' normalizzato
     /// (ADR 0034) o `null`; gli altri campi sono i segnali del gate as-is.
     pub fn structured_verdict(&self) -> Value {
+        use verdict_keys as k;
         let status = self.classify_status();
         serde_json::json!({
-            "verdict": status.as_str(),
-            "success": status.is_success(),
-            "declared": self.declared_outcome,
+            k::VERDICT: status.as_str(),
+            k::SUCCESS: status.is_success(),
+            k::DECLARED: self.declared_outcome,
             // Verdetto del REVISORE (Fase B ultracode): presente solo nei run
             // di review col tool `review_verdict` whitelistato; `null` altrove.
-            "review": self.review_verdict,
-            "final_gate_passed": self.final_gate_passed,
-            "final_gate_unverified": self.final_gate_unverified,
-            "final_gate_failed_pending": self.final_gate_failed_pending,
-            "forced_close_unverified": self.forced_close_unverified,
-            "error_class": self.error_class,
+            k::REVIEW: self.review_verdict,
+            k::FINAL_GATE_PASSED: self.final_gate_passed,
+            k::FINAL_GATE_UNVERIFIED: self.final_gate_unverified,
+            k::FINAL_GATE_FAILED_PENDING: self.final_gate_failed_pending,
+            k::FORCED_CLOSE_UNVERIFIED: self.forced_close_unverified,
+            k::ERROR_CLASS: self.error_class,
         })
     }
 }
