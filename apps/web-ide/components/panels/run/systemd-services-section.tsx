@@ -220,11 +220,11 @@ export function SystemdServicesSection({
                     type="button"
                     onClick={() => {
                       const msg = [
-                        `Il servizio "${svc.short}" (unit: ${svc.unit}) è in stato ${svc.state}${svc.crash_loop ? " (crash-loop)" : ""}.`,
+                        `Il servizio "${svc.short}" è in stato ${svc.state}${svc.crash_loop ? " (crash-loop)" : ""}.`,
                         "",
                         "Richiesta:",
-                        `- Esegui/usa: journalctl --user -u ${svc.unit} -n 80 --no-pager`,
-                        "- Identifica la causa root e proponi una fix concreta (file/righe).",
+                        "- Leggi i log del servizio (pannello Run / Console Debug) e identifica la causa root.",
+                        "- Proponi una fix concreta (file/righe).",
                         "- Dammi un test plan minimo per verificare il fix.",
                       ].join("\n");
                       onSendToChat?.(msg);

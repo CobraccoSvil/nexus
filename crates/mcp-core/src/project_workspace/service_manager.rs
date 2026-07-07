@@ -185,8 +185,13 @@ pub struct ServiceContext<'a> {
     /// Pool DB meta (i backend instradano internamente sul pool del progetto per
     /// le tabelle migrate, come fanno gia' i primitivi che avvolgono).
     pub db: &'a sqlx::PgPool,
-    /// Registro porte, necessario ai web service Windows per alloca+inietta.
-    pub port_registry: &'a PortRegistryCache,
+    /// Registro porte per l'alloca+inietta della porta stabile ai web service
+    /// Windows. `None` quando il chiamante non ha un registry a disposizione (es.
+    /// i tool agente, che girano nel contesto `execute()` senza `AppState`): in
+    /// quel caso lo start di un web service NON inietta PORT (il servizio parte
+    /// comunque, la porta la gestisce il flusso run_service/run_config). Il
+    /// pannello e gli handler HTTP passano sempre `Some`.
+    pub port_registry: Option<&'a PortRegistryCache>,
     pub project_id: Uuid,
     /// Slug di servizio del progetto (`project_service_slug`), NON `projects.slug`.
     pub slug: &'a str,
@@ -404,27 +409,33 @@ async fn control_windows(
         .unwrap_or_else(|| ctx.project_root.to_string_lossy().to_string());
 
     // Web service: alloca+inietta la porta stabile del bucket PRIMA dello spawn
-    // (riuso di find_or_allocate + link_allocation_to_service_unit).
-    let port_env = if crate::agent_tools::service::looks_like_web_service(&command) {
-        match super::find_or_allocate_port(ctx.db, ctx.port_registry, ctx.project_id, short).await {
-            Ok(alloc) => {
-                let unit_name = super::services::service_unit_name(ctx.slug, short);
-                super::allocate_port::link_allocation_to_service_unit(
-                    ctx.db,
-                    ctx.project_id,
-                    short,
-                    &unit_name,
-                )
-                .await;
-                let mut env = std::collections::HashMap::new();
-                env.insert("PORT".to_string(), alloc.port.to_string());
-                env.insert("HOST".to_string(), "0.0.0.0".to_string());
-                Some(env)
+    // (riuso di find_or_allocate + link_allocation_to_service_unit). Solo se il
+    // chiamante ha un registry (il contesto tool agente ne e' privo -> niente
+    // iniezione, il servizio parte comunque).
+    let port_env = match (
+        crate::agent_tools::service::looks_like_web_service(&command),
+        ctx.port_registry,
+    ) {
+        (true, Some(registry)) => {
+            match super::find_or_allocate_port(ctx.db, registry, ctx.project_id, short).await {
+                Ok(alloc) => {
+                    let unit_name = super::services::service_unit_name(ctx.slug, short);
+                    super::allocate_port::link_allocation_to_service_unit(
+                        ctx.db,
+                        ctx.project_id,
+                        short,
+                        &unit_name,
+                    )
+                    .await;
+                    let mut env = std::collections::HashMap::new();
+                    env.insert("PORT".to_string(), alloc.port.to_string());
+                    env.insert("HOST".to_string(), "0.0.0.0".to_string());
+                    Some(env)
+                }
+                Err(_) => None,
             }
-            Err(_) => None,
         }
-    } else {
-        None
+        _ => None,
     };
 
     match crate::agent_processes::spawn_agent_process(
@@ -554,6 +565,12 @@ async fn control_systemd(
     action: &str,
 ) -> ServiceActionOutcome {
     let svc_name = super::services::service_unit_name(ctx.slug, short);
+
+    // Pre-start (comportamento degli handler originali su Linux): libera le porte
+    // dichiarate nell'unit occupate da processi estranei. No-op per lo stop.
+    if matches!(action, "start" | "restart") {
+        let _ = super::services::free_ports_for_unit(&svc_name).await;
+    }
 
     let out = tokio::process::Command::new("systemctl")
         .args(["--user", action, &svc_name])
