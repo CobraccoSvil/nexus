@@ -1073,13 +1073,19 @@ pub(crate) async fn supersede_active_runs(
     let wpool =
         crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
     let cancelled_ids: Vec<Uuid> = sqlx::query_scalar(
-        "UPDATE agent_runs \
+        // Cancella TUTTI i run attivi/sospesi-vivi della sessione (punto unico
+        // ACTIVE_RUN_STATUSES): il force-stop deve liberare anche un padre sospeso
+        // su awaiting_subagents, non solo running/awaiting_confirmation.
+        &format!(
+            "UPDATE agent_runs \
          SET status='cancelled', completed_at=NOW(), \
              cancellation_requested=NOW(), cancellation_reason=$2, \
              final_answer=COALESCE(final_answer, $3) \
          WHERE session_id = $1 \
-           AND status IN ('running', 'awaiting_confirmation') \
+           AND status IN ({}) \
          RETURNING id",
+            crate::agent_types::ACTIVE_RUN_STATUS_SQL
+        ),
     )
     .bind(session_id)
     .bind(reason)
@@ -1133,9 +1139,10 @@ pub(crate) async fn supersede_active_runs(
 }
 
 /// Punto unico (regola L) della domanda "c'e' un run agentico attivo su questa
-/// sessione?". Usa gli STESSI stati che `supersede_active_runs` (sopra)
-/// considera attivi (`running`/`awaiting_confirmation`): coerenza garantita,
-/// nessuna re-implementazione del predicato sparsa nei call site.
+/// sessione?". Usa la lista autoritativa `ACTIVE_RUN_STATUSES` (running /
+/// awaiting_confirmation / awaiting_subagents), la STESSA di `supersede_active_runs`
+/// e di ogni altro gate "run attivo": nessuna re-implementazione del predicato
+/// sparsa nei call site.
 ///
 /// Fail-safe: in caso di errore DB assume run attivo (`true`) per NON rischiare
 /// di interrompere un run in corso. Il chiamante critico e' `process_resume`,
@@ -1143,11 +1150,14 @@ pub(crate) async fn supersede_active_runs(
 /// RIMANDARE il resume (run ancora attivo) invece di superarlo via last-wins.
 pub(crate) async fn session_has_active_run(db: &sqlx::PgPool, session_id: Uuid) -> bool {
     match sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS( \
+        &format!(
+            "SELECT EXISTS( \
              SELECT 1 FROM agent_runs \
               WHERE session_id = $1 \
-                AND status IN ('running', 'awaiting_confirmation') \
+                AND status IN ({}) \
          )",
+            crate::agent_types::ACTIVE_RUN_STATUS_SQL
+        ),
     )
     .bind(session_id)
     .fetch_one(db)
@@ -4494,9 +4504,11 @@ pub(crate) async fn confirm_native_run(
 /// mai prosa. Iniettati nello stato al resume fan-in (`build_resume_delta_
 /// subagents`) cosi' il padre compone i verdetti dei figli deterministicamente.
 ///
-/// Query sul PROJECT pool (dove vive `nexus_subagent_runs`), ordinata per
-/// `created_at` (ordine stabile di dispatch). Best-effort: su errore ritorna
-/// `vec![]` (il resume prosegue con risultati vuoti, meglio che bloccare).
+/// CLAIM, non lettura pura: marca `fanin_consumed_at` sui figli ritornati, cosi'
+/// un'ondata successiva non li re-inietta (ALTA-2). Query sul PROJECT pool (dove
+/// vive `nexus_subagent_runs`), ordinata per `created_at` (ordine stabile di
+/// dispatch). Best-effort: su errore infra logga un WARN e ritorna `vec![]` (il
+/// resume prosegue con esiti vuoti, meglio che bloccare).
 ///
 /// Correla via `dispatcher_run_id = dispatcher_run_id` (mig project 0010): i figli
 /// DIRETTI del run che si e' sospeso (`dispatcher_run_id` = `ctx.core.run_id` di
@@ -4505,7 +4517,7 @@ pub(crate) async fn confirm_native_run(
 /// inietterebbe anche i NIPOTI annidati dispatchati da un altro figlio ancora vivo:
 /// ALTA 1). Il `parent_run_id` della coda E' gia' il dispatcher (accodato da
 /// `fanin_enqueue_if_last` sul run corrente), quindi nessuna derivazione d'anchor.
-async fn fetch_subagent_fanin_results(proj_pool: &PgPool, dispatcher_run_id: Uuid) -> Vec<Value> {
+async fn claim_subagent_fanin_results(proj_pool: &PgPool, dispatcher_run_id: Uuid) -> Vec<Value> {
     // UPDATE ... RETURNING dentro una CTE (non piu' SELECT): marca ATOMICAMENTE
     // `fanin_consumed_at = NOW()` sui figli NON ancora consumati e li ritorna
     // ordinati. Discrimina l'ONDATA (ALTA-2, mig project 0011): `dispatcher_run_id`
@@ -4528,7 +4540,15 @@ async fn fetch_subagent_fanin_results(proj_pool: &PgPool, dispatcher_run_id: Uui
     .bind(dispatcher_run_id)
     .fetch_all(proj_pool)
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "mcp_core::fanin",
+            dispatcher_run_id = %dispatcher_run_id,
+            error = %e,
+            "fan-in: claim dei risultati figli fallito (infra) -> resume con esiti vuoti"
+        );
+        Vec::new()
+    });
     rows.into_iter()
         .map(|r| {
             use sqlx::Row;
@@ -4604,7 +4624,7 @@ pub(crate) async fn resume_fanin(
     // (COALESCE che degenera in session_id e inietterebbe anche i NIPOTI annidati
     // dispatchati da un altro figlio ancora vivo: ALTA 1). La coda porta gia' il
     // dispatcher (il run corrente), quindi il fetch usa direttamente il suo id.
-    let subagent_results = fetch_subagent_fanin_results(&cn_pool, parent_run_id).await;
+    let subagent_results = claim_subagent_fanin_results(&cn_pool, parent_run_id).await;
 
     // Canale SSE del run: riusa quello esistente (client agganciati) o creane uno
     // nuovo (dopo un restart) cosi' l'is_final finale sblocca i reattach.
@@ -5306,6 +5326,22 @@ mod tests_session_active {
     }
 
     #[sqlx::test]
+    async fn vero_su_awaiting_subagents(pool: sqlx::PgPool) {
+        // Fase D: un padre sospeso su awaiting_subagents e' un run ATTIVO/sospeso-vivo
+        // sulla sessione (punto unico ACTIVE_RUN_STATUSES) -> session_has_active_run
+        // deve vederlo, altrimenti process_resume/service_observer avvierebbero un 2o
+        // run parallelo (S2 della re-review).
+        create_agent_runs_table(&pool).await;
+        let sess = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_subagents')")
+            .bind(sess)
+            .execute(&pool)
+            .await
+            .expect("insert awaiting_subagents");
+        assert!(session_has_active_run(&pool, sess).await);
+    }
+
+    #[sqlx::test]
     async fn falso_se_solo_run_conclusi(pool: sqlx::PgPool) {
         create_agent_runs_table(&pool).await;
         let sess = Uuid::new_v4();
@@ -5935,7 +5971,7 @@ mod tests_finalize_turn {
         insert(session, cp1_run, "running").await;
 
         // Fetch di P: deve vedere SOLO i suoi 2 figli diretti, NON il nipote Cs1.
-        let results_p = fetch_subagent_fanin_results(&pool, p_run).await;
+        let results_p = claim_subagent_fanin_results(&pool, p_run).await;
         assert_eq!(
             results_p.len(),
             2,
@@ -5949,7 +5985,7 @@ mod tests_finalize_turn {
         );
 
         // Fetch di Cp1: deve vedere SOLO il suo figlio diretto Cs1.
-        let results_cp1 = fetch_subagent_fanin_results(&pool, cp1_run).await;
+        let results_cp1 = claim_subagent_fanin_results(&pool, cp1_run).await;
         assert_eq!(
             results_cp1.len(),
             1,
@@ -6005,16 +6041,16 @@ mod tests_finalize_turn {
         insert("completed").await;
 
         // 1a fetch: vede e CONSUMA i 2 figli.
-        let wave1 = fetch_subagent_fanin_results(&pool, dispatcher).await;
+        let wave1 = claim_subagent_fanin_results(&pool, dispatcher).await;
         assert_eq!(wave1.len(), 2, "la 1a ondata inietta i 2 figli");
 
         // 2a fetch SENZA nuovi figli: 0 (gia' consumati) -> nessuna ri-iniezione.
-        let repeat = fetch_subagent_fanin_results(&pool, dispatcher).await;
+        let repeat = claim_subagent_fanin_results(&pool, dispatcher).await;
         assert_eq!(repeat.len(), 0, "figli gia' consumati: mai ri-iniettati");
 
         // 2a ondata: un NUOVO figlio dello stesso dispatcher.
         insert("failed").await;
-        let wave2 = fetch_subagent_fanin_results(&pool, dispatcher).await;
+        let wave2 = claim_subagent_fanin_results(&pool, dispatcher).await;
         assert_eq!(wave2.len(), 1, "la 2a ondata inietta SOLO il figlio nuovo");
         assert_eq!(wave2[0]["status"], serde_json::json!("failed"));
     }

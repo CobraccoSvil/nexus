@@ -132,12 +132,15 @@ async fn replay_idempotent_send(
         // `awaiting_subagents` (Fase D fan-in): il run e' sospeso-VIVO in attesa dei
         // figli background (gemello di `awaiting_confirmation`), quindi il replay
         // idempotente deve ritrovarlo come run attivo del primo tentativo.
-        "SELECT id, status, provider, model FROM agent_runs \
+        &format!(
+            "SELECT id, status, provider, model FROM agent_runs \
          WHERE session_id = $1 \
-           AND status IN ('running', 'awaiting_confirmation', 'awaiting_subagents') \
+           AND status IN ({}) \
            AND created_at > NOW() - INTERVAL '15 minutes' \
          ORDER BY created_at DESC \
          LIMIT 1",
+            crate::agent_types::ACTIVE_RUN_STATUS_SQL
+        ),
     )
     .bind(context.session_id)
     .fetch_optional(session_pool)
@@ -269,13 +272,16 @@ pub async fn send_chat_message(
             // vero), quindi deve restare bloccante come pausa-conferma. Senza, un nuovo
             // messaggio sulla sessione col padre sospeso avvierebbe un 2o run parallelo
             // che ruba lo stream SSE.
-            "SELECT id FROM agent_runs \
+            &format!(
+                "SELECT id FROM agent_runs \
              WHERE session_id = $1 \
-               AND status IN ('running', 'awaiting_confirmation', 'awaiting_subagents') \
+               AND status IN ({}) \
                AND created_at > NOW() - INTERVAL '15 minutes' \
                AND generation_ended_at IS NULL \
                AND nexus_agent_type IS DISTINCT FROM 'subagent' \
              LIMIT 1",
+                crate::agent_types::ACTIVE_RUN_STATUS_SQL
+            ),
         )
         .bind(context.session_id)
         .fetch_optional(&session_pool)

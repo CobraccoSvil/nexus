@@ -277,14 +277,17 @@ pub async fn get_active_run_for_session(
     let run_pool =
         crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
     let run_row = sqlx::query(
+        &format!(
         "SELECT id, session_id, project_id, user_id, status, automation_mode, provider, model,
                 iteration_count, final_answer, pending_actions_json, created_at, completed_at
          FROM agent_runs
          WHERE session_id = $1 AND user_id = $2
-           AND status IN ('running', 'awaiting_confirmation')
+           AND status IN ({})
            AND nexus_agent_type IS DISTINCT FROM 'subagent'
          ORDER BY created_at DESC
          LIMIT 1",
+            crate::agent_types::ACTIVE_RUN_STATUS_SQL
+        ),
     )
     .bind(session_id)
     .bind(user_id)

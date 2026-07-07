@@ -64,8 +64,11 @@ async fn run_cycle(db: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 /// Pota i checkpoint dei run TERMINALI oltre il grace period, iterando i progetti
-/// (separazione DB). Tiene i run resumibili (running / awaiting_confirmation)
-/// e quelli recenti. `blocked_needs_input` e' TERMINALE (ADR 0034: run concluso
+/// (separazione DB). Tiene i run resumibili (punto unico `ACTIVE_RUN_STATUSES`:
+/// running / awaiting_confirmation / awaiting_subagents) e quelli recenti: potare
+/// il checkpoint di un run sospeso-vivo lo renderebbe non piu' resumibile
+/// (`resume_native_fanin`/HITL ripartono PROPRIO da quel checkpoint).
+/// `blocked_needs_input` e' TERMINALE (ADR 0034: run concluso
 /// con dichiarazione "serve input", nessun resume) -> potabile. A flag OFF tutti
 /// i pool sono il meta: la prima iterazione pota, le successive sono no-op
 /// (idempotente).
@@ -75,14 +78,17 @@ async fn prune_checkpoints(db: &PgPool) {
     for project_id in crate::project_db_routes::list_all_project_ids(db).await {
         let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
         let deleted = sqlx::query(
-            r#"
+            &format!(
+                r#"
             DELETE FROM nexus_graph_checkpoints
             WHERE run_id IN (
                 SELECT id FROM agent_runs
-                WHERE status NOT IN ('running', 'awaiting_confirmation')
+                WHERE status NOT IN ({active})
                   AND COALESCE(completed_at, updated_at, created_at) < NOW() - make_interval(hours => $1)
             )
             "#,
+                active = crate::agent_types::ACTIVE_RUN_STATUS_SQL
+            ),
         )
         .bind(grace_hours as f64)
         .execute(&pool)

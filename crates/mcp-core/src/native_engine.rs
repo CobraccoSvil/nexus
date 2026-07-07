@@ -1931,24 +1931,44 @@ fn build_resume_delta_subagents(subagent_results: Vec<Value>) -> nexus_graph::St
     typed.into_opaque()
 }
 
+/// Cap per-figlio del `summary` iniettato al resume (caratteri). Evita che N figli
+/// con summary enormi (final_summary non ha cap alla fonte) producano un singolo
+/// turno gigantesco -> context_overflow al resume. Solo il `summary` (testo libero)
+/// e' troncato; `status`/`outcome` (segnali autoritativi, regola M) restano integri.
+const FANIN_SUMMARY_CAP: usize = 2000;
+
 /// Formatta i risultati strutturati dei figli background nel testo del turno utente
-/// iniettato al resume fan-in (`build_resume_delta_subagents`). I segnali
-/// autoritativi (`status`/`outcome`) sono serializzati come JSON (regola M:
-/// struttura, non prosa); `summary` e' descrittivo. Array vuoto -> nota esplicita
-/// (il modello riprende comunque non cieco). Delimitatori `<subagent_results>` per
-/// un parsing robusto lato modello.
+/// iniettato al resume fan-in (`build_resume_delta_subagents`). Presenta un ARRAY
+/// JSON (i segnali autoritativi `status`/`outcome` sono struttura, non prosa: regola
+/// M); il modello lo parsa come JSON. NIENTE delimitatori XML: un `summary` LLM che
+/// contenesse la stringa di chiusura confonderebbe un parsing naive del delimitatore
+/// (l'array JSON e' auto-delimitante, un tag di chiusura dentro una stringa e' solo
+/// contenuto). Array vuoto -> nota esplicita (il modello riprende comunque non cieco).
 fn format_fanin_results_message(results: &[Value]) -> String {
     if results.is_empty() {
         return "I sub-agenti in background che avevi dispatchato sono terminati \
                 (nessun nuovo esito strutturato da riportare)."
             .to_string();
     }
-    let json = serde_json::to_string_pretty(results).unwrap_or_else(|_| "[]".to_string());
+    // Tronca i soli `summary` (testo libero LLM, potenzialmente enorme).
+    let capped: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            if let Some(s) = r.get("summary").and_then(Value::as_str) {
+                if s.chars().count() > FANIN_SUMMARY_CAP {
+                    let head: String = s.chars().take(FANIN_SUMMARY_CAP).collect();
+                    r["summary"] = Value::String(format!("{head}... [troncato]"));
+                }
+            }
+            r
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&capped).unwrap_or_else(|_| "[]".to_string());
     format!(
-        "I sub-agenti in background che avevi dispatchato sono terminati. Ecco i \
-         loro esiti (un oggetto per figlio; `status`/`outcome` sono i segnali \
-         autoritativi, `summary` e' descrittivo):\n\
-         <subagent_results>\n{json}\n</subagent_results>"
+        "I sub-agenti in background che avevi dispatchato sono terminati. Di seguito \
+         i loro esiti come array JSON (un oggetto per figlio; `status` e `outcome` \
+         sono i segnali autoritativi, `summary` e' descrittivo):\n{json}"
     )
 }
 
@@ -3011,8 +3031,8 @@ mod tests {
             Some(Message::Human { content }) => {
                 let txt = serde_json::to_string(content).unwrap_or_default();
                 assert!(
-                    txt.contains("subagent_results") && txt.contains("completed_verified"),
-                    "il turno iniettato deve portare gli esiti STRUTTURATI dei figli: {txt}"
+                    txt.contains("completed_verified") && txt.contains("bbb"),
+                    "il turno iniettato deve portare gli esiti STRUTTURATI di entrambi i figli: {txt}"
                 );
             }
             other => panic!("atteso Human coi risultati in coda, trovato {other:?}"),
@@ -3022,10 +3042,31 @@ mod tests {
     #[test]
     fn format_fanin_results_message_vuoto_non_e_cieco() {
         // Array vuoto -> nota esplicita (il modello riprende comunque non cieco),
-        // niente blocco <subagent_results> spurio.
+        // nessun array JSON spurio.
         let msg = format_fanin_results_message(&[]);
         assert!(msg.contains("terminati"), "nota di completamento: {msg}");
-        assert!(!msg.contains("<subagent_results>"), "niente blocco vuoto: {msg}");
+        assert!(!msg.contains("array JSON"), "niente blocco JSON quando vuoto: {msg}");
+    }
+
+    #[test]
+    fn format_fanin_results_message_tronca_summary_enorme() {
+        // Un summary oltre il cap e' troncato (evita context_overflow al resume);
+        // status/outcome restano integri.
+        let big = "x".repeat(FANIN_SUMMARY_CAP + 500);
+        let results = vec![serde_json::json!({
+            "subagent_run_id": "aaa",
+            "status": "completed",
+            "summary": big,
+            "outcome": {"verdict": "completed_verified"},
+        })];
+        let msg = format_fanin_results_message(&results);
+        assert!(msg.contains("[troncato]"), "summary enorme troncato: {}", &msg[..80.min(msg.len())]);
+        assert!(msg.contains("completed_verified"), "outcome integro");
+        // Il testo non deve contenere l'intero summary enorme non troncato.
+        assert!(
+            !msg.contains(&"x".repeat(FANIN_SUMMARY_CAP + 1)),
+            "il summary oltre il cap non compare per intero"
+        );
     }
 
     #[test]
