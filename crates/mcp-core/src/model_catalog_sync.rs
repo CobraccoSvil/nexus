@@ -36,15 +36,13 @@ use crate::settings::get_setting;
 
 const DEFAULT_INTERVAL_HOURS: u64 = 6;
 
-/// Filtro chat-compatibilita': i provider espongono nelle loro `/v1/models` API
-/// anche modelli specializzati (voice, TTS, transcribe, embedding, instruct
-/// legacy, image generation, modelli "preview" hollow) che NON sono usabili
-/// dalla chat agentic di Nexus. Senza filtro, il catalog viene inquinato e
-/// il routing puo' selezionarli, generando errori in cascata.
-///
-/// Ritorna `true` se il modello e' un valido modello di chat completion.
-fn is_chat_compatible_model(model: &str) -> bool {
-    let lower = model.to_lowercase();
+/// True se il nome modello (gia' lowercase) rientra nella blacklist STRUTTURALE
+/// dei modelli che per design NON sono chat completion (TTS/transcribe/embedding/
+/// realtime/instruct legacy/image-gen/moderation). Estratta da
+/// `is_chat_compatible_model` (regola L) senza cambi di comportamento: la
+/// valutazione resta l'unione delle quattro blacklist per posizione (substring/
+/// infix/prefix/suffix), nello stesso ordine.
+fn matches_incompatible_blacklist(lower: &str) -> bool {
     const SUBSTRING_BLACKLIST: &[&str] = &[
         "voxtral",
         "whisper",
@@ -52,10 +50,8 @@ fn is_chat_compatible_model(model: &str) -> bool {
         "moderation",
         "unknown-provider",
     ];
-    for bad in SUBSTRING_BLACKLIST {
-        if lower.contains(bad) {
-            return false;
-        }
+    if SUBSTRING_BLACKLIST.iter().any(|bad| lower.contains(bad)) {
+        return true;
     }
     const INFIX_BLACKLIST: &[&str] = &[
         "-tts-",
@@ -64,10 +60,8 @@ fn is_chat_compatible_model(model: &str) -> bool {
         "-instruct-",
         "-unknown-",
     ];
-    for bad in INFIX_BLACKLIST {
-        if lower.contains(bad) {
-            return false;
-        }
+    if INFIX_BLACKLIST.iter().any(|bad| lower.contains(bad)) {
+        return true;
     }
     const PREFIX_BLACKLIST: &[&str] = &[
         "tts-",
@@ -79,16 +73,24 @@ fn is_chat_compatible_model(model: &str) -> bool {
         "davinci-00",
         "text-embedding",
     ];
-    for bad in PREFIX_BLACKLIST {
-        if lower.starts_with(bad) {
-            return false;
-        }
+    if PREFIX_BLACKLIST.iter().any(|bad| lower.starts_with(bad)) {
+        return true;
     }
     const SUFFIX_BLACKLIST: &[&str] = &["-tts", "-transcribe", "-realtime", "-embed", "-instruct"];
-    for bad in SUFFIX_BLACKLIST {
-        if lower.ends_with(bad) {
-            return false;
-        }
+    SUFFIX_BLACKLIST.iter().any(|bad| lower.ends_with(bad))
+}
+
+/// Filtro chat-compatibilita': i provider espongono nelle loro `/v1/models` API
+/// anche modelli specializzati (voice, TTS, transcribe, embedding, instruct
+/// legacy, image generation, modelli "preview" hollow) che NON sono usabili
+/// dalla chat agentic di Nexus. Senza filtro, il catalog viene inquinato e
+/// il routing puo' selezionarli, generando errori in cascata.
+///
+/// Ritorna `true` se il modello e' un valido modello di chat completion.
+fn is_chat_compatible_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    if matches_incompatible_blacklist(&lower) {
+        return false;
     }
     // Nota: NESSUNA blacklist per nome modello/famiglia (es. ex-blacklist
     // hardcoded di gemini-3.x). I modelli "fantasma" (esposti dall'API
@@ -222,20 +224,7 @@ async fn insert_media_model(
         .await
     {
         Ok(r) if r.rows_affected() > 0 => {
-            audit_log(
-                db,
-                provider,
-                api_model,
-                "inserted",
-                json!({"source": "api_discovery", "media_kind": kind}),
-            )
-            .await;
-            tracing::info!(
-                "catalog_sync[{}]: + nuovo modello MEDIA '{}' (kind={}, disabled, no probe)",
-                provider,
-                api_model,
-                kind
-            );
+            on_media_model_inserted(db, provider, api_model, kind).await;
             Some(1)
         }
         Ok(_) => None,
@@ -249,6 +238,25 @@ async fn insert_media_model(
             None
         }
     }
+}
+
+/// Coda dell'INSERT riuscito di un modello media: audit + log. Estratta da
+/// `insert_media_model` senza cambi di comportamento.
+async fn on_media_model_inserted(db: &PgPool, provider: &str, api_model: &str, kind: &str) {
+    audit_log(
+        db,
+        provider,
+        api_model,
+        "inserted",
+        json!({"source": "api_discovery", "media_kind": kind}),
+    )
+    .await;
+    tracing::info!(
+        "catalog_sync[{}]: + nuovo modello MEDIA '{}' (kind={}, disabled, no probe)",
+        provider,
+        api_model,
+        kind
+    );
 }
 
 /// Riallinea il flag `supports_<media>` di un media GIA' presente, sulle sole
@@ -309,7 +317,20 @@ pub(crate) fn infer_capabilities_from_name(provider: &str, model: &str) -> Vec<&
     if m.contains("customtools") {
         caps.push("tool_use_optimized");
     }
-    let base: &[&str] = match provider {
+    for c in base_caps_from_name(provider, &m) {
+        if !caps.contains(c) {
+            caps.push(c);
+        }
+    }
+    caps
+}
+
+/// Capability "base" (senza marker `customtools`) di un modello dal nome, per
+/// FAMIGLIA/provider. `m` gia' lowercase. Estratta da
+/// `infer_capabilities_from_name` (regola L) senza cambi di comportamento.
+/// Ritorna sempre almeno `["chat"]`.
+fn base_caps_from_name(provider: &str, m: &str) -> &'static [&'static str] {
+    match provider {
         "google" => {
             if m.contains("pro") {
                 &["reasoning", "code", "long-context", "chat"]
@@ -358,13 +379,7 @@ pub(crate) fn infer_capabilities_from_name(provider: &str, model: &str) -> Vec<&
             }
         }
         _ => &["chat"],
-    };
-    for c in base {
-        if !caps.contains(c) {
-            caps.push(c);
-        }
     }
-    caps
 }
 
 /// Inferisce il `performance_tier` (light|medium|heavy) dal nome del modello.
@@ -396,123 +411,144 @@ fn openai_gpt_major(model_lower: &str) -> Option<u32> {
 
 pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str {
     let m = model.to_ascii_lowercase();
+    // Delega per-provider: l'euristica di ogni famiglia vive in un helper
+    // dedicato (regola L), cosi' questo dispatch resta piatto e testabile.
     match provider {
-        "google" => {
-            // Marcatori di generazione: 3.5 e' l'attuale frontiera Google.
-            let g35 = m.contains("3.5") || m.contains("3-5");
-            let g3 = !g35 && (m.contains("gemini-3") || m.contains("-3-") || m.ends_with("-3"));
-            if m.contains("lite") {
-                "light"
-            } else if m.contains("flash") {
-                // flash veloce/economico resta light (fascia bassa invariata);
-                // ECCEZIONE: 3.5-flash e' il flagship coding Google -> heavy.
-                if g35 {
-                    "heavy"
-                } else {
-                    "light"
-                }
-            } else if m.contains("pro") {
-                // 3.5-pro -> frontier, gemini-3-pro/3.1-pro -> heavy, 2.5-pro -> high.
-                if g35 {
-                    "frontier"
-                } else if g3 {
-                    "heavy"
-                } else {
-                    "high"
-                }
-            } else {
-                "light"
-            }
-        }
-        "anthropic" => {
-            if m.contains("opus") {
-                // opus-4-8 (l'attuale flagship coding) frontier; opus precedenti heavy.
-                if m.contains("4-8") || m.contains("4.8") {
-                    "frontier"
-                } else {
-                    "heavy"
-                }
-            } else if m.contains("fable") {
-                // claude-fable-5: flagship "most capable widely-released".
-                "frontier"
-            } else if m.contains("haiku") {
-                "light"
-            } else {
-                // sonnet e altri
-                "medium"
-            }
-        }
-        "openai" => {
-            // I "piccoli" hanno la precedenza assoluta: qualunque variante
-            // mini/nano (anche di un flagship, es. gpt-5.4-mini) e' light.
-            if m.contains("nano") || m.contains("mini") {
-                "light"
-            } else if m.contains("o1") {
-                "high"
-            } else if m.contains("o3") || m.contains("o4") {
-                "heavy"
-            } else if let Some(major) = openai_gpt_major(&m) {
-                // Famiglia GPT: la versione distingue la fascia (regola G: parsing
-                // del numero, niente nome hardcoded). I "chat-latest" sono varianti
-                // chat veloci, non flagship reasoning: medium.
-                if major < 5 {
-                    // gpt-4o, gpt-4.1, ecc.
-                    "medium"
-                } else if m.contains("chat") {
-                    "medium"
-                } else if major >= 6 || m.contains("5.5") || m.contains("5-5") {
-                    // gpt-5.5 e generazioni future = frontiera.
-                    "frontier"
-                } else if m.contains("pro")
-                    || m.contains("codex")
-                    || m.contains("5.1")
-                    || m.contains("5.2")
-                    || m.contains("5.3")
-                    || m.contains("5.4")
-                    || m.contains("5-1")
-                    || m.contains("5-2")
-                    || m.contains("5-3")
-                    || m.contains("5-4")
-                {
-                    "heavy"
-                } else {
-                    // gpt-5 base
-                    "high"
-                }
-            } else if m.contains("pro") {
-                "heavy"
-            } else {
-                "medium"
-            }
-        }
-        "mistral" => {
-            // Mistral non ha un tier "heavy"/"frontier" reale: large/medium-3.5 e'
-            // il loro massimo (medium). Piccoli (ministral, small, nemo, tiny) light.
-            if m.contains("ministral")
-                || m.contains("small")
-                || m.contains("nemo")
-                || m.contains("tiny")
-            {
-                "light"
-            } else {
-                // large, medium, codestral, devstral, magistral
-                "medium"
-            }
-        }
-        "deepseek" => {
-            // deepseek-coder/chat = completion/chat LEGACY (V2/V3) -> light. I V4
-            // sono i forti: pro/reasoner -> 'high' (fascia alta ma non frontier),
-            // flash (1M ctx, veloce) -> 'medium'.
-            if m.contains("coder") || m.contains("chat") {
-                "light"
-            } else if m.contains("pro") || m.contains("reasoner") || m.contains("r1") {
-                "high"
-            } else {
-                // deepseek-v4-flash e successivi.
-                "medium"
-            }
-        }
+        "google" => infer_tier_google(&m),
+        "anthropic" => infer_tier_anthropic(&m),
+        "openai" => infer_tier_openai(&m),
+        "mistral" => infer_tier_mistral(&m),
+        "deepseek" => infer_tier_deepseek(&m),
         _ => "medium",
+    }
+}
+
+/// Euristica tier per Google (Gemini). `m` gia' lowercase.
+fn infer_tier_google(m: &str) -> &'static str {
+    // Marcatori di generazione: 3.5 e' l'attuale frontiera Google.
+    let g35 = m.contains("3.5") || m.contains("3-5");
+    let g3 = !g35 && (m.contains("gemini-3") || m.contains("-3-") || m.ends_with("-3"));
+    if m.contains("lite") {
+        "light"
+    } else if m.contains("flash") {
+        // flash veloce/economico resta light (fascia bassa invariata);
+        // ECCEZIONE: 3.5-flash e' il flagship coding Google -> heavy.
+        if g35 {
+            "heavy"
+        } else {
+            "light"
+        }
+    } else if m.contains("pro") {
+        // 3.5-pro -> frontier, gemini-3-pro/3.1-pro -> heavy, 2.5-pro -> high.
+        if g35 {
+            "frontier"
+        } else if g3 {
+            "heavy"
+        } else {
+            "high"
+        }
+    } else {
+        "light"
+    }
+}
+
+/// Euristica tier per Anthropic (Claude). `m` gia' lowercase.
+fn infer_tier_anthropic(m: &str) -> &'static str {
+    if m.contains("opus") {
+        // opus-4-8 (l'attuale flagship coding) frontier; opus precedenti heavy.
+        if m.contains("4-8") || m.contains("4.8") {
+            "frontier"
+        } else {
+            "heavy"
+        }
+    } else if m.contains("fable") {
+        // claude-fable-5: flagship "most capable widely-released".
+        "frontier"
+    } else if m.contains("haiku") {
+        "light"
+    } else {
+        // sonnet e altri
+        "medium"
+    }
+}
+
+/// Euristica tier per OpenAI (GPT / o-series). `m` gia' lowercase.
+fn infer_tier_openai(m: &str) -> &'static str {
+    // I "piccoli" hanno la precedenza assoluta: qualunque variante
+    // mini/nano (anche di un flagship, es. gpt-5.4-mini) e' light.
+    if m.contains("nano") || m.contains("mini") {
+        "light"
+    } else if m.contains("o1") {
+        "high"
+    } else if m.contains("o3") || m.contains("o4") {
+        "heavy"
+    } else if let Some(major) = openai_gpt_major(m) {
+        infer_tier_openai_gpt(m, major)
+    } else if m.contains("pro") {
+        "heavy"
+    } else {
+        "medium"
+    }
+}
+
+/// Sotto-euristica della famiglia GPT numerata (dopo aver estratto il major).
+/// La versione distingue la fascia (regola G: parsing del numero, niente nome
+/// hardcoded). I "chat-latest" sono varianti chat veloci, non flagship reasoning.
+fn infer_tier_openai_gpt(m: &str, major: u32) -> &'static str {
+    if major < 5 {
+        // gpt-4o, gpt-4.1, ecc.
+        "medium"
+    } else if m.contains("chat") {
+        "medium"
+    } else if major >= 6 || m.contains("5.5") || m.contains("5-5") {
+        // gpt-5.5 e generazioni future = frontiera.
+        "frontier"
+    } else if m.contains("pro")
+        || m.contains("codex")
+        || m.contains("5.1")
+        || m.contains("5.2")
+        || m.contains("5.3")
+        || m.contains("5.4")
+        || m.contains("5-1")
+        || m.contains("5-2")
+        || m.contains("5-3")
+        || m.contains("5-4")
+    {
+        "heavy"
+    } else {
+        // gpt-5 base
+        "high"
+    }
+}
+
+/// Euristica tier per Mistral. `m` gia' lowercase.
+fn infer_tier_mistral(m: &str) -> &'static str {
+    // Mistral non ha un tier "heavy"/"frontier" reale: large/medium-3.5 e'
+    // il loro massimo (medium). Piccoli (ministral, small, nemo, tiny) light.
+    if m.contains("ministral")
+        || m.contains("small")
+        || m.contains("nemo")
+        || m.contains("tiny")
+    {
+        "light"
+    } else {
+        // large, medium, codestral, devstral, magistral
+        "medium"
+    }
+}
+
+/// Euristica tier per DeepSeek. `m` gia' lowercase.
+fn infer_tier_deepseek(m: &str) -> &'static str {
+    // deepseek-coder/chat = completion/chat LEGACY (V2/V3) -> light. I V4
+    // sono i forti: pro/reasoner -> 'high' (fascia alta ma non frontier),
+    // flash (1M ctx, veloce) -> 'medium'.
+    if m.contains("coder") || m.contains("chat") {
+        "light"
+    } else if m.contains("pro") || m.contains("reasoner") || m.contains("r1") {
+        "high"
+    } else {
+        // deepseek-v4-flash e successivi.
+        "medium"
     }
 }
 
@@ -521,7 +557,7 @@ pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str 
 /// legge derivati via vista `v_model_capabilities`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClassifiedCaps {
-    /// Il modello sa invocare tool (function calling).
+    /// Il modello sa invocare tool (function-calling).
     pub supports_tool_use: bool,
     /// Il modello accetta input immagine (vision).
     pub supports_vision: bool,
@@ -794,14 +830,15 @@ pub(crate) const RECONCILE_PASSES_POLICY_SQL: &str = "( c.model ~ ANY(p.allowed_
          OR cardinality(p.allowed_patterns) = 0 ) \
      AND NOT ( c.model ~ ANY(p.denied_patterns) )";
 
-pub async fn reconcile_catalog_with_policy(db: &PgPool) -> anyhow::Result<PolicyReconcileStats> {
+/// ABILITA (reconciliation policy->catalog): rientrati nella policy, disabilitati
+/// per assenza/policy (non per fallimento). `auto_disabled_reason IS NULL` (mai
+/// disabilitato esplicito, tipico dei modelli importati staticamente) OPPURE
+/// reason di policy. Ritorna le righe abilitate. Estratta da
+/// `reconcile_catalog_with_policy` senza cambi di comportamento.
+async fn reconcile_enable_returning_to_policy(db: &PgPool) -> anyhow::Result<u64> {
     let manual = RECONCILE_MANUAL_LOCKED_SQL;
     let media = RECONCILE_IS_MEDIA_SQL;
     let passes = RECONCILE_PASSES_POLICY_SQL;
-
-    // ABILITA: rientrati nella policy, disabilitati per assenza/policy (non per
-    // fallimento). `auto_disabled_reason IS NULL` (mai disabilitato esplicito,
-    // tipico dei modelli importati staticamente) OPPURE reason di policy.
     let enable_sql = format!(
         "UPDATE ai_price_catalog c \
          SET is_enabled = true, \
@@ -818,9 +855,16 @@ pub async fn reconcile_catalog_with_policy(db: &PgPool) -> anyhow::Result<Policy
                  OR c.auto_disabled_reason ILIKE '%policy%' ) \
            AND ( {passes} )",
     );
-    let enabled = sqlx::query(&enable_sql).execute(db).await?.rows_affected();
+    Ok(sqlx::query(&enable_sql).execute(db).await?.rows_affected())
+}
 
-    // DISABILITA: attualmente abilitati ma non piu' conformi alla policy.
+/// DISABILITA (reconciliation policy->catalog): attualmente abilitati ma non piu'
+/// conformi alla policy. Ritorna le righe disabilitate. Estratta da
+/// `reconcile_catalog_with_policy` senza cambi di comportamento.
+async fn reconcile_disable_leaving_policy(db: &PgPool) -> anyhow::Result<u64> {
+    let manual = RECONCILE_MANUAL_LOCKED_SQL;
+    let media = RECONCILE_IS_MEDIA_SQL;
+    let passes = RECONCILE_PASSES_POLICY_SQL;
     let disable_sql = format!(
         "UPDATE ai_price_catalog c \
          SET is_enabled = false, \
@@ -834,7 +878,12 @@ pub async fn reconcile_catalog_with_policy(db: &PgPool) -> anyhow::Result<Policy
            AND NOT {media} \
            AND NOT ( {passes} )",
     );
-    let disabled = sqlx::query(&disable_sql).execute(db).await?.rows_affected();
+    Ok(sqlx::query(&disable_sql).execute(db).await?.rows_affected())
+}
+
+pub async fn reconcile_catalog_with_policy(db: &PgPool) -> anyhow::Result<PolicyReconcileStats> {
+    let enabled = reconcile_enable_returning_to_policy(db).await?;
+    let disabled = reconcile_disable_leaving_policy(db).await?;
 
     if enabled > 0 || disabled > 0 {
         tracing::info!(
@@ -1006,37 +1055,58 @@ async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::
         if provider.is_empty() {
             continue;
         }
-        match sync_provider(
+        sync_one_provider_into_stats(
             db,
             provider,
             disable_missing,
             insert_new_disabled,
             orchestrator,
+            &mut stats,
         )
-        .await
-        {
-            Ok((ins, dis, re)) => {
-                stats.providers_ok += 1;
-                stats.inserted += ins;
-                stats.disabled += dis;
-                stats.reenabled += re;
-            }
-            Err(e) => {
-                stats.providers_skipped += 1;
-                tracing::warn!("catalog_sync[{}] skip: {}", provider, e);
-            }
-        }
+        .await;
     }
     Ok(stats)
 }
 
-async fn sync_provider(
+/// Esegue `sync_provider` per un provider e accumula l'esito in `stats`
+/// (ok/skipped + delta inserted/disabled/reenabled). Estratta dal loop di
+/// `sync_tick` senza cambi di comportamento.
+async fn sync_one_provider_into_stats(
     db: &PgPool,
     provider: &str,
     disable_missing: bool,
     insert_new_disabled: bool,
     orchestrator: Option<&Orchestrator>,
-) -> anyhow::Result<(u32, u32, u32)> {
+    stats: &mut SyncStats,
+) {
+    match sync_provider(db, provider, disable_missing, insert_new_disabled, orchestrator).await {
+        Ok((ins, dis, re)) => {
+            stats.providers_ok += 1;
+            stats.inserted += ins;
+            stats.disabled += dis;
+            stats.reenabled += re;
+        }
+        Err(e) => {
+            stats.providers_skipped += 1;
+            tracing::warn!("catalog_sync[{}] skip: {}", provider, e);
+        }
+    }
+}
+
+/// Modelli live del provider indicizzati per il sync: la lista dei nomi e la
+/// mappa nome -> finestra di contesto DICHIARATA (solo quando >0).
+struct DiscoveredModels {
+    api_models: Vec<String>,
+    declared_windows: std::collections::HashMap<String, i64>,
+}
+
+/// Fetch dei modelli live dal gateway + indicizzazione (finestre dichiarate).
+/// Estratta da `sync_provider` senza cambi di comportamento: bail su lista vuota
+/// (sospetta, per safety), poi costruisce `declared_windows` e `api_models`.
+async fn discover_provider_models(
+    orchestrator: Option<&Orchestrator>,
+    provider: &str,
+) -> anyhow::Result<DiscoveredModels> {
     // Fetch modelli live dal gateway (via UNICA per la discovery: il gateway
     // incapsula l'auth di ogni provider, Vertex Service Account incluso, quindi
     // non servono api_key qui ne' la delega al brain per Google — regola L).
@@ -1056,12 +1126,24 @@ async fn sync_provider(
         }
     }
     let api_models: Vec<String> = api_metas.into_iter().map(|m| m.id).collect();
+    Ok(DiscoveredModels {
+        api_models,
+        declared_windows,
+    })
+}
 
-    // Carica modelli del catalog locale per questo provider.
-    // Il flag `manual_locked` viene letto da `auto_disabled_reason LIKE 'manual:%'`
-    // — convenzione introdotta col fix Bug A (audit 27/05/2026) per evitare che
-    // il worker riabiliti modelli che l'admin ha disabilitato manualmente
-    // (es. modelli "preview" che l'API espone ma non accetta in inference).
+/// Carica i modelli del catalog locale per un provider: mappa
+/// nome -> (is_enabled, manual_locked). Estratta da `sync_provider` senza cambi
+/// di comportamento.
+///
+/// Il flag `manual_locked` viene letto da `auto_disabled_reason LIKE 'manual:%'`
+/// — convenzione introdotta col fix Bug A (audit 27/05/2026) per evitare che
+/// il worker riabiliti modelli che l'admin ha disabilitato manualmente
+/// (es. modelli "preview" che l'API espone ma non accetta in inference).
+async fn load_catalog_models(
+    db: &PgPool,
+    provider: &str,
+) -> anyhow::Result<std::collections::HashMap<String, (bool, bool)>> {
     let catalog_rows = sqlx::query_as::<_, (String, bool, bool)>(
         "SELECT model, is_enabled, \
          (auto_disabled_reason IS NOT NULL AND auto_disabled_reason LIKE 'manual:%') AS manual_locked \
@@ -1070,87 +1152,183 @@ async fn sync_provider(
     .bind(provider)
     .fetch_all(db)
     .await?;
-
     // (model_name -> (is_enabled, manual_locked))
-    let catalog_models: std::collections::HashMap<String, (bool, bool)> = catalog_rows
+    Ok(catalog_rows
         .into_iter()
         .map(|(m, e, l)| (m, (e, l)))
-        .collect();
-    let api_set: std::collections::HashSet<&str> = api_models.iter().map(|s| s.as_str()).collect();
+        .collect())
+}
 
-    let mut inserted = 0u32;
-    let mut disabled = 0u32;
-    let mut reenabled = 0u32;
-    // Quante righe 'auto' di questo provider hanno avuto il performance_tier
-    // riallineato all'euristica corrente in questa passata (vedi blocco Some).
-    let mut tier_realigned = 0u32;
+/// Delta prodotti dall'elaborazione di UN modello scoperto dall'API discovery.
+#[derive(Debug, Default, Clone, Copy)]
+struct ModelSyncDelta {
+    inserted: u32,
+    reenabled: u32,
+    tier_realigned: u32,
+}
 
-    // 1. Nuovi modelli dall'API non presenti nel catalog -> INSERT
-    for api_model in &api_models {
-        // Classificazione MEDIA (punto unico, regola L): un modello image-gen/
-        // audio/video NON e' chat completion ma va comunque gestito dal catalog
-        // per essere instradato PER CAPABILITY. Prima questi venivano SCARTATI
-        // da `is_chat_compatible_model` (blacklist), rendendoli inesistenti per
-        // il routing media. Ora: se e' un media lo inseriamo coi suoi flag; se
-        // NON e' un media E non e' chat-compatibile (embedding/realtime/instruct/
-        // moderation) lo skippiamo come prima.
-        let media = classify_media_kind(api_model);
-        if media.is_none() && !is_chat_compatible_model(api_model) {
-            tracing::debug!(
-                "catalog_sync[{}]: skip '{}' (non chat-compatible, non media)",
-                provider,
-                api_model
-            );
-            continue;
+/// Ramo MEDIA terminale di `process_discovered_model`: insert dedicato, default
+/// sicuro (is_enabled=false), NIENTE probe chat (probe_model_on_insert
+/// chiamerebbe una completion: un media non e' chat -> sarebbe rumore/falso
+/// fallimento). NON applica la chat model_selection_policy ne' il pruning chat:
+/// i media vivono dei loro flag supports_<media>. Ritorna quante righe media
+/// sono state inserite (0 o 1). Estratto senza cambi di comportamento.
+async fn process_discovered_media_model(
+    db: &PgPool,
+    provider: &str,
+    api_model: &str,
+    kind: &str,
+    insert_new_disabled: bool,
+    catalog_models: &std::collections::HashMap<String, (bool, bool)>,
+) -> u32 {
+    match catalog_models.contains_key(api_model) {
+        false if insert_new_disabled => {
+            insert_media_model(db, provider, api_model, kind)
+                .await
+                .unwrap_or(0)
         }
-
-        // Ramo MEDIA: insert dedicato, default sicuro (is_enabled=false), NIENTE
-        // probe chat (probe_model_on_insert chiamerebbe una completion: un media
-        // non e' chat -> sarebbe rumore/falso fallimento). NON applichiamo la
-        // chat model_selection_policy ne' il pruning chat: i media vivono dei
-        // loro flag supports_<media>. I media NON attraversano il `match`
-        // chat sottostante (re-enable/policy/probe): questo ramo e' terminale.
-        if let Some(kind) = media {
-            match catalog_models.contains_key(api_model) {
-                false if insert_new_disabled => {
-                    if let Some(n) = insert_media_model(db, provider, api_model, kind).await {
-                        inserted += n;
-                    }
-                }
-                // Media gia' presente: riallinea il flag supports_<media> sulle
-                // righe 'auto' (gemello del riallineamento supports_vision dei chat).
-                true => realign_media_flags(db, provider, api_model, kind).await,
-                false => {}
-            }
-            continue;
+        // Media gia' presente: riallinea il flag supports_<media> sulle
+        // righe 'auto' (gemello del riallineamento supports_vision dei chat).
+        true => {
+            realign_media_flags(db, provider, api_model, kind).await;
+            0
         }
+        false => 0,
+    }
+}
 
-        let declared_window = declared_windows.get(api_model.as_str()).copied();
-        match catalog_models.get(api_model) {
-            None => {
-                if insert_new_disabled
-                    && insert_new_chat_model(db, orchestrator, provider, api_model, declared_window)
-                        .await
-                {
-                    inserted += 1;
-                }
+/// Elabora un singolo modello scoperto dall'API discovery (ramo INSERT del passo
+/// 1 di `sync_provider`), ritornando i delta. Estratta senza cambi di
+/// comportamento: gate chat/media, ramo media terminale, ramo chat (insert nuovo
+/// / riallineamento + re-enable esistente).
+async fn process_discovered_model(
+    db: &PgPool,
+    orchestrator: Option<&Orchestrator>,
+    provider: &str,
+    api_model: &str,
+    insert_new_disabled: bool,
+    catalog_models: &std::collections::HashMap<String, (bool, bool)>,
+    declared_windows: &std::collections::HashMap<String, i64>,
+) -> ModelSyncDelta {
+    let mut delta = ModelSyncDelta::default();
+
+    // Classificazione MEDIA (punto unico, regola L): un modello image-gen/
+    // audio/video NON e' chat completion ma va comunque gestito dal catalog
+    // per essere instradato PER CAPABILITY. Prima questi venivano SCARTATI
+    // da `is_chat_compatible_model` (blacklist), rendendoli inesistenti per
+    // il routing media. Ora: se e' un media lo inseriamo coi suoi flag; se
+    // NON e' un media E non e' chat-compatibile (embedding/realtime/instruct/
+    // moderation) lo skippiamo come prima.
+    let media = classify_media_kind(api_model);
+    if media.is_none() && !is_chat_compatible_model(api_model) {
+        tracing::debug!(
+            "catalog_sync[{}]: skip '{}' (non chat-compatible, non media)",
+            provider,
+            api_model
+        );
+        return delta;
+    }
+
+    // Ramo MEDIA: terminale (non attraversa il match chat sottostante).
+    if let Some(kind) = media {
+        delta.inserted += process_discovered_media_model(
+            db,
+            provider,
+            api_model,
+            kind,
+            insert_new_disabled,
+            catalog_models,
+        )
+        .await;
+        return delta;
+    }
+
+    // Ramo CHAT.
+    let declared_window = declared_windows.get(api_model).copied();
+    process_discovered_chat_model(
+        db,
+        orchestrator,
+        provider,
+        api_model,
+        insert_new_disabled,
+        declared_window,
+        catalog_models.get(api_model).copied(),
+        &mut delta,
+    )
+    .await;
+    delta
+}
+
+/// Ramo CHAT di `process_discovered_model`: se il modello non e' nel catalog lo
+/// inserisce (default sicuro is_enabled=false + probe-on-insert); se e' gia'
+/// presente riallinea tier/vision + finestra di contesto e prova il re-enable.
+/// Aggiorna `delta` in loco. Estratto senza cambi di comportamento.
+#[allow(clippy::too_many_arguments)]
+async fn process_discovered_chat_model(
+    db: &PgPool,
+    orchestrator: Option<&Orchestrator>,
+    provider: &str,
+    api_model: &str,
+    insert_new_disabled: bool,
+    declared_window: Option<i64>,
+    catalog_entry: Option<(bool, bool)>,
+    delta: &mut ModelSyncDelta,
+) {
+    match catalog_entry {
+        None => {
+            if insert_new_disabled
+                && insert_new_chat_model(db, orchestrator, provider, api_model, declared_window)
+                    .await
+            {
+                delta.inserted += 1;
             }
-            Some(&(is_enabled, manual_locked)) => {
-                tier_realigned += realign_existing_model(db, provider, api_model).await;
-                // Finestra dichiarata dal provider: riallinea il catalog al
-                // valore REALE (self-healing dei placeholder, regola H).
-                realign_context_window(db, provider, api_model, declared_window).await;
-                if reenable_existing_model(db, provider, api_model, is_enabled, manual_locked).await
-                {
-                    reenabled += 1;
-                }
+        }
+        Some((is_enabled, manual_locked)) => {
+            delta.tier_realigned += realign_existing_model(db, provider, api_model).await;
+            // Finestra dichiarata dal provider: riallinea il catalog al
+            // valore REALE (self-healing dei placeholder, regola H).
+            realign_context_window(db, provider, api_model, declared_window).await;
+            if reenable_existing_model(db, provider, api_model, is_enabled, manual_locked).await {
+                delta.reenabled += 1;
             }
         }
     }
+}
+
+async fn sync_provider(
+    db: &PgPool,
+    provider: &str,
+    disable_missing: bool,
+    insert_new_disabled: bool,
+    orchestrator: Option<&Orchestrator>,
+) -> anyhow::Result<(u32, u32, u32)> {
+    let DiscoveredModels {
+        api_models,
+        declared_windows,
+    } = discover_provider_models(orchestrator, provider).await?;
+
+    let catalog_models = load_catalog_models(db, provider).await?;
+    let api_set: std::collections::HashSet<&str> = api_models.iter().map(|s| s.as_str()).collect();
+
+    // 1. Nuovi modelli dall'API non presenti nel catalog -> INSERT (+ riallineo).
+    let ModelSyncDelta {
+        inserted,
+        reenabled,
+        tier_realigned,
+    } = accumulate_discovered_models(
+        db,
+        orchestrator,
+        provider,
+        insert_new_disabled,
+        &api_models,
+        &catalog_models,
+        &declared_windows,
+    )
+    .await;
 
     // 1bis. Prune dei modelli gia' nel catalog non piu' chat-compatibili o fuori
     // policy (self-healing, ADR 0025).
-    disabled += prune_incompatible_models(db, provider, &catalog_models).await;
+    let mut disabled = prune_incompatible_models(db, provider, &catalog_models).await;
 
     // 2. Modelli del catalog enabled non piu' nell'API -> disable.
     if disable_missing {
@@ -1165,8 +1343,40 @@ async fn sync_provider(
             tier_realigned
         );
     }
-
     Ok((inserted, disabled, reenabled))
+}
+
+/// Passo 1 di `sync_provider`: itera i modelli scoperti dall'API e accumula i
+/// delta (insert nuovi + riallineo/re-enable esistenti). Estratto senza cambi di
+/// comportamento; `disabled` NON e' qui (i due passi di disable restano nel
+/// chiamante).
+#[allow(clippy::too_many_arguments)]
+async fn accumulate_discovered_models(
+    db: &PgPool,
+    orchestrator: Option<&Orchestrator>,
+    provider: &str,
+    insert_new_disabled: bool,
+    api_models: &[String],
+    catalog_models: &std::collections::HashMap<String, (bool, bool)>,
+    declared_windows: &std::collections::HashMap<String, i64>,
+) -> ModelSyncDelta {
+    let mut total = ModelSyncDelta::default();
+    for api_model in api_models {
+        let delta = process_discovered_model(
+            db,
+            orchestrator,
+            provider,
+            api_model,
+            insert_new_disabled,
+            catalog_models,
+            declared_windows,
+        )
+        .await;
+        total.inserted += delta.inserted;
+        total.reenabled += delta.reenabled;
+        total.tier_realigned += delta.tier_realigned;
+    }
+    total
 }
 
 /// 1bis. Auto-disabilita i modelli GIA' nel catalog (is_enabled=true) non piu'
@@ -1203,37 +1413,52 @@ async fn prune_incompatible_models(
         } else {
             "fuori model_selection_policy (legacy)"
         };
-        let res = sqlx::query(
-            "UPDATE ai_price_catalog SET is_enabled = false, \
-             auto_disabled_at = NOW(), auto_disabled_reason = $3 \
-             WHERE provider = $1 AND model = $2",
-        )
-        .bind(provider)
-        .bind(catalog_model)
-        .bind(reason)
-        .execute(db)
-        .await;
-        if let Ok(r) = res {
-            if r.rows_affected() > 0 {
-                disabled += 1;
-                audit_log(
-                    db,
-                    provider,
-                    catalog_model,
-                    "disabled",
-                    json!({ "reason": reason }),
-                )
-                .await;
-                tracing::warn!(
-                    "catalog_sync[{}]: disabled '{}' ({})",
-                    provider,
-                    catalog_model,
-                    reason,
-                );
-            }
+        if prune_disable_one_model(db, provider, catalog_model, reason).await {
+            disabled += 1;
         }
     }
     disabled
+}
+
+/// Disabilita un singolo modello incompatibile/fuori-policy con il `reason`
+/// dato + audit + log. Ritorna `true` se una riga e' stata disabilitata.
+/// Estratta da `prune_incompatible_models` senza cambi di comportamento.
+async fn prune_disable_one_model(
+    db: &PgPool,
+    provider: &str,
+    catalog_model: &str,
+    reason: &str,
+) -> bool {
+    let res = sqlx::query(
+        "UPDATE ai_price_catalog SET is_enabled = false, \
+         auto_disabled_at = NOW(), auto_disabled_reason = $3 \
+         WHERE provider = $1 AND model = $2",
+    )
+    .bind(provider)
+    .bind(catalog_model)
+    .bind(reason)
+    .execute(db)
+    .await;
+    if let Ok(r) = res {
+        if r.rows_affected() > 0 {
+            audit_log(
+                db,
+                provider,
+                catalog_model,
+                "disabled",
+                json!({ "reason": reason }),
+            )
+            .await;
+            tracing::warn!(
+                "catalog_sync[{}]: disabled '{}' ({})",
+                provider,
+                catalog_model,
+                reason,
+            );
+            return true;
+        }
+    }
+    false
 }
 
 /// True se `api_model` e' `catalog_model` seguito da un suffisso data ISO
@@ -1245,6 +1470,97 @@ fn is_dated_variant_of(api_model: &str, catalog_model: &str) -> bool {
     }
     let suffix = &api_model[catalog_model.len()..];
     suffix.starts_with('-') && suffix.len() == 9 && suffix[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// True se un modello del catalog assente dall'API va PRESERVATO (non
+/// disabilitato) perche' e' un alias (con/senza suffisso data) ancora coperto
+/// dall'API, OPPURE perche' e' "recentemente sano" secondo l'account (FIX 2: la
+/// lista upstream e' un INDIZIO, non la verita'). Nel caso "recentemente sano"
+/// registra anche l'annotazione diagnostica idempotente. Estratta da
+/// `disable_missing_models` senza cambi di comportamento.
+async fn missing_model_should_be_preserved(
+    db: &PgPool,
+    provider: &str,
+    catalog_model: &str,
+    api_models: &[String],
+    api_set: &std::collections::HashSet<&str>,
+) -> bool {
+    // Skip alias "senza data" (es. claude-haiku-4-5) se l'API ritorna lo stesso
+    // modello con suffisso data (es. claude-haiku-4-5-20251001). Anthropic
+    // ritorna solo dated, ma il catalog/routing usa l'alias (piu' stabile).
+    if api_models
+        .iter()
+        .any(|api_m| is_dated_variant_of(api_m, catalog_model))
+    {
+        return true; // alias preservato (es. claude-haiku-4-5)
+    }
+
+    // Skip alias con suffisso data se la base name e' nell'API.
+    // Es: catalog "claude-sonnet-4-6-20251201" disabilitato solo se anche
+    // "claude-sonnet-4-6" non e' nell'API.
+    let base_name = strip_date_suffix(catalog_model);
+    if base_name.as_str() != catalog_model && api_set.contains(base_name.as_str()) {
+        return true;
+    }
+
+    // FIX 2 (catalog_sync probe-aware): la lista upstream LiteLLM/provider e'
+    // un INDIZIO, non la verita'. La verita' e' l'account: se il probe
+    // (model_health_probe) trova ancora il modello SANO, non spegnerlo solo
+    // perche' "datato" / non piu' in lista. Disabilitiamo solo se anche
+    // l'health reale lo conferma rotto.
+    if model_recently_healthy(db, provider, catalog_model).await {
+        // Annotazione diagnostica idempotente: il modello resta is_enabled=true
+        // (NON tocchiamo auto_disabled_*), ma l'audit_log registra la decisione
+        // cosi' e' rintracciabile perche' un modello "datato" e' rimasto attivo.
+        tracing::info!(
+            "catalog_sync[{}]: '{}' assente da upstream MA probe recente healthy -> NON disabilito (legacy, lascio is_enabled=true)",
+            provider, catalog_model,
+        );
+        audit_log(
+            db,
+            provider,
+            catalog_model,
+            "kept_enabled_legacy",
+            json!({"reason":"missing_from_api_but_recently_healthy"}),
+        )
+        .await;
+        return true;
+    }
+    false
+}
+
+/// Disabilita un singolo modello assente dall'API (reason 'missing_from_api') +
+/// audit + log. Ritorna `true` se una riga e' stata effettivamente disabilitata.
+/// Estratta da `disable_missing_models` senza cambi di comportamento.
+async fn disable_one_missing_model(db: &PgPool, provider: &str, catalog_model: &str) -> bool {
+    let res = sqlx::query(
+        "UPDATE ai_price_catalog SET is_enabled = false, \
+         auto_disabled_at = NOW(), auto_disabled_reason = 'missing_from_api' \
+         WHERE provider = $1 AND model = $2",
+    )
+    .bind(provider)
+    .bind(catalog_model)
+    .execute(db)
+    .await;
+    if let Ok(r) = res {
+        if r.rows_affected() > 0 {
+            audit_log(
+                db,
+                provider,
+                catalog_model,
+                "disabled",
+                json!({"reason":"missing_from_api"}),
+            )
+            .await;
+            tracing::warn!(
+                "catalog_sync[{}]: - disabled '{}' (non piu nell API)",
+                provider,
+                catalog_model,
+            );
+            return true;
+        }
+    }
+    false
 }
 
 /// 2. Disabilita i modelli del catalog enabled non piu' presenti nell'API.
@@ -1264,74 +1580,12 @@ async fn disable_missing_models(
         if !*is_enabled || api_set.contains(catalog_model.as_str()) {
             continue;
         }
-        // Skip alias "senza data" (es. claude-haiku-4-5) se l'API ritorna lo stesso
-        // modello con suffisso data (es. claude-haiku-4-5-20251001). Anthropic
-        // ritorna solo dated, ma il catalog/routing usa l'alias (piu' stabile).
-        if api_models
-            .iter()
-            .any(|api_m| is_dated_variant_of(api_m, catalog_model))
+        if missing_model_should_be_preserved(db, provider, catalog_model, api_models, api_set).await
         {
-            continue; // alias preservato (es. claude-haiku-4-5)
-        }
-
-        // Skip alias con suffisso data se la base name e' nell'API.
-        // Es: catalog "claude-sonnet-4-6-20251201" disabilitato solo se anche
-        // "claude-sonnet-4-6" non e' nell'API.
-        let base_name = strip_date_suffix(catalog_model);
-        if base_name.as_str() != catalog_model.as_str() && api_set.contains(base_name.as_str()) {
             continue;
         }
-
-        // FIX 2 (catalog_sync probe-aware): la lista upstream LiteLLM/provider e'
-        // un INDIZIO, non la verita'. La verita' e' l'account: se il probe
-        // (model_health_probe) trova ancora il modello SANO, non spegnerlo solo
-        // perche' "datato" / non piu' in lista. Disabilitiamo solo se anche
-        // l'health reale lo conferma rotto.
-        if model_recently_healthy(db, provider, catalog_model).await {
-            // Annotazione diagnostica idempotente: il modello resta is_enabled=true
-            // (NON tocchiamo auto_disabled_*), ma l'audit_log registra la decisione
-            // cosi' e' rintracciabile perche' un modello "datato" e' rimasto attivo.
-            tracing::info!(
-                "catalog_sync[{}]: '{}' assente da upstream MA probe recente healthy -> NON disabilito (legacy, lascio is_enabled=true)",
-                provider, catalog_model,
-            );
-            audit_log(
-                db,
-                provider,
-                catalog_model,
-                "kept_enabled_legacy",
-                json!({"reason":"missing_from_api_but_recently_healthy"}),
-            )
-            .await;
-            continue;
-        }
-
-        let res = sqlx::query(
-            "UPDATE ai_price_catalog SET is_enabled = false, \
-             auto_disabled_at = NOW(), auto_disabled_reason = 'missing_from_api' \
-             WHERE provider = $1 AND model = $2",
-        )
-        .bind(provider)
-        .bind(catalog_model)
-        .execute(db)
-        .await;
-        if let Ok(r) = res {
-            if r.rows_affected() > 0 {
-                disabled += 1;
-                audit_log(
-                    db,
-                    provider,
-                    catalog_model,
-                    "disabled",
-                    json!({"reason":"missing_from_api"}),
-                )
-                .await;
-                tracing::warn!(
-                    "catalog_sync[{}]: - disabled '{}' (non piu nell API)",
-                    provider,
-                    catalog_model,
-                );
-            }
+        if disable_one_missing_model(db, provider, catalog_model).await {
+            disabled += 1;
         }
     }
     disabled
@@ -1530,38 +1784,7 @@ async fn reenable_existing_model(
     // ricomparso nell'API non deve rientrare.
     let policy_ok = model_passes_selection_policy(db, provider, api_model).await;
     if !is_enabled && !manual_locked && policy_ok {
-        // Modello disabilitato dal worker (missing_from_api) ma ricomparso.
-        // Il reason si azzera SOLO se appartiene al ciclo is_enabled: i reason del
-        // ciclo tool-capability ('malformed_tool_calls', 'tool_probe_failed:%')
-        // vanno PRESERVATI — azzerarli lasciava supports_tool_use=false orfano
-        // (reason NULL), irraggiungibile dal ri-test del probe (incidente
-        // magistral-small-2509, 2026-06-10).
-        let sql = format!(
-            "UPDATE ai_price_catalog SET is_enabled = true, effective_from = NOW(), \
-             auto_disabled_at = NULL, \
-             auto_disabled_reason = CASE WHEN {tool_reason} \
-                                         THEN auto_disabled_reason \
-                                         ELSE NULL END, \
-             updated_at = NOW() \
-             WHERE provider = $1 AND model = $2",
-            tool_reason = crate::tool_capability::TOOL_REASON_PREDICATE_SQL
-        );
-        let res = sqlx::query(&sql)
-            .bind(provider)
-            .bind(api_model)
-            .execute(db)
-            .await;
-        if let Ok(r) = res {
-            if r.rows_affected() > 0 {
-                audit_log(db, provider, api_model, "reenabled", json!({})).await;
-                tracing::info!(
-                    "catalog_sync[{}]: re-enabled '{}' (ricomparso API)",
-                    provider,
-                    api_model
-                );
-                return true;
-            }
-        }
+        return do_reenable_model(db, provider, api_model).await;
     } else if !is_enabled && manual_locked {
         // Skip: admin lo ha disabilitato manualmente, non riabilitare anche se ricompare.
         tracing::debug!(
@@ -1569,6 +1792,45 @@ async fn reenable_existing_model(
             provider,
             api_model
         );
+    }
+    false
+}
+
+/// Esegue l'UPDATE di re-enable di un modello ricomparso nell'API + audit + log.
+/// Ritorna `true` se una riga e' stata riabilitata. Estratta da
+/// `reenable_existing_model` senza cambi di comportamento.
+///
+/// Il reason si azzera SOLO se appartiene al ciclo is_enabled: i reason del
+/// ciclo tool-capability ('malformed_tool_calls', 'tool_probe_failed:%') vanno
+/// PRESERVATI — azzerarli lasciava supports_tool_use=false orfano (reason NULL),
+/// irraggiungibile dal ri-test del probe (incidente magistral-small-2509,
+/// 2026-06-10).
+async fn do_reenable_model(db: &PgPool, provider: &str, api_model: &str) -> bool {
+    let sql = format!(
+        "UPDATE ai_price_catalog SET is_enabled = true, effective_from = NOW(), \
+         auto_disabled_at = NULL, \
+         auto_disabled_reason = CASE WHEN {tool_reason} \
+                                     THEN auto_disabled_reason \
+                                     ELSE NULL END, \
+         updated_at = NOW() \
+         WHERE provider = $1 AND model = $2",
+        tool_reason = crate::tool_capability::TOOL_REASON_PREDICATE_SQL
+    );
+    let res = sqlx::query(&sql)
+        .bind(provider)
+        .bind(api_model)
+        .execute(db)
+        .await;
+    if let Ok(r) = res {
+        if r.rows_affected() > 0 {
+            audit_log(db, provider, api_model, "reenabled", json!({})).await;
+            tracing::info!(
+                "catalog_sync[{}]: re-enabled '{}' (ricomparso API)",
+                provider,
+                api_model
+            );
+            return true;
+        }
     }
     false
 }
@@ -1588,50 +1850,10 @@ async fn probe_new_model_on_insert(
             apply_probe_healthy(db, provider, api_model).await;
         }
         ProbeOnInsertResult::ModelBroken(kind) => {
-            let reason = format!("failed_initial_probe:{}", kind);
-            let _ = sqlx::query(
-                "UPDATE ai_price_catalog \
-                 SET auto_disabled_at = NOW(), \
-                     auto_disabled_reason = $3, updated_at = NOW() \
-                 WHERE provider = $1 AND model = $2",
-            )
-            .bind(provider)
-            .bind(api_model)
-            .bind(&reason)
-            .execute(db)
-            .await;
-            audit_log(
-                db,
-                provider,
-                api_model,
-                "probe_failed_on_insert",
-                json!({"reason": reason}),
-            )
-            .await;
-            tracing::warn!(
-                "catalog_sync[{}]: probe FAIL su nuovo modello '{}' (reason={}) -> resta disabled",
-                provider, api_model, kind
-            );
+            apply_probe_model_broken(db, provider, api_model, &kind).await;
         }
         ProbeOnInsertResult::ProviderDown(kind) => {
-            // Provider giu' (quota/billing/auth): non possiamo sapere se il
-            // modello e' valido. Lasciamo disabled con motivazione esplicita: il
-            // model_health_probe worker (run periodico) lo riabilitera' quando il
-            // provider torna up E il probe passa.
-            let reason = format!("provider_down_on_insert:{}", kind);
-            let _ = sqlx::query(
-                "UPDATE ai_price_catalog SET auto_disabled_reason = $3, updated_at = NOW() \
-                 WHERE provider = $1 AND model = $2",
-            )
-            .bind(provider)
-            .bind(api_model)
-            .bind(&reason)
-            .execute(db)
-            .await;
-            tracing::info!(
-                "catalog_sync[{}]: probe inconclusive (provider down: {}) su '{}' -> resta disabled, model_health_probe lo rivedra'",
-                provider, kind, api_model
-            );
+            apply_probe_provider_down(db, provider, api_model, &kind).await;
         }
         ProbeOnInsertResult::Inconclusive(reason) => {
             tracing::debug!(
@@ -1649,6 +1871,58 @@ async fn probe_new_model_on_insert(
             );
         }
     }
+}
+
+/// Ramo `ModelBroken` del probe-on-insert: annota il reason punitivo
+/// (`failed_initial_probe:<kind>`) + audit + log. Estratto senza cambi di
+/// comportamento.
+async fn apply_probe_model_broken(db: &PgPool, provider: &str, api_model: &str, kind: &str) {
+    let reason = format!("failed_initial_probe:{}", kind);
+    let _ = sqlx::query(
+        "UPDATE ai_price_catalog \
+         SET auto_disabled_at = NOW(), \
+             auto_disabled_reason = $3, updated_at = NOW() \
+         WHERE provider = $1 AND model = $2",
+    )
+    .bind(provider)
+    .bind(api_model)
+    .bind(&reason)
+    .execute(db)
+    .await;
+    audit_log(
+        db,
+        provider,
+        api_model,
+        "probe_failed_on_insert",
+        json!({"reason": reason}),
+    )
+    .await;
+    tracing::warn!(
+        "catalog_sync[{}]: probe FAIL su nuovo modello '{}' (reason={}) -> resta disabled",
+        provider, api_model, kind
+    );
+}
+
+/// Ramo `ProviderDown` del probe-on-insert: provider giu' (quota/billing/auth),
+/// non possiamo sapere se il modello e' valido. Lasciamo disabled con
+/// motivazione esplicita: il model_health_probe worker (run periodico) lo
+/// riabilitera' quando il provider torna up E il probe passa. Estratto senza
+/// cambi di comportamento.
+async fn apply_probe_provider_down(db: &PgPool, provider: &str, api_model: &str, kind: &str) {
+    let reason = format!("provider_down_on_insert:{}", kind);
+    let _ = sqlx::query(
+        "UPDATE ai_price_catalog SET auto_disabled_reason = $3, updated_at = NOW() \
+         WHERE provider = $1 AND model = $2",
+    )
+    .bind(provider)
+    .bind(api_model)
+    .bind(&reason)
+    .execute(db)
+    .await;
+    tracing::info!(
+        "catalog_sync[{}]: probe inconclusive (provider down: {}) su '{}' -> resta disabled, model_health_probe lo rivedra'",
+        provider, kind, api_model
+    );
 }
 
 /// Ramo `Healthy` del probe-on-insert: infersce capabilities/tier dal nome,
@@ -1670,6 +1944,32 @@ async fn apply_probe_healthy(db: &PgPool, provider: &str, api_model: &str) {
     // model_selection_policy. Cosi' i modelli legacy (pruned dalla 0320) non
     // rientrano via probe-on-insert.
     let allowed = model_passes_selection_policy(db, provider, api_model).await;
+    write_probe_healthy_flags(db, provider, api_model, &caps_json, &cc, allowed).await;
+    audit_log(
+        db, provider, api_model,
+        if allowed { "probe_ok_on_insert" } else { "probe_ok_but_outside_policy" },
+        json!({"action": if allowed {"auto_enabled"} else {"kept_disabled_outside_allowlist"}, "inferred_capabilities": inferred_caps}),
+    )
+    .await;
+    tracing::info!(
+        "catalog_sync[{}]: probe OK su '{}' -> {} (policy allowlist)",
+        provider, api_model, if allowed {"abilitato"} else {"lasciato disabilitato (fuori allowlist)"}
+    );
+}
+
+/// UPDATE dei flag canonici (ADR 0024) + is_enabled dopo un probe Healthy.
+/// Scrive `capabilities` solo se attualmente vuoto e i flag SOLO su righe
+/// 'auto' (le 'manual' restano intatte). `is_enabled` diventa `allowed` (gate
+/// allowlist ADR 0025). Estratta da `apply_probe_healthy` senza cambi di
+/// comportamento.
+async fn write_probe_healthy_flags(
+    db: &PgPool,
+    provider: &str,
+    api_model: &str,
+    caps_json: &Value,
+    cc: &ClassifiedCaps,
+    allowed: bool,
+) {
     let _ = sqlx::query(
         "UPDATE ai_price_catalog \
          SET is_enabled = $8, \
@@ -1690,7 +1990,7 @@ async fn apply_probe_healthy(db: &PgPool, provider: &str, api_model: &str) {
     )
     .bind(provider)
     .bind(api_model)
-    .bind(&caps_json)
+    .bind(caps_json)
     .bind(cc.supports_tool_use)
     .bind(cc.supports_vision)
     .bind(cc.is_thinking)
@@ -1699,16 +1999,6 @@ async fn apply_probe_healthy(db: &PgPool, provider: &str, api_model: &str) {
     .bind(cc.agentic_thinking_policy)
     .execute(db)
     .await;
-    audit_log(
-        db, provider, api_model,
-        if allowed { "probe_ok_on_insert" } else { "probe_ok_but_outside_policy" },
-        json!({"action": if allowed {"auto_enabled"} else {"kept_disabled_outside_allowlist"}, "inferred_capabilities": inferred_caps}),
-    )
-    .await;
-    tracing::info!(
-        "catalog_sync[{}]: probe OK su '{}' -> {} (policy allowlist)",
-        provider, api_model, if allowed {"abilitato"} else {"lasciato disabilitato (fuori allowlist)"}
-    );
 }
 
 /// Rimuove suffisso data ISO (es. -20251201) dal model name per gestire alias.
@@ -1735,14 +2025,7 @@ fn strip_date_suffix(model: &str) -> String {
 /// Conservativo: se la query fallisce, ritorna `false` (cioe' lascia procedere
 /// la disabilitazione come prima — niente nuovi falsi-positivi su DB down).
 async fn model_recently_healthy(db: &PgPool, provider: &str, model: &str) -> bool {
-    // Finestra di freschezza DB-driven (regola G: niente hardcode magico).
-    let window_hours: i64 = get_setting(db, "agent.catalog_sync_health_window_hours")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|h| *h > 0)
-        .unwrap_or(24);
+    let window_hours = load_health_window_hours(db).await;
 
     // (a) Ultimo health check recente healthy=true.
     let recent_healthy: Option<bool> = sqlx::query_scalar(
@@ -1766,24 +2049,42 @@ async fn model_recently_healthy(db: &PgPool, provider: &str, model: &str) -> boo
 
     // (b) Fallback: nessun probe recente, ma il catalog non registra fallimenti
     // model-specific consecutivi -> consideriamo il modello ancora valido.
-    // (Se un probe l'avesse trovato rotto, consecutive_failures sarebbe > 0.)
     if recent_healthy.is_none() {
-        let cf: Option<i32> = sqlx::query_scalar(
-            "SELECT consecutive_failures FROM ai_price_catalog
-              WHERE provider = $1 AND model = $2",
-        )
-        .bind(provider)
-        .bind(model)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
-        if matches!(cf, Some(0)) {
-            return true;
-        }
+        return model_has_no_consecutive_failures(db, provider, model).await;
     }
 
     false
+}
+
+/// Finestra di freschezza health DB-driven (setting
+/// `agent.catalog_sync_health_window_hours`, default 24h; regola G: niente
+/// hardcode magico). Estratta da `model_recently_healthy`.
+async fn load_health_window_hours(db: &PgPool) -> i64 {
+    get_setting(db, "agent.catalog_sync_health_window_hours")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|h| *h > 0)
+        .unwrap_or(24)
+}
+
+/// Fallback (b) di `model_recently_healthy`: nessun probe recente, ma il catalog
+/// non registra fallimenti model-specific consecutivi (`consecutive_failures=0`,
+/// cioe' nessun probe l'ha trovato rotto) -> modello ancora valido. Estratta
+/// senza cambi di comportamento.
+async fn model_has_no_consecutive_failures(db: &PgPool, provider: &str, model: &str) -> bool {
+    let cf: Option<i32> = sqlx::query_scalar(
+        "SELECT consecutive_failures FROM ai_price_catalog
+          WHERE provider = $1 AND model = $2",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    matches!(cf, Some(0))
 }
 
 async fn audit_log(db: &PgPool, provider: &str, model: &str, action: &str, details: Value) {
