@@ -3,7 +3,6 @@
 # 1. Endpoint backend che ogni pannello consuma
 # 2. Errori nei log dei servizi (ultimi 5 min)
 # 3. Errori console Next.js
-cd /home/administrator/ideai
 
 GREEN="\033[0;32m"
 RED="\033[0;31m"
@@ -17,7 +16,10 @@ warn() { echo -e "${YELLOW}[WARN]${NC}   $*"; }
 probe() {
   local label="$1"; local url="$2"; local expect="${3:-200}"
   local code
-  code=$(curl -sS -o /dev/null -m 5 -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+  # In caso di errore curl stampa comunque "000" via -w: niente || echo,
+  # altrimenti il codice raddoppia in "000000" e il ramo TIMEOUT non scatta.
+  code=$(curl -sS -o /dev/null -m 5 -w "%{http_code}" "$url" 2>/dev/null) || true
+  [ -n "$code" ] || code="000"
   if [ "$code" = "$expect" ]; then
     ok "$label  ($code)  $url"
   elif [[ "$code" =~ ^(401|403)$ ]] && [ "$expect" = "auth" ]; then
@@ -30,7 +32,7 @@ probe() {
 }
 
 echo "═══════════════════════════════════════════════════════════"
-echo "  Smoke pannelli web-ide (post-merge stash WIP, $(date +%H:%M))"
+echo "  Smoke pannelli web-ide ($(date +%H:%M))"
 echo "═══════════════════════════════════════════════════════════"
 
 echo ""
@@ -61,11 +63,6 @@ echo "── Pannello Database (project-db) ──"
 probe "/api/admin/nexus-database-stats  " "http://localhost:3000/api/admin/nexus-database-stats" "auth"
 
 echo ""
-echo "── Pannello Neural (brain) ──"
-probe "brain /health             " "http://localhost:8001/health"
-probe "brain /providers          " "http://localhost:8001/providers" "200"
-
-echo ""
 echo "── Pannello Plugin/Settings ──"
 probe "/api/admin/settings      " "http://localhost:3000/api/admin/settings" "auth"
 
@@ -76,7 +73,7 @@ probe "/api/dispatcher/projects  " "http://localhost:3000/api/dispatcher/project
 
 echo ""
 echo "── Errori recenti nei log servizi (ultimi 2 min) ──"
-for log in /tmp/nexus-mcp-core.log /tmp/nexus-neural.log /tmp/nexus-gateway.log /tmp/nexus-webide.log; do
+for log in /tmp/nexus-mcp-core.log /tmp/nexus-gateway.log /tmp/nexus-webide.log; do
   if [ -f "$log" ]; then
     errs=$(tail -200 "$log" 2>/dev/null | grep -iE 'ERROR|panic|Error:|FATAL|Exception|Traceback' | grep -v 'http.*40[14]' | tail -3)
     if [ -n "$errs" ]; then
