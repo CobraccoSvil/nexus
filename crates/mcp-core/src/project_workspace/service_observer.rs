@@ -285,31 +285,37 @@ async fn collect_units(
     _slug: &str,
     name: &str,
 ) -> Vec<UnitSample> {
-    use chrono::{DateTime, Utc};
-
-    // Slug e unit dai PUNTI UNICI condivisi col pannello (regola L): la formula
-    // e' name.to_lowercase().replace([' ','_'],"-"), NON projects.slug (slugify +
+    // Slug/unit dai PUNTI UNICI condivisi col pannello (regola L): la formula e'
+    // name.to_lowercase().replace([' ','_'],"-"), NON projects.slug (slugify +
     // suffisso -N), altrimenti l'unit divergerebbe da list_services_windows e da
     // nexus_port_allocations.service_unit (diagnosi orfane, readiness saltata).
     let slug = super::services::project_service_slug(name);
+    let (rows, visible) = windows_visible_service_rows(state, project_id).await;
 
-    // Separazione DB per-progetto: agent_processes e' tabella migrata (flag OFF
-    // -> meta-pool, behavior-preserving). Stessa fonte di list_services_windows.
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for row in rows {
+        // Prima occorrenza per label = riga piu' recente (rows ordinata DESC).
+        if !seen.insert(row.0.clone()) || !visible.contains(&row.0) {
+            continue;
+        }
+        out.push(windows_service_sample(&slug, row));
+    }
+    out
+}
+
+/// Carica le righe service di `agent_processes` (ordinate label ASC, created_at
+/// DESC) e l'insieme delle label visibili dal PUNTO UNICO `visible_windows_services`
+/// (services.rs, dedup label/fantasma). Separazione DB per-progetto: stessa fonte
+/// di list_services_windows. Estratto da `collect_units`.
+#[cfg(windows)]
+async fn windows_visible_service_rows(
+    state: &AppState,
+    project_id: Uuid,
+) -> (Vec<WindowsServiceRow>, std::collections::HashSet<String>) {
+    use chrono::{DateTime, Utc};
     let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
-    // Tutte le righe service, ordinate come vuole visible_windows_services
-    // (label ASC, created_at DESC): la prima occorrenza di ogni label e' la piu'
-    // recente. Carico anche pid/exit_code/output/error_output/started_at.
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        String,              // label
-        String,              // status
-        DateTime<Utc>,       // created_at
-        Option<i32>,         // pid
-        Option<i32>,         // exit_code
-        String,              // output (stdout)
-        String,              // error_output (stderr)
-        Option<DateTime<Utc>>, // started_at
-    )> = sqlx::query_as(
+    let rows: Vec<WindowsServiceRow> = sqlx::query_as(
         "SELECT label, status, created_at, pid, exit_code, output, error_output, started_at \
          FROM agent_processes \
          WHERE project_id = $1 AND kind = 'service' \
@@ -330,79 +336,90 @@ async fn collect_units(
             .into_iter()
             .map(|(label, _running)| label)
             .collect();
+    (rows, visible)
+}
 
-    let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for (label, status, _created_at, pid, exit_code, output, error_output, started_at) in rows {
-        // Prima occorrenza per label = riga piu' recente (rows ordinata DESC).
-        if !seen.insert(label.clone()) {
-            continue;
+/// Riga service di `agent_processes` (proiezione usata dal collector Windows).
+#[cfg(windows)]
+type WindowsServiceRow = (
+    String,                          // label
+    String,                          // status
+    chrono::DateTime<chrono::Utc>,   // created_at
+    Option<i32>,                     // pid
+    Option<i32>,                     // exit_code
+    String,                          // output (stdout)
+    String,                          // error_output (stderr)
+    Option<chrono::DateTime<chrono::Utc>>, // started_at
+);
+
+/// Deriva `(active_state, effective_pid)` di una riga service Windows. Stato
+/// strutturato (regola M): la liveness reale via process_alive + VALIDAZIONE
+/// IDENTITA' del PID (anti-riciclo: creation-time vs started_at; dato mancante =>
+/// non vivo, fail-safe) hanno la precedenza sul campo `status` (che puo' restare
+/// 'running' dopo un crash o un riciclo del PID).
+#[cfg(windows)]
+fn windows_pid_state(
+    status: &str,
+    pid: Option<i32>,
+    exit_code: Option<i32>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> (String, Option<u32>) {
+    let pid_u = pid.and_then(|p| u32::try_from(p).ok()).filter(|&p| p > 0);
+    let alive = match pid_u {
+        Some(p) if crate::process_util::process_alive(p) => pid_identity_ok(
+            crate::process_util::process_start_unix(p),
+            started_at.map(|t| t.timestamp()),
+            PID_IDENTITY_TOLERANCE_S,
+        ),
+        _ => false,
+    };
+    // Vivo E identita' confermata => 'active'; altrimenti morto: exit_code!=0 o
+    // status='failed' => 'failed', sennò 'inactive'.
+    let active_state = if alive {
+        "active".to_string()
+    } else if status == "failed" || exit_code.is_some_and(|c| c != 0) {
+        "failed".to_string()
+    } else {
+        "inactive".to_string()
+    };
+    (active_state, if alive { pid_u } else { None })
+}
+
+/// Costruisce un `UnitSample` da una riga service Windows. Estratto da
+/// `collect_units` (comportamento invariato).
+#[cfg(windows)]
+fn windows_service_sample(slug: &str, row: WindowsServiceRow) -> UnitSample {
+    let (label, status, _created_at, pid, exit_code, output, error_output, started_at) = row;
+    let unit = super::services::service_unit_name(slug, &label);
+    let (active_state, effective_pid) = windows_pid_state(&status, pid, exit_code, started_at);
+
+    // Marcatore di run: pid + started_at. Cambia a ogni nuovo avvio (pid nuovo,
+    // started_at pure) -> reset grace/anti-spam. Non viene parsato.
+    let active_enter =
+        effective_pid.map(|p| format!("{p}:{}", started_at.map(|t| t.timestamp()).unwrap_or(0)));
+
+    // Log del run corrente = stdout + stderr accumulati (cap 50KB alla fonte,
+    // spawn_agent_process). Servono a error-rate e alla diagnosi LLM.
+    let mut run_log = String::with_capacity(output.len() + error_output.len() + 1);
+    run_log.push_str(&output);
+    if !error_output.is_empty() {
+        if !run_log.is_empty() {
+            run_log.push('\n');
         }
-        if !visible.contains(&label) {
-            continue;
-        }
-        let unit = super::services::service_unit_name(&slug, &label);
-        // Stato strutturato (regola M): la liveness reale via process_alive +
-        // VALIDAZIONE IDENTITA' del PID hanno la precedenza sul campo `status`
-        // (che puo' restare 'running' dopo un crash o un riciclo del PID).
-        // Vivo E identita' confermata => 'active'; altrimenti morto:
-        // exit_code!=0 o status='failed' => 'failed', sennò 'inactive'.
-        let pid_u = pid.and_then(|p| u32::try_from(p).ok()).filter(|&p| p > 0);
-        let alive = match pid_u {
-            // Anti-riciclo: il processo con quel PID e' vivo, ma e' DAVVERO il
-            // nostro servizio? Confronta il creation-time reale con started_at.
-            // Se started_at manca o il creation-time non e' leggibile, non si puo'
-            // confermare l'identita' -> NON considerarlo vivo (fail-safe: meglio
-            // segnalare un possibile crash che mascherarlo con metriche altrui).
-            Some(p) if crate::process_util::process_alive(p) => pid_identity_ok(
-                crate::process_util::process_start_unix(p),
-                started_at.map(|t| t.timestamp()),
-                PID_IDENTITY_TOLERANCE_S,
-            ),
-            _ => false,
-        };
-        let active_state = if alive {
-            "active".to_string()
-        } else if status == "failed" || exit_code.is_some_and(|c| c != 0) {
-            "failed".to_string()
-        } else {
-            "inactive".to_string()
-        };
-        let effective_pid = if alive { pid_u } else { None };
-
-        // Marcatore di run: pid + started_at. Cambia a ogni nuovo avvio (il pid e'
-        // nuovo, started_at pure) -> reset grace/anti-spam. Non viene parsato.
-        let active_enter = effective_pid.map(|p| {
-            format!(
-                "{p}:{}",
-                started_at.map(|t| t.timestamp()).unwrap_or(0)
-            )
-        });
-
-        // Log del run corrente = stdout + stderr accumulati (cap 50KB alla fonte,
-        // spawn_agent_process). Servono a error-rate e alla diagnosi LLM.
-        let mut run_log = String::with_capacity(output.len() + error_output.len() + 1);
-        run_log.push_str(&output);
-        if !error_output.is_empty() {
-            if !run_log.is_empty() {
-                run_log.push('\n');
-            }
-            run_log.push_str(&error_output);
-        }
-
-        out.push(UnitSample {
-            unit,
-            active_state,
-            pid: effective_pid,
-            // agent_processes non traccia i restart: anomaly 'restart' disabilitata
-            // su Windows (regola M/H: nessun dato strutturato -> None, non stime).
-            restarts: None,
-            active_enter,
-            log_buffer: run_log.clone(),
-            run_log,
-        });
+        run_log.push_str(&error_output);
     }
-    out
+
+    UnitSample {
+        unit,
+        active_state,
+        pid: effective_pid,
+        // agent_processes non traccia i restart: anomaly 'restart' disabilitata su
+        // Windows (regola M/H: nessun dato strutturato -> None, non stime).
+        restarts: None,
+        active_enter,
+        log_buffer: run_log.clone(),
+        run_log,
+    }
 }
 
 /// Unit systemd `{slug}-*.service` con il loro stato active (es. "active",
@@ -730,6 +747,19 @@ struct AnomalySignal {
     severity: String,
 }
 
+impl AnomalySignal {
+    /// Costruttore compatto per ridurre la ripetizione nei push di
+    /// `evaluate_anomalies`.
+    fn new(metric: &str, value: f64, threshold: f64, severity: &str) -> Self {
+        Self {
+            metric: metric.into(),
+            value,
+            threshold,
+            severity: severity.into(),
+        }
+    }
+}
+
 /// Valuta le metriche correnti contro le soglie. Funzione pura.
 fn evaluate_anomalies(
     active_state: &str,
@@ -747,46 +777,36 @@ fn evaluate_anomalies(
     // transizione + auto-resolve quando il servizio torna attivo) e' gia' gestito
     // da resolve_stale_anomalies, senza logica nuova (regola L).
     if active_state == "failed" {
-        out.push(AnomalySignal {
-            metric: "down".into(),
-            value: 1.0,
-            threshold: 0.0,
-            severity: "critical".into(),
-        });
+        out.push(AnomalySignal::new("down", 1.0, 0.0, "critical"));
     }
     if let Some(cpu) = cpu_pct {
         if cpu > cfg.cpu_pct_threshold {
-            out.push(AnomalySignal {
-                metric: "cpu".into(),
-                value: cpu,
-                threshold: cfg.cpu_pct_threshold,
-                severity: "warning".into(),
-            });
+            out.push(AnomalySignal::new("cpu", cpu, cfg.cpu_pct_threshold, "warning"));
         }
     }
     if cfg.rss_bytes_threshold > 0 && rss_bytes > cfg.rss_bytes_threshold {
-        out.push(AnomalySignal {
-            metric: "rss".into(),
-            value: rss_bytes as f64,
-            threshold: cfg.rss_bytes_threshold as f64,
-            severity: "warning".into(),
-        });
+        out.push(AnomalySignal::new(
+            "rss",
+            rss_bytes as f64,
+            cfg.rss_bytes_threshold as f64,
+            "warning",
+        ));
     }
     if restart_delta > cfg.restart_rate_max {
-        out.push(AnomalySignal {
-            metric: "restart".into(),
-            value: restart_delta as f64,
-            threshold: cfg.restart_rate_max as f64,
-            severity: "critical".into(),
-        });
+        out.push(AnomalySignal::new(
+            "restart",
+            restart_delta as f64,
+            cfg.restart_rate_max as f64,
+            "critical",
+        ));
     }
     if error_per_min > cfg.error_rate_max_per_min {
-        out.push(AnomalySignal {
-            metric: "error_rate".into(),
-            value: error_per_min,
-            threshold: cfg.error_rate_max_per_min,
-            severity: "warning".into(),
-        });
+        out.push(AnomalySignal::new(
+            "error_rate",
+            error_per_min,
+            cfg.error_rate_max_per_min,
+            "warning",
+        ));
     }
     out
 }
@@ -818,38 +838,72 @@ async fn persist_diagnosis(
     error_signature_hash: Option<&str>,
     detail: Option<&str>,
 ) -> Option<Uuid> {
+    let row = DiagnosisRow {
+        project_id,
+        unit,
+        signal_kind,
+        metric,
+        value,
+        threshold,
+        error_signature_hash,
+        detail,
+    };
     if signal_kind == "anomaly" {
-        // UPSERT: una sola anomalia attiva per (project_id, unit, metric).
-        // Il target ON CONFLICT replica esattamente colonne+predicato
-        // dell'indice parziale uniq_service_diagnoses_active_anomaly.
-        return sqlx::query_scalar::<_, Uuid>(
-            r#"INSERT INTO service_diagnoses
-               (project_id, unit, signal_kind, metric, value, threshold,
-                error_signature_hash, status, detail)
-               VALUES ($1,$2,'anomaly',$3,$4,$5,$6,'open',$7)
-               ON CONFLICT (project_id, unit, COALESCE(metric, ''))
-                 WHERE signal_kind = 'anomaly' AND status IN ('open', 'diagnosing')
-               DO UPDATE SET
-                 value       = EXCLUDED.value,
-                 threshold   = EXCLUDED.threshold,
-                 detail      = EXCLUDED.detail,
-                 updated_at  = NOW(),
-                 occurrences = service_diagnoses.occurrences + 1
-               RETURNING id"#,
-        )
-        .bind(project_id)
-        .bind(unit)
-        .bind(metric)
-        .bind(value)
-        .bind(threshold)
-        .bind(error_signature_hash)
-        .bind(detail)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
+        upsert_anomaly_diagnosis(db, &row).await
+    } else {
+        insert_event_diagnosis(db, &row).await
     }
+}
 
+/// Campi di una riga `service_diagnoses` da persistere, raggruppati per delegare
+/// ai due rami SQL senza superare il limite clippy::too_many_arguments.
+struct DiagnosisRow<'a> {
+    project_id: Uuid,
+    unit: &'a str,
+    signal_kind: &'a str,
+    metric: Option<&'a str>,
+    value: Option<f64>,
+    threshold: Option<f64>,
+    error_signature_hash: Option<&'a str>,
+    detail: Option<&'a str>,
+}
+
+/// UPSERT per `signal_kind='anomaly'`: una sola anomalia attiva per
+/// (project_id, unit, metric). Il target ON CONFLICT replica esattamente
+/// colonne+predicato dell'indice parziale uniq_service_diagnoses_active_anomaly.
+async fn upsert_anomaly_diagnosis(db: &PgPool, row: &DiagnosisRow<'_>) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO service_diagnoses
+           (project_id, unit, signal_kind, metric, value, threshold,
+            error_signature_hash, status, detail)
+           VALUES ($1,$2,'anomaly',$3,$4,$5,$6,'open',$7)
+           ON CONFLICT (project_id, unit, COALESCE(metric, ''))
+             WHERE signal_kind = 'anomaly' AND status IN ('open', 'diagnosing')
+           DO UPDATE SET
+             value       = EXCLUDED.value,
+             threshold   = EXCLUDED.threshold,
+             detail      = EXCLUDED.detail,
+             updated_at  = NOW(),
+             occurrences = service_diagnoses.occurrences + 1
+           RETURNING id"#,
+    )
+    .bind(row.project_id)
+    .bind(row.unit)
+    .bind(row.metric)
+    .bind(row.value)
+    .bind(row.threshold)
+    .bind(row.error_signature_hash)
+    .bind(row.detail)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// INSERT puro per `crash`/`build_error`: ogni evento e' distinto (firma errore
+/// propria) e il suo ciclo di vita lo governa il Debugger, quindi non rientra nel
+/// vincolo univoco parziale (limitato a signal_kind='anomaly').
+async fn insert_event_diagnosis(db: &PgPool, row: &DiagnosisRow<'_>) -> Option<Uuid> {
     sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO service_diagnoses
            (project_id, unit, signal_kind, metric, value, threshold,
@@ -857,14 +911,14 @@ async fn persist_diagnosis(
            VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8)
            RETURNING id"#,
     )
-    .bind(project_id)
-    .bind(unit)
-    .bind(signal_kind)
-    .bind(metric)
-    .bind(value)
-    .bind(threshold)
-    .bind(error_signature_hash)
-    .bind(detail)
+    .bind(row.project_id)
+    .bind(row.unit)
+    .bind(row.signal_kind)
+    .bind(row.metric)
+    .bind(row.value)
+    .bind(row.threshold)
+    .bind(row.error_signature_hash)
+    .bind(row.detail)
     .fetch_optional(db)
     .await
     .ok()
@@ -965,6 +1019,425 @@ fn sig_hash(s: &str) -> String {
     format!("{:x}", h.finalize())[..16].to_string()
 }
 
+// ── Fasi del ciclo, estratte da run_cycle (regola L: helper coesi) ────────────
+
+/// Contesto condiviso di un ciclo, raggruppato per non superare il limite
+/// clippy::too_many_arguments negli helper di fase. Riferimenti presi in prestito
+/// dal `run_cycle`: nessuna copia di stato.
+struct CycleCtx<'a> {
+    state: &'a AppState,
+    cfg: &'a ObserverConfig,
+    project_id: Uuid,
+}
+
+/// Campiona le metriche OS del processo servizio (cap 4) e ne emette l'evento.
+///
+/// `pid` e' gia' il PID VALIDATO dal collector (MainPID fresco su Unix; su Windows
+/// solo se vivo e con identita' confermata). Aggiorna i campioni CPU in `st` e
+/// ritorna `(cpu_pct, rss_bytes)` per la valutazione anomalie. Estratto da
+/// `run_cycle` (comportamento invariato).
+fn sample_process_metrics(
+    ctx: &CycleCtx<'_>,
+    st: &mut UnitState,
+    unit: &str,
+    pid: Option<u32>,
+) -> (Option<f64>, u64) {
+    // Le metriche OS arrivano dal PUNTO UNICO cross-platform
+    // process_util::read_process_metrics. cpu_seconds e' cumulativo e gia'
+    // normalizzato: il delta / dt da la % identica sui due OS. Il PID e' gia'
+    // quello giusto (vedi collector), non serve ri-validare.
+    let sample = pid.and_then(crate::process_util::read_process_metrics);
+    let Some(m) = sample else {
+        // Servizio non attivo o PID sparito tra enum e campionamento: azzera i
+        // campioni CPU.
+        st.prev_cpu_seconds = None;
+        st.prev_sample = None;
+        return (None, 0);
+    };
+    let pid = pid.expect("pid presente: sample deriva da Some(pid)");
+    let now_inst = Instant::now();
+    let mut cpu_pct: Option<f64> = None;
+    if let (Some(prev_secs), Some(prev_inst)) = (st.prev_cpu_seconds, st.prev_sample) {
+        let dt = now_inst.duration_since(prev_inst).as_secs_f64();
+        if dt > 0.0 {
+            cpu_pct = Some(((m.cpu_seconds - prev_secs).max(0.0) / dt) * 100.0);
+        }
+    }
+    st.prev_cpu_seconds = Some(m.cpu_seconds);
+    st.prev_sample = Some(now_inst);
+
+    if ctx.cfg.metrics_enabled {
+        emit_service_metrics(ctx, unit, pid, cpu_pct, &m);
+    }
+    (cpu_pct, m.rss_bytes)
+}
+
+/// Emette l'evento `ServiceMetrics` per un campione. Estratto da
+/// `sample_process_metrics` (comportamento invariato).
+fn emit_service_metrics(
+    ctx: &CycleCtx<'_>,
+    unit: &str,
+    pid: u32,
+    cpu_pct: Option<f64>,
+    m: &crate::process_util::ProcessMetrics,
+) {
+    nexus_events::dispatcher::emit_global(
+        ctx.project_id,
+        ProjectEvent::ServiceMetrics {
+            unit: unit.to_string(),
+            pid: Some(pid as i32),
+            cpu_pct: cpu_pct.unwrap_or(0.0) as f32,
+            rss_bytes: m.rss_bytes,
+            io_read_bytes: m.io_read_bytes,
+            io_write_bytes: m.io_write_bytes,
+            latency_ms: None,
+        },
+    );
+}
+
+/// Conta le righe-error NUOVE del ciclo e ritorna `(righe_error, testo_log)`.
+///
+/// Unix: finestra journalctl incrementale (`scan_new_logs`), `log_buffer` inutile.
+/// Windows: buffer cumulativo di agent_processes; conta solo la coda oltre
+/// `prev_log_len` (baseline al primo ciclo), replicando l'incrementalita' della
+/// finestra journalctl. Estratto da `run_cycle` (comportamento invariato).
+#[cfg_attr(unix, allow(unused_variables))]
+async fn scan_error_rate(
+    st: &mut UnitState,
+    unit: &str,
+    since: i64,
+    log_buffer: &str,
+) -> (u64, String) {
+    #[cfg(unix)]
+    {
+        let _ = (st, log_buffer); // su Unix il buffer aggregato non serve
+        scan_new_logs(unit, since).await
+    }
+    #[cfg(windows)]
+    {
+        let _ = (unit, since);
+        scan_error_rate_windows(st, log_buffer)
+    }
+}
+
+/// Ramo Windows di [`scan_error_rate`]: error-rate incrementale sul buffer
+/// cumulativo di agent_processes. PRIMO CICLO (last_log_scan_ts==0): stabilisce
+/// solo la BASELINE senza contare lo storico (fino a 50KB) che gonfierebbe
+/// error_per_min con un'anomalia 'error_rate' spuria; dal secondo ciclo conta la
+/// sola coda nuova. Char-boundary safe sull'offset in byte.
+#[cfg(windows)]
+fn scan_error_rate_windows(st: &mut UnitState, log_buffer: &str) -> (u64, String) {
+    if st.last_log_scan_ts == 0 {
+        st.prev_log_len = log_buffer.len();
+        return (0u64, log_buffer.to_string());
+    }
+    // Se il buffer si e' accorciato (troncamento/nuovo avvio) resetta l'offset.
+    let mut start = if log_buffer.len() >= st.prev_log_len {
+        st.prev_log_len
+    } else {
+        0
+    };
+    // L'offset e' in byte del ciclo precedente: potrebbe cadere in mezzo a un
+    // carattere multibyte del buffer corrente. Avanza al primo char boundary
+    // valido per evitare un panic di slicing.
+    while start < log_buffer.len() && !log_buffer.is_char_boundary(start) {
+        start += 1;
+    }
+    let n = count_error_lines(&log_buffer[start..]);
+    st.prev_log_len = log_buffer.len();
+    (n, log_buffer.to_string())
+}
+
+/// Apre/aggiorna le anomalie di un sample e chiude quelle rientrate (cap 3).
+///
+/// Emette l'evento SSE solo sulla TRANSIZIONE (guardia in-memory), ma persiste a
+/// ogni tick via UPSERT (mig 0491) e auto-risolve le anomalie non piu' attive.
+/// Aggiorna `st.active_anomalies`. Estratto da `run_cycle` (comportamento
+/// invariato).
+async fn handle_anomalies(
+    ctx: &CycleCtx<'_>,
+    st: &mut UnitState,
+    unit: &str,
+    active: &str,
+    signals: &[AnomalySignal],
+) {
+    let current: HashSet<String> = signals.iter().map(|s| s.metric.clone()).collect();
+    for sig in signals {
+        // L'evento SSE scatta SOLO sulla transizione healthy->anomaly (la guardia
+        // in-memory evita lo spam di notifiche entro lo stesso processo). La
+        // PERSISTENZA invece avviene a ogni tick: persist_diagnosis fa UPSERT
+        // (mig 0491), quindi aggiorna la riga canonica (value/updated_at/
+        // occurrences) senza creare duplicati. Cosi' dopo un restart di mcp-core,
+        // dove `active_anomalies` si svuota, l'anomalia ancora attiva viene riusata
+        // anziche' re-inserita.
+        if !st.active_anomalies.contains(&sig.metric) {
+            nexus_events::dispatcher::emit_global(
+                ctx.project_id,
+                ProjectEvent::ServiceAnomaly {
+                    unit: unit.to_string(),
+                    metric: sig.metric.clone(),
+                    value: sig.value,
+                    threshold: sig.threshold,
+                    severity: sig.severity.clone(),
+                },
+            );
+        }
+        persist_diagnosis(
+            &ctx.state.db,
+            ctx.project_id,
+            unit,
+            "anomaly",
+            Some(&sig.metric),
+            Some(sig.value),
+            Some(sig.threshold),
+            None,
+            Some(&format!("active={active}")),
+        )
+        .await;
+    }
+    st.active_anomalies = current;
+
+    // Auto-resolve simmetrico all'apertura: chiude le diagnosi 'anomaly' aperte la
+    // cui metrica non e' piu' attiva (anche le 'fantasma' storiche, perche' si basa
+    // sul DB, non sullo stato in-memory). Senza questo le righe restavano 'open' a
+    // vita nel pannello Problemi a servizio sano.
+    let active_metrics: Vec<String> = st.active_anomalies.iter().cloned().collect();
+    resolve_stale_anomalies(&ctx.state.db, ctx.project_id, unit, &active_metrics).await;
+}
+
+/// Ingredienti per la registrazione di un problema strutturale, gia' calcolati.
+struct StructuralProblem {
+    reason: &'static str,
+    sig: String,
+    /// Testo log ripulito da passare alla diagnosi LLM (con eventuale hint cause).
+    clean_log: String,
+    /// Detail iniziale mostrato nel pannello Problemi (sincrono, no LLM).
+    initial_detail: String,
+}
+
+/// Costruisce log ripulito + detail per un problema strutturale rilevato. Punto
+/// unico della formattazione (regola L): hint cause per port_not_listening,
+/// strip ANSI, coda log. Estratto da `run_cycle` (comportamento invariato).
+fn build_structural_problem(
+    reason: &'static str,
+    sig: String,
+    run_log: &str,
+    log_text: &str,
+    ports: &[u16],
+) -> StructuralProblem {
+    // Per la diagnosi usa il log dell'INTERO run corrente (startup incluso, gia'
+    // in `run_log` dal collector) anziche' la sola finestra error-rate: lo startup
+    // contiene il segnale chiave (es. la porta reale in ascolto). Fallback alla
+    // finestra se il run-log non e' disponibile.
+    let source: &str = if run_log.trim().is_empty() {
+        log_text
+    } else {
+        run_log
+    };
+    let mut clean = strip_ansi(source);
+    // Gestione porte STRUTTURALE (no liste/regex): se il servizio e' su ma non
+    // ascolta sulle porte ALLOCATE (fonte unica), passa il fatto alla diagnosi.
+    // Hint sulle cause per port_not_listening (segnala, non prescrive): va SIA nel
+    // log passato alla diagnosi LLM SIA nel detail del problema (che l'agente
+    // error-fix riceve dal pannello).
+    let cause_hint: Option<String> = port_not_listening_hint(reason, ports);
+    if let Some(ref hint) = cause_hint {
+        clean = format!("{hint}\n\nLog del servizio:\n{clean}");
+    }
+    let tail: Vec<&str> = clean.lines().rev().take(15).collect();
+    let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+    let tail: String = tail.chars().take(600).collect();
+    let initial_detail = match &cause_hint {
+        Some(hint) => format!(
+            "Servizio non operativo ({reason}). {hint}\n\nUltime righe di log:\n{tail}"
+        ),
+        None => {
+            format!("Servizio non operativo ({reason}). Ultime righe di log:\n{tail}")
+        }
+    };
+    StructuralProblem {
+        reason,
+        sig,
+        clean_log: clean,
+        initial_detail,
+    }
+}
+
+/// Hint diagnostico per `port_not_listening` (None per gli altri reason o senza
+/// porte). Estratto per tenere `build_structural_problem` coeso e sotto soglia.
+fn port_not_listening_hint(reason: &str, ports: &[u16]) -> Option<String> {
+    if reason != "port_not_listening" || ports.is_empty() {
+        return None;
+    }
+    let plist = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "[Nexus] Il servizio risulta avviato ma non ascolta sulle porte \
+         ALLOCATE attese ({plist}). Per la causa, distingui verificando lo \
+         stato reale (quali processi sono in ascolto su quella porta e quali \
+         processi di questo servizio sono in esecuzione): (a) il codice \
+         ascolta su una porta HARDCODED diversa da quella allocata (dai log \
+         vedi una porta diversa); (b) la porta allocata e' gia' occupata da \
+         un'altra istanza dello STESSO servizio non terminata (processi \
+         orfani -> EADDRINUSE), per cui il nuovo avvio non riesce ad \
+         ascoltare. Verifica quale delle due prima di concludere."
+    ))
+}
+
+/// Registra un problema strutturale (evento + persistenza) e lancia la diagnosi
+/// LLM in background. Register-then-refine: il persist e' sincrono e non dipende
+/// dall'LLM; la diagnosi raffina il detail dopo, senza bloccare il ciclo. Estratto
+/// da `run_cycle` (comportamento invariato).
+async fn register_structural_problem(
+    ctx: &CycleCtx<'_>,
+    unit: &str,
+    problem: StructuralProblem,
+) {
+    let StructuralProblem {
+        reason,
+        sig,
+        clean_log,
+        initial_detail,
+    } = problem;
+
+    nexus_events::dispatcher::emit_global(
+        ctx.project_id,
+        ProjectEvent::ServiceCrashDetected {
+            unit: unit.to_string(),
+            error_kind: reason.to_string(),
+            last_log: initial_detail.clone(),
+        },
+    );
+    let diag_id = persist_diagnosis(
+        &ctx.state.db,
+        ctx.project_id,
+        unit,
+        "crash",
+        Some(reason),
+        None,
+        None,
+        Some(&sig),
+        Some(&initial_detail),
+    )
+    .await;
+
+    // Diagnosi LLM + auto-debug in BACKGROUND (non blocca il ciclo).
+    crate::project_workspace::service_log_diagnose::spawn_diagnosis(
+        ctx.state.clone(),
+        ctx.project_id,
+        unit.to_string(),
+        clean_log,
+        sig,
+        diag_id,
+        ctx.cfg.auto_diagnose_enabled,
+        ctx.cfg.diagnose_cooldown_seconds,
+        ctx.cfg.diagnose_max_per_hour,
+    );
+}
+
+/// Gestisce il cambio di "run" (marcatore d'avvio) e ritorna se il grace di
+/// readiness e' scaduto. Su nuovo run resetta grace + anti-spam e risolve i crash
+/// dei run PRECEDENTI (obsoleti dopo un fix/riavvio), cosi' il pannello mostra solo
+/// il problema del run corrente. Estratto da `detect_structural_failure`.
+async fn apply_run_reset(
+    ctx: &CycleCtx<'_>,
+    st: &mut UnitState,
+    unit: &str,
+    active_enter: Option<String>,
+) -> bool {
+    if active_enter != st.prev_active_enter {
+        st.prev_active_enter = active_enter;
+        st.run_seen_at = Some(Instant::now());
+        st.last_crash_sig = None;
+        resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
+    }
+    st.run_seen_at
+        .map(|t| t.elapsed().as_secs() as i64 >= ctx.cfg.readiness_grace_seconds)
+        .unwrap_or(false)
+}
+
+/// Reason strutturale del servizio giu' (o None se sano). Readiness TCP: servizio
+/// attivo da > grace con porte allocate ma NESSUNA in ascolto -> e' giu' (cattura i
+/// supervisori vivi con l'app crashata, qualunque tecnologia). Servizio senza porte
+/// (worker): readiness non applicabile -> solo failed/restart-loop. Estratto da
+/// `detect_structural_failure`.
+async fn structural_reason(
+    ctx: &CycleCtx<'_>,
+    active: &str,
+    restart_delta: u32,
+    grace_ok: bool,
+    ports: &[u16],
+) -> Option<&'static str> {
+    let readiness_failed =
+        grace_ok && active == "active" && !ports.is_empty() && !any_port_listening(ports).await;
+    if active == "failed" {
+        Some("service_failed")
+    } else if readiness_failed {
+        Some("port_not_listening")
+    } else if restart_delta > ctx.cfg.restart_rate_max {
+        Some("restart_loop")
+    } else {
+        None
+    }
+}
+
+/// Detection STRUTTURALE di servizio non funzionante (cap 1): stato failed /
+/// porta non in ascolto dopo l'avvio / restart-loop. Niente pattern testuali:
+/// si rileva OGGETTIVAMENTE che il servizio e' giu', poi un LLM classifica i log.
+/// Gestisce reset-run, grace readiness, probe TCP, anti-spam e auto-resolve.
+/// Estratto da `run_cycle` (comportamento invariato).
+async fn detect_structural_failure(
+    ctx: &CycleCtx<'_>,
+    st: &mut UnitState,
+    unit: &str,
+    active: &str,
+    restart_delta: u32,
+    active_enter: Option<String>,
+    run_log: &str,
+    log_text: &str,
+) {
+    let grace_ok = apply_run_reset(ctx, st, unit, active_enter).await;
+    let ports = ports_for_unit(&ctx.state.db, ctx.project_id, unit).await;
+    let reason = structural_reason(ctx, active, restart_delta, grace_ok, &ports).await;
+
+    let Some(reason) = reason else {
+        if grace_ok {
+            // Servizio sano dopo il grace: chiude eventuali crash aperti (ciclo di
+            // vita: quando viene riparato, il problema sparisce).
+            resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
+            st.last_crash_sig = None;
+        }
+        return;
+    };
+
+    // Firma per anti-spam: unit + run corrente + natura del problema.
+    let sig = sig_hash(&format!(
+        "{unit}:{}:{reason}",
+        st.prev_active_enter.as_deref().unwrap_or("")
+    ));
+    if st.last_crash_sig.as_deref() == Some(sig.as_str()) {
+        return;
+    }
+    st.last_crash_sig = Some(sig.clone());
+
+    let problem = build_structural_problem(reason, sig, run_log, log_text, &ports);
+    register_structural_problem(ctx, unit, problem).await;
+}
+
+/// Vero se almeno una delle porte attese e' in ascolto (probe TCP con timeout
+/// breve). Estratto da `run_cycle` per early-return leggibile.
+async fn any_port_listening(ports: &[u16]) -> bool {
+    for p in ports {
+        if crate::project_workspace::port_recovery::tcp_probe(*p, 400).await {
+            return true;
+        }
+    }
+    false
+}
+
 // ── Loop ──────────────────────────────────────────────────────────────────────
 
 /// Avvia l'observer in background. Gating runtime via `agent.observer.enabled`.
@@ -992,6 +1465,91 @@ pub fn spawn_service_observer(state: AppState) {
     tracing::info!("service_observer: avviato (config DB-driven, gating runtime)");
 }
 
+/// Delta di restart rispetto al ciclo precedente (cap 3). `restarts` e' None su
+/// Windows (agent_processes non traccia i restart): il delta resta 0 -> l'anomaly
+/// 'restart' e il reason 'restart_loop' sono di fatto disabilitati la', senza
+/// codice extra. Aggiorna `st.prev_restarts` quando il dato e' disponibile.
+fn compute_restart_delta(st: &mut UnitState, restarts: Option<u32>) -> u32 {
+    let delta = match (st.prev_restarts, restarts) {
+        (Some(prev), Some(cur)) => cur.saturating_sub(prev),
+        _ => 0,
+    };
+    if restarts.is_some() {
+        st.prev_restarts = restarts;
+    }
+    delta
+}
+
+/// Error-rate per minuto sulla finestra dall'ultimo scan + testo log per la
+/// diagnosi (cap 3 + cap 1). Wrappa `scan_error_rate` con il calcolo della
+/// finestra temporale e aggiorna `st.last_log_scan_ts`. Estratto da
+/// `process_sample`.
+async fn sample_error_rate(
+    st: &mut UnitState,
+    unit: &str,
+    now_ts: i64,
+    log_buffer: &str,
+) -> (f64, String) {
+    let since = if st.last_log_scan_ts > 0 {
+        st.last_log_scan_ts
+    } else {
+        now_ts - 60
+    };
+    let window_min = ((now_ts - since).max(1) as f64) / 60.0;
+    let (error_lines, log_text) = scan_error_rate(st, unit, since, log_buffer).await;
+    st.last_log_scan_ts = now_ts;
+    (error_lines as f64 / window_min, log_text)
+}
+
+/// Elabora un singolo sample (unit) di un progetto: metriche, restart-rate,
+/// error-rate dai log, anomalie e detection strutturale. Orchestra gli helper di
+/// fase; lo stato per-unit vive in `states`. Estratto da `run_cycle` per tenere
+/// entrambe le funzioni coese e sotto le soglie di qualita' (comportamento
+/// invariato).
+async fn process_sample(
+    ctx: &CycleCtx<'_>,
+    states: &mut HashMap<String, UnitState>,
+    now_ts: i64,
+    sample: UnitSample,
+) {
+    let UnitSample {
+        unit,
+        active_state: active,
+        pid,
+        restarts,
+        active_enter,
+        run_log,
+        log_buffer,
+    } = sample;
+    let key = format!("{}:{unit}", ctx.project_id);
+    let st = states.entry(key).or_default();
+
+    // ── Metriche (cap 4) ───────────────────────────────────────────────────
+    let (cpu_pct, rss) = sample_process_metrics(ctx, st, &unit, pid);
+
+    // ── Restart rate (cap 3) + error-rate dai log (cap 3 + cap 1) ──────────
+    let restart_delta = compute_restart_delta(st, restarts);
+    let (error_per_min, log_text) = sample_error_rate(st, &unit, now_ts, &log_buffer).await;
+
+    // ── Anomalie: emetti solo sulla transizione + auto-resolve ─────────────
+    let signals =
+        evaluate_anomalies(&active, cpu_pct, rss, restart_delta, error_per_min, ctx.cfg);
+    handle_anomalies(ctx, st, &unit, &active, &signals).await;
+
+    // ── Detection STRUTTURALE di servizio non funzionante (cap 1) ──────────
+    detect_structural_failure(
+        ctx,
+        st,
+        &unit,
+        &active,
+        restart_delta,
+        active_enter,
+        &run_log,
+        &log_text,
+    )
+    .await;
+}
+
 async fn run_cycle(
     state: &AppState,
     cfg: &ObserverConfig,
@@ -1001,346 +1559,18 @@ async fn run_cycle(
     let projects = projects_with_slug(&state.db).await;
 
     for (project_id, slug, name) in projects {
+        let ctx = CycleCtx {
+            state,
+            cfg,
+            project_id,
+        };
         // Sorgenti dati aggregate per OS (Unix: systemd+/proc+journalctl; Windows:
         // agent_processes+Win32). Il ramo Unix usa `slug`, quello Windows deriva
         // lo slug di servizio da `name`. Il resto del ciclo e' identico.
         let services = collect_units(state, project_id, &slug, &name).await;
         let observed_units: Vec<String> = services.iter().map(|s| s.unit.clone()).collect();
         for sample in services {
-            let UnitSample {
-                unit,
-                active_state: active,
-                pid,
-                restarts,
-                active_enter,
-                run_log,
-                log_buffer,
-            } = sample;
-            let key = format!("{project_id}:{unit}");
-            let st = states.entry(key).or_default();
-
-            // ── Metriche (cap 4) ───────────────────────────────────────────
-            // Le metriche OS arrivano dal PUNTO UNICO cross-platform
-            // process_util::read_process_metrics (Unix /proc, Windows Win32).
-            // cpu_seconds e' cumulativo e gia' normalizzato: il delta / dt da la %
-            // in modo identico sui due OS. `pid` qui e' gia' il PID VALIDATO dal
-            // collector: su Unix e' il MainPID fresco di systemd; su Windows e' il
-            // pid solo se vivo E con identita' confermata (creation-time vs
-            // started_at, anti-riciclo) -- altrimenti None. Quindi qui non serve
-            // ri-validare: read_process_metrics campiona il processo giusto.
-            let mut cpu_pct: Option<f64> = None;
-            let mut rss: u64 = 0;
-            if let Some(pid) = pid {
-                if let Some(m) = crate::process_util::read_process_metrics(pid) {
-                    rss = m.rss_bytes;
-                    let now_inst = Instant::now();
-                    if let (Some(prev_secs), Some(prev_inst)) =
-                        (st.prev_cpu_seconds, st.prev_sample)
-                    {
-                        let dt = now_inst.duration_since(prev_inst).as_secs_f64();
-                        if dt > 0.0 {
-                            let dcpu = (m.cpu_seconds - prev_secs).max(0.0);
-                            cpu_pct = Some((dcpu / dt) * 100.0);
-                        }
-                    }
-                    st.prev_cpu_seconds = Some(m.cpu_seconds);
-                    st.prev_sample = Some(now_inst);
-
-                    if cfg.metrics_enabled {
-                        nexus_events::dispatcher::emit_global(
-                            project_id,
-                            ProjectEvent::ServiceMetrics {
-                                unit: unit.clone(),
-                                pid: Some(pid as i32),
-                                cpu_pct: cpu_pct.unwrap_or(0.0) as f32,
-                                rss_bytes: m.rss_bytes,
-                                io_read_bytes: m.io_read_bytes,
-                                io_write_bytes: m.io_write_bytes,
-                                latency_ms: None,
-                            },
-                        );
-                    }
-                } else {
-                    // PID sparito tra enum e campionamento: azzera i campioni CPU.
-                    st.prev_cpu_seconds = None;
-                    st.prev_sample = None;
-                }
-            } else {
-                // Servizio non attivo: azzera i campioni CPU.
-                st.prev_cpu_seconds = None;
-                st.prev_sample = None;
-            }
-
-            // ── Restart rate (cap 3) ───────────────────────────────────────
-            // `restarts` e' None su Windows (agent_processes non traccia i
-            // restart): restart_delta resta 0 -> l'anomaly 'restart' e il reason
-            // 'restart_loop' sono di fatto disabilitati la', senza codice extra.
-            let restart_delta = match (st.prev_restarts, restarts) {
-                (Some(prev), Some(cur)) => cur.saturating_sub(prev),
-                _ => 0,
-            };
-            if restarts.is_some() {
-                st.prev_restarts = restarts;
-            }
-
-            // ── Log scan: error-rate + crash (cap 3 + cap 1) ───────────────
-            let since = if st.last_log_scan_ts > 0 {
-                st.last_log_scan_ts
-            } else {
-                now_ts - 60
-            };
-            let window_min = ((now_ts - since).max(1) as f64) / 60.0;
-            // Unix: finestra journalctl incrementale (scan_new_logs). Windows:
-            // buffer cumulativo di agent_processes; l'error-rate conta solo la
-            // CODA nuova (oltre prev_log_len), replicando l'incrementalita'.
-            #[cfg(unix)]
-            let (error_lines, log_text) = {
-                let _ = &log_buffer; // su Unix il buffer aggregato non serve
-                scan_new_logs(&unit, since).await
-            };
-            #[cfg(windows)]
-            let (error_lines, log_text) = {
-                // PRIMO CICLO (last_log_scan_ts==0): stabilisci solo la BASELINE,
-                // NON contare lo storico gia' accumulato nel buffer cumulativo.
-                // Su Unix journalctl --since limita agli ultimi ~60s; qui l'unico
-                // modo di replicare quella semantica time-bounded e' non conteggiare
-                // le righe-error preesistenti al primo campione (altrimenti fino a
-                // 50KB di storico gonfiano error_per_min -> anomaly 'error_rate'
-                // spuria). Dal secondo ciclo si conta solo la coda nuova.
-                if st.last_log_scan_ts == 0 {
-                    st.prev_log_len = log_buffer.len();
-                    (0u64, log_buffer.clone())
-                } else {
-                    // Se il buffer si e' accorciato (troncamento/nuovo avvio)
-                    // resetta l'offset. Conta le righe-error nella sola coda nuova.
-                    let mut start = if log_buffer.len() >= st.prev_log_len {
-                        st.prev_log_len
-                    } else {
-                        0
-                    };
-                    // L'offset e' in byte del ciclo precedente: potrebbe cadere in
-                    // mezzo a un carattere multibyte del buffer corrente. Avanza al
-                    // primo char boundary valido per evitare un panic di slicing.
-                    while start < log_buffer.len() && !log_buffer.is_char_boundary(start) {
-                        start += 1;
-                    }
-                    let new_slice = &log_buffer[start..];
-                    let n = count_error_lines(new_slice);
-                    st.prev_log_len = log_buffer.len();
-                    (n, log_buffer.clone())
-                }
-            };
-            st.last_log_scan_ts = now_ts;
-            let error_per_min = error_lines as f64 / window_min;
-
-            // ── Anomalie: emetti solo sulla transizione ────────────────────
-            let signals =
-                evaluate_anomalies(&active, cpu_pct, rss, restart_delta, error_per_min, cfg);
-            let current: HashSet<String> = signals.iter().map(|s| s.metric.clone()).collect();
-            for sig in &signals {
-                // L'evento SSE scatta SOLO sulla transizione healthy->anomaly
-                // (la guardia in-memory evita lo spam di notifiche entro lo stesso
-                // processo). La PERSISTENZA invece avviene a ogni tick: persist_diagnosis
-                // fa UPSERT (mig 0491), quindi aggiorna la riga canonica
-                // (value/updated_at/occurrences) senza creare duplicati. In questo
-                // modo dopo un restart di mcp-core, dove `active_anomalies` si svuota,
-                // l'anomalia ancora attiva viene riusata anziche' re-inserita.
-                if !st.active_anomalies.contains(&sig.metric) {
-                    nexus_events::dispatcher::emit_global(
-                        project_id,
-                        ProjectEvent::ServiceAnomaly {
-                            unit: unit.clone(),
-                            metric: sig.metric.clone(),
-                            value: sig.value,
-                            threshold: sig.threshold,
-                            severity: sig.severity.clone(),
-                        },
-                    );
-                }
-                persist_diagnosis(
-                    &state.db,
-                    project_id,
-                    &unit,
-                    "anomaly",
-                    Some(&sig.metric),
-                    Some(sig.value),
-                    Some(sig.threshold),
-                    None,
-                    Some(&format!("active={active}")),
-                )
-                .await;
-            }
-            st.active_anomalies = current;
-
-            // ── Auto-resolve: anomalie rientrate sotto soglia ──────────────
-            // Simmetrico all'apertura sopra: chiude le diagnosi 'anomaly' aperte
-            // la cui metrica non e' piu' attiva (anche le 'fantasma' storiche,
-            // perche' si basa sul DB, non sullo stato in-memory). Senza questo le
-            // righe restavano 'open' a vita nel pannello Problemi a servizio sano.
-            let active_metrics: Vec<String> = st.active_anomalies.iter().cloned().collect();
-            resolve_stale_anomalies(&state.db, project_id, &unit, &active_metrics).await;
-
-            // ── Detection STRUTTURALE di servizio non funzionante (cap 1) ───
-            // Niente piu' pattern testuali per-linguaggio: si rileva in modo
-            // OGGETTIVO che il servizio e' giu' (stato failed / porta non in
-            // ascolto dopo l'avvio / restart-loop), poi un LLM classifica i log
-            // (cross-tecnologia). Vedi service_log_diagnose + mig 0384.
-
-            // Nuovo "run"? (marcatore d'avvio cambiato: ActiveEnterTimestamp su
-            // Unix, pid+started_at su Windows) -> reset grace + anti-spam.
-            if active_enter != st.prev_active_enter {
-                st.prev_active_enter = active_enter;
-                st.run_seen_at = Some(Instant::now());
-                st.last_crash_sig = None;
-                // Nuovo avvio del servizio (es. il debugger ha applicato un fix e
-                // l'auto-remediation ha riavviato): i crash dei run PRECEDENTI sono
-                // obsoleti -> risolvili, cosi' il pannello mostra solo il problema
-                // del run corrente. Se il nuovo run e' ancora unhealthy, la
-                // detection sotto crea un nuovo crash aggiornato.
-                resolve_open_crashes(&state.db, project_id, &unit).await;
-            }
-            let grace_ok = st
-                .run_seen_at
-                .map(|t| t.elapsed().as_secs() as i64 >= cfg.readiness_grace_seconds)
-                .unwrap_or(false);
-
-            // Readiness TCP: servizio attivo da > grace con porte allocate ma
-            // NESSUNA in ascolto -> e' giu' (cattura i supervisori che restano
-            // vivi con l'app crashata, qualunque tecnologia). Servizio senza porte
-            // (worker): readiness non applicabile -> solo failed/restart-loop.
-            let ports = ports_for_unit(&state.db, project_id, &unit).await;
-            let mut readiness_failed = false;
-            if grace_ok && active == "active" && !ports.is_empty() {
-                let mut any_up = false;
-                for p in &ports {
-                    if crate::project_workspace::port_recovery::tcp_probe(*p, 400).await {
-                        any_up = true;
-                        break;
-                    }
-                }
-                readiness_failed = !any_up;
-            }
-
-            let reason: Option<&str> = if active == "failed" {
-                Some("service_failed")
-            } else if readiness_failed {
-                Some("port_not_listening")
-            } else if restart_delta > cfg.restart_rate_max {
-                Some("restart_loop")
-            } else {
-                None
-            };
-
-            if let Some(reason) = reason {
-                // Firma per anti-spam: unit + run corrente + natura del problema.
-                let sig = sig_hash(&format!(
-                    "{unit}:{}:{reason}",
-                    st.prev_active_enter.as_deref().unwrap_or("")
-                ));
-                if st.last_crash_sig.as_deref() != Some(sig.as_str()) {
-                    st.last_crash_sig = Some(sig.clone());
-
-                    // Register-then-refine: registra SUBITO il problema (sincrono,
-                    // veloce, col log grezzo) cosi' compare in Problemi e il persist
-                    // NON dipende dall'LLM; poi la diagnosi LLM raffina il detail in
-                    // BACKGROUND (con timeout), senza bloccare il ciclo observer.
-                    // Per la diagnosi usa il log dell'INTERO run corrente (startup
-                    // incluso, gia' in `run_log` dal collector: journalctl per
-                    // InvocationID su Unix, output+error_output su Windows) anziche'
-                    // la sola finestra error-rate: lo startup contiene il segnale
-                    // chiave (es. la porta reale in ascolto). Fallback alla finestra
-                    // se il run-log non e' disponibile.
-                    let source: &str = if run_log.trim().is_empty() {
-                        &log_text
-                    } else {
-                        &run_log
-                    };
-                    let mut clean = strip_ansi(source);
-                    // Gestione porte STRUTTURALE (no liste/regex): se il servizio e'
-                    // su ma non ascolta sulle porte ALLOCATE (fonte unica), passa il
-                    // fatto alla diagnosi. L'LLM, leggendo i log, rileva se ascolta
-                    // su una porta hardcoded diversa e suggerisce process.env.PORT.
-                    // Hint sulle cause per port_not_listening (segnala, non
-                    // prescrive): due cause tipiche da distinguere verificando lo
-                    // stato reale. Va SIA nel log passato alla diagnosi LLM SIA nel
-                    // detail del problema (che l'agente error-fix riceve dal pannello),
-                    // altrimenti finirebbe solo nella diagnosi LLM in background (gated).
-                    let cause_hint: Option<String> =
-                        if reason == "port_not_listening" && !ports.is_empty() {
-                            let plist = ports
-                                .iter()
-                                .map(u16::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            Some(format!(
-                                "[Nexus] Il servizio risulta avviato ma non ascolta sulle porte \
-                                 ALLOCATE attese ({plist}). Per la causa, distingui verificando lo \
-                                 stato reale (quali processi sono in ascolto su quella porta e quali \
-                                 processi di questo servizio sono in esecuzione): (a) il codice \
-                                 ascolta su una porta HARDCODED diversa da quella allocata (dai log \
-                                 vedi una porta diversa); (b) la porta allocata e' gia' occupata da \
-                                 un'altra istanza dello STESSO servizio non terminata (processi \
-                                 orfani -> EADDRINUSE), per cui il nuovo avvio non riesce ad \
-                                 ascoltare. Verifica quale delle due prima di concludere."
-                            ))
-                        } else {
-                            None
-                        };
-                    if let Some(ref hint) = cause_hint {
-                        clean = format!("{hint}\n\nLog del servizio:\n{clean}");
-                    }
-                    let tail: Vec<&str> = clean.lines().rev().take(15).collect();
-                    let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-                    let tail: String = tail.chars().take(600).collect();
-                    let initial_detail = match &cause_hint {
-                        Some(hint) => format!(
-                            "Servizio non operativo ({reason}). {hint}\n\nUltime righe di log:\n{tail}"
-                        ),
-                        None => format!(
-                            "Servizio non operativo ({reason}). Ultime righe di log:\n{tail}"
-                        ),
-                    };
-
-                    nexus_events::dispatcher::emit_global(
-                        project_id,
-                        ProjectEvent::ServiceCrashDetected {
-                            unit: unit.clone(),
-                            error_kind: reason.to_string(),
-                            last_log: initial_detail.clone(),
-                        },
-                    );
-                    let diag_id = persist_diagnosis(
-                        &state.db,
-                        project_id,
-                        &unit,
-                        "crash",
-                        Some(reason),
-                        None,
-                        None,
-                        Some(&sig),
-                        Some(&initial_detail),
-                    )
-                    .await;
-
-                    // Diagnosi LLM + auto-debug in BACKGROUND (non blocca il ciclo).
-                    crate::project_workspace::service_log_diagnose::spawn_diagnosis(
-                        state.clone(),
-                        project_id,
-                        unit.clone(),
-                        clean,
-                        sig,
-                        diag_id,
-                        cfg.auto_diagnose_enabled,
-                        cfg.diagnose_cooldown_seconds,
-                        cfg.diagnose_max_per_hour,
-                    );
-                }
-            } else if grace_ok {
-                // Servizio sano dopo il grace: chiude eventuali crash aperti
-                // (ciclo di vita: quando viene riparato, il problema sparisce).
-                resolve_open_crashes(&state.db, project_id, &unit).await;
-                st.last_crash_sig = None;
-            }
+            process_sample(&ctx, states, now_ts, sample).await;
         }
 
         // ── Sweep: anomalie di unit non piu' osservati (rinominati/rimossi) ─
@@ -1515,40 +1745,36 @@ mod tests {
         .expect("count")
     }
 
+    // Apre/aggiorna un'anomalia 'error_rate' col `value` dato (soglia fissa 10.0):
+    // incapsula la chiamata ripetuta di persist_diagnosis nel test dell'UPSERT.
+    async fn open_error_rate(pool: &PgPool, project_id: Uuid, unit: &str, value: f64) -> Uuid {
+        persist_diagnosis(
+            pool, project_id, unit, "anomaly", Some("error_rate"),
+            Some(value), Some(10.0), None, Some("active=active"),
+        )
+        .await
+        .expect("persist error_rate")
+    }
+
     #[sqlx::test]
     async fn anomaly_upsert_non_duplica_e_incrementa_occurrences(pool: PgPool) {
         create_service_diagnoses(&pool).await;
         let project_id = Uuid::new_v4();
         let unit = "beauty-book-frontend.service";
 
-        // Primo tick: apre l'anomalia.
-        let id1 = persist_diagnosis(
-            &pool, project_id, unit, "anomaly", Some("error_rate"),
-            Some(60.0), Some(10.0), None, Some("active=active"),
-        )
-        .await
-        .expect("prima diagnosi inserita");
-
-        // Tick successivi (simulano anche un restart che svuota active_anomalies):
-        // devono AGGIORNARE la stessa riga, non inserirne di nuove.
-        let id2 = persist_diagnosis(
-            &pool, project_id, unit, "anomaly", Some("error_rate"),
-            Some(177.0), Some(10.0), None, Some("active=active"),
-        )
-        .await
-        .expect("seconda diagnosi (upsert)");
-        let id3 = persist_diagnosis(
-            &pool, project_id, unit, "anomaly", Some("error_rate"),
-            Some(833.0), Some(10.0), None, Some("active=active"),
-        )
-        .await
-        .expect("terza diagnosi (upsert)");
+        // Primo tick: apre l'anomalia. Tick successivi (simulano anche un restart
+        // che svuota active_anomalies): AGGIORNANO la stessa riga, non ne inseriscono.
+        let id1 = open_error_rate(&pool, project_id, unit, 60.0).await;
+        let id2 = open_error_rate(&pool, project_id, unit, 177.0).await;
+        let id3 = open_error_rate(&pool, project_id, unit, 833.0).await;
 
         assert_eq!(id1, id2, "stesso id: riga riusata, non duplicata");
         assert_eq!(id1, id3, "stesso id sul terzo tick");
-
-        let open = count_open_anomalies(&pool, project_id, unit, "error_rate").await;
-        assert_eq!(open, 1, "una sola anomalia open per (unit, metric)");
+        assert_eq!(
+            count_open_anomalies(&pool, project_id, unit, "error_rate").await,
+            1,
+            "una sola anomalia open per (unit, metric)"
+        );
 
         let (value, occ): (f64, i32) = sqlx::query_as(
             "SELECT value, occurrences FROM service_diagnoses WHERE id=$1",
@@ -1559,8 +1785,16 @@ mod tests {
         .expect("riga canonica");
         assert_eq!(value, 833.0, "value aggiornato all'ultimo tick");
         assert_eq!(occ, 3, "occurrences incrementato a ogni tick");
+    }
+
+    #[sqlx::test]
+    async fn anomaly_metrica_diversa_e_riga_separata(pool: PgPool) {
+        create_service_diagnoses(&pool).await;
+        let project_id = Uuid::new_v4();
+        let unit = "beauty-book-frontend.service";
 
         // Metrica diversa sulla stessa unit -> riga distinta (chiave diversa).
+        open_error_rate(&pool, project_id, unit, 60.0).await;
         persist_diagnosis(
             &pool, project_id, unit, "anomaly", Some("cpu"),
             Some(95.0), Some(90.0), None, Some("active=active"),
@@ -1572,19 +1806,22 @@ mod tests {
             1,
             "metrica diversa = anomalia separata"
         );
+    }
+
+    #[sqlx::test]
+    async fn anomaly_riapre_dopo_resolve(pool: PgPool) {
+        create_service_diagnoses(&pool).await;
+        let project_id = Uuid::new_v4();
+        let unit = "beauty-book-frontend.service";
 
         // Dopo resolve, un nuovo tick puo' riaprire (l'indice copre solo gli attivi).
+        let id1 = open_error_rate(&pool, project_id, unit, 60.0).await;
         sqlx::query("UPDATE service_diagnoses SET status='resolved', resolved_at=NOW() WHERE id=$1")
             .bind(id1)
             .execute(&pool)
             .await
             .expect("resolve manuale");
-        let id_riaperta = persist_diagnosis(
-            &pool, project_id, unit, "anomaly", Some("error_rate"),
-            Some(500.0), Some(10.0), None, Some("active=active"),
-        )
-        .await
-        .expect("riapertura post-resolve");
+        let id_riaperta = open_error_rate(&pool, project_id, unit, 500.0).await;
         assert_ne!(id_riaperta, id1, "nuova riga dopo resolve (storico preservato)");
         assert_eq!(
             count_open_anomalies(&pool, project_id, unit, "error_rate").await,
