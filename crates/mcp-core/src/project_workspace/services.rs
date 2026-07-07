@@ -1315,7 +1315,8 @@ pub async fn get_project_ports(
         }
     }
 
-    // Aggiungi le allocazioni in DB non gia presenti come live
+    // Allocazioni port<->servizio dal DB: sono la FONTE AUTORITATIVA del mapping
+    // (Nexus alloca la porta a una label PRIMA dello spawn, regola L). Le usiamo per due cose.
     let allocations: Vec<(i32, String, String)> = sqlx::query_as::<_, (i32, String, String)>(
         "SELECT port, COALESCE(label, ''), allocation_mode \
          FROM nexus_port_allocations WHERE project_id = $1",
@@ -1324,6 +1325,20 @@ pub async fn get_project_ports(
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
+
+    // (1) Arricchisci le porte LIVE il cui `service` NON e' stato risolto dall'albero
+    // processi con la label dell'allocazione. Senza questo, un dev server orfano
+    // (avviato fuori da Nexus, o il cui pid di servizio e' morto e non e' piu'
+    // antenato del listener) restava con service=null -> il pannello non mostrava il
+    // link URL, pur sapendo Nexus a quale servizio la porta e' allocata.
+    let alloc_label_by_port: std::collections::HashMap<i32, String> = allocations
+        .iter()
+        .filter(|(_, label, _)| !label.trim().is_empty())
+        .map(|(port, label, _)| (*port, label.clone()))
+        .collect();
+    assign_service_from_allocations(&mut ports, &alloc_label_by_port);
+
+    // (2) Aggiungi le allocazioni non ancora live.
     for (port, label, mode) in allocations {
         if !live_ports.contains(&port) {
             ports.push(json!({
@@ -1337,6 +1352,33 @@ pub async fn get_project_ports(
     }
 
     Ok(Json(json!({ "ports": ports })))
+}
+
+/// Assegna il campo `service` alle porte LIVE prive di risoluzione dall'albero
+/// processi, usando la mappa autoritativa port->label di `nexus_port_allocations`
+/// (regola L). Non sovrascrive un `service` gia' risolto. Pura e testabile.
+pub(super) fn assign_service_from_allocations(
+    ports: &mut [serde_json::Value],
+    alloc_label_by_port: &std::collections::HashMap<i32, String>,
+) {
+    for p in ports.iter_mut() {
+        let Some(obj) = p.as_object_mut() else {
+            continue;
+        };
+        let has_service = obj
+            .get("service")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if has_service {
+            continue;
+        }
+        if let Some(port_num) = obj.get("port").and_then(|v| v.as_i64()) {
+            if let Some(label) = alloc_label_by_port.get(&(port_num as i32)) {
+                obj.insert("service".to_string(), json!(label));
+            }
+        }
+    }
 }
 
 /// Rileva le porte TCP in ascolto associate ai processi del progetto.
@@ -3059,5 +3101,29 @@ mod tests {
             super::resolve_project_ancestor(1, &HashMap::new(), &cyclic),
             None
         );
+    }
+
+    #[test]
+    fn assign_service_da_allocazione_solo_se_mancante() {
+        use std::collections::HashMap;
+        // Mappa autoritativa port->servizio (nexus_port_allocations).
+        let mut alloc: HashMap<i32, String> = HashMap::new();
+        alloc.insert(31776, "backend".to_string());
+        alloc.insert(31798, "frontend".to_string());
+        let mut ports = vec![
+            // Porta live senza service risolto dall'albero processi (dev server
+            // orfano): deve ricevere "backend" dall'allocazione -> il pannello
+            // mostra il link.
+            json!({ "port": 31776, "service": serde_json::Value::Null, "live": true }),
+            // Porta live con service GIA' risolto: non va sovrascritta dalla label
+            // (la risoluzione dall'albero processi e' piu' specifica).
+            json!({ "port": 31798, "service": "frontend-dev", "live": true }),
+            // Porta senza allocazione: resta senza service.
+            json!({ "port": 31800, "live": true }),
+        ];
+        super::assign_service_from_allocations(&mut ports, &alloc);
+        assert_eq!(ports[0]["service"].as_str(), Some("backend"));
+        assert_eq!(ports[1]["service"].as_str(), Some("frontend-dev"));
+        assert!(ports[2].get("service").and_then(|v| v.as_str()).is_none());
     }
 }
