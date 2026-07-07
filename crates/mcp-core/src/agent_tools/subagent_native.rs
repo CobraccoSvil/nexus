@@ -298,8 +298,9 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         Some(a) if !a.is_empty() => a.clone(),
         _ => return err("parametro 'tasks' (array non vuoto) obbligatorio"),
     };
-    if tasks.len() > 8 {
-        return err("troppi task in un batch (max 8)");
+    let batch_max_tasks = read_batch_max_tasks(ctx).await;
+    if tasks.len() as u64 > batch_max_tasks {
+        return err(&format!("troppi task in un batch (max {batch_max_tasks})"));
     }
     let configured_max = read_max_parallel_subagents(ctx).await;
     let max_parallel = input
@@ -810,6 +811,26 @@ async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
     v.and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(3)
         .clamp(1, MAX_PARALLEL_HARD_CAP)
+}
+
+/// Backstop assoluto al numero di task di UN batch `dispatch_subagents`: previene
+/// che un valore di setting insensato faccia esplodere il numero di sub-run.
+const BATCH_MAX_TASKS_HARD_CAP: u64 = 32;
+
+/// Numero massimo di task in UN batch `dispatch_subagents` (regola G: DB-driven,
+/// niente literal hardcoded). Default 8, clampato al backstop
+/// [`BATCH_MAX_TASKS_HARD_CAP`]. Sostituisce il vecchio `tasks.len() > 8` fisso.
+async fn read_batch_max_tasks(ctx: &AgentToolContext) -> u64 {
+    let v: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings WHERE key = 'orchestrator.subagent_batch_max_tasks'",
+    )
+    .fetch_optional(&*ctx.core.db)
+    .await
+    .ok()
+    .flatten();
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(8)
+        .clamp(1, BATCH_MAX_TASKS_HARD_CAP)
 }
 
 /// Policy del quorum del panel di review (Fase C, regola G: DB-driven, niente
