@@ -1192,7 +1192,7 @@ async fn run_single_subagent(
     }
     let tools_json = build_tools_json(&definition.tool_whitelist);
 
-    let (provider, model) = resolve_worker_model(db, kind, &definition).await;
+    let (provider, model) = resolve_worker_model(db, kind, &definition, anchor).await;
 
     let timeout_s = if definition.timeout_s > 0 {
         definition.timeout_s
@@ -1356,28 +1356,74 @@ async fn run_single_subagent(
 /// Modello del worker dal `model_purpose` della definition (regola G,
 /// tier-aware). Non risolto -> nessun override: l'executor usa il routing di
 /// default (parita' col brain).
+///
+/// VINCOLO GIUDICE != WORKER (Fase C2): per un sub-run di `kind == "review"` la
+/// risoluzione ESCLUDE il provider del run PADRE (il worker che ha prodotto il
+/// lavoro), cosi' la verifica avversaria gira su un provider diverso (indipendenza
+/// reale). Se l'esclusione svuota il pool (unico provider capable) si ripiega
+/// SENZA esclusione con un WARN: il vincolo e' una preferenza forte, non un hard
+/// filter — meglio un review sullo stesso provider che nessun review.
 async fn resolve_worker_model(
     db: &sqlx::PgPool,
     kind: &str,
     definition: &SubagentDefinition,
+    anchor: Uuid,
 ) -> (String, String) {
     if definition.model_purpose.trim().is_empty() {
         return (String::new(), String::new());
     }
-    match crate::internal_routing::resolve_purpose_model_db(db, &definition.model_purpose).await {
+    let purpose = &definition.model_purpose;
+    // Provider del padre da escludere SOLO per i review (astensione da
+    // auto-certificazione). Per gli altri kind: nessuna esclusione (parita').
+    let exclude: Vec<String> = if kind == "review" {
+        parent_provider(db, anchor).await.into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    match crate::internal_routing::resolve_purpose_model_db_excluding(db, purpose, &exclude).await {
         crate::internal_routing::PurposeResolution::Resolved {
             provider, model, ..
         } => (provider, model),
+        other if !exclude.is_empty() => {
+            // L'esclusione del provider del worker ha svuotato il pool: fallback
+            // SENZA esclusione (il review gira comunque, vedi doc). WARN esplicito.
+            tracing::warn!(
+                kind = %kind, model_purpose = %purpose, excluded = ?exclude,
+                resolution = ?other,
+                "subagent_native: giudice != worker impossibile (unico provider capable), \
+                 review sullo stesso provider del worker"
+            );
+            match crate::internal_routing::resolve_purpose_model_db(db, purpose).await {
+                crate::internal_routing::PurposeResolution::Resolved {
+                    provider, model, ..
+                } => (provider, model),
+                _ => (String::new(), String::new()),
+            }
+        }
         other => {
             tracing::warn!(
                 kind = %kind,
-                model_purpose = %definition.model_purpose,
+                model_purpose = %purpose,
                 resolution = ?other,
                 "subagent_native: model_purpose non risolto, routing di default"
             );
             (String::new(), String::new())
         }
     }
+}
+
+/// Provider del run PADRE (`agent_runs.provider`) per il vincolo giudice != worker
+/// (Fase C2). `None` se l'anchor non e' un run tracciato (sessione senza riga in
+/// `agent_runs`) o il provider e' vuoto: in tal caso nessuna esclusione.
+async fn parent_provider(db: &sqlx::PgPool, anchor: Uuid) -> Option<String> {
+    let provider: Option<String> =
+        sqlx::query_scalar("SELECT provider FROM agent_runs WHERE id = $1")
+            .bind(anchor)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    provider.filter(|p| !p.trim().is_empty())
 }
 
 /// Campi comuni della riga `nexus_subagent_runs` (i rami isolato/sequenziale
@@ -2346,6 +2392,102 @@ mod tests {
                 .await
                 .expect("figlio");
         assert_eq!(linked, Some(parent));
+    }
+
+    /// Semina un padre tracciato su `provider` e due modelli 'light' capable
+    /// (worker-provider + un alternativo) + il purpose tier-only. Ritorna
+    /// (parent_run_id, definition_reviewer).
+    async fn seed_review_routing(
+        pool: &sqlx::PgPool,
+        parent_provider: &str,
+        catalog: &[(&str, &str)],
+    ) -> (Uuid, SubagentDefinition) {
+        create_child_run_tables(pool).await;
+        // Il DB di test di questo modulo e' bare (#[sqlx::test] non applica le
+        // migrazioni meta): creo le tabelle di routing come fanno gli altri test.
+        crate::test_support::create_ai_price_catalog_table(pool).await;
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model ( \
+                 purpose TEXT PRIMARY KEY, \
+                 tier TEXT, \
+                 required_capability TEXT, \
+                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_purpose_model");
+        let parent = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agent_runs (id, session_id, project_id, user_id, provider, model) \
+             VALUES ($1, $2, $3, $4, $5, 'pm')",
+        )
+        .bind(parent)
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(parent_provider)
+        .execute(pool)
+        .await
+        .expect("padre");
+        for (prov, model) in catalog {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                 (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, \
+                  input_cost_per_million_tokens) VALUES ($1, $2, true, 'none', 'light', 1.0)",
+            )
+            .bind(prov)
+            .bind(model)
+            .execute(pool)
+            .await
+            .expect("catalog");
+        }
+        // Purpose tier-only: requires_tool_use=true -> ramo agentico (select_agentic_model).
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, requires_tool_use) \
+             VALUES ('reviewer', 'light', true)",
+        )
+        .execute(pool)
+        .await
+        .expect("purpose");
+        let def = SubagentDefinition {
+            prompt_key: String::new(),
+            tool_whitelist: vec![],
+            model_purpose: "reviewer".to_string(),
+            timeout_s: 0,
+        };
+        (parent, def)
+    }
+
+    /// C2: un sub-run `kind == "review"` risolve il modello ESCLUDENDO il provider
+    /// del padre (worker) -> il giudice gira su un provider diverso.
+    #[sqlx::test]
+    async fn review_esclude_il_provider_del_worker(pool: sqlx::PgPool) {
+        let (parent, def) =
+            seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
+        let (provider, _model) = resolve_worker_model(&pool, "review", &def, parent).await;
+        assert_eq!(provider, "beta", "il review deve evitare il provider del worker (alpha)");
+    }
+
+    /// C2 fallback: se il provider del worker e' l'UNICO capable, il review gira
+    /// comunque su quel provider (preferenza forte, non hard filter).
+    #[sqlx::test]
+    async fn review_fallback_se_unico_provider_capable(pool: sqlx::PgPool) {
+        let (parent, def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
+        let (provider, _model) = resolve_worker_model(&pool, "review", &def, parent).await;
+        assert_eq!(provider, "alpha", "unico provider capable -> fallback senza esclusione");
+    }
+
+    /// C2 parita': un kind NON review non esclude nulla (il provider del padre e'
+    /// ammesso, comportamento invariato).
+    #[sqlx::test]
+    async fn non_review_non_esclude_il_provider_del_padre(pool: sqlx::PgPool) {
+        // Solo 'alpha' capable; un worker (kind implement) risolve su 'alpha'
+        // senza alcuna esclusione anche se il padre e' 'alpha'.
+        let (parent, mut def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
+        def.model_purpose = "reviewer".to_string();
+        let (provider, _model) = resolve_worker_model(&pool, "implement", &def, parent).await;
+        assert_eq!(provider, "alpha", "kind non-review: nessuna esclusione");
     }
 
     /// `mark_run` chiude ENTRAMBE le righe del figlio (nexus_subagent_runs +
