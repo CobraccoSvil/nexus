@@ -26,7 +26,7 @@ import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
 import { InlineTruncated, formatStepInput, humanizeToolResult } from "./step-detail";
 import { ProviderIcon } from "./provider-icon";
-import { capStreamToRecent } from "../../lib/use-chat/activity-stream";
+import { capStreamToRecent, switchCauseLabel } from "../../lib/use-chat/activity-stream";
 import type {
   ActivityStream,
   ActivitySegment,
@@ -177,10 +177,14 @@ function ThoughtBlock({ text, tc }: { text: string; tc: ThemeColors }) {
 }
 
 /** Banda "Cambio provider" a colore pieno (gradiente da -> a). Invariante:
- *  sempre resa, con motivo e cooldown quando noti. */
+ *  sempre resa, con motivo e cooldown quando noti. Il motivo usa l'etichetta
+ *  umana della causa strutturata quando nota (punto unico switchCauseLabel,
+ *  regola L/M): un rifiuto 4xx o un'esclusione di policy non vanno raccontati
+ *  come cooldown ne' come codice grezzo `provider_failover`. */
 function SwitchBand({ sw, tc }: { sw: SwitchEvent; tc: ThemeColors }) {
   const fromColor = providerBaseColor(sw.fromProvider);
   const toColor = providerBaseColor(sw.toProvider);
+  const causeLabel = switchCauseLabel(sw.cause);
   return (
     <div
       style={{
@@ -215,17 +219,23 @@ function SwitchBand({ sw, tc }: { sw: SwitchEvent; tc: ThemeColors }) {
         <span style={{ fontSize: 15, color: toColor, flexShrink: 0 }}>{"→"}</span>
         <ProviderBadge provider={sw.toProvider} model={sw.toModel ?? null} />
       </div>
-      {(sw.reason || sw.cooldown) && (
+      {(causeLabel || sw.reason || sw.cooldown) && (
         <div style={{ marginTop: 4, fontSize: 11.5, color: tc.textSecondary }}>
-          {sw.reason && (
+          {(causeLabel || sw.reason) && (
             <>
               Motivo:{" "}
-              <code style={codeStyle}>{sw.reason}</code>
+              {causeLabel ? (
+                // Causa strutturata nota: etichetta umana onesta al posto del
+                // codice tecnico (che resta nel payload per gli sviluppatori).
+                <span>{causeLabel}</span>
+              ) : (
+                <code style={codeStyle}>{sw.reason}</code>
+              )}
             </>
           )}
           {sw.cooldown && (
             <>
-              {sw.reason ? " · " : ""}
+              {causeLabel || sw.reason ? " · " : ""}
               {sw.fromProvider ?? "provider"} in <code style={codeStyle}>cooldown</code> ({sw.cooldown})
             </>
           )}

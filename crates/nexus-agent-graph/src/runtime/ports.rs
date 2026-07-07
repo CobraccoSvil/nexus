@@ -33,21 +33,97 @@ pub enum PortError {
     #[error("gateway LLM: {0}")]
     Llm(String),
     /// Il gateway LLM ha risposto che il/i provider risolti per la richiesta NON
-    /// sono disponibili (cooldown billing/transient o `PROVIDER_ERROR` aggregato:
-    /// "tutti i provider hanno fallito"). E' un SEGNALE STRUTTURATO distinto da
+    /// sono disponibili (cooldown billing/transient, rifiuto 4xx del provider,
+    /// esclusione di policy per tier, o `PROVIDER_ERROR` aggregato: "tutti i
+    /// provider hanno fallito"). E' un SEGNALE STRUTTURATO distinto da
     /// [`PortError::Llm`] generico (regola L): il nodo executor lo matcha per
     /// tentare il FALLBACK cross-provider (escalation) invece di chiudere il run
     /// con `StopReason::Error`. Il discriminante e' il CODICE errore del gateway
-    /// (`PROVIDER_ERROR` nel body del 500), NON il testo lessicale "in cooldown"
-    /// (fragile): la mappatura vive nell'adapter concreto (`llm_gateway.rs`).
+    /// (`PROVIDER_ERROR`/`POLICY_TIER_EXCLUDED` nel body), NON il testo lessicale
+    /// "in cooldown" (fragile): la mappatura vive nell'adapter (`llm_gateway.rs`).
+    /// Il payload porta anche la CAUSA tipizzata cosi' il meta-step di
+    /// escalation riporta il motivo onesto (regola M), non "cooldown" per tutto.
     #[error("provider non disponibile: {0}")]
-    ProviderUnavailable(String),
+    ProviderUnavailable(ProviderUnavailableInfo),
     /// L'esecuzione di un tool e' fallita (ToolRunner down o errore applicativo).
     #[error("esecuzione tool: {0}")]
     Tool(String),
     /// In modalita' Replay il tool_result del run primario non e' disponibile.
     #[error("replay non disponibile per la chiamata '{0}'")]
     ReplayMissing(String),
+}
+
+/// Causa STRUTTURATA dell'indisponibilita' di un provider (vocabolario chiuso,
+/// regola M): derivata dai CODICI del body d'errore del gateway
+/// (`code` + `details.primary_cause`), mai dal testo umano. E' cio' che rende
+/// onesto il meta-step "Cambio provider": un rifiuto 4xx del provider o
+/// un'esclusione di policy NON devono essere raccontati come "cooldown"
+/// (incidente run 48793fde del 2026-07-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureCause {
+    /// Cooldown transitorio (rate-limit/5xx recenti) del provider.
+    Cooldown,
+    /// Credito/fatturazione esauriti (billing fresco o cooldown billing).
+    Billing,
+    /// Il provider ha RIFIUTATO la richiesta (4xx client): il provider e' sano,
+    /// e' la richiesta corrente a non essere accettata.
+    ClientError,
+    /// Provider escluso dalla policy per il sensitivity tier del contenuto.
+    PolicyTierExcluded,
+    /// Non determinabile dai segnali disponibili.
+    Unknown,
+}
+
+impl ProviderFailureCause {
+    /// Identificatore stabile per telemetria/payload meta-step.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cooldown => "cooldown",
+            Self::Billing => "billing",
+            Self::ClientError => "client_error",
+            Self::PolicyTierExcluded => "policy_tier_excluded",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// `true` quando lo switch e' dovuto a indisponibilita' temporale del
+    /// provider (cooldown/credito): il frontend colora la banda come cooldown.
+    pub fn is_cooldown_like(self) -> bool {
+        matches!(self, Self::Cooldown | Self::Billing)
+    }
+}
+
+/// Payload di [`PortError::ProviderUnavailable`]: causa tipizzata + messaggio
+/// umano (solo display/log). `From<String>` per i costruttori che non hanno
+/// segnali di causa (stub di test, porte legacy): causa `Unknown`.
+#[derive(Debug, Clone)]
+pub struct ProviderUnavailableInfo {
+    pub cause: ProviderFailureCause,
+    pub message: String,
+}
+
+impl ProviderUnavailableInfo {
+    pub fn new(cause: ProviderFailureCause, message: impl Into<String>) -> Self {
+        Self {
+            cause,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderUnavailableInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl From<String> for ProviderUnavailableInfo {
+    fn from(message: String) -> Self {
+        Self {
+            cause: ProviderFailureCause::Unknown,
+            message,
+        }
+    }
 }
 
 /// Messaggio nel formato minimale richiesto dal gateway (ruolo + contenuto).

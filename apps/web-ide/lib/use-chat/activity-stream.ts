@@ -94,6 +94,11 @@ export interface SwitchEvent {
   toProvider: string;
   toModel?: string;
   reason?: string;
+  /** Causa STRUTTURATA dello switch (vocabolario chiuso del backend,
+   *  ProviderFailureCause: cooldown | billing | client_error |
+   *  policy_tier_excluded | unknown). Il renderer la mappa in etichetta umana
+   *  onesta invece di mostrare il codice grezzo `provider_failover`. */
+  cause?: string;
   /** provider `to`/`from` in cooldown (arricchimento B): stringa causa se nota. */
   cooldown?: string;
   /** contatore escalation "n/max" quando il payload lo porta. */
@@ -421,6 +426,9 @@ export function composeActivityStream(
             toProvider,
             toModel,
             reason: asString(p.reason),
+            // Causa strutturata dello switch (regola M): vocabolario chiuso
+            // emesso dall'executor (payload.cause), mai dedotta dal titolo.
+            cause: asString(p.cause),
             // Arricchimento B: causa cooldown se il payload la espone.
             cooldown: asString(p.cooldown) ?? (p.provider_in_cooldown ? asString(p.provider_in_cooldown) : undefined),
             attempt: asString(p.attempt) ?? formatAttempt(asNumber(p.attempt_index), asNumber(p.max_attempts)),
@@ -641,6 +649,24 @@ function propagateSubagentProvenance(segments: ActivitySegment[]): void {
 function formatAttempt(index?: number, max?: number): string | undefined {
   if (index == null) return undefined;
   return max != null ? `${index}/${max}` : String(index);
+}
+
+/** Etichette umane della causa STRUTTURATA di uno switch provider (vocabolario
+ *  chiuso ProviderFailureCause del backend, regola M). PUNTO UNICO (regola L)
+ *  riusato dalla banda "Cambio provider" del nastro e dalla card meta-step
+ *  escalation: un rifiuto 4xx del provider o un'esclusione di policy NON vanno
+ *  raccontati come cooldown. Cause ignote -> undefined (il renderer degrada al
+ *  codice grezzo). */
+export const SWITCH_CAUSE_LABELS: Record<string, string> = {
+  cooldown: "provider in cooldown (indisponibilita' temporanea)",
+  billing: "credito esaurito sul provider",
+  client_error: "il provider ha rifiutato la richiesta (errore lato provider)",
+  policy_tier_excluded: "contenuto riservato: provider escluso dalla policy (sensitivity tier)",
+};
+
+/** Etichetta umana della causa, se nota. */
+export function switchCauseLabel(cause?: string): string | undefined {
+  return cause ? SWITCH_CAUSE_LABELS[cause] : undefined;
 }
 
 /**

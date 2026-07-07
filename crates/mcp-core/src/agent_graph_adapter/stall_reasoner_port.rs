@@ -381,16 +381,18 @@ impl PgMetaReasonerPort {
                 return Ok(MetaLlmParse::Degrade);
             }
             PurposeResolution::NoCapableModel { tier } => {
-                return Err(PortError::ProviderUnavailable(format!(
-                    "{}: nessun modello del tier '{tier}' per purpose '{}'",
-                    spec.kind, spec.purpose
-                )));
+                return Err(PortError::ProviderUnavailable(
+                    format!(
+                        "{}: nessun modello del tier '{tier}' per purpose '{}'",
+                        spec.kind, spec.purpose
+                    )
+                    .into(),
+                ));
             }
             PurposeResolution::MatrixUnavailable(e) => {
-                return Err(PortError::ProviderUnavailable(format!(
-                    "{}: routing non disponibile: {e}",
-                    spec.kind
-                )));
+                return Err(PortError::ProviderUnavailable(
+                    format!("{}: routing non disponibile: {e}", spec.kind).into(),
+                ));
             }
         };
 

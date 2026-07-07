@@ -184,6 +184,54 @@ pub struct GwResponse {
     pub thinking_signature: Option<String>,
 }
 
+/// Errore HTTP del Nexus Gateway coi segnali STRUTTURATI del body JSON estratti
+/// al punto di costruzione (regola M): `code` (`PROVIDER_ERROR`,
+/// `POLICY_TIER_EXCLUDED`, `TIER_BLOCKED`, ...) e `details` (fallimenti
+/// per-provider con classe, tier rilevato, provider ammessi — vedi
+/// `PipelineError` in `nexus-gateway::server::routes`). I decisori fanno
+/// `downcast_ref::<GatewayHttpError>()`, mai match sul testo. `Display` e'
+/// IDENTICO al vecchio `bail!("Nexus Gateway {status}: {body}")` cosi' i
+/// consumatori legacy della stringa non cambiano comportamento.
+#[derive(Debug)]
+pub struct GatewayHttpError {
+    pub status: u16,
+    /// Riga di status per il display (es. "500 Internal Server Error").
+    status_text: String,
+    /// Codice d'errore strutturato dal body JSON del gateway, se presente.
+    pub code: Option<String>,
+    /// Blocco `details` del body (failures classificate, tier, ammessi).
+    pub details: Option<Value>,
+    /// Body grezzo: solo display/log, mai per decidere.
+    pub body: String,
+}
+
+impl GatewayHttpError {
+    pub fn from_response(status: reqwest::StatusCode, body: String) -> Self {
+        let parsed: Option<Value> = serde_json::from_str(&body).ok();
+        let code = parsed
+            .as_ref()
+            .and_then(|v| v.get("code"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        let details = parsed.as_ref().and_then(|v| v.get("details")).cloned();
+        Self {
+            status: status.as_u16(),
+            status_text: status.to_string(),
+            code,
+            details,
+            body,
+        }
+    }
+}
+
+impl std::fmt::Display for GatewayHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Nexus Gateway {}: {}", self.status_text, self.body)
+    }
+}
+
+impl std::error::Error for GatewayHttpError {}
+
 impl NexusGatewayClient {
     pub fn new(base_url: String, service_token: String) -> Self {
         Self {
@@ -223,7 +271,11 @@ impl NexusGatewayClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Nexus Gateway {status}: {body}");
+            // Errore TIPIZZATO (regola M): il punto di costruzione — che conosce
+            // il contratto del body del gateway — estrae `code` e `details`; il
+            // punto di decisione (adapter agent-graph) fa downcast, non parsing
+            // della stringa. Display identico al vecchio bail! per i log.
+            return Err(GatewayHttpError::from_response(status, body).into());
         }
 
         resp.json::<GwResponse>()

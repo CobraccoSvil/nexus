@@ -323,7 +323,7 @@ mod tests {
             _ctx: StallContext,
             _mode: ExecMode,
         ) -> Result<Option<RecoveryMove>, PortError> {
-            Err(PortError::ProviderUnavailable("test".to_string()))
+            Err(PortError::ProviderUnavailable("test".to_string().into()))
         }
 
         async fn orchestrate(

@@ -1,4 +1,11 @@
 # Profilo HYBRID — cloud per tier 0-1, vLLM locale per tier 2-3
+#
+# Matrice tier -> provider: vedi la documentazione estesa in default.yaml
+# (gate DLP per-tier, semantica pin, codici errore strutturati). In questo
+# profilo `allow_cloud_tier3=false`: a tier 3 i provider cloud sono ESCLUSI
+# (403 POLICY_TIER_EXCLUDED, anche per un provider pinnato) e resta solo vllm.
+# Tier 2 ammette il cloud (allow_cloud_tier2=true) ma la chain preferisce vllm.
+# Override runtime dei flag: settings DB dlp_allow_cloud_tier2/3, dlp_enabled.
 profile: hybrid
 
 providers:
