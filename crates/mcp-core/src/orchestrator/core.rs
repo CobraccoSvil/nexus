@@ -1043,15 +1043,13 @@ impl Orchestrator {
         // (helper unico, regola L).
         let (tier, cap) = self.intent_tier_capability(intent, estimated_tokens).await;
 
-        // Tier-chain con pavimento: un task heavy/medium non degrada sotto il
-        // proprio tier (niente caduta a un modello light per un coding heavy).
-        let tiers_to_try: Vec<&str> = match tier.as_str() {
-            "frontier" => vec!["frontier", "heavy", "high"],
-            "heavy" => vec!["heavy", "high", "medium"],
-            "high" => vec!["high", "medium"],
-            "medium" => vec!["medium"],
-            _ => vec!["light"],
-        };
+        // Tier-chain di degradazione graceful (PUNTO UNICO, regola L):
+        // `agentic_tier_chain`, la STESSA usata da route_model_from_catalog e
+        // select_models_tierchain. Provider-agnostico: cerca il tier richiesto tra
+        // TUTTI i provider non in cooldown (stessi criteri), e degrada di UN gradino
+        // solo se quel tier e' vuoto. Prima qui c'era una tier-chain hardcoded con
+        // pavimento diverso -> degradazione incoerente tra i percorsi (rimossa).
+        let tiers_to_try = crate::orchestrator::model_routing::agentic_tier_chain(&tier);
 
         // PUNTO UNICO di selezione agentica (regola L): miglior modello
         // tool-capable del tier/capability, da un provider NON in cooldown.
@@ -1146,15 +1144,12 @@ impl Orchestrator {
                             d.provider, d.model
                         );
                     }
-                    // PUNTO UNICO di selezione agentica (regola L): tier degradato,
-                    // provider non in cooldown, eleggibilita' definita una volta sola.
-                    let tiers_to_try: Vec<&str> = match base_tier {
-                        "frontier" => vec!["frontier", "heavy", "high", "medium"],
-                        "heavy" => vec!["heavy", "high", "medium"],
-                        "high" => vec!["high", "medium", "light"],
-                        "medium" => vec!["medium", "light"],
-                        _ => vec!["light"],
-                    };
+                    // Tier-chain di degradazione graceful (PUNTO UNICO, regola L):
+                    // stessa `agentic_tier_chain` del selettore principale, non piu'
+                    // una copia hardcoded con degradazione diversa. Provider-agnostico:
+                    // stesso tier tra tutti i provider sani, poi un gradino sotto.
+                    let tiers_to_try =
+                        crate::orchestrator::model_routing::agentic_tier_chain(base_tier);
                     let catalog_alt = select_agentic_model(
                         db,
                         &tiers_to_try,
