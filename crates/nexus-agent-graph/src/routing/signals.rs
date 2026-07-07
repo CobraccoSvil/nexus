@@ -450,6 +450,78 @@ pub fn tool_result_outcome_after(recent: &[Message], idx: usize, max_ahead: usiz
     None
 }
 
+/// Chiave CONTRATTO del tool_result emesso dal ponte figlio->padre di
+/// `mcp-core::agent_tools::subagent_native` (`K_SUB_RUN_ID`): discrimina un
+/// tool_result di sub-run da qualunque altro. Duplicata come letterale (mcp-core
+/// dipende da questo crate, non viceversa: non possiamo importare la sua const),
+/// stabile come gli altri contratti macchina (`EXIT CODE: N`, `\u{274C}`).
+const SUBAGENT_RUN_ID_KEY: &str = "subagent_run_id";
+
+/// `true` se un payload di tool_result e' la chiusura RIUSCITA di un sub-run:
+/// porta la chiave contratto [`SUBAGENT_RUN_ID_KEY`] E `status == "completed"`
+/// (segnale MACCHINA, regola M — non prosa). `paused`/`timeout`/`failed` NON
+/// contano. Gestisce sia il payload gia' strutturato (`Value::Object`) sia la
+/// forma tipica in cui il tool ritorna una STRINGA JSON (`Value::String`).
+fn is_completed_subagent_payload(v: &Value) -> bool {
+    fn obj_matches(obj: &serde_json::Map<String, Value>) -> bool {
+        obj.contains_key(SUBAGENT_RUN_ID_KEY)
+            && obj.get("status").and_then(Value::as_str) == Some("completed")
+    }
+    match v {
+        Value::Object(obj) => obj_matches(obj),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(obj_matches)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// `true` se nella history c'e' il tool_result di un `dispatch_subagent(s)`
+/// COMPLETATO con successo (un sub-run arrivato a fine turno, che ha percio'
+/// dichiarato il proprio esito via `task_complete`).
+///
+/// Serve al final_gate (`completion_confirmed`, ADR 0034): quando il PADRE
+/// coordinatore delega l'intero lavoro a un sub-agente — che HA dichiarato in
+/// modo strutturato — e chiude il turno senza ri-dichiarare a sua volta, la
+/// CHIUSURA onesta del run ESISTE gia' (quella del figlio). Il criterio non deve
+/// bocciare per "nessuna dichiarazione": ne cerca UNA, non che sia del padre. La
+/// verifica tecnica (build/typecheck) resta a guardia della correttezza — un
+/// figlio che ha lasciato il lavoro incompleto fa fallire gli altri criteri.
+///
+/// Punto unico (regola L) del fatto strutturale "un sub-run e' stato delegato e
+/// chiuso con successo in questo run". Legge il segnale MACCHINA (`status`), mai
+/// la prosa del summary.
+pub fn has_completed_subagent_dispatch(messages: &[Message]) -> bool {
+    messages.iter().any(message_has_completed_subagent_result)
+}
+
+/// Vero se il messaggio porta un tool_result di sub-run completato, in una
+/// qualsiasi delle forme (ToolMessage testo/blocchi, HumanMessage con blocchi
+/// tool_result), come [`message_tool_result_outcome`].
+fn message_has_completed_subagent_result(m: &Message) -> bool {
+    let block_matches = |b: &ContentBlock| match b {
+        ContentBlock::ToolResult { content, .. } => is_completed_subagent_payload(content),
+        ContentBlock::Text { text } => {
+            is_completed_subagent_payload(&Value::String(text.clone()))
+        }
+        ContentBlock::ToolUse { .. } => false,
+    };
+    match m {
+        Message::Tool { content, .. } => match content {
+            MessageContent::Text(s) => is_completed_subagent_payload(&Value::String(s.clone())),
+            MessageContent::Blocks(blocks) => blocks.iter().any(block_matches),
+        },
+        Message::Human { content } => match content {
+            MessageContent::Blocks(blocks) => blocks.iter().any(block_matches),
+            MessageContent::Text(_) => false,
+        },
+        Message::Ai { .. } => false,
+    }
+}
+
 /// CODICE STRUTTURATO (regola M) che il guard anti-persistenza-redazione della
 /// fonte (`mcp-core::security::redaction_guard`) antepone al tool_result quando
 /// RIFIUTA un input contenente un placeholder di redazione (audit
@@ -1473,6 +1545,41 @@ mod tests {
             tool_call_id: "c1".into(),
             content: MessageContent::text(text),
         }
+    }
+
+    #[test]
+    fn completed_subagent_dispatch_da_history() {
+        // Payload REALE del ponte figlio->padre (finalize_success): il tool_result
+        // e' una STRINGA JSON con `subagent_run_id` + `status`.
+        let ok = r#"{"subagent_run_id":"11111111-1111-1111-1111-111111111111","kind":"rust_implementer","status":"completed","summary":"riscritto AppointmentsTab","iterations":56,"cost_usd":0.1}"#;
+        // Forma HumanMessage con blocco tool_result (content = stringa JSON).
+        assert!(has_completed_subagent_dispatch(&[human_tool_result(None, false, ok)]));
+        // Forma ToolMessage langchain con content testuale.
+        assert!(has_completed_subagent_dispatch(&[tool_msg(ok)]));
+        // Solo `status == "completed"` conta: paused/failed/timeout/running NO.
+        for st in ["paused", "failed", "timeout", "running"] {
+            let other = format!(r#"{{"subagent_run_id":"abc","status":"{st}","summary":"x"}}"#);
+            assert!(
+                !has_completed_subagent_dispatch(&[tool_msg(&other)]),
+                "status {st} non deve contare come completamento"
+            );
+        }
+        // Un tool_result NON-subagente (nessun subagent_run_id) non conta.
+        assert!(!has_completed_subagent_dispatch(&[tool_msg(
+            r#"{"status":"completed","output":"build ok"}"#
+        )]));
+        // Payload gia' strutturato (Value::Object) invece di stringa JSON.
+        let structured = Message::Human {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: json!({"subagent_run_id": "abc", "status": "completed"}),
+                is_error: false,
+                exit_code: None,
+            }]),
+        };
+        assert!(has_completed_subagent_dispatch(&[structured]));
+        // History senza sub-run -> false.
+        assert!(!has_completed_subagent_dispatch(&[tool_msg("nessun subrun")]));
     }
 
     #[test]

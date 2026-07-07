@@ -238,19 +238,40 @@ whitelist (verificare supports_tool_use e le whitelist agent.tools.*)"
 
     /// completion_confirmed: la chiusura va CONFERMATA da una dichiarazione
     /// strutturata task_complete (ADR 0034). Qualunque outcome onesto passa.
+    ///
+    /// Delega post-subagente: quando il PADRE coordinatore delega il lavoro a un
+    /// sub-agente che arriva a chiusura (`subagent_completed`, segnale MACCHINA
+    /// dalla history, regola M) e chiude senza ri-dichiarare, la dichiarazione
+    /// onesta del run ESISTE gia' (quella del figlio) -> passa. Il criterio ne
+    /// cerca UNA, non che sia del padre; la verifica tecnica (build/typecheck)
+    /// resta a guardia della correttezza per un figlio che ha lasciato incompleto.
     fn check_completion_confirmed(spec: &Value) -> (bool, Value) {
         let declared = spec
             .get("declared_outcome")
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty());
-        let passed = declared.is_some();
-        let verdict = match declared {
-            Some(o) => format!("esito dichiarato: {o}"),
-            None => "nessuna dichiarazione strutturata: chiudi con il tool \
+        let subagent_completed = spec
+            .get("subagent_completed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let passed = declared.is_some() || subagent_completed;
+        let verdict = match (declared, subagent_completed) {
+            (Some(o), _) => format!("esito dichiarato: {o}"),
+            (None, true) => "chiusura strutturata delegata a un sub-agente \
+completato (task_complete del figlio)"
+                .to_string(),
+            (None, false) => "nessuna dichiarazione strutturata: chiudi con il tool \
 task_complete (outcome + summary)"
                 .to_string(),
         };
-        (passed, json!({ "declared_outcome": declared, "verdict": verdict }))
+        (
+            passed,
+            json!({
+                "declared_outcome": declared,
+                "subagent_completed": subagent_completed,
+                "verdict": verdict,
+            }),
+        )
     }
 
     async fn check_run_command(
@@ -842,6 +863,50 @@ mod tests {
         assert_eq!(res[0].evidence["type"], json!("run_command"));
     }
 
+    /// REGRESSIONE run 48793fde (Beaty-Book): `pnpm build` (vite) esce 0 e RIESCE,
+    /// ma stampa il warning del reporter `[plugin:vite:reporter]` (import misto
+    /// dinamico/statico + chunk > 500 kB). Prima il pattern `[plugin:` di
+    /// count_build_errors lo contava come errore -> il criterio build bocciava un
+    /// build OGGETTIVAMENTE verde (falso negativo del final_gate, gate 2/2). Ora
+    /// passa: exit 0 + zero errori reali.
+    #[sqlx::test]
+    async fn run_command_build_passa_con_warning_reporter_vite(pool: PgPool) {
+        let raw = "EXIT CODE: 0\nSTDOUT:\n\
+            vite v5.4.21 building for production...\n\
+            2334 modules transformed.\n\
+            [plugin:vite:reporter] [plugin vite:reporter]\n\
+            (!) src/app/services/bookingService.ts is dynamically imported by \
+            src/app/components/admin/AppointmentsTab.tsx but also statically imported by \
+            src/app/components/admin/AdminLogin.tsx, dynamic import will not move module \
+            into another chunk.\n\
+            (!) Some chunks are larger than 500 kB after minification.\n\
+            built in 7.67s\nSTDERR:\n";
+        let exec = FakeToolExecutor::with(&[("run_command", &[raw])]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "run_command",
+                    json!({ "command": "pnpm build" }),
+                    json!({ "exit_code": 0 }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(
+            res[0].passed,
+            "build vite exit 0 con soli warning deve PASSARE, evidence: {}",
+            res[0].evidence
+        );
+        assert_eq!(res[0].evidence["exit_code"], json!(0));
+        assert_eq!(
+            res[0].evidence["build_errors"],
+            json!(0),
+            "il warning [plugin:vite:reporter] non e' un errore"
+        );
+    }
+
     #[sqlx::test]
     async fn run_command_build_fallisce_su_exit_non_zero(pool: PgPool) {
         let exec = FakeToolExecutor::with(&[(
@@ -1314,5 +1379,23 @@ mod tests {
             assert!(!ko, "spec {spec} deve fallire");
             assert!(ev["verdict"].as_str().unwrap().contains("task_complete"));
         }
+        // Delega: il PADRE non dichiara ma un sub-agente e' arrivato a chiusura
+        // -> passa (la dichiarazione onesta del run e' quella del figlio).
+        let (ok, ev) = FinalGateCriteriaRunnerAdapter::check_completion_confirmed(
+            &json!({"declared_outcome": null, "subagent_completed": true}),
+        );
+        assert!(ok, "completamento subagente deve confermare la chiusura");
+        assert!(ev["verdict"].as_str().unwrap().contains("sub-agente"));
+        // subagent_completed=false senza dichiarazione -> continua a fallire.
+        let (ko, _) = FinalGateCriteriaRunnerAdapter::check_completion_confirmed(
+            &json!({"declared_outcome": null, "subagent_completed": false}),
+        );
+        assert!(!ko, "nessuna dichiarazione e nessun subagente completato -> fallisce");
+        // La dichiarazione del padre prevale sul verdict del subagente.
+        let (ok, ev) = FinalGateCriteriaRunnerAdapter::check_completion_confirmed(
+            &json!({"declared_outcome": "done", "subagent_completed": true}),
+        );
+        assert!(ok);
+        assert!(ev["verdict"].as_str().unwrap().contains("esito dichiarato: done"));
     }
 }
