@@ -121,7 +121,7 @@ pub async fn cleanup_external_resources(
     // Esegui in parallelo: i 3 step non condividono risorse condivise.
     let (docker, systemd, qdrant) = tokio::join!(
         cleanup_docker_containers(slug),
-        cleanup_systemd_units(slug),
+        cleanup_project_services(db, project_id, slug),
         cleanup_qdrant_points(db, project_id),
     );
 
@@ -306,21 +306,90 @@ struct SystemdResult {
     errors: Vec<String>,
 }
 
+/// De-registra i servizi del progetto dal manager della piattaforma.
+///
+/// Dispatch platform-aware (regola L): su Linux ferma/disabilita/rimuove le unit
+/// `systemd --user`; su Windows ferma e de-registra i processi gestiti in
+/// `agent_processes` (kind='service'). Prima questa funzione era solo-systemd e
+/// su Windows produceva "HOME env non impostata" nel report senza toccare i
+/// servizi Windows reali.
+async fn cleanup_project_services(db: &PgPool, project_id: Uuid, slug: &str) -> SystemdResult {
+    #[cfg(windows)]
+    {
+        let _ = slug;
+        cleanup_windows_services(db, project_id).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (db, project_id);
+        cleanup_systemd_units(slug).await
+    }
+}
+
+/// Windows: ferma e de-registra i servizi del progetto in `agent_processes`.
+///
+/// Enumera via il PUNTO UNICO `service_manager::active().list` (regola L) e ferma
+/// ciascun servizio col relativo `stop` (kill dei pid running + status='stopped').
+/// Poi RIMUOVE le righe kind='service' del progetto: il progetto e' gia' stato
+/// cancellato dal DB meta, quindi la de-registrazione e' definitiva ed equivale
+/// alla rimozione dei file unit su Linux. `project_root` non e' necessario qui
+/// (list/stop Windows non lo usano nel ramo cleanup), quindi si passa una path
+/// vuota.
+#[cfg(windows)]
+async fn cleanup_windows_services(db: &PgPool, project_id: Uuid) -> SystemdResult {
+    use crate::project_workspace::service_manager::{self, ServiceBackend, ServiceContext};
+
+    let mut out = SystemdResult::default();
+    let empty_root = std::path::Path::new("");
+    let ctx = ServiceContext {
+        db,
+        port_registry: None,
+        project_id,
+        // Lo slug del ctx serve solo a comporre l'unit name Windows (non usato
+        // nel cleanup, che filtra per project_id): valore neutro.
+        slug: "",
+        project_root: empty_root,
+    };
+
+    let backend = service_manager::active();
+    for entry in backend.list(&ctx).await {
+        // Esito da segnale strutturato (regola M): `acted`, non parsing di prosa.
+        let outcome = backend.stop(&ctx, &entry.label).await;
+        if outcome.acted {
+            out.removed.push(entry.label.clone());
+        }
+    }
+
+    // De-registrazione definitiva delle righe kind='service' del progetto sul
+    // pool del progetto (agent_processes e' tabella migrata).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    if let Err(e) = sqlx::query(
+        "DELETE FROM agent_processes WHERE project_id = $1 AND kind = 'service'",
+    )
+    .bind(project_id)
+    .execute(&proj_pool)
+    .await
+    {
+        out.errors
+            .push(format!("de-registrazione servizi Windows: {e}"));
+    }
+
+    out
+}
+
 /// Ferma, disabilita e rimuove i service file `~/.config/systemd/user/<slug>-*.service`.
 ///
 /// Esegue `daemon-reload` alla fine se almeno un file e' stato rimosso.
 /// Skip se l'unit name inizia con `nexus-` o `ideai-`.
+#[cfg(not(windows))]
 async fn cleanup_systemd_units(slug: &str) -> SystemdResult {
     let mut out = SystemdResult::default();
 
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => {
-            out.errors.push("HOME env non impostata".to_string());
-            return out;
-        }
-    };
-    let dir = std::path::PathBuf::from(&home).join(".config/systemd/user");
+    // Fallback HOME consolidato sul punto unico del path (regola L):
+    // service_manager::user_systemd_dir(), che gestisce la env mancante senza
+    // errore spurio nel report.
+    let dir =
+        std::path::PathBuf::from(crate::project_workspace::service_manager::user_systemd_dir());
     if !dir.exists() {
         return out;
     }

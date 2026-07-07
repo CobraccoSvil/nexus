@@ -371,41 +371,89 @@ pub(super) const FORBIDDEN_NOOP: &[&str] = &[
 
 /// Marca come `existing=true` i suggerimenti gia' gestiti dal progetto. PUNTO
 /// UNICO (regola L): usato sia dal ramo agentico sia dall'euristica in
-/// `wizard_detect_services`. Considera DUE fonti, cosi' la dialog del wizard
-/// (che decide "Installato vs Installa" su questo flag) resta allineata al badge
-/// e alla lista dei servizi gestiti:
+/// `wizard_detect_services`. La dialog del wizard decide "Installato vs Installa"
+/// su questo flag, quindi la fonte di "cosa esiste gia'" deve essere quella dei
+/// servizi realmente gestiti sulla piattaforma corrente.
+///
+/// Linux (comportamento invariato): l'esistenza deriva dalle unit systemd, con
+/// DUE fonti allineate al pannello (`list_services_fallback`):
 ///   1. unit registrate in systemd --user (`list-unit-files`), quando il bus c'e';
 ///   2. file unit presenti su disco (`services::project_unit_files_on_disk`), che
 ///      e' l'unica fonte disponibile in WSL/detached dove il bus utente e' giu' e
-///      il punto 1 ritorna vuoto. E' la stessa fonte di `list_services_fallback`.
+///      il punto 1 ritorna vuoto. Il matching e' per NOME UNIT completo.
+///
+/// Windows: non esistono unit file, i servizi gestiti vivono in `agent_processes`
+/// (kind='service'). La fonte e' il PUNTO UNICO `service_manager::active().list`
+/// (regola L), da cui si ricavano le label (short) gia' installate; il matching
+/// e' per SHORT. Senza questo, su Windows il flag `existing` non si settava mai e
+/// il wizard riproponeva "Installa" su servizi gia' presenti (doppio spawn).
+///
 /// Stato volatile: non va cachato.
-pub(super) async fn mark_existing_services(slug: &str, suggestions: &mut [serde_json::Value]) {
-    let mut installed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // 1. Unit registrate in systemd --user (quando il bus risponde).
-    if let Ok(svc_out) = systemctl_user()
-        .args([
-            "--user",
-            "list-unit-files",
-            "--type=service",
-            "--no-legend",
-            "--no-pager",
-        ])
-        .output()
-        .await
+pub(super) async fn mark_existing_services(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    project_root: &std::path::Path,
+    slug: &str,
+    suggestions: &mut [serde_json::Value],
+) {
+    #[cfg(windows)]
     {
-        installed.extend(
-            String::from_utf8_lossy(&svc_out.stdout)
-                .lines()
-                .filter_map(|l| l.split_whitespace().next().map(String::from)),
-        );
+        use crate::project_workspace::service_manager::{self, ServiceBackend, ServiceContext};
+        // I servizi gestiti su Windows sono processi in agent_processes: il
+        // ServiceManager li enumera (ServiceEntry.label = short). Matching per short.
+        let ctx = ServiceContext {
+            db,
+            port_registry: None,
+            project_id,
+            slug,
+            project_root,
+        };
+        let installed_shorts: std::collections::HashSet<String> = service_manager::active()
+            .list(&ctx)
+            .await
+            .into_iter()
+            .map(|e| e.label)
+            .collect();
+        for s in suggestions.iter_mut() {
+            let short = s["short"].as_str().unwrap_or("");
+            if !short.is_empty() && installed_shorts.contains(short) {
+                s["existing"] = json!(true);
+            }
+        }
     }
-    // 2. Unit presenti come FILE su disco: in WSL/detached il bus e' giu' (punto 1
-    //    vuoto) ma i file unit esistono e il pannello li mostra gia' come gestiti.
-    installed.extend(super::services::project_unit_files_on_disk(slug).await);
-    for s in suggestions.iter_mut() {
-        let unit = s["unit"].as_str().unwrap_or("");
-        if installed.contains(unit) {
-            s["existing"] = json!(true);
+
+    #[cfg(not(windows))]
+    {
+        // Su Linux non servono db/project_id/project_root: la fonte sono le unit
+        // systemd (matching per unit completo). Evita warning unused.
+        let _ = (db, project_id, project_root);
+        let mut installed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 1. Unit registrate in systemd --user (quando il bus risponde).
+        if let Ok(svc_out) = systemctl_user()
+            .args([
+                "--user",
+                "list-unit-files",
+                "--type=service",
+                "--no-legend",
+                "--no-pager",
+            ])
+            .output()
+            .await
+        {
+            installed.extend(
+                String::from_utf8_lossy(&svc_out.stdout)
+                    .lines()
+                    .filter_map(|l| l.split_whitespace().next().map(String::from)),
+            );
+        }
+        // 2. Unit presenti come FILE su disco: in WSL/detached il bus e' giu' (punto 1
+        //    vuoto) ma i file unit esistono e il pannello li mostra gia' come gestiti.
+        installed.extend(super::services::project_unit_files_on_disk(slug).await);
+        for s in suggestions.iter_mut() {
+            let unit = s["unit"].as_str().unwrap_or("");
+            if installed.contains(unit) {
+                s["existing"] = json!(true);
+            }
         }
     }
 }
@@ -819,7 +867,14 @@ pub async fn wizard_detect_services(
     .await
     {
         if !found.is_empty() {
-            mark_existing_services(&slug, &mut found).await;
+            mark_existing_services(
+                &state.db,
+                project_id,
+                &context.repository_root_path,
+                &slug,
+                &mut found,
+            )
+            .await;
             super::service_discovery::drop_managed_variants(&mut found).await;
             return Ok(Json(json!({ "suggestions": found, "slug": slug })));
         }
@@ -827,8 +882,16 @@ pub async fn wizard_detect_services(
 
     let mut suggestions = detect_services_heuristic(&state, &project_id, &root, &slug).await;
 
-    // Marca quelli già installati come .service files (punto unico, regola L).
-    mark_existing_services(&slug, &mut suggestions).await;
+    // Marca quelli già installati (punto unico, regola L): su Linux dalle unit
+    // systemd, su Windows dai processi gestiti in agent_processes.
+    mark_existing_services(
+        &state.db,
+        project_id,
+        &context.repository_root_path,
+        &slug,
+        &mut suggestions,
+    )
+    .await;
     // Scarta le varianti di avvio di servizi gia' gestiti (punto unico, regola L).
     super::service_discovery::drop_managed_variants(&mut suggestions).await;
 

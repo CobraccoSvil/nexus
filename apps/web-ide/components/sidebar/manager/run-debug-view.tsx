@@ -30,7 +30,7 @@ import {
   CATEGORY_LABEL,
   CATEGORY_ICON,
   isStopScript,
-  isDuplicateOfSystemdService,
+  isDuplicateOfManagedService,
   categorize,
 } from "./shared";
 
@@ -55,10 +55,10 @@ export function RunDebugView({
   const [suggestions, setSuggestions] = useState<SuggestedConfig[] | null>(null);
   const [selectedSuggestions, setSelectedSuggestions] = useState<Set<number>>(new Set());
   const [importingAll, setImportingAll] = useState(false);
-  /** Set degli "short" name dei servizi systemd installati per il progetto.
+  /** Set degli "short" name dei servizi del progetto installati.
    *  Usato SOLO per nascondere i run config che duplicherebbero un servizio
-   *  (isDuplicateOfSystemdService). La gestione dei servizi e' nel pannello Run & Debug. */
-  const [systemdShorts, setSystemdShorts] = useState<Set<string>>(new Set());
+   *  (isDuplicateOfManagedService). La gestione dei servizi e' nel pannello Run & Debug. */
+  const [serviceShorts, setServiceShorts] = useState<Set<string>>(new Set());
   /** Categorie collassate dall'utente (chiavi in CATEGORY_LABEL) */
   const [collapsed, setCollapsed] = useState<Set<Category>>(() => new Set());
   /** "show all" forza il rendering di tutto (anche stop e duplicati) per debug */
@@ -73,13 +73,13 @@ export function RunDebugView({
 
   // Polling rilassato (30s) — fallback; il refresh reale e' event-driven sotto.
   useEffect(() => {
-    if (!projectId) { setSystemdShorts(new Set()); return; }
+    if (!projectId) { setServiceShorts(new Set()); return; }
     let cancelled = false;
     const refresh = async () => {
       try {
         const r = await getProjectServicesStatus(projectId);
         if (cancelled) return;
-        setSystemdShorts(new Set((r.services ?? []).map(s => s.short)));
+        setServiceShorts(new Set((r.services ?? []).map(s => s.short)));
       } catch { /* ignora */ }
     };
     refresh();
@@ -95,7 +95,7 @@ export function RunDebugView({
       try {
         const r = await getProjectServicesStatus(projectId);
         if (cancelled) return;
-        setSystemdShorts(new Set((r.services ?? []).map(s => s.short)));
+        setServiceShorts(new Set((r.services ?? []).map(s => s.short)));
       } catch { /* ignora */ }
     })();
     return () => { cancelled = true; };
@@ -286,15 +286,15 @@ export function RunDebugView({
 
   return (
     <>
-      <div className="flex-row px-3 py-2" style={{ borderBottom: `1px solid ${tc.border}`, justifyContent: "space-between" }} title="Script & comandi una-tantum del progetto (build, test, lint, migrazioni, ecc.). Gli script che corrispondono a servizi systemd installati e quelli di stop/kill vengono nascosti automaticamente — clicca '👁' per mostrarli.">
+      <div className="flex-row px-3 py-2" style={{ borderBottom: `1px solid ${tc.border}`, justifyContent: "space-between" }} title="Script & comandi una-tantum del progetto (build, test, lint, migrazioni, ecc.). Gli script che corrispondono a servizi del progetto installati e quelli di stop/kill vengono nascosti automaticamente — clicca '👁' per mostrarli.">
         <span style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, textTransform: "uppercase", letterSpacing: 1 }}>Script &amp; Comandi</span>
         {!editing && !suggestions && (
           <div className="flex-row" style={{ gap: 4, alignItems: "center" }}>
             <button
               onClick={() => setShowAll(v => !v)}
               title={showAll
-                ? "Nascondi script di stop/kill e duplicati di servizi systemd"
-                : "Mostra TUTTI gli script (anche stop e quelli coperti da servizi systemd)"}
+                ? "Nascondi script di stop/kill e duplicati di servizi del progetto"
+                : "Mostra TUTTI gli script (anche stop e quelli coperti da servizi del progetto)"}
               className="text-xs px-1 py-0 rounded-sm cursor-pointer"
               style={{
                 background: showAll ? tc.accent : "none",
@@ -328,8 +328,8 @@ export function RunDebugView({
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
         {error && <div style={{ color: tc.error, fontSize: 11, padding: "4px 0" }}>{error}</div>}
 
-        {/* La gestione dei servizi systemd (stato + start/stop/restart) vive UNICAMENTE
-            nel pannello "Run & Debug" (SystemdServicesSection): qui la duplicavamo con
+        {/* La gestione dei servizi del progetto (stato + start/stop/restart) vive UNICAMENTE
+            nel pannello "Run & Debug" (ProjectServicesSection): qui la duplicavamo con
             un secondo fetch/polling indipendente (rischio desync). Rimossa per avere un
             solo punto di controllo. Questa sidebar resta il gestore degli script/comandi
             one-shot del progetto. */}
@@ -544,11 +544,11 @@ export function RunDebugView({
           const visible: Array<{ c: RunConfigItem; muted?: string }> = [];
           for (const c of runConfigs) {
             const isStop = isStopScript(c);
-            const isDup  = isDuplicateOfSystemdService(c, systemdShorts);
+            const isDup  = isDuplicateOfManagedService(c, serviceShorts);
             if ((isStop || isDup) && !showAll) continue;
             const muted = showAll
               ? (isStop ? "Script di stop/kill (lancialo solo se sai cosa fai)" :
-                 isDup  ? "Duplicato di un servizio systemd installato" : undefined)
+                 isDup  ? "Duplicato di un servizio del progetto installato" : undefined)
               : undefined;
             visible.push({ c, muted });
           }
@@ -565,7 +565,7 @@ export function RunDebugView({
           if (visible.length === 0) {
             return (
               <div style={{ color: tc.textMuted, fontSize: 12, paddingTop: 4 }}>
-                Tutti gli {runConfigs.length} script rilevati sono nascosti perché duplicati di servizi systemd o script di stop. Clicca <strong>👁 tutti</strong> in alto per vederli.
+                Tutti gli {runConfigs.length} script rilevati sono nascosti perché duplicati di servizi del progetto o script di stop. Clicca <strong>👁 tutti</strong> in alto per vederli.
               </div>
             );
           }
@@ -574,7 +574,7 @@ export function RunDebugView({
             <>
               {totalHidden > 0 && !showAll && (
                 <div style={{ fontSize: 10, color: tc.textMuted, marginBottom: 6, fontStyle: "italic" }}>
-                  ℹ {totalHidden} script nascosti (duplicati systemd o stop). Clicca 👁 in alto per mostrarli.
+                  ℹ {totalHidden} script nascosti (duplicati di servizi del progetto o stop). Clicca 👁 in alto per mostrarli.
                 </div>
               )}
               {order.map(cat => {

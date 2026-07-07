@@ -9,15 +9,15 @@ tags:
   - isolation
 source_files:
   - crates/mcp-core/src/meta_docs/generators/concepts.rs
-auto_generated: true
+auto_generated: false
 created_at: 2026-05-23T11:08:59Z
-updated_at: 2026-06-04T12:54:52Z
+updated_at: 2026-07-07T00:00:00Z
 nexus_meta_version: 1
 ---
 
 # Isolamento tra progetti
 
-Ogni progetto registrato in Nexus e' un **mondo a se'**: codice, chat, knowledge, credenziali, container Docker, services systemd.
+Ogni progetto registrato in Nexus e' un **mondo a se'**: codice, chat, knowledge, credenziali, container Docker, servizi del progetto (Linux: `systemd --user`; Windows: processi gestiti in `agent_processes`). Il ciclo di vita dei servizi di progetto e' governato da un punto unico multipiattaforma — vedi [[0038-modello-servizi-progetto-multipiattaforma]].
 
 ## Regole assolute (vedi CLAUDE.md sezione E)
 

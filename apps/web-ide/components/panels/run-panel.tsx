@@ -3,15 +3,15 @@
 /**
  * RunPanel — pannello Run & Debug (tab inferiore).
  *
- * Sezione A: Servizi systemd attivi del progetto
- *   - Rilevamento dinamico: tutti i {slug}-*.service installati
+ * Sezione A: Servizi del progetto attivi
+ *   - Rilevamento dinamico dei servizi gestiti del progetto
  *   - Stato live con polling 5s + bottoni start / stop / restart
  *   - URL/porta cliccabile per ogni servizio in esecuzione
  *
- * Sezione B: Wizard "Configura servizi systemd"
+ * Sezione B: Wizard "Configura servizi del progetto"
  *   - Analizza il progetto (package.json, .csproj, Cargo.toml, docker-compose…)
- *   - Propone i servizi systemd mancanti
- *   - Installa i file .service e li abilita con un click
+ *   - Propone i servizi del progetto mancanti
+ *   - Registra i servizi e li avvia con un click
  *
  * Nota: le Run Configurations (processi on-demand) sono gestite nella sidebar sinistra.
  */
@@ -46,7 +46,7 @@ import {
 import { type ServiceAction } from "./run/shared";
 import { WizardInstallModal } from "./run/wizard-install-modal";
 import { NexusServicesSection } from "./run/nexus-services-section";
-import { SystemdServicesSection } from "./run/systemd-services-section";
+import { ProjectServicesSection } from "./run/project-services-section";
 import { StaticSiteSection } from "./run/static-site-section";
 import { PortAllocationsSection } from "./run/port-allocations-section";
 import { WizardOverlay } from "./run/wizard-overlay";
@@ -56,8 +56,8 @@ import { WizardOverlay } from "./run/wizard-overlay";
  * "+ Configura". Esclude:
  *  1. i candidati gia' marcati `existing` dal backend;
  *  2. quelli GIA' gestiti dal progetto (presenti tra `managed` per unit o short),
- *     anche in modalita' detached: il backend `mark_existing_services` controlla
- *     solo systemd --user, cieco in WSL/detached, quindi li conterebbe a torto;
+ *     anche quando il gestore non e' interrogabile: in quel caso il backend
+ *     `mark_existing_services` e' cieco e li conterebbe a torto;
  *  3. i duplicati (stesso unit/short, es. lo script alias `dev` -> `dev:frontend`).
  * Cosi' il badge non dice "3 da configurare" quando 2 sono gia' in lista e 1 e' un doppione.
  */
@@ -96,10 +96,10 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   const tc = useThemeColors();
   const { confirmDialog } = useGlobalDialog();
 
-  // ── Servizi systemd ──
+  // ── Servizi del progetto ──
   const [services,  setServices]  = useState<ProjectServiceEntry[]>([]);
   const [slug,      setSlug]      = useState("");
-  // ADR 0022: bus systemd utente irraggiungibile (servizi installati ma non elencabili).
+  // ADR 0022: gestore dei servizi irraggiungibile (servizi presenti ma non elencabili).
   const [managerUnavailable, setManagerUnavailable] = useState(false);
   const [managerHint, setManagerHint] = useState<string | undefined>(undefined);
   const [svcBusy,   setSvcBusy]   = useState<Record<string,boolean>>({});
@@ -299,24 +299,24 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   const [batchBusy, setBatchBusy] = useState(false);
 
   const handleRestartAll = async () => {
-    // Caso 1: nessun servizio systemd installato (M47).
+    // Caso 1: nessun servizio del progetto configurato (M47).
     if (services.length === 0) {
       await confirmDialog(
-        "Nessun servizio systemd installato per questo progetto. " +
+        "Nessun servizio del progetto configurato. " +
         "Usa il pulsante '+ Configura' qui sopra per lanciare il wizard di rilevamento, " +
         "oppure avvia i Run Configurations dal pannello Run & Debug (npm dev / npm start).",
       );
       bumpLastRestart(); // Azzera comunque il contatore "file modificati" se l'utente conferma
       return;
     }
-    // Caso 2: manager systemd --user non attivo (WSL/ambiente detached). Il
-    // restart batch via systemctl (endpoint restart-all) ritornerebbe 0 unit
-    // ("non succede nulla" lato utente, come segnalato). Ma i servizi detached
-    // SONO riavviabili individualmente: controlProjectService li gestisce, come i
-    // pulsanti "restart" singoli. Li riavviamo quindi in batch DALLA UI, senza
-    // rimandare l'utente al terminale (regola: tutto gestibile da Nexus).
+    // Caso 2: gestore dei servizi non interrogabile in batch. Il restart batch
+    // via endpoint restart-all ritornerebbe 0 servizi ("non succede nulla" lato
+    // utente, come segnalato). Ma i servizi SONO riavviabili individualmente:
+    // controlProjectService li gestisce, come i pulsanti "restart" singoli. Li
+    // riavviamo quindi in batch DALLA UI, senza rimandare l'utente al terminale
+    // (regola: tutto gestibile da Nexus).
     if (managerUnavailable) {
-      if (!await confirmDialog("Riavviare tutti i servizi del progetto (modalità detached)?")) return;
+      if (!await confirmDialog("Riavviare tutti i servizi del progetto?")) return;
       setBatchBusy(true); setSvcMsg("Riavvio in corso…");
       let ok = 0;
       for (const svc of services) {
@@ -331,17 +331,17 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       setBatchBusy(false); setTimeout(() => setSvcMsg(""), 10000);
       return;
     }
-    // Caso 3: manager attivo -> restart batch via systemctl (endpoint dedicato).
+    // Caso 3: gestore attivo -> restart batch via endpoint dedicato.
     if (!await confirmDialog("Riavviare tutti i servizi del progetto?")) return;
     setBatchBusy(true); setSvcMsg("Riavvio in corso…");
     try {
       const r = await restartAllProjectServices(projectId);
       const ok = (r.restarted ?? []).filter(x=>x.ok).length;
       const tot = (r.restarted ?? []).length;
-      // Edge case: systemctl ritorna 0 unit (slug non matcha, manager appena
+      // Edge case: l'endpoint ritorna 0 servizi (slug non matcha, gestore appena
       // morto) — segnalare invece di lasciare "Riavviati 0/0 servizi" criptico.
       if (tot === 0) {
-        setSvcMsg("Nessun servizio del progetto trovato in systemctl (slug non corrisponde alle unit).");
+        setSvcMsg("Nessun servizio del progetto trovato (lo slug non corrisponde ai servizi registrati).");
       } else {
         setSvcMsg(`Riavviati ${ok}/${tot} servizi`);
         if (ok > 0) bumpLastRestart();
@@ -433,8 +433,8 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       setWizardMsg(`Errore di rete: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       // SEMPRE re-fetch dello stato reale: copre il caso in cui il backend
-      // segnala errore ma il file unit e' stato comunque creato (parziale),
-      // o viceversa "ok" ma una verifica di systemd dice il contrario.
+      // segnala errore ma il servizio e' stato comunque registrato (parziale),
+      // o viceversa "ok" ma una verifica del gestore dice il contrario.
       // Cosi' la riga del wizard riflette la realta' del sistema.
       fetchServices();
     }
@@ -496,7 +496,7 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
         handleNexusAction={handleNexusAction}
       />
 
-      <SystemdServicesSection
+      <ProjectServicesSection
         tc={tc}
         services={services}
         slug={slug}

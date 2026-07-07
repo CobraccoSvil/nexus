@@ -1,66 +1,80 @@
 //! Handler per il gruppo `service_control` del server Nexus Builtin.
-//! Gestisce stato e controllo dei servizi systemd associati al progetto.
+//! Gestisce stato e controllo dei "servizi del progetto" delegando al punto unico
+//! `service_manager` (regola L): su Windows sono processi gestiti in
+//! `agent_processes`, su Linux unit `systemd --user`. Prima questi handler
+//! chiamavano direttamente `systemctl` e su Windows erano ciechi (l'agente
+//! concludeva che nulla girava e lanciava duplicati del dev server).
 
 use super::*;
 
+use crate::project_workspace::service_manager::{self, ServiceBackend};
+
+/// Nome + root del progetto (contesto minimo per il ServiceManager). Ritorna un
+/// messaggio di errore gia' formattato in caso di progetto assente.
+async fn project_name_and_root(
+    db: &PgPool,
+    project_id: Uuid,
+) -> Result<(String, Option<String>), String> {
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, repository_root_path FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| format!("[DB] {e}"))?;
+    row.ok_or_else(|| "[Errore] Progetto non trovato".to_string())
+}
+
 pub(super) async fn handle_service_status(db: &PgPool, project_id: Uuid) -> String {
-    let slug = match get_project_slug(db, project_id).await {
-        Ok(s) => s,
+    let (name, root) = match project_name_and_root(db, project_id).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
-    let prefix = format!("{}-", slug);
+    let slug = name.to_lowercase().replace([' ', '_'], "-");
+    let root_path = std::path::PathBuf::from(root.unwrap_or_default());
 
-    let out = match tokio::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "list-units",
-            "--type=service",
-            "--all",
-            "--no-legend",
-            "--no-pager",
-        ])
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => return format!("[Errore] systemctl non disponibile: {}", e),
+    let ctx = service_manager::ServiceContext {
+        db,
+        // Contesto tool agente: nessun registry porte (non e' un handler HTTP con
+        // AppState). Sufficiente per list/status; lo start di un web service non
+        // iniettera' PORT (il flusso run_service/run_config lo gestisce).
+        port_registry: None,
+        project_id,
+        slug: &slug,
+        project_root: &root_path,
     };
 
-    let mut services: Vec<serde_json::Value> = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 4 {
-            continue;
-        }
-        let unit = cols[0].trim_start_matches('●').trim();
-        if !unit.starts_with(&prefix) || !unit.ends_with(".service") {
-            continue;
-        }
-        let short = unit
-            .strip_prefix(&prefix)
-            .unwrap_or(unit)
-            .strip_suffix(".service")
-            .unwrap_or(unit);
-        services.push(serde_json::json!({
-            "unit":  unit,
-            "short": short,
-            "state": cols[2],
-            "sub":   cols[3],
-        }));
-    }
+    let services: Vec<serde_json::Value> = service_manager::active()
+        .list(&ctx)
+        .await
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "service": e.label,
+                "state": e.state,
+                "managed_by": e.managed_by,
+            })
+        })
+        .collect();
 
     if services.is_empty() {
-        return format!("Nessun servizio systemd trovato con prefisso '{}'.\nAssicurati che i servizi siano installati come unità --user.", prefix);
+        return format!(
+            "Nessun servizio del progetto '{slug}' risulta configurato o attivo. \
+             Usa il pannello Run (+ Configura) o lo strumento run_service per crearne uno."
+        );
     }
 
     serde_json::json!({ "slug": slug, "services": services }).to_string()
 }
 
 pub(super) async fn handle_service_control(db: &PgPool, project_id: Uuid, args: &Value) -> String {
-    let slug = match get_project_slug(db, project_id).await {
-        Ok(s) => s,
+    let (name, root) = match project_name_and_root(db, project_id).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
+    let slug = name.to_lowercase().replace([' ', '_'], "-");
+    let root_path = std::path::PathBuf::from(root.unwrap_or_default());
+
     let service = match args.get("service").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => return "[Errore] Parametro 'service' obbligatorio".to_string(),
@@ -75,29 +89,36 @@ pub(super) async fn handle_service_control(db: &PgPool, project_id: Uuid, args: 
     if !matches!(action.as_str(), "start" | "stop" | "restart") {
         return format!("[Errore] Azione non valida: {}", action);
     }
-    // Costruisce il nome unit accettando sia il nome corto che il nome completo
-    let svc_name = if service.starts_with(&format!("{}-", slug)) {
-        format!("{}.service", service)
-    } else {
-        format!("{}-{}.service", slug, service)
+
+    // Nome corto: accetta sia il corto sia il nome completo ({slug}-x.service).
+    let short = service
+        .strip_prefix(&format!("{slug}-"))
+        .unwrap_or(&service)
+        .strip_suffix(".service")
+        .unwrap_or(&service)
+        .to_string();
+
+    let ctx = service_manager::ServiceContext {
+        db,
+        port_registry: None,
+        project_id,
+        slug: &slug,
+        project_root: &root_path,
+    };
+    let mgr = service_manager::active();
+    let outcome = match action.as_str() {
+        "start" => mgr.start(&ctx, &short).await,
+        "stop" => mgr.stop(&ctx, &short).await,
+        _ => mgr.restart(&ctx, &short).await,
     };
 
-    let out = tokio::process::Command::new("systemctl")
-        .args(["--user", &action, &svc_name])
-        .output()
-        .await;
-    match out {
-        Ok(o) => {
-            let ok = o.status.success();
-            let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            let msg = if ok {
-                format!("OK: {} → {} completato.", svc_name, action)
-            } else {
-                format!("ERRORE: {} → {} fallito.\n{}", svc_name, action, stderr)
-            };
-            serde_json::json!({ "ok": ok, "unit": svc_name, "action": action, "stdout": stdout, "stderr": stderr, "message": msg }).to_string()
-        }
-        Err(e) => format!("[Errore di sistema] {}", e),
-    }
+    // Esito da segnale strutturato (regola M): `acted` dice se l'azione e' avvenuta
+    // davvero, non il parsing dello stdout di un comando.
+    serde_json::json!({
+        "ok": outcome.acted,
+        "service": short,
+        "action": action,
+        "message": outcome.message,
+    })
+    .to_string()
 }

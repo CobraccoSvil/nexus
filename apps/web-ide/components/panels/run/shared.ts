@@ -64,26 +64,30 @@ export function detectRunMode(kind: string, command: string, args: string[]): "d
 }
 
 // ── Genera prompt diagnostico contestualizzato per la chat AI ─────────────
+// Platform-neutral (regola M): NON inietta comandi di piattaforma (es.
+// `journalctl --user`, inesistente su Windows) nel prompt dell'agente. I log del
+// servizio vanno letti dalla sorgente strutturata gia' esposta (pannello Run /
+// Console Debug), che l'agente raggiunge con i propri strumenti.
 export function buildDiagnosticPrompt(svc: ProjectServiceEntry): string {
-  const base = `Il servizio "${svc.short}" (unit: ${svc.unit}) e' in crash-loop e non riesce ad avviarsi.`;
+  const base = `Il servizio "${svc.short}" e' in crash-loop e non riesce ad avviarsi.`;
   const error = svc.last_error ? `\nErrore rilevato: ${svc.last_error}` : "";
 
   switch (svc.error_kind) {
     case "missing_script":
-      return `${base}${error}\nControlla il package.json del sotto-progetto corrispondente, identifica lo script corretto per avviare il servizio in modalita' dev e aggiorna il file .service systemd di conseguenza.`;
+      return `${base}${error}\nControlla il package.json del sotto-progetto corrispondente, identifica lo script corretto per avviare il servizio in modalita' dev e aggiorna la configurazione del servizio di conseguenza.`;
     case "missing_directory":
-      return `${base}${error}\nLa directory di lavoro configurata nel file .service non esiste. Verifica la struttura del progetto e correggi il percorso WorkingDirectory nel file systemd.`;
+      return `${base}${error}\nLa directory di lavoro configurata per il servizio non esiste. Verifica la struttura del progetto e correggi la working directory del servizio.`;
     case "missing_dependencies":
       return `${base}${error}\nLe dipendenze Node.js non sono installate. Esegui l'installazione delle dipendenze (npm install / pnpm install) nella directory corretta del progetto.`;
     case "missing_sdk":
       return `${base}${error}\nVerifica che il SDK necessario sia installato e accessibile nel PATH. Se non e' installato, suggerisci i comandi per installarlo.`;
     case "build_failed":
-      return `${base}${error}\nLeggi il journal del servizio con 'journalctl --user -u ${svc.unit} -n 50 --no-pager' per estrarre gli errori di compilazione completi, poi analizzali e proponi le correzioni necessarie al codice sorgente.`;
+      return `${base}${error}\nLeggi i log del servizio (pannello Run / Console Debug) per estrarre gli errori di compilazione completi, poi analizzali e proponi le correzioni necessarie al codice sorgente.`;
     case "port_in_use":
       return `${base}${error}\nIdentifica quale processo occupa la porta e suggerisci come liberarla oppure come configurare il servizio su una porta alternativa.`;
     case "permission_denied":
       return `${base}${error}\nVerifica i permessi dei file coinvolti e suggerisci i comandi necessari per correggerli.`;
     default:
-      return `${base}${error}\nAnalizza i log del servizio con 'journalctl --user -u ${svc.unit} -n 50 --no-pager' per identificare la causa del crash e proponi una soluzione.`;
+      return `${base}${error}\nAnalizza i log del servizio (pannello Run / Console Debug) per identificare la causa del crash e proponi una soluzione.`;
   }
 }

@@ -108,8 +108,8 @@ export type SuggestedConfig = Omit<RunConfigItem, "id"> & { args?: string[] };
 
 // ── Filtraggio + Categorizzazione Run Configs ────────────────────────────
 // L'auto-detect propone tutto quel che trova nel filesystem (npm scripts, make
-// targets, ecc.), ma molte voci si sovrappongono ai servizi systemd persistenti
-// del progetto (gestiti nel pannello inferiore Run & Debug) e altre sono
+// targets, ecc.), ma molte voci si sovrappongono ai servizi gestiti del
+// progetto (gestiti nel pannello inferiore Run & Debug) e altre sono
 // "stop / kill" che non hanno senso come bottone "▶ Avvia".
 
 const STOP_PATTERNS = [
@@ -124,8 +124,8 @@ export function isStopScript(c: { label: string; command?: string; args?: string
   return STOP_PATTERNS.some(re => re.test(haystack));
 }
 
-/** True se il run config duplica un servizio systemd già installato (per nome breve). */
-export function isDuplicateOfSystemdService(
+/** True se il run config duplica un servizio del progetto già installato (per nome breve). */
+export function isDuplicateOfManagedService(
   c: { label: string; command?: string; args?: string[] },
   serviceShorts: Set<string>,
 ): boolean {

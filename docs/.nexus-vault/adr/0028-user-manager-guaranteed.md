@@ -17,6 +17,8 @@ nexus_meta_version: 1
 
 # ADR 0028 — Garanzia permanente del systemd --user manager
 
+> **Relativizzato da** [[0038-modello-servizi-progetto-multipiattaforma]]: la garanzia del manager `user@<uid>.service` resta valida come dettaglio del backend systemd/Linux. Su Windows non esiste un manager (`ManagerStatus::NotApplicable`) e questo modulo e' gated `#[cfg(not(windows))]` (inerte). Contenuto storico invariato.
+
 > **Status**: accettato (implementato)
 > **Decisori**: team Nexus
 > **Trigger**: il manager `user@<UID>.service` risulta `inactive` dopo `wsl --shutdown` nonostante `Linger=yes`. Conseguenza: `systemctl --user` da "Connection refused", il `service_observer` diventa cieco e i servizi dei progetti non sono gestibili. Supera la decisione "non avviamo automaticamente il manager" di [ADR 0022](0022-systemd-user-bus-down-vs-zero-servizi.md).
