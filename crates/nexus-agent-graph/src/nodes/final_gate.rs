@@ -97,11 +97,20 @@ static BUILD_ERROR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // vite/rollup/esbuild: il bundler JS puo' USCIRE 0 anche quando il build
         // FALLISCE (config con exit-code bugiardo). Questi pattern rendono
         // count_build_errors > 0 -> il criterio build fallisce comunque (rete di
-        // sicurezza in criteria_runner::check_run_command).
+        // sicurezza in criteria_runner::check_run_command). Sono FRASI di
+        // fallimento DETERMINISTICHE (regola M): vite le stampa SOLO quando il
+        // build fallisce davvero, mai su un successo con warning.
         Regex::new(r"(?i)could not resolve\b").expect("regex rollup resolve valida"),
         Regex::new(r"(?i)\berror during build\b").expect("regex vite build valida"),
         Regex::new(r"(?i)\bbuild failed\b").expect("regex vite failed valida"),
-        Regex::new(r"\[plugin:").expect("regex vite plugin valida"),
+        // NB: NIENTE pattern sul solo prefisso `[plugin:...]`. Vite lo emette anche
+        // su WARNING benigni (`[plugin:vite:reporter]` per import misto dinamico/
+        // statico o chunk > 500 kB), quindi contarlo come errore boccia un build
+        // uscito 0 e OGGETTIVAMENTE riuscito -> falso negativo del final_gate (run
+        // 48793fde, Beaty-Book: `pnpm build` exit 0 + reporter warning, gate 2/2
+        // bocciato). Un vero errore di plugin stampa SEMPRE "error during build:"
+        // (o "could not resolve" / "build failed"), gia' coperti sopra: il prefisso
+        // nudo non aggiunge copertura, aggiunge solo falsi positivi.
     ]
 });
 
@@ -584,9 +593,21 @@ impl FinalGateNode {
                 .as_ref()
                 .and_then(|v| v.get("outcome"))
                 .and_then(Value::as_str);
+            // Delega post-subagente: se il PADRE coordinatore non ha dichiarato a
+            // sua volta ma un sub-agente delegato in QUESTO run e' arrivato a
+            // chiusura (ha percio' dichiarato via task_complete), la CHIUSURA
+            // onesta del run ESISTE gia'. Il criterio ne cerca UNA, non che sia
+            // del padre (run 48793fde: il coordinatore delega la riscrittura del
+            // file, il figlio dichiara `done`, il padre rientra nel gate senza
+            // ri-dichiarare -> completion_confirmed bocciava a torto). Segnale
+            // MACCHINA dalla history (regola M), punto unico signals (regola L).
+            let subagent_completed = signals::has_completed_subagent_dispatch(&state.messages);
             criteria.push(CriterionSpec {
                 criterion_type: "completion_confirmed".to_string(),
-                spec: json!({ "declared_outcome": declared }),
+                spec: json!({
+                    "declared_outcome": declared,
+                    "subagent_completed": subagent_completed,
+                }),
                 expected: json!({ "confirmed": true }),
                 timeout_s: None,
             });
@@ -624,11 +645,27 @@ impl FinalGateNode {
                     .or_else(|| str_truthy(ev.get("error")))
                     .unwrap_or("");
                 let excerpt: String = excerpt.chars().take(500).collect();
-                serde_json::json!({
+                let mut item = serde_json::json!({
                     "type": r.criterion_type,
                     "command": ev.get("command").and_then(Value::as_str),
                     "excerpt": excerpt,
-                })
+                });
+                // Segnali STRUTTURATI del criterio comando (regola M): l'excerpt e'
+                // l'output umano, ma la DECISIONE pass/fail dipende da exit_code +
+                // build_errors. Esporli AS-IS (exit_code anche quando null: la resa
+                // dell'excerpt non lo mostra) rende un falso negativo diagnosticabile
+                // dal solo payload: es. exit_code=0 + build_errors>0 = falso positivo
+                // dei pattern di errore su un build riuscito (run 48793fde).
+                if r.criterion_type == "run_command" {
+                    if let Value::Object(map) = &mut item {
+                        map.insert("exit_code".to_string(), ev.get("exit_code").cloned().unwrap_or(Value::Null));
+                        map.insert(
+                            "build_errors".to_string(),
+                            ev.get("build_errors").cloned().unwrap_or(Value::Null),
+                        );
+                    }
+                }
+                item
             })
             .collect();
         Value::Array(items)
@@ -1403,8 +1440,72 @@ mod tests {
             ) >= 2,
             "pattern vite (could not resolve + error during build) devono contare"
         );
-        assert!(count_build_errors("[plugin:vite:import-analysis] x") >= 1);
         assert!(count_build_errors("x Build failed in 312ms") >= 1);
+        // REGRESSIONE run 48793fde (Beaty-Book): un build vite uscito 0 e RIUSCITO
+        // emette warning del reporter col prefisso `[plugin:vite:reporter]` e la
+        // nota "chunks are larger than 500 kB". Questi NON sono errori: contarli
+        // bocciava un build oggettivamente verde (falso negativo del final_gate).
+        let vite_ok_con_warning = "vite v5.4.21 building for production...\n\
+             2334 modules transformed.\n\
+             [plugin:vite:reporter] [plugin vite:reporter]\n\
+             (!) src/app/services/bookingService.ts is dynamically imported by \
+             src/app/components/admin/AppointmentsTab.tsx but also statically imported by \
+             src/app/components/admin/AdminLogin.tsx, dynamic import will not move module \
+             into another chunk.\n\
+             (!) Some chunks are larger than 500 kB after minification.\n\
+             built in 7.67s";
+        assert_eq!(
+            count_build_errors(vite_ok_con_warning),
+            0,
+            "un build vite riuscito con soli warning (reporter/chunk-size) non deve contare errori"
+        );
+    }
+
+    #[test]
+    fn failed_criteria_meta_espone_exit_code_e_build_errors() {
+        // Regola M: per un criterio comando il payload della timeline deve portare
+        // i segnali STRUTTURATI (exit_code + build_errors), non solo l'excerpt
+        // umano, cosi' un falso negativo (exit 0 ma bocciato) e' diagnosticabile
+        // dal solo meta_step. `exit_code` va emesso AS-IS anche quando null.
+        let build = fail_result(
+            "run_command",
+            json!({
+                "command": "pnpm build",
+                "exit_code": 0,
+                "build_errors": 1,
+                "output_excerpt": "EXIT CODE: 0\nSTDOUT:\nbuild ok",
+                "output_total_chars": 30,
+            }),
+        );
+        let cc = fail_result(
+            "completion_confirmed",
+            json!({ "declared_outcome": null, "verdict": "chiudi con task_complete" }),
+        );
+        let meta = FinalGateNode::failed_criteria_meta(&[build, cc]);
+        let arr = meta.as_array().expect("array");
+        assert_eq!(arr[0]["type"], json!("run_command"));
+        assert_eq!(arr[0]["exit_code"], json!(0), "exit_code AS-IS nel payload");
+        assert_eq!(arr[0]["build_errors"], json!(1), "build_errors visibile: exit 0 + 1 = falso positivo");
+        // I criteri NON-comando non portano exit_code/build_errors (niente rumore).
+        assert_eq!(arr[1]["type"], json!("completion_confirmed"));
+        assert!(arr[1].get("exit_code").is_none());
+        assert!(arr[1].get("build_errors").is_none());
+
+        // exit_code AS-IS anche quando l'estrazione FALLISCE (null): il criterio
+        // e' comunque un run_command, il null deve comparire per rendere visibile
+        // che l'estrazione non e' riuscita.
+        let no_exit = fail_result(
+            "run_command",
+            json!({
+                "command": "npx eslint .",
+                "exit_code": null,
+                "build_errors": 0,
+                "output_total_chars": 10,
+                "output_excerpt": "[Auto-probe] long-running",
+            }),
+        );
+        let meta2 = FinalGateNode::failed_criteria_meta(&[no_exit]);
+        assert_eq!(meta2.as_array().unwrap()[0]["exit_code"], json!(null));
     }
 
     // ── render_failed_block ────────────────────────────────────────────────────────
