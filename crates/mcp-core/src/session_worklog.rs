@@ -101,6 +101,49 @@ pub async fn current_settings(meta_db: &PgPool) -> WorklogSettings {
     value
 }
 
+/// Applica una singola coppia (key, value) letta da `settings` alla struct in
+/// costruzione. Valori fuori range vengono clampati; chiavi ignote ignorate.
+fn apply_setting(out: &mut WorklogSettings, key: &str, raw: &str) {
+    let trimmed = raw.trim();
+    match key {
+        "agent.worklog.enabled" => {
+            out.enabled = matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        "agent.worklog.inject_mode" => {
+            out.inject_full = trimmed.eq_ignore_ascii_case("full");
+        }
+        "agent.worklog.inject_max_chars" => {
+            if let Ok(v) = trimmed.parse::<usize>() {
+                out.inject_max_chars = v.clamp(200, 20_000);
+            }
+        }
+        "agent.worklog.digest_max_items" => {
+            if let Ok(v) = trimmed.parse::<usize>() {
+                out.digest_max_items = v.clamp(1, 50);
+            }
+        }
+        "agent.worklog.tool_page_size" => {
+            if let Ok(v) = trimmed.parse::<i64>() {
+                out.tool_page_size = v.clamp(1, 200);
+            }
+        }
+        "agent.worklog.events_max_per_session" => {
+            if let Ok(v) = trimmed.parse::<i64>() {
+                out.events_max_per_session = v.max(20);
+            }
+        }
+        "agent.worklog.error_excerpt_max_chars" => {
+            if let Ok(v) = trimmed.parse::<usize>() {
+                out.error_excerpt_max_chars = v.clamp(40, 2000);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn load_settings(db: &PgPool) -> Result<WorklogSettings> {
     let rows = sqlx::query(
         "SELECT key, value FROM settings WHERE key IN ( \
@@ -121,43 +164,7 @@ async fn load_settings(db: &PgPool) -> Result<WorklogSettings> {
     for row in rows {
         let key: String = row.try_get("key").unwrap_or_default();
         let raw: String = row.try_get("value").unwrap_or_default();
-        match key.as_str() {
-            "agent.worklog.enabled" => {
-                out.enabled = matches!(
-                    raw.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                );
-            }
-            "agent.worklog.inject_mode" => {
-                out.inject_full = raw.trim().eq_ignore_ascii_case("full");
-            }
-            "agent.worklog.inject_max_chars" => {
-                if let Ok(v) = raw.trim().parse::<usize>() {
-                    out.inject_max_chars = v.clamp(200, 20_000);
-                }
-            }
-            "agent.worklog.digest_max_items" => {
-                if let Ok(v) = raw.trim().parse::<usize>() {
-                    out.digest_max_items = v.clamp(1, 50);
-                }
-            }
-            "agent.worklog.tool_page_size" => {
-                if let Ok(v) = raw.trim().parse::<i64>() {
-                    out.tool_page_size = v.clamp(1, 200);
-                }
-            }
-            "agent.worklog.events_max_per_session" => {
-                if let Ok(v) = raw.trim().parse::<i64>() {
-                    out.events_max_per_session = v.max(20);
-                }
-            }
-            "agent.worklog.error_excerpt_max_chars" => {
-                if let Ok(v) = raw.trim().parse::<usize>() {
-                    out.error_excerpt_max_chars = v.clamp(40, 2000);
-                }
-            }
-            _ => {}
-        }
+        apply_setting(&mut out, &key, &raw);
     }
     Ok(out)
 }
@@ -233,6 +240,140 @@ fn exit_code_from_result(tool_result: Option<&str>) -> Option<i64> {
     v.get("exit_code").and_then(Value::as_i64)
 }
 
+/// Costruisce un `ErrorFact` da uno step non riuscito (Failed o
+/// ProviderUnavailable): stessa forma per entrambi i rami, estratta per
+/// evitare duplicazione e tenere `collect_step_facts` compatta.
+fn error_fact(step: &AgentStep, detail: &Option<String>, error_excerpt_max_chars: usize) -> ErrorFact {
+    ErrorFact {
+        tool: step.tool_name.clone(),
+        detail: detail.clone().unwrap_or_default(),
+        excerpt: trunc(
+            step.tool_result.as_deref().unwrap_or_default(),
+            error_excerpt_max_chars,
+        ),
+    }
+}
+
+/// `CommandFact` per gli step run_command/run_tests, con `ok` dato dall'esito
+/// dello step chiamante. `None` se lo step non e' un comando.
+fn command_fact(step: &AgentStep, ok: bool) -> Option<CommandFact> {
+    if !matches!(step.tool_name.as_str(), "run_command" | "run_tests") {
+        return None;
+    }
+    let cmd = step.tool_input.get("command").and_then(|v| v.as_str())?;
+    Some(CommandFact {
+        command: trunc(cmd, 120),
+        ok,
+        exit_code: exit_code_from_result(step.tool_result.as_deref()),
+    })
+}
+
+/// Applica a `facts` gli effetti di uno step COMPLETATO (parita' col recap
+/// storico di `collect_actions`): righe-azione deduplicate, file toccati,
+/// destinazione dei rename e comandi riusciti.
+fn apply_completed_step(
+    facts: &mut StepFacts,
+    step: &AgentStep,
+    detail: &Option<String>,
+    seen_lines: &mut std::collections::BTreeSet<String>,
+) {
+    let line = match detail {
+        Some(d) => format!("- `{}`: {}", step.tool_name, d),
+        None => format!("- `{}`", step.tool_name),
+    };
+    if seen_lines.insert(line.clone()) {
+        facts.action_lines.push(line);
+    }
+    let file_action = match step.tool_name.as_str() {
+        "write_file" => Some("write"),
+        "edit_file" => Some("edit"),
+        "create_file" => Some("create"),
+        "apply_patch" => Some("patch"),
+        _ => None,
+    };
+    if let Some(action) = file_action {
+        if let Some(p) = step.tool_input.get("path").and_then(|v| v.as_str()) {
+            facts.files_touched.insert(p.to_string(), action.to_string());
+        }
+    }
+    // Spostamenti: la destinazione E' un file/albero toccato
+    // (incidente Beauty-Book, vedi recap ADR 0025).
+    if matches!(step.tool_name.as_str(), "rename_file" | "fs_move") {
+        if let Some(to) = step.tool_input.get("to").and_then(|v| v.as_str()) {
+            facts.files_touched.insert(to.to_string(), "move".to_string());
+        }
+    }
+    if let Some(cmd) = command_fact(step, true) {
+        facts.commands.push(cmd);
+    }
+}
+
+/// Deriva `retry_ok` e `failed_attempts` dagli esiti accumulati per signature.
+/// - retry_ok: fallita >=1 ma l'ultimo esito e' ok (errore-e-fix).
+/// - failed_attempts: fallita >=1 e l'ultimo esito resta un fallimento
+///   (copre anche il singolo fallimento mai recuperato: da NON ripetere).
+fn derive_retry_facts(facts: &mut StepFacts, outcomes: &BTreeMap<String, (u32, bool)>) {
+    for (signature, (fails, last_ok)) in outcomes {
+        let detail = signature.replace('|', ": ");
+        if *fails >= 1 && *last_ok {
+            facts.retry_ok.push(detail.clone());
+        } else if *fails >= 1 && !*last_ok {
+            facts.failed_attempts.push(RepeatFact {
+                detail,
+                count: *fails,
+            });
+        }
+    }
+}
+
+/// Elabora un singolo step aggiornando `facts` e la mappa `outcomes`
+/// (signature -> numero fallimenti, ultimo esito ok?). Estratto per tenere
+/// `collect_step_facts` compatta; comportamento invariato.
+///
+/// Invariante: action_lines e files_touched sono popolati SOLO dal ramo
+/// Completed (parita' col recap storico di collect_actions). Failed e
+/// ProviderUnavailable alimentano solo errors/commands/outcomes.
+fn process_step(
+    step: &AgentStep,
+    facts: &mut StepFacts,
+    seen_lines: &mut std::collections::BTreeSet<String>,
+    outcomes: &mut BTreeMap<String, (u32, bool)>,
+    error_excerpt_max_chars: usize,
+) {
+    let detail = step_detail(step);
+    facts.last_tool = Some(step.tool_name.clone());
+
+    let signature = format!("{}|{}", step.tool_name, detail.as_deref().unwrap_or_default());
+
+    match step.status {
+        AgentStepStatus::Completed => {
+            outcomes.entry(signature).or_insert((0, true)).1 = true;
+            apply_completed_step(facts, step, &detail, seen_lines);
+        }
+        AgentStepStatus::Failed => {
+            let entry = outcomes.entry(signature).or_insert((0, false));
+            entry.0 += 1;
+            entry.1 = false;
+
+            facts.errors.push(error_fact(step, &detail, error_excerpt_max_chars));
+            if let Some(cmd) = command_fact(step, false) {
+                facts.commands.push(cmd);
+            }
+        }
+        AgentStepStatus::ProviderUnavailable => {
+            // Provider non disponibile durante questo tool (cooldown/billing):
+            // fallimento INFRASTRUTTURALE, non dell'azione. Lo registriamo come
+            // errore informativo per il modello subentrante (continuita'
+            // cross-provider), ma NON tocchiamo `outcomes`: "non ripetere" vale
+            // per i fallimenti dell'azione, non per quelli del provider.
+            facts.errors.push(error_fact(step, &detail, error_excerpt_max_chars));
+        }
+        // Running/AwaitingConfirmation/Skipped: stati transitori o non-esiti,
+        // nessun fatto operativo certo da registrare.
+        _ => {}
+    }
+}
+
 /// Punto unico (regola L) di estrazione dei fatti strutturati dagli step.
 /// `collect_actions` (agent_run.rs) e l'ingest del worklog delegano qui:
 /// nessuna seconda implementazione della domanda "cosa ha fatto il run?".
@@ -247,125 +388,34 @@ pub fn collect_step_facts(steps: &[AgentStep], error_excerpt_max_chars: usize) -
         if step.tool_name.is_empty() {
             continue;
         }
-        let detail = step_detail(step);
-        facts.last_tool = Some(step.tool_name.clone());
-
-        let signature = format!(
-            "{}|{}",
-            step.tool_name,
-            detail.as_deref().unwrap_or_default()
-        );
-
-        // Invariante: action_lines e files_touched sono popolati SOLO dal ramo
-        // Completed (parita' col recap storico di collect_actions). Failed e
-        // ProviderUnavailable alimentano solo errors/commands/outcomes.
-        match step.status {
-            AgentStepStatus::Completed => {
-                let entry = outcomes.entry(signature).or_insert((0, true));
-                entry.1 = true;
-
-                // Comportamento storico di collect_actions: righe-azione
-                // deduplicate + file toccati, SOLO dagli step completati.
-                let line = match &detail {
-                    Some(d) => format!("- `{}`: {}", step.tool_name, d),
-                    None => format!("- `{}`", step.tool_name),
-                };
-                if seen_lines.insert(line.clone()) {
-                    facts.action_lines.push(line);
-                }
-                let file_action = match step.tool_name.as_str() {
-                    "write_file" => Some("write"),
-                    "edit_file" => Some("edit"),
-                    "create_file" => Some("create"),
-                    "apply_patch" => Some("patch"),
-                    _ => None,
-                };
-                if let Some(action) = file_action {
-                    if let Some(p) = step.tool_input.get("path").and_then(|v| v.as_str()) {
-                        facts.files_touched.insert(p.to_string(), action.to_string());
-                    }
-                }
-                // Spostamenti: la destinazione E' un file/albero toccato
-                // (incidente Beauty-Book, vedi recap ADR 0025).
-                if matches!(step.tool_name.as_str(), "rename_file" | "fs_move") {
-                    if let Some(to) = step.tool_input.get("to").and_then(|v| v.as_str()) {
-                        facts.files_touched.insert(to.to_string(), "move".to_string());
-                    }
-                }
-                if matches!(step.tool_name.as_str(), "run_command" | "run_tests") {
-                    if let Some(cmd) = step.tool_input.get("command").and_then(|v| v.as_str()) {
-                        facts.commands.push(CommandFact {
-                            command: trunc(cmd, 120),
-                            ok: true,
-                            exit_code: exit_code_from_result(step.tool_result.as_deref()),
-                        });
-                    }
-                }
-            }
-            AgentStepStatus::Failed => {
-                let entry = outcomes.entry(signature).or_insert((0, false));
-                entry.0 += 1;
-                entry.1 = false;
-
-                facts.errors.push(ErrorFact {
-                    tool: step.tool_name.clone(),
-                    detail: detail.clone().unwrap_or_default(),
-                    excerpt: trunc(
-                        step.tool_result.as_deref().unwrap_or_default(),
-                        error_excerpt_max_chars,
-                    ),
-                });
-                if matches!(step.tool_name.as_str(), "run_command" | "run_tests") {
-                    if let Some(cmd) = step.tool_input.get("command").and_then(|v| v.as_str()) {
-                        facts.commands.push(CommandFact {
-                            command: trunc(cmd, 120),
-                            ok: false,
-                            exit_code: exit_code_from_result(step.tool_result.as_deref()),
-                        });
-                    }
-                }
-            }
-            AgentStepStatus::ProviderUnavailable => {
-                // Provider non disponibile durante questo tool (cooldown/billing):
-                // fallimento INFRASTRUTTURALE, non dell'azione. Lo registriamo
-                // come errore informativo per il modello subentrante (continuita'
-                // cross-provider), ma NON tocchiamo `outcomes`: "non ripetere"
-                // vale per i fallimenti dell'azione, non per quelli del provider.
-                facts.errors.push(ErrorFact {
-                    tool: step.tool_name.clone(),
-                    detail: detail.clone().unwrap_or_default(),
-                    excerpt: trunc(
-                        step.tool_result.as_deref().unwrap_or_default(),
-                        error_excerpt_max_chars,
-                    ),
-                });
-            }
-            // Running/AwaitingConfirmation/Skipped: stati transitori o non-esiti,
-            // nessun fatto operativo certo da registrare.
-            _ => {}
-        }
+        process_step(step, &mut facts, &mut seen_lines, &mut outcomes, error_excerpt_max_chars);
     }
 
-    // retry_ok: fallita >=1 ma l'ultimo esito e' ok (errore-e-fix).
-    // failed_attempts: fallita >=1 e l'ultimo esito resta un fallimento
-    // (copre anche il singolo fallimento mai recuperato: da NON ripetere).
-    for (signature, (fails, last_ok)) in &outcomes {
-        let detail = signature.replace('|', ": ");
-        if *fails >= 1 && *last_ok {
-            facts.retry_ok.push(detail.clone());
-        } else if *fails >= 1 && !*last_ok {
-            facts.failed_attempts.push(RepeatFact {
-                detail,
-                count: *fails,
-            });
-        }
-    }
+    derive_retry_facts(&mut facts, &outcomes);
     facts
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // Ingest eventi (idempotente: UNIQUE(session_id, dedup_key))
 // ───────────────────────────────────────────────────────────────────────────
+
+/// Riga di stato del run: deterministica, latest-wins nel render (un evento per
+/// run). Conteggi azioni/file/errori + eventuale ultimo tool.
+fn status_text_for(facts: &StepFacts, run_id: Uuid, status_label: &str) -> String {
+    format!(
+        "run {} {}: {} azioni, {} file toccati, {} errori{}",
+        &run_id.to_string()[..8],
+        status_label,
+        facts.action_lines.len(),
+        facts.files_touched.len(),
+        facts.errors.len(),
+        facts
+            .last_tool
+            .as_deref()
+            .map(|t| format!("; ultimo tool: {t}"))
+            .unwrap_or_default()
+    )
+}
 
 fn facts_to_events(facts: &StepFacts, run_id: Uuid, status_label: &str) -> Vec<(String, Value, String)> {
     let mut events: Vec<(String, Value, String)> = Vec::new();
@@ -409,48 +459,26 @@ fn facts_to_events(facts: &StepFacts, run_id: Uuid, status_label: &str) -> Vec<(
             format!("fail|{rid}|{}", f.detail),
         ));
     }
-    // Stato del run: deterministico, latest-wins nel render (un evento per run).
-    let status_text = format!(
-        "run {} {}: {} azioni, {} file toccati, {} errori{}",
-        &run_id.to_string()[..8],
-        status_label,
-        facts.action_lines.len(),
-        facts.files_touched.len(),
-        facts.errors.len(),
-        facts
-            .last_tool
-            .as_deref()
-            .map(|t| format!("; ultimo tool: {t}"))
-            .unwrap_or_default()
-    );
     events.push((
         "status".into(),
-        json!({"text": status_text}),
+        json!({"text": status_text_for(facts, run_id, status_label)}),
         format!("status|run|{run_id}"),
     ));
     events
 }
 
-/// Inserisce gli eventi derivati dai fatti e rinfresca il digest materializzato.
-/// Best-effort by-design: i chiamanti ignorano l'errore (mai bloccare la chat).
-/// `meta_db` = meta (settings di piattaforma); `db` = pool del DB dove vivono le
-/// righe worklog (progetto a flag separazione ON).
-pub async fn ingest_facts(
-    meta_db: &PgPool,
+/// Inserisce gli eventi (idempotente per dedup_key) e ritorna quanti sono
+/// andati a buon fine. Best-effort per riga: un insert fallito viene loggato
+/// (regola F: solo id/conteggi) senza interrompere il ciclo.
+async fn insert_events(
     db: &PgPool,
     session_id: Uuid,
     project_id: Option<Uuid>,
     run_id: Uuid,
-    status_label: &str,
-    facts: &StepFacts,
-) -> Result<usize> {
-    let settings = current_settings(meta_db).await;
-    if !settings.enabled {
-        return Ok(0);
-    }
-    let events = facts_to_events(facts, run_id, status_label);
+    events: &[(String, Value, String)],
+) -> usize {
     let mut inserted = 0usize;
-    for (kind, payload, dedup_key) in &events {
+    for (kind, payload, dedup_key) in events {
         // dedup_key per-run (include run_id): l'ON CONFLICT scatta solo per
         // re-ingest dello STESSO run (idempotente) — DO UPDATE riallinea
         // payload/status all'ultima finalizzazione. Cross-run non collide.
@@ -476,6 +504,28 @@ pub async fn ingest_facts(
             }
         }
     }
+    inserted
+}
+
+/// Inserisce gli eventi derivati dai fatti e rinfresca il digest materializzato.
+/// Best-effort by-design: i chiamanti ignorano l'errore (mai bloccare la chat).
+/// `meta_db` = meta (settings di piattaforma); `db` = pool del DB dove vivono le
+/// righe worklog (progetto a flag separazione ON).
+pub async fn ingest_facts(
+    meta_db: &PgPool,
+    db: &PgPool,
+    session_id: Uuid,
+    project_id: Option<Uuid>,
+    run_id: Uuid,
+    status_label: &str,
+    facts: &StepFacts,
+) -> Result<usize> {
+    let settings = current_settings(meta_db).await;
+    if !settings.enabled {
+        return Ok(0);
+    }
+    let events = facts_to_events(facts, run_id, status_label);
+    let inserted = insert_events(db, session_id, project_id, run_id, &events).await;
     prune_events(db, session_id, &settings).await;
     refresh_rendered(db, session_id, project_id, &settings).await?;
     tracing::info!(
@@ -507,6 +557,44 @@ pub async fn ingest_steps_for_run(
     }
     let facts = collect_step_facts(steps, settings.error_excerpt_max_chars);
     ingest_facts(meta_db, db, session_id, project_id, run_id, status_label, &facts).await
+}
+
+/// Traduce l'etichetta status persistita in `AgentStepStatus`. Copertura
+/// esplicita di TUTTE le varianti note: uno status non mappato non deve sparire
+/// in silenzio (la perdita sarebbe invisibile). Lo logghiamo (regola F: solo
+/// l'etichetta, mai il payload dello step) e lo trattiamo come Running (ignorato
+/// a valle, senza fabbricare fatti falsi).
+fn parse_step_status(status_raw: &str, run_id: Uuid) -> AgentStepStatus {
+    match status_raw {
+        "completed" => AgentStepStatus::Completed,
+        "failed" => AgentStepStatus::Failed,
+        "awaiting_confirmation" => AgentStepStatus::AwaitingConfirmation,
+        "skipped" => AgentStepStatus::Skipped,
+        "provider_unavailable" => AgentStepStatus::ProviderUnavailable,
+        "running" => AgentStepStatus::Running,
+        other => {
+            tracing::warn!(
+                status = %other,
+                run_id = %run_id,
+                "session_worklog: status step non riconosciuto in agent_steps"
+            );
+            AgentStepStatus::Running
+        }
+    }
+}
+
+/// Costruisce un `AgentStep` da una riga `agent_steps` (fetch per worklog).
+fn db_row_to_step(r: &sqlx::postgres::PgRow, run_id: Uuid) -> AgentStep {
+    let status_raw: String = r.try_get("status").unwrap_or_default();
+    AgentStep {
+        run_id: run_id.to_string(),
+        step_index: r.try_get::<i32, _>("step_index").unwrap_or(0).max(0) as u32,
+        tool_name: r.try_get("tool_name").unwrap_or_default(),
+        tool_input: r.try_get::<Value, _>("tool_input").unwrap_or(Value::Null),
+        tool_result: r.try_get::<Option<String>, _>("tool_result").unwrap_or(None),
+        status: parse_step_status(&status_raw, run_id),
+        created_at: String::new(),
+    }
 }
 
 /// Ingest dagli `agent_steps` persistiti (supersede last-wins, run reapati
@@ -552,40 +640,7 @@ pub async fn ingest_from_db_steps(
 
     let steps: Vec<AgentStep> = rows
         .iter()
-        .map(|r| {
-            let status_raw: String = r.try_get("status").unwrap_or_default();
-            AgentStep {
-                run_id: run_id.to_string(),
-                step_index: r.try_get::<i32, _>("step_index").unwrap_or(0).max(0) as u32,
-                tool_name: r.try_get("tool_name").unwrap_or_default(),
-                tool_input: r
-                    .try_get::<Value, _>("tool_input")
-                    .unwrap_or(Value::Null),
-                tool_result: r.try_get::<Option<String>, _>("tool_result").unwrap_or(None),
-                // Copertura esplicita di TUTTE le varianti note di
-                // AgentStepStatus: uno status non mappato non deve sparire in
-                // silenzio (la perdita sarebbe invisibile). Lo logghiamo (regola
-                // F: solo l'etichetta, mai il payload dello step) e lo trattiamo
-                // come Running (ignorato a valle, senza fabbricare fatti falsi).
-                status: match status_raw.as_str() {
-                    "completed" => AgentStepStatus::Completed,
-                    "failed" => AgentStepStatus::Failed,
-                    "awaiting_confirmation" => AgentStepStatus::AwaitingConfirmation,
-                    "skipped" => AgentStepStatus::Skipped,
-                    "provider_unavailable" => AgentStepStatus::ProviderUnavailable,
-                    "running" => AgentStepStatus::Running,
-                    other => {
-                        tracing::warn!(
-                            status = %other,
-                            run_id = %run_id,
-                            "session_worklog: status step non riconosciuto in agent_steps"
-                        );
-                        AgentStepStatus::Running
-                    }
-                },
-                created_at: String::new(),
-            }
-        })
+        .map(|r| db_row_to_step(r, run_id))
         .collect();
 
     let facts = collect_step_facts(&steps, settings.error_excerpt_max_chars);
@@ -636,6 +691,122 @@ fn payload_str(p: &Value, key: &str) -> String {
     p.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
+/// Righe "Da NON ripetere": failed_attempt e' per-run (dedup_key con run_id);
+/// aggreghiamo per detail sommando i count cross-run, cosi' il digest mostra
+/// una riga per azione.
+fn digest_failed_lines(events: &[WorklogEvent]) -> Vec<String> {
+    let mut failed_agg: BTreeMap<String, u64> = BTreeMap::new();
+    for e in events.iter().filter(|e| e.kind == "failed_attempt") {
+        let detail = payload_str(&e.payload, "detail");
+        if detail.is_empty() {
+            continue;
+        }
+        let c = e.payload.get("count").and_then(Value::as_u64).unwrap_or(1);
+        *failed_agg.entry(detail).or_insert(0) += c;
+    }
+    failed_agg
+        .into_iter()
+        .map(|(detail, count)| format!("- {detail} (fallita {count} volte)"))
+        .collect()
+}
+
+/// Righe "Errori incontrati": tool + eventuale detail + testa dell'estratto.
+fn digest_error_lines(events: &[WorklogEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e.kind == "error")
+        .rev()
+        .map(|e| {
+            let tool = payload_str(&e.payload, "tool");
+            let detail = payload_str(&e.payload, "detail");
+            let excerpt = payload_str(&e.payload, "excerpt");
+            let head: String = excerpt.chars().take(80).collect();
+            if detail.is_empty() {
+                format!("- `{tool}`: {head}")
+            } else {
+                format!("- `{tool}` {detail}: {head}")
+            }
+        })
+        .collect()
+}
+
+/// Righe "File gia' creati/modificati": path + azione.
+fn digest_file_lines(events: &[WorklogEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e.kind == "file_touched")
+        .rev()
+        .map(|e| {
+            format!(
+                "- `{}` ({})",
+                payload_str(&e.payload, "path"),
+                payload_str(&e.payload, "action")
+            )
+        })
+        .collect()
+}
+
+/// Righe "Comandi eseguiti": comando + esito (ok/FALLITO).
+fn digest_command_lines(events: &[WorklogEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e.kind == "command")
+        .rev()
+        .map(|e| {
+            let ok = e.payload.get("ok").and_then(Value::as_bool).unwrap_or(true);
+            format!(
+                "- `{}` ({})",
+                payload_str(&e.payload, "command"),
+                if ok { "ok" } else { "FALLITO" }
+            )
+        })
+        .collect()
+}
+
+/// Righe semplici "- {payload[key]}" per gli eventi di un dato kind. `rev`
+/// controlla se mostrare i piu' recenti prima (decision) o l'ordine naturale
+/// (retry_ok).
+fn digest_simple_lines(events: &[WorklogEvent], kind: &str, key: &str, rev: bool) -> Vec<String> {
+    let it = events.iter().filter(|e| e.kind == kind);
+    let map = |e: &WorklogEvent| format!("- {}", payload_str(&e.payload, key));
+    if rev {
+        it.rev().map(map).collect()
+    } else {
+        it.map(map).collect()
+    }
+}
+
+/// Rende una sezione del digest: titolo + fino a `max_items` righe, con nota di
+/// overflow se ce ne sono altre. Stringa vuota se `lines` e' vuoto.
+fn digest_section(title: &str, lines: &[String], max_items: usize) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let shown = lines.len().min(max_items);
+    let mut s = format!("\n{title}\n");
+    for l in lines.iter().take(max_items) {
+        s.push_str(l);
+        s.push('\n');
+    }
+    if lines.len() > shown {
+        s.push_str(&format!("- (... altre {} voci via nexus_get_worklog)\n", lines.len() - shown));
+    }
+    s
+}
+
+/// Troncamento budget-safe: il footer e' misurato dinamicamente cosi' il
+/// risultato resta SEMPRE <= max_chars qualunque sia la lunghezza del footer.
+fn truncate_to_budget(out: String, max_chars: usize) -> String {
+    let footer = "\n(... digest troncato; dettaglio: nexus_get_worklog)\n";
+    if out.chars().count() > max_chars {
+        let budget = max_chars.saturating_sub(footer.chars().count());
+        let mut t: String = out.chars().take(budget).collect();
+        t.push_str(footer);
+        return t;
+    }
+    out
+}
+
 /// Render del digest provider-neutro (solo markdown, mai tool_call_id o
 /// thinking). Priorita' sezioni: stato > da-non-ripetere > errori > risolti
 /// dopo retry > file > comandi. `max_items` voci per sezione, troncamento
@@ -661,115 +832,23 @@ pub fn render_digest(
         out.push_str(&format!("\nStato: {}\n", payload_str(&st.payload, "text")));
     }
 
-    let section = |title: &str, lines: Vec<String>| {
-        if lines.is_empty() {
-            return String::new();
-        }
-        let shown = lines.len().min(max_items);
-        let mut s = format!("\n{title}\n");
-        for l in lines.iter().take(max_items) {
-            s.push_str(l);
-            s.push('\n');
-        }
-        if lines.len() > shown {
-            s.push_str(&format!("- (... altre {} voci via nexus_get_worklog)\n", lines.len() - shown));
-        }
-        s
-    };
+    let section = |title: &str, lines: Vec<String>| digest_section(title, &lines, max_items);
 
-    // failed_attempt e' per-run (dedup_key con run_id): aggreghiamo per detail
-    // sommando i count cross-run, cosi' il digest mostra una riga per azione.
-    let mut failed_agg: BTreeMap<String, u64> = BTreeMap::new();
-    for e in events.iter().filter(|e| e.kind == "failed_attempt") {
-        let detail = payload_str(&e.payload, "detail");
-        if detail.is_empty() {
-            continue;
-        }
-        let c = e.payload.get("count").and_then(Value::as_u64).unwrap_or(1);
-        *failed_agg.entry(detail).or_insert(0) += c;
-    }
-    let failed: Vec<String> = failed_agg
-        .into_iter()
-        .map(|(detail, count)| format!("- {detail} (fallita {count} volte)"))
-        .collect();
-    out.push_str(&section("Da NON ripetere (tentativi falliti):", failed));
-
-    let errors: Vec<String> = events
-        .iter()
-        .filter(|e| e.kind == "error")
-        .rev()
-        .map(|e| {
-            let tool = payload_str(&e.payload, "tool");
-            let detail = payload_str(&e.payload, "detail");
-            let excerpt = payload_str(&e.payload, "excerpt");
-            let head: String = excerpt.chars().take(80).collect();
-            if detail.is_empty() {
-                format!("- `{tool}`: {head}")
-            } else {
-                format!("- `{tool}` {detail}: {head}")
-            }
-        })
-        .collect();
-    out.push_str(&section("Errori incontrati:", errors));
-
-    let retried: Vec<String> = events
-        .iter()
-        .filter(|e| e.kind == "retry_ok")
-        .map(|e| format!("- {}", payload_str(&e.payload, "detail")))
-        .collect();
-    out.push_str(&section("Risolti dopo retry:", retried));
-
-    let decisions: Vec<String> = events
-        .iter()
-        .filter(|e| e.kind == "decision")
-        .rev()
-        .map(|e| format!("- {}", payload_str(&e.payload, "text")))
-        .collect();
-    out.push_str(&section("Decisioni:", decisions));
-
-    let files: Vec<String> = events
-        .iter()
-        .filter(|e| e.kind == "file_touched")
-        .rev()
-        .map(|e| {
-            format!(
-                "- `{}` ({})",
-                payload_str(&e.payload, "path"),
-                payload_str(&e.payload, "action")
-            )
-        })
-        .collect();
-    out.push_str(&section("File gia' creati/modificati:", files));
-
-    let commands: Vec<String> = events
-        .iter()
-        .filter(|e| e.kind == "command")
-        .rev()
-        .map(|e| {
-            let ok = e.payload.get("ok").and_then(Value::as_bool).unwrap_or(true);
-            format!(
-                "- `{}` ({})",
-                payload_str(&e.payload, "command"),
-                if ok { "ok" } else { "FALLITO" }
-            )
-        })
-        .collect();
-    out.push_str(&section("Comandi eseguiti:", commands));
+    // Ordine di priorita' sezioni (invariato): da-non-ripetere > errori >
+    // risolti-dopo-retry > decisioni > file > comandi. La costruzione delle
+    // righe di ogni sezione vive negli helper `digest_*_lines`.
+    out.push_str(&section("Da NON ripetere (tentativi falliti):", digest_failed_lines(events)));
+    out.push_str(&section("Errori incontrati:", digest_error_lines(events)));
+    out.push_str(&section("Risolti dopo retry:", digest_simple_lines(events, "retry_ok", "detail", false)));
+    out.push_str(&section("Decisioni:", digest_simple_lines(events, "decision", "text", true)));
+    out.push_str(&section("File gia' creati/modificati:", digest_file_lines(events)));
+    out.push_str(&section("Comandi eseguiti:", digest_command_lines(events)));
 
     out.push_str(&format!(
         "\nEventi totali registrati: {total_events}. Dettaglio: nexus_get_worklog.\n"
     ));
 
-    // Troncamento budget-safe: il footer e' misurato dinamicamente cosi' il
-    // risultato resta SEMPRE <= max_chars qualunque sia la lunghezza del footer.
-    let footer = "\n(... digest troncato; dettaglio: nexus_get_worklog)\n";
-    if out.chars().count() > max_chars {
-        let budget = max_chars.saturating_sub(footer.chars().count());
-        let mut t: String = out.chars().take(budget).collect();
-        t.push_str(footer);
-        return t;
-    }
-    out
+    truncate_to_budget(out, max_chars)
 }
 
 /// Rilegge gli eventi della sessione e materializza il digest in
@@ -958,6 +1037,47 @@ pub async fn supersede_summary(
 // Tool read-only nexus_get_worklog (D8: drill-down on-demand, zero LLM)
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Serializza una riga evento del drill-down in oggetto JSON per la risposta
+/// del tool. run_id assente resta `null`.
+fn worklog_row_to_json(r: &sqlx::postgres::PgRow) -> Value {
+    json!({
+        "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
+        "payload": r.try_get::<Value, _>("payload").unwrap_or(Value::Null),
+        "run_id": r.try_get::<Option<Uuid>, _>("run_id").ok().flatten().map(|u| u.to_string()),
+        "source": r.try_get::<String, _>("source").unwrap_or_default(),
+        "created_at": r.try_get::<String, _>("created_at").unwrap_or_default(),
+    })
+}
+
+/// Pagina di eventi del worklog filtrata per kind/run_id (drill-down del tool).
+/// La query espone `total` (COUNT OVER) sulla prima riga per la paginazione.
+async fn fetch_worklog_page(
+    wpool: &PgPool,
+    session_id: Uuid,
+    kind: Option<&str>,
+    run_id: Option<Uuid>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
+    sqlx::query(
+        "SELECT kind, payload, run_id, source, created_at::text AS created_at, \
+                COUNT(*) OVER() AS total \
+         FROM nexus_session_worklog_events \
+         WHERE session_id = $1 \
+           AND ($2::text IS NULL OR kind = $2) \
+           AND ($3::uuid IS NULL OR run_id = $3) \
+         ORDER BY created_at DESC \
+         LIMIT $4 OFFSET $5",
+    )
+    .bind(session_id)
+    .bind(kind)
+    .bind(run_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(wpool)
+    .await
+}
+
 pub async fn tool_nexus_get_worklog(
     ctx: &crate::agent_tools::AgentToolContext,
     input: &Value,
@@ -983,25 +1103,7 @@ pub async fn tool_nexus_get_worklog(
         .clamp(1, settings.tool_page_size);
     let offset = input.get("offset").and_then(Value::as_i64).unwrap_or(0).max(0);
 
-    let rows = sqlx::query(
-        "SELECT kind, payload, run_id, source, created_at::text AS created_at, \
-                COUNT(*) OVER() AS total \
-         FROM nexus_session_worklog_events \
-         WHERE session_id = $1 \
-           AND ($2::text IS NULL OR kind = $2) \
-           AND ($3::uuid IS NULL OR run_id = $3) \
-         ORDER BY created_at DESC \
-         LIMIT $4 OFFSET $5",
-    )
-    .bind(session_id)
-    .bind(kind)
-    .bind(run_id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(wpool)
-    .await;
-
-    let rows = match rows {
+    let rows = match fetch_worklog_page(wpool, session_id, kind, run_id, limit, offset).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, %session_id, "nexus_get_worklog: query fallita");
@@ -1012,18 +1114,7 @@ pub async fn tool_nexus_get_worklog(
         .first()
         .and_then(|r| r.try_get::<i64, _>("total").ok())
         .unwrap_or(0);
-    let events: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            json!({
-                "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
-                "payload": r.try_get::<Value, _>("payload").unwrap_or(Value::Null),
-                "run_id": r.try_get::<Option<Uuid>, _>("run_id").ok().flatten().map(|u| u.to_string()),
-                "source": r.try_get::<String, _>("source").unwrap_or_default(),
-                "created_at": r.try_get::<String, _>("created_at").unwrap_or_default(),
-            })
-        })
-        .collect();
+    let events: Vec<Value> = rows.iter().map(worklog_row_to_json).collect();
     serde_json::to_string(&json!({
         "session_id": session_id.to_string(),
         "total": total,
