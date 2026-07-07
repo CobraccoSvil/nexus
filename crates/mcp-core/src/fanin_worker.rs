@@ -85,7 +85,7 @@ pub fn spawn_fanin_worker(state: AppState) {
             .unwrap_or_else(std::time::Instant::now);
         loop {
             let poll = load_u64(&state.db, "orchestrator.background_fanin_poll_seconds", 4, 2).await;
-            if is_enabled(&state.db).await {
+            if background_fanin_enabled(&state.db).await {
                 if let Err(e) = run_one_round(&state).await {
                     tracing::warn!("fanin_worker: round fallito: {e}");
                 }
@@ -113,7 +113,12 @@ pub fn spawn_fanin_worker(state: AppState) {
 }
 
 /// Kill-switch DB-driven (regola G): default ON (mig 0542). `false/0/no/off` OFF.
-async fn is_enabled(db: &PgPool) -> bool {
+/// PUNTO UNICO (regola L) del flag `orchestrator.background_fanin_enabled`: lo
+/// consultano SIA il worker (per drenare la coda) SIA il gate di dispatch
+/// (`background_active` in subagent_native) — se OFF il param `background` del tool
+/// viene ignorato e il dispatch resta sincrono, così spegnere il flag riporta tutto
+/// a sincrono a runtime (60s, senza redeploy) senza lasciare padri appesi.
+pub(crate) async fn background_fanin_enabled(db: &PgPool) -> bool {
     crate::settings::get_setting(db, "orchestrator.background_fanin_enabled")
         .await
         .ok()

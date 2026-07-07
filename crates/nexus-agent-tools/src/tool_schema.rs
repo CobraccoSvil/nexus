@@ -270,6 +270,10 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         "expected_output_format": {
           "type": "string",
           "description": "Forma del summary atteso, es. 'lista file modificati', 'paragrafo 300 char con file:linea', 'json {passed, results}'."
+        },
+        "background": {
+          "type": "boolean",
+          "description": "Se true, NON attendere il sub-agent: il main si sospende e riprende automaticamente quando il sub-agent completa (fan-in asincrono). Usa SOLO per task lunghi e indipendenti quando puoi procedere con altro lavoro senza il risultato immediato, per non tenere bloccato il main. Default false = attesa sincrona (il main resta fermo fino al summary). NB: un dispatch background salta l'isolamento worktree."
         }
       },
       "required": ["kind", "task"]
@@ -303,7 +307,8 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
             "required": ["kind", "task"]
           }
         },
-        "max_parallel": {"type": "integer", "description": "Ampiezza ondata concorrente (default e tetto dal setting admin orchestrator.max_parallel_subagents)"}
+        "max_parallel": {"type": "integer", "description": "Ampiezza ondata concorrente (default e tetto dal setting admin orchestrator.max_parallel_subagents)"},
+        "background": {"type": "boolean", "description": "Se true, NON attendere il batch: il main si sospende e riprende quando TUTTI i sub-agent completano (fan-in asincrono). Usa SOLO per batch di task lunghi e indipendenti quando puoi procedere senza i risultati immediati. Default false = attesa sincrona. NB: con background=true il batch salta l'isolamento worktree ed esegue sul ramo sequenziale."}
       },
       "required": ["tasks"]
     }

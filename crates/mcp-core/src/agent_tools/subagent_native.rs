@@ -290,15 +290,27 @@ async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
     .unwrap_or(0.0)
 }
 
-/// Legge il flag OPT-IN NASCOSTO `background` (bool, default false) dall'input di
-/// `dispatch_subagent`/`dispatch_subagents` (PUNTO UNICO, regola L + M: campo
-/// strutturato, mai parsing di prosa). Non e' nello schema del tool: resta
-/// disabilitato finche' un chiamante non lo passa esplicitamente (Fase D fan-in).
+/// Legge il param `background` (bool, default false) dall'input di
+/// `dispatch_subagent`/`dispatch_subagents` (regola M: campo strutturato, mai
+/// parsing di prosa). Dalla Fase D turn-on il param E' nello schema del tool; la
+/// sua ATTIVAZIONE effettiva passa da [`background_active`] (kill-switch DB).
 fn read_background_flag(input: &Value) -> bool {
     input
         .get("background")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// PUNTO UNICO (regola L) del "background EFFETTIVAMENTE attivo": il chiamante ha
+/// passato `background=true` E il kill-switch DB-driven
+/// `orchestrator.background_fanin_enabled` e' ON (stesso flag del worker fan-in,
+/// [`crate::fanin_worker::background_fanin_enabled`]). Se il flag e' OFF il param
+/// viene IGNORATO e il dispatch resta SINCRONO: spegnere il flag riporta tutto a
+/// sincrono a runtime (60s, senza redeploy) senza lasciare padri appesi (regola
+/// G/H). Rete di sicurezza per il turn-on del fan-in async.
+async fn background_active(ctx: &AgentToolContext, input: &Value) -> bool {
+    read_background_flag(input)
+        && crate::fanin_worker::background_fanin_enabled(&ctx.core.db).await
 }
 
 /// Handler del tool `dispatch_subagent` (singolo sub-run nativo).
@@ -321,10 +333,10 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    // OPT-IN NASCOSTO (Fase D fan-in): dispatch asincrono. Non documentato nello
-    // schema del tool (default false) -> comportamento invariato finche' nessuno
-    // lo passa. Letto come CAMPO strutturato (regola M).
-    let background = read_background_flag(input);
+    // Fase D fan-in: dispatch asincrono opt-in dal param `background` (ora nello
+    // schema del tool), gattato dal kill-switch DB (regola G/H). Default e flag-OFF
+    // -> sincrono, comportamento invariato. Letto come CAMPO strutturato (regola M).
+    let background = background_active(ctx, input).await;
 
     run_single_subagent(ctx, &kind, &task, &context_blob, &expected_format, None, background)
         .await
@@ -347,13 +359,14 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         .and_then(|v| v.as_u64())
         .unwrap_or(configured_max)
         .clamp(1, configured_max) as usize;
-    // OPT-IN NASCOSTO (Fase D fan-in): dispatch asincrono dell'intero batch. Il
+    // Fase D fan-in: dispatch asincrono dell'intero batch, opt-in dal param
+    // `background` (ora nello schema) gattato dal kill-switch DB (regola G/H). Il
     // ramo ISOLATO non supporta il background (l'apply serializzato dei worktree
     // esige che i sub-run siano TERMINATI prima di promuovere): quando
     // `background=true` il batch salta l'isolamento e va sempre sul ramo
     // sequenziale con `is_background=true` (scelta piu' semplice e sicura). Letto
     // come CAMPO strutturato (regola M).
-    let background = read_background_flag(input);
+    let background = background_active(ctx, input).await;
 
     let mut parsed: Vec<ParsedTask> = Vec::with_capacity(tasks.len());
     for (i, t) in tasks.iter().enumerate() {
