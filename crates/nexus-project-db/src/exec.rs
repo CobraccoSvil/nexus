@@ -43,7 +43,30 @@ pub async fn resolve_project_conn(
     project_id: Uuid,
     connection_name: Option<&str>,
 ) -> Result<String, String> {
-    let row = if let Some(name) = connection_name.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    let row = fetch_conn_secret_row(db, project_id, connection_name).await?;
+    let conn = decode_connection_secret(&row)?;
+
+    // Guard-rail: blocca connessioni verso il DB infrastruttura Nexus.
+    if points_to_nexus_infra_db(&conn) {
+        return Err(
+            "SICUREZZA: la connessione del progetto punta al DB infrastruttura \
+             Nexus. Operazione rifiutata per isolamento. Configura un DB \
+             applicativo dedicato per il progetto."
+                .to_string(),
+        );
+    }
+    Ok(conn)
+}
+
+/// Recupera la riga `connection_secret` dal pool Nexus: per `name`
+/// (case-insensitive) se dato e non vuoto, altrimenti la connessione
+/// `is_primary=true`. Errore descrittivo se la connessione non esiste.
+async fn fetch_conn_secret_row(
+    db: &PgPool,
+    project_id: Uuid,
+    connection_name: Option<&str>,
+) -> Result<sqlx::postgres::PgRow, String> {
+    if let Some(name) = connection_name.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         sqlx::query(
             "SELECT connection_secret FROM project_database_config \
              WHERE project_id = $1 AND LOWER(name) = LOWER($2) \
@@ -60,7 +83,7 @@ pub async fn resolve_project_conn(
                  pannello Database per crearla.",
                 name
             )
-        })?
+        })
     } else {
         sqlx::query(
             "SELECT connection_secret FROM project_database_config \
@@ -76,31 +99,31 @@ pub async fn resolve_project_conn(
              Database del progetto per aggiungere una connessione, oppure esegui \
              un comando che avvii il DB applicativo (auto-provisioning)."
                 .to_string()
-        })?
-    };
+        })
+    }
+}
 
+/// Decodifica il campo bytea `connection_secret` (URL raw) in stringa trimmata
+/// non vuota. Errore se assente/non-UTF8/vuoto.
+fn decode_connection_secret(row: &sqlx::postgres::PgRow) -> Result<String, String> {
     let secret: Option<Vec<u8>> = row.try_get("connection_secret").unwrap_or(None);
-    let conn = secret
+    secret
         .and_then(|b| String::from_utf8(b).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "connection_secret vuoto o non decodificabile".to_string())?;
+        .ok_or_else(|| "connection_secret vuoto o non decodificabile".to_string())
+}
 
-    // Guard-rail: blocca connessioni verso il DB infrastruttura Nexus.
+/// Guard-rail anti-contaminazione (regola E): vero se la connection string punta
+/// al DB infrastruttura Nexus (db `nexus` su porta 5433 o hostname
+/// `postgres-nexus`/`ideai-postgres-nexus`). Un tool applicativo non deve mai
+/// toccare il DB di sistema.
+fn points_to_nexus_infra_db(conn: &str) -> bool {
     let lower = conn.to_lowercase();
-    let touches_nexus_db = (lower.contains("/nexus") || lower.contains("database=nexus"))
+    (lower.contains("/nexus") || lower.contains("database=nexus"))
         && (lower.contains(":5433")
             || lower.contains("postgres-nexus")
-            || lower.contains("ideai-postgres-nexus"));
-    if touches_nexus_db {
-        return Err(
-            "SICUREZZA: la connessione del progetto punta al DB infrastruttura \
-             Nexus. Operazione rifiutata per isolamento. Configura un DB \
-             applicativo dedicato per il progetto."
-                .to_string(),
-        );
-    }
-    Ok(conn)
+            || lower.contains("ideai-postgres-nexus"))
 }
 
 /// Apre un pool sqlx (max 2 conn) verso il DB del progetto.
@@ -113,10 +136,16 @@ pub async fn open_pool(conn: &str) -> Result<PgPool, String> {
         .map_err(|e| format!("connessione DB progetto fallita: {e}"))
 }
 
-/// Converte una cella di PgRow in serde_json::Value in base al tipo Postgres.
-/// I tipi non gestiti esplicitamente ricadono su String; se anche quella
-/// fallisce, ritorna un marcatore di tipo.
-pub fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) -> Value {
+/// Decodifica una cella secondo il tipo Postgres noto. Ritorna:
+///   - `Some(Some(v))` valore decodificato,
+///   - `Some(None)`     valore NULL,
+///   - `None`           tipo non gestito o decodifica fallita (il chiamante
+///                      applica il fallback su String).
+fn cell_by_type(
+    row: &sqlx::postgres::PgRow,
+    idx: usize,
+    type_name: &str,
+) -> Option<Option<Value>> {
     macro_rules! try_as {
         ($t:ty) => {
             row.try_get::<Option<$t>, _>(idx)
@@ -124,11 +153,8 @@ pub fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) ->
                 .map(|o| o.map(Value::from))
         };
     }
-    let val: Option<Option<Value>> = match type_name {
-        "BOOL" => row
-            .try_get::<Option<bool>, _>(idx)
-            .ok()
-            .map(|o| o.map(Value::from)),
+    match type_name {
+        "BOOL" => try_as!(bool),
         "INT2" => row
             .try_get::<Option<i16>, _>(idx)
             .ok()
@@ -137,10 +163,7 @@ pub fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) ->
             .try_get::<Option<i32>, _>(idx)
             .ok()
             .map(|o| o.map(|v| Value::from(v as i64))),
-        "INT8" => row
-            .try_get::<Option<i64>, _>(idx)
-            .ok()
-            .map(|o| o.map(Value::from)),
+        "INT8" => try_as!(i64),
         "FLOAT4" => row
             .try_get::<Option<f32>, _>(idx)
             .ok()
@@ -153,6 +176,23 @@ pub fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) ->
             .ok()
             .map(|o| o.map(|v| Value::from(v.to_string()))),
         "JSON" | "JSONB" => row.try_get::<Option<Value>, _>(idx).ok(),
+        "TIMESTAMPTZ" | "TIMESTAMP" | "DATE" | "TIME" => cell_temporal(row, idx, type_name),
+        "BYTEA" => row
+            .try_get::<Option<Vec<u8>>, _>(idx)
+            .ok()
+            .map(|o| o.map(|v| Value::from(format!("\\x{} ({} byte)", hex_prefix(&v), v.len())))),
+        _ => None,
+    }
+}
+
+/// Decodifica i tipi temporali Postgres (`TIMESTAMPTZ`/`TIMESTAMP`/`DATE`/`TIME`)
+/// come stringhe: RFC3339 per i timestamptz, formato nativo per gli altri.
+fn cell_temporal(
+    row: &sqlx::postgres::PgRow,
+    idx: usize,
+    type_name: &str,
+) -> Option<Option<Value>> {
+    match type_name {
         "TIMESTAMPTZ" => row
             .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx)
             .ok()
@@ -169,13 +209,15 @@ pub fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) ->
             .try_get::<Option<chrono::NaiveTime>, _>(idx)
             .ok()
             .map(|o| o.map(|v| Value::from(v.to_string()))),
-        "BYTEA" => row
-            .try_get::<Option<Vec<u8>>, _>(idx)
-            .ok()
-            .map(|o| o.map(|v| Value::from(format!("\\x{} ({} byte)", hex_prefix(&v), v.len())))),
         _ => None,
-    };
-    match val {
+    }
+}
+
+/// Converte una cella di PgRow in serde_json::Value in base al tipo Postgres.
+/// I tipi non gestiti esplicitamente ricadono su String; se anche quella
+/// fallisce, ritorna un marcatore di tipo.
+pub fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) -> Value {
+    match cell_by_type(row, idx, type_name) {
         Some(Some(v)) => clamp_cell(v),
         Some(None) => Value::Null,
         None => match row.try_get::<Option<String>, _>(idx) {
@@ -292,158 +334,220 @@ pub fn classify_statement(sql: &str) -> &'static str {
     }
 }
 
+/// Stato del lexer di [`split_statements`]. Ogni variante indica in quale
+/// contesto sintattico si trova lo scanner mentre percorre il testo SQL.
+enum SplitState {
+    Normal,
+    SingleString,         // dentro '...'
+    DoubleQuoted,         // dentro "..."
+    LineComment,          // dentro -- fino a newline
+    BlockComment,         // dentro /* ... */
+    DollarQuoted(String), // tag $foo$ ... $foo$
+}
+
+/// Lexer incrementale che percorre il testo SQL byte per byte tenendo traccia
+/// del contesto (stringhe, commenti, dollar-quoting) per individuare i `;` di
+/// separazione a livello top-level. Estratto da [`split_statements`] per
+/// distribuire la logica in metodi coesi (un metodo per stato), a comportamento
+/// invariato.
+struct SqlSplitter<'a> {
+    bytes: &'a [u8],
+    len: usize,
+    i: usize,
+    current: String,
+    out: Vec<String>,
+    state: SplitState,
+}
+
+impl<'a> SqlSplitter<'a> {
+    fn new(sql: &'a str) -> Self {
+        Self {
+            bytes: sql.as_bytes(),
+            len: sql.len(),
+            i: 0,
+            current: String::with_capacity(sql.len()),
+            out: Vec::new(),
+            state: SplitState::Normal,
+        }
+    }
+
+    /// Carattere all'indice corrente (invariante: `self.i < self.len`).
+    fn cur(&self) -> char {
+        self.bytes[self.i] as char
+    }
+
+    /// Vero se il byte successivo esiste ed e' `c`.
+    fn peek_is(&self, c: char) -> bool {
+        self.i + 1 < self.len && self.bytes[self.i + 1] as char == c
+    }
+
+    /// Consuma tutto l'input applicando la transizione di stato appropriata e
+    /// ritorna gli statement non vuoti raccolti.
+    fn run(mut self) -> Vec<String> {
+        while self.i < self.len {
+            match &self.state {
+                SplitState::Normal => self.step_normal(),
+                SplitState::SingleString => self.step_single_string(),
+                SplitState::DoubleQuoted => self.step_double_quoted(),
+                SplitState::LineComment => self.step_line_comment(),
+                SplitState::BlockComment => self.step_block_comment(),
+                SplitState::DollarQuoted(_) => self.step_dollar_quoted(),
+            }
+        }
+        let tail = self.current.trim().to_string();
+        if !tail.is_empty() {
+            self.out.push(tail);
+        }
+        self.out
+    }
+
+    /// Ramo `Normal`: apre stringhe/commenti/dollar-quote o chiude uno statement
+    /// sul `;` top-level.
+    fn step_normal(&mut self) {
+        let c = self.cur();
+        if c == '\'' {
+            self.current.push(c);
+            self.state = SplitState::SingleString;
+            self.i += 1;
+        } else if c == '"' {
+            self.current.push(c);
+            self.state = SplitState::DoubleQuoted;
+            self.i += 1;
+        } else if c == '-' && self.peek_is('-') {
+            self.current.push_str("--");
+            self.state = SplitState::LineComment;
+            self.i += 2;
+        } else if c == '/' && self.peek_is('*') {
+            self.current.push_str("/*");
+            self.state = SplitState::BlockComment;
+            self.i += 2;
+        } else if c == '$' {
+            self.step_dollar_open();
+        } else if c == ';' {
+            let stmt = self.current.trim().to_string();
+            if !stmt.is_empty() {
+                self.out.push(stmt);
+            }
+            self.current.clear();
+            self.i += 1;
+        } else {
+            self.current.push(c);
+            self.i += 1;
+        }
+    }
+
+    /// Sul `$` in stato `Normal`: se segue un tag `$foo$` valido entra in
+    /// dollar-quoting, altrimenti tratta `$` come carattere ordinario.
+    fn step_dollar_open(&mut self) {
+        // Tenta di leggere $tag$ (tag alfanumerico/underscore, anche vuoto).
+        let mut j = self.i + 1;
+        while j < self.len {
+            let ch = self.bytes[j] as char;
+            if ch == '$' {
+                break;
+            }
+            if !(ch.is_alphanumeric() || ch == '_') {
+                j = self.i; // non e' un dollar-quote valido
+                break;
+            }
+            j += 1;
+        }
+        if j > self.i && j < self.len && self.bytes[j] as char == '$' {
+            let tag = String::from_utf8_lossy(&self.bytes[self.i..=j]).to_string();
+            self.current.push_str(&tag);
+            self.state = SplitState::DollarQuoted(tag);
+            self.i = j + 1;
+        } else {
+            self.current.push('$');
+            self.i += 1;
+        }
+    }
+
+    fn step_single_string(&mut self) {
+        let c = self.cur();
+        self.current.push(c);
+        if c == '\'' {
+            // Escape standard '': se il prossimo carattere e' anche ', resta
+            // nello stato.
+            if self.peek_is('\'') {
+                self.current.push('\'');
+                self.i += 2;
+            } else {
+                self.state = SplitState::Normal;
+                self.i += 1;
+            }
+        } else {
+            self.i += 1;
+        }
+    }
+
+    fn step_double_quoted(&mut self) {
+        let c = self.cur();
+        self.current.push(c);
+        if c == '"' {
+            if self.peek_is('"') {
+                self.current.push('"');
+                self.i += 2;
+            } else {
+                self.state = SplitState::Normal;
+                self.i += 1;
+            }
+        } else {
+            self.i += 1;
+        }
+    }
+
+    fn step_line_comment(&mut self) {
+        let c = self.cur();
+        self.current.push(c);
+        if c == '\n' {
+            self.state = SplitState::Normal;
+        }
+        self.i += 1;
+    }
+
+    fn step_block_comment(&mut self) {
+        let c = self.cur();
+        self.current.push(c);
+        if c == '*' && self.peek_is('/') {
+            self.current.push('/');
+            self.state = SplitState::Normal;
+            self.i += 2;
+        } else {
+            self.i += 1;
+        }
+    }
+
+    fn step_dollar_quoted(&mut self) {
+        let SplitState::DollarQuoted(tag) = &self.state else {
+            return;
+        };
+        // Cerca chiusura tag.
+        let tag_clone = tag.clone();
+        let tlen = tag_clone.len();
+        if self.i + tlen <= self.len && self.bytes[self.i..self.i + tlen] == *tag_clone.as_bytes() {
+            self.current.push_str(&tag_clone);
+            self.state = SplitState::Normal;
+            self.i += tlen;
+        } else {
+            self.current.push(self.cur());
+            self.i += 1;
+        }
+    }
+}
+
 /// Splitta uno script SQL nei singoli statement, separati da `;` a livello
 /// top-level. Ignora i `;` dentro:
 ///   - stringhe SQL delimitate da `'...'` (con escape `''` standard)
 ///   - identifier quotati `"..."`
 ///   - commenti riga `-- ...`
 ///   - commenti blocco `/* ... */`
-///   - dollar-quoting `$tag$ ... $tag$` (Postgres function bodies)
+///   - dollar-quoting `$tag$ ... $tag$` (corpi delle procedure PL/pgSQL)
 ///
 /// Ritorna solo statement non vuoti (i `;` finali a vuoto vengono scartati).
 /// Trim leading/trailing whitespace per ogni statement.
 pub fn split_statements(sql: &str) -> Vec<String> {
-    let bytes = sql.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let mut current = String::with_capacity(sql.len());
-    let mut i = 0;
-    let len = bytes.len();
-
-    enum State {
-        Normal,
-        SingleString,         // dentro '...'
-        DoubleQuoted,         // dentro "..."
-        LineComment,          // dentro -- fino a newline
-        BlockComment,         // dentro /* ... */
-        DollarQuoted(String), // tag $foo$ ... $foo$
-    }
-
-    let mut state = State::Normal;
-
-    while i < len {
-        let c = bytes[i] as char;
-        match &state {
-            State::Normal => {
-                if c == '\'' {
-                    current.push(c);
-                    state = State::SingleString;
-                    i += 1;
-                } else if c == '"' {
-                    current.push(c);
-                    state = State::DoubleQuoted;
-                    i += 1;
-                } else if c == '-' && i + 1 < len && bytes[i + 1] as char == '-' {
-                    current.push_str("--");
-                    state = State::LineComment;
-                    i += 2;
-                } else if c == '/' && i + 1 < len && bytes[i + 1] as char == '*' {
-                    current.push_str("/*");
-                    state = State::BlockComment;
-                    i += 2;
-                } else if c == '$' {
-                    // Tenta di leggere $tag$ (tag alfanumerico/underscore, anche vuoto).
-                    let mut j = i + 1;
-                    while j < len {
-                        let ch = bytes[j] as char;
-                        if ch == '$' {
-                            break;
-                        }
-                        if !(ch.is_alphanumeric() || ch == '_') {
-                            j = i; // non e' un dollar-quote valido
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if j > i && j < len && bytes[j] as char == '$' {
-                        let tag = String::from_utf8_lossy(&bytes[i..=j]).to_string();
-                        current.push_str(&tag);
-                        state = State::DollarQuoted(tag);
-                        i = j + 1;
-                    } else {
-                        current.push(c);
-                        i += 1;
-                    }
-                } else if c == ';' {
-                    let stmt = current.trim().to_string();
-                    if !stmt.is_empty() {
-                        out.push(stmt);
-                    }
-                    current.clear();
-                    i += 1;
-                } else {
-                    current.push(c);
-                    i += 1;
-                }
-            }
-            State::SingleString => {
-                current.push(c);
-                if c == '\'' {
-                    // Escape standard '': se il prossimo carattere e' anche ',
-                    // resta nello stato.
-                    if i + 1 < len && bytes[i + 1] as char == '\'' {
-                        current.push('\'');
-                        i += 2;
-                    } else {
-                        state = State::Normal;
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            State::DoubleQuoted => {
-                current.push(c);
-                if c == '"' {
-                    if i + 1 < len && bytes[i + 1] as char == '"' {
-                        current.push('"');
-                        i += 2;
-                    } else {
-                        state = State::Normal;
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            State::LineComment => {
-                current.push(c);
-                if c == '\n' {
-                    state = State::Normal;
-                }
-                i += 1;
-            }
-            State::BlockComment => {
-                current.push(c);
-                if c == '*' && i + 1 < len && bytes[i + 1] as char == '/' {
-                    current.push('/');
-                    state = State::Normal;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            State::DollarQuoted(tag) => {
-                // Cerca chiusura tag.
-                let tag_clone = tag.clone();
-                let tlen = tag_clone.len();
-                if i + tlen <= len && &bytes[i..i + tlen] == tag_clone.as_bytes() {
-                    current.push_str(&tag_clone);
-                    state = State::Normal;
-                    i += tlen;
-                } else {
-                    current.push(c);
-                    i += 1;
-                }
-            }
-        }
-    }
-
-    let tail = current.trim().to_string();
-    if !tail.is_empty() {
-        out.push(tail);
-    }
-
-    out
+    SqlSplitter::new(sql).run()
 }
 
 /// Esito strutturato di un'esecuzione SQL.
@@ -508,9 +612,26 @@ pub async fn execute_query(
         .await
         .map_err(QueryExecError::ConnectionError)?;
 
+    // Il pool va chiuso su OGNI ritorno (successo o errore): eseguo la query in
+    // un blocco interno che produce il Result, poi chiudo il pool una sola volta
+    // prima di propagare. Comportamento invariato rispetto ai `pool.close()`
+    // sparsi sui singoli early-return.
+    let result = run_on_pool(&pool, sql, params, max_rows).await;
+    pool.close().await;
+    result
+}
+
+/// Corpo di [`execute_query`] una volta risolto e aperto il pool: splitta lo
+/// script e instrada verso il percorso single- o multi-statement. Non chiude il
+/// pool (se ne occupa il chiamante).
+async fn run_on_pool(
+    pool: &PgPool,
+    sql: &str,
+    params: &[Option<String>],
+    max_rows: usize,
+) -> Result<QueryExecOutcome, QueryExecError> {
     let statements = split_statements(sql);
     if statements.is_empty() {
-        pool.close().await;
         return Err(QueryExecError::Sql(
             "nessuna statement SQL trovata (solo commenti o whitespace)".to_string(),
         ));
@@ -520,7 +641,6 @@ pub async fn execute_query(
     // per UN solo statement nel protocollo prepared. Se l'utente vuole un
     // batch con parametri, deve splittare lato chiamante.
     if statements.len() > 1 && !params.is_empty() {
-        pool.close().await;
         return Err(QueryExecError::Sql(
             "i parametri ($1, $2, ...) sono supportati solo con UNA singola \
              statement. Per eseguire piu' statement insieme, rimuovi i \
@@ -531,133 +651,154 @@ pub async fn execute_query(
 
     let started = std::time::Instant::now();
 
-    let outcome = if statements.len() == 1 {
-        // Path classico single-statement: rispetta i param bindabili e
-        // distingue read vs write a livello di statement.
-        let single = &statements[0];
-        let kind = classify_statement(single).to_string();
-        let read_only = is_read_only(single);
-
-        let mut q = sqlx::query(single);
-        for p in params {
-            q = q.bind(p.clone());
-        }
-
-        if read_only {
-            let fetch =
-                tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), q.fetch_all(&pool))
-                    .await;
-            let rows = match fetch {
-                Err(_) => {
-                    pool.close().await;
-                    return Err(QueryExecError::Timeout);
-                }
-                Ok(Err(e)) => {
-                    pool.close().await;
-                    return Err(QueryExecError::Sql(e.to_string()));
-                }
-                Ok(Ok(r)) => r,
-            };
-            let duration_ms = started.elapsed().as_millis() as u64;
-            let truncated = rows.len() > max_rows;
-            let slice = &rows[..rows.len().min(max_rows)];
-            let (columns, out_rows) = serialize_rows(slice);
-
-            QueryExecOutcome {
-                mode: "read",
-                statement_kind: kind,
-                row_count: out_rows.len(),
-                columns,
-                rows: out_rows,
-                rows_affected: None,
-                truncated,
-                duration_ms,
-                statements_executed: 1,
-                per_statement_summary: Vec::new(),
-            }
-        } else {
-            let exec =
-                tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), q.execute(&pool))
-                    .await;
-            let res = match exec {
-                Err(_) => {
-                    pool.close().await;
-                    return Err(QueryExecError::Timeout);
-                }
-                Ok(Err(e)) => {
-                    pool.close().await;
-                    return Err(QueryExecError::Sql(e.to_string()));
-                }
-                Ok(Ok(r)) => r,
-            };
-            let duration_ms = started.elapsed().as_millis() as u64;
-            QueryExecOutcome {
-                mode: "write",
-                statement_kind: kind,
-                columns: Vec::new(),
-                rows: Vec::new(),
-                row_count: 0,
-                rows_affected: Some(res.rows_affected()),
-                truncated: false,
-                duration_ms,
-                statements_executed: 1,
-                per_statement_summary: Vec::new(),
-            }
-        }
+    if statements.len() == 1 {
+        exec_single_statement(pool, &statements[0], params, max_rows, started).await
     } else {
-        // Multi-statement: eseguo in transazione una per una. L'ULTIMO
-        // statement determina mode/columns/rows del payload principale; i
-        // precedenti vengono riassunti in `per_statement_summary`.
-        let last_idx = statements.len() - 1;
-        let last_kind = classify_statement(&statements[last_idx]).to_string();
-        let last_is_read = is_read_only(&statements[last_idx]);
+        exec_multi_statement(pool, &statements, max_rows, started).await
+    }
+}
 
-        let tx_result = tokio::time::timeout(
-            Duration::from_secs(QUERY_TIMEOUT_SECS),
-            run_batch_in_tx(&pool, &statements, max_rows, last_is_read),
-        )
-        .await;
+/// Percorso single-statement: rispetta i parametri bindabili e distingue read
+/// (fetch_all) da write (execute) a livello di statement.
+async fn exec_single_statement(
+    pool: &PgPool,
+    single: &str,
+    params: &[Option<String>],
+    max_rows: usize,
+    started: std::time::Instant,
+) -> Result<QueryExecOutcome, QueryExecError> {
+    let kind = classify_statement(single).to_string();
+    if is_read_only(single) {
+        exec_single_read(pool, single, params, max_rows, started, kind).await
+    } else {
+        exec_single_write(pool, single, params, started, kind).await
+    }
+}
 
-        let batch = match tx_result {
-            Err(_) => {
-                pool.close().await;
-                return Err(QueryExecError::Timeout);
-            }
-            Ok(Err(e)) => {
-                pool.close().await;
-                return Err(QueryExecError::Sql(e));
-            }
-            Ok(Ok(b)) => b,
-        };
-        let duration_ms = started.elapsed().as_millis() as u64;
+/// Binda i parametri TEXT sullo statement (NULL -> bind null), come nel path
+/// classico single-statement.
+fn bind_params<'q>(
+    single: &'q str,
+    params: &'q [Option<String>],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    let mut q = sqlx::query(single);
+    for p in params {
+        q = q.bind(p.clone());
+    }
+    q
+}
 
-        // Aggregato: somma write rows_affected (solo se l'ultimo NON e' read).
-        let total_write: u64 = batch
-            .per_statement
-            .iter()
-            .filter_map(|s| s.get("rows_affected").and_then(Value::as_u64))
-            .sum();
-
-        QueryExecOutcome {
-            mode: if last_is_read { "read" } else { "write" },
-            statement_kind: last_kind,
-            row_count: batch.rows.len(),
-            columns: batch.columns,
-            rows: batch.rows,
-            rows_affected: if last_is_read {
-                None
-            } else {
-                Some(total_write)
-            },
-            truncated: batch.truncated,
-            duration_ms,
-            statements_executed: statements.len(),
-            per_statement_summary: batch.per_statement,
-        }
+/// Statement read singolo: `fetch_all` con timeout, serializza righe/colonne.
+async fn exec_single_read(
+    pool: &PgPool,
+    single: &str,
+    params: &[Option<String>],
+    max_rows: usize,
+    started: std::time::Instant,
+    kind: String,
+) -> Result<QueryExecOutcome, QueryExecError> {
+    let q = bind_params(single, params);
+    let fetch =
+        tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), q.fetch_all(pool)).await;
+    let rows = match fetch {
+        Err(_) => return Err(QueryExecError::Timeout),
+        Ok(Err(e)) => return Err(QueryExecError::Sql(e.to_string())),
+        Ok(Ok(r)) => r,
     };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let truncated = rows.len() > max_rows;
+    let slice = &rows[..rows.len().min(max_rows)];
+    let (columns, out_rows) = serialize_rows(slice);
 
-    pool.close().await;
-    Ok(outcome)
+    Ok(QueryExecOutcome {
+        mode: "read",
+        statement_kind: kind,
+        row_count: out_rows.len(),
+        columns,
+        rows: out_rows,
+        rows_affected: None,
+        truncated,
+        duration_ms,
+        statements_executed: 1,
+        per_statement_summary: Vec::new(),
+    })
+}
+
+/// Statement write singolo: `execute` con timeout, riporta `rows_affected`.
+async fn exec_single_write(
+    pool: &PgPool,
+    single: &str,
+    params: &[Option<String>],
+    started: std::time::Instant,
+    kind: String,
+) -> Result<QueryExecOutcome, QueryExecError> {
+    let q = bind_params(single, params);
+    let exec = tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), q.execute(pool)).await;
+    let res = match exec {
+        Err(_) => return Err(QueryExecError::Timeout),
+        Ok(Err(e)) => return Err(QueryExecError::Sql(e.to_string())),
+        Ok(Ok(r)) => r,
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    Ok(QueryExecOutcome {
+        mode: "write",
+        statement_kind: kind,
+        columns: Vec::new(),
+        rows: Vec::new(),
+        row_count: 0,
+        rows_affected: Some(res.rows_affected()),
+        truncated: false,
+        duration_ms,
+        statements_executed: 1,
+        per_statement_summary: Vec::new(),
+    })
+}
+
+/// Percorso multi-statement: esegue il batch in transazione. L'ULTIMO statement
+/// determina mode/columns/rows del payload principale; i precedenti finiscono in
+/// `per_statement_summary`.
+async fn exec_multi_statement(
+    pool: &PgPool,
+    statements: &[String],
+    max_rows: usize,
+    started: std::time::Instant,
+) -> Result<QueryExecOutcome, QueryExecError> {
+    let last_idx = statements.len() - 1;
+    let last_kind = classify_statement(&statements[last_idx]).to_string();
+    let last_is_read = is_read_only(&statements[last_idx]);
+
+    let tx_result = tokio::time::timeout(
+        Duration::from_secs(QUERY_TIMEOUT_SECS),
+        run_batch_in_tx(pool, statements, max_rows, last_is_read),
+    )
+    .await;
+
+    let batch = match tx_result {
+        Err(_) => return Err(QueryExecError::Timeout),
+        Ok(Err(e)) => return Err(QueryExecError::Sql(e)),
+        Ok(Ok(b)) => b,
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    // Aggregato: somma write rows_affected (solo se l'ultimo NON e' read).
+    let total_write: u64 = batch
+        .per_statement
+        .iter()
+        .filter_map(|s| s.get("rows_affected").and_then(Value::as_u64))
+        .sum();
+
+    Ok(QueryExecOutcome {
+        mode: if last_is_read { "read" } else { "write" },
+        statement_kind: last_kind,
+        row_count: batch.rows.len(),
+        columns: batch.columns,
+        rows: batch.rows,
+        rows_affected: if last_is_read { None } else { Some(total_write) },
+        truncated: batch.truncated,
+        duration_ms,
+        statements_executed: statements.len(),
+        per_statement_summary: batch.per_statement,
+    })
 }
 
 /// Esito del batch multi-statement (interno).
@@ -683,66 +824,20 @@ async fn run_batch_in_tx(
         .map_err(|e| format!("BEGIN fallito: {e}"))?;
 
     let last_idx = statements.len() - 1;
-    let mut per_statement: Vec<Value> = Vec::with_capacity(statements.len());
-    let mut columns: Vec<Value> = Vec::new();
-    let mut rows: Vec<Value> = Vec::new();
-    let mut truncated = false;
+    let mut acc = BatchAccumulator::with_capacity(statements.len());
 
     for (i, stmt) in statements.iter().enumerate() {
-        let kind = classify_statement(stmt).to_string();
-        let read_only = is_read_only(stmt);
         let is_last = i == last_idx;
-
-        if is_last && last_is_read {
+        let step = if is_last && last_is_read {
             // L'ultimo read: fetch_all per popolare il risultato principale.
-            let r = sqlx::query(stmt).fetch_all(&mut *tx).await;
-            match r {
-                Ok(fetched) => {
-                    truncated = fetched.len() > max_rows;
-                    let slice = &fetched[..fetched.len().min(max_rows)];
-                    let (cols, out_rows) = serialize_rows(slice);
-                    columns = cols;
-                    let count = out_rows.len();
-                    rows = out_rows;
-                    per_statement.push(json!({
-                        "index": i,
-                        "statement_kind": kind,
-                        "mode": "read",
-                        "row_count": count,
-                    }));
-                }
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    return Err(format!("errore statement #{}: {}", i + 1, e));
-                }
-            }
+            run_last_read_stmt(&mut tx, &mut acc, stmt, i, max_rows).await
         } else {
             // Statement intermedie + ultima write: execute (rows_affected).
-            // Per le read non-finali ignoriamo le righe (lo user vede solo
-            // l'output dell'ultima); cosi' supportiamo CTE/script con
-            // SELECT diagnostiche intermedie senza saturare il payload.
-            let r = if read_only {
-                // Per evitare prepared con multiple-row result inutile,
-                // converto a EXPLAIN-less execute: usiamo execute() che
-                // non porta indietro le righe (sqlx accetta).
-                sqlx::query(stmt).execute(&mut *tx).await
-            } else {
-                sqlx::query(stmt).execute(&mut *tx).await
-            };
-            match r {
-                Ok(pg_res) => {
-                    per_statement.push(json!({
-                        "index": i,
-                        "statement_kind": kind,
-                        "mode": if read_only { "read_ignored" } else { "write" },
-                        "rows_affected": pg_res.rows_affected(),
-                    }));
-                }
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    return Err(format!("errore statement #{}: {}", i + 1, e));
-                }
-            }
+            run_write_stmt(&mut tx, &mut acc, stmt, i).await
+        };
+        if let Err(e) = step {
+            let _ = tx.rollback().await;
+            return Err(e);
         }
     }
 
@@ -750,12 +845,90 @@ async fn run_batch_in_tx(
         .await
         .map_err(|e| format!("COMMIT fallito: {e}"))?;
 
-    Ok(BatchExecResult {
-        columns,
-        rows,
-        truncated,
-        per_statement,
-    })
+    Ok(acc.into_result())
+}
+
+/// Accumulatore per il batch multi-statement: raccoglie il riepilogo
+/// per-statement e i dati dell'unico statement read finale.
+struct BatchAccumulator {
+    per_statement: Vec<Value>,
+    columns: Vec<Value>,
+    rows: Vec<Value>,
+    truncated: bool,
+}
+
+impl BatchAccumulator {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            per_statement: Vec::with_capacity(n),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn into_result(self) -> BatchExecResult {
+        BatchExecResult {
+            columns: self.columns,
+            rows: self.rows,
+            truncated: self.truncated,
+            per_statement: self.per_statement,
+        }
+    }
+}
+
+/// Esegue lo statement read finale del batch: `fetch_all`, popola
+/// columns/rows/truncated sull'accumulatore e aggiunge il riepilogo.
+async fn run_last_read_stmt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    acc: &mut BatchAccumulator,
+    stmt: &str,
+    i: usize,
+    max_rows: usize,
+) -> Result<(), String> {
+    let kind = classify_statement(stmt).to_string();
+    let fetched = sqlx::query(stmt)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| format!("errore statement #{}: {}", i + 1, e))?;
+    acc.truncated = fetched.len() > max_rows;
+    let slice = &fetched[..fetched.len().min(max_rows)];
+    let (cols, out_rows) = serialize_rows(slice);
+    acc.columns = cols;
+    let count = out_rows.len();
+    acc.rows = out_rows;
+    acc.per_statement.push(json!({
+        "index": i,
+        "statement_kind": kind,
+        "mode": "read",
+        "row_count": count,
+    }));
+    Ok(())
+}
+
+/// Esegue uno statement intermedio o l'ultima write: `execute` (rows_affected).
+/// Per le read non-finali ignoriamo le righe (lo user vede solo l'output
+/// dell'ultima); cosi' supportiamo CTE/script con SELECT diagnostiche
+/// intermedie senza saturare il payload.
+async fn run_write_stmt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    acc: &mut BatchAccumulator,
+    stmt: &str,
+    i: usize,
+) -> Result<(), String> {
+    let kind = classify_statement(stmt).to_string();
+    let read_only = is_read_only(stmt);
+    let pg_res = sqlx::query(stmt)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("errore statement #{}: {}", i + 1, e))?;
+    acc.per_statement.push(json!({
+        "index": i,
+        "statement_kind": kind,
+        "mode": if read_only { "read_ignored" } else { "write" },
+        "rows_affected": pg_res.rows_affected(),
+    }));
+    Ok(())
 }
 
 /// Helper condiviso: converte un set di PgRow in `(columns, rows)` JSON.
@@ -826,29 +999,59 @@ pub async fn archive_ddl(
 
     let trimmed = sql.trim();
     let timestamp = chrono::Utc::now();
-    let action = first_token_upper(trimmed); // CREATE / ALTER / DROP / TRUNCATE / RENAME
-    let object = second_meaningful_token_upper(trimmed); // TABLE / INDEX / VIEW / ...
-    let target = third_meaningful_identifier(trimmed); // <nome>
 
-    // Identifica la connessione effettiva risolta lato archive: stessa logica
-    // di resolve_project_conn (None / vuoto -> primary). Cosi' il titolo
-    // della nota KB e il tag riflettono il DB su cui la DDL e' atterrata.
+    // Connessione effettiva risolta lato archive (stessa logica di
+    // resolve_project_conn: None/vuoto -> primary): titolo e tag riflettono il
+    // DB su cui la DDL e' atterrata.
     let effective_conn = resolve_connection_name(db, project_id, connection_name)
         .await
         .unwrap_or_else(|| "primary".to_string());
 
-    let title = match (action.as_str(), object.as_str(), target.as_deref()) {
-        (a, "", _) => format!(
-            "DDL {} on '{}' - {}",
-            a,
-            effective_conn,
-            timestamp.format("%Y-%m-%d %H:%M")
-        ),
-        (a, o, Some(t)) => format!("DDL {} {} {} on '{}'", a, o, t, effective_conn),
-        (a, o, None) => format!("DDL {} {} on '{}'", a, o, effective_conn),
-    };
+    let title = build_ddl_title(trimmed, &effective_conn, timestamp);
+    let body_md = build_ddl_body(trimmed, &effective_conn, outcome, timestamp);
+    let note_id = Uuid::new_v4();
+    let tags = ddl_tags(&effective_conn);
 
-    let body_md = format!(
+    if !insert_ddl_note(db, note_id, project_id, &title, &body_md, &tags).await {
+        return None;
+    }
+    upsert_knowledge_tags(db, project_id, &tags).await;
+
+    let (mig_filename, mig_abs) =
+        write_migration_best_effort(db, project_id, trimmed, &title, &effective_conn).await;
+
+    tracing::info!(
+        %project_id,
+        %note_id,
+        migration_filename = mig_filename.as_deref().unwrap_or("(skip)"),
+        "archive_ddl: DDL archiviata in KB"
+    );
+
+    Some(DdlArchiveOutcome {
+        note_id,
+        migration_filename: mig_filename,
+        migration_abs_path: mig_abs,
+    })
+}
+
+/// Tag della nota KB per una DDL: `schema-change`, `ddl` e `db:<conn>` (l'ultimo
+/// permette di filtrare le DDL per DB di destinazione nel pannello KB, multi-DB).
+fn ddl_tags(effective_conn: &str) -> Vec<String> {
+    vec![
+        "schema-change".to_string(),
+        "ddl".to_string(),
+        format!("db:{}", effective_conn),
+    ]
+}
+
+/// Corpo Markdown della nota KB per una DDL archiviata.
+fn build_ddl_body(
+    trimmed: &str,
+    effective_conn: &str,
+    outcome: &QueryExecOutcome,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
         "**DDL eseguita sul DB `{}`** ({} righe modificate, {} ms)\n\n\
          ```sql\n{}\n```\n\n\
          _Archiviata automaticamente il {}_",
@@ -857,15 +1060,66 @@ pub async fn archive_ddl(
         outcome.duration_ms,
         trimmed,
         timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
-    );
+    )
+}
 
-    let note_id = Uuid::new_v4();
-    let mut tags: Vec<String> = vec!["schema-change".to_string(), "ddl".to_string()];
-    // Tag aggiuntivo con il nome della connessione, cosi' nel pannello KB e'
-    // facile filtrare le DDL per DB di destinazione (utile in multi-DB).
-    tags.push(format!("db:{}", effective_conn));
+/// Scrive il file migration versionato (best effort): su errore logga WARN e
+/// ritorna `(None, None)`. La connection effettiva instrada verso cartelle
+/// separate in multi-DB (`nexus_migrations/<conn_name>/`).
+async fn write_migration_best_effort(
+    db: &PgPool,
+    project_id: Uuid,
+    trimmed: &str,
+    title: &str,
+    effective_conn: &str,
+) -> (Option<String>, Option<String>) {
+    match write_migration_file(db, project_id, trimmed, title, effective_conn).await {
+        Ok((name, abs)) => (Some(name), Some(abs)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                %project_id,
+                connection = %effective_conn,
+                "archive_ddl: scrittura file migration fallita"
+            );
+            (None, None)
+        }
+    }
+}
+
+/// Costruisce il titolo della nota KB per una DDL archiviata, a partire dai
+/// primi token significativi dello statement (azione / oggetto / target).
+fn build_ddl_title(
+    trimmed: &str,
+    effective_conn: &str,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let action = first_token_upper(trimmed); // CREATE / ALTER / DROP / TRUNCATE / RENAME
+    let object = second_meaningful_token_upper(trimmed); // TABLE / INDEX / VIEW / ...
+    let target = third_meaningful_identifier(trimmed); // <nome>
+    match (action.as_str(), object.as_str(), target.as_deref()) {
+        (a, "", _) => format!(
+            "DDL {} on '{}' - {}",
+            a,
+            effective_conn,
+            timestamp.format("%Y-%m-%d %H:%M")
+        ),
+        (a, o, Some(t)) => format!("DDL {} {} {} on '{}'", a, o, t, effective_conn),
+        (a, o, None) => format!("DDL {} {} on '{}'", a, o, effective_conn),
+    }
+}
+
+/// Inserisce la nota KB della DDL. Ritorna `false` (loggando WARN) se l'INSERT
+/// fallisce, cosi' il chiamante interrompe l'archiviazione best-effort.
+async fn insert_ddl_note(
+    db: &PgPool,
+    note_id: Uuid,
+    project_id: Uuid,
+    title: &str,
+    body_md: &str,
+    tags: &[String],
+) -> bool {
     let file_paths: Vec<String> = Vec::new();
-
     let note_insert = sqlx::query(
         r#"
         INSERT INTO project_knowledge_notes
@@ -875,9 +1129,9 @@ pub async fn archive_ddl(
     )
     .bind(note_id)
     .bind(project_id)
-    .bind(&title)
-    .bind(&body_md)
-    .bind(&tags)
+    .bind(title)
+    .bind(body_md)
+    .bind(tags)
     .bind(&file_paths)
     .execute(db)
     .await;
@@ -888,11 +1142,15 @@ pub async fn archive_ddl(
             %project_id,
             "archive_ddl: INSERT project_knowledge_notes fallito"
         );
-        return None;
+        return false;
     }
+    true
+}
 
-    // Tag aggregati (best effort).
-    for tag in &tags {
+/// Aggiorna i contatori aggregati dei tag KB (best effort: gli errori sono
+/// ignorati, come nel comportamento storico).
+async fn upsert_knowledge_tags(db: &PgPool, project_id: Uuid, tags: &[String]) {
+    for tag in tags {
         let _ = sqlx::query(
             r#"
             INSERT INTO project_knowledge_tags (project_id, tag, note_count, last_used_at)
@@ -907,36 +1165,6 @@ pub async fn archive_ddl(
         .execute(db)
         .await;
     }
-
-    // File migration (best effort - se lo scrivi senza root, salta).
-    // Passa la connection effettiva cosi' multi-DB scrive in cartelle
-    // separate (nexus_migrations/<conn_name>/).
-    let (mig_filename, mig_abs) =
-        match write_migration_file(db, project_id, trimmed, &title, &effective_conn).await {
-            Ok((name, abs)) => (Some(name), Some(abs)),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    %project_id,
-                    connection = %effective_conn,
-                    "archive_ddl: scrittura file migration fallita"
-                );
-                (None, None)
-            }
-        };
-
-    tracing::info!(
-        %project_id,
-        %note_id,
-        migration_filename = mig_filename.as_deref().unwrap_or("(skip)"),
-        "archive_ddl: DDL archiviata in KB"
-    );
-
-    Some(DdlArchiveOutcome {
-        note_id,
-        migration_filename: mig_filename,
-        migration_abs_path: mig_abs,
-    })
 }
 
 /// Scrive il file migration progressivo `<root>/<migration_path>/<NNNN>_<slug>.sql`.
@@ -965,49 +1193,11 @@ async fn write_migration_file(
     connection_name: &str,
 ) -> Result<(String, String), String> {
     // 1) Root del progetto.
-    let root_row = sqlx::query("SELECT repository_root_path FROM projects WHERE id = $1")
-        .bind(project_id)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| format!("query projects: {e}"))?
-        .ok_or_else(|| "progetto non trovato".to_string())?;
-    let root: Option<String> = root_row.try_get("repository_root_path").unwrap_or(None);
-    let root = root
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "repository_root_path non configurato per il progetto".to_string())?;
+    let root = fetch_project_root(db, project_id).await?;
 
-    // 2) migration_path: prima cerca override sulla connessione SPECIFICA
-    //    (LOWER name match). Se vuoto -> fallback multi-DB-aware.
-    let cfg_row = sqlx::query(
-        "SELECT migration_path FROM project_database_config \
-         WHERE project_id = $1 AND LOWER(name) = LOWER($2) \
-         LIMIT 1",
-    )
-    .bind(project_id)
-    .bind(connection_name)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| format!("query project_database_config: {e}"))?;
-    let explicit_path: Option<String> = cfg_row
-        .and_then(|r| {
-            r.try_get::<Option<String>, _>("migration_path")
-                .unwrap_or(None)
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let migration_subdir: String = match explicit_path {
-        Some(p) => p,
-        None => {
-            // Default: primary -> nexus_migrations/, altre -> nexus_migrations/<slug>/
-            if connection_name.eq_ignore_ascii_case("primary") {
-                "nexus_migrations".to_string()
-            } else {
-                format!("nexus_migrations/{}", safe_dir_segment(connection_name))
-            }
-        }
-    };
+    // 2) migration_path: override sulla connessione specifica o fallback
+    //    multi-DB-aware.
+    let migration_subdir = resolve_migration_subdir(db, project_id, connection_name).await?;
 
     let mig_dir = std::path::Path::new(&root).join(&migration_subdir);
     tokio::fs::create_dir_all(&mig_dir)
@@ -1015,22 +1205,7 @@ async fn write_migration_file(
         .map_err(|e| format!("create_dir_all {}: {e}", mig_dir.display()))?;
 
     // 3) Calcola prossimo numero progressivo.
-    let mut max_seen: u32 = 0;
-    let mut entries = tokio::fs::read_dir(&mig_dir)
-        .await
-        .map_err(|e| format!("read_dir {}: {e}", mig_dir.display()))?;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Some(fname) = entry.file_name().to_str() {
-            if let Some(num_str) = fname.split('_').next() {
-                if let Ok(n) = num_str.parse::<u32>() {
-                    if n > max_seen {
-                        max_seen = n;
-                    }
-                }
-            }
-        }
-    }
-    let next = max_seen + 1;
+    let next = next_migration_number(&mig_dir).await?;
     let slug = slugify_sql(sql);
     let filename = format!("{:04}_{}.sql", next, slug);
     let abs_path = mig_dir.join(&filename);
@@ -1052,6 +1227,80 @@ async fn write_migration_file(
         .map_err(|e| format!("write {}: {e}", abs_path.display()))?;
 
     Ok((filename, abs_path.to_string_lossy().into_owned()))
+}
+
+/// Legge e valida `projects.repository_root_path` (trimmato, non vuoto).
+async fn fetch_project_root(db: &PgPool, project_id: Uuid) -> Result<String, String> {
+    let root_row = sqlx::query("SELECT repository_root_path FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("query projects: {e}"))?
+        .ok_or_else(|| "progetto non trovato".to_string())?;
+    let root: Option<String> = root_row.try_get("repository_root_path").unwrap_or(None);
+    root.map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "repository_root_path non configurato per il progetto".to_string())
+}
+
+/// Risolve la sottocartella migration relativa alla root: override esplicito su
+/// `project_database_config.migration_path` per la connessione specifica; in
+/// assenza, `nexus_migrations/` per la primary, `nexus_migrations/<slug>/` per
+/// le altre.
+async fn resolve_migration_subdir(
+    db: &PgPool,
+    project_id: Uuid,
+    connection_name: &str,
+) -> Result<String, String> {
+    let cfg_row = sqlx::query(
+        "SELECT migration_path FROM project_database_config \
+         WHERE project_id = $1 AND LOWER(name) = LOWER($2) \
+         LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(connection_name)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("query project_database_config: {e}"))?;
+    let explicit_path: Option<String> = cfg_row
+        .and_then(|r| {
+            r.try_get::<Option<String>, _>("migration_path")
+                .unwrap_or(None)
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Ok(match explicit_path {
+        Some(p) => p,
+        None => {
+            // Default: primary -> nexus_migrations/, altre -> nexus_migrations/<slug>/
+            if connection_name.eq_ignore_ascii_case("primary") {
+                "nexus_migrations".to_string()
+            } else {
+                format!("nexus_migrations/{}", safe_dir_segment(connection_name))
+            }
+        }
+    })
+}
+
+/// Prossimo numero progressivo per la cartella: max(NNNN dei file esistenti) + 1.
+/// Il counter e' per-cartella, quindi ogni connessione ha la sua sequenza.
+async fn next_migration_number(mig_dir: &std::path::Path) -> Result<u32, String> {
+    let mut max_seen: u32 = 0;
+    let mut entries = tokio::fs::read_dir(mig_dir)
+        .await
+        .map_err(|e| format!("read_dir {}: {e}", mig_dir.display()))?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(fname) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some(n) = fname.split('_').next().and_then(|s| s.parse::<u32>().ok()) {
+            if n > max_seen {
+                max_seen = n;
+            }
+        }
+    }
+    Ok(max_seen + 1)
 }
 
 fn first_token_upper(sql: &str) -> String {

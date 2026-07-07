@@ -314,16 +314,9 @@ fn filter_tools_by_automation_mode(
     }
 }
 
-pub async fn build_tools_json_for_agent(
-    db: &PgPool,
-    user_id: Uuid,
-    project_id: Uuid,
-    automation_mode: &crate::orchestrator::AutomationMode,
-    _provider: &str,
-    model: &str,
-) -> Value {
-    // Legge soglia dal DB
-    let hard_limit: i64 = sqlx::query_scalar::<_, String>(
+/// Legge dal DB la soglia `mcp_tool_search_hard_limit` (default 20).
+async fn load_mcp_tool_hard_limit(db: &PgPool) -> i64 {
+    sqlx::query_scalar::<_, String>(
         "SELECT value FROM settings WHERE key = 'mcp_tool_search_hard_limit'",
     )
     .fetch_optional(db)
@@ -331,10 +324,12 @@ pub async fn build_tools_json_for_agent(
     .ok()
     .flatten()
     .and_then(|v| v.trim().parse().ok())
-    .unwrap_or(20);
+    .unwrap_or(20)
+}
 
-    // Conta tool MCP esterni abilitati e accessibili
-    let mcp_tool_count: i64 = sqlx::query_scalar(
+/// Conta i tool MCP esterni abilitati e accessibili a `user_id`/`project_id`.
+async fn count_accessible_mcp_tools(db: &PgPool, user_id: Uuid, project_id: Uuid) -> i64 {
+    sqlx::query_scalar(
         r#"SELECT COUNT(*)
            FROM mcp_servers s
            JOIN mcp_server_tools t ON t.server_id = s.id
@@ -350,13 +345,17 @@ pub async fn build_tools_json_for_agent(
     .bind(project_id)
     .fetch_one(db)
     .await
-    .unwrap_or(0_i64);
+    .unwrap_or(0_i64)
+}
 
-    // Il catalogo del run PRINCIPALE esclude i tool riservati ai sub-agenti
-    // (SUBAGENT_ONLY_TOOLS, punto unico in nexus-agent-tools): quei tool
-    // arrivano SOLO via tool_whitelist di nexus_subagent_definitions
-    // (build_tools_json in subagent_native.rs).
-    let base_tools: Value = serde_json::from_str(AGENT_TOOLS_JSON)
+/// Parsea `AGENT_TOOLS_JSON` escludendo i tool riservati ai sub-agenti.
+///
+/// Il catalogo del run PRINCIPALE esclude i tool riservati ai sub-agenti
+/// (SUBAGENT_ONLY_TOOLS, punto unico in nexus-agent-tools): quei tool
+/// arrivano SOLO via tool_whitelist di nexus_subagent_definitions
+/// (build_tools_json in subagent_native.rs).
+fn load_base_agent_tools() -> Value {
+    serde_json::from_str(AGENT_TOOLS_JSON)
         .map(|v: Value| {
             let filtered: Vec<Value> = v
                 .as_array()
@@ -372,9 +371,21 @@ pub async fn build_tools_json_for_agent(
                 .collect();
             json!(filtered)
         })
-        .unwrap_or_else(|_| json!([]));
+        .unwrap_or_else(|_| json!([]))
+}
 
-    let full_tools = if mcp_tool_count < hard_limit && mcp_tool_count > 0 {
+/// Compone il set completo di tool prima del gating per automation_mode:
+/// se il catalogo MCP e' piccolo (< soglia, > 0) include le definizioni MCP
+/// dirette; altrimenti resta in discovery mode con i soli `base_tools`.
+async fn assemble_full_tools(
+    db: &PgPool,
+    user_id: Uuid,
+    project_id: Uuid,
+    mcp_tool_count: i64,
+    hard_limit: i64,
+    base_tools: Value,
+) -> Value {
+    if mcp_tool_count < hard_limit && mcp_tool_count > 0 {
         // Catalogo piccolo: include le definizioni MCP direttamente
         tracing::debug!(
             "build_tools_json: {} tool MCP < soglia {}, includo definizioni dirette",
@@ -401,7 +412,22 @@ pub async fn build_tools_json_for_agent(
             );
         }
         base_tools
-    };
+    }
+}
+
+pub async fn build_tools_json_for_agent(
+    db: &PgPool,
+    user_id: Uuid,
+    project_id: Uuid,
+    automation_mode: &crate::orchestrator::AutomationMode,
+    _provider: &str,
+    model: &str,
+) -> Value {
+    let hard_limit = load_mcp_tool_hard_limit(db).await;
+    let mcp_tool_count = count_accessible_mcp_tools(db, user_id, project_id).await;
+    let base_tools = load_base_agent_tools();
+    let full_tools =
+        assemble_full_tools(db, user_id, project_id, mcp_tool_count, hard_limit, base_tools).await;
 
     // Gating finale per automation_mode: in `study` filtriamo a solo
     // read-only. `confirm` e `automatic` passano la lista intera.
@@ -411,6 +437,14 @@ pub async fn build_tools_json_for_agent(
     let after_mode =
         filter_tools_by_automation_mode(full_tools, automation_mode, &readonly_whitelist);
 
+    apply_tool_disclosure(db, after_mode, model).await
+}
+
+/// Applica la riduzione progressiva del set di tool secondo la strategia di
+/// disclosure attiva (discovery-first M16 -> o-series -> ADR 0016 Fase A.2), in
+/// ordine di priorita'. Se nessuna strategia e' attiva ritorna `after_mode`
+/// invariato. Estratta da `build_tools_json_for_agent` (comportamento invariato).
+async fn apply_tool_disclosure(db: &PgPool, after_mode: Value, model: &str) -> Value {
     // M16 — Progressive tool disclosure: se discovery-first e' attivo, il set
     // INIZIALE passato al brain contiene SOLO i 2 tool di discovery
     // (nexus_mcp_tool_search/call). Il brain (state.py + nodes.py) intercetta i
@@ -504,22 +538,18 @@ enum CooldownKind {
     Short,
 }
 
-/// Classifica un errore del provider e suggerisce il tipo di cooldown.
-/// Ritorna `(error_class_normalizzato, kind, human_reason)`.
-/// La priorita': prima legge `error_class` esplicito (dal brain Python via
-/// `brain/providers/error_handler.py`), poi cade sul pattern matching su msg
-/// (per messaggi italiani/altri provider).
-fn classify_provider_error(
-    error_class: Option<&str>,
-    msg: &str,
-) -> Option<(&'static str, CooldownKind, &'static str)> {
-    // Marker testuali di quota/credito esaurito. Un HTTP 429 e' AMBIGUO: puo'
-    // essere un rate-limit transitorio (finestra di richieste, cooldown breve)
-    // oppure quota/credito esaurito (cooldown lungo come credit_balance_too_low).
-    // La distinzione si fa SOLO sul contenuto del messaggio: se compare uno di
-    // questi marker e' billing/quota, altrimenti rate-limit transitorio.
-    let lower = msg.to_lowercase();
-    let has_billing_marker = (lower.contains("credit balance") && lower.contains("too low"))
+/// Reason human-readable per un cooldown di tipo billing/quota. Costante di
+/// modulo condivisa dai due step di classificazione (regola L: un solo punto).
+const BILLING_REASON: &str = "Quota AI esaurita o credito insufficiente";
+
+/// Marker testuali di quota/credito esaurito. Un HTTP 429 e' AMBIGUO: puo'
+/// essere un rate-limit transitorio (finestra di richieste, cooldown breve)
+/// oppure quota/credito esaurito (cooldown lungo come credit_balance_too_low).
+/// La distinzione si fa SOLO sul contenuto del messaggio: se compare uno di
+/// questi marker e' billing/quota, altrimenti rate-limit transitorio.
+/// `lower` deve gia' essere lowercased dal chiamante.
+fn msg_has_billing_marker(lower: &str) -> bool {
+    (lower.contains("credit balance") && lower.contains("too low"))
         || lower.contains("insufficient_quota")
         || lower.contains("insufficient quota")
         || lower.contains("exceeded your current quota")
@@ -533,18 +563,23 @@ fn classify_provider_error(
         || lower.contains("account is not active")
         || lower.contains("no credits")
         || lower.contains("quota ai esaurita")
-        || lower.contains("credito insufficiente");
+        || lower.contains("credito insufficiente")
+}
 
-    const BILLING_REASON: &str = "Quota AI esaurita o credito insufficiente";
-
-    // Step 1: error_class esplicito propagato dal brain.
+/// Step 1 della classificazione: `error_class` esplicito propagato dal brain.
+/// Ritorna `None` se `error_class` non e' uno dei valori noti (si passa allo
+/// step 2 sul testo).
+fn classify_by_error_class(
+    error_class: Option<&str>,
+    has_billing_marker: bool,
+) -> Option<(&'static str, CooldownKind, &'static str)> {
     match error_class {
         Some("billing_error")
         | Some("billing_required")
         | Some("quota_exceeded")
         | Some("credit_balance_too_low")
         | Some("insufficient_quota") => {
-            return Some(("billing_error", CooldownKind::Long, BILLING_REASON));
+            Some(("billing_error", CooldownKind::Long, BILLING_REASON))
         }
         Some("rate_limit") => {
             // Anche con error_class=rate_limit esplicito, un 429 puo' in realta'
@@ -553,26 +588,31 @@ fn classify_provider_error(
             // Se il testo contiene marker billing, promuovi a cooldown lungo,
             // altrimenti resta rate-limit transitorio (cooldown breve).
             if has_billing_marker {
-                return Some(("billing_error", CooldownKind::Long, BILLING_REASON));
+                Some(("billing_error", CooldownKind::Long, BILLING_REASON))
+            } else {
+                Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto"))
             }
-            return Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto"));
         }
         Some("overloaded")
         | Some("provider_error")
         | Some("server_error")
         | Some("service_unavailable")
         | Some("bad_gateway")
-        | Some("internal_server_error") => {
-            return Some((
-                "provider_error",
-                CooldownKind::Short,
-                "Provider sovraccarico o errore temporaneo",
-            ));
-        }
-        _ => {}
+        | Some("internal_server_error") => Some((
+            "provider_error",
+            CooldownKind::Short,
+            "Provider sovraccarico o errore temporaneo",
+        )),
+        _ => None,
     }
+}
 
-    // Step 2: pattern matching sul testo (it/en).
+/// Step 2 della classificazione: pattern matching sul testo (it/en) quando
+/// `error_class` non ha dato un esito. `lower` deve gia' essere lowercased.
+fn classify_by_message(
+    lower: &str,
+    has_billing_marker: bool,
+) -> Option<(&'static str, CooldownKind, &'static str)> {
     if has_billing_marker {
         return Some(("billing_error", CooldownKind::Long, BILLING_REASON));
     }
@@ -599,6 +639,774 @@ fn classify_provider_error(
         ));
     }
     None
+}
+
+/// Classifica un errore del provider e suggerisce il tipo di cooldown.
+/// Ritorna `(error_class_normalizzato, kind, human_reason)`.
+/// La priorita': prima legge `error_class` esplicito (dal brain Python via
+/// `brain/providers/error_handler.py`), poi cade sul pattern matching su msg
+/// (per messaggi italiani/altri provider).
+fn classify_provider_error(
+    error_class: Option<&str>,
+    msg: &str,
+) -> Option<(&'static str, CooldownKind, &'static str)> {
+    let lower = msg.to_lowercase();
+    let has_billing_marker = msg_has_billing_marker(&lower);
+
+    if let Some(hit) = classify_by_error_class(error_class, has_billing_marker) {
+        return Some(hit);
+    }
+    classify_by_message(&lower, has_billing_marker)
+}
+
+/// Applica il cooldown al provider in base alla classificazione dell'errore.
+///
+/// Punto unico (regola L) della doppia logica di cooldown che prima era
+/// duplicata tra il ramo `assistant_delta` (errore propagato come content
+/// `[Error: ...]`) e il ramo `error` dello stream SSE. `short_secs` e' la durata
+/// del cooldown breve scelta dal chiamante (DB-driven `slow_cooldown_s` per il
+/// content-error, valore fisso per il ramo error). L'assegnazione di
+/// `last_error`/`last_error_class` resta al chiamante: ha semantica diversa nei
+/// due punti.
+fn apply_provider_cooldown(
+    provider: &str,
+    err_class: &str,
+    kind: CooldownKind,
+    human_reason: &str,
+    short_secs: u64,
+) {
+    let provider_key = provider.split('/').next().unwrap_or(provider);
+    match kind {
+        CooldownKind::Long => {
+            crate::provider_cooldown::put_provider_in_long_cooldown(provider_key, human_reason);
+            tracing::warn!(
+                "Provider '{}' COOLDOWN LUNGO 6h ({}): {}",
+                provider,
+                err_class,
+                human_reason
+            );
+        }
+        CooldownKind::Short => {
+            crate::provider_cooldown::put_provider_in_short_cooldown(
+                provider_key,
+                human_reason,
+                short_secs,
+            );
+            tracing::warn!(
+                "Provider '{}' COOLDOWN BREVE {}s ({}): {}",
+                provider,
+                short_secs,
+                err_class,
+                human_reason
+            );
+        }
+    }
+}
+
+/// Gestisce l'evento SSE `usage`: aggiorna gli accumulatori token/costo e
+/// ri-emette lo snapshot al frontend come `usage_snapshot`.
+///
+/// Token cumulativi live emessi dal brain a ogni iterazione executor (vedi
+/// brain/grpc_server/routes/agent.py). Vengono ritrasmessi al frontend come
+/// meta_step kind="usage_snapshot" che chat_agent.rs mappa all'evento SSE
+/// `agent_usage`, cosi' la barra context si aggiorna in tempo reale senza
+/// polling. Riusa il campo meta_step esistente per non toccare i call site di
+/// AgentStepEvent (regola: niente patch speculative).
+#[allow(clippy::too_many_arguments)]
+fn handle_usage_event(
+    evt: &Value,
+    step_tx: &broadcast::Sender<AgentStepEvent>,
+    run_id_str: &str,
+    acc_prompt_tokens: &mut u32,
+    acc_completion_tokens: &mut u32,
+    acc_total_tokens: &mut u32,
+    acc_total_cost: &mut f64,
+    last_prompt_tokens: &mut Option<u32>,
+) {
+    let u32_field = |k: &str| evt.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let prompt_t = u32_field("prompt_tokens");
+    let completion_t = u32_field("completion_tokens");
+    let total_t = u32_field("total_tokens");
+    let cost_t = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let last_pt = u32_field("last_prompt_tokens");
+    // Mantieni gli accumulatori coerenti col risultato finale anche
+    // se end_turn non dovesse arrivare (es. stream troncato).
+    if total_t > 0 {
+        *acc_prompt_tokens = prompt_t;
+        *acc_completion_tokens = completion_t;
+        *acc_total_tokens = total_t;
+        *acc_total_cost = cost_t;
+    }
+    if last_pt > 0 {
+        *last_prompt_tokens = Some(last_pt);
+    }
+    let _ = step_tx.send(AgentStepEvent {
+        run_id: run_id_str.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(AgentMetaStep {
+            kind: "usage_snapshot".to_string(),
+            title: String::new(),
+            payload: json!({
+                "totalTokens": total_t,
+                "promptTokens": prompt_t,
+                "completionTokens": completion_t,
+                "lastPromptTokens": last_pt,
+                "totalCostUsd": cost_t,
+            }),
+            correlation_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }),
+    });
+}
+
+/// Gestisce l'evento SSE `meta_step`: ritrasmette lo step semantico
+/// (plan/routing/clarify/fallback/reflection) al frontend come AgentMetaStep.
+///
+/// La persistenza su nexus_agent_meta_steps avviene lato brain Python che ha
+/// gia' accesso al DB (vedi event_bus.py). Se il `kind` e' vuoto lo step viene
+/// scartato (equivalente al `continue` originale: nessun codice segue nel loop).
+fn handle_meta_step_event(
+    evt: &Value,
+    step_tx: &broadcast::Sender<AgentStepEvent>,
+    run_id_str: &str,
+    payload: &str,
+) {
+    let kind = evt.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if kind.is_empty() {
+        tracing::warn!("meta_step senza kind, scarto: {payload}");
+        return;
+    }
+    let title = evt.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let payload_val = evt.get("payload").cloned().unwrap_or(json!({}));
+    let correlation_id = evt
+        .get("correlation_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let created_at = evt
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let _ = step_tx.send(AgentStepEvent {
+        run_id: run_id_str.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(AgentMetaStep {
+            kind,
+            title,
+            payload: payload_val,
+            correlation_id,
+            created_at,
+        }),
+    });
+}
+
+/// Contesto read-only necessario alla gestione dell'evento `end_turn`.
+struct EndTurnCtx<'a> {
+    db: &'a PgPool,
+    session_id: Uuid,
+    run_id: Uuid,
+    run_id_str: &'a str,
+    iteration: u32,
+    conversation_history_len: usize,
+    tools_json: &'a Value,
+    last_text_segment: &'a str,
+    step_tx: &'a broadcast::Sender<AgentStepEvent>,
+}
+
+/// Riferimenti agli accumulatori del run che l'evento `end_turn` aggiorna.
+/// Raggruppati in una struct per non superare il limite di parametri (clippy)
+/// e per mantenere `run_via_brain` privo della logica di questo ramo.
+struct EndTurnOutputs<'a> {
+    ended: &'a mut bool,
+    acc_prompt_tokens: &'a mut u32,
+    acc_completion_tokens: &'a mut u32,
+    acc_total_tokens: &'a mut u32,
+    acc_total_cost: &'a mut f64,
+    last_prompt_tokens: &'a mut Option<u32>,
+    nexus_task_type: &'a mut Option<String>,
+    nexus_agent_type: &'a mut Option<String>,
+    forced_close_unverified: &'a mut bool,
+    final_gate_passed: &'a mut bool,
+    last_error_class: &'a mut Option<String>,
+    declared_outcome: &'a mut Option<String>,
+    declared_summary: &'a mut Option<String>,
+    effective_provider: &'a mut String,
+    effective_model: &'a mut String,
+    last_stop_reason: &'a mut Option<String>,
+    trace_seq: &'a mut i32,
+}
+
+/// Gestisce l'evento SSE `end_turn`: marca la fine della fase generativa
+/// (mig 0388), aggiorna token/costo, i metadata routing, l'esito dichiarato e i
+/// provider/model effettivi post-cascade, quindi costruisce e persiste la
+/// traccia gateway del turno (FIX D7) ri-emettendola live. Estratto da
+/// `run_via_brain` per ridurne complessita' e lunghezza (comportamento
+/// invariato).
+/// Marca `generation_ended_at` sul run (mig 0388): da qui il frontend e' libero
+/// e reflection/learner girano in post-processing. Il guard anti-run-concorrente
+/// (handlers.rs) esclude i run con `generation_ended_at` valorizzato, evitando il
+/// 409 "la chat sembra libera". Best-effort: un errore qui non deve interrompere
+/// lo stream. `IS NULL`: marca una volta sola. Separazione DB: agent_runs vive
+/// sul pool del progetto (risolto da session_id).
+async fn mark_generation_ended(db: &PgPool, session_id: Uuid, run_id: Uuid) {
+    let run_pool =
+        crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
+    let _ = sqlx::query(
+        "UPDATE agent_runs SET generation_ended_at = NOW() \
+         WHERE id = $1 AND generation_ended_at IS NULL",
+    )
+    .bind(run_id)
+    .execute(&run_pool)
+    .await;
+}
+
+/// Copia dall'evento `end_turn` token/costo e metadata routing/esito negli
+/// accumulatori del run. Nessun IO: sola trasformazione in-memory.
+fn apply_end_turn_metadata(evt: &Value, out: &mut EndTurnOutputs<'_>) {
+    apply_end_turn_tokens(evt, out);
+    apply_end_turn_routing_meta(evt, out);
+}
+
+/// Copia token cumulativi, costo e token dell'ultima iterazione dall'evento.
+fn apply_end_turn_tokens(evt: &Value, out: &mut EndTurnOutputs<'_>) {
+    *out.acc_prompt_tokens = evt.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    *out.acc_completion_tokens = evt
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    *out.acc_total_tokens = evt.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    *out.acc_total_cost = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    // Token prompt dell'ultima iterazione (per context ratio UI)
+    *out.last_prompt_tokens = evt
+        .get("last_prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+}
+
+/// Copia i metadata di routing/esito (task/agent type, gate, esito dichiarato,
+/// provider/model effettivi post-cascade, stop_reason) dall'evento end_turn.
+fn apply_end_turn_routing_meta(evt: &Value, out: &mut EndTurnOutputs<'_>) {
+    // B5: legge metadata routing propagati dal brain Python
+    if let Some(tt) = evt.get("nexus_task_type").and_then(|v| v.as_str()) {
+        *out.nexus_task_type = Some(tt.to_string());
+    }
+    if evt
+        .get("forced_close_unverified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        *out.forced_close_unverified = true;
+    }
+    if evt
+        .get("final_gate_passed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        *out.final_gate_passed = true;
+    }
+    if let Some(at) = evt.get("nexus_agent_type").and_then(|v| v.as_str()) {
+        *out.nexus_agent_type = Some(at.to_string());
+    }
+    // WAVE 2.2: error_class infrastruttura propagato nell'end_turn
+    // (ToolRunner down): mcp-core non scala i provider.
+    if let Some(ec) = evt.get("error_class").and_then(|v| v.as_str()) {
+        if !ec.trim().is_empty() {
+            *out.last_error_class = Some(ec.to_string());
+        }
+    }
+    // WAVE 3.2: esito dichiarato {outcome, summary, ...}.
+    if let Some(d) = evt.get("declared_outcome").and_then(|v| v.as_object()) {
+        if let Some(o) = d.get("outcome").and_then(|v| v.as_str()) {
+            *out.declared_outcome = Some(o.to_string());
+        }
+        if let Some(s) = d.get("summary").and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                *out.declared_summary = Some(s.to_string());
+            }
+        }
+    }
+    apply_end_turn_effective(evt, out);
+}
+
+/// Copia i provider/model EFFETTIVI post cascade-fallback sticky (sovrascrivono i
+/// valori iniziali nel risultato finale) e lo stop_reason se non gia' impostato.
+fn apply_end_turn_effective(evt: &Value, out: &mut EndTurnOutputs<'_>) {
+    if let Some(pu) = evt.get("provider_used").and_then(|v| v.as_str()) {
+        if !pu.trim().is_empty() {
+            *out.effective_provider = pu.to_string();
+        }
+    }
+    if let Some(mu) = evt.get("model_used").and_then(|v| v.as_str()) {
+        if !mu.trim().is_empty() {
+            *out.effective_model = mu.to_string();
+        }
+    }
+    if out.last_stop_reason.is_none() {
+        *out.last_stop_reason = Some(
+            evt.get("stop_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("end_turn")
+                .to_string(),
+        );
+    }
+}
+
+/// FIX D7: costruisce l'`AITraceEvent` con provider/model EFFETTIVI (post
+/// cascade/escalation), token e stop_reason del turno, lo PERSISTE su
+/// nexus_agent_traces (best-effort, punto unico trace_store — regola L) e lo
+/// ri-emette LIVE cosi' il trace panel sopravvive al refresh. response_text
+/// troncato (regola F: niente leak di contenuti integri nel payload persistito).
+async fn persist_and_emit_turn_trace(ctx: &EndTurnCtx<'_>, out: &mut EndTurnOutputs<'_>) {
+    let trace = AITraceEvent {
+        run_id: ctx.run_id_str.to_string(),
+        iteration: ctx.iteration,
+        provider: out.effective_provider.clone(),
+        model: out.effective_model.clone(),
+        messages_sent: ctx.conversation_history_len as u32,
+        tools_count: ctx.tools_json.as_array().map(|a| a.len()).unwrap_or(0) as u32,
+        response_text: ctx.last_text_segment.chars().take(2000).collect(),
+        tool_calls: Vec::new(),
+        stop_reason: out.last_stop_reason.clone().unwrap_or_default(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        input_tokens: *out.acc_prompt_tokens,
+        output_tokens: *out.acc_completion_tokens,
+        cache_read_tokens: 0,
+    };
+    // Separazione DB: nexus_agent_traces vive nel DB del progetto; qui `db` e' il
+    // meta -> risolvi by_session (directory O(1)), trace_store NON ri-risolve
+    // (convenzione: pool gia' risolto).
+    if let Ok(payload) = serde_json::to_value(&trace) {
+        let trace_pool =
+            crate::project_db_routes::project_data_pool_by_session_from(ctx.db, ctx.session_id)
+                .await;
+        crate::trace_store::persist_trace(
+            &trace_pool,
+            ctx.session_id,
+            ctx.run_id,
+            *out.trace_seq,
+            &payload,
+        )
+        .await;
+    }
+    *out.trace_seq += 1;
+    // Emissione LIVE: lo STESSO evento che il frontend mostra nel pannello tracce
+    // (chat_agent.rs mappa trace.is_some() -> `agent_trace`). Live e refresh ora
+    // coincidono.
+    let _ = ctx.step_tx.send(AgentStepEvent {
+        run_id: ctx.run_id_str.to_string(),
+        step: None,
+        trace: Some(trace),
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: None,
+    });
+}
+
+/// Gestisce l'evento SSE `end_turn` orchestrando le tre fasi (marca fine
+/// generazione, applica i metadata, persiste ed emette la traccia). Estratto da
+/// `run_via_brain` per ridurne complessita' e lunghezza (comportamento
+/// invariato).
+async fn handle_end_turn(evt: &Value, ctx: &EndTurnCtx<'_>, out: &mut EndTurnOutputs<'_>) {
+    *out.ended = true;
+    mark_generation_ended(ctx.db, ctx.session_id, ctx.run_id).await;
+    apply_end_turn_metadata(evt, out);
+    persist_and_emit_turn_trace(ctx, out).await;
+}
+
+/// Deriva lo status canonico del run (macchina a stati, mig 0386) dai segnali
+/// strutturati raccolti durante lo stream. Estratto da `run_via_brain` per
+/// isolarne la logica di branching (comportamento invariato).
+fn determine_run_status(
+    last_error: &Option<String>,
+    last_stop_reason: &Option<String>,
+    forced_close_unverified: bool,
+    declared_outcome: &Option<String>,
+    ended: bool,
+    final_gate_passed: bool,
+) -> AgentRunStatus {
+    if last_error.is_some() {
+        // Distingui la causa di terminazione con errore
+        return match last_stop_reason.as_deref() {
+            Some("no_capable_provider") | Some("provider_unavailable") => {
+                AgentRunStatus::ProviderUnavailable
+            }
+            _ => AgentRunStatus::Failed,
+        };
+    }
+    if forced_close_unverified
+        || matches!(
+            last_stop_reason.as_deref(),
+            Some("loop_detected") | Some("loop_aborted") | Some("loop_abort")
+        )
+    {
+        // Esito canonico (macchina a stati, mig 0386): un abort anti-loop NON e' un
+        // successo ne' un errore infrastrutturale, ma un FALLIMENTO DIAGNOSTICATO.
+        // Il recap M44 dell'executor porta sempre esito + file toccati + prossimo
+        // passo. `forced_close_unverified` e' il segnale autoritativo: copre anche
+        // il caso in cui il final_gate ha riscritto stop_reason a "end_turn" sul
+        // ramo forced_close (prima un abort finiva erroneamente come Completed).
+        return AgentRunStatus::FailedDiagnosed;
+    }
+    if matches!(
+        declared_outcome.as_deref(),
+        Some("blocked") | Some("needs_input")
+    ) {
+        // WAVE 3.2: il modello ha DICHIARATO via task_complete di essere bloccato
+        // (causa esterna mancante) o di aver bisogno di input. Esito canonico
+        // BlockedNeedsInput, indipendente dalla lingua del testo. Sostituisce
+        // l'inferenza lessicale resigned_patterns per questo caso.
+        return AgentRunStatus::BlockedNeedsInput;
+    }
+    if ended && final_gate_passed {
+        // Verifica E2E (final_gate) superata: successo verificato (mig 0386).
+        return AgentRunStatus::CompletedVerified;
+    }
+    // Sia il run terminato senza final_gate sia il fallback non-ended
+    // convergono su Completed (i rami erano identici; semantica invariata).
+    AgentRunStatus::Completed
+}
+
+/// Calcola i segnali di "hollow completion" (completamento allucinato):
+///   (A) `hollow_no_tools`: aveva tool ma ha chiuso senza usarne al primo turno;
+///   (B) `hollow_empty_answer`: risposta vuota/whitespace-only su Completed.
+/// Ritorna `(hollow_completion, hollow_no_tools, hollow_kind)`. La detection
+/// "RESIGNED" lessicale e' stata RIMOSSA (ADR 0018 fase 3, regola M): la rinuncia
+/// va dichiarata in forma STRUTTURATA via task_complete.
+fn compute_hollow_completion(
+    status: &AgentRunStatus,
+    tools_json: &Value,
+    steps: &[AgentStep],
+    iteration: u32,
+    final_answer: &str,
+) -> (bool, bool, &'static str) {
+    let had_tools = tools_json.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    let final_answer_empty = final_answer.trim().is_empty();
+    let is_completed = *status == AgentRunStatus::Completed;
+    let hollow_no_tools = is_completed && had_tools && steps.is_empty() && iteration <= 1;
+    let hollow_empty_answer = is_completed && final_answer_empty;
+    let hollow_completion = hollow_no_tools || hollow_empty_answer;
+    let hollow_kind: &str = if !hollow_completion {
+        ""
+    } else if hollow_empty_answer && !hollow_no_tools {
+        "EMPTY_ANSWER"
+    } else if hollow_empty_answer {
+        "EMPTY_ANSWER+NO_TOOLS"
+    } else {
+        "NO_TOOLS"
+    };
+    (hollow_completion, hollow_no_tools, hollow_kind)
+}
+
+/// Costruisce il messaggio-risposta a partire dall'errore quando il run non ha
+/// prodotto testo. Fix M23: distingue le due cause piu' comuni di interruzione
+/// SSE dal brain (chunk decode error, silenzio prolungato) dal generico errore
+/// di elaborazione, dando indicazioni utili. Lo stato del progetto e gli step
+/// gia' eseguiti sono persistiti: l'utente puo' riprendere senza perdere lavoro.
+fn build_answer_from_error(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.starts_with("sse chunk:")
+        || lower.contains("error decoding response body")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+    {
+        format!(
+            "Il flusso dal brain si e' interrotto prima del completamento. \
+             Gli step gia eseguiti e i file generati sono salvati. \
+             Premi Invio (o scrivi \"continua\") per riprendere da dove eri.\n\n\
+             *Dettaglio tecnico: {}*",
+            sanitize_error_for_user(err)
+        )
+    } else if lower.contains("silenzioso") || lower.contains("timeout") {
+        format!(
+            "Il brain non ha risposto entro il timeout configurato. \
+             Verifica che sia attivo (`curl http://localhost:8001/health`) \
+             e premi Invio per riprendere.\n\n\
+             *Dettaglio tecnico: {}*",
+            sanitize_error_for_user(err)
+        )
+    } else {
+        format!(
+            "Si e' verificato un errore durante l'elaborazione della richiesta. \
+             Riprova tra qualche secondo oppure cambia modello.\n\n\
+             *Dettaglio tecnico: {}*",
+            sanitize_error_for_user(err)
+        )
+    }
+}
+
+/// Contesto read-only condiviso da tutti gli handler di evento SSE.
+struct SseCtx<'a> {
+    db: &'a PgPool,
+    session_id: Uuid,
+    run_id: Uuid,
+    run_id_str: &'a str,
+    provider: &'a str,
+    conversation_history_len: usize,
+    tools_json: &'a Value,
+    step_tx: &'a broadcast::Sender<AgentStepEvent>,
+}
+
+/// Stato mutabile del run accumulato dagli handler di evento SSE. Raggruppato in
+/// una struct per centralizzare in `dispatch_sse_event` lo smistamento (regola L)
+/// e togliere da `run_via_brain` complessita' e lunghezza.
+struct SseState<'a> {
+    final_answer: &'a mut String,
+    last_text_segment: &'a mut String,
+    accumulated_reasoning: &'a mut String,
+    trace_seq: &'a mut i32,
+    steps: &'a mut Vec<AgentStep>,
+    iteration: &'a mut u32,
+    ended: &'a mut bool,
+    last_error: &'a mut Option<String>,
+    last_error_class: &'a mut Option<String>,
+    last_stop_reason: &'a mut Option<String>,
+    acc_prompt_tokens: &'a mut u32,
+    acc_completion_tokens: &'a mut u32,
+    acc_total_tokens: &'a mut u32,
+    acc_total_cost: &'a mut f64,
+    last_prompt_tokens: &'a mut Option<u32>,
+    nexus_task_type: &'a mut Option<String>,
+    nexus_agent_type: &'a mut Option<String>,
+    forced_close_unverified: &'a mut bool,
+    final_gate_passed: &'a mut bool,
+    declared_outcome: &'a mut Option<String>,
+    declared_summary: &'a mut Option<String>,
+    effective_provider: &'a mut String,
+    effective_model: &'a mut String,
+}
+
+/// Gestisce l'evento `assistant_delta`: accumula il testo e, se il brain ha
+/// convertito un errore provider in content `[Error: ...]`, mette il provider in
+/// cooldown (senza questo il LED resterebbe verde con provider fuori uso).
+fn handle_assistant_delta(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
+    let text = evt.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if text.is_empty() {
+        return;
+    }
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
+        if let Some((err_class, kind, human_reason)) = classify_provider_error(None, &text) {
+            // Durata cooldown breve DB-driven (regola G): slow_cooldown_s.
+            let short_secs = crate::provider_cooldown::provider_health_timings().slow_cooldown_s;
+            apply_provider_cooldown(ctx.provider, err_class, kind, human_reason, short_secs);
+            *state.last_error_class = Some(err_class.to_string());
+            *state.last_error = Some(text.clone());
+        }
+    }
+    state.final_answer.push_str(&text);
+    state.last_text_segment.push_str(&text);
+    let _ = ctx.step_tx.send(AgentStepEvent {
+        run_id: ctx.run_id_str.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: Some(text),
+        thinking_delta: None,
+        meta_step: None,
+    });
+}
+
+/// Gestisce l'evento `tool_use`: crea un nuovo step Running e lo emette.
+fn handle_tool_use(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
+    state.last_text_segment.clear();
+    *state.iteration = state.iteration.saturating_add(1);
+    let tool_name = evt.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let input = evt.get("input").cloned().unwrap_or(json!({}));
+    let step = AgentStep {
+        run_id: ctx.run_id_str.to_string(),
+        step_index: *state.iteration,
+        tool_name,
+        tool_input: input,
+        tool_result: None,
+        status: AgentStepStatus::Running,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = ctx.step_tx.send(AgentStepEvent {
+        run_id: ctx.run_id_str.to_string(),
+        step: Some(step.clone()),
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: None,
+    });
+    state.steps.push(step);
+}
+
+/// Gestisce l'evento `thinking_delta`: accumula il ragionamento (FIX D4) e lo
+/// ri-emette live.
+fn handle_thinking_delta(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
+    let text = evt.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if text.is_empty() {
+        return;
+    }
+    // Accumula per la persistenza (FIX D4): il blocco "Ragionamento" deve
+    // sopravvivere al refresh.
+    state.accumulated_reasoning.push_str(&text);
+    let _ = ctx.step_tx.send(AgentStepEvent {
+        run_id: ctx.run_id_str.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: Some(text),
+        meta_step: None,
+    });
+}
+
+/// Gestisce l'evento `tool_result`: aggiorna l'ultimo step Running con l'esito.
+fn handle_tool_result(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
+    let tool_use_id = evt.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+    let content = evt.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let is_error = evt.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Aggiorna l'ultimo step in Running (match by step_index non disponibile
+    // qui — aggiorniamo l'ultimo).
+    if let Some(last) = state
+        .steps
+        .iter_mut()
+        .rev()
+        .find(|s| s.status == AgentStepStatus::Running)
+    {
+        last.tool_result = Some(content.clone());
+        last.status = if is_error {
+            AgentStepStatus::Failed
+        } else {
+            AgentStepStatus::Completed
+        };
+        let _ = ctx.step_tx.send(AgentStepEvent {
+            run_id: ctx.run_id_str.to_string(),
+            step: Some(last.clone()),
+            trace: None,
+            is_final: false,
+            token_delta: None,
+            thinking_delta: None,
+            meta_step: None,
+        });
+    } else {
+        tracing::warn!("tool_result senza step Running (tool_use_id={})", tool_use_id);
+    }
+}
+
+/// Gestisce l'evento `error`: logga, classifica l'errore provider (cooldown
+/// breve fisso 60s per i transient del ramo error) e registra stop_reason/error.
+fn handle_error_event(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
+    let msg = evt
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("errore brain")
+        .to_string();
+    // Lettura del campo strutturato `error_class` propagato dal brain (vedi
+    // brain/providers/error_handler.py::format_error_result). Ha priorita' sul
+    // pattern matching testuale: i messaggi possono essere localizzati ma
+    // error_class resta stabile.
+    let err_class_raw = evt.get("error_class").and_then(|v| v.as_str());
+    tracing::error!("brain SSE error (error_class={:?}): {msg}", err_class_raw);
+
+    if let Some((err_class, kind, human_reason)) = classify_provider_error(err_class_raw, &msg) {
+        apply_provider_cooldown(ctx.provider, err_class, kind, human_reason, 60);
+        *state.last_error_class = Some(err_class.to_string());
+    } else if let Some(c) = err_class_raw {
+        // error_class non riconosciuto: lo propaghiamo comunque per audit.
+        *state.last_error_class = Some(c.to_string());
+    }
+
+    *state.last_stop_reason = Some("error".to_string());
+    *state.last_error = Some(msg);
+}
+
+/// Adatta `SseCtx`/`SseState` a `EndTurnCtx`/`EndTurnOutputs` e delega a
+/// `handle_end_turn`. Isolato dal dispatch per tenere `dispatch_sse_event`
+/// compatto (il mapping dei riferimenti e' verboso ma meccanico).
+async fn dispatch_end_turn(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
+    let end_ctx = EndTurnCtx {
+        db: ctx.db,
+        session_id: ctx.session_id,
+        run_id: ctx.run_id,
+        run_id_str: ctx.run_id_str,
+        iteration: *state.iteration,
+        conversation_history_len: ctx.conversation_history_len,
+        tools_json: ctx.tools_json,
+        last_text_segment: state.last_text_segment,
+        step_tx: ctx.step_tx,
+    };
+    let mut out = EndTurnOutputs {
+        ended: state.ended,
+        acc_prompt_tokens: state.acc_prompt_tokens,
+        acc_completion_tokens: state.acc_completion_tokens,
+        acc_total_tokens: state.acc_total_tokens,
+        acc_total_cost: state.acc_total_cost,
+        last_prompt_tokens: state.last_prompt_tokens,
+        nexus_task_type: state.nexus_task_type,
+        nexus_agent_type: state.nexus_agent_type,
+        forced_close_unverified: state.forced_close_unverified,
+        final_gate_passed: state.final_gate_passed,
+        last_error_class: state.last_error_class,
+        declared_outcome: state.declared_outcome,
+        declared_summary: state.declared_summary,
+        effective_provider: state.effective_provider,
+        effective_model: state.effective_model,
+        last_stop_reason: state.last_stop_reason,
+        trace_seq: state.trace_seq,
+    };
+    handle_end_turn(evt, &end_ctx, &mut out).await;
+}
+
+/// Smista un singolo evento SSE decodificato all'handler competente (punto unico
+/// del dispatch, regola L). Ritorna `true` se il loop esterno deve terminare
+/// (evento `done`), `false` altrimenti. Estratto da `run_via_brain` per togliere
+/// dal motore la logica di branching per-evento.
+async fn dispatch_sse_event(
+    evt: &Value,
+    payload: &str,
+    ctx: &SseCtx<'_>,
+    state: &mut SseState<'_>,
+) -> bool {
+    let kind = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match kind {
+        "assistant_delta" => handle_assistant_delta(evt, ctx, state),
+        "tool_use" => handle_tool_use(evt, ctx, state),
+        "thinking_delta" => handle_thinking_delta(evt, ctx, state),
+        "tool_result" => handle_tool_result(evt, ctx, state),
+        "end_turn" => dispatch_end_turn(evt, ctx, state).await,
+        "error" => handle_error_event(evt, ctx, state),
+        "ping" => {
+            // Heartbeat del brain: il run e' ancora attivo. Il timer MAX_SILENCE
+            // viene resettato implicitamente dalla ricezione di questo chunk.
+            tracing::debug!("brain SSE ping: run attivo");
+        }
+        "usage" => handle_usage_event(
+            evt,
+            ctx.step_tx,
+            ctx.run_id_str,
+            state.acc_prompt_tokens,
+            state.acc_completion_tokens,
+            state.acc_total_tokens,
+            state.acc_total_cost,
+            state.last_prompt_tokens,
+        ),
+        "meta_step" => handle_meta_step_event(evt, ctx.step_tx, ctx.run_id_str, payload),
+        "done" => {
+            // Segnale terminale esplicito dal brain: il graph LangGraph ha concluso
+            // (END node raggiunto). Chiediamo l'uscita immediata dal loop esterno
+            // senza attendere il timeout di silenzio SSE — elimina l'attesa di 120s
+            // percepita come "Agente in esecuzione" dopo la risposta finale.
+            tracing::info!("brain SSE done ricevuto: chiusura stream {}", ctx.run_id_str);
+            return true;
+        }
+        _ => {
+            // Eventi sconosciuti: ignoriamo.
+        }
+    }
+    false
 }
 
 /// Esegue un turno agente tramite `POST brain/agent/run/stream` e
@@ -787,7 +1595,9 @@ pub async fn run_via_brain(
         };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-        // Ogni evento SSE termina con `\n\n`.
+        // Ogni evento SSE termina con `\n\n`. Lo smistamento per-evento e la
+        // mutazione dello stato sono centralizzati in `dispatch_sse_event`
+        // (regola L): qui restano solo il framing SSE e il parsing JSON.
         while let Some(pos) = buffer.find("\n\n") {
             let raw_event: String = buffer.drain(..pos + 2).collect();
             let payload = parse_sse_data(&raw_event);
@@ -799,583 +1609,63 @@ pub async fn run_via_brain(
                     continue;
                 }
             };
-            let kind = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match kind {
-                "assistant_delta" => {
-                    let text = evt
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !text.is_empty() {
-                        // ── Detection errori provider che arrivano come content
-                        // Il brain Python a volte converte gli errori del provider
-                        // SDK in stringhe `[Error: ...]` propagate come assistant
-                        // content invece di essere lanciate come exception. Senza
-                        // questo check il cooldown non scatta e il LED resta verde
-                        // anche se il provider e' fuori uso.
-                        // (vedi /api/gateway/providers che riporta healthy:true
-                        // ma le richieste falliscono con quota_exceeded).
-                        let trimmed = text.trim_start();
-                        if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
-                            if let Some((err_class, kind, human_reason)) =
-                                classify_provider_error(None, &text)
-                            {
-                                let provider_key = provider.split('/').next().unwrap_or(&provider);
-                                match kind {
-                                    CooldownKind::Long => {
-                                        crate::provider_cooldown::put_provider_in_long_cooldown(
-                                            provider_key,
-                                            human_reason,
-                                        );
-                                        tracing::warn!(
-                                            "Provider '{}' COOLDOWN LUNGO ({}): {}",
-                                            provider,
-                                            err_class,
-                                            human_reason
-                                        );
-                                    }
-                                    CooldownKind::Short => {
-                                        // Durata DB-driven (regola G): slow_cooldown_s, non 60 letterale.
-                                        let secs =
-                                            crate::provider_cooldown::provider_health_timings()
-                                                .slow_cooldown_s;
-                                        crate::provider_cooldown::put_provider_in_short_cooldown(
-                                            provider_key,
-                                            human_reason,
-                                            secs,
-                                        );
-                                        tracing::warn!(
-                                            "Provider '{}' COOLDOWN BREVE {}s ({}): {}",
-                                            provider,
-                                            secs,
-                                            err_class,
-                                            human_reason
-                                        );
-                                    }
-                                }
-                                last_error_class = Some(err_class.to_string());
-                                last_error = Some(text.clone());
-                            }
-                        }
-                        final_answer.push_str(&text);
-                        last_text_segment.push_str(&text);
-                        let _ = step_tx.send(AgentStepEvent {
-                            run_id: run_id_str.clone(),
-                            step: None,
-                            trace: None,
-                            is_final: false,
-                            token_delta: Some(text),
-                            thinking_delta: None,
-                            meta_step: None,
-                        });
-                    }
-                }
-                "tool_use" => {
-                    last_text_segment.clear();
-                    iteration = iteration.saturating_add(1);
-                    let tool_name = evt
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let input = evt.get("input").cloned().unwrap_or(json!({}));
-                    let step = AgentStep {
-                        run_id: run_id_str.clone(),
-                        step_index: iteration,
-                        tool_name,
-                        tool_input: input,
-                        tool_result: None,
-                        status: AgentStepStatus::Running,
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let _ = step_tx.send(AgentStepEvent {
-                        run_id: run_id_str.clone(),
-                        step: Some(step.clone()),
-                        trace: None,
-                        is_final: false,
-                        token_delta: None,
-                        thinking_delta: None,
-                        meta_step: None,
-                    });
-                    steps.push(step);
-                }
-                "thinking_delta" => {
-                    let text = evt
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !text.is_empty() {
-                        // Accumula per la persistenza (FIX D4): il blocco
-                        // "Ragionamento" deve sopravvivere al refresh.
-                        accumulated_reasoning.push_str(&text);
-                        let _ = step_tx.send(AgentStepEvent {
-                            run_id: run_id_str.clone(),
-                            step: None,
-                            trace: None,
-                            is_final: false,
-                            token_delta: None,
-                            thinking_delta: Some(text),
-                            meta_step: None,
-                        });
-                    }
-                }
-                "tool_result" => {
-                    let tool_use_id = evt
-                        .get("tool_use_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let content = evt
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let is_error = evt
-                        .get("is_error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    // Aggiorna l'ultimo step in Running (match by step_index
-                    // non disponibile qui — aggiorniamo l'ultimo).
-                    if let Some(last) = steps
-                        .iter_mut()
-                        .rev()
-                        .find(|s| s.status == AgentStepStatus::Running)
-                    {
-                        last.tool_result = Some(content.clone());
-                        last.status = if is_error {
-                            AgentStepStatus::Failed
-                        } else {
-                            AgentStepStatus::Completed
-                        };
-                        let _ = step_tx.send(AgentStepEvent {
-                            run_id: run_id_str.clone(),
-                            step: Some(last.clone()),
-                            trace: None,
-                            is_final: false,
-                            token_delta: None,
-                            thinking_delta: None,
-                            meta_step: None,
-                        });
-                    } else {
-                        tracing::warn!(
-                            "tool_result senza step Running (tool_use_id={})",
-                            tool_use_id
-                        );
-                    }
-                }
-                "end_turn" => {
-                    ended = true;
-                    // Marca la fine della fase generativa (mig 0388): da qui il
-                    // frontend e' libero (riceve end_turn) e reflection/learner
-                    // girano in post-processing. Il guard anti-run-concorrente
-                    // (handlers.rs) esclude i run con generation_ended_at valorizzato,
-                    // evitando il 409 "la chat sembra libera". Best-effort: un errore
-                    // qui non deve interrompere lo stream. IS NULL: marca una volta sola.
-                    // separazione DB: agent_runs vive sul pool del progetto (risolto da session_id)
-                    let run_pool = crate::project_db_routes::project_data_pool_by_session_from(
-                        &db, session_id,
-                    )
-                    .await;
-                    let _ = sqlx::query(
-                        "UPDATE agent_runs SET generation_ended_at = NOW() \
-                         WHERE id = $1 AND generation_ended_at IS NULL",
-                    )
-                    .bind(run_id)
-                    .execute(&run_pool)
-                    .await;
-                    acc_prompt_tokens = evt
-                        .get("prompt_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    acc_completion_tokens = evt
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    acc_total_tokens = evt
-                        .get("total_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    acc_total_cost = evt
-                        .get("total_cost")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    // Token prompt dell'ultima iterazione (per context ratio UI)
-                    last_prompt_tokens = evt
-                        .get("last_prompt_tokens")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32);
-                    // B5: legge metadata routing propagati dal brain Python
-                    if let Some(tt) = evt.get("nexus_task_type").and_then(|v| v.as_str()) {
-                        nexus_task_type = Some(tt.to_string());
-                    }
-                    if evt
-                        .get("forced_close_unverified")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
-                        forced_close_unverified = true;
-                    }
-                    if evt
-                        .get("final_gate_passed")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
-                        final_gate_passed = true;
-                    }
-                    if let Some(at) = evt.get("nexus_agent_type").and_then(|v| v.as_str()) {
-                        nexus_agent_type = Some(at.to_string());
-                    }
-                    // WAVE 2.2: error_class infrastruttura propagato nell'end_turn
-                    // (ToolRunner down): mcp-core non scala i provider.
-                    if let Some(ec) = evt.get("error_class").and_then(|v| v.as_str()) {
-                        if !ec.trim().is_empty() {
-                            last_error_class = Some(ec.to_string());
-                        }
-                    }
-                    // WAVE 3.2: esito dichiarato {outcome, summary, ...}.
-                    if let Some(d) = evt.get("declared_outcome").and_then(|v| v.as_object()) {
-                        if let Some(o) = d.get("outcome").and_then(|v| v.as_str()) {
-                            declared_outcome = Some(o.to_string());
-                        }
-                        if let Some(s) = d.get("summary").and_then(|v| v.as_str()) {
-                            if !s.trim().is_empty() {
-                                declared_summary = Some(s.to_string());
-                            }
-                        }
-                    }
-                    // Provider/model effettivi dopo cascade fallback sticky:
-                    // sovrascrivono i valori iniziali nel risultato finale.
-                    if let Some(pu) = evt.get("provider_used").and_then(|v| v.as_str()) {
-                        if !pu.trim().is_empty() {
-                            effective_provider = pu.to_string();
-                        }
-                    }
-                    if let Some(mu) = evt.get("model_used").and_then(|v| v.as_str()) {
-                        if !mu.trim().is_empty() {
-                            effective_model = mu.to_string();
-                        }
-                    }
-                    if last_stop_reason.is_none() {
-                        last_stop_reason = Some(
-                            evt.get("stop_reason")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("end_turn")
-                                .to_string(),
-                        );
-                    }
-                    // ── FIX D7: traccia gateway del turno ─────────────────────
-                    // Costruisce l'AITraceEvent con provider/model EFFETTIVI (post
-                    // cascade/escalation), token e stop_reason di questo turno, lo
-                    // emette LIVE (`agent_trace`) e lo PERSISTE su nexus_agent_traces
-                    // cosi' il trace panel sopravvive al refresh (prima viveva solo
-                    // in sessionStorage del browser). response_text troncato (regola
-                    // F: niente leak di contenuti integri nel payload persistito).
-                    let trace = AITraceEvent {
-                        run_id: run_id_str.clone(),
-                        iteration,
-                        provider: effective_provider.clone(),
-                        model: effective_model.clone(),
-                        messages_sent: conversation_history.len() as u32,
-                        tools_count: tools_json.as_array().map(|a| a.len()).unwrap_or(0) as u32,
-                        response_text: last_text_segment.chars().take(2000).collect(),
-                        tool_calls: Vec::new(),
-                        stop_reason: last_stop_reason.clone().unwrap_or_default(),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        input_tokens: acc_prompt_tokens,
-                        output_tokens: acc_completion_tokens,
-                        cache_read_tokens: 0,
-                    };
-                    // Persistenza best-effort (punto unico trace_store, regola L).
-                    // Separazione DB: nexus_agent_traces vive nel DB del progetto;
-                    // qui `db` e' il meta -> risolvi by_session (directory O(1)),
-                    // trace_store NON ri-risolve (convenzione: pool gia' risolto).
-                    if let Ok(payload) = serde_json::to_value(&trace) {
-                        let trace_pool =
-                            crate::project_db_routes::project_data_pool_by_session_from(
-                                &db, session_id,
-                            )
-                            .await;
-                        crate::trace_store::persist_trace(
-                            &trace_pool,
-                            session_id,
-                            run_id,
-                            trace_seq,
-                            &payload,
-                        )
-                        .await;
-                    }
-                    trace_seq += 1;
-                    // Emissione LIVE: lo STESSO evento che il frontend mostra nel
-                    // pannello tracce (chat_agent.rs mappa trace.is_some() ->
-                    // `agent_trace`). Live e refresh ora coincidono.
-                    let _ = step_tx.send(AgentStepEvent {
-                        run_id: run_id_str.clone(),
-                        step: None,
-                        trace: Some(trace),
-                        is_final: false,
-                        token_delta: None,
-                        thinking_delta: None,
-                        meta_step: None,
-                    });
-                }
-                "error" => {
-                    let msg = evt
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("errore brain")
-                        .to_string();
-                    // Lettura del campo strutturato `error_class` propagato dal brain
-                    // (vedi brain/providers/error_handler.py::format_error_result).
-                    // Ha priorita' sul pattern matching testuale: i messaggi possono
-                    // essere localizzati o riformulati ma error_class resta stabile.
-                    let err_class_raw = evt.get("error_class").and_then(|v| v.as_str());
-                    tracing::error!("brain SSE error (error_class={:?}): {msg}", err_class_raw);
-
-                    if let Some((err_class, kind, human_reason)) =
-                        classify_provider_error(err_class_raw, &msg)
-                    {
-                        let provider_key = provider.split('/').next().unwrap_or(&provider);
-                        match kind {
-                            CooldownKind::Long => {
-                                crate::provider_cooldown::put_provider_in_long_cooldown(
-                                    provider_key,
-                                    human_reason,
-                                );
-                                tracing::warn!(
-                                    "Provider '{}' COOLDOWN LUNGO 6h ({}): {}. Routing successivo selezionera' un altro provider.",
-                                    provider, err_class, human_reason
-                                );
-                            }
-                            CooldownKind::Short => {
-                                crate::provider_cooldown::put_provider_in_short_cooldown(
-                                    provider_key,
-                                    human_reason,
-                                    60,
-                                );
-                                tracing::warn!(
-                                    "Provider '{}' COOLDOWN BREVE 60s ({}): {}",
-                                    provider,
-                                    err_class,
-                                    human_reason
-                                );
-                            }
-                        }
-                        last_error_class = Some(err_class.to_string());
-                    } else if let Some(c) = err_class_raw {
-                        // error_class non riconosciuto: lo propaghiamo comunque per audit.
-                        last_error_class = Some(c.to_string());
-                    }
-
-                    last_stop_reason = Some("error".to_string());
-                    last_error = Some(msg);
-                }
-                "ping" => {
-                    // Heartbeat del brain: il run e' ancora attivo.
-                    // Il timer MAX_SILENCE viene resettato implicitamente
-                    // dalla ricezione di questo chunk (tokio::time::timeout
-                    // si riavvia ad ogni Ok). Nessuna azione necessaria.
-                    tracing::debug!("brain SSE ping: run attivo");
-                }
-                "usage" => {
-                    // Token cumulativi live emessi dal brain a ogni iterazione
-                    // executor (vedi brain/grpc_server/routes/agent.py). Vengono
-                    // ritrasmessi al frontend come meta_step kind="usage_snapshot"
-                    // che chat_agent.rs mappa all'evento SSE `agent_usage`, cosi'
-                    // la barra context si aggiorna in tempo reale senza polling.
-                    // Riusa il campo meta_step esistente per non toccare i 12 call
-                    // site di AgentStepEvent (regola: niente patch speculative).
-                    let prompt_t = evt
-                        .get("prompt_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    let completion_t = evt
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    let total_t = evt
-                        .get("total_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    let cost_t = evt
-                        .get("total_cost")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let last_pt = evt
-                        .get("last_prompt_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    // Mantieni gli accumulatori coerenti col risultato finale anche
-                    // se end_turn non dovesse arrivare (es. stream troncato).
-                    if total_t > 0 {
-                        acc_prompt_tokens = prompt_t;
-                        acc_completion_tokens = completion_t;
-                        acc_total_tokens = total_t;
-                        acc_total_cost = cost_t;
-                    }
-                    if last_pt > 0 {
-                        last_prompt_tokens = Some(last_pt);
-                    }
-                    let _ = step_tx.send(AgentStepEvent {
-                        run_id: run_id_str.clone(),
-                        step: None,
-                        trace: None,
-                        is_final: false,
-                        token_delta: None,
-                        thinking_delta: None,
-                        meta_step: Some(AgentMetaStep {
-                            kind: "usage_snapshot".to_string(),
-                            title: String::new(),
-                            payload: json!({
-                                "totalTokens": total_t,
-                                "promptTokens": prompt_t,
-                                "completionTokens": completion_t,
-                                "lastPromptTokens": last_pt,
-                                "totalCostUsd": cost_t,
-                            }),
-                            correlation_id: None,
-                            created_at: chrono::Utc::now().to_rfc3339(),
-                        }),
-                    });
-                }
-                "meta_step" => {
-                    // Step semantico (plan/routing/clarify/fallback/reflection)
-                    // ritrasmesso al frontend come AgentMetaStep. La persistenza
-                    // su nexus_agent_meta_steps avviene lato brain Python che
-                    // ha gia' accesso al DB tramite psycopg2 (vedi event_bus.py).
-                    let kind = evt
-                        .get("kind")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if kind.is_empty() {
-                        tracing::warn!("meta_step senza kind, scarto: {payload}");
-                        continue;
-                    }
-                    let title = evt
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let payload_val = evt.get("payload").cloned().unwrap_or(json!({}));
-                    let correlation_id = evt
-                        .get("correlation_id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let created_at = evt
-                        .get("created_at")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-                    let _ = step_tx.send(AgentStepEvent {
-                        run_id: run_id_str.clone(),
-                        step: None,
-                        trace: None,
-                        is_final: false,
-                        token_delta: None,
-                        thinking_delta: None,
-                        meta_step: Some(AgentMetaStep {
-                            kind,
-                            title,
-                            payload: payload_val,
-                            correlation_id,
-                            created_at,
-                        }),
-                    });
-                }
-                "done" => {
-                    // Segnale terminale esplicito dal brain: il graph LangGraph
-                    // ha concluso (END node raggiunto). Usciamo subito dal loop
-                    // esterno (label 'sse_loop) senza attendere il timeout di
-                    // silenzio SSE — questo elimina l'attesa di 120s che
-                    // l'utente percepiva come "Agente in esecuzione" anche
-                    // dopo aver ricevuto la risposta finale.
-                    tracing::info!("brain SSE done ricevuto: chiusura stream {run_id_str}");
-                    break 'sse_loop;
-                }
-                _ => {
-                    // Eventi sconosciuti: ignoriamo.
-                }
+            let sse_ctx = SseCtx {
+                db: &db,
+                session_id,
+                run_id,
+                run_id_str: &run_id_str,
+                provider: &provider,
+                conversation_history_len: conversation_history.len(),
+                tools_json: &tools_json,
+                step_tx: &step_tx,
+            };
+            let mut sse_state = SseState {
+                final_answer: &mut final_answer,
+                last_text_segment: &mut last_text_segment,
+                accumulated_reasoning: &mut accumulated_reasoning,
+                trace_seq: &mut trace_seq,
+                steps: &mut steps,
+                iteration: &mut iteration,
+                ended: &mut ended,
+                last_error: &mut last_error,
+                last_error_class: &mut last_error_class,
+                last_stop_reason: &mut last_stop_reason,
+                acc_prompt_tokens: &mut acc_prompt_tokens,
+                acc_completion_tokens: &mut acc_completion_tokens,
+                acc_total_tokens: &mut acc_total_tokens,
+                acc_total_cost: &mut acc_total_cost,
+                last_prompt_tokens: &mut last_prompt_tokens,
+                nexus_task_type: &mut nexus_task_type,
+                nexus_agent_type: &mut nexus_agent_type,
+                forced_close_unverified: &mut forced_close_unverified,
+                final_gate_passed: &mut final_gate_passed,
+                declared_outcome: &mut declared_outcome,
+                declared_summary: &mut declared_summary,
+                effective_provider: &mut effective_provider,
+                effective_model: &mut effective_model,
+            };
+            if dispatch_sse_event(&evt, &payload, &sse_ctx, &mut sse_state).await {
+                // Evento `done`: chiusura immediata dello stream.
+                break 'sse_loop;
             }
         }
     }
 
-    let status = if last_error.is_some() {
-        // Distingui la causa di terminazione con errore
-        match last_stop_reason.as_deref() {
-            Some("no_capable_provider") | Some("provider_unavailable") => {
-                AgentRunStatus::ProviderUnavailable
-            }
-            _ => AgentRunStatus::Failed,
-        }
-    } else if forced_close_unverified
-        || matches!(
-            last_stop_reason.as_deref(),
-            Some("loop_detected") | Some("loop_aborted") | Some("loop_abort")
-        )
-    {
-        // Esito canonico (macchina a stati, mig 0386): un abort anti-loop NON e' un
-        // successo ne' un errore infrastrutturale, ma un FALLIMENTO DIAGNOSTICATO.
-        // Il recap M44 dell'executor porta sempre esito + file toccati + prossimo
-        // passo. `forced_close_unverified` e' il segnale autoritativo: copre anche
-        // il caso in cui il final_gate ha riscritto stop_reason a "end_turn" sul
-        // ramo forced_close (prima un abort finiva erroneamente come Completed).
-        AgentRunStatus::FailedDiagnosed
-    } else if matches!(
-        declared_outcome.as_deref(),
-        Some("blocked") | Some("needs_input")
-    ) {
-        // WAVE 3.2: il modello ha DICHIARATO via task_complete di essere bloccato
-        // (causa esterna mancante) o di aver bisogno di input. Esito canonico
-        // BlockedNeedsInput, indipendente dalla lingua del testo. Sostituisce
-        // l'inferenza lessicale resigned_patterns per questo caso.
-        AgentRunStatus::BlockedNeedsInput
-    } else if ended && final_gate_passed {
-        // Verifica E2E (final_gate) superata: successo verificato (mig 0386).
-        AgentRunStatus::CompletedVerified
-    } else {
-        // Sia il run terminato senza final_gate sia il fallback non-ended
-        // convergono su Completed (i rami erano identici; semantica invariata).
-        AgentRunStatus::Completed
-    };
+    let status = determine_run_status(
+        &last_error,
+        &last_stop_reason,
+        forced_close_unverified,
+        &declared_outcome,
+        ended,
+        final_gate_passed,
+    );
 
     // ── Hollow completion detection ─────────────────────────────────────────
-    // Cattura due varianti del "completamento allucinato":
-    //   (A) had_tools && steps.is_empty() && iteration <= 1: l'agente aveva
-    //       tool disponibili e ha chiuso senza usarne nessuno al primo turno
-    //       (tipico di modelli piccoli che non sanno come usare le tool).
-    //   (B) final_answer vuoto/whitespace-only: l'agente ha dichiarato Completed
-    //       ma il body della risposta e' assente. Travestito da successo,
-    //       tipico ad esempio di deepseek-coder/deepseek-reasoner quando il
-    //       provider risponde solo con la status line "Operazione completata"
-    //       senza il content reale (visto in prod il 2026-05-20).
-    // In entrambi i casi il caller (chat_messages.rs) deve poter ri-tentare
-    // con un altro provider (hollow_retry path).
-    let had_tools = tools_json
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-    let final_answer_empty = final_answer.trim().is_empty();
-    let hollow_no_tools =
-        status == AgentRunStatus::Completed && had_tools && steps.is_empty() && iteration <= 1;
-    let hollow_empty_answer = status == AgentRunStatus::Completed && final_answer_empty;
-
-    // La detection "RESIGNED" (blacklist di frasi di rinuncia sul testo) e'
-    // stata RIMOSSA (ADR 0018 fase 3, regola M): la rinuncia va dichiarata dal
-    // modello in forma STRUTTURATA via task_complete (outcome=blocked/partial,
-    // refusal=true — ADR 0034, gestita nel path nativo da declared_refusal/
-    // blocked in agent_run.rs). Restano i soli segnali strutturali hollow:
-    // zero tool su intent che li richiede, risposta vuota.
-    let hollow_completion = hollow_no_tools || hollow_empty_answer;
-    let hollow_kind: &str = if !hollow_completion {
-        ""
-    } else if hollow_empty_answer && !hollow_no_tools {
-        "EMPTY_ANSWER"
-    } else if hollow_empty_answer {
-        "EMPTY_ANSWER+NO_TOOLS"
-    } else {
-        "NO_TOOLS"
-    };
+    // Cattura due varianti del "completamento allucinato" (dettaglio in
+    // compute_hollow_completion). In entrambi i casi il caller (chat_messages.rs)
+    // deve poter ri-tentare con un altro provider (hollow_retry path).
+    let (hollow_completion, hollow_no_tools, hollow_kind) =
+        compute_hollow_completion(&status, &tools_json, &steps, iteration, &final_answer);
     if hollow_completion {
         let kind = hollow_kind;
         tracing::warn!(
@@ -1423,42 +1713,7 @@ pub async fn run_via_brain(
             if let Some(summary) = declared_summary.clone() {
                 Some(summary)
             } else {
-            last_error.as_ref().map(|e| {
-                // Fix M23: distingue le due cause piu comuni di interruzione SSE
-                // dal brain Python (chunk decode error, silenzio prolungato) dal
-                // generico errore di elaborazione, dando indicazioni utili.
-                // Lo stato del progetto e gli step gia eseguiti sono persistiti
-                // su disco/DB: l'utente puo riprendere senza perdere il lavoro.
-                let lower = e.to_ascii_lowercase();
-                if lower.starts_with("sse chunk:")
-                    || lower.contains("error decoding response body")
-                    || lower.contains("connection reset")
-                    || lower.contains("connection closed")
-                {
-                    format!(
-                        "Il flusso dal brain si e' interrotto prima del completamento. \
-                         Gli step gia eseguiti e i file generati sono salvati. \
-                         Premi Invio (o scrivi \"continua\") per riprendere da dove eri.\n\n\
-                         *Dettaglio tecnico: {}*",
-                        sanitize_error_for_user(e)
-                    )
-                } else if lower.contains("silenzioso") || lower.contains("timeout") {
-                    format!(
-                        "Il brain non ha risposto entro il timeout configurato. \
-                         Verifica che sia attivo (`curl http://localhost:8001/health`) \
-                         e premi Invio per riprendere.\n\n\
-                         *Dettaglio tecnico: {}*",
-                        sanitize_error_for_user(e)
-                    )
-                } else {
-                    format!(
-                        "Si e' verificato un errore durante l'elaborazione della richiesta. \
-                         Riprova tra qualche secondo oppure cambia modello.\n\n\
-                         *Dettaglio tecnico: {}*",
-                        sanitize_error_for_user(e)
-                    )
-                }
-            })
+                last_error.as_ref().map(|e| build_answer_from_error(e.as_str()))
             }
         } else {
             // Se ci sono stati tool_use, salva solo l'ultimo segmento di testo

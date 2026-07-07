@@ -16,6 +16,11 @@ use crate::{
 
 use super::*;
 
+/// Esito di un'esecuzione LLM: `(provider, model, completion, usage, cost,
+/// currency)`. Alias interno usato dai due path di esecuzione (gateway/neural)
+/// estratti da `Orchestrator::run`.
+type LlmExecution = (String, String, serde_json::Value, UsageNumbers, f64, String);
+
 impl Orchestrator {
     pub fn new(
         neural: NeuralCoreClient,
@@ -230,6 +235,27 @@ impl Orchestrator {
             Err(_) => TokenThresholds::defaults(),
         };
         (preferred, thresholds)
+    }
+
+    /// Helper unico (regola L): risolve `(tier, capability)` per un intent dalla
+    /// cache `intent_capability` (mig 0110), col default `("light", "chat")` sia
+    /// quando l'intent non e' mappato sia quando la cache non e' disponibile.
+    /// Consolida il pattern ripetuto nei gate capability e nei fallback catalog.
+    /// NB: il ramo "dinamico" di `resolve_agent_provider` NON usa questo helper:
+    /// li' il default e' `medium/reasoning` con WARN dedicato (comportamento
+    /// deliberatamente diverso, lasciato invariato).
+    async fn intent_tier_capability(&self, intent: &str, estimated_tokens: u32) -> (String, String) {
+        let icap_arc = self.intent_capability.current_async().await.ok();
+        match icap_arc.as_deref() {
+            Some(map) => match map.get(intent) {
+                Some(c) => (
+                    c.tier_for_tokens(estimated_tokens),
+                    c.base_capability.clone(),
+                ),
+                None => ("light".to_string(), "chat".to_string()),
+            },
+            None => ("light".to_string(), "chat".to_string()),
+        }
     }
 
     pub async fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
@@ -566,19 +592,10 @@ impl Orchestrator {
             ToolCapabilityGate::NeedsFallback => {
                 // Tier/capability dell'intent dalla cache (mig 0110), stessi
                 // valori usati dal routing dinamico. Default light/chat se
-                // l'intent non e' mappato.
+                // l'intent non e' mappato (helper unico, regola L).
                 let estimated_tokens = estimate_complexity(message);
-                let icap_arc = self.intent_capability.current_async().await.ok();
-                let (tier, capability) = match icap_arc.as_deref() {
-                    Some(map) => match map.get(intent) {
-                        Some(c) => (
-                            c.tier_for_tokens(estimated_tokens),
-                            c.base_capability.clone(),
-                        ),
-                        None => ("light".to_string(), "chat".to_string()),
-                    },
-                    None => ("light".to_string(), "chat".to_string()),
-                };
+                let (tier, capability) =
+                    self.intent_tier_capability(intent, estimated_tokens).await;
 
                 // Fallback deterministico: miglior modello tool-capable del tier
                 // (degradazione di tier controllata in best_model_for_tier).
@@ -679,16 +696,11 @@ impl Orchestrator {
             VisionCapabilityGate::KeepOriginal => {}
             VisionCapabilityGate::NeedsVisionModel => {
                 // Tier dell'intent dalla cache (mig 0110), stesso meccanismo del
-                // gate tool-use. Default light/chat se l'intent non e' mappato.
+                // gate tool-use. Default light/chat se l'intent non e' mappato
+                // (helper unico, regola L): qui serve solo il tier.
                 let estimated_tokens = estimate_complexity(message);
-                let icap_arc = self.intent_capability.current_async().await.ok();
-                let tier = match icap_arc.as_deref() {
-                    Some(map) => match map.get(intent) {
-                        Some(c) => c.tier_for_tokens(estimated_tokens),
-                        None => "light".to_string(),
-                    },
-                    None => "light".to_string(),
-                };
+                let (tier, _capability) =
+                    self.intent_tier_capability(intent, estimated_tokens).await;
                 // Run agentico (intent != "chat") -> serve un modello vision CHE
                 // sia anche tool-capable: passiamo requires_tool_use al selettore
                 // unico, cosi' non vanifichiamo il gate tool-use applicato prima.
@@ -974,90 +986,15 @@ impl Orchestrator {
             };
             (decision_provider, model)
         } else {
-            if decision_provider == "__no_model__" {
-                tracing::warn!(
-                    "Agent routing: matrice senza modello per intent={} (provider preferito assente o in cooldown), consulto il catalog tier-aware",
-                    intent
-                );
-            } else {
-                tracing::warn!(
-                    "Agent routing: '{}' scelto dal routing ma in cooldown, consulto il catalog tier-aware",
-                    decision_provider
-                );
-            }
-
-            // Tier/capability dell'intent dalla cache intent_capability (mig 0110):
-            // stessi valori del routing dinamico. Default light/chat se non mappato.
-            let icap_arc = self.intent_capability.current_async().await.ok();
-            let (tier, cap) = match icap_arc.as_deref() {
-                Some(map) => match map.get(intent) {
-                    Some(c) => (
-                        c.tier_for_tokens(estimated_tokens),
-                        c.base_capability.clone(),
-                    ),
-                    None => ("light".to_string(), "chat".to_string()),
-                },
-                None => ("light".to_string(), "chat".to_string()),
-            };
-
-            // Tier-chain con pavimento: un task heavy/medium non degrada sotto il
-            // proprio tier (niente caduta a un modello light per un coding heavy).
-            let tiers_to_try: Vec<&str> = match tier.as_str() {
-                "frontier" => vec!["frontier", "heavy", "high"],
-                "heavy" => vec!["heavy", "high", "medium"],
-                "high" => vec!["high", "medium"],
-                "medium" => vec!["medium"],
-                _ => vec!["light"],
-            };
-
-            // PUNTO UNICO di selezione agentica (regola L): miglior modello
-            // tool-capable del tier/capability, da un provider NON in cooldown.
-            // Ordine allineato a route_model_from_catalog (AGENTIC_COST_FIRST_ORDER):
-            // il tier gia' garantisce la fascia di capacita', dentro il tier si
-            // prende il piu' ECONOMICO (obiettivo costi). I modelli economici
-            // problematici sono retrocessi dalla governance telemetria-aware e dagli
-            // esiti dei run, non da un flag `is_featured` statico.
-            let found = select_agentic_model(
+            self.resolve_via_catalog_fallback(
                 db,
-                &tiers_to_try,
-                Some(&cap),
-                0,
-                &[],
-                crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
+                matrix,
+                &routing,
+                intent,
+                estimated_tokens,
+                &decision_provider,
             )
-            .await;
-            if let Some((ref alt_provider, ref alt_model)) = found {
-                tracing::info!(
-                    "Agent routing (fallback catalog tier-aware, selettore unico): {} → {}/{} (intent={}, tier={}, cap={})",
-                    decision_provider,
-                    alt_provider,
-                    alt_model,
-                    intent,
-                    tier,
-                    cap
-                );
-            }
-
-            // ULTIMA spiaggia: hierarchy classica (candidates), raggiunta SOLO se il
-            // catalog non ha nulla di sano nel tier. Se nemmeno qui c'e' un provider
-            // fuori cooldown si mantiene la sentinella `__no_model__`, cosi' il
-            // chiamante (resolve_agent_provider_detailed) calcoli no_capable_provider
-            // e fermi il run con alert invece di spacciare un modello fittizio.
-            found.unwrap_or_else(|| {
-                let alt = routing
-                    .candidates(intent, None)
-                    .into_iter()
-                    .find(|p| !is_provider_in_cooldown(p))
-                    .unwrap_or_else(|| decision_provider.clone());
-                let alt_model = default_model_for_provider(matrix, &alt).to_string();
-                tracing::warn!(
-                    "Agent routing (fallback legacy hierarchy, catalog vuoto): {} → {}/{}",
-                    decision_provider,
-                    alt,
-                    alt_model
-                );
-                (alt, alt_model)
-            })
+            .await
         };
 
         tracing::info!(
@@ -1071,63 +1008,128 @@ impl Orchestrator {
         (provider, model)
     }
 
-    pub async fn run(
+    /// Fallback tier-aware su catalog quando la matrice non e' servibile
+    /// direttamente (sentinella `__no_model__` o provider in cooldown). Estratto
+    /// da `resolve_agent_provider` per contenerne lunghezza e complessita': la
+    /// logica e il logging sono invariati.
+    ///
+    /// Consulta PRIMA il catalog tier-aware (`select_agentic_model`, punto unico
+    /// regola L) e SOLO come ultima spiaggia cade sulla hierarchy classica
+    /// (candidates + default per-provider); se nemmeno li' c'e' un provider fuori
+    /// cooldown mantiene la sentinella, cosi' il chiamante ferma il run con alert.
+    async fn resolve_via_catalog_fallback(
         &self,
         db: &PgPool,
-        input: OrchestratorRequest,
-    ) -> anyhow::Result<OrchestratorResult> {
-        let user_id =
-            Uuid::parse_str(&input.user_id).map_err(|_| anyhow::anyhow!("invalid_user_id"))?;
-        let project_uuid = Uuid::parse_str(&input.project_id)
-            .map_err(|_| anyhow::anyhow!("invalid_project_id"))?;
-        let run_id = Uuid::new_v4();
+        matrix: &crate::routing_matrix::RoutingMatrix,
+        routing: &RoutingConfig,
+        intent: &str,
+        estimated_tokens: u32,
+        decision_provider: &str,
+    ) -> (String, String) {
+        if decision_provider == "__no_model__" {
+            tracing::warn!(
+                "Agent routing: matrice senza modello per intent={} (provider preferito assente o in cooldown), consulto il catalog tier-aware",
+                intent
+            );
+        } else {
+            tracing::warn!(
+                "Agent routing: '{}' scelto dal routing ma in cooldown, consulto il catalog tier-aware",
+                decision_provider
+            );
+        }
 
-        // Snapshot della routing matrix DB (cache 60s, await sul lock).
-        // Se la matrice non e' caricata, ritorniamo errore esplicito invece
-        // di un fallback nascosto.
-        let matrix_arc = self.routing_matrix.current_async().await.map_err(|e| {
-            anyhow::anyhow!(
-                "routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."
-            )
-        })?;
-        let matrix = &*matrix_arc;
+        // Tier/capability dell'intent dalla cache intent_capability (mig 0110):
+        // stessi valori del routing dinamico. Default light/chat se non mappato
+        // (helper unico, regola L).
+        let (tier, cap) = self.intent_tier_capability(intent, estimated_tokens).await;
 
-        // Step 1 + 2: Routing locale — zero gRPC, zero latenza aggiuntiva
-        // Usa estimate_complexity per non farsi ingannare da messaggi con liste dati lunghe
-        let msg_tokens_estimate = estimate_complexity(&input.message);
-        let (intent_str, _confidence) = self
-            .classify_intent_with_db_thresholds(db, &input.message)
-            .await;
-        let intent = intent_str.to_string();
-        let mut routing = Self::load_routing_config(db).await?;
-
-        // Routing: se modalità "dinamico" usa il catalogo DB, altrimenti la matrice statica
-        // Risolvi tier/capability dalla cache intent_capability (mig 0110).
-        let icap_arc = self.intent_capability.current_async().await.ok();
-        let (base_tier, capability) = match icap_arc.as_deref() {
-            Some(map) => match map.get(intent_str) {
-                Some(c) => (
-                    c.tier_for_tokens(msg_tokens_estimate),
-                    c.base_capability.clone(),
-                ),
-                None => ("light".to_string(), "chat".to_string()),
-            },
-            None => ("light".to_string(), "chat".to_string()),
+        // Tier-chain con pavimento: un task heavy/medium non degrada sotto il
+        // proprio tier (niente caduta a un modello light per un coding heavy).
+        let tiers_to_try: Vec<&str> = match tier.as_str() {
+            "frontier" => vec!["frontier", "heavy", "high"],
+            "heavy" => vec!["heavy", "high", "medium"],
+            "high" => vec!["high", "medium"],
+            "medium" => vec!["medium"],
+            _ => vec!["light"],
         };
-        let (suggested_provider, suggested_model): (Option<String>, Option<String>) = if routing
-            .behavior_mode
-            == "dinamico"
-        {
+
+        // PUNTO UNICO di selezione agentica (regola L): miglior modello
+        // tool-capable del tier/capability, da un provider NON in cooldown.
+        // Ordine allineato a route_model_from_catalog (AGENTIC_COST_FIRST_ORDER):
+        // il tier gia' garantisce la fascia di capacita', dentro il tier si
+        // prende il piu' ECONOMICO (obiettivo costi). I modelli economici
+        // problematici sono retrocessi dalla governance telemetria-aware e dagli
+        // esiti dei run, non da un flag `is_featured` statico.
+        let found = select_agentic_model(
+            db,
+            &tiers_to_try,
+            Some(&cap),
+            0,
+            &[],
+            crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
+        )
+        .await;
+        if let Some((ref alt_provider, ref alt_model)) = found {
+            tracing::info!(
+                "Agent routing (fallback catalog tier-aware, selettore unico): {} → {}/{} (intent={}, tier={}, cap={})",
+                decision_provider,
+                alt_provider,
+                alt_model,
+                intent,
+                tier,
+                cap
+            );
+        }
+
+        // ULTIMA spiaggia: hierarchy classica (candidates), raggiunta SOLO se il
+        // catalog non ha nulla di sano nel tier. Se nemmeno qui c'e' un provider
+        // fuori cooldown si mantiene la sentinella `__no_model__`, cosi' il
+        // chiamante (resolve_agent_provider_detailed) calcoli no_capable_provider
+        // e fermi il run con alert invece di spacciare un modello fittizio.
+        found.unwrap_or_else(|| {
+            let alt = routing
+                .candidates(intent, None)
+                .into_iter()
+                .find(|p| !is_provider_in_cooldown(p))
+                .unwrap_or_else(|| decision_provider.to_string());
+            let alt_model = default_model_for_provider(matrix, &alt).to_string();
+            tracing::warn!(
+                "Agent routing (fallback legacy hierarchy, catalog vuoto): {} → {}/{}",
+                decision_provider,
+                alt,
+                alt_model
+            );
+            (alt, alt_model)
+        })
+    }
+
+    /// Suggerimento provider/model per `run` in base al behavior_mode. Estratto
+    /// da `run` per contenerne lunghezza e complessita': i tre rami (dinamico
+    /// col fallback tier-aware, manuale, statico) e il loro logging sono
+    /// invariati. Ritorna `(Some(provider), Some(model))` (i rami producono
+    /// sempre un suggerimento; l'Option resta per compatibilita' col chiamante).
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_suggested_model(
+        &self,
+        db: &PgPool,
+        matrix: &crate::routing_matrix::RoutingMatrix,
+        behavior_mode: &str,
+        intent_str: &str,
+        msg_tokens_estimate: u32,
+        base_tier: &str,
+        capability: &str,
+    ) -> (Option<String>, Option<String>) {
+        if behavior_mode == "dinamico" {
             // Turno agentico = intent != "chat" (convenzione del progetto):
             // attiva il pavimento di tier agentico nel selettore dinamico.
             let is_agentic_turn = intent_str != "chat";
-            match route_model_from_catalog(db, &base_tier, &capability, "dinamico", is_agentic_turn)
+            match route_model_from_catalog(db, base_tier, capability, "dinamico", is_agentic_turn)
                 .await
             {
                 Some(dyn_decision) if !is_provider_in_cooldown(&dyn_decision.provider) => {
                     tracing::info!(
                         "Dynamic catalog routing: intent={} tokens~{} → {}/{}",
-                        intent,
+                        intent_str,
                         msg_tokens_estimate,
                         dyn_decision.provider,
                         dyn_decision.model
@@ -1146,7 +1148,7 @@ impl Orchestrator {
                     }
                     // PUNTO UNICO di selezione agentica (regola L): tier degradato,
                     // provider non in cooldown, eleggibilita' definita una volta sola.
-                    let tiers_to_try: Vec<&str> = match base_tier.as_str() {
+                    let tiers_to_try: Vec<&str> = match base_tier {
                         "frontier" => vec!["frontier", "heavy", "high", "medium"],
                         "heavy" => vec!["heavy", "high", "medium"],
                         "high" => vec!["high", "medium", "light"],
@@ -1156,7 +1158,7 @@ impl Orchestrator {
                     let catalog_alt = select_agentic_model(
                         db,
                         &tiers_to_try,
-                        Some(&capability),
+                        Some(capability),
                         0,
                         &[],
                         "input_cost_per_million_tokens ASC",
@@ -1191,7 +1193,7 @@ impl Orchestrator {
                     })
                 }
             }
-        } else if routing.behavior_mode == "manuale" {
+        } else if behavior_mode == "manuale" {
             // Manuale: nessun routing automatico — usa provider/model da config admin
             let (pref, thr) = self.routing_helpers_for(intent_str).await;
             let d = route_model_with_mode(
@@ -1204,7 +1206,7 @@ impl Orchestrator {
             );
             tracing::info!(
                 "Manual routing config: intent={} tokens~{} → {}/{}",
-                intent,
+                intent_str,
                 msg_tokens_estimate,
                 d.provider,
                 d.model
@@ -1216,20 +1218,388 @@ impl Orchestrator {
                 matrix,
                 intent_str,
                 msg_tokens_estimate,
-                &routing.behavior_mode,
+                behavior_mode,
                 pref.as_deref(),
                 &thr,
             );
             tracing::info!(
                 "Local routing: intent={} tokens~{} mode={} → {}/{}",
-                intent,
+                intent_str,
                 msg_tokens_estimate,
-                routing.behavior_mode,
+                behavior_mode,
                 d.provider,
                 d.model
             );
             (Some(d.provider.to_string()), Some(d.model.to_string()))
+        }
+    }
+
+    /// Esecuzione LLM via Nexus Gateway (PATH A). Estratta da `run` per
+    /// contenerne lunghezza e complessita': logica, billing e logging invariati.
+    /// Ritorna `(provider, model, completion, usage, cost, currency)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_via_gateway(
+        &self,
+        db: &PgPool,
+        gw: &NexusGatewayClient,
+        matrix: &crate::routing_matrix::RoutingMatrix,
+        input: &OrchestratorRequest,
+        routing: &RoutingConfig,
+        intent: &str,
+        forced_provider: Option<&str>,
+        forced_model: Option<&str>,
+        suggested_provider: Option<&str>,
+        suggested_model: Option<&str>,
+        composed_prompt: &str,
+        token_budget: u32,
+        corrections_count: usize,
+        run_id: Uuid,
+        user_id: Uuid,
+        project_uuid: Uuid,
+    ) -> anyhow::Result<LlmExecution> {
+        let alias = intent_to_alias(intent, &routing.behavior_mode, forced_model);
+        let gw_model = if let Some(fp) = forced_provider {
+            format!("{fp}/{}", forced_model.unwrap_or(&alias))
+        } else {
+            alias
         };
+        let gw_req = GwRequest {
+            model: gw_model,
+            messages: vec![GwMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::String(composed_prompt.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                thinking_signature: None,
+            }],
+            max_tokens: Some(token_budget),
+            temperature: None,
+            metadata: GwMetadata {
+                tenant_id: input.project_id.clone(),
+                user_id: input.user_id.clone(),
+                request_id: run_id.to_string(),
+                // Claim locale di sensibilita' (punto unico dlp, regola L).
+                // L'enforcement resta nel gateway, che ri-classifica e usa
+                // max(claim, classificazione) + validate_tier_claim: il claim
+                // onesto evita di dichiarare 'pubblico' (0) un prompt che il
+                // DLP locale sa gia' essere sensibile.
+                sensitivity_tier: crate::dlp::classify_sensitivity(composed_prompt) as u8,
+                feature: intent.to_string(),
+            },
+            ..Default::default()
+        };
+        let prompt_tokens = mcp_token::count_tokens(composed_prompt) as i32;
+        let estimated_completion = (token_budget as i32 - prompt_tokens).max(0);
+        // Fallback provider/model letti da DB (matrice routing) invece che hardcoded.
+        let fallback_provider: String = match matrix.lookup("chat", "bilanciata") {
+            Some((p, _)) => p,
+            None => "openai".to_string(),
+        };
+        let hint_provider_owned: String = forced_provider
+            .or(suggested_provider)
+            .map(String::from)
+            .unwrap_or(fallback_provider);
+        let fallback_model: String = default_model_for_provider(matrix, &hint_provider_owned);
+        let hint_model_owned: String = forced_model
+            .or(suggested_model)
+            .map(String::from)
+            .unwrap_or(fallback_model);
+        let hint_provider = hint_provider_owned.as_str();
+        let hint_model = hint_model_owned.as_str();
+        let reservation = billing::reserve_usage(
+            db,
+            user_id,
+            project_uuid,
+            hint_provider,
+            hint_model,
+            prompt_tokens,
+            estimated_completion,
+            json!({"intent": intent, "profile_id": input.profile_id,
+                       "via_nexus_gateway": true,
+                       "corrections_count": corrections_count}),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("billing_rejected: {e}"))?;
+
+        let gw_resp = match gw.complete(gw_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                billing::release_usage(db, &reservation, "gateway_error").await;
+                anyhow::bail!("Nexus Gateway failed for intent '{intent}': {e}");
+            }
+        };
+        let actual_usage = UsageNumbers {
+            prompt_tokens: gw_resp.usage.input_tokens as i32,
+            completion_tokens: gw_resp.usage.output_tokens as i32,
+            total_tokens: (gw_resp.usage.input_tokens + gw_resp.usage.output_tokens) as i32,
+        };
+        let (_, _, cost, cur) =
+            billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
+        let gw_completion = json!({"content": gw_resp.content, "metadata": {
+            "provider": gw_resp.provider_used, "model": gw_resp.model_used,
+            "latency_ms": gw_resp.latency_ms, "finish_reason": gw_resp.finish_reason},
+            "privacy_rerouted": gw_resp.privacy_rerouted.as_ref().map(|pr| json!({
+                "provider": pr.provider,
+                "blocked_tier": pr.blocked_tier,
+                "reason": pr.reason,
+            }))
+        });
+        if let Some(ref pr) = gw_resp.privacy_rerouted {
+            tracing::warn!(
+                    "Nexus Gateway: privacy re-route tier={} → local provider={} intent={} tokens={}",
+                    pr.blocked_tier, pr.provider, intent, actual_usage.total_tokens
+                );
+        } else {
+            tracing::info!(
+                "Nexus Gateway: intent={} provider={} model={} tokens={}",
+                intent,
+                gw_resp.provider_used,
+                gw_resp.model_used,
+                actual_usage.total_tokens
+            );
+        }
+        Ok((
+            gw_resp.provider_used,
+            gw_resp.model_used,
+            gw_completion,
+            actual_usage,
+            cost,
+            cur,
+        ))
+    }
+
+    /// Esecuzione LLM via Brain gRPC legacy (PATH B): itera i provider candidati,
+    /// salta quelli non sani / rate-limited / falliti, e ritorna il primo che
+    /// completa. Estratta da `run` per contenerne lunghezza e complessita':
+    /// logica di fallback, billing e logging invariati.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_via_neural(
+        &self,
+        db: &PgPool,
+        matrix: &crate::routing_matrix::RoutingMatrix,
+        input: &OrchestratorRequest,
+        routing: &RoutingConfig,
+        intent: &str,
+        forced_provider: Option<&str>,
+        forced_model: Option<&str>,
+        suggested_provider: Option<&str>,
+        suggested_model: Option<&str>,
+        composed_prompt: &str,
+        prompt_corrections: &[Value],
+        token_budget: u32,
+        run_id: Uuid,
+        user_id: Uuid,
+        project_uuid: Uuid,
+    ) -> anyhow::Result<LlmExecution> {
+        let mut selected_provider: Option<String> = None;
+        let mut selected_model: Option<String> = None;
+        let mut completion: Option<serde_json::Value> = None;
+        let mut usage: Option<UsageNumbers> = None;
+        let mut usage_cost: Option<(f64, f64, f64, String)> = None;
+        let mut skip_reasons = Vec::new();
+
+        // In modalità dinamico la scelta del catalogo è autoritativa
+        let provider_candidates = if let Some(provider) = forced_provider {
+            vec![provider.to_string()]
+        } else if routing.behavior_mode == "dinamico" {
+            if let Some(p) = suggested_provider {
+                vec![p.to_string()]
+            } else {
+                routing.candidates(intent, suggested_provider)
+            }
+        } else {
+            routing.candidates(intent, suggested_provider)
+        };
+        for provider in provider_candidates {
+            let health = match self.neural.provider_health(&provider).await {
+                Ok(health) => health,
+                Err(error) => {
+                    skip_reasons.push(format!("{provider}:health_check_failed:{error}"));
+                    continue;
+                }
+            };
+
+            let status = health["status"].as_str().unwrap_or("unknown");
+            if !matches!(status, "ready" | "ok") {
+                let reason = health["reason"]
+                    .as_str()
+                    .or_else(|| health["skipReasons"].get(0).and_then(Value::as_str))
+                    .unwrap_or(status);
+                skip_reasons.push(format!("{provider}:skipped:{reason}"));
+                continue;
+            }
+
+            let model = if forced_provider == Some(provider.as_str()) {
+                forced_model.map(str::to_string).unwrap_or_else(|| {
+                    routing.resolve_model(matrix, &provider, Some(provider.as_str()), None)
+                })
+            } else if routing.behavior_mode == "dinamico"
+                && suggested_provider == Some(provider.as_str())
+                && suggested_model.is_some()
+            {
+                // In dinamico fidiamoci del catalogo: niente override da provider_model_<x>.
+                // suggested_model.is_some() controllato sopra; clone+unwrap_or e' difensivo.
+                suggested_model.map(str::to_string).unwrap_or_default()
+            } else {
+                routing.resolve_model(matrix, &provider, suggested_provider, suggested_model)
+            };
+            let prompt_tokens = mcp_token::count_tokens(composed_prompt) as i32;
+            let estimated_completion_tokens = token_budget as i32 - prompt_tokens;
+            let reservation = match billing::reserve_usage(
+                db,
+                user_id,
+                project_uuid,
+                &provider,
+                &model,
+                prompt_tokens,
+                estimated_completion_tokens.max(0),
+                json!({
+                    "intent": intent,
+                    "profile_id": input.profile_id,
+                    "corrections_count": prompt_corrections.len(),
+                    "request_message_id": input.request_message_id,
+                    "automation_mode": input.automation_mode.as_str(),
+                    "provider_override": forced_provider,
+                    "model_override": forced_model,
+                    "attachments_count": input.attachments.len(),
+                }),
+            )
+            .await
+            {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    skip_reasons.push(format!("{provider}:billing_rejected:{error}"));
+                    continue;
+                }
+            };
+
+            let provider_completion = match self
+                .neural
+                .generate_completion(&provider, &model, composed_prompt)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    billing::release_usage(db, &reservation, "provider_error").await;
+                    let error_msg = error.to_string();
+                    // Distingui rate limit da altri errori
+                    if error_msg.contains("429")
+                        || error_msg.to_lowercase().contains("rate_limit")
+                        || error_msg.to_lowercase().contains("quota")
+                        || error_msg.to_lowercase().contains("too_many_requests")
+                    {
+                        skip_reasons.push(format!("{provider}:rate_limited:{error_msg}"));
+                        tracing::warn!(
+                            "Provider {provider} è rate-limited, provo il prossimo candidato"
+                        );
+                    } else {
+                        skip_reasons.push(format!("{provider}:execution_error:{error_msg}"));
+                    }
+                    continue;
+                }
+            };
+
+            if completion_has_error(&provider_completion) {
+                billing::release_usage(db, &reservation, "provider_failed").await;
+                let error = provider_completion["metadata"]["error"]
+                    .as_str()
+                    .unwrap_or("generation_failed");
+                // Distingui rate limit da altri errori anche nella risposta
+                if error.contains("429")
+                    || error.to_lowercase().contains("rate_limit")
+                    || error.to_lowercase().contains("quota")
+                    || error.to_lowercase().contains("too_many_requests")
+                {
+                    skip_reasons.push(format!("{provider}:rate_limited:{error}"));
+                    tracing::warn!("Provider {provider} segnala rate limit nella risposta, provo il prossimo");
+                } else {
+                    skip_reasons.push(format!("{provider}:failed:{error}"));
+                }
+                continue;
+            }
+
+            let usage_numbers = billing::extract_usage_numbers(
+                &provider_completion,
+                prompt_tokens,
+                estimated_completion_tokens,
+            );
+            let finalized_cost =
+                billing::finalize_usage(db, &reservation, run_id, &usage_numbers).await?;
+
+            selected_provider = Some(provider);
+            selected_model = Some(model);
+            completion = Some(provider_completion);
+            usage = Some(usage_numbers);
+            usage_cost = Some(finalized_cost);
+            break;
+        }
+
+        let provider = selected_provider.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No AI provider available for intent '{intent}'. Skip reasons: {}",
+                skip_reasons.join(", ")
+            )
+        })?;
+        let model = selected_model
+            .unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
+        let completion = completion.ok_or_else(|| anyhow::anyhow!("No completion generated"))?;
+        let usage = usage.unwrap_or(UsageNumbers {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        });
+        let (_, _, cost, cur) = usage_cost.unwrap_or((0.0, 0.0, 0.0, "EUR".to_string()));
+        Ok((provider, model, completion, usage, cost, cur))
+    }
+
+    pub async fn run(
+        &self,
+        db: &PgPool,
+        input: OrchestratorRequest,
+    ) -> anyhow::Result<OrchestratorResult> {
+        let user_id =
+            Uuid::parse_str(&input.user_id).map_err(|_| anyhow::anyhow!("invalid_user_id"))?;
+        let project_uuid = Uuid::parse_str(&input.project_id)
+            .map_err(|_| anyhow::anyhow!("invalid_project_id"))?;
+        let run_id = Uuid::new_v4();
+
+        // Snapshot della routing matrix DB (cache 60s, await sul lock).
+        // Se la matrice non e' caricata, ritorniamo errore esplicito invece
+        // di un fallback nascosto.
+        let matrix_arc = self.routing_matrix.current_async().await.map_err(|e| {
+            anyhow::anyhow!(
+                "routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."
+            )
+        })?;
+        let matrix = &*matrix_arc;
+
+        // Step 1 + 2: Routing locale — zero gRPC, zero latenza aggiuntiva
+        // Usa estimate_complexity per non farsi ingannare da messaggi con liste dati lunghe
+        let msg_tokens_estimate = estimate_complexity(&input.message);
+        let (intent_str, _confidence) = self
+            .classify_intent_with_db_thresholds(db, &input.message)
+            .await;
+        let intent = intent_str.to_string();
+        let mut routing = Self::load_routing_config(db).await?;
+
+        // Routing: se modalità "dinamico" usa il catalogo DB, altrimenti la matrice statica
+        // Risolvi tier/capability dalla cache intent_capability (mig 0110)
+        // (helper unico, regola L).
+        let (base_tier, capability) = self
+            .intent_tier_capability(intent_str, msg_tokens_estimate)
+            .await;
+        let (suggested_provider, suggested_model): (Option<String>, Option<String>) = self
+            .resolve_suggested_model(
+                db,
+                matrix,
+                &routing.behavior_mode,
+                intent_str,
+                msg_tokens_estimate,
+                &base_tier,
+                &capability,
+            )
+            .await;
         if let Some(project_chain) =
             Self::load_project_intent_chain(db, project_uuid, &intent).await?
         {
@@ -1279,289 +1649,47 @@ impl Orchestrator {
         // ── Step 4: LLM Execution ─────────────────────────────────────────────────
         // PATH A: Nexus Gateway (routing, DLP, rate limiting, fallback automatico)
         // PATH B: Brain gRPC diretto (legacy, usato se il gateway non è disponibile)
-        let (provider, model, completion, usage, total_cost, currency) = if let Some(gw) =
-            &self.nexus_gateway
-        {
-            let alias = intent_to_alias(&intent, &routing.behavior_mode, forced_model.as_deref());
-            let gw_model = if let Some(fp) = &forced_provider {
-                format!("{fp}/{}", forced_model.as_deref().unwrap_or(&alias))
-            } else {
-                alias
-            };
-            let gw_req = GwRequest {
-                model: gw_model,
-                messages: vec![GwMessage {
-                    role: "user".to_string(),
-                    content: serde_json::Value::String(composed_prompt.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning: None,
-                    thinking_signature: None,
-                }],
-                max_tokens: Some(token_budget),
-                temperature: None,
-                metadata: GwMetadata {
-                    tenant_id: input.project_id.clone(),
-                    user_id: input.user_id.clone(),
-                    request_id: run_id.to_string(),
-                    // Claim locale di sensibilita' (punto unico dlp, regola L).
-                    // L'enforcement resta nel gateway, che ri-classifica e usa
-                    // max(claim, classificazione) + validate_tier_claim: il claim
-                    // onesto evita di dichiarare 'pubblico' (0) un prompt che il
-                    // DLP locale sa gia' essere sensibile.
-                    sensitivity_tier: crate::dlp::classify_sensitivity(&composed_prompt) as u8,
-                    feature: intent.clone(),
-                },
-                ..Default::default()
-            };
-            let prompt_tokens = mcp_token::count_tokens(&composed_prompt) as i32;
-            let estimated_completion = (token_budget as i32 - prompt_tokens).max(0);
-            // Fallback provider/model letti da DB (matrice routing) invece che hardcoded.
-            let fallback_provider: String = match matrix.lookup("chat", "bilanciata") {
-                Some((p, _)) => p,
-                None => "openai".to_string(),
-            };
-            let hint_provider_owned: String = forced_provider
-                .as_deref()
-                .or(suggested_provider.as_deref())
-                .map(String::from)
-                .unwrap_or(fallback_provider);
-            let fallback_model: String = default_model_for_provider(matrix, &hint_provider_owned);
-            let hint_model_owned: String = forced_model
-                .as_deref()
-                .or(suggested_model.as_deref())
-                .map(String::from)
-                .unwrap_or(fallback_model);
-            let hint_provider = hint_provider_owned.as_str();
-            let hint_model = hint_model_owned.as_str();
-            let reservation = billing::reserve_usage(
-                db,
-                user_id,
-                project_uuid,
-                hint_provider,
-                hint_model,
-                prompt_tokens,
-                estimated_completion,
-                json!({"intent": intent, "profile_id": input.profile_id,
-                           "via_nexus_gateway": true,
-                           "corrections_count": prompt_corrections.len()}),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("billing_rejected: {e}"))?;
-
-            let gw_resp = match gw.complete(gw_req).await {
-                Ok(r) => r,
-                Err(e) => {
-                    billing::release_usage(db, &reservation, "gateway_error").await;
-                    anyhow::bail!("Nexus Gateway failed for intent '{intent}': {e}");
-                }
-            };
-            let actual_usage = UsageNumbers {
-                prompt_tokens: gw_resp.usage.input_tokens as i32,
-                completion_tokens: gw_resp.usage.output_tokens as i32,
-                total_tokens: (gw_resp.usage.input_tokens + gw_resp.usage.output_tokens) as i32,
-            };
-            let (_, _, cost, cur) =
-                billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
-            let gw_completion = json!({"content": gw_resp.content, "metadata": {
-                "provider": gw_resp.provider_used, "model": gw_resp.model_used,
-                "latency_ms": gw_resp.latency_ms, "finish_reason": gw_resp.finish_reason},
-                "privacy_rerouted": gw_resp.privacy_rerouted.as_ref().map(|pr| json!({
-                    "provider": pr.provider,
-                    "blocked_tier": pr.blocked_tier,
-                    "reason": pr.reason,
-                }))
-            });
-            if let Some(ref pr) = gw_resp.privacy_rerouted {
-                tracing::warn!(
-                        "Nexus Gateway: privacy re-route tier={} → local provider={} intent={} tokens={}",
-                        pr.blocked_tier, pr.provider, intent, actual_usage.total_tokens
-                    );
-            } else {
-                tracing::info!(
-                    "Nexus Gateway: intent={} provider={} model={} tokens={}",
-                    intent,
-                    gw_resp.provider_used,
-                    gw_resp.model_used,
-                    actual_usage.total_tokens
-                );
-            }
-            (
-                gw_resp.provider_used,
-                gw_resp.model_used,
-                gw_completion,
-                actual_usage,
-                cost,
-                cur,
-            )
-        } else {
-            // PATH B: Brain gRPC legacy
-            let mut selected_provider: Option<String> = None;
-            let mut selected_model: Option<String> = None;
-            let mut completion: Option<serde_json::Value> = None;
-            let mut usage: Option<UsageNumbers> = None;
-            let mut usage_cost: Option<(f64, f64, f64, String)> = None;
-            let mut skip_reasons = Vec::new();
-
-            // In modalità dinamico la scelta del catalogo è autoritativa
-            let provider_candidates = if let Some(provider) = forced_provider.as_ref() {
-                vec![provider.clone()]
-            } else if routing.behavior_mode == "dinamico" {
-                if let Some(p) = suggested_provider.as_ref() {
-                    vec![p.clone()]
-                } else {
-                    routing.candidates(&intent, suggested_provider.as_deref())
-                }
-            } else {
-                routing.candidates(&intent, suggested_provider.as_deref())
-            };
-            for provider in provider_candidates {
-                let health = match self.neural.provider_health(&provider).await {
-                    Ok(health) => health,
-                    Err(error) => {
-                        skip_reasons.push(format!("{provider}:health_check_failed:{error}"));
-                        continue;
-                    }
-                };
-
-                let status = health["status"].as_str().unwrap_or("unknown");
-                if !matches!(status, "ready" | "ok") {
-                    let reason = health["reason"]
-                        .as_str()
-                        .or_else(|| health["skipReasons"].get(0).and_then(Value::as_str))
-                        .unwrap_or(status);
-                    skip_reasons.push(format!("{provider}:skipped:{reason}"));
-                    continue;
-                }
-
-                let model = if forced_provider.as_deref() == Some(provider.as_str()) {
-                    forced_model.clone().unwrap_or_else(|| {
-                        routing.resolve_model(matrix, &provider, Some(provider.as_str()), None)
-                    })
-                } else if routing.behavior_mode == "dinamico"
-                    && suggested_provider.as_deref() == Some(provider.as_str())
-                    && suggested_model.is_some()
-                {
-                    // In dinamico fidiamoci del catalogo: niente override da provider_model_<x>.
-                    // suggested_model.is_some() controllato sopra; clone+unwrap_or e' difensivo.
-                    suggested_model.clone().unwrap_or_default()
-                } else {
-                    routing.resolve_model(
-                        matrix,
-                        &provider,
-                        suggested_provider.as_deref(),
-                        suggested_model.as_deref(),
-                    )
-                };
-                let prompt_tokens = mcp_token::count_tokens(&composed_prompt) as i32;
-                let estimated_completion_tokens = token_budget as i32 - prompt_tokens;
-                let reservation = match billing::reserve_usage(
+        let (provider, model, completion, usage, total_cost, currency) =
+            if let Some(gw) = &self.nexus_gateway {
+                self.execute_via_gateway(
                     db,
+                    gw,
+                    matrix,
+                    &input,
+                    &routing,
+                    &intent,
+                    forced_provider.as_deref(),
+                    forced_model.as_deref(),
+                    suggested_provider.as_deref(),
+                    suggested_model.as_deref(),
+                    &composed_prompt,
+                    token_budget,
+                    prompt_corrections.len(),
+                    run_id,
                     user_id,
                     project_uuid,
-                    &provider,
-                    &model,
-                    prompt_tokens,
-                    estimated_completion_tokens.max(0),
-                    json!({
-                        "intent": intent,
-                        "profile_id": input.profile_id,
-                        "corrections_count": prompt_corrections.len(),
-                        "request_message_id": input.request_message_id,
-                        "automation_mode": input.automation_mode.as_str(),
-                        "provider_override": forced_provider,
-                        "model_override": forced_model,
-                        "attachments_count": input.attachments.len(),
-                    }),
                 )
-                .await
-                {
-                    Ok(reservation) => reservation,
-                    Err(error) => {
-                        skip_reasons.push(format!("{provider}:billing_rejected:{error}"));
-                        continue;
-                    }
-                };
-
-                let provider_completion = match self
-                    .neural
-                    .generate_completion(&provider, &model, &composed_prompt)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        billing::release_usage(db, &reservation, "provider_error").await;
-                        let error_msg = error.to_string();
-                        // Distingui rate limit da altri errori
-                        if error_msg.contains("429")
-                            || error_msg.to_lowercase().contains("rate_limit")
-                            || error_msg.to_lowercase().contains("quota")
-                            || error_msg.to_lowercase().contains("too_many_requests")
-                        {
-                            skip_reasons.push(format!("{provider}:rate_limited:{error_msg}"));
-                            tracing::warn!(
-                                "Provider {provider} è rate-limited, provo il prossimo candidato"
-                            );
-                        } else {
-                            skip_reasons.push(format!("{provider}:execution_error:{error_msg}"));
-                        }
-                        continue;
-                    }
-                };
-
-                if completion_has_error(&provider_completion) {
-                    billing::release_usage(db, &reservation, "provider_failed").await;
-                    let error = provider_completion["metadata"]["error"]
-                        .as_str()
-                        .unwrap_or("generation_failed");
-                    // Distingui rate limit da altri errori anche nella risposta
-                    if error.contains("429")
-                        || error.to_lowercase().contains("rate_limit")
-                        || error.to_lowercase().contains("quota")
-                        || error.to_lowercase().contains("too_many_requests")
-                    {
-                        skip_reasons.push(format!("{provider}:rate_limited:{error}"));
-                        tracing::warn!("Provider {provider} segnala rate limit nella risposta, provo il prossimo");
-                    } else {
-                        skip_reasons.push(format!("{provider}:failed:{error}"));
-                    }
-                    continue;
-                }
-
-                let usage_numbers = billing::extract_usage_numbers(
-                    &provider_completion,
-                    prompt_tokens,
-                    estimated_completion_tokens,
-                );
-                let finalized_cost =
-                    billing::finalize_usage(db, &reservation, run_id, &usage_numbers).await?;
-
-                selected_provider = Some(provider);
-                selected_model = Some(model);
-                completion = Some(provider_completion);
-                usage = Some(usage_numbers);
-                usage_cost = Some(finalized_cost);
-                break;
-            }
-
-            let provider = selected_provider.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No AI provider available for intent '{intent}'. Skip reasons: {}",
-                    skip_reasons.join(", ")
+                .await?
+            } else {
+                self.execute_via_neural(
+                    db,
+                    matrix,
+                    &input,
+                    &routing,
+                    &intent,
+                    forced_provider.as_deref(),
+                    forced_model.as_deref(),
+                    suggested_provider.as_deref(),
+                    suggested_model.as_deref(),
+                    &composed_prompt,
+                    &prompt_corrections,
+                    token_budget,
+                    run_id,
+                    user_id,
+                    project_uuid,
                 )
-            })?;
-            let model = selected_model
-                .unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
-            let completion =
-                completion.ok_or_else(|| anyhow::anyhow!("No completion generated"))?;
-            let usage = usage.unwrap_or(UsageNumbers {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            });
-            let (_, _, cost, cur) = usage_cost.unwrap_or((0.0, 0.0, 0.0, "EUR".to_string()));
-            (provider, model, completion, usage, cost, cur)
-        };
+                .await?
+            };
 
         // Step 5: Build audit record
         let audit = OrchestratorAudit {

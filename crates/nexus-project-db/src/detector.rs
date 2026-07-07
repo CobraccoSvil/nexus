@@ -6,215 +6,283 @@
 use super::{DbEngine, DbProfile, MigrationTool};
 use std::path::Path;
 
+/// Accumulatore di rilevamento condiviso fra i blocchi di `detect_db_profile`.
+///
+/// Ogni blocco (Alembic, Prisma, sqlx, ...) e' estratto in un helper privato che
+/// muta questo stato; l'ordine di applicazione e' load-bearing (i blocchi successivi
+/// leggono `migration_tool`/`markers`/`engine` gia' popolati dai precedenti e usano
+/// `.or(...)` / `.max(...)` per non sovrascrivere segnali piu' forti).
+struct Detection {
+    markers: Vec<String>,
+    engine: DbEngine,
+    migration_tool: Option<MigrationTool>,
+    migration_path: Option<String>,
+    confidence: f32,
+}
+
+impl Detection {
+    fn new() -> Self {
+        Detection {
+            markers: Vec::new(),
+            engine: DbEngine::Unknown("unknown".into()),
+            migration_tool: None,
+            migration_path: None,
+            confidence: 0.0,
+        }
+    }
+
+    /// `true` se l'engine non e' ancora stato rilevato (equivalente al vecchio
+    /// confronto `engine == DbEngine::Unknown("unknown".into())`).
+    fn engine_unknown(&self) -> bool {
+        self.engine == DbEngine::Unknown("unknown".into())
+    }
+}
+
 /// Entry point principale: riceve la root del progetto e restituisce un `DbProfile`.
 /// Non fallisce mai: se nulla viene rilevato restituisce un profilo con engine Unknown.
 pub fn detect_db_profile(project_root: &Path) -> DbProfile {
-    let mut markers: Vec<String> = Vec::new();
-    let mut engine = DbEngine::Unknown("unknown".into());
-    let mut migration_tool: Option<MigrationTool> = None;
-    let mut migration_path: Option<String> = None;
-    let mut confidence: f32 = 0.0;
+    let mut d = Detection::new();
 
-    // ── 1. Alembic (Python) ───────────────────────────────────────────────
-    if project_root.join("alembic.ini").exists() {
-        markers.push("alembic.ini".into());
-        migration_tool = Some(MigrationTool::Alembic);
-        migration_path = Some("migrations".into());
-        confidence = 0.95;
-    } else if project_root.join("migrations").join("env.py").exists() {
-        markers.push("migrations/env.py".into());
-        migration_tool = Some(MigrationTool::Alembic);
-        migration_path = Some("migrations".into());
-        confidence = 0.90;
+    detect_alembic(project_root, &mut d);
+    detect_prisma(project_root, &mut d);
+    detect_sqlx(project_root, &mut d);
+    detect_rails(project_root, &mut d);
+    detect_flyway(project_root, &mut d);
+    detect_django(project_root, &mut d);
+    detect_knex(project_root, &mut d);
+    detect_liquibase(project_root, &mut d);
+    detect_generic_sql(project_root, &mut d);
+
+    // ── 10. .NET / ASP.NET Core ───────────────────────────────────────────
+    if d.engine_unknown() {
+        if let Some((net_engine, net_tool, net_path)) = detect_dotnet(project_root) {
+            d.engine = net_engine;
+            d.migration_tool = d.migration_tool.take().or(net_tool);
+            d.migration_path = d.migration_path.take().or(net_path);
+            d.confidence = d.confidence.max(0.92);
+        }
     }
 
-    // ── 2. Prisma (Node/TypeScript) ───────────────────────────────────────
+    // ── 11. Engine da .env / package.json ────────────────────────────────
+    if d.engine_unknown() {
+        d.engine = detect_engine_from_config(project_root);
+    }
+
+    // Postgres è default V1 se non rilevato e c'è un migration tool
+    if d.engine_unknown() && d.migration_tool.is_some() {
+        d.engine = DbEngine::Postgres;
+        d.confidence = d.confidence.max(0.50);
+    }
+
+    DbProfile {
+        engine: d.engine,
+        migration_tool: d.migration_tool,
+        migration_path: d.migration_path,
+        marker_files: d.markers,
+        confidence: d.confidence,
+    }
+}
+
+// ── Blocchi di rilevamento (uno per migration tool) ─────────────────────────
+
+/// Blocco 1: Alembic (Python).
+fn detect_alembic(project_root: &Path, d: &mut Detection) {
+    if project_root.join("alembic.ini").exists() {
+        d.markers.push("alembic.ini".into());
+        d.migration_tool = Some(MigrationTool::Alembic);
+        d.migration_path = Some("migrations".into());
+        d.confidence = 0.95;
+    } else if project_root.join("migrations").join("env.py").exists() {
+        d.markers.push("migrations/env.py".into());
+        d.migration_tool = Some(MigrationTool::Alembic);
+        d.migration_path = Some("migrations".into());
+        d.confidence = 0.90;
+    }
+}
+
+/// Blocco 2: Prisma (Node/TypeScript).
+fn detect_prisma(project_root: &Path, d: &mut Detection) {
     if project_root.join("prisma").join("schema.prisma").exists() {
-        markers.push("prisma/schema.prisma".into());
-        migration_tool = Some(MigrationTool::Prisma);
-        migration_path = Some("prisma/migrations".into());
-        confidence = confidence.max(0.98);
+        d.markers.push("prisma/schema.prisma".into());
+        d.migration_tool = Some(MigrationTool::Prisma);
+        d.migration_path = Some("prisma/migrations".into());
+        d.confidence = d.confidence.max(0.98);
         // Leggi provider dal schema.prisma per rilevare engine
         if let Ok(schema) = std::fs::read_to_string(project_root.join("prisma/schema.prisma")) {
-            engine = engine_from_prisma_schema(&schema);
+            d.engine = engine_from_prisma_schema(&schema);
         }
     }
+}
 
-    // ── 3. sqlx (Rust) ────────────────────────────────────────────────────
+/// Blocco 3: sqlx (Rust).
+fn detect_sqlx(project_root: &Path, d: &mut Detection) {
     let cargo_toml_path = project_root.join("Cargo.toml");
-    if cargo_toml_path.exists() {
-        if let Ok(cargo) = std::fs::read_to_string(&cargo_toml_path) {
-            if cargo.contains("sqlx") {
-                markers.push("Cargo.toml[sqlx]".into());
-                // Cerca anche migrations/*.sql
-                if project_root.join("migrations").exists() {
-                    markers.push("migrations/".into());
-                    migration_tool = migration_tool.or(Some(MigrationTool::Sqlx));
-                    migration_path = migration_path.or(Some("migrations".into()));
-                    confidence = confidence.max(0.88);
-                }
-            }
-            // Rilevamento engine da DATABASE_URL in .env o da feature sqlx
-            if cargo.contains("postgres") || cargo.contains("postgresql") {
-                engine = DbEngine::Postgres;
-            } else if cargo.contains("mysql") {
-                engine = DbEngine::Mysql;
-            } else if cargo.contains("sqlite") {
-                engine = DbEngine::Sqlite;
-            }
+    if !cargo_toml_path.exists() {
+        return;
+    }
+    let Ok(cargo) = std::fs::read_to_string(&cargo_toml_path) else {
+        return;
+    };
+    if cargo.contains("sqlx") {
+        d.markers.push("Cargo.toml[sqlx]".into());
+        // Cerca anche migrations/*.sql
+        if project_root.join("migrations").exists() {
+            d.markers.push("migrations/".into());
+            d.migration_tool = d.migration_tool.take().or(Some(MigrationTool::Sqlx));
+            d.migration_path = d.migration_path.take().or(Some("migrations".into()));
+            d.confidence = d.confidence.max(0.88);
         }
     }
+    // Rilevamento engine da DATABASE_URL in .env o da feature sqlx
+    if cargo.contains("postgres") || cargo.contains("postgresql") {
+        d.engine = DbEngine::Postgres;
+    } else if cargo.contains("mysql") {
+        d.engine = DbEngine::Mysql;
+    } else if cargo.contains("sqlite") {
+        d.engine = DbEngine::Sqlite;
+    }
+}
 
-    // ── 4. Rails ActiveRecord (Ruby) ──────────────────────────────────────
-    if project_root.join("db").join("migrate").exists() && project_root.join("Gemfile").exists() {
-        markers.push("db/migrate/".into());
-        markers.push("Gemfile".into());
-        migration_tool = migration_tool.or(Some(MigrationTool::Rails));
-        migration_path = migration_path.or(Some("db/migrate".into()));
-        confidence = confidence.max(0.92);
-        if let Ok(gemfile) = std::fs::read_to_string(project_root.join("Gemfile")) {
-            if gemfile.contains("pg") || gemfile.contains("activerecord-postgresql") {
-                engine = DbEngine::Postgres;
-            } else if gemfile.contains("mysql") {
-                engine = DbEngine::Mysql;
-            } else if gemfile.contains("sqlite") {
-                engine = DbEngine::Sqlite;
-            }
+/// Blocco 4: Rails ActiveRecord (Ruby).
+fn detect_rails(project_root: &Path, d: &mut Detection) {
+    if !(project_root.join("db").join("migrate").exists() && project_root.join("Gemfile").exists())
+    {
+        return;
+    }
+    d.markers.push("db/migrate/".into());
+    d.markers.push("Gemfile".into());
+    d.migration_tool = d.migration_tool.take().or(Some(MigrationTool::Rails));
+    d.migration_path = d.migration_path.take().or(Some("db/migrate".into()));
+    d.confidence = d.confidence.max(0.92);
+    if let Ok(gemfile) = std::fs::read_to_string(project_root.join("Gemfile")) {
+        if gemfile.contains("pg") || gemfile.contains("activerecord-postgresql") {
+            d.engine = DbEngine::Postgres;
+        } else if gemfile.contains("mysql") {
+            d.engine = DbEngine::Mysql;
+        } else if gemfile.contains("sqlite") {
+            d.engine = DbEngine::Sqlite;
         }
     }
+}
 
-    // ── 5. Flyway (JVM) ───────────────────────────────────────────────────
+/// Blocco 5: Flyway (JVM) — marker espliciti o pattern V*__*.sql in db/migration.
+fn detect_flyway(project_root: &Path, d: &mut Detection) {
     if project_root.join("flyway.conf").exists() || project_root.join("flyway.toml").exists() {
         let marker = if project_root.join("flyway.conf").exists() {
             "flyway.conf"
         } else {
             "flyway.toml"
         };
-        markers.push(marker.into());
-        migration_tool = migration_tool.or(Some(MigrationTool::Flyway));
-        migration_path = migration_path.or(Some("db/migration".into()));
-        confidence = confidence.max(0.95);
-    } else {
-        // Cerca pattern V*__*.sql in db/migration
-        let flyway_dir = project_root.join("db").join("migration");
-        if flyway_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&flyway_dir) {
-                let has_flyway = entries.flatten().any(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    name.starts_with('V') && name.contains("__") && name.ends_with(".sql")
-                });
-                if has_flyway {
-                    markers.push("db/migration/V*__*.sql".into());
-                    migration_tool = migration_tool.or(Some(MigrationTool::Flyway));
-                    migration_path = migration_path.or(Some("db/migration".into()));
-                    confidence = confidence.max(0.85);
-                }
-            }
+        d.markers.push(marker.into());
+        d.migration_tool = d.migration_tool.take().or(Some(MigrationTool::Flyway));
+        d.migration_path = d.migration_path.take().or(Some("db/migration".into()));
+        d.confidence = d.confidence.max(0.95);
+        return;
+    }
+    // Cerca pattern V*__*.sql in db/migration
+    let flyway_dir = project_root.join("db").join("migration");
+    if !flyway_dir.exists() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(&flyway_dir) {
+        let has_flyway = entries.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with('V') && name.contains("__") && name.ends_with(".sql")
+        });
+        if has_flyway {
+            d.markers.push("db/migration/V*__*.sql".into());
+            d.migration_tool = d.migration_tool.take().or(Some(MigrationTool::Flyway));
+            d.migration_path = d.migration_path.take().or(Some("db/migration".into()));
+            d.confidence = d.confidence.max(0.85);
         }
     }
+}
 
-    // ── 6. Django (Python) ────────────────────────────────────────────────
-    if !markers.iter().any(|m| m.contains("alembic")) {
-        // Django usa directory migrations/ con __init__.py e file 0001_*.py
-        if let Ok(entries) = std::fs::read_dir(project_root) {
-            for app_entry in entries.flatten() {
-                let migrations_dir = app_entry.path().join("migrations");
-                let init_py = migrations_dir.join("__init__.py");
-                if migrations_dir.exists() && init_py.exists() {
-                    if let Ok(sub) = std::fs::read_dir(&migrations_dir) {
-                        let has_django = sub.flatten().any(|e| {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            name.starts_with("000") && name.ends_with(".py")
-                        });
-                        if has_django {
-                            let rel = migrations_dir
-                                .strip_prefix(project_root)
-                                .unwrap_or(&migrations_dir)
-                                .to_string_lossy()
-                                .to_string();
-                            markers.push(format!("{}/0001_*.py", rel));
-                            migration_tool = migration_tool.or(Some(MigrationTool::Django));
-                            migration_path = migration_path.or(Some(rel));
-                            confidence = confidence.max(0.88);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+/// Blocco 6: Django (Python) — directory migrations/ con __init__.py e file 000*.py.
+fn detect_django(project_root: &Path, d: &mut Detection) {
+    if d.markers.iter().any(|m| m.contains("alembic")) {
+        return;
     }
-
-    // ── 7. Knex (Node.js) ─────────────────────────────────────────────────
-    for knex_file in &["knexfile.js", "knexfile.ts", "knexfile.cjs"] {
-        if project_root.join(knex_file).exists() {
-            markers.push((*knex_file).into());
-            migration_tool = migration_tool.or(Some(MigrationTool::Knex));
-            migration_path = migration_path.or(Some("migrations".into()));
-            confidence = confidence.max(0.90);
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return;
+    };
+    for app_entry in entries.flatten() {
+        let migrations_dir = app_entry.path().join("migrations");
+        let init_py = migrations_dir.join("__init__.py");
+        if !(migrations_dir.exists() && init_py.exists()) {
+            continue;
+        }
+        let Ok(sub) = std::fs::read_dir(&migrations_dir) else {
+            continue;
+        };
+        let has_django = sub.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with("000") && name.ends_with(".py")
+        });
+        if has_django {
+            let rel = migrations_dir
+                .strip_prefix(project_root)
+                .unwrap_or(&migrations_dir)
+                .to_string_lossy()
+                .to_string();
+            d.markers.push(format!("{}/0001_*.py", rel));
+            d.migration_tool = d.migration_tool.take().or(Some(MigrationTool::Django));
+            d.migration_path = d.migration_path.take().or(Some(rel));
+            d.confidence = d.confidence.max(0.88);
             break;
         }
     }
+}
 
-    // ── 8. Liquibase ──────────────────────────────────────────────────────
+/// Blocco 7: Knex (Node.js).
+fn detect_knex(project_root: &Path, d: &mut Detection) {
+    for knex_file in &["knexfile.js", "knexfile.ts", "knexfile.cjs"] {
+        if project_root.join(knex_file).exists() {
+            d.markers.push((*knex_file).into());
+            d.migration_tool = d.migration_tool.take().or(Some(MigrationTool::Knex));
+            d.migration_path = d.migration_path.take().or(Some("migrations".into()));
+            d.confidence = d.confidence.max(0.90);
+            break;
+        }
+    }
+}
+
+/// Blocco 8: Liquibase.
+fn detect_liquibase(project_root: &Path, d: &mut Detection) {
     for lb_file in &[
         "liquibase.properties",
         "changelog.xml",
         "db/changelog/db.changelog-master.xml",
     ] {
         if project_root.join(lb_file).exists() {
-            markers.push((*lb_file).into());
-            migration_tool = migration_tool.or(Some(MigrationTool::Liquibase));
-            migration_path = migration_path.or(Some("db/changelog".into()));
-            confidence = confidence.max(0.88);
+            d.markers.push((*lb_file).into());
+            d.migration_tool = d.migration_tool.take().or(Some(MigrationTool::Liquibase));
+            d.migration_path = d.migration_path.take().or(Some("db/changelog".into()));
+            d.confidence = d.confidence.max(0.88);
             break;
         }
     }
+}
 
-    // ── 9. Fallback: cartella migrations/ con SQL files (generic-sql) ─────
-    if migration_tool.is_none() {
-        let generic_dir = project_root.join("migrations");
-        if generic_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&generic_dir) {
-                let has_sql = entries
-                    .flatten()
-                    .any(|e| e.file_name().to_string_lossy().ends_with(".sql"));
-                if has_sql {
-                    markers.push("migrations/*.sql".into());
-                    migration_tool = Some(MigrationTool::GenericSql);
-                    migration_path = Some("migrations".into());
-                    confidence = 0.60;
-                }
-            }
+/// Blocco 9: fallback generico — cartella migrations/ con file .sql.
+fn detect_generic_sql(project_root: &Path, d: &mut Detection) {
+    if d.migration_tool.is_some() {
+        return;
+    }
+    let generic_dir = project_root.join("migrations");
+    if !generic_dir.exists() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(&generic_dir) {
+        let has_sql = entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".sql"));
+        if has_sql {
+            d.markers.push("migrations/*.sql".into());
+            d.migration_tool = Some(MigrationTool::GenericSql);
+            d.migration_path = Some("migrations".into());
+            d.confidence = 0.60;
         }
-    }
-
-    // ── 10. .NET / ASP.NET Core ───────────────────────────────────────────
-    if engine == DbEngine::Unknown("unknown".into()) {
-        if let Some((net_engine, net_tool, net_path)) = detect_dotnet(project_root) {
-            engine = net_engine;
-            migration_tool = migration_tool.or(net_tool);
-            migration_path = migration_path.or(net_path);
-            confidence = confidence.max(0.92);
-        }
-    }
-
-    // ── 11. Engine da .env / package.json ────────────────────────────────
-    if engine == DbEngine::Unknown("unknown".into()) {
-        engine = detect_engine_from_config(project_root);
-    }
-
-    // Postgres è default V1 se non rilevato e c'è un migration tool
-    if engine == DbEngine::Unknown("unknown".into()) && migration_tool.is_some() {
-        engine = DbEngine::Postgres;
-        confidence = confidence.max(0.50);
-    }
-
-    DbProfile {
-        engine,
-        migration_tool,
-        migration_path,
-        marker_files: markers,
-        confidence,
     }
 }
 
@@ -348,57 +416,69 @@ fn engine_from_appsettings(content: &str) -> Option<DbEngine> {
         let value = value.trim_matches('"').trim_matches(',').trim_matches('"');
         let lc = value.to_ascii_lowercase();
 
-        // ── 1. PostgreSQL: segnali univoci ────────────────────────────────
-        // Schema URL non ambiguo
-        if lc.contains("postgresql://") || lc.contains("postgres://") {
-            return Some(DbEngine::Postgres);
-        }
-        // Keyword `Host=` e' usata SOLO da Npgsql, mai da SQL Server
-        if lc.contains("host=") {
-            return Some(DbEngine::Postgres);
-        }
-        // Porta esplicita 5432: certa Postgres
-        if lc.contains("port=5432") {
-            return Some(DbEngine::Postgres);
-        }
-        // Npgsql usa "Server=host;Port=NNNN;..." (keyword `Port=` separata).
-        // SQL Server usa invece "Server=host,1433;..." (porta dopo virgola).
-        // Se troviamo `Port=` come keyword separata (preceduta da `;` o inizio
-        // stringa) e nessun `,1433`/`,1434`, e' Npgsql/Postgres.
-        let has_explicit_port_kw = lc.contains(";port=") || lc.starts_with("port=");
-        let has_sqlserver_inline_port = lc.contains(",1433") || lc.contains(",1434");
-        if has_explicit_port_kw && !has_sqlserver_inline_port {
-            // Se la porta e' fra le tipiche Postgres
-            // (5432, 5433, 5434...) o non specificata diversamente, Postgres.
-            // Ma controlliamo anche MySQL prima (3306).
-            if lc.contains("port=3306") {
-                return Some(DbEngine::Mysql);
-            }
-            return Some(DbEngine::Postgres);
-        }
-
-        // ── 2. MySQL ──────────────────────────────────────────────────────
-        if lc.contains("mysql://") {
-            return Some(DbEngine::Mysql);
-        }
-        if lc.contains("server=") && lc.contains("port=3306") {
-            return Some(DbEngine::Mysql);
-        }
-
-        // ── 3. SQL Server (fallback) ──────────────────────────────────────
-        // Pattern certi: "Initial Catalog=" o "Data Source=" + "Initial Catalog="
-        if lc.contains("initial catalog=") {
-            return Some(DbEngine::Sqlserver);
-        }
-        if lc.contains("data source=") && lc.contains("initial catalog=") {
-            return Some(DbEngine::Sqlserver);
-        }
-        // Pattern legacy: Server= + Database= senza nessun segnale Postgres/MySQL
-        // (gia' filtrati sopra)
-        if lc.contains("server=") && lc.contains("database=") {
-            return Some(DbEngine::Sqlserver);
+        if let Some(engine) = classify_connection_string(&lc) {
+            return Some(engine);
         }
     }
+    None
+}
+
+/// Classifica l'engine da una singola connection string gia' normalizzata a
+/// lowercase (`lc`). Ritorna `None` se la riga non contiene segnali riconoscibili
+/// (il chiamante prosegue con le righe successive). Estratto da
+/// `engine_from_appsettings` per contenere la complessita' ciclomatica.
+fn classify_connection_string(lc: &str) -> Option<DbEngine> {
+    // ── 1. PostgreSQL: segnali univoci ────────────────────────────────
+    // Schema URL non ambiguo
+    if lc.contains("postgresql://") || lc.contains("postgres://") {
+        return Some(DbEngine::Postgres);
+    }
+    // Keyword `Host=` e' usata SOLO da Npgsql, mai da SQL Server
+    if lc.contains("host=") {
+        return Some(DbEngine::Postgres);
+    }
+    // Porta esplicita 5432: certa Postgres
+    if lc.contains("port=5432") {
+        return Some(DbEngine::Postgres);
+    }
+    // Npgsql usa "Server=host;Port=NNNN;..." (keyword `Port=` separata).
+    // SQL Server usa invece "Server=host,1433;..." (porta dopo virgola).
+    // Se troviamo `Port=` come keyword separata (preceduta da `;` o inizio
+    // stringa) e nessun `,1433`/`,1434`, e' Npgsql/Postgres.
+    let has_explicit_port_kw = lc.contains(";port=") || lc.starts_with("port=");
+    let has_sqlserver_inline_port = lc.contains(",1433") || lc.contains(",1434");
+    if has_explicit_port_kw && !has_sqlserver_inline_port {
+        // Se la porta e' fra le tipiche Postgres
+        // (5432, 5433, 5434...) o non specificata diversamente, Postgres.
+        // Ma controlliamo anche MySQL prima (3306).
+        if lc.contains("port=3306") {
+            return Some(DbEngine::Mysql);
+        }
+        return Some(DbEngine::Postgres);
+    }
+
+    // ── 2. MySQL ──────────────────────────────────────────────────────
+    if lc.contains("mysql://") {
+        return Some(DbEngine::Mysql);
+    }
+    if lc.contains("server=") && lc.contains("port=3306") {
+        return Some(DbEngine::Mysql);
+    }
+
+    // ── 3. SQL Server (fallback) ──────────────────────────────────────
+    // Pattern certi: "Initial Catalog=" o "Data Source=" + "Initial Catalog="
+    if lc.contains("initial catalog=") {
+        return Some(DbEngine::Sqlserver);
+    }
+    if lc.contains("data source=") && lc.contains("initial catalog=") {
+        return Some(DbEngine::Sqlserver);
+    }
+    // Pattern legacy: Server= + Database= senza nessun segnale Postgres/MySQL
+    // (gia' filtrati sopra)
+    if lc.contains("server=") && lc.contains("database=") {
+        return Some(DbEngine::Sqlserver);
+    }
+
     None
 }
 

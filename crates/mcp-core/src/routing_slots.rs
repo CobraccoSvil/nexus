@@ -106,78 +106,47 @@ impl SlotsRoutingMatrix {
         if !slots.is_complete() {
             return None;
         }
-        // Probe a wildcard-relaxation crescente: (framework, scope, target).
-        // Some(x) = match esatto o riga '*'; None = solo riga '*'.
-        let probes: [(Option<&str>, Option<&str>, Option<&str>); 5] = [
-            (
-                Some(slots.framework.as_str()),
-                Some(slots.scope.as_str()),
-                Some(slots.target_type.as_str()),
-            ),
-            (
-                None,
-                Some(slots.scope.as_str()),
-                Some(slots.target_type.as_str()),
-            ),
-            (None, None, Some(slots.target_type.as_str())),
-            (
-                Some(slots.framework.as_str()),
-                None,
-                Some(slots.target_type.as_str()),
-            ),
-            (None, None, None),
-        ];
-
-        for (fw_probe, scope_probe, target_probe) in probes {
-            let mut matches: Vec<&SlotsRoutingEntry> = self
-                .entries
-                .iter()
-                .filter(|e| {
-                    if e.action_verb != slots.action_verb {
-                        return false;
-                    }
-                    // target: se probe e' None usiamo wildcard, altrimenti match diretto OR row='*'
-                    let target_ok = match target_probe {
-                        Some(t) => e.target_type == t || e.target_type == "*",
-                        None => e.target_type == "*",
-                    };
-                    if !target_ok {
-                        return false;
-                    }
-                    let scope_ok = match scope_probe {
-                        Some(s) => e.scope == s || e.scope == "*",
-                        None => e.scope == "*",
-                    };
-                    if !scope_ok {
-                        return false;
-                    }
-                    // framework: stringhe vuote ammesse come wildcard
-                    
-                    match fw_probe {
-                        Some(f) if !f.is_empty() => e.framework == f || e.framework == "*",
-                        _ => e.framework == "*",
-                    }
-                })
-                .collect();
-            if !matches.is_empty() {
-                // Preferenza al match piu' specifico (campi esatti sui wildcard)
-                // se piu' righe collidono nello stesso probe.
-                matches.sort_by_key(|e| {
-                    let exact = (e.target_type != "*") as u8
-                        + (e.scope != "*") as u8
-                        + (e.framework != "*") as u8;
-                    std::cmp::Reverse(exact)
-                });
-                let e = matches[0];
-                return Some(SlotRequirement {
-                    preferred_tier: e.preferred_tier.clone(),
-                    required_capabilities: e.required_capabilities.clone(),
-                    requires_tool_use: e.requires_tool_use,
-                    cost_direction: e.cost_direction.clone(),
-                });
+        for (fw_probe, scope_probe, target_probe) in probe_sequence(slots) {
+            if let Some(req) = self.match_probe(slots, fw_probe, scope_probe, target_probe) {
+                return Some(req);
             }
         }
         None
+    }
+
+    /// Filtra le entry che matchano una singola probe e, in caso di collisione,
+    /// ritorna il requisito della riga piu' specifica (campi esatti preferiti ai
+    /// wildcard). None se nessuna entry matcha questo livello di specificita'.
+    fn match_probe(
+        &self,
+        slots: &ActionSlots,
+        fw_probe: Option<&str>,
+        scope_probe: Option<&str>,
+        target_probe: Option<&str>,
+    ) -> Option<SlotRequirement> {
+        let mut matches: Vec<&SlotsRoutingEntry> = self
+            .entries
+            .iter()
+            .filter(|e| entry_matches_probe(e, slots, fw_probe, scope_probe, target_probe))
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        // Preferenza al match piu' specifico (campi esatti sui wildcard)
+        // se piu' righe collidono nello stesso probe.
+        matches.sort_by_key(|e| {
+            let exact = (e.target_type != "*") as u8
+                + (e.scope != "*") as u8
+                + (e.framework != "*") as u8;
+            std::cmp::Reverse(exact)
+        });
+        let e = matches[0];
+        Some(SlotRequirement {
+            preferred_tier: e.preferred_tier.clone(),
+            required_capabilities: e.required_capabilities.clone(),
+            requires_tool_use: e.requires_tool_use,
+            cost_direction: e.cost_direction.clone(),
+        })
     }
 
     /// Conta le entry attive (utile per dashboard + test).
@@ -195,6 +164,67 @@ impl SlotsRoutingMatrix {
     }
 }
 
+/// Sequenza di probe a wildcard-relaxation crescente per il lookup gerarchico:
+/// (framework, scope, target). `Some(x)` = match esatto o riga '*'; `None` =
+/// solo riga '*'. L'ordine riflette la specificita' decrescente documentata su
+/// `lookup`.
+fn probe_sequence(slots: &ActionSlots) -> [(Option<&str>, Option<&str>, Option<&str>); 5] {
+    [
+        (
+            Some(slots.framework.as_str()),
+            Some(slots.scope.as_str()),
+            Some(slots.target_type.as_str()),
+        ),
+        (
+            None,
+            Some(slots.scope.as_str()),
+            Some(slots.target_type.as_str()),
+        ),
+        (None, None, Some(slots.target_type.as_str())),
+        (
+            Some(slots.framework.as_str()),
+            None,
+            Some(slots.target_type.as_str()),
+        ),
+        (None, None, None),
+    ]
+}
+
+/// True se `e` matcha la chiave `slots` per la probe data. `None` su un campo
+/// significa "solo riga '*'"; `Some(v)` significa "match diretto oppure riga
+/// '*'". Il framework tratta le stringhe vuote come wildcard.
+fn entry_matches_probe(
+    e: &SlotsRoutingEntry,
+    slots: &ActionSlots,
+    fw_probe: Option<&str>,
+    scope_probe: Option<&str>,
+    target_probe: Option<&str>,
+) -> bool {
+    if e.action_verb != slots.action_verb {
+        return false;
+    }
+    // target: se probe e' None usiamo wildcard, altrimenti match diretto OR row='*'
+    let target_ok = match target_probe {
+        Some(t) => e.target_type == t || e.target_type == "*",
+        None => e.target_type == "*",
+    };
+    if !target_ok {
+        return false;
+    }
+    let scope_ok = match scope_probe {
+        Some(s) => e.scope == s || e.scope == "*",
+        None => e.scope == "*",
+    };
+    if !scope_ok {
+        return false;
+    }
+    // framework: stringhe vuote ammesse come wildcard
+    match fw_probe {
+        Some(f) if !f.is_empty() => e.framework == f || e.framework == "*",
+        _ => e.framework == "*",
+    }
+}
+
 /// Safety-net: estrae slots euristicamente dal messaggio quando il classifier
 /// LLM ha fallito (JSON parse fail, timeout, ecc.). Pattern matching su
 /// keyword italiane/inglesi piu' comuni. Confidence sempre <= 0.65 per
@@ -205,96 +235,122 @@ impl SlotsRoutingMatrix {
 pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
     let lc = message.to_lowercase();
 
-    // === action_verb ===
-    let resolve_kw = [
-        "risolv",
-        "correggi",
-        "ripara",
-        "fix the",
-        " fix ",
-        "make work",
-        "make pass",
-        "fai funzionare",
-        "fai passare",
-        "non passano",
-        "stanno fallendo",
-        "are failing",
-        "is failing",
-        "non funziona",
-        "make them pass",
-        "esegui i test e",
-    ];
-    let write_kw = [
-        "scrivi",
-        "aggiung",
-        "crea ",
-        "create ",
-        "aggiungi",
-        "implementa",
-        "implement",
-        "add ",
-        "write new",
-        "write a",
-        "scrivere",
-    ];
-    let read_kw = [
-        "leggi",
-        "leggere",
-        "elenca",
-        "mostra",
-        "ispez",
-        "controlla lo stato",
-        "list files",
-        "list ",
-        "guarda",
-    ];
-    let analyze_kw = [
-        "perche'",
-        "perché",
-        "perche ",
-        "why does",
-        "investiga",
-        "analizza",
-        "indaga",
-        "root cause",
-    ];
-    let refactor_kw = ["refactor", "rinomina", "ristruttur", "estrai funzione"];
-    let configure_kw = [
-        "configur",
-        "imposta",
-        "setup",
-        "set up",
-        "abilit",
-        "disabilit",
-    ];
-    let deploy_kw = ["deploy", "deploya", "rilascia", "rilancia"];
-    let delete_kw = ["elimin", "rimuov", "cancell", "delete", "remove"];
-
-    let action_verb = if resolve_kw.iter().any(|k| lc.contains(k)) {
-        "resolve"
-    } else if delete_kw.iter().any(|k| lc.contains(k)) {
-        "delete"
-    } else if deploy_kw.iter().any(|k| lc.contains(k)) {
-        "deploy"
-    } else if configure_kw.iter().any(|k| lc.contains(k)) {
-        "configure"
-    } else if refactor_kw.iter().any(|k| lc.contains(k)) {
-        "refactor"
-    } else if analyze_kw.iter().any(|k| lc.contains(k)) {
-        "analyze"
-    } else if write_kw.iter().any(|k| lc.contains(k)) {
-        "write"
-    } else if read_kw.iter().any(|k| lc.contains(k)) {
-        "read"
-    } else {
-        ""
-    };
+    let action_verb = infer_action_verb(&lc);
     if action_verb.is_empty() {
         return ActionSlots::default();
     }
+    let target_type = infer_target_type(&lc);
+    let framework = infer_framework(&lc);
+    let scope = infer_scope(&lc, action_verb, target_type);
 
-    // === target_type ===
-    let target_type = if lc.contains("test")
+    ActionSlots {
+        action_verb: action_verb.to_string(),
+        target_type: target_type.to_string(),
+        framework: framework.to_string(),
+        scope: scope.to_string(),
+        // Confidence bassa: e' keyword-based, non semantic. Sopra la soglia
+        // 0.60 di route_by_slots ma sotto la soglia LLM (0.70-0.85).
+        confidence: 0.65,
+    }
+}
+
+// Keyword per categoria d'azione (estratte come const per tenere
+// `infer_action_verb` sotto la soglia di lunghezza: sono dati, non logica).
+const RESOLVE_KW: &[&str] = &[
+    "risolv",
+    "correggi",
+    "ripara",
+    "fix the",
+    " fix ",
+    "make work",
+    "make pass",
+    "fai funzionare",
+    "fai passare",
+    "non passano",
+    "stanno fallendo",
+    "are failing",
+    "is failing",
+    "non funziona",
+    "make them pass",
+    "esegui i test e",
+];
+const WRITE_KW: &[&str] = &[
+    "scrivi",
+    "aggiung",
+    "crea ",
+    "create ",
+    "aggiungi",
+    "implementa",
+    "implement",
+    "add ",
+    "write new",
+    "write a",
+    "scrivere",
+];
+const READ_KW: &[&str] = &[
+    "leggi",
+    "leggere",
+    "elenca",
+    "mostra",
+    "ispez",
+    "controlla lo stato",
+    "list files",
+    "list ",
+    "guarda",
+];
+const ANALYZE_KW: &[&str] = &[
+    "perche'",
+    "perché",
+    "perche ",
+    "why does",
+    "investiga",
+    "analizza",
+    "indaga",
+    "root cause",
+];
+const REFACTOR_KW: &[&str] = &["refactor", "rinomina", "ristruttur", "estrai funzione"];
+const CONFIGURE_KW: &[&str] = &[
+    "configur",
+    "imposta",
+    "setup",
+    "set up",
+    "abilit",
+    "disabilit",
+];
+const DEPLOY_KW: &[&str] = &["deploy", "deploya", "rilascia", "rilancia"];
+const DELETE_KW: &[&str] = &["elimin", "rimuov", "cancell", "delete", "remove"];
+
+/// Deriva l'`action_verb` canonico dalle keyword nel messaggio (gia' in
+/// lowercase). Ritorna "" se nessuna categoria d'azione matcha (in quel caso
+/// il chiamante fa fallback ad `ActionSlots::default()`). Ordine di priorita'
+/// preservato dalla catena `if/else` originale.
+fn infer_action_verb(lc: &str) -> &'static str {
+    let has_any = |kw: &[&str]| kw.iter().any(|k| lc.contains(k));
+    if has_any(RESOLVE_KW) {
+        "resolve"
+    } else if has_any(DELETE_KW) {
+        "delete"
+    } else if has_any(DEPLOY_KW) {
+        "deploy"
+    } else if has_any(CONFIGURE_KW) {
+        "configure"
+    } else if has_any(REFACTOR_KW) {
+        "refactor"
+    } else if has_any(ANALYZE_KW) {
+        "analyze"
+    } else if has_any(WRITE_KW) {
+        "write"
+    } else if has_any(READ_KW) {
+        "read"
+    } else {
+        ""
+    }
+}
+
+/// Deriva il `target_type` canonico dalle keyword nel messaggio (lowercase).
+/// Default "code" se nessun target specifico matcha. Ordine preservato.
+fn infer_target_type(lc: &str) -> &'static str {
+    if lc.contains("test")
         || lc.contains("playwright")
         || lc.contains("pytest")
         || lc.contains("jest")
@@ -319,10 +375,13 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
         "data"
     } else {
         "code"
-    };
+    }
+}
 
-    // === framework ===
-    let framework = if lc.contains("playwright") {
+/// Deriva il `framework` canonico dalle keyword nel messaggio (lowercase).
+/// Ritorna "" (opzionale) se nessun framework noto matcha. Ordine preservato.
+fn infer_framework(lc: &str) -> &'static str {
+    if lc.contains("playwright") {
         "playwright"
     } else if lc.contains("pytest") {
         "pytest"
@@ -338,10 +397,14 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
         "nextjs"
     } else {
         ""
-    };
+    }
+}
 
-    // === scope ===
-    let scope = if lc.contains("cross-service")
+/// Deriva lo `scope` canonico dalle keyword nel messaggio (lowercase). Usa
+/// anche `action_verb`/`target_type` gia' derivati per la regola "esegui test
+/// e risolvi" (quasi sempre multi-file). Default "single". Ordine preservato.
+fn infer_scope(lc: &str, action_verb: &str, target_type: &str) -> &'static str {
+    if lc.contains("cross-service")
         || lc.contains("cross service")
         || lc.contains("microservi")
         || lc.contains("frontend e backend")
@@ -364,16 +427,6 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
         "system_wide"
     } else {
         "single"
-    };
-
-    ActionSlots {
-        action_verb: action_verb.to_string(),
-        target_type: target_type.to_string(),
-        framework: framework.to_string(),
-        scope: scope.to_string(),
-        // Confidence bassa: e' keyword-based, non semantic. Sopra la soglia
-        // 0.60 di route_by_slots ma sotto la soglia LLM (0.70-0.85).
-        confidence: 0.65,
     }
 }
 

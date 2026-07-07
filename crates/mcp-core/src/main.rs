@@ -195,6 +195,436 @@ struct AppState {
     pub(crate) project_meta_pools: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
 }
 
+// Fallback quando `tail` non parte (Unix): non potendo seguire l'output, resta in
+// polling della liveness del processo; alla morte marca status='stopped' e prova a
+// leggere l'exit code da /proc/{pid}/status. Estratto da `spawn_reattach_monitor`
+// per tenere ciascuna funzione sotto la soglia di lunghezza (comportamento invariato).
+#[cfg(unix)]
+async fn reattach_fallback_poll(id: uuid::Uuid, pid_val: i32, db_clone: &sqlx::PgPool) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if !crate::process_util::process_alive(pid_val as u32) {
+            let exit_code: Option<i32> = tokio::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("cat /proc/{}/status 2>/dev/null | grep -c VmPeak", pid_val),
+                ])
+                .output()
+                .await
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse().ok());
+            let _ = sqlx::query(
+                "UPDATE agent_processes SET status='stopped', exit_code=$2, stopped_at=NOW() WHERE id=$1"
+            )
+            .bind(id)
+            .bind(exit_code.unwrap_or(-1))
+            .execute(db_clone)
+            .await;
+            break;
+        }
+    }
+}
+
+// Legge l'output del `tail` riga per riga e lo appende al DB in batch (ogni 2s o a
+// EOF). Estratto da `spawn_reattach_monitor` per contenere la lunghezza della
+// funzione principale (comportamento invariato).
+#[cfg(unix)]
+async fn reattach_stream_output(
+    mut stdout: tokio::process::ChildStdout,
+    id: uuid::Uuid,
+    db_clone: &sqlx::PgPool,
+) {
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(&mut stdout).lines();
+    let mut buf = String::new();
+    let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(l)) => { buf.push_str(&l); buf.push('\n'); }
+                    _ => break,
+                }
+            }
+            _ = flush_tick.tick() => {
+                if !buf.is_empty() {
+                    let chunk = std::mem::take(&mut buf);
+                    let _ = sqlx::query(
+                        "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
+                    )
+                    .bind(&chunk)
+                    .bind(id)
+                    .execute(db_clone)
+                    .await;
+                }
+            }
+        }
+    }
+    if !buf.is_empty() {
+        let _ = sqlx::query(
+            "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
+        )
+        .bind(&buf)
+        .bind(id)
+        .execute(db_clone)
+        .await;
+    }
+}
+
+// Re-attach del monitoring su un processo sopravvissuto a un riavvio (Unix).
+// Segue stdout+stderr del processo via /proc/{pid}/fd/1,2 con `tail -f --pid`,
+// accumula l'output nel DB e, quando `tail` esce (processo terminato), marca
+// status='stopped'. Se `tail` non parte, fa fallback a polling della liveness.
+// Interamente Linux-centrico (dipende da /proc, `tail`, `sh`, `kill`).
+// Estratta da `main` (era un `fn` nested, nessuna cattura d'ambiente): sposta
+// la lunghezza/complessita fuori dal corpo di `main`, comportamento invariato.
+#[cfg(unix)]
+fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) {
+    tokio::spawn(async move {
+        let stdout_path = format!("/proc/{}/fd/1", pid_val);
+        let stderr_path = format!("/proc/{}/fd/2", pid_val);
+        let mut child = match tokio::process::Command::new("tail")
+            .args([
+                "-f",
+                "--pid",
+                &pid_val.to_string(),
+                &stdout_path,
+                &stderr_path,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to re-attach to process {}: {}", pid_val, e);
+                reattach_fallback_poll(id, pid_val, &db_clone).await;
+                return;
+            }
+        };
+
+        // Leggi output dal tail e appendilo al DB
+        if let Some(stdout) = child.stdout.take() {
+            reattach_stream_output(stdout, id, &db_clone).await;
+        }
+
+        // tail è uscito: il processo originale è terminato
+        let _ = sqlx::query(
+            "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1 AND status='running'"
+        )
+        .bind(id)
+        .execute(&db_clone)
+        .await;
+    });
+}
+
+// Re-attach del monitoring su un processo sopravvissuto a un riavvio (Windows).
+// /proc non esiste e non e' possibile ri-agganciare stdout/stderr di un processo
+// gia' avviato da un'istanza precedente: ci si limita a poll della liveness via
+// process_util::process_alive (OpenProcess) ogni 5s; quando il processo non e'
+// piu' vivo si marca status='stopped' con exit_code=NULL (il codice di uscita
+// reale non e' recuperabile senza aver aperto il processo come figlio).
+// Estratta da `main` (era un `fn` nested, nessuna cattura d'ambiente).
+#[cfg(windows)]
+fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if !crate::process_util::process_alive(pid_val as u32) {
+                // exit_code non determinabile su Windows senza handle del figlio:
+                // si lascia NULL (coerente col path Unix, che scrive -1 solo se
+                // non riesce a leggere VmPeak).
+                let _ = sqlx::query(
+                    "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1"
+                )
+                .bind(id)
+                .execute(&db_clone)
+                .await;
+                break;
+            }
+        }
+    });
+}
+
+// Diagnostica: al SIGTERM raccoglie indizi sul possibile MITTENTE. tokio non
+// espone il si_pid del segnale, quindi facciamo best-effort scansionando /proc
+// per i processi che tipicamente inviano SIGTERM a mcp-core (deploy, pkill/kill,
+// un secondo mcp-core in single-instance). Serve a capire in 10s chi ha ucciso
+// il backend, invece di doverlo ricostruire a ritroso (incidente 2026-06-07).
+// Solo Unix: legge /proc ed e' invocata unicamente nel ramo SIGTERM cfg(unix)
+// (su Windows sarebbe codice morto -> warning con clippy -D warnings).
+// Estratta da `main` (era un `fn` nested, nessuna cattura d'ambiente).
+#[cfg(unix)]
+fn diagnose_signal_origin() -> String {
+    let own = std::process::id();
+    let ppid = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            // campo 4 (1-based) di /proc/self/stat = ppid; comm puo' avere spazi,
+            // quindi si parte dopo l'ultima ')'.
+            s.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(1).map(String::from))
+        })
+        .unwrap_or_else(|| "?".into());
+    let mut suspects: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let pid: u32 = match e.file_name().to_str().and_then(|s| s.parse().ok()) {
+                Some(p) if p != own => p,
+                _ => continue,
+            };
+            let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if raw.is_empty() {
+                continue;
+            }
+            let cmd: String = raw
+                .split(|b| *b == 0)
+                .map(|s| String::from_utf8_lossy(s))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let l = cmd.to_lowercase();
+            if l.contains("deploy-local")
+                || l.contains("pkill")
+                || l.contains("supervisor")
+                || l.contains("target/release/mcp-core")
+                || l.contains("target/debug/mcp-core")
+            {
+                suspects.push(format!(
+                    "pid={pid} cmd=\"{}\"",
+                    cmd.chars().take(120).collect::<String>()
+                ));
+            }
+        }
+    }
+    if suspects.is_empty() {
+        format!(" [origine: ppid={ppid}; nessun mittente sospetto in /proc — probabile kill manuale o systemd]")
+    } else {
+        format!(
+            " [origine: ppid={ppid}; candidati mittenti: {}]",
+            suspects.join(" | ")
+        )
+    }
+}
+
+/// Interpreta un valore di setting testuale come flag booleano attivo/spento.
+/// Punto unico (regola L) del pattern ripetuto in `main`: un valore assente
+/// ricade sul `default`; un valore presente e' considerato SPENTO solo se e'
+/// esattamente uno di `0|false|no|off` (case-insensitive), altrimenti ACCESO.
+/// Comportamento identico ai blocchi inline che sostituisce.
+fn setting_flag_enabled(opt: Option<String>, default: bool) -> bool {
+    opt.map(|v| {
+        !matches!(
+            v.trim().to_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+    .unwrap_or(default)
+}
+
+/// Ripristina i cooldown billing dei provider sopravvissuti al riavvio, letti
+/// dalle chiavi Redis `nexus:billing_cooldown:*` (formato `<until_ts>|<reason>`).
+/// Estratta da `main` (comportamento invariato) per contenerne complessita e
+/// lunghezza; scarta silenziosamente chiavi malformate o gia' scadute.
+async fn restore_billing_cooldowns_from_redis(mut conn: redis::aio::MultiplexedConnection) {
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let Ok(keys) = redis::cmd("KEYS")
+        .arg("nexus:billing_cooldown:*")
+        .query_async::<Vec<String>>(&mut conn)
+        .await
+    else {
+        return;
+    };
+    for key in keys {
+        let Ok(value) = redis::cmd("GET")
+            .arg(&key)
+            .query_async::<String>(&mut conn)
+            .await
+        else {
+            continue;
+        };
+        // Formato: "<until_unix_ts>|<reason>"
+        let mut parts = value.splitn(2, '|');
+        let (Some(ts_str), Some(reason)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(until_ts) = ts_str.parse::<u64>() else {
+            continue;
+        };
+        if until_ts > now_ts {
+            let remaining = until_ts - now_ts;
+            let provider = key.strip_prefix("nexus:billing_cooldown:").unwrap_or(&key);
+            crate::provider_cooldown::restore_cooldown(provider, remaining, reason);
+        }
+    }
+}
+
+/// Boot-recovery per-progetto (separazione DB): itera i progetti registrati e
+/// marca 'failed' i processi `agent_processes` in stato 'running'/'starting' il
+/// cui PID non e' piu' vivo. Mark-only: NON re-attacha il monitor (side-effect
+/// non idempotente). Estratta dalla closure `tokio::spawn` in `main` per
+/// contenerne complessita e lunghezza; comportamento invariato.
+async fn mark_stale_project_processes_failed(db_recover: sqlx::PgPool) {
+    use sqlx::Row;
+    for pid in project_db_routes::list_all_project_ids(&db_recover).await {
+        let pool = project_db_routes::project_data_pool_from(&db_recover, pid).await;
+        let stale = sqlx::query(
+            "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for row in stale {
+            let Ok(id) = row.try_get::<uuid::Uuid, _>("id") else {
+                continue;
+            };
+            let ppid: Option<i32> = row.try_get("pid").unwrap_or(None);
+            let alive = matches!(
+                ppid,
+                Some(p) if p > 0 && crate::process_util::process_alive(p as u32)
+            );
+            if !alive {
+                let _ = sqlx::query(
+                    "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1 AND status IN ('running','starting')",
+                )
+                .bind(id)
+                .execute(&pool)
+                .await;
+            }
+        }
+    }
+}
+
+/// ADR 0017 v2 F3 — re-ingest automatico dai vault se `wiki_docs` e' vuota.
+/// Bootstrap one-shot: alla prima esecuzione dopo la mig 0295 la tabella e'
+/// vuota e i vault Markdown sono la sola fonte di verita'. Estratta dalla
+/// closure `tokio::spawn` in `main` (comportamento invariato).
+async fn wiki_bootstrap_reingest_if_empty(state_bootstrap: AppState) {
+    let empty: bool = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wiki_docs")
+        .fetch_one(&state_bootstrap.db)
+        .await
+    {
+        Ok(n) => n == 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "wiki.bootstrap: COUNT wiki_docs fallita, skip");
+            return;
+        }
+    };
+    if !empty {
+        tracing::debug!("wiki.bootstrap: wiki_docs gia' popolata, skip re-ingest auto");
+        return;
+    }
+    tracing::info!("wiki: tabella vuota, lancio re-ingest automatico dai vault");
+    match wiki::reingest::reingest_all(&state_bootstrap.wiki_deps(), None, None).await {
+        Ok(report) => {
+            tracing::info!(
+                meta = report.meta_docs_ingested,
+                projects = report.project_docs_ingested_by_project.len(),
+                skipped = report.files_skipped,
+                errors = report.errors.len(),
+                elapsed_ms = report.elapsed_ms,
+                "wiki.bootstrap: re-ingest completato"
+            );
+            if !report.errors.is_empty() {
+                for err in report.errors.iter().take(10) {
+                    tracing::warn!(error = %err, "wiki.bootstrap: errore re-ingest");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "wiki.bootstrap: re-ingest fallito");
+        }
+    }
+}
+
+/// ADR 0017 v2 F4 — auto-recompute link al primo avvio post-F3. Se `wiki_docs > 0`
+/// ma `wiki_links == 0` la mig 0295 e' applicata, F3 ha popolato i doc ma F4 non e'
+/// mai stato eseguito. Attende 60s per dare tempo al re-ingest F3 di completare.
+/// Estratta dalla closure `tokio::spawn` in `main` (comportamento invariato).
+async fn wiki_bootstrap_recompute_links(state_links: AppState) {
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    let counts: Option<(i64, i64)> = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT (SELECT COUNT(*) FROM wiki_docs), (SELECT COUNT(*) FROM wiki_links)",
+    )
+    .fetch_optional(&state_links.db)
+    .await
+    .ok()
+    .flatten();
+    let Some((docs, links)) = counts else {
+        tracing::warn!("wiki.links.bootstrap: COUNT fallita, skip");
+        return;
+    };
+    if docs == 0 {
+        tracing::debug!("wiki.links.bootstrap: wiki_docs vuota, skip recompute");
+        return;
+    }
+    if links > 0 {
+        tracing::debug!(
+            links = links,
+            "wiki.links.bootstrap: wiki_links gia' popolata, skip recompute auto"
+        );
+        return;
+    }
+    tracing::info!(
+        docs = docs,
+        "wiki.links.bootstrap: avvio recompute automatico (scope=meta)"
+    );
+    match wiki::links_worker::recompute_links_for_scope(
+        &state_links.wiki_deps(),
+        Some(wiki::model::WikiScope::Meta),
+        None,
+    )
+    .await
+    {
+        Ok(rep) => tracing::info!(
+            scanned = rep.docs_scanned,
+            wikilinks = rep.wikilinks_resolved,
+            semantic_new = rep.semantic_links_created,
+            semantic_upd = rep.semantic_links_updated,
+            errors = rep.errors.len(),
+            elapsed_ms = rep.elapsed_ms,
+            "wiki.links.bootstrap: completato"
+        ),
+        Err(e) => tracing::error!(error = %e, "wiki.links.bootstrap: fallito"),
+    }
+}
+
+/// Connette il Neural Core con retry a backoff crescente (2s -> cap 10s, fino a
+/// `MAX_ATTEMPTS` tentativi, ~9 minuti). Resilienza all'avvio (regola H): il brain
+/// puo' avere cold start lento o hang transitori; ci arrendiamo solo dopo molti
+/// tentativi. Estratta da `main` (comportamento invariato): ritorna il client o un
+/// errore che `main` propaga con `?`.
+async fn connect_neural_core_with_retry(neural_core_url: &str) -> anyhow::Result<NeuralCoreClient> {
+    let mut attempts = 0u32;
+    const MAX_ATTEMPTS: u32 = 60;
+    loop {
+        match NeuralCoreClient::connect(neural_core_url).await {
+            Ok(c) => {
+                if attempts > 0 {
+                    tracing::info!("Neural Core connesso dopo {attempts} tentativi");
+                }
+                return Ok(c);
+            }
+            Err(e) => {
+                attempts += 1;
+                if attempts >= MAX_ATTEMPTS {
+                    anyhow::bail!(
+                        "Failed to connect to Neural Core after {attempts} attempts: {e}"
+                    );
+                }
+                let backoff = std::cmp::min(2 + attempts as u64, 10);
+                tracing::warn!(
+                    "Neural Core not ready (attempt {attempts}/{MAX_ATTEMPTS}): {e} — retry in {backoff}s"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            }
+        }
+    }
+}
+
 #[tokio::main(worker_threads = 32)]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -237,139 +667,10 @@ async fn main() -> anyhow::Result<()> {
     //   inizializzato e i siti di chiamata fanno fallback silenzioso.
     nexus_bridge::NexusBridge::init_global_with_pool(Arc::new(db.clone())).await;
 
-    // Re-attach del monitoring su un processo sopravvissuto a un riavvio (Unix).
-    // Segue stdout+stderr del processo via /proc/{pid}/fd/1,2 con `tail -f --pid`,
-    // accumula l'output nel DB e, quando `tail` esce (processo terminato), marca
-    // status='stopped'. Se `tail` non parte, fa fallback a polling della liveness.
-    // Interamente Linux-centrico (dipende da /proc, `tail`, `sh`, `kill`).
-    #[cfg(unix)]
-    fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) {
-        tokio::spawn(async move {
-            let stdout_path = format!("/proc/{}/fd/1", pid_val);
-            let stderr_path = format!("/proc/{}/fd/2", pid_val);
-            let mut child = match tokio::process::Command::new("tail")
-                .args([
-                    "-f",
-                    "--pid",
-                    &pid_val.to_string(),
-                    &stdout_path,
-                    &stderr_path,
-                ])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("Failed to re-attach to process {}: {}", pid_val, e);
-                    // Non possiamo seguire l'output ma il processo risulta running
-                    // Aspettiamo che termini tramite polling
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        if !crate::process_util::process_alive(pid_val as u32) {
-                            let exit_code: Option<i32> = tokio::process::Command::new("sh")
-                                .args([
-                                    "-c",
-                                    &format!(
-                                        "cat /proc/{}/status 2>/dev/null | grep -c VmPeak",
-                                        pid_val
-                                    ),
-                                ])
-                                .output()
-                                .await
-                                .ok()
-                                .and_then(|o| String::from_utf8(o.stdout).ok())
-                                .and_then(|s| s.trim().parse().ok());
-                            let _ = sqlx::query(
-                                "UPDATE agent_processes SET status='stopped', exit_code=$2, stopped_at=NOW() WHERE id=$1"
-                            )
-                            .bind(id)
-                            .bind(exit_code.unwrap_or(-1))
-                            .execute(&db_clone)
-                            .await;
-                            break;
-                        }
-                    }
-                    return;
-                }
-            };
-
-            // Leggi output dal tail e appendilo al DB
-            use tokio::io::AsyncBufReadExt;
-            let stdout = child.stdout.take();
-            if let Some(stdout) = stdout {
-                let mut lines = tokio::io::BufReader::new(stdout).lines();
-                let mut buf = String::new();
-                let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(2));
-                loop {
-                    tokio::select! {
-                        line = lines.next_line() => {
-                            match line {
-                                Ok(Some(l)) => { buf.push_str(&l); buf.push('\n'); }
-                                _ => break,
-                            }
-                        }
-                        _ = flush_tick.tick() => {
-                            if !buf.is_empty() {
-                                let chunk = std::mem::take(&mut buf);
-                                let _ = sqlx::query(
-                                    "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
-                                )
-                                .bind(&chunk)
-                                .bind(id)
-                                .execute(&db_clone)
-                                .await;
-                            }
-                        }
-                    }
-                }
-                if !buf.is_empty() {
-                    let _ = sqlx::query(
-                        "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
-                    )
-                    .bind(&buf)
-                    .bind(id)
-                    .execute(&db_clone)
-                    .await;
-                }
-            }
-
-            // tail è uscito: il processo originale è terminato
-            let _ = sqlx::query(
-                "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1 AND status='running'"
-            )
-            .bind(id)
-            .execute(&db_clone)
-            .await;
-        });
-    }
-
-    // Re-attach del monitoring su un processo sopravvissuto a un riavvio (Windows).
-    // /proc non esiste e non e' possibile ri-agganciare stdout/stderr di un processo
-    // gia' avviato da un'istanza precedente: ci si limita a poll della liveness via
-    // process_util::process_alive (OpenProcess) ogni 5s; quando il processo non e'
-    // piu' vivo si marca status='stopped' con exit_code=NULL (il codice di uscita
-    // reale non e' recuperabile senza aver aperto il processo come figlio).
-    #[cfg(windows)]
-    fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if !crate::process_util::process_alive(pid_val as u32) {
-                    // exit_code non determinabile su Windows senza handle del figlio:
-                    // si lascia NULL (coerente col path Unix, che scrive -1 solo se
-                    // non riesce a leggere VmPeak).
-                    let _ = sqlx::query(
-                        "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1"
-                    )
-                    .bind(id)
-                    .execute(&db_clone)
-                    .await;
-                    break;
-                }
-            }
-        });
-    }
+    // NOTA: `spawn_reattach_monitor` (Unix/Windows) e' stata estratta a livello
+    // di modulo (sopra `fn main`) per contenere la lunghezza/complessita di
+    // `main`. Comportamento invariato: e' un `fn` item (nessuna cattura
+    // dell'ambiente) chiamato solo da qui.
 
     // Riconcilia i processi lasciati in stato 'running'/'starting' da un riavvio precedente.
     // - PID non più vivo → status=failed
@@ -453,41 +754,7 @@ async fn main() -> anyhow::Result<()> {
     crate::provider_cooldown::init_db_pool(db.clone());
 
     // Ripristina cooldown billing provider sopravvissuti al riavvio (persistiti su Redis).
-    {
-        let mut conn = redis.clone();
-        let now_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Ok(keys) = redis::cmd("KEYS")
-            .arg("nexus:billing_cooldown:*")
-            .query_async::<Vec<String>>(&mut conn)
-            .await
-        {
-            for key in keys {
-                if let Ok(value) = redis::cmd("GET")
-                    .arg(&key)
-                    .query_async::<String>(&mut conn)
-                    .await
-                {
-                    // Formato: "<until_unix_ts>|<reason>"
-                    let mut parts = value.splitn(2, '|');
-                    if let (Some(ts_str), Some(reason)) = (parts.next(), parts.next()) {
-                        if let Ok(until_ts) = ts_str.parse::<u64>() {
-                            if until_ts > now_ts {
-                                let remaining = until_ts - now_ts;
-                                let provider =
-                                    key.strip_prefix("nexus:billing_cooldown:").unwrap_or(&key);
-                                crate::provider_cooldown::restore_cooldown(
-                                    provider, remaining, reason,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    restore_billing_cooldowns_from_redis(redis.clone()).await;
 
     // Restore COMPLEMENTARE dal DB persistente (ADR 0020): se Redis e' stato
     // svuotato/riavviato, il blocco sopra non ripristina nulla e il gate parte
@@ -497,40 +764,7 @@ async fn main() -> anyhow::Result<()> {
     // cosi' il run li salta senza ri-testarli (il polling resta l'unico tester).
     crate::provider_cooldown::restore_billing_cooldowns_from_db(&db).await;
 
-    let neural_client = {
-        let mut attempts = 0u32;
-        // Resilienza all'avvio (regola H): il brain (Neural Core) puo' avere un
-        // cold start lento (build debug, warmup Vertex) o subire un hang
-        // transitorio del filesystem 9p su WSL. Il vecchio loop si arrendeva
-        // dopo 10 tentativi x 2s = 20s, facendo USCIRE mcp-core in cascata
-        // quando il brain non era ancora pronto (instabilita' ricorrente: mcp-core
-        // morto, da rilanciare a mano). Ora attendiamo molto piu' a lungo con
-        // backoff (2s -> cap 10s, ~9 minuti) prima di arrenderci davvero.
-        const MAX_ATTEMPTS: u32 = 60;
-        loop {
-            match NeuralCoreClient::connect(&neural_core_url).await {
-                Ok(c) => {
-                    if attempts > 0 {
-                        tracing::info!("Neural Core connesso dopo {attempts} tentativi");
-                    }
-                    break c;
-                }
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= MAX_ATTEMPTS {
-                        anyhow::bail!(
-                            "Failed to connect to Neural Core after {attempts} attempts: {e}"
-                        );
-                    }
-                    let backoff = std::cmp::min(2 + attempts as u64, 10);
-                    tracing::warn!(
-                        "Neural Core not ready (attempt {attempts}/{MAX_ATTEMPTS}): {e} — retry in {backoff}s"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                }
-            }
-        }
-    };
+    let neural_client = connect_neural_core_with_retry(&neural_core_url).await?;
     let template_cache = prompt_templates::TemplateCache::new();
 
     // Inizializza la cache routing matrix (legge da DB + spawn refresh background 60s).
@@ -686,36 +920,7 @@ async fn main() -> anyhow::Result<()> {
     // dal watchdog periodico (residuo noto, degrada non corrompe).
     {
         let db_recover = state.db.clone();
-        tokio::spawn(async move {
-            use sqlx::Row;
-            for pid in project_db_routes::list_all_project_ids(&db_recover).await {
-                let pool = project_db_routes::project_data_pool_from(&db_recover, pid).await;
-                let stale = sqlx::query(
-                    "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')",
-                )
-                .fetch_all(&pool)
-                .await
-                .unwrap_or_default();
-                for row in stale {
-                    let Ok(id) = row.try_get::<uuid::Uuid, _>("id") else {
-                        continue;
-                    };
-                    let ppid: Option<i32> = row.try_get("pid").unwrap_or(None);
-                    let alive = matches!(
-                        ppid,
-                        Some(p) if p > 0 && crate::process_util::process_alive(p as u32)
-                    );
-                    if !alive {
-                        let _ = sqlx::query(
-                            "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1 AND status IN ('running','starting')",
-                        )
-                        .bind(id)
-                        .execute(&pool)
-                        .await;
-                    }
-                }
-            }
-        });
+        tokio::spawn(mark_stale_project_processes_failed(db_recover));
     }
 
     chat_learning::spawn_vector_compaction_scheduler(state.clone());
@@ -731,43 +936,7 @@ async fn main() -> anyhow::Result<()> {
     // il `ReingestReport` al termine.
     {
         let state_bootstrap = state.clone();
-        tokio::spawn(async move {
-            let empty: bool = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wiki_docs")
-                .fetch_one(&state_bootstrap.db)
-                .await
-            {
-                Ok(n) => n == 0,
-                Err(e) => {
-                    tracing::warn!(error = %e, "wiki.bootstrap: COUNT wiki_docs fallita, skip");
-                    return;
-                }
-            };
-            if !empty {
-                tracing::debug!("wiki.bootstrap: wiki_docs gia' popolata, skip re-ingest auto");
-                return;
-            }
-            tracing::info!("wiki: tabella vuota, lancio re-ingest automatico dai vault");
-            match wiki::reingest::reingest_all(&state_bootstrap.wiki_deps(), None, None).await {
-                Ok(report) => {
-                    tracing::info!(
-                        meta = report.meta_docs_ingested,
-                        projects = report.project_docs_ingested_by_project.len(),
-                        skipped = report.files_skipped,
-                        errors = report.errors.len(),
-                        elapsed_ms = report.elapsed_ms,
-                        "wiki.bootstrap: re-ingest completato"
-                    );
-                    if !report.errors.is_empty() {
-                        for err in report.errors.iter().take(10) {
-                            tracing::warn!(error = %err, "wiki.bootstrap: errore re-ingest");
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "wiki.bootstrap: re-ingest fallito");
-                }
-            }
-        });
+        tokio::spawn(wiki_bootstrap_reingest_if_empty(state_bootstrap));
     }
 
     // ── ADR 0017 v2 F4 — auto-recompute link al primo avvio post-F3 ───────
@@ -777,53 +946,7 @@ async fn main() -> anyhow::Result<()> {
     // dare tempo al re-ingest F3 di completare (se in corso).
     {
         let state_links = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let counts: Option<(i64, i64)> = sqlx::query_as::<_, (i64, i64)>(
-                "SELECT (SELECT COUNT(*) FROM wiki_docs), (SELECT COUNT(*) FROM wiki_links)",
-            )
-            .fetch_optional(&state_links.db)
-            .await
-            .ok()
-            .flatten();
-            let Some((docs, links)) = counts else {
-                tracing::warn!("wiki.links.bootstrap: COUNT fallita, skip");
-                return;
-            };
-            if docs == 0 {
-                tracing::debug!("wiki.links.bootstrap: wiki_docs vuota, skip recompute");
-                return;
-            }
-            if links > 0 {
-                tracing::debug!(
-                    links = links,
-                    "wiki.links.bootstrap: wiki_links gia' popolata, skip recompute auto"
-                );
-                return;
-            }
-            tracing::info!(
-                docs = docs,
-                "wiki.links.bootstrap: avvio recompute automatico (scope=meta)"
-            );
-            match wiki::links_worker::recompute_links_for_scope(
-                &state_links.wiki_deps(),
-                Some(wiki::model::WikiScope::Meta),
-                None,
-            )
-            .await
-            {
-                Ok(rep) => tracing::info!(
-                    scanned = rep.docs_scanned,
-                    wikilinks = rep.wikilinks_resolved,
-                    semantic_new = rep.semantic_links_created,
-                    semantic_upd = rep.semantic_links_updated,
-                    errors = rep.errors.len(),
-                    elapsed_ms = rep.elapsed_ms,
-                    "wiki.links.bootstrap: completato"
-                ),
-                Err(e) => tracing::error!(error = %e, "wiki.links.bootstrap: fallito"),
-            }
-        });
+        tokio::spawn(wiki_bootstrap_recompute_links(state_links));
     }
 
     // ── ADR 0017 v2 F5 — worker periodico LLM triple extraction ───────────
@@ -961,16 +1084,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "127.0.0.1:50071".to_string());
 
     // Inizializza il flag AtomicBool per il classificatore LLM.
-    let llm_classifier_db = s_llm_classifier
-        .ok()
-        .flatten()
-        .map(|v| {
-            !matches!(
-                v.trim().to_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true);
+    let llm_classifier_db = setting_flag_enabled(s_llm_classifier.ok().flatten(), true);
     crate::orchestrator::set_llm_classifier_enabled(llm_classifier_db);
     tracing::info!(
         "llm_classifier_enabled: {} (fonte: DB{})",
@@ -1106,16 +1220,7 @@ async fn main() -> anyhow::Result<()> {
     // per rilevare cooldown / quota esaurita PRIMA del primo errore utente.
     // Valore canonico: settings.provider_health_probe_enabled/interval_s nel DB.
     // Override emergenza: NEXUS_PROVIDER_HEALTH_PROBE_ENABLED, NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S.
-    let probe_enabled = s_health_probe_enabled
-        .ok()
-        .flatten()
-        .map(|v| {
-            !matches!(
-                v.trim().to_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true);
+    let probe_enabled = setting_flag_enabled(s_health_probe_enabled.ok().flatten(), true);
     let probe_interval = s_health_probe_interval
         .ok()
         .flatten()
@@ -1173,16 +1278,7 @@ async fn main() -> anyhow::Result<()> {
     // Worker `catalog_sync`: aggiorna periodicamente ai_price_catalog dal
     // JSON LiteLLM. Cadenza configurabile via settings.model_catalog_sync_interval_s
     // (default 12h, minimo 1h). Disabilitabile via settings.model_catalog_sync_enabled.
-    let catalog_sync_enabled = s_catalog_sync_enabled
-        .ok()
-        .flatten()
-        .map(|v| {
-            !matches!(
-                v.trim().to_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true);
+    let catalog_sync_enabled = setting_flag_enabled(s_catalog_sync_enabled.ok().flatten(), true);
     let catalog_sync_interval = s_catalog_sync_interval
         .ok()
         .flatten()
@@ -1198,16 +1294,7 @@ async fn main() -> anyhow::Result<()> {
     // per rilevare modelli broken model-specific (model_not_found, hollow_completion,
     // unsupported, ecc.). Auto-disable dopo N fallimenti consecutivi
     // (settings.model_health_probe_failure_threshold, default 3).
-    let model_probe_enabled = s_model_health_enabled
-        .ok()
-        .flatten()
-        .map(|v| {
-            !matches!(
-                v.trim().to_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true);
+    let model_probe_enabled = setting_flag_enabled(s_model_health_enabled.ok().flatten(), true);
     let model_probe_interval = s_model_health_interval
         .ok()
         .flatten()
@@ -1246,14 +1333,7 @@ async fn main() -> anyhow::Result<()> {
             .await
             .ok()
             .flatten();
-    let ap_enabled = auto_promote_enabled
-        .map(|v| {
-            !matches!(
-                v.trim().to_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true);
+    let ap_enabled = setting_flag_enabled(auto_promote_enabled, true);
     let ap_interval = auto_promote_interval
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(21600);
@@ -1431,64 +1511,9 @@ async fn main() -> anyhow::Result<()> {
         tokio::net::TcpListener::from_std(std_listener)?
     };
 
-    // Diagnostica: al SIGTERM raccoglie indizi sul possibile MITTENTE. tokio non
-    // espone il si_pid del segnale, quindi facciamo best-effort scansionando /proc
-    // per i processi che tipicamente inviano SIGTERM a mcp-core (deploy, pkill/kill,
-    // un secondo mcp-core in single-instance). Serve a capire in 10s chi ha ucciso
-    // il backend, invece di doverlo ricostruire a ritroso (incidente 2026-06-07).
-    // Solo Unix: legge /proc ed e' invocata unicamente nel ramo SIGTERM cfg(unix)
-    // (su Windows sarebbe codice morto -> warning con clippy -D warnings).
-    #[cfg(unix)]
-    fn diagnose_signal_origin() -> String {
-        let own = std::process::id();
-        let ppid = std::fs::read_to_string("/proc/self/stat")
-            .ok()
-            .and_then(|s| {
-                // campo 4 (1-based) di /proc/self/stat = ppid; comm puo' avere spazi,
-                // quindi si parte dopo l'ultima ')'.
-                s.rsplit_once(')')
-                    .and_then(|(_, rest)| rest.split_whitespace().nth(1).map(String::from))
-            })
-            .unwrap_or_else(|| "?".into());
-        let mut suspects: Vec<String> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for e in entries.flatten() {
-                let pid: u32 = match e.file_name().to_str().and_then(|s| s.parse().ok()) {
-                    Some(p) if p != own => p,
-                    _ => continue,
-                };
-                let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-                if raw.is_empty() {
-                    continue;
-                }
-                let cmd: String = raw
-                    .split(|b| *b == 0)
-                    .map(|s| String::from_utf8_lossy(s))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let l = cmd.to_lowercase();
-                if l.contains("deploy-local")
-                    || l.contains("pkill")
-                    || l.contains("supervisor")
-                    || l.contains("target/release/mcp-core")
-                    || l.contains("target/debug/mcp-core")
-                {
-                    suspects.push(format!(
-                        "pid={pid} cmd=\"{}\"",
-                        cmd.chars().take(120).collect::<String>()
-                    ));
-                }
-            }
-        }
-        if suspects.is_empty() {
-            format!(" [origine: ppid={ppid}; nessun mittente sospetto in /proc — probabile kill manuale o systemd]")
-        } else {
-            format!(
-                " [origine: ppid={ppid}; candidati mittenti: {}]",
-                suspects.join(" | ")
-            )
-        }
-    }
+    // NOTA: `diagnose_signal_origin` (Unix) e' stata estratta a livello di modulo
+    // (sopra `fn main`). Era un `fn` nested senza cattura d'ambiente, chiamato solo
+    // dal ramo SIGTERM piu' sotto: comportamento invariato.
 
     // Graceful shutdown: SIGTERM o Ctrl-C → flush NexusBridge (Q-table + replication)
     // prima che il processo termini, per evitare perdita dati in-flight.
@@ -1557,6 +1582,70 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Probe TCP rapido (500ms) al ToolRunner gRPC: senza questo l'AI non puo'
+/// invocare tool (read_file, str_replace, ...) e fallirebbe silenziosamente.
+/// Indirizzo: env var (override emergenza) > DB (canonico) > hardcoded.
+/// Estratta da `health` (comportamento invariato).
+async fn probe_tool_runner_grpc(state: &AppState) -> bool {
+    let db_addr = settings::get_setting(&state.db, "tool_runner_addr")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string());
+    let addr = std::env::var("TOOL_RUNNER_ADDR")
+        .ok()
+        .or(db_addr)
+        .unwrap_or_else(|| "127.0.0.1:50071".into());
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
+}
+
+/// Somma i conteggi dashboard (run ultimi 30 giorni, job attivi) su tutti i DB
+/// per-progetto e restituisce lo stato del job `shadow_db_validation` piu' recente
+/// cross-progetto. Estratta da `dashboard` (comportamento invariato): a flag OFF
+/// gli helper `project_db_routes` ritornano il meta -> stessa semantica di prima.
+async fn aggregate_project_dashboard_stats(
+    db: &PgPool,
+) -> (i64, i64, Option<(chrono::DateTime<chrono::Utc>, String)>) {
+    let mut total_runs: i64 = 0;
+    let mut active_jobs: i64 = 0;
+    let mut latest_shadow: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+    for project_id in project_db_routes::list_all_project_ids(db).await {
+        let pool = project_db_routes::project_data_pool_from(db, project_id).await;
+
+        total_runs += sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM orchestrator_runs WHERE created_at > NOW() - INTERVAL '30 days'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+
+        active_jobs += sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+
+        if let Ok(Some(row)) = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, String)>(
+            "SELECT created_at, status FROM jobs WHERE job_type = 'shadow_db_validation' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        {
+            if latest_shadow.as_ref().is_none_or(|(ts, _)| row.0 > *ts) {
+                latest_shadow = Some(row);
+            }
+        }
+    }
+    (total_runs, active_jobs, latest_shadow)
+}
+
 async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
     let db_ok = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
     let redis_ok: bool = redis::cmd("PING")
@@ -1567,25 +1656,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
 
     // Verifica TCP connect rapido al ToolRunner gRPC: senza questo l'AI non può
     // invocare tool (read_file, str_replace…) e fallisce silenziosamente.
-    // Indirizzo: env var (override emergenza) > DB (canonico) > hardcoded.
-    let tools_grpc_ok = {
-        let db_addr = settings::get_setting(&state.db, "tool_runner_addr")
-            .await
-            .ok()
-            .flatten()
-            .map(|v| v.trim().to_string());
-        let addr = std::env::var("TOOL_RUNNER_ADDR")
-            .ok()
-            .or(db_addr)
-            .unwrap_or_else(|| "127.0.0.1:50071".into());
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
-    };
+    let tools_grpc_ok = probe_tool_runner_grpc(&state).await;
 
     // NB: il vecchio probe `brain_rest` (TCP :8001) e' stato rimosso. Il brain
     // Python e' stato eliminato e i suoi endpoint vivono ora in mcp-core (coperti
@@ -1620,8 +1691,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
     })
 }
 
-async fn dashboard(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let token_stats = sqlx::query_as::<_, domain::TokenStats>(
+/// Somma token e costo consumati negli ultimi 30 giorni dai record finalizzati di
+/// `ai_usage_ledger` (tabella globale sul meta). Estratta da `dashboard`
+/// (comportamento invariato): ritorna `None` se la query fallisce o non ha righe.
+async fn fetch_token_stats(db: &PgPool) -> Option<domain::TokenStats> {
+    sqlx::query_as::<_, domain::TokenStats>(
         r#"
         SELECT
             COALESCE(SUM(total_tokens), 0) AS total_consumed,
@@ -1631,10 +1705,14 @@ async fn dashboard(State(state): State<AppState>) -> Json<serde_json::Value> {
           AND status = 'finalized'
         "#,
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await
     .ok()
-    .flatten();
+    .flatten()
+}
+
+async fn dashboard(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let token_stats = fetch_token_stats(&state.db).await;
 
     // Conteggio quality finding APERTI dalla fonte unica `project_quality_findings`
     // (regola L). La vecchia tabella `quality_findings` (mig 0001) non e' mai stata
@@ -1651,46 +1729,11 @@ async fn dashboard(State(state): State<AppState>) -> Json<serde_json::Value> {
     .unwrap_or(0);
 
     // orchestrator_runs e jobs sono MIGRATE al DB per-progetto (separazione DB):
-    // a flag ON le copie meta sono vuote. Questo handler non ha un project_id in
-    // scope (aggregato globale), quindi iteriamo tutti i progetti e SOMMIAMO i
-    // conteggi per-progetto (per shadow_db_status prendiamo lo stato del job piu'
-    // recente cross-progetto). A flag OFF gli helper ritornano il meta -> stessa
-    // semantica di prima (behavior-preserving). ai_usage_ledger e
+    // a flag ON le copie meta sono vuote. Aggregazione cross-progetto delegata a
+    // `aggregate_project_dashboard_stats` (behavior-preserving). ai_usage_ledger e
     // project_quality_findings restano sul meta (tabelle globali, non toccate).
-    let mut total_runs: i64 = 0;
-    let mut active_jobs: i64 = 0;
-    let mut latest_shadow: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
-    for project_id in project_db_routes::list_all_project_ids(&state.db).await {
-        let pool = project_db_routes::project_data_pool_from(&state.db, project_id).await;
-
-        total_runs += sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM orchestrator_runs WHERE created_at > NOW() - INTERVAL '30 days'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
-
-        active_jobs += sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
-
-        if let Ok(Some(row)) = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, String)>(
-            "SELECT created_at, status FROM jobs WHERE job_type = 'shadow_db_validation' ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&pool)
-        .await
-        {
-            if latest_shadow
-                .as_ref()
-                .is_none_or(|(ts, _)| row.0 > *ts)
-            {
-                latest_shadow = Some(row);
-            }
-        }
-    }
+    let (total_runs, active_jobs, latest_shadow) =
+        aggregate_project_dashboard_stats(&state.db).await;
     let shadow_db_status = latest_shadow
         .map(|(_, status)| status)
         .unwrap_or_else(|| "no_runs".to_string());

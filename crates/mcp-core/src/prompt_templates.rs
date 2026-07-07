@@ -122,13 +122,66 @@ pub async fn get_template_handler(
     ))
 }
 
+/// Aggiorna un template esistente: salva la history poi incrementa la versione.
+/// Estratto da `upsert_template_handler` per mantenere l'handler sotto soglia
+/// (comportamento invariato).
+async fn update_existing_template(
+    db: &PgPool,
+    cur_id: i32,
+    key: &str,
+    req: &UpsertTemplateReq,
+    updated_by: &str,
+) -> Result<PromptTemplate, StatusCode> {
+    // Save history
+    let _ = sqlx::query(
+        "INSERT INTO nexus_prompt_template_history (template_id, content, version, changed_by, change_note) SELECT id, content, version, $2, $3 FROM nexus_prompt_templates WHERE id = $1"
+    )
+    .bind(cur_id)
+    .bind(updated_by)
+    .bind(&req.change_note)
+    .execute(db)
+    .await;
+
+    // Update
+    sqlx::query_as::<_, PromptTemplate>(
+        "UPDATE nexus_prompt_templates SET content=$1, version=version+1, updated_by=$2, updated_at=NOW(), title=COALESCE($3, title) WHERE key=$4 RETURNING id, key, category, title, content, is_active, version, updated_by, updated_at, usage_context"
+    )
+    .bind(&req.content)
+    .bind(updated_by)
+    .bind(&req.title)
+    .bind(key)
+    .fetch_one(db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Inserisce un nuovo template (categoria 'system'). Estratto da
+/// `upsert_template_handler` (comportamento invariato).
+async fn insert_new_template(
+    db: &PgPool,
+    key: &str,
+    req: UpsertTemplateReq,
+    updated_by: &str,
+) -> Result<PromptTemplate, StatusCode> {
+    sqlx::query_as::<_, PromptTemplate>(
+        "INSERT INTO nexus_prompt_templates (key, category, title, content, updated_by) VALUES ($1, 'system', $2, $3, $4) RETURNING id, key, category, title, content, is_active, version, updated_by, updated_at, usage_context"
+    )
+    .bind(key)
+    .bind(req.title.unwrap_or_else(|| key.to_string()))
+    .bind(&req.content)
+    .bind(updated_by)
+    .fetch_one(db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// PUT /api/prompt-templates/:key
 pub async fn upsert_template_handler(
     State(state): State<crate::AppState>,
     Path(key): Path<String>,
     Json(req): Json<UpsertTemplateReq>,
 ) -> Result<Json<PromptTemplate>, StatusCode> {
-    let updated_by = req.updated_by.unwrap_or_else(|| "user".to_string());
+    let updated_by = req.updated_by.clone().unwrap_or_else(|| "user".to_string());
 
     // Get current version
     let current = sqlx::query("SELECT id, version FROM nexus_prompt_templates WHERE key = $1")
@@ -139,38 +192,9 @@ pub async fn upsert_template_handler(
         .map(|row| (row.get::<i32, _>("id"), row.get::<i32, _>("version")));
 
     let template = if let Some((cur_id, _)) = current {
-        // Save history
-        let _ = sqlx::query(
-            "INSERT INTO nexus_prompt_template_history (template_id, content, version, changed_by, change_note) SELECT id, content, version, $2, $3 FROM nexus_prompt_templates WHERE id = $1"
-        )
-        .bind(cur_id)
-        .bind(&updated_by)
-        .bind(&req.change_note)
-        .execute(&state.db)
-        .await;
-
-        // Update
-        sqlx::query_as::<_, PromptTemplate>(
-            "UPDATE nexus_prompt_templates SET content=$1, version=version+1, updated_by=$2, updated_at=NOW(), title=COALESCE($3, title) WHERE key=$4 RETURNING id, key, category, title, content, is_active, version, updated_by, updated_at, usage_context"
-        )
-        .bind(&req.content)
-        .bind(&updated_by)
-        .bind(&req.title)
-        .bind(&key)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        update_existing_template(&state.db, cur_id, &key, &req, &updated_by).await?
     } else {
-        sqlx::query_as::<_, PromptTemplate>(
-            "INSERT INTO nexus_prompt_templates (key, category, title, content, updated_by) VALUES ($1, 'system', $2, $3, $4) RETURNING id, key, category, title, content, is_active, version, updated_by, updated_at, usage_context"
-        )
-        .bind(&key)
-        .bind(req.title.unwrap_or_else(|| key.clone()))
-        .bind(&req.content)
-        .bind(&updated_by)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        insert_new_template(&state.db, &key, req, &updated_by).await?
     };
 
     state.template_cache.invalidate(&key);
@@ -265,6 +289,35 @@ pub async fn false_positive_stats_handler(
     Ok(Json(stats))
 }
 
+/// Persiste la suggestion nexus nella history del template. Estratto da
+/// `generate_nexus_suggestion` per tenere la funzione sotto soglia
+/// (comportamento invariato).
+async fn persist_nexus_suggestion(
+    db: &PgPool,
+    tmpl_id: i32,
+    tmpl_content: &str,
+    examples_text: &[String],
+) -> anyhow::Result<()> {
+    // Save nexus suggestion in history (as placeholder — full LLM call can be added later)
+    let suggestion = format!(
+        "{}\n\n[Auto-suggestion pending based on {} false positives. Examples: {}]",
+        tmpl_content,
+        examples_text.len(),
+        examples_text.join("; ")
+    );
+
+    sqlx::query(
+        "INSERT INTO nexus_prompt_template_history (template_id, content, version, changed_by, change_note) SELECT id, $2, version, 'nexus', $3 FROM nexus_prompt_templates WHERE id=$1"
+    )
+    .bind(tmpl_id)
+    .bind(&suggestion)
+    .bind(format!("Auto-suggestion from {} false positives", examples_text.len()))
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
 async fn generate_nexus_suggestion(db: &PgPool, rule_key: &str) -> anyhow::Result<()> {
     // Get current template content
     let template = sqlx::query("SELECT id, content FROM nexus_prompt_templates WHERE key=$1")
@@ -302,42 +355,32 @@ async fn generate_nexus_suggestion(db: &PgPool, rule_key: &str) -> anyhow::Resul
         .filter_map(|row| row.get::<Option<String>, _>("false_positive_reason"))
         .collect();
 
-    // Save nexus suggestion in history (as placeholder — full LLM call can be added later)
-    let suggestion = format!(
-        "{}\n\n[Auto-suggestion pending based on {} false positives. Examples: {}]",
-        tmpl_content,
-        examples_text.len(),
-        examples_text.join("; ")
-    );
-
-    sqlx::query(
-        "INSERT INTO nexus_prompt_template_history (template_id, content, version, changed_by, change_note) SELECT id, $2, version, 'nexus', $3 FROM nexus_prompt_templates WHERE id=$1"
-    )
-    .bind(tmpl_id)
-    .bind(&suggestion)
-    .bind(format!("Auto-suggestion from {} false positives", examples_text.len()))
-    .execute(db)
-    .await?;
-
-    Ok(())
+    persist_nexus_suggestion(db, tmpl_id, &tmpl_content, &examples_text).await
 }
 
-/// Genera testo rispettando l'ordine dei provider configurato in admin (settings.provider_hierarchy).
-/// Se un provider restituisce errore di quota/credito/rate, tenta il successivo nella lista admin.
-/// Non aggiunge provider extra: la configurazione admin è autoritativa.
-async fn generate_with_admin_fallback(
-    neural: &crate::orchestrator::NeuralCoreClient,
-    db: &PgPool,
-    routing_matrix: &crate::routing_matrix::RoutingMatrix,
-    prompt: &str,
-    broken_providers: &mut std::collections::HashSet<String>,
-    billing_user_id: uuid::Uuid,
-    billing_project_id: uuid::Uuid,
-) -> Result<serde_json::Value, String> {
-    use crate::billing::{self, UsageNumbers};
-    use crate::orchestrator::default_model_for_provider;
+/// Vero se il contenuto della risposta segnala esaurimento quota/credito/rate.
+/// NB: euristica testuale storica (comportamento invariato); mantenuta identica
+/// nell'estrazione da `generate_with_admin_fallback`. La classificazione
+/// strutturata alla fonte (regola M) resta un miglioramento fuori scope qui.
+fn response_signals_exhausted(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("credit balance")
+        || lower.contains("too low")
+        || lower.contains("quota")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("529")
+        || lower.contains("overloaded")
+        || (lower.contains("429") && lower.contains("exceeded"))
+}
 
-    // Carica l'ordine provider dall'admin (stesso campo usato dall'agent loop)
+/// Carica e filtra l'ordine provider dall'admin (settings.provider_hierarchy),
+/// escludendo quelli gia' marcati broken. Estratto da
+/// `generate_with_admin_fallback` (comportamento invariato).
+async fn load_admin_provider_order(
+    db: &PgPool,
+    broken_providers: &std::collections::HashSet<String>,
+) -> Result<Vec<String>, String> {
     let hierarchy_str: Option<String> =
         sqlx::query_scalar("SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1")
             .fetch_optional(db)
@@ -356,83 +399,167 @@ async fn generate_with_admin_fallback(
     if providers.is_empty() {
         return Err("Nessun provider disponibile (tutti skip o non configurati)".to_string());
     }
+    Ok(providers)
+}
+
+/// Esito di un singolo tentativo provider dentro `generate_with_admin_fallback`.
+enum ProviderAttempt {
+    /// Risposta valida da restituire subito.
+    Ok(serde_json::Value),
+    /// Provider da marcare broken e saltare (esaurito o errore).
+    Broken,
+}
+
+/// Esegue un singolo tentativo su un provider: riserva billing, chiama il
+/// modello, finalizza/rilascia il costo e classifica l'esito. Estratto da
+/// `generate_with_admin_fallback` (comportamento invariato).
+/// Finalizza il costo di un tentativo batch riuscito con i token reali (o la
+/// stima). No-op se non c'era riserva. Estratto da `try_provider_once`
+/// (comportamento invariato).
+async fn finalize_batch_usage(
+    db: &PgPool,
+    reservation: &Option<crate::billing::UsageReservation>,
+    v: &serde_json::Value,
+    prompt_tokens: i32,
+    estimated_completion_tokens: i32,
+) {
+    // Finalizza il costo con i token reali (se presenti), altrimenti usa stima.
+    let usage_numbers = crate::billing::extract_usage_numbers(v, prompt_tokens, estimated_completion_tokens);
+    if let Some(res) = reservation {
+        if let Err(e) =
+            crate::billing::finalize_usage(db, res, uuid::Uuid::new_v4(), &usage_numbers).await
+        {
+            tracing::error!("batch: billing finalize FAILED: {e}");
+        }
+    }
+}
+
+/// Riserva il billing per un tentativo batch (best-effort: `None` se fallisce,
+/// il tentativo prosegue comunque). Estratto da `try_provider_once`
+/// (comportamento invariato).
+async fn reserve_batch_usage(
+    db: &PgPool,
+    billing_user_id: uuid::Uuid,
+    billing_project_id: uuid::Uuid,
+    provider: &str,
+    model: &str,
+    prompt_tokens: i32,
+    estimated_completion_tokens: i32,
+) -> Option<crate::billing::UsageReservation> {
+    match crate::billing::reserve_usage(
+        db,
+        billing_user_id,
+        billing_project_id,
+        provider,
+        model,
+        prompt_tokens,
+        estimated_completion_tokens,
+        serde_json::json!({
+            "feature": "batch_assign_tools",
+            "via": "prompt_templates::generate_with_admin_fallback",
+        }),
+    )
+    .await
+    {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::error!("batch: billing reserve FAILED (provider={provider} model={model}): {e}");
+            None
+        }
+    }
+}
+
+async fn try_provider_once(
+    neural: &crate::orchestrator::NeuralCoreClient,
+    db: &PgPool,
+    routing_matrix: &crate::routing_matrix::RoutingMatrix,
+    prompt: &str,
+    provider: &str,
+    billing_user_id: uuid::Uuid,
+    billing_project_id: uuid::Uuid,
+) -> ProviderAttempt {
+    use crate::orchestrator::default_model_for_provider;
+
+    let model = default_model_for_provider(routing_matrix, provider);
+    // Billing: riserva prima di chiamare il provider, finalizza dopo.
+    // Nota: qui non abbiamo un token_budget esplicito; stimiamo un upper bound.
+    let prompt_tokens = mcp_token::count_tokens(prompt) as i32;
+    let estimated_completion_tokens = 800i32;
+    let reservation = reserve_batch_usage(
+        db,
+        billing_user_id,
+        billing_project_id,
+        provider,
+        &model,
+        prompt_tokens,
+        estimated_completion_tokens,
+    )
+    .await;
+
+    match neural.generate_completion(provider, &model, prompt).await {
+        Ok(v) => {
+            finalize_batch_usage(db, &reservation, &v, prompt_tokens, estimated_completion_tokens)
+                .await;
+            classify_successful_generation(v, provider)
+        }
+        Err(e) => {
+            // In caso di errore, rilascia la riserva (non conteggiare).
+            if let Some(res) = &reservation {
+                crate::billing::release_usage(db, res, "provider_error").await;
+            }
+            tracing::warn!("batch: provider {} errore gRPC: {}, marcato broken", provider, e);
+            ProviderAttempt::Broken
+        }
+    }
+}
+
+/// Classifica una risposta LLM riuscita: `Broken` se segnala esaurimento
+/// quota/credito/rate, altrimenti `Ok`. Estratto da `try_provider_once`
+/// (comportamento invariato).
+fn classify_successful_generation(v: serde_json::Value, provider: &str) -> ProviderAttempt {
+    let content = v["content"].as_str().unwrap_or("");
+    // Controlla se la risposta è un errore di quota/credito/rate limit
+    if response_signals_exhausted(content) {
+        tracing::warn!(
+            "batch: provider {} esaurito/rate-limited → marcato broken per il resto del batch",
+            provider
+        );
+        return ProviderAttempt::Broken;
+    }
+    tracing::debug!("batch: provider {} OK", provider);
+    ProviderAttempt::Ok(v)
+}
+
+/// Genera testo rispettando l'ordine dei provider configurato in admin (settings.provider_hierarchy).
+/// Se un provider restituisce errore di quota/credito/rate, tenta il successivo nella lista admin.
+/// Non aggiunge provider extra: la configurazione admin è autoritativa.
+async fn generate_with_admin_fallback(
+    neural: &crate::orchestrator::NeuralCoreClient,
+    db: &PgPool,
+    routing_matrix: &crate::routing_matrix::RoutingMatrix,
+    prompt: &str,
+    broken_providers: &mut std::collections::HashSet<String>,
+    billing_user_id: uuid::Uuid,
+    billing_project_id: uuid::Uuid,
+) -> Result<serde_json::Value, String> {
+    // Carica l'ordine provider dall'admin (stesso campo usato dall'agent loop)
+    let providers = load_admin_provider_order(db, broken_providers).await?;
 
     for provider in &providers {
-        let model = default_model_for_provider(routing_matrix, provider);
-        // Billing: riserva prima di chiamare il provider, finalizza dopo.
-        // Nota: qui non abbiamo un token_budget esplicito; stimiamo un upper bound.
-        let prompt_tokens = mcp_token::count_tokens(prompt) as i32;
-        let estimated_completion_tokens = 800i32;
-        let reservation = match billing::reserve_usage(
+        match try_provider_once(
+            neural,
             db,
+            routing_matrix,
+            prompt,
+            provider,
             billing_user_id,
             billing_project_id,
-            provider,
-            &model,
-            prompt_tokens,
-            estimated_completion_tokens,
-            serde_json::json!({
-                "feature": "batch_assign_tools",
-                "via": "prompt_templates::generate_with_admin_fallback",
-            }),
         )
         .await
         {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::error!(
-                    "batch: billing reserve FAILED (provider={provider} model={model}): {e}"
-                );
-                None
-            }
-        };
-
-        match neural.generate_completion(provider, &model, prompt).await {
-            Ok(v) => {
-                // Finalizza il costo con i token reali (se presenti), altrimenti usa stima.
-                let usage_numbers: UsageNumbers =
-                    billing::extract_usage_numbers(&v, prompt_tokens, estimated_completion_tokens);
-                if let Some(res) = &reservation {
-                    if let Err(e) =
-                        billing::finalize_usage(db, res, uuid::Uuid::new_v4(), &usage_numbers).await
-                    {
-                        tracing::error!("batch: billing finalize FAILED: {e}");
-                    }
-                }
-
-                let content = v["content"].as_str().unwrap_or("");
-                let lower = content.to_lowercase();
-                // Controlla se la risposta è un errore di quota/credito/rate limit
-                if lower.contains("credit balance")
-                    || lower.contains("too low")
-                    || lower.contains("quota")
-                    || lower.contains("rate limit")
-                    || lower.contains("rate_limit")
-                    || lower.contains("529")
-                    || lower.contains("overloaded")
-                    || (lower.contains("429") && lower.contains("exceeded"))
-                {
-                    tracing::warn!(
-                        "batch: provider {} esaurito/rate-limited → marcato broken per il resto del batch",
-                        provider
-                    );
-                    // Marca come broken: non verrà ritentato nei template successivi
-                    broken_providers.insert(provider.clone());
-                    continue;
-                }
-                tracing::debug!("batch: provider {} OK", provider);
-                return Ok(v);
-            }
-            Err(e) => {
-                // In caso di errore, rilascia la riserva (non conteggiare).
-                if let Some(res) = &reservation {
-                    billing::release_usage(db, res, "provider_error").await;
-                }
-                tracing::warn!(
-                    "batch: provider {} errore gRPC: {}, marcato broken",
-                    provider,
-                    e
-                );
+            ProviderAttempt::Ok(v) => return Ok(v),
+            ProviderAttempt::Broken => {
+                // Marca come broken: non verrà ritentato nei template successivi
                 broken_providers.insert(provider.clone());
                 continue;
             }
@@ -445,25 +572,15 @@ async fn generate_with_admin_fallback(
     ))
 }
 
-/// POST /api/prompt-templates/:key/ai-suggest
-/// Genera un nuovo contenuto per il prompt usando un LLM, con contesto d'uso preinserito.
-pub async fn ai_suggest_handler(
-    State(state): State<crate::AppState>,
-    Path(key): Path<String>,
-    Json(req): Json<AiSuggestReq>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let template = sqlx::query_as::<_, PromptTemplate>(
-        "SELECT id, key, category, title, content, is_active, version, updated_by, updated_at, usage_context FROM nexus_prompt_templates WHERE key = $1"
-    )
-    .bind(&key)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
-    .ok_or((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "template non trovato"}))))?;
-
-    // Default provider/model dal PUNTO UNICO tier-only (regola L/G).
+/// Risolve provider/model per la ai-suggest: default dal PUNTO UNICO tier-only
+/// (regola L/G), con override opzionale dai campi della richiesta. Estratto da
+/// `ai_suggest_handler` (comportamento invariato).
+async fn resolve_ai_suggest_provider_model(
+    state: &crate::AppState,
+    req: &AiSuggestReq,
+) -> Result<(String, String), (StatusCode, Json<serde_json::Value>)> {
     let (purpose_provider, purpose_model) =
-        crate::internal_routing::resolve_purpose_model(&state, "admin_fallback_default")
+        crate::internal_routing::resolve_purpose_model(state, "admin_fallback_default")
             .await
             .into_model("admin_fallback_default")
             .map_err(|m| {
@@ -484,7 +601,19 @@ pub async fn ai_suggest_handler(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or(purpose_model);
+    Ok((provider, model))
+}
 
+/// Costruisce il meta-prompt (system.ai_suggest_meta_prompt, mig 0445), chiama
+/// l'LLM e restituisce la suggestion ripulita. Estratto da `ai_suggest_handler`
+/// (comportamento invariato).
+async fn generate_ai_suggestion_text(
+    state: &crate::AppState,
+    template: &PromptTemplate,
+    req: &AiSuggestReq,
+    provider: &str,
+    model: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     let usage_ctx = template
         .usage_context
         .as_deref()
@@ -506,7 +635,7 @@ pub async fn ai_suggest_handler(
     let result = state
         .orchestrator
         .neural
-        .generate_completion(provider.as_str(), model.as_str(), &meta_prompt)
+        .generate_completion(provider, model, &meta_prompt)
         .await
         .map_err(|e| {
             (
@@ -515,104 +644,38 @@ pub async fn ai_suggest_handler(
             )
         })?;
 
-    let suggestion = result["content"]
+    Ok(result["content"]
         .as_str()
         .unwrap_or("")
         .trim()
         .trim_matches('"')
-        .to_string();
+        .to_string())
+}
+
+/// POST /api/prompt-templates/:key/ai-suggest
+/// Genera un nuovo contenuto per il prompt usando un LLM, con contesto d'uso preinserito.
+pub async fn ai_suggest_handler(
+    State(state): State<crate::AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<AiSuggestReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let template = sqlx::query_as::<_, PromptTemplate>(
+        "SELECT id, key, category, title, content, is_active, version, updated_by, updated_at, usage_context FROM nexus_prompt_templates WHERE key = $1"
+    )
+    .bind(&key)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
+    .ok_or((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "template non trovato"}))))?;
+
+    let (provider, model) = resolve_ai_suggest_provider_model(&state, &req).await?;
+
+    let suggestion =
+        generate_ai_suggestion_text(&state, &template, &req, &provider, &model).await?;
 
     // --- Tool suggestion automatica ---
-    let suggested_tools: Vec<PromptMcpTool> = {
-        let rows = sqlx::query(
-            r#"SELECT DISTINCT
-                mcp_tools.tool_name as name,
-                mcp_servers.name as server_name,
-                mcp_tools.description
-            FROM mcp_server_tools as mcp_tools
-            JOIN mcp_servers ON mcp_tools.server_id = mcp_servers.id
-            WHERE mcp_servers.enabled = true
-            ORDER BY mcp_servers.name, mcp_tools.tool_name"#,
-        )
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-
-        let tools_list = rows
-            .iter()
-            .map(|r| {
-                let name: String = r.get("name");
-                let desc: Option<String> = r.try_get("description").ok().flatten();
-                format!("- {}: {}", name, desc.as_deref().unwrap_or(""))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if tools_list.is_empty() {
-            vec![]
-        } else {
-            let tool_prompt = get_template_or_default(
-                &state.db,
-                &state.template_cache,
-                "system.tool_selection_single_prompt",
-            )
-            .await
-            .replace("{{tools_list}}", &tools_list)
-            .replace("{{content}}", &suggestion);
-
-            // Usa lo stesso provider/model della richiesta principale per la tool suggestion
-            let tool_result = state
-                .orchestrator
-                .neural
-                .generate_completion(provider.as_str(), model.as_str(), &tool_prompt)
-                .await
-                .unwrap_or_default();
-
-            let tool_names: Vec<String> = tool_result["content"]
-                .as_str()
-                .map(|s| {
-                    let s = s.trim();
-                    let start = s.find('[').unwrap_or(0);
-                    let end = s.rfind(']').map(|i| i + 1).unwrap_or(s.len());
-                    serde_json::from_str::<Vec<String>>(&s[start..end]).unwrap_or_default()
-                })
-                .unwrap_or_default();
-
-            let tool_map: std::collections::HashMap<String, String> = rows
-                .iter()
-                .map(|r| {
-                    (
-                        r.get::<String, _>("name"),
-                        r.get::<String, _>("server_name"),
-                    )
-                })
-                .collect();
-
-            let prompt_tools: Vec<PromptMcpTool> = tool_names
-                .iter()
-                .filter_map(|name| {
-                    tool_map.get(name).map(|server| PromptMcpTool {
-                        tool_name: name.clone(),
-                        tool_server: server.clone(),
-                        usage_context: None,
-                    })
-                })
-                .collect();
-
-            if !prompt_tools.is_empty() {
-                let tools_json = serde_json::to_value(&prompt_tools).unwrap_or_default();
-                let _ = sqlx::query(
-                    "UPDATE nexus_prompt_templates SET mcp_tools_json=$1, updated_at=NOW() WHERE key=$2",
-                )
-                .bind(tools_json)
-                .bind(&key)
-                .execute(&state.db)
-                .await;
-            }
-
-            prompt_tools
-        }
-    };
+    let suggested_tools =
+        suggest_tools_for_template(&state, &key, &suggestion, &provider, &model).await;
 
     Ok(Json(serde_json::json!({
         "suggestion": suggestion,
@@ -622,50 +685,11 @@ pub async fn ai_suggest_handler(
     })))
 }
 
-async fn batch_assign_tools_impl(
-    State(state): State<crate::AppState>,
-    billing_user_id: uuid::Uuid,
-    billing_project_id: uuid::Uuid,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // Marker “hard” per rendere verificabile che il job è partito e che scrive sul DB giusto.
-    // Non dipende da orchestrator_runs/run_id e non blocca il job se fallisce.
-    {
-        let marker_id = uuid::Uuid::new_v4();
-        if let Err(e) = sqlx::query(
-            r#"
-            INSERT INTO ai_usage_ledger (
-                id, user_id, project_id, provider, model,
-                prompt_tokens, completion_tokens, total_tokens,
-                input_cost, output_cost, total_cost, currency,
-                status, details
-            ) VALUES ($1, $2, $3, 'internal', 'batch_assign_tools_job', 0, 0, 0, 0, 0, 0, 'EUR', 'reserved', $4)
-            "#,
-        )
-        .bind(marker_id)
-        .bind(billing_user_id)
-        .bind(billing_project_id)
-        .bind(serde_json::json!({
-            "feature": "batch_assign_tools",
-            "event": "job_started",
-        }))
-        .execute(&state.db)
-        .await
-        {
-            tracing::error!("batch_assign_tools: marker insert FAILED: {e}");
-        } else {
-            tracing::info!("batch_assign_tools: marker inserted ledger_id={marker_id}");
-        }
-    }
-
-    let templates = sqlx::query(
-        "SELECT key, title, content, category FROM nexus_prompt_templates WHERE is_active = true ORDER BY category, key",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-
-    // Carica TUTTI i tool MCP abilitati (inclusi server esterni gestiti) con descrizioni troncate.
-    let tool_rows = sqlx::query(
+/// Carica i tool MCP dei server abilitati (nome, server, descrizione).
+/// Punto unico della query ripetuta negli handler prompt-templates (regola L);
+/// su errore ritorna una lista vuota (comportamento invariato).
+async fn fetch_enabled_mcp_tools(db: &PgPool) -> Vec<sqlx::postgres::PgRow> {
+    sqlx::query(
         r#"SELECT DISTINCT
             mcp_tools.tool_name as name,
             mcp_servers.name as server_name,
@@ -675,17 +699,180 @@ async fn batch_assign_tools_impl(
         WHERE mcp_servers.enabled = true
         ORDER BY mcp_servers.name, mcp_tools.tool_name"#,
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
-    .unwrap_or_default();
+    .unwrap_or_default()
+}
 
-    if tool_rows.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "processed": 0, "assigned": 0, "skipped": templates.len(), "errors": 0,
-            "message": "Nessun tool MCP disponibile"
-        })));
+/// Estrae la lista di nomi tool da una risposta LLM che contiene un array JSON
+/// (eventualmente incorniciato da prosa). Estratto da `suggest_tools_for_template`
+/// (comportamento invariato).
+fn parse_tool_names(tool_result: &serde_json::Value) -> Vec<String> {
+    tool_result["content"]
+        .as_str()
+        .map(|s| {
+            let s = s.trim();
+            let start = s.find('[').unwrap_or(0);
+            let end = s.rfind(']').map(|i| i + 1).unwrap_or(s.len());
+            serde_json::from_str::<Vec<String>>(&s[start..end]).unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// Persiste i tool assegnati su `mcp_tools_json` (no-op se vuoti). Estratto da
+/// `suggest_tools_for_template` (comportamento invariato).
+async fn persist_assigned_tools(db: &PgPool, key: &str, prompt_tools: &[PromptMcpTool]) {
+    if prompt_tools.is_empty() {
+        return;
+    }
+    let tools_json = serde_json::to_value(prompt_tools).unwrap_or_default();
+    let _ = sqlx::query(
+        "UPDATE nexus_prompt_templates SET mcp_tools_json=$1, updated_at=NOW() WHERE key=$2",
+    )
+    .bind(tools_json)
+    .bind(key)
+    .execute(db)
+    .await;
+}
+
+/// Formatta le righe tool in una lista "- name: desc" (una per riga). Estratto
+/// da `suggest_tools_for_template` (comportamento invariato).
+fn format_tools_list(rows: &[sqlx::postgres::PgRow]) -> String {
+    rows.iter()
+        .map(|r| {
+            let name: String = r.get("name");
+            let desc: Option<String> = r.try_get("description").ok().flatten();
+            format!("- {}: {}", name, desc.as_deref().unwrap_or(""))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Mappa i nomi tool selezionati sui rispettivi server noti, scartando quelli
+/// non presenti. Estratto da `suggest_tools_for_template` (comportamento
+/// invariato).
+fn resolve_selected_tools(
+    rows: &[sqlx::postgres::PgRow],
+    tool_names: &[String],
+) -> Vec<PromptMcpTool> {
+    let tool_map: std::collections::HashMap<String, String> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("name"),
+                r.get::<String, _>("server_name"),
+            )
+        })
+        .collect();
+
+    tool_names
+        .iter()
+        .filter_map(|name| {
+            tool_map.get(name).map(|server| PromptMcpTool {
+                tool_name: name.clone(),
+                tool_server: server.clone(),
+                usage_context: None,
+            })
+        })
+        .collect()
+}
+
+/// Seleziona via LLM i tool MCP piu' adatti al contenuto suggerito e li
+/// persiste su `mcp_tools_json`. Estratto da `ai_suggest_handler`
+/// (comportamento invariato).
+async fn suggest_tools_for_template(
+    state: &crate::AppState,
+    key: &str,
+    suggestion: &str,
+    provider: &str,
+    model: &str,
+) -> Vec<PromptMcpTool> {
+    let rows = fetch_enabled_mcp_tools(&state.db).await;
+
+    let tools_list = format_tools_list(&rows);
+
+    if tools_list.is_empty() {
+        return vec![];
     }
 
+    let tool_prompt = get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        "system.tool_selection_single_prompt",
+    )
+    .await
+    .replace("{{tools_list}}", &tools_list)
+    .replace("{{content}}", suggestion);
+
+    // Usa lo stesso provider/model della richiesta principale per la tool suggestion
+    let tool_result = state
+        .orchestrator
+        .neural
+        .generate_completion(provider, model, &tool_prompt)
+        .await
+        .unwrap_or_default();
+
+    let tool_names = parse_tool_names(&tool_result);
+    let prompt_tools = resolve_selected_tools(&rows, &tool_names);
+
+    persist_assigned_tools(&state.db, key, &prompt_tools).await;
+
+    prompt_tools
+}
+
+/// Catalogo dei tool MCP abilitati con i lookup usati dal batch: lista testuale
+/// disambiguata, coppie (server, tool) e mappa tool_name -> set(server).
+/// Estratto da `batch_assign_tools_impl` (comportamento invariato).
+struct ToolCatalog {
+    /// Lista minima "- server::tool" per il prompt.
+    tools_list: String,
+    /// Coppie (server, tool_name) esistenti.
+    by_pair: std::collections::HashSet<(String, String)>,
+    /// tool_name -> insieme dei server che lo espongono (disambiguazione).
+    servers_by_name: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Numero di tool nel catalogo (per la soglia token-saver).
+    total: usize,
+}
+
+/// Inserisce il marker "job started" sul ledger. Best-effort: non blocca il job
+/// se fallisce. Estratto da `batch_assign_tools_impl` (comportamento invariato).
+async fn insert_batch_job_marker(
+    db: &PgPool,
+    billing_user_id: uuid::Uuid,
+    billing_project_id: uuid::Uuid,
+) {
+    // Marker “hard” per rendere verificabile che il job è partito e che scrive sul DB giusto.
+    // Non dipende da orchestrator_runs/run_id e non blocca il job se fallisce.
+    let marker_id = uuid::Uuid::new_v4();
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO ai_usage_ledger (
+            id, user_id, project_id, provider, model,
+            prompt_tokens, completion_tokens, total_tokens,
+            input_cost, output_cost, total_cost, currency,
+            status, details
+        ) VALUES ($1, $2, $3, 'internal', 'batch_assign_tools_job', 0, 0, 0, 0, 0, 0, 'EUR', 'reserved', $4)
+        "#,
+    )
+    .bind(marker_id)
+    .bind(billing_user_id)
+    .bind(billing_project_id)
+    .bind(serde_json::json!({
+        "feature": "batch_assign_tools",
+        "event": "job_started",
+    }))
+    .execute(db)
+    .await
+    {
+        tracing::error!("batch_assign_tools: marker insert FAILED: {e}");
+    } else {
+        tracing::info!("batch_assign_tools: marker inserted ledger_id={marker_id}");
+    }
+}
+
+/// Costruisce `ToolCatalog` dalle righe tool. Estratto da
+/// `batch_assign_tools_impl` (comportamento invariato).
+fn build_tool_catalog(tool_rows: &[sqlx::postgres::PgRow]) -> ToolCatalog {
     // Token/costo: NON includere descrizioni qui (sono tantissime e fanno esplodere il prompt).
     // Lista minima, disambiguata: "server::tool".
     let tools_list = tool_rows
@@ -701,269 +888,532 @@ async fn batch_assign_tools_impl(
     // Mappa per lookup:
     // - by_pair: (server, tool_name) -> true
     // - by_name: tool_name -> set(server) per gestire collisioni e richiedere disambiguazione quando serve.
-    let mut tool_by_pair: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
-    let mut tool_servers_by_name: std::collections::HashMap<
+    let mut by_pair: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut servers_by_name: std::collections::HashMap<
         String,
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
-    for r in &tool_rows {
+    for r in tool_rows {
         let name: String = r.get("name");
         let server: String = r.get("server_name");
-        tool_by_pair.insert((server.clone(), name.clone()));
-        tool_servers_by_name.entry(name).or_default().insert(server);
+        by_pair.insert((server.clone(), name.clone()));
+        servers_by_name.entry(name).or_default().insert(server);
     }
+
+    ToolCatalog {
+        tools_list,
+        by_pair,
+        servers_by_name,
+        total: tool_rows.len(),
+    }
+}
+
+/// Item grezzo estratto da un elemento dell'array LLM: nome tool, server
+/// (opzionale) e usage_context (opzionale). Estratto da `batch_assign_tools_impl`.
+struct ParsedToolItem {
+    name: Option<String>,
+    server: Option<String>,
+    usage_ctx: Option<String>,
+}
+
+/// Interpreta un singolo elemento JSON della selezione tool (stringa
+/// "tool"/"server::tool" oppure oggetto {tool_name, tool_server?, usage_context?}).
+/// Estratto da `batch_assign_tools_impl` (comportamento invariato).
+fn parse_tool_selection_item(item: &serde_json::Value) -> ParsedToolItem {
+    // 1) String: "tool" oppure "server::tool"
+    // 2) Object: {tool_name, tool_server?, usage_context?}
+    let mut name: Option<String> = None;
+    let mut server: Option<String> = None;
+    let mut usage_ctx: Option<String> = None;
+
+    if let Some(s) = item.as_str() {
+        let s = s.trim();
+        if let Some((srv, nm)) = s.split_once("::") {
+            let srv = srv.trim();
+            let nm = nm.trim();
+            if !srv.is_empty() && !nm.is_empty() {
+                server = Some(srv.to_string());
+                name = Some(nm.to_string());
+            }
+        } else if !s.is_empty() {
+            name = Some(s.to_string());
+        }
+    } else if let Some(obj) = item.as_object() {
+        name = obj
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        server = obj
+            .get("tool_server")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        usage_ctx = obj
+            .get("usage_context")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+    }
+
+    ParsedToolItem { name, server, usage_ctx }
+}
+
+/// Risolve il server per un tool selezionato: usa quello esplicito, oppure
+/// l'unico server che espone il tool_name. `None` se ambiguo o inesistente.
+/// Estratto da `batch_assign_tools_impl` (comportamento invariato).
+fn resolve_tool_server(catalog: &ToolCatalog, tool_name: &str, server: Option<String>) -> Option<String> {
+    // Se server non specificato:
+    // - accetta solo se il tool_name è univoco tra i server
+    // - se ambiguo, richiede "server::tool" o tool_server nel JSON.
+    if let Some(srv) = server {
+        return Some(srv);
+    }
+    match catalog.servers_by_name.get(tool_name) {
+        Some(s) if s.len() == 1 => s.iter().next().cloned(),
+        _ => None, // ambiguo o inesistente
+    }
+}
+
+/// Costruisce la lista di tool validi da un array JSON, applicando dedup e i
+/// limiti BASE_MAX/HARD_MAX. Estratto da `batch_assign_tools_impl`
+/// (comportamento invariato).
+fn select_tools_from_array(
+    arr: &[serde_json::Value],
+    catalog: &ToolCatalog,
+    base_max: usize,
+    hard_max: usize,
+) -> Vec<PromptMcpTool> {
+    // Parsing robusto:
+    // - accetta ["tool_name", ...]
+    // - accetta [{tool_name, usage_context?}, ...]
+    // - ignora tool non presenti in catalog
+    // - de-duplica
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut prompt_tools: Vec<PromptMcpTool> = Vec::new();
+
+    for item in arr {
+        let parsed = parse_tool_selection_item(item);
+        let Some(tool_name) = parsed.name else {
+            continue;
+        };
+        let Some(tool_server) = resolve_tool_server(catalog, &tool_name, parsed.server) else {
+            continue;
+        };
+
+        if !catalog.by_pair.contains(&(tool_server.clone(), tool_name.clone())) {
+            continue;
+        }
+
+        let dedup_key = format!("{}::{}", tool_server, tool_name);
+        if !seen.insert(dedup_key) {
+            continue;
+        }
+
+        // Oltre BASE_MAX accettiamo solo tool con usage_context.
+        if prompt_tools.len() >= base_max && parsed.usage_ctx.is_none() {
+            continue;
+        }
+
+        prompt_tools.push(PromptMcpTool {
+            tool_name,
+            tool_server,
+            usage_context: parsed.usage_ctx,
+        });
+
+        if prompt_tools.len() >= hard_max {
+            break;
+        }
+    }
+
+    prompt_tools
+}
+
+/// Token saver "hard": con catalogo grande (>=80 tool) rimpiazza la selezione
+/// specifica con i 2 meta-tool builtin di discovery/call, se un server li espone
+/// entrambi. Estratto da `batch_assign_tools_impl` (comportamento invariato).
+fn maybe_collapse_to_meta_tools(
+    prompt_tools: Vec<PromptMcpTool>,
+    catalog: &ToolCatalog,
+) -> Vec<PromptMcpTool> {
+    // Token saver “hard”: se il catalogo tool è grande, non assegnare tool specifici.
+    // Assegna solo i 2 meta-tool builtin che permettono discovery+call runtime
+    // (riduce enormemente il payload tools_json inviato al provider nei turni agente).
+    if catalog.total < 80 || prompt_tools.is_empty() {
+        return prompt_tools;
+    }
+    // Un server MCP deve esporre entrambi i meta-tool (ordine HashSet non deterministico).
+    let servers: std::collections::HashSet<String> =
+        catalog.by_pair.iter().map(|(srv, _)| srv.clone()).collect();
+    let mut meta_server: Option<String> = None;
+    for srv in servers {
+        let search_pair = (srv.clone(), "nexus_mcp_tool_search".to_string());
+        let call_pair = (srv.clone(), "nexus_mcp_tool_call".to_string());
+        if catalog.by_pair.contains(&search_pair) && catalog.by_pair.contains(&call_pair) {
+            meta_server = Some(srv);
+            break;
+        }
+    }
+    let Some(srv) = meta_server else {
+        return prompt_tools;
+    };
+    vec![
+        PromptMcpTool {
+            tool_name: "nexus_mcp_tool_search".to_string(),
+            tool_server: srv.clone(),
+            usage_context: Some(
+                "Cerca tool MCP disponibili solo quando servono (riduce token).".to_string(),
+            ),
+        },
+        PromptMcpTool {
+            tool_name: "nexus_mcp_tool_call".to_string(),
+            tool_server: srv,
+            usage_context: Some(
+                "Invoca un tool MCP specifico (server_id + tool_name).".to_string(),
+            ),
+        },
+    ]
+}
+
+/// Esito dell'elaborazione della risposta LLM per un singolo template.
+struct TemplateOutcome {
+    tools_selected: usize,
+    assigned: bool,
+    errored: bool,
+    result: serde_json::Value,
+}
+
+impl TemplateOutcome {
+    /// Esito di errore (nessun tool assegnato). Il `result` porta lo `status`
+    /// e l'eventuale messaggio d'errore.
+    fn error(result: serde_json::Value) -> Self {
+        TemplateOutcome {
+            tools_selected: 0,
+            assigned: false,
+            errored: true,
+            result,
+        }
+    }
+}
+
+/// Estrae l'array JSON incorniciato da eventuale prosa nel testo grezzo.
+/// `None` se il contenuto non e' un array JSON valido. Estratto da
+/// `process_template_response` (comportamento invariato).
+fn extract_json_array(raw: &str) -> Option<Vec<serde_json::Value>> {
+    let start = raw.find('[').unwrap_or(0);
+    let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
+    let json_slice = &raw[start..end];
+    // Match con if-let invece di guardia is_array() + unwrap successivo.
+    match serde_json::from_str::<serde_json::Value>(json_slice) {
+        Ok(serde_json::Value::Array(arr)) => Some(arr),
+        _ => None,
+    }
+}
+
+/// Elabora la risposta `generate_with_admin_fallback` per un template: parsa
+/// l'array, seleziona i tool, applica il token-saver e persiste. Estratto da
+/// `batch_assign_tools_impl` (comportamento invariato).
+async fn process_template_response(
+    db: &PgPool,
+    key: &str,
+    catalog: &ToolCatalog,
+    base_max: usize,
+    hard_max: usize,
+    tool_result: Result<serde_json::Value, String>,
+) -> TemplateOutcome {
+    let v = match tool_result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("batch_assign: tutti i provider falliti per {}: {}", key, e);
+            return TemplateOutcome::error(
+                serde_json::json!({"key": key, "status": "llm_error", "error": e}),
+            );
+        }
+    };
+
+    let raw = v["content"].as_str().unwrap_or("[]");
+    let Some(arr) = extract_json_array(raw) else {
+        let snippet: String = raw.chars().take(80).collect();
+        tracing::warn!("batch_assign: parse error per {}: {:?}", key, snippet);
+        return TemplateOutcome::error(serde_json::json!({"key": key, "status": "parse_error"}));
+    };
+
+    let prompt_tools = select_tools_from_array(&arr, catalog, base_max, hard_max);
+    let prompt_tools = maybe_collapse_to_meta_tools(prompt_tools, catalog);
+
+    let count = prompt_tools.len();
+    persist_assigned_tools(db, key, &prompt_tools).await;
+
+    TemplateOutcome {
+        tools_selected: count,
+        assigned: count > 0,
+        errored: false,
+        result: serde_json::json!({"key": key, "tools_count": count, "status": "ok"}),
+    }
+}
+
+// Limiti adattivi per l'assegnazione tool per template:
+// - fino a BASE_MAX accettiamo anche tool senza "usage_context"
+// - oltre BASE_MAX, accettiamo solo tool con usage_context (giustificazione) per evitare over-assign.
+// - HARD_MAX resta un limite di sicurezza.
+const BATCH_BASE_MAX: usize = 3;
+const BATCH_HARD_MAX: usize = 8;
+
+/// Elabora un singolo template: costruisce il prompt, seleziona il provider,
+/// genera e persiste i tool. `None` se la routing matrix non e' disponibile
+/// (template saltato). Estratto da `batch_assign_tools_impl` (comportamento
+/// invariato).
+/// Costruisce il meta-prompt di assegnazione tool per un template
+/// (system.batch_tool_assignment_prompt, mig 0445). {{role}} per ultimo:
+/// l'estratto del prompt template puo' contenere placeholder. Estratto da
+/// `assign_tools_for_one_template` (comportamento invariato).
+async fn build_batch_tool_prompt(
+    state: &crate::AppState,
+    key: &str,
+    title: &str,
+    category: &str,
+    content_preview: &str,
+    catalog: &ToolCatalog,
+) -> String {
+    get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        "system.batch_tool_assignment_prompt",
+    )
+    .await
+    .replace("{{key}}", key)
+    .replace("{{title}}", title)
+    .replace("{{category}}", category)
+    .replace("{{tools_list}}", &catalog.tools_list)
+    .replace("{{base_max}}", &BATCH_BASE_MAX.to_string())
+    .replace("{{hard_max}}", &BATCH_HARD_MAX.to_string())
+    .replace("{{role}}", content_preview)
+}
+
+async fn assign_tools_for_one_template(
+    state: &crate::AppState,
+    row: &sqlx::postgres::PgRow,
+    catalog: &ToolCatalog,
+    broken_providers: &mut std::collections::HashSet<String>,
+    billing_user_id: uuid::Uuid,
+    billing_project_id: uuid::Uuid,
+) -> Option<TemplateOutcome> {
+    let key: String = row.get("key");
+    let title: String = row.get("title");
+    let category: String = row.get("category");
+    let content_text: String = row.get("content");
+    let content_preview: String = content_text.chars().take(400).collect();
+
+    let tool_prompt =
+        build_batch_tool_prompt(state, &key, &title, &category, &content_preview, catalog).await;
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let matrix_arc = match state.orchestrator.routing_matrix.current_async().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("regenerate_tool_suggestions: routing_matrix non disponibile ({e}), skip");
+            return None;
+        }
+    };
+    let tool_result = generate_with_admin_fallback(
+        &state.orchestrator.neural,
+        &state.db,
+        &matrix_arc,
+        &tool_prompt,
+        broken_providers,
+        billing_user_id,
+        billing_project_id,
+    )
+    .await;
+
+    Some(
+        process_template_response(
+            &state.db,
+            &key,
+            catalog,
+            BATCH_BASE_MAX,
+            BATCH_HARD_MAX,
+            tool_result,
+        )
+        .await,
+    )
+}
+
+/// Accumulatore delle statistiche del batch: contatori + risultati per-template.
+/// Estratto da `batch_assign_tools_impl` (comportamento invariato).
+#[derive(Default)]
+struct BatchStats {
+    processed: usize,
+    assigned: usize,
+    errors: usize,
+    total_tools_selected: usize,
+    results: Vec<serde_json::Value>,
+}
+
+impl BatchStats {
+    /// Registra l'esito di un template elaborato.
+    fn record(&mut self, outcome: TemplateOutcome) {
+        self.total_tools_selected += outcome.tools_selected;
+        if outcome.assigned {
+            self.assigned += 1;
+        }
+        if outcome.errored {
+            self.errors += 1;
+        }
+        self.results.push(outcome.result);
+    }
+
+    /// Costruisce il JSON riassuntivo finale del batch.
+    fn into_summary(self) -> Json<serde_json::Value> {
+        let avg_tools = if self.processed > 0 {
+            (self.total_tools_selected as f64) / (self.processed as f64)
+        } else {
+            0.0
+        };
+        Json(serde_json::json!({
+            "status": "completed",
+            "processed": self.processed,
+            "assigned": self.assigned,
+            "skipped": self.processed - self.assigned - self.errors,
+            "errors": self.errors,
+            "avg_tools_per_template": avg_tools,
+            "base_max_tools_per_template": 3,
+            "hard_max_tools_per_template": 8,
+            "results": self.results,
+        }))
+    }
+}
+
+async fn batch_assign_tools_impl(
+    State(state): State<crate::AppState>,
+    billing_user_id: uuid::Uuid,
+    billing_project_id: uuid::Uuid,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    insert_batch_job_marker(&state.db, billing_user_id, billing_project_id).await;
+
+    let templates = sqlx::query(
+        "SELECT key, title, content, category FROM nexus_prompt_templates WHERE is_active = true ORDER BY category, key",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+
+    // Carica TUTTI i tool MCP abilitati (inclusi server esterni gestiti) con descrizioni troncate.
+    let tool_rows = fetch_enabled_mcp_tools(&state.db).await;
+
+    if tool_rows.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "processed": 0, "assigned": 0, "skipped": templates.len(), "errors": 0,
+            "message": "Nessun tool MCP disponibile"
+        })));
+    }
+
+    let catalog = build_tool_catalog(&tool_rows);
 
     // Set dei provider che hanno fallito - evita di ritentarli per ogni template
     let mut broken_providers: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    let mut processed = 0usize;
-    let mut assigned = 0usize;
-    let mut errors = 0usize;
-    let mut total_tools_selected = 0usize;
-    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut stats = BatchStats::default();
 
     for row in &templates {
-        let key: String = row.get("key");
-        let title: String = row.get("title");
-        let category: String = row.get("category");
-        let content_text: String = row.get("content");
-        let content_preview: String = content_text.chars().take(400).collect();
-
-        // Obiettivo: assegnare SOLO i tool effettivamente necessari, minimizzando token/costo.
-        // Logica adattiva:
-        // - fino a BASE_MAX accettiamo anche tool senza "usage_context"
-        // - oltre BASE_MAX, accettiamo solo tool con usage_context (giustificazione) per evitare over-assign.
-        // - HARD_MAX resta un limite di sicurezza.
-        const BASE_MAX: usize = 3;
-        const HARD_MAX: usize = 8;
-
-        // Meta-prompt dal DB (system.batch_tool_assignment_prompt, mig 0445);
-        // fallback al default builtin se DB down. {{role}} per ultimo (l'estratto
-        // del prompt template puo' contenere placeholder).
-        let tool_prompt = get_template_or_default(
-            &state.db,
-            &state.template_cache,
-            "system.batch_tool_assignment_prompt",
-        )
-        .await
-        .replace("{{key}}", &key)
-        .replace("{{title}}", &title)
-        .replace("{{category}}", &category)
-        .replace("{{tools_list}}", &tools_list)
-        .replace("{{base_max}}", &BASE_MAX.to_string())
-        .replace("{{hard_max}}", &HARD_MAX.to_string())
-        .replace("{{role}}", &content_preview);
-
-        processed += 1;
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-        let matrix_arc = match state.orchestrator.routing_matrix.current_async().await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(
-                    "regenerate_tool_suggestions: routing_matrix non disponibile ({e}), skip"
-                );
-                continue;
-            }
-        };
-        let tool_result = generate_with_admin_fallback(
-            &state.orchestrator.neural,
-            &state.db,
-            &matrix_arc,
-            &tool_prompt,
+        stats.processed += 1;
+        let Some(outcome) = assign_tools_for_one_template(
+            &state,
+            row,
+            &catalog,
             &mut broken_providers,
             billing_user_id,
             billing_project_id,
         )
-        .await;
-
-        match tool_result {
-            Ok(v) => {
-                let raw = v["content"].as_str().unwrap_or("[]");
-                let start = raw.find('[').unwrap_or(0);
-                let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
-                let json_slice = &raw[start..end];
-                match serde_json::from_str::<serde_json::Value>(json_slice) {
-                    // Match con if-let invece di guardia is_array() + unwrap successivo.
-                    Ok(serde_json::Value::Array(ref arr_ref_owned)) => {
-                        let arr_ref = arr_ref_owned;
-                        // Parsing robusto:
-                        // - accetta ["tool_name", ...]
-                        // - accetta [{tool_name, usage_context?}, ...]
-                        // - ignora tool non presenti in tool_map
-                        // - de-duplica
-                        let mut seen: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        let mut prompt_tools: Vec<PromptMcpTool> = Vec::new();
-
-                        for item in arr_ref {
-                            // 1) String: "tool" oppure "server::tool"
-                            // 2) Object: {tool_name, tool_server?, usage_context?}
-                            let mut name: Option<String> = None;
-                            let mut server: Option<String> = None;
-                            let mut usage_ctx_opt: Option<String> = None;
-
-                            if let Some(s) = item.as_str() {
-                                let s = s.trim();
-                                if let Some((srv, nm)) = s.split_once("::") {
-                                    let srv = srv.trim();
-                                    let nm = nm.trim();
-                                    if !srv.is_empty() && !nm.is_empty() {
-                                        server = Some(srv.to_string());
-                                        name = Some(nm.to_string());
-                                    }
-                                } else if !s.is_empty() {
-                                    name = Some(s.to_string());
-                                }
-                            } else if let Some(obj) = item.as_object() {
-                                name = obj
-                                    .get("tool_name")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty());
-                                server = obj
-                                    .get("tool_server")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty());
-                                usage_ctx_opt = obj
-                                    .get("usage_context")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.trim())
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| s.to_string());
-                            }
-
-                            let Some(tool_name) = name else {
-                                continue;
-                            };
-
-                            // Se server non specificato:
-                            // - accetta solo se il tool_name è univoco tra i server
-                            // - se ambiguo, richiede "server::tool" o tool_server nel JSON.
-                            let tool_server = if let Some(srv) = server {
-                                srv
-                            } else {
-                                let servers = tool_servers_by_name.get(&tool_name);
-                                match servers {
-                                    Some(s) if s.len() == 1 => {
-                                        s.iter().next().cloned().unwrap_or_default()
-                                    }
-                                    _ => continue, // ambiguo o inesistente
-                                }
-                            };
-
-                            if !tool_by_pair.contains(&(tool_server.clone(), tool_name.clone())) {
-                                continue;
-                            }
-
-                            let dedup_key = format!("{}::{}", tool_server, tool_name);
-                            if !seen.insert(dedup_key) {
-                                continue;
-                            }
-
-                            // Oltre BASE_MAX accettiamo solo tool con usage_context.
-                            if prompt_tools.len() >= BASE_MAX && usage_ctx_opt.is_none() {
-                                continue;
-                            }
-
-                            prompt_tools.push(PromptMcpTool {
-                                tool_name,
-                                tool_server,
-                                usage_context: usage_ctx_opt,
-                            });
-
-                            if prompt_tools.len() >= HARD_MAX {
-                                break;
-                            }
-                        }
-
-                        // Token saver “hard”: se il catalogo tool è grande, non assegnare tool specifici.
-                        // Assegna solo i 2 meta-tool builtin che permettono discovery+call runtime
-                        // (riduce enormemente il payload tools_json inviato al provider nei turni agente).
-                        if tool_rows.len() >= 80 && !prompt_tools.is_empty() {
-                            // Un server MCP deve esporre entrambi i meta-tool (ordine HashSet non deterministico).
-                            let servers: std::collections::HashSet<String> =
-                                tool_by_pair.iter().map(|(srv, _)| srv.clone()).collect();
-                            let mut meta_server: Option<String> = None;
-                            for srv in servers {
-                                let search_pair =
-                                    (srv.clone(), "nexus_mcp_tool_search".to_string());
-                                let call_pair = (srv.clone(), "nexus_mcp_tool_call".to_string());
-                                if tool_by_pair.contains(&search_pair)
-                                    && tool_by_pair.contains(&call_pair)
-                                {
-                                    meta_server = Some(srv);
-                                    break;
-                                }
-                            }
-                            if let Some(srv) = meta_server {
-                                prompt_tools = vec![
-                                    PromptMcpTool {
-                                        tool_name: "nexus_mcp_tool_search".to_string(),
-                                        tool_server: srv.clone(),
-                                        usage_context: Some("Cerca tool MCP disponibili solo quando servono (riduce token).".to_string()),
-                                    },
-                                    PromptMcpTool {
-                                        tool_name: "nexus_mcp_tool_call".to_string(),
-                                        tool_server: srv,
-                                        usage_context: Some("Invoca un tool MCP specifico (server_id + tool_name).".to_string()),
-                                    },
-                                ];
-                            }
-                        }
-
-                        let count = prompt_tools.len();
-                        total_tools_selected += count;
-                        let tools_json = serde_json::to_value(&prompt_tools).unwrap_or_default();
-                        let _ = sqlx::query(
-                            "UPDATE nexus_prompt_templates SET mcp_tools_json=$1, updated_at=NOW() WHERE key=$2"
-                        )
-                        .bind(tools_json)
-                        .bind(&key)
-                        .execute(&state.db)
-                        .await;
-
-                        if count > 0 {
-                            assigned += 1;
-                        }
-                        results.push(
-                            serde_json::json!({"key": &key, "tools_count": count, "status": "ok"}),
-                        );
-                    }
-                    _ => {
-                        errors += 1;
-                        let snippet: String = raw.chars().take(80).collect();
-                        tracing::warn!("batch_assign: parse error per {}: {:?}", &key, snippet);
-                        results.push(serde_json::json!({"key": &key, "status": "parse_error"}));
-                    }
-                }
-            }
-            Err(e) => {
-                errors += 1;
-                tracing::warn!("batch_assign: tutti i provider falliti per {}: {}", &key, e);
-                results.push(serde_json::json!({"key": &key, "status": "llm_error", "error": e}));
-            }
-        }
+        .await
+        else {
+            continue;
+        };
+        stats.record(outcome);
     }
 
-    let avg_tools = if processed > 0 {
-        (total_tools_selected as f64) / (processed as f64)
-    } else {
-        0.0
+    Ok(stats.into_summary())
+}
+
+/// Risposta "gia' in esecuzione" per gli handler batch (HTTP 202). Punto unico
+/// del payload duplicato tra admin e internal (regola L, comportamento invariato).
+fn batch_already_running_response() -> axum::response::Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "queued": false,
+            "running": true,
+            "pending": true
+        })),
+    )
+        .into_response()
+}
+
+/// Risposta "job accodato" per gli handler batch (HTTP 202).
+fn batch_queued_response() -> axum::response::Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "queued": true,
+            "running": true,
+            "pending": false
+        })),
+    )
+        .into_response()
+}
+
+/// Risolve user_id/project_id per il primo run "admin": preferisce il subject
+/// dei claims, poi l'ultimo utente/progetto; su fallimento logga e ritorna nil.
+/// Estratto da `batch_assign_tools_handler` (comportamento invariato).
+async fn resolve_billing_ids_admin_first(
+    db: &PgPool,
+    claims_sub: &str,
+) -> (uuid::Uuid, uuid::Uuid) {
+    // Billing: usa l'utente autenticato + progetto più recente (necessari per FK).
+    let user_id = match uuid::Uuid::parse_str(claims_sub) {
+        Ok(u) => u,
+        Err(_) => sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::error!(
+                "batch: impossibile risolvere user_id per billing (claims non UUID e nessun utente?)"
+            );
+            uuid::Uuid::nil()
+        }),
     };
-    Ok(Json(serde_json::json!({
-        "status": "completed",
-        "processed": processed,
-        "assigned": assigned,
-        "skipped": processed - assigned - errors,
-        "errors": errors,
-        "avg_tools_per_template": avg_tools,
-        "base_max_tools_per_template": 3,
-        "hard_max_tools_per_template": 8,
-        "results": results,
-    })))
+
+    let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap_or_else(|_| {
+        tracing::error!("batch: impossibile risolvere project_id per billing (nessun progetto?)");
+        uuid::Uuid::nil()
+    });
+
+    (user_id, project_id)
+}
+
+/// Risolve user_id/project_id come ultimo utente/progetto, nil su fallimento
+/// (nessun log). Usato dal re-run "admin". Comportamento invariato.
+async fn resolve_billing_ids_latest_or_nil(db: &PgPool) -> (uuid::Uuid, uuid::Uuid) {
+    let user_id =
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap_or(uuid::Uuid::nil());
+    let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap_or(uuid::Uuid::nil());
+    (user_id, project_id)
 }
 
 /// POST /api/admin/prompt-templates/batch-assign-tools
@@ -980,47 +1430,14 @@ pub async fn batch_assign_tools_handler(
 
     if RUNNING.swap(true, Ordering::SeqCst) {
         PENDING.store(true, Ordering::SeqCst);
-        return (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "queued": false,
-                "running": true,
-                "pending": true
-            })),
-        )
-            .into_response();
+        return batch_already_running_response();
     }
 
     let state_clone = state.clone();
     let claims_sub = claims.sub.clone();
     tokio::spawn(async move {
-        // Billing: usa l'utente autenticato + progetto più recente (necessari per FK).
-        let user_id = match uuid::Uuid::parse_str(&claims_sub) {
-            Ok(u) => u,
-            Err(_) => sqlx::query_scalar::<_, uuid::Uuid>(
-                "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
-            )
-            .fetch_one(&state_clone.db)
-            .await
-            .unwrap_or_else(|_| {
-                tracing::error!(
-                    "batch: impossibile risolvere user_id per billing (claims non UUID e nessun utente?)"
-                );
-                uuid::Uuid::nil()
-            }),
-        };
-
-        let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_one(&state_clone.db)
-        .await
-        .unwrap_or_else(|_| {
-            tracing::error!(
-                "batch: impossibile risolvere project_id per billing (nessun progetto?)"
-            );
-            uuid::Uuid::nil()
-        });
+        let (user_id, project_id) =
+            resolve_billing_ids_admin_first(&state_clone.db, &claims_sub).await;
 
         if user_id.is_nil() || project_id.is_nil() {
             // Senza FK valide non possiamo scrivere su ledger: abort job.
@@ -1034,19 +1451,8 @@ pub async fn batch_assign_tools_handler(
             let state_clone2 = state.clone();
             RUNNING.store(true, Ordering::SeqCst);
             tokio::spawn(async move {
-                let user_id2 = sqlx::query_scalar::<_, uuid::Uuid>(
-                    "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
-                )
-                .fetch_one(&state_clone2.db)
-                .await
-                .unwrap_or(uuid::Uuid::nil());
-
-                let project_id2 = sqlx::query_scalar::<_, uuid::Uuid>(
-                    "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
-                )
-                .fetch_one(&state_clone2.db)
-                .await
-                .unwrap_or(uuid::Uuid::nil());
+                let (user_id2, project_id2) =
+                    resolve_billing_ids_latest_or_nil(&state_clone2.db).await;
 
                 if !user_id2.is_nil() && !project_id2.is_nil() {
                     let _ =
@@ -1057,15 +1463,7 @@ pub async fn batch_assign_tools_handler(
         }
     });
 
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "queued": true,
-            "running": true,
-            "pending": false
-        })),
-    )
-        .into_response()
+    batch_queued_response()
 }
 
 /// POST /api/internal/prompt-templates/batch-assign-tools
@@ -1074,6 +1472,31 @@ pub async fn batch_assign_tools_handler(
 /// Usata da servizi interni (es. plugin-service) quando cambia il parco MCP
 /// disponibile (install/disable/delete) e serve riallineare `mcp_tools_json`
 /// su TUTTI i prompt template minimizzando i tool assegnati.
+/// Risolve user_id/project_id per i trigger interni: ultimo utente/progetto,
+/// con un UUID nuovo come "contabilità di sistema" se assenti. Estratto da
+/// `internal_batch_assign_tools_handler` (comportamento invariato).
+async fn resolve_billing_ids_internal(db: &PgPool) -> (uuid::Uuid, uuid::Uuid) {
+    // Trigger interno: usa ultimo user/progetto come “contabilità di sistema”.
+    let user_id =
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users ORDER BY created_at DESC LIMIT 1")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(uuid::Uuid::new_v4);
+
+    let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(uuid::Uuid::new_v4);
+
+    (user_id, project_id)
+}
+
 pub async fn internal_batch_assign_tools_handler(
     State(state): State<crate::AppState>,
 ) -> impl IntoResponse {
@@ -1085,37 +1508,12 @@ pub async fn internal_batch_assign_tools_handler(
 
     if RUNNING.swap(true, Ordering::SeqCst) {
         PENDING.store(true, Ordering::SeqCst);
-        return (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "queued": false,
-                "running": true,
-                "pending": true
-            })),
-        )
-            .into_response();
+        return batch_already_running_response();
     }
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        // Trigger interno: usa ultimo user/progetto come “contabilità di sistema”.
-        let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&state_clone.db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(uuid::Uuid::new_v4);
-
-        let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&state_clone.db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(uuid::Uuid::new_v4);
+        let (user_id, project_id) = resolve_billing_ids_internal(&state_clone.db).await;
 
         let _ = batch_assign_tools_impl(State(state_clone), user_id, project_id).await;
         RUNNING.store(false, Ordering::SeqCst);
@@ -1124,23 +1522,7 @@ pub async fn internal_batch_assign_tools_handler(
             let state_clone2 = state.clone();
             RUNNING.store(true, Ordering::SeqCst);
             tokio::spawn(async move {
-                let user_id2 = sqlx::query_scalar::<_, uuid::Uuid>(
-                    "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
-                )
-                .fetch_optional(&state_clone2.db)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(uuid::Uuid::new_v4);
-
-                let project_id2 = sqlx::query_scalar::<_, uuid::Uuid>(
-                    "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
-                )
-                .fetch_optional(&state_clone2.db)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(uuid::Uuid::new_v4);
+                let (user_id2, project_id2) = resolve_billing_ids_internal(&state_clone2.db).await;
 
                 let _ = batch_assign_tools_impl(State(state_clone2), user_id2, project_id2).await;
                 RUNNING.store(false, Ordering::SeqCst);
@@ -1148,15 +1530,7 @@ pub async fn internal_batch_assign_tools_handler(
         }
     });
 
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "queued": true,
-            "running": true,
-            "pending": false
-        })),
-    )
-        .into_response()
+    batch_queued_response()
 }
 /// GET /api/admin/prompt-templates/:key/tools
 pub async fn get_prompt_tools_handler(
