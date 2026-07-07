@@ -41,7 +41,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::AgentToolContext;
-use crate::native_engine::{NativeDeps, NativeRunInput, NativeRunOutcome};
+use crate::native_engine::{verdict_keys, NativeDeps, NativeRunInput, NativeRunOutcome};
 
 /// Marker d'errore (stesso contratto di `subagent.rs`: prefisso U+274C ->
 /// `tool_result_is_error` deriva `is_error=true`).
@@ -1426,6 +1426,35 @@ async fn finalize_timeout(
     })
 }
 
+/// Narrazione (meta-step live sul run PADRE) della chiusura OK del sub-run.
+/// Estratta da `finalize_success` (regola L / lunghezza): no-op se `narrator`
+/// e' `None` (kill-switch UX `subagent_narration_enabled`).
+async fn narrate_completed(
+    narrator: Option<&ParentNarrator>,
+    sub_run_id: Uuid,
+    kind: &str,
+    status: &str,
+    summary: &str,
+    o: &NativeRunOutcome,
+) {
+    let Some(n) = narrator else { return };
+    let esito = if o.completed { "completato" } else { "in pausa" };
+    n.say(
+        "subagent_completed",
+        format!("Subagente {kind} {esito} ({} iterazioni)", o.iterations),
+        n.with_pin(json!({
+            K_SUB_RUN_ID: sub_run_id.to_string(),
+            K_SUB_KIND: kind,
+            "status": status,
+            K_SUMMARY: compact_summary(summary),
+            "iterations": o.iterations,
+            "cost_usd": o.total_cost,
+        })),
+        sub_run_id,
+    )
+    .await;
+}
+
 /// Chiusura del ramo OK del sub-run: mark_run + log + narrazione + tool_result
 /// (il main riceve SOLO questo summary, non l'intera conversazione del figlio).
 async fn finalize_success(
@@ -1463,23 +1492,7 @@ async fn finalize_success(
         summary_len = summary.len(),
         "subagent_native: sub-run eseguito sul grafo nativo"
     );
-    if let Some(n) = narrator {
-        let esito = if o.completed { "completato" } else { "in pausa" };
-        n.say(
-            "subagent_completed",
-            format!("Subagente {kind} {esito} ({} iterazioni)", o.iterations),
-            n.with_pin(json!({
-                K_SUB_RUN_ID: sub_run_id.to_string(),
-                K_SUB_KIND: kind,
-                "status": status,
-                K_SUMMARY: compact_summary(&summary),
-                "iterations": o.iterations,
-                "cost_usd": o.total_cost,
-            })),
-            sub_run_id,
-        )
-        .await;
-    }
+    narrate_completed(narrator, sub_run_id, kind, status, &summary, o).await;
     json!({
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
@@ -1621,23 +1634,24 @@ impl<'a> SubRunClosure<'a> {
 /// Blocco esito strutturato per i rami TERMINALI del sub-run privi di un
 /// [`NativeRunOutcome`] (timeout / errore del motore): stessa forma di
 /// [`NativeRunOutcome::structured_verdict`] cosi' il coordinatore e il poll
-/// leggono SEMPRE lo stesso schema. `verdict` usa il vocabolario canonico
-/// (`AgentRunStatus::as_str`: `timed_out` / `failed`), `success` e' sempre
-/// `false`. La parita' di FORMA con `structured_verdict` e' garantita dal test
-/// `terminal_verdict_stessa_forma_di_structured_verdict` (regola L: la forma e'
-/// duplicata per necessita' — qui non esiste un `NativeRunOutcome` — ma il
-/// drift e' un test rosso).
+/// leggono SEMPRE lo stesso schema. Le chiavi vengono dal PUNTO UNICO
+/// [`verdict_keys`] (regola L): la parita' con `structured_verdict` e' quindi
+/// strutturale (stesse costanti), non solo asserita — piu' il test
+/// `terminal_verdict_stessa_forma_di_structured_verdict` come rete. `verdict`
+/// usa il vocabolario canonico (`AgentRunStatus::as_str`: `timed_out` /
+/// `failed`), `success` e' sempre `false`.
 fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
+    use verdict_keys as k;
     json!({
-        "verdict": verdict,
-        "success": false,
-        "declared": Value::Null,
-        "review": Value::Null,
-        "final_gate_passed": Value::Null,
-        "final_gate_unverified": Value::Null,
-        "final_gate_failed_pending": false,
-        "forced_close_unverified": false,
-        "error_class": error_class,
+        k::VERDICT: verdict,
+        k::SUCCESS: false,
+        k::DECLARED: Value::Null,
+        k::REVIEW: Value::Null,
+        k::FINAL_GATE_PASSED: Value::Null,
+        k::FINAL_GATE_UNVERIFIED: Value::Null,
+        k::FINAL_GATE_FAILED_PENDING: false,
+        k::FORCED_CLOSE_UNVERIFIED: false,
+        k::ERROR_CLASS: error_class,
     })
 }
 
