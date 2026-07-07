@@ -1218,7 +1218,8 @@ async fn run_single_subagent(
     }
     let tools_json = build_tools_json(&definition.tool_whitelist);
 
-    let (provider, model) = resolve_worker_model(db, kind, &definition, anchor).await;
+    let (provider, model) =
+        resolve_worker_model(db, &proj_pool, kind, &definition, anchor, session_id).await;
 
     let timeout_s = if definition.timeout_s > 0 {
         definition.timeout_s
@@ -1389,24 +1390,99 @@ async fn run_single_subagent(
 /// reale). Se l'esclusione svuota il pool (unico provider capable) si ripiega
 /// SENZA esclusione con un WARN: il vincolo e' una preferenza forte, non un hard
 /// filter — meglio un review sullo stesso provider che nessun review.
+///
+/// PIN DEL PROVIDER (propagazione all'utente): per i kind WORKER (NON review) se
+/// l'utente ha pinnato un provider sulla chat (`chat_sessions.preferred_provider`)
+/// la risoluzione del purpose viene RISTRETTA a quel provider (preferenza-forte
+/// tier-aware: tier + capability + tool_use invariati, solo il provider e'
+/// vincolato — regola L: unica sorgente del vincolo, NON si propaga il
+/// preferred_model, il modello si deriva sempre dal tier via catalog, regola G).
+/// Se il provider pinnato non offre un modello capable del tier (o e' in cooldown)
+/// si RIPIEGA sulla risoluzione SENZA pin, con un WARN strutturato: il figlio non
+/// resta bloccato (preferenza forte, non hard filter). Per `kind == "review"` il
+/// pin e' IGNORATO: il vincolo giudice != worker vince (indipendenza avversaria).
+///
+/// SEPARAZIONE DB: `db` e' il pool META (purpose-resolution via catalog +
+/// `parent_provider` da `agent_runs`); `proj_pool` e' il pool del PROGETTO, dove
+/// vive `chat_sessions` (il pin). Le due letture NON possono condividere lo stesso
+/// pool (incidente separazione DB: `chat_sessions` non e' nel meta).
 async fn resolve_worker_model(
     db: &sqlx::PgPool,
+    proj_pool: &sqlx::PgPool,
     kind: &str,
     definition: &SubagentDefinition,
     anchor: Uuid,
+    session_id: Uuid,
 ) -> (String, String) {
     if definition.model_purpose.trim().is_empty() {
         return (String::new(), String::new());
     }
     let purpose = &definition.model_purpose;
-    // Provider del padre da escludere SOLO per i review (astensione da
-    // auto-certificazione). Per gli altri kind: nessuna esclusione (parita').
-    let exclude: Vec<String> = if kind == "review" {
-        parent_provider(db, anchor).await.into_iter().collect()
-    } else {
-        Vec::new()
-    };
-    match crate::internal_routing::resolve_purpose_model_db_excluding(db, purpose, &exclude).await {
+
+    // Ramo REVIEW: pin IGNORATO, vincolo giudice != worker invariato. Provider del
+    // padre da escludere (astensione da auto-certificazione).
+    if kind == "review" {
+        let exclude: Vec<String> = parent_provider(db, anchor).await.into_iter().collect();
+        return resolve_review_model(db, purpose, kind, &exclude).await;
+    }
+
+    // Ramo WORKER: se l'utente ha pinnato un provider sulla chat, prova a risolvere
+    // il purpose RISTRETTO a quel provider (preferenza-forte tier-aware).
+    if let Some(pinned) = session_pinned_provider(proj_pool, session_id).await {
+        match crate::internal_routing::resolve_purpose_model_db_pinned(db, purpose, Some(&pinned))
+            .await
+        {
+            crate::internal_routing::PurposeResolution::Resolved {
+                provider, model, ..
+            } => return (provider, model),
+            // NoCapableModel/NotFound col pin: il provider pinnato non offre un
+            // modello capable del tier (o e' in cooldown). FALLBACK senza pin
+            // (regola H fail-loud: il figlio non resta bloccato). WARN strutturato
+            // (regola M: la decisione e' sull'enum PurposeResolution, il testo e'
+            // solo display).
+            other => {
+                tracing::warn!(
+                    kind = %kind,
+                    purpose = %purpose,
+                    pinned = %pinned,
+                    resolution = ?other,
+                    "subagent_native: pin provider non risolvibile per il tier del purpose, \
+                     fallback senza pin"
+                );
+            }
+        }
+    }
+
+    // Nessun pin (o pin degradato): risoluzione worker standard (parita' col
+    // comportamento pre-pin).
+    match crate::internal_routing::resolve_purpose_model_db(db, purpose).await {
+        crate::internal_routing::PurposeResolution::Resolved {
+            provider, model, ..
+        } => (provider, model),
+        other => {
+            tracing::warn!(
+                kind = %kind,
+                model_purpose = %purpose,
+                resolution = ?other,
+                "subagent_native: model_purpose non risolto, routing di default"
+            );
+            (String::new(), String::new())
+        }
+    }
+}
+
+/// Risoluzione del modello per un sub-run di `kind == "review"`: ESCLUDE il
+/// provider del padre (`exclude`), con fallback SENZA esclusione + WARN se il pool
+/// si svuota (unico provider capable). Estratto da `resolve_worker_model` per
+/// tenere il ramo review distinto dal ramo pin-worker (leggibilita'); la logica
+/// del vincolo giudice != worker e' invariata.
+async fn resolve_review_model(
+    db: &sqlx::PgPool,
+    purpose: &str,
+    kind: &str,
+    exclude: &[String],
+) -> (String, String) {
+    match crate::internal_routing::resolve_purpose_model_db_excluding(db, purpose, exclude).await {
         crate::internal_routing::PurposeResolution::Resolved {
             provider, model, ..
         } => (provider, model),
@@ -1450,6 +1526,23 @@ async fn parent_provider(db: &sqlx::PgPool, anchor: Uuid) -> Option<String> {
             .ok()
             .flatten();
     provider.filter(|p| !p.trim().is_empty())
+}
+
+/// Provider PINNATO dall'utente sulla chat (`chat_sessions.preferred_provider`).
+/// DISTINTA da [`parent_provider`]: legge dal pool PROGETTO (`chat_sessions` vive
+/// nel DB del progetto, NON nel meta — incidente separazione DB), non da
+/// `agent_runs`. `None` se la sessione non ha pin, il valore e' NULL/vuoto, o la
+/// query fallisce (fail-open: nessun pin -> routing worker standard). Il pin e'
+/// SOLO il provider: il modello si deriva sempre dal tier via catalog (regola G).
+async fn session_pinned_provider(proj_pool: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
+    let pinned: Option<String> =
+        sqlx::query_scalar("SELECT preferred_provider FROM chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(proj_pool)
+            .await
+            .ok()
+            .flatten();
+    pinned.filter(|p| !p.trim().is_empty())
 }
 
 /// Campi comuni della riga `nexus_subagent_runs` (i rami isolato/sequenziale
@@ -2443,6 +2536,18 @@ mod tests {
         .execute(pool)
         .await
         .expect("create nexus_purpose_model");
+        // `chat_sessions` (pin provider) vive nel DB PROGETTO. Nei test il pool e'
+        // unico, quindi la creo qui: senza pin i test review/worker-standard
+        // leggono NULL -> nessun pin (parita').
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chat_sessions ( \
+                 id UUID PRIMARY KEY, \
+                 preferred_provider TEXT \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create chat_sessions");
         let parent = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO agent_runs (id, session_id, project_id, user_id, provider, model) \
@@ -2491,7 +2596,8 @@ mod tests {
     async fn review_esclude_il_provider_del_worker(pool: sqlx::PgPool) {
         let (parent, def) =
             seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
-        let (provider, _model) = resolve_worker_model(&pool, "review", &def, parent).await;
+        let (provider, _model) =
+            resolve_worker_model(&pool, &pool, "review", &def, parent, Uuid::new_v4()).await;
         assert_eq!(provider, "beta", "il review deve evitare il provider del worker (alpha)");
     }
 
@@ -2500,7 +2606,8 @@ mod tests {
     #[sqlx::test]
     async fn review_fallback_se_unico_provider_capable(pool: sqlx::PgPool) {
         let (parent, def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
-        let (provider, _model) = resolve_worker_model(&pool, "review", &def, parent).await;
+        let (provider, _model) =
+            resolve_worker_model(&pool, &pool, "review", &def, parent, Uuid::new_v4()).await;
         assert_eq!(provider, "alpha", "unico provider capable -> fallback senza esclusione");
     }
 
@@ -2512,8 +2619,206 @@ mod tests {
         // senza alcuna esclusione anche se il padre e' 'alpha'.
         let (parent, mut def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
         def.model_purpose = "reviewer".to_string();
-        let (provider, _model) = resolve_worker_model(&pool, "implement", &def, parent).await;
+        let (provider, _model) =
+            resolve_worker_model(&pool, &pool, "implement", &def, parent, Uuid::new_v4()).await;
         assert_eq!(provider, "alpha", "kind non-review: nessuna esclusione");
+    }
+
+    // ── PROPAGAZIONE PIN PROVIDER AI SUB-AGENTI WORKER ────────────────────────
+    //
+    // Un catalog reale per il pin: tier 'medium' + capability 'code' + tool_use
+    // (il purpose worker 'frontend'). Colonna di catalog: `capabilities` jsonb
+    // (la capability 'code' non ha colonna dedicata -> `capabilities @> ["code"]`).
+
+    /// Riga di catalog completa per i test pin: provider/model, tier, capability
+    /// 'code' (jsonb), costo (per il cost-first ASC). `enabled=true`.
+    async fn seed_catalog_row(
+        pool: &sqlx::PgPool,
+        provider: &str,
+        model: &str,
+        tier: &str,
+        cost: f64,
+    ) {
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+              performance_tier, capabilities, input_cost_per_million_tokens) \
+             VALUES ($1, $2, true, true, 'none', $3, '[\"code\"]'::jsonb, $4)",
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(tier)
+        .bind(cost)
+        .execute(pool)
+        .await
+        .expect("catalog row");
+    }
+
+    /// Semina catalog + purpose worker + tabella chat_sessions per i test pin.
+    /// `catalog`: (provider, model, tier, cost). Il purpose 'frontend' e' tier
+    /// 'medium' + capability 'code' + tool_use (ramo agentico, cost-first). Ritorna
+    /// il session_id (per il pin) e la definition worker.
+    async fn seed_pin_routing(
+        pool: &sqlx::PgPool,
+        catalog: &[(&str, &str, &str, f64)],
+    ) -> (Uuid, SubagentDefinition) {
+        crate::test_support::create_ai_price_catalog_table(pool).await;
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model ( \
+                 purpose TEXT PRIMARY KEY, \
+                 tier TEXT, \
+                 required_capability TEXT, \
+                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_purpose_model");
+        sqlx::query(
+            "CREATE TABLE chat_sessions ( \
+                 id UUID PRIMARY KEY, \
+                 preferred_provider TEXT \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create chat_sessions");
+        for (prov, model, tier, cost) in catalog {
+            seed_catalog_row(pool, prov, model, tier, *cost).await;
+        }
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('frontend', 'medium', 'code', true)",
+        )
+        .execute(pool)
+        .await
+        .expect("purpose frontend");
+        let def = SubagentDefinition {
+            prompt_key: String::new(),
+            tool_whitelist: vec![],
+            model_purpose: "frontend".to_string(),
+            timeout_s: 0,
+        };
+        (Uuid::new_v4(), def)
+    }
+
+    /// Inserisce una sessione con `preferred_provider` = pin.
+    async fn seed_session_pin(pool: &sqlx::PgPool, session_id: Uuid, pin: Option<&str>) {
+        sqlx::query("INSERT INTO chat_sessions (id, preferred_provider) VALUES ($1, $2)")
+            .bind(session_id)
+            .bind(pin)
+            .execute(pool)
+            .await
+            .expect("session pin");
+    }
+
+    /// TEST 1 — pin propagato felice: pin='deepseek' + purpose worker medium/code/
+    /// tool_use -> ritorna il modello DEEPSEEK del tier (non mistral, non il light).
+    /// Senza pin vincerebbe mistral (piu' economico): il pin sposta la scelta.
+    #[sqlx::test]
+    async fn pin_propagato_sceglie_provider_pinnato(pool: sqlx::PgPool) {
+        let (session, def) = seed_pin_routing(
+            &pool,
+            &[
+                ("mistral", "mistral-medium", "medium", 1.0),
+                ("deepseek", "deepseek-medium", "medium", 2.0),
+                ("deepseek", "deepseek-flash", "light", 0.5),
+            ],
+        )
+        .await;
+        seed_session_pin(&pool, session, Some("deepseek")).await;
+        let (provider, model) =
+            resolve_worker_model(&pool, &pool, "implement", &def, Uuid::new_v4(), session).await;
+        assert_eq!(provider, "deepseek", "il pin deve vincere il cost-first (mistral piu' economico)");
+        assert_eq!(model, "deepseek-medium", "tier medium rispettato (non il light deepseek-flash)");
+    }
+
+    /// TEST 2 — pin non-capable -> degrado: il provider pinnato non ha un modello
+    /// medium+code+tool_use -> NoCapableModel col pin -> fallback SENZA pin ->
+    /// modello purpose normale (mistral). MAI ("","").
+    #[sqlx::test]
+    async fn pin_non_capable_degrada_al_purpose_normale(pool: sqlx::PgPool) {
+        // deepseek ha solo un modello 'light' (tier sbagliato): non capable per
+        // il tier 'medium' del purpose. mistral ha il medium capable.
+        let (session, def) = seed_pin_routing(
+            &pool,
+            &[
+                ("mistral", "mistral-medium", "medium", 1.0),
+                ("deepseek", "deepseek-flash", "light", 0.5),
+            ],
+        )
+        .await;
+        seed_session_pin(&pool, session, Some("deepseek")).await;
+        let (provider, model) =
+            resolve_worker_model(&pool, &pool, "implement", &def, Uuid::new_v4(), session).await;
+        assert_eq!(provider, "mistral", "pin non-capable -> fallback senza pin al purpose normale");
+        assert_eq!(model, "mistral-medium");
+        assert!(!provider.is_empty() && !model.is_empty(), "mai (\"\",\"\") se il purpose e' risolvibile");
+    }
+
+    /// TEST 3 — pin in cooldown -> degrado: il provider pinnato e' capable ma in
+    /// cooldown (escluso dalla query) -> query pinnata vuota -> fallback senza pin
+    /// (il figlio non resta bloccato).
+    #[sqlx::test]
+    async fn pin_in_cooldown_degrada_senza_bloccare(pool: sqlx::PgPool) {
+        // Provider con nomi DEDICATI: il cooldown e' uno snapshot GLOBALE in-memory
+        // condiviso tra i test paralleli, quindi non riuso 'deepseek'/'mistral'
+        // (evita interferenze cross-test). Il pin va sul provider pinnato-in-cooldown.
+        let pinned = "pincd-provider";
+        let fallback = "fbcd-provider";
+        let (session, def) = seed_pin_routing(
+            &pool,
+            &[
+                (fallback, "fb-medium", "medium", 1.0),
+                (pinned, "pin-medium", "medium", 2.0),
+            ],
+        )
+        .await;
+        seed_session_pin(&pool, session, Some(pinned)).await;
+        // Cooldown in-memory sul provider pinnato: la WHERE `apply_cooldown` lo esclude.
+        crate::provider_cooldown::put_provider_in_cooldown(pinned, Some(300));
+        let (provider, model) =
+            resolve_worker_model(&pool, &pool, "implement", &def, Uuid::new_v4(), session).await;
+        // Rimuovo il cooldown per non contaminare altri test (stato globale).
+        crate::provider_cooldown::remove_cooldown(pinned);
+        assert_eq!(provider, fallback, "pin in cooldown -> fallback senza pin");
+        assert_eq!(model, "fb-medium");
+    }
+
+    /// TEST 5 — Auto (nessun pin) bit-identico: preferred_provider NULL -> stesso
+    /// (provider, model) del comportamento pre-pin (il cost-first sceglie mistral).
+    #[sqlx::test]
+    async fn nessun_pin_bit_identico_al_comportamento_attuale(pool: sqlx::PgPool) {
+        let (session, def) = seed_pin_routing(
+            &pool,
+            &[
+                ("mistral", "mistral-medium", "medium", 1.0),
+                ("deepseek", "deepseek-medium", "medium", 2.0),
+            ],
+        )
+        .await;
+        seed_session_pin(&pool, session, None).await;
+        let (provider, model) =
+            resolve_worker_model(&pool, &pool, "implement", &def, Uuid::new_v4(), session).await;
+        // Senza pin, il cost-first (ASC) sceglie il piu' economico: mistral.
+        assert_eq!(provider, "mistral");
+        assert_eq!(model, "mistral-medium");
+    }
+
+    /// TEST 4 — review ignora il pin: kind='review', pin = provider del padre ->
+    /// il modello risolto NON e' del provider padre (l'esclusione giudice != worker
+    /// vince sul pin). Nota: qui il purpose e' tier-only agentico su due provider.
+    #[sqlx::test]
+    async fn review_ignora_il_pin_esclusione_vince(pool: sqlx::PgPool) {
+        let (parent, def) =
+            seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
+        // La sessione ha pinnato ALPHA (lo stesso del padre). Se il pin fosse
+        // rispettato il review girerebbe su alpha; l'esclusione deve prevalere.
+        let session = Uuid::new_v4();
+        seed_session_pin(&pool, session, Some("alpha")).await;
+        let (provider, _model) =
+            resolve_worker_model(&pool, &pool, "review", &def, parent, session).await;
+        assert_eq!(provider, "beta", "review: il pin e' ignorato, l'esclusione del padre vince");
     }
 
     /// `mark_run` chiude ENTRAMBE le righe del figlio (nexus_subagent_runs +
