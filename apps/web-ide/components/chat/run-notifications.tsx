@@ -85,6 +85,31 @@ export function deriveRunNotifications(
     });
   }
 
+  // Fan-in async: il run e' sospeso in attesa dei sub-agent in background.
+  // NON e' bloccante per l'utente (non deve agire, solo attendere): tono "info"
+  // e FUORI da BLOCKING_STATUSES cosi' NON auto-apre il pannello rubando il
+  // focus. Il conteggio, se noto, arriva dall'evento awaiting_subagents del
+  // nastro (segnale strutturato, regola M).
+  if (runStatus === "awaiting_subagents") {
+    let count: number | undefined;
+    for (const seg of stream.segments) {
+      for (const ev of seg.events) {
+        if (ev.type === "awaiting_subagents" && typeof ev.count === "number") {
+          count = ev.count;
+        }
+      }
+    }
+    out.push({
+      tone: "info",
+      title: "In attesa dei sub-agent",
+      detail:
+        typeof count === "number" && count > 0
+          ? `${count} sub-agent in background, il run riprende al loro completamento.`
+          : "Il run riprende al completamento dei sub-agent in background.",
+      color: "#8b5cf6",
+    });
+  }
+
   return out;
 }
 

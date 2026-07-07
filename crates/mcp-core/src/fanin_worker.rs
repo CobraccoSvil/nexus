@@ -119,7 +119,15 @@ pub fn spawn_fanin_worker(state: AppState) {
 /// viene ignorato e il dispatch resta sincrono, così spegnere il flag riporta tutto
 /// a sincrono a runtime (60s, senza redeploy) senza lasciare padri appesi.
 pub(crate) async fn background_fanin_enabled(db: &PgPool) -> bool {
-    crate::settings::get_setting(db, "orchestrator.background_fanin_enabled")
+    bool_setting(db, "orchestrator.background_fanin_enabled", true).await
+}
+
+/// Lettura di un flag booleano DB-driven (regola G) con default. PUNTO UNICO
+/// (regola L) del parsing bool dei setting del worker: `background_fanin_enabled`
+/// e la guardia no-progress lo condividono invece di re-implementare
+/// `matches!(..., "0"|"false"|"no"|"off")`. Setting assente/DB down -> `default`.
+async fn bool_setting(db: &PgPool, key: &str, default: bool) -> bool {
+    crate::settings::get_setting(db, key)
         .await
         .ok()
         .flatten()
@@ -129,7 +137,19 @@ pub(crate) async fn background_fanin_enabled(db: &PgPool) -> bool {
                 "0" | "false" | "no" | "off"
             )
         })
-        .unwrap_or(true)
+        .unwrap_or(default)
+}
+
+/// Parametri della guardia NO-PROGRESS (mig 0543) passati alla scansione
+/// per-progetto del backstop. `Copy` (due campi scalari) per evitare cloni.
+#[derive(Debug, Clone, Copy)]
+struct NoProgressGuard {
+    /// Kill-switch (`orchestrator.subagent_no_progress_check_enabled`): se `false`
+    /// il check non viene applicato (resta solo l'orphan_timeout storico).
+    enabled: bool,
+    /// Eta minima (s) di una sub-run background senza progresso oltre cui e'
+    /// marcata `timeout` (`orchestrator.subagent_no_progress_timeout_seconds`).
+    timeout_s: i64,
 }
 
 async fn load_u64(db: &PgPool, key: &str, default: u64, min: u64) -> u64 {
@@ -225,11 +245,39 @@ async fn run_backstop(state: &AppState) -> Result<(), String> {
         60,
     )
     .await;
+    // GUARDIA NO-PROGRESS (mig 0543): timeout piu' aggressivo dell'orphan_timeout,
+    // applicato SOLO ai figli background SENZA progresso (0 agent_steps E 0
+    // iterazioni). Kill-switch DB-driven (regola G) letto col PUNTO UNICO
+    // `bool_setting` (stesso helper di `background_fanin_enabled`). Passati a
+    // `backstop_project` cosi' la scansione per-progetto applica entrambi i check.
+    let no_progress_enabled = bool_setting(
+        &state.db,
+        "orchestrator.subagent_no_progress_check_enabled",
+        true,
+    )
+    .await;
+    let no_progress_timeout_s = load_u64(
+        &state.db,
+        "orchestrator.subagent_no_progress_timeout_seconds",
+        300,
+        30,
+    )
+    .await;
+    let no_progress = NoProgressGuard {
+        enabled: no_progress_enabled,
+        timeout_s: no_progress_timeout_s as i64,
+    };
     let mut requeued = 0u64;
     for project_id in crate::project_db_routes::list_all_project_ids(&state.db).await {
         let proj_pool =
             crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
-        requeued += backstop_project(&state.db, &proj_pool, orphan_timeout_s as i64).await;
+        requeued += backstop_project(
+            &state.db,
+            &proj_pool,
+            orphan_timeout_s as i64,
+            no_progress,
+        )
+        .await;
     }
     if requeued > 0 {
         tracing::warn!(
@@ -244,11 +292,52 @@ async fn run_backstop(state: &AppState) -> Result<(), String> {
 /// Backstop di UN progetto: marca gli orfani, trova i padri recuperabili, accoda.
 /// Ritorna il numero di padri accodati (righe INSERT effettive). `meta` = coda;
 /// `proj` = pool del progetto (agent_runs + nexus_subagent_runs).
-async fn backstop_project(meta: &PgPool, proj: &PgPool, orphan_timeout_s: i64) -> u64 {
-    // (1) Marca 'timeout' le sub-run BACKGROUND rimaste `running` oltre soglia
+async fn backstop_project(
+    meta: &PgPool,
+    proj: &PgPool,
+    orphan_timeout_s: i64,
+    no_progress: NoProgressGuard,
+) -> u64 {
+    // (1a) GUARDIA NO-PROGRESS (mig 0543): marca 'timeout' le sub-run BACKGROUND
+    //      impantanate — `running`/`paused` create oltre la soglia (piu' aggressiva
+    //      dell'orphan_timeout) E SENZA alcun progresso. Il PROGRESSO e' un segnale
+    //      STRUTTURATO (regola M), non prosa: (a) 0 righe in `agent_steps` per quel
+    //      run (il figlio ha lo stesso id in agent_runs -> gli step si correlano su
+    //      run_id, persistiti INCREMENTALMENTE dal grafo, a differenza di
+    //      `iterations`/`tokens_completion` scritti solo al mark_run finale) E
+    //      (b) `iterations = 0` (difesa in profondita' sulla stessa riga). Cosi' un
+    //      figlio che LAVORA (ha eseguito almeno un tool) non viene mai ucciso,
+    //      mentre quello a 0 token/0 iter/0 step per >timeout_s viene abortito e la
+    //      COUNT del fan-in scende, liberando il padre. Gated dal kill-switch.
+    if no_progress.enabled {
+        if let Err(e) = sqlx::query(
+            "UPDATE nexus_subagent_runs s SET status = 'timeout', completed_at = NOW() \
+             WHERE s.is_background = true AND s.status IN ('running', 'paused') \
+               AND s.created_at < NOW() - make_interval(secs => $1) \
+               AND COALESCE(s.iterations, 0) = 0 \
+               AND NOT EXISTS ( \
+                     SELECT 1 FROM agent_steps st WHERE st.run_id = s.id)",
+        )
+        .bind(no_progress.timeout_s as f64)
+        .execute(proj)
+        .await
+        {
+            tracing::warn!(
+                target: "mcp_core::fanin_worker",
+                error = %e,
+                "fan-in backstop: marcatura sub-run no-progress fallita (ritento al prossimo giro)"
+            );
+            return 0;
+        }
+    }
+
+    // (1b) Marca 'timeout' le sub-run BACKGROUND rimaste `running` oltre soglia
     //     (figlio detached morto senza mark_run): senza, la COUNT del fan-in non
     //     scenderebbe mai a 0 e il padre resterebbe appeso. Solo i background
     //     (i sincroni non sospendono il padre) e solo oltre il timeout DB-driven.
+    //     Complementare al check no-progress: questo colpisce QUALSIASI sub-run
+    //     vecchia (anche una che aveva fatto progressi ma e' poi morta), con
+    //     timeout piu' lungo.
     if let Err(e) = sqlx::query(
         "UPDATE nexus_subagent_runs SET status = 'timeout', completed_at = NOW() \
          WHERE is_background = true AND status IN ('running', 'paused') \
@@ -576,18 +665,33 @@ mod tests {
         .await
         .expect("create agent_runs");
         sqlx::query(
+            // `iterations` (mig project 0002) e' il segnale strutturato di progresso
+            // letto dal check no-progress; `agent_steps` (sotto) e' l'altro segnale.
             "CREATE TABLE nexus_subagent_runs ( \
                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
                  parent_run_id UUID NOT NULL, \
                  dispatcher_run_id UUID, \
                  is_background BOOLEAN NOT NULL DEFAULT false, \
                  status TEXT NOT NULL, \
+                 iterations INTEGER DEFAULT 0, \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
                  completed_at TIMESTAMPTZ )",
         )
         .execute(pool)
         .await
         .expect("create nexus_subagent_runs");
+        // agent_steps: il figlio ha lo stesso id in agent_runs, gli step si
+        // correlano su run_id (persistiti incrementalmente). Il check no-progress
+        // usa NOT EXISTS su questa tabella come segnale primario di progresso.
+        sqlx::query(
+            "CREATE TABLE agent_steps ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 run_id UUID NOT NULL, \
+                 step_index INTEGER NOT NULL )",
+        )
+        .execute(pool)
+        .await
+        .expect("create agent_steps");
         sqlx::query(
             "CREATE TABLE subagent_fanin_resume_queue ( \
                  parent_run_id UUID PRIMARY KEY, \
@@ -599,6 +703,13 @@ mod tests {
         .await
         .expect("create queue");
     }
+
+    /// Guardia no-progress DISABILITATA: per i test che esercitano l'orphan_timeout
+    /// storico senza il nuovo check (comportamento pre-mig-0543).
+    const NO_PROGRESS_OFF: NoProgressGuard = NoProgressGuard {
+        enabled: false,
+        timeout_s: 300,
+    };
 
     /// BUG #3 (ALTA): un padre `awaiting_subagents` con TUTTI i figli background
     /// terminali ma NESSUNA riga in coda (figlio detached crashato prima
@@ -646,7 +757,7 @@ mod tests {
         assert_eq!(before, 0, "precondizione: coda vuota");
 
         // Backstop: timeout orfano irrilevante qui (figli gia' terminali).
-        let requeued = backstop_project(&pool, &pool, 900).await;
+        let requeued = backstop_project(&pool, &pool, 900, NO_PROGRESS_OFF).await;
         assert_eq!(requeued, 1, "il backstop deve accodare il padre orfano");
 
         // Il padre accodato e' il RUN corrente (agent_runs.id), non l'anchor.
@@ -658,7 +769,7 @@ mod tests {
         assert_eq!(queued, Some(parent), "in coda ci deve essere il run padre");
 
         // Idempotente: un secondo passaggio non duplica (la riga esiste gia').
-        let requeued2 = backstop_project(&pool, &pool, 900).await;
+        let requeued2 = backstop_project(&pool, &pool, 900, NO_PROGRESS_OFF).await;
         assert_eq!(requeued2, 0, "backstop idempotente: nessun duplicato");
     }
 
@@ -697,7 +808,7 @@ mod tests {
 
         // Timeout ALTO (1h): il figlio (30 min) e' sotto soglia -> NON marcato, NON
         // accodato (potrebbe ancora vivere).
-        let requeued_young = backstop_project(&pool, &pool, 3600).await;
+        let requeued_young = backstop_project(&pool, &pool, 3600, NO_PROGRESS_OFF).await;
         assert_eq!(requeued_young, 0, "figlio sotto timeout -> non accodato");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM subagent_fanin_resume_queue")
@@ -709,7 +820,7 @@ mod tests {
 
         // Timeout BASSO (60s): il figlio (30 min) e' oltre soglia -> marcato
         // `timeout`, la COUNT scende a 0, il padre viene accodato.
-        let requeued_old = backstop_project(&pool, &pool, 60).await;
+        let requeued_old = backstop_project(&pool, &pool, 60, NO_PROGRESS_OFF).await;
         assert_eq!(requeued_old, 1, "figlio orfano oltre timeout -> padre accodato");
         let status: String = sqlx::query_scalar(
             "SELECT status FROM nexus_subagent_runs WHERE parent_run_id = $1",
@@ -719,6 +830,122 @@ mod tests {
         .await
         .expect("status figlio");
         assert_eq!(status, "timeout", "la sub-run orfana e' marcata timeout");
+    }
+
+    /// GUARDIA NO-PROGRESS (mig 0543): un figlio background impantanato (`running`
+    /// oltre la soglia no-progress, 0 agent_steps E 0 iterazioni) viene marcato
+    /// `timeout` e il padre accodato. Un figlio che HA PROGREDITO (almeno 1
+    /// agent_step) NON viene toccato dal check no-progress anche se oltre la stessa
+    /// soglia (l'orphan_timeout, piu' lungo, non e' ancora scattato). Con la guardia
+    /// DISABILITATA il check non agisce (solo l'orphan_timeout storico).
+    #[sqlx::test]
+    async fn backstop_no_progress_marca_solo_impantanati(pool: sqlx::PgPool) {
+        create_backstop_tables(&pool).await;
+        let session = Uuid::new_v4();
+        let project = Uuid::new_v4();
+
+        // Padre A: figlio bg IMPANTANATO (running 10 min, 0 step, 0 iter).
+        let parent_stuck = Uuid::new_v4();
+        let child_stuck = Uuid::new_v4();
+        // Padre B: figlio bg che HA PROGREDITO (running 10 min, 1 step).
+        let parent_working = Uuid::new_v4();
+        let child_working = Uuid::new_v4();
+        for p in [parent_stuck, parent_working] {
+            sqlx::query(
+                "INSERT INTO agent_runs (id, session_id, project_id, parent_run_id, status) \
+                 VALUES ($1, $2, $3, NULL, 'awaiting_subagents')",
+            )
+            .bind(p)
+            .bind(session)
+            .bind(project)
+            .execute(&pool)
+            .await
+            .expect("insert padre");
+        }
+        // Figlio impantanato: running da 10 min, iterations 0, nessun agent_step.
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs (id, parent_run_id, dispatcher_run_id, is_background, status, iterations, created_at) \
+             VALUES ($1, $2, $3, true, 'running', 0, NOW() - interval '10 minutes')",
+        )
+        .bind(child_stuck)
+        .bind(session)
+        .bind(parent_stuck)
+        .execute(&pool)
+        .await
+        .expect("insert figlio impantanato");
+        // Figlio che lavora: running da 10 min ma con 1 agent_step gia' persistito.
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs (id, parent_run_id, dispatcher_run_id, is_background, status, iterations, created_at) \
+             VALUES ($1, $2, $3, true, 'running', 0, NOW() - interval '10 minutes')",
+        )
+        .bind(child_working)
+        .bind(session)
+        .bind(parent_working)
+        .execute(&pool)
+        .await
+        .expect("insert figlio che lavora");
+        sqlx::query("INSERT INTO agent_steps (run_id, step_index) VALUES ($1, 0)")
+            .bind(child_working)
+            .execute(&pool)
+            .await
+            .expect("insert agent_step del figlio che lavora");
+
+        // Guardia DISABILITATA: nessun figlio viene toccato dal check no-progress.
+        // orphan_timeout ALTO (1h): neanche l'orphan scatta -> 0 accodati.
+        let requeued_off = backstop_project(&pool, &pool, 3600, NO_PROGRESS_OFF).await;
+        assert_eq!(requeued_off, 0, "guardia off + orphan alto -> nessun accodato");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM nexus_subagent_runs WHERE status = 'timeout'"
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count timeout off"),
+            0,
+            "guardia off: nessuna sub-run marcata timeout"
+        );
+
+        // Guardia ON con soglia no-progress 300s (orphan_timeout alto 1h, cosi'
+        // l'orphan storico NON scatta: isola l'effetto del solo check no-progress).
+        let no_progress_on = NoProgressGuard {
+            enabled: true,
+            timeout_s: 300,
+        };
+        let requeued_on = backstop_project(&pool, &pool, 3600, no_progress_on).await;
+        // Solo il padre col figlio IMPANTANATO viene accodato.
+        assert_eq!(
+            requeued_on, 1,
+            "solo il padre col figlio impantanato viene accodato"
+        );
+        // Il figlio impantanato e' marcato timeout.
+        let stuck_status: String =
+            sqlx::query_scalar("SELECT status FROM nexus_subagent_runs WHERE id = $1")
+                .bind(child_stuck)
+                .fetch_one(&pool)
+                .await
+                .expect("status impantanato");
+        assert_eq!(stuck_status, "timeout", "figlio impantanato -> timeout");
+        // Il figlio che LAVORA (1 agent_step) resta running: il check no-progress lo
+        // ignora (ha progredito), l'orphan_timeout (1h) non e' ancora scattato.
+        let working_status: String =
+            sqlx::query_scalar("SELECT status FROM nexus_subagent_runs WHERE id = $1")
+                .bind(child_working)
+                .fetch_one(&pool)
+                .await
+                .expect("status che lavora");
+        assert_eq!(
+            working_status, "running",
+            "figlio con progresso NON marcato dal check no-progress"
+        );
+        // Il padre col figlio che lavora NON e' in coda.
+        let working_queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subagent_fanin_resume_queue WHERE parent_run_id = $1",
+        )
+        .bind(parent_working)
+        .fetch_one(&pool)
+        .await
+        .expect("count working queued");
+        assert_eq!(working_queued, 0, "padre col figlio vivo NON accodato");
     }
 
     /// Replica LOCALE della meccanica di `fanin_enqueue_if_last` (privata in

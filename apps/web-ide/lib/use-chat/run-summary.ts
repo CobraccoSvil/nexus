@@ -45,6 +45,13 @@ export function buildTerminalRunSummary(run: AgentRunInfo): string {
       ? `In attesa di conferma per ${awaiting} azion${awaiting === 1 ? "e" : "i"}.`
       : "In attesa di conferma per proseguire.";
   }
+  // Fan-in async (NON terminale, come awaiting_confirmation): il run PADRE e'
+  // sospeso finche' i sub-agent in background completano, poi riprende. Non
+  // dovrebbe passare di qui (lo stream resta aperto), ma se un percorso lo
+  // sintetizza come messaggio, la sintesi resta coerente e non fuorviante.
+  if (run.status === "awaiting_subagents") {
+    return "In attesa dei sub-agent in background...";
+  }
   // Esiti canonici della macchina a stati di terminazione (mig 0386).
   if (run.status === "completed_verified") {
     return completed > 0

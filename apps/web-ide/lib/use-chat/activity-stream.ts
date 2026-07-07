@@ -155,6 +155,25 @@ export interface SubagentEvent extends EventProvenance {
   elapsedS?: number;
 }
 
+/** Il run PADRE e' entrato in `awaiting_subagents` (fan-in async): ha
+ *  dispatchato N sub-agent in background e il backend lo ha SOSPESO in attesa
+ *  che completino, poi lo riprende (flag ora OFF lato backend). NON e' uno stato
+ *  terminale: lo stream resta aperto e la narrazione dei sub-agent (SubagentEvent)
+ *  continua ad arrivare. Questo evento e' il segnale di "attesa" da mostrare nel
+ *  nastro, distinto dai singoli SubagentEvent (che raccontano il lavoro di OGNI
+ *  figlio). Estende EventProvenance: e' un evento del PADRE, riceve il provider
+ *  del segmento padre come gli altri eventi non-subagent.
+ *
+ *  Contratto backend confermato: il meta-step ha kind === "awaiting_subagents" e
+ *  payload { status, pending_count: <numero>, run_id }. Il contatore e' letto da
+ *  `payload.pending_count` (readAwaitingCount, punto unico). */
+export interface AwaitingSubagentsEvent extends EventProvenance {
+  type: "awaiting_subagents";
+  /** numero di sub-agent ancora in attesa (payload.pending_count), se presente. */
+  count?: number;
+  title: string;
+}
+
 export type ActivityEvent =
   | RoutingEvent
   | PlanEvent
@@ -164,7 +183,8 @@ export type ActivityEvent =
   | VerifyEvent
   | ContextOverflowEvent
   | FoldedToolsEvent
-  | SubagentEvent;
+  | SubagentEvent
+  | AwaitingSubagentsEvent;
 
 /** Segmento del nastro: tutti gli eventi eseguiti da UN provider/model, in
  *  ordine. Un nuovo segmento si apre a ogni cambio provider effettivo. */
@@ -201,6 +221,30 @@ function asString(v: unknown): string | undefined {
 
 function asNumber(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Legge il numero di sub-agent in attesa dal payload del meta-step
+ *  `awaiting_subagents` (segnale strutturato, regola M). PUNTO UNICO del
+ *  contatore. Contratto backend confermato: il campo e' `pending_count`. */
+function readAwaitingCount(payload: Record<string, unknown>): number | undefined {
+  return asNumber(payload.pending_count);
+}
+
+/** Contatore sub-agent in attesa dall'ULTIMO meta-step `awaiting_subagents` del
+ *  run (segnale strutturato, regola M). Fonte primaria dello STATO e' comunque
+ *  `agentRun.status === "awaiting_subagents"`: questo helper serve solo ad
+ *  arricchire il banner col numero, se disponibile. Ritorna `undefined` se non
+ *  c'e' il meta-step o il payload non porta il conteggio (banner generico). */
+export function latestAwaitingSubagentsCount(
+  metaSteps: MetaStepEntry[],
+): number | undefined {
+  for (let i = metaSteps.length - 1; i >= 0; i--) {
+    const m = metaSteps[i];
+    if (m.kind === "awaiting_subagents") {
+      return readAwaitingCount(m.payload ?? {});
+    }
+  }
+  return undefined;
 }
 
 /** Esito di uno step agente da SEGNALE STRUTTURATO (status), mai dal testo. */
@@ -514,6 +558,18 @@ export function composeActivityStream(
           seg.events.push(ev);
           break;
         }
+        case "awaiting_subagents": {
+          // Il run PADRE si e' sospeso in attesa dei sub-agent in background
+          // (fan-in async). Il contatore arriva dal SEGNALE STRUTTURATO del
+          // payload (payload.pending_count, regola M), mai dal parsing del titolo.
+          const seg = ensureSegment(undefined, undefined);
+          seg.events.push({
+            type: "awaiting_subagents",
+            count: readAwaitingCount(p),
+            title: m.title,
+          });
+          break;
+        }
         default:
           // Altri kind (clarify/next_actions/usage_snapshot/end_turn/...) non
           // fanno parte del nastro attivita': restano gestiti dai renderer
@@ -791,7 +847,7 @@ export interface ProviderTokenBucket {
 export function aggregateTokensByProvider(traces: AITraceEvent[]): ProviderTokenBucket[] {
   const map = new Map<string, ProviderTokenBucket>();
   for (const t of traces) {
-    const key = `${t.provider} ${t.model}`;
+    const key = `${t.provider}|${t.model}`;
     const bucket = map.get(key) ?? {
       provider: t.provider,
       model: t.model,

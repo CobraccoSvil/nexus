@@ -351,6 +351,7 @@ function RunStatusBadge({ status, tc }: { status: string; tc: ThemeColors }) {
     interrupted: { label: "interrotto (riavvio)", color: "#f59e0b", bg: "#f59e0b18" },
     provider_unavailable: { label: "provider non disponibile", color: "#f59e0b", bg: "#f59e0b18" },
     awaiting_confirmation: { label: "in attesa di conferma", color: "#8b5cf6", bg: "#8b5cf618" },
+    awaiting_subagents: { label: "in attesa dei sub-agent", color: "#8b5cf6", bg: "#8b5cf618" },
     blocked_needs_input: { label: "in attesa di input", color: "#8b5cf6", bg: "#8b5cf618" },
     running: { label: "in corso", color: tc.accent, bg: `${tc.accent}18` },
   };

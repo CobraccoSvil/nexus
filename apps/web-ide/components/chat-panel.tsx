@@ -12,6 +12,7 @@ import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, 
 import { SimilarRequestBanner } from "./knowledge/similar-request-banner";
 import { computeContextFill } from "../lib/context-fill";
 import { isStatusTerminal } from "../lib/use-chat/helpers";
+import { isAgentRunLiveOrWaiting } from "../lib/api/agent";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { useGlobalDialog } from "./global-dialog-provider";
@@ -19,7 +20,7 @@ import { FeedbackErrorDialog } from "./feedback-error-dialog";
 import { IconButton } from "./icon-button";
 import { MessageList } from "./chat/message-list";
 import { useActivityStreamEnabled } from "../lib/use-chat/activity-stream-flag";
-import { composeActivityStream, tracesForRun, type FoldThreshold } from "../lib/use-chat/activity-stream";
+import { composeActivityStream, tracesForRun, latestAwaitingSubagentsCount, type FoldThreshold } from "../lib/use-chat/activity-stream";
 import { RunNotifications } from "./chat/run-notifications";
 import { SessionWorklogPanel } from "./chat/session-worklog-panel";
 import { AgentStepsPanel } from "./chat/agent-steps-panel";
@@ -432,16 +433,28 @@ export function ChatPanel({
     return arr.filter((x): x is string => typeof x === "string");
   })();
   const isChatBusy = isLoading || isAgentRunning || hasBusyMessageAction;
+  // Fan-in async: il run PADRE e' SOSPESO in attesa dei sub-agent in background
+  // (fonte primaria dello stato: agentRun.status, non il testo). Il contatore,
+  // se disponibile, arriva dall'ULTIMO meta-step awaiting_subagents (segnale
+  // strutturato, punto unico latestAwaitingSubagentsCount).
+  const isAwaitingSubagents = agentRun?.status === "awaiting_subagents";
+  const awaitingSubagentsCount = isAwaitingSubagents
+    ? latestAwaitingSubagentsCount(liveMetaSteps)
+    : undefined;
   // "Invio al server in corso" SOLO finche' la POST non e' confermata
   // (isSending): lo stato di elaborazione non deve essere ottimismo del client
   // ma riflettere la conferma del server (messaggio persistito / run avviato).
   const busyLabel = isAgentRunning
     ? "Agente AI in esecuzione"
-    : hasBusyMessageAction
-      ? "Operazione sui messaggi in corso"
-      : isSending
-        ? "Invio al server in corso…"
-        : "Elaborazione richiesta in corso";
+    : isAwaitingSubagents
+      ? typeof awaitingSubagentsCount === "number" && awaitingSubagentsCount > 0
+        ? `In attesa di ${awaitingSubagentsCount} sub-agent in background…`
+        : "In attesa dei sub-agent in background…"
+      : hasBusyMessageAction
+        ? "Operazione sui messaggi in corso"
+        : isSending
+          ? "Invio al server in corso…"
+          : "Elaborazione richiesta in corso";
 
   /* ---- Scroll management ---- */
 
@@ -1225,7 +1238,7 @@ export function ChatPanel({
             <ThinkingBlock text={thinkingText} tc={tc} />
           )}
 
-          {agentRun && (agentRun.status === "running" || agentRun.status === "awaiting_confirmation") && (
+          {agentRun && isAgentRunLiveOrWaiting(agentRun.status) && (
             <AgentStepsPanel
               agentRun={agentRun}
               agentSteps={agentSteps}
