@@ -1592,6 +1592,14 @@ async fn resolve_session_project_root(
 /// Riusa gli STESSI punti unici del batch tool (`isolation_flag_enabled`,
 /// `probe_isolatable`), cosi' il gate del planner e l'esecuzione reale
 /// dell'isolamento vedono lo stesso verdetto.
+///
+/// ATTENZIONE ai pool: il flag `orchestrator.subagent_isolation_enabled` e' un
+/// setting GLOBALE di piattaforma -> tabella `settings`, che vive SOLO nel
+/// META-DB (`meta_db`), non nei DB-progetto (`run_db`, `<slug>_nexus`: con
+/// separazione DB ON non ha affatto la tabella `settings`). Va quindi letto da
+/// `meta_db`, coerentemente col batch tool che legge da `ctx.core.db` (= meta).
+/// Solo la catena `chat_sessions -> projects` di `resolve_session_project_root`
+/// usa `run_db` per `chat_sessions` (dominio run) e `meta_db` per `projects`.
 async fn compute_run_isolation_available(
     meta_db: &PgPool,
     run_db: &PgPool,
@@ -1601,7 +1609,9 @@ async fn compute_run_isolation_available(
     if role.is_shadow() {
         return false;
     }
-    if !crate::agent_tools::subagent_native::isolation_flag_enabled(run_db).await {
+    // Flag GLOBALE -> meta_db (NON run_db: li' `settings` non esiste a
+    // separazione DB ON e la query fallirebbe mascherandosi come flag OFF).
+    if !crate::agent_tools::subagent_native::isolation_flag_enabled(meta_db).await {
         return false;
     }
     let Some((_pid, root)) = resolve_session_project_root(run_db, meta_db, session_id).await else {
