@@ -75,6 +75,10 @@ pub enum AgentStepStatus {
     Completed,
     Failed,
     AwaitingConfirmation,
+    /// Il run e' SOSPESO in attesa del fan-in dei sub-run background (fan-in
+    /// deterministico, Fase D): gemello di `AwaitingConfirmation` ma il resume e'
+    /// innescato dal completamento dell'ultimo figlio, non da un'azione utente.
+    AwaitingSubagents,
     Skipped,
     /// Tutti i provider configurati sono in cooldown / non disponibili.
     /// Stato emesso da `chat_messages.rs::spawn_agent_run` quando il
@@ -92,6 +96,7 @@ impl AgentStepStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::AwaitingSubagents => "awaiting_subagents",
             Self::Skipped => "skipped",
             Self::ProviderUnavailable => "provider_unavailable",
         }
@@ -113,6 +118,13 @@ pub enum AgentRunStatus {
     Running,
     Completed,
     AwaitingConfirmation,
+    /// Il run e' SOSPESO in attesa del fan-in dei sub-run background (fan-in
+    /// deterministico, Fase D). Gemello di `AwaitingConfirmation` (run SOSPESO,
+    /// non-terminale, resumibile), ma il resume e' innescato dal completamento
+    /// dell'ULTIMO figlio background (via `subagent_fanin_resume_queue`, mig
+    /// 0542), non da un'azione utente. Distinto da `AwaitingConfirmation` cosi'
+    /// il worker fan-in seleziona SOLO i propri run (CAS su questo status).
+    AwaitingSubagents,
     Failed,
     TimedOut,
     Cancelled,
@@ -155,6 +167,7 @@ impl AgentRunStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::AwaitingSubagents => "awaiting_subagents",
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
@@ -191,6 +204,7 @@ impl AgentRunStatus {
             "running" => Self::Running,
             "completed" => Self::Completed,
             "awaiting_confirmation" => Self::AwaitingConfirmation,
+            "awaiting_subagents" => Self::AwaitingSubagents,
             "failed" => Self::Failed,
             "timed_out" => Self::TimedOut,
             "cancelled" | "interrupted" => Self::Cancelled,
@@ -222,7 +236,14 @@ impl AgentRunStatus {
         // HITL). Da non-terminale produceva run appesi per sempre: mai purgati
         // dalla retention, replay senza agent_final, frontend che forzava
         // "failed" dopo timeout con warning fuorviante.
-        !matches!(self, Self::Running | Self::AwaitingConfirmation)
+        // AwaitingSubagents (fan-in, Fase D) e' NON-terminale come
+        // AwaitingConfirmation: il run e' SOSPESO, riprende al completamento
+        // dell'ultimo figlio background (worker fan-in), quindi il client deve
+        // restare in ascolto, non considerarlo finito.
+        !matches!(
+            self,
+            Self::Running | Self::AwaitingConfirmation | Self::AwaitingSubagents
+        )
     }
 }
 
@@ -872,6 +893,7 @@ mod tests {
             AgentRunStatus::Running,
             AgentRunStatus::Completed,
             AgentRunStatus::AwaitingConfirmation,
+            AgentRunStatus::AwaitingSubagents,
             AgentRunStatus::Failed,
             AgentRunStatus::TimedOut,
             AgentRunStatus::Cancelled,
@@ -927,6 +949,8 @@ mod tests {
         // Running = in corso; Awaiting = run SOSPESO con resume HITL.
         assert!(!AgentRunStatus::Running.is_terminal());
         assert!(!AgentRunStatus::AwaitingConfirmation.is_terminal());
+        // AwaitingSubagents = run SOSPESO con resume fan-in (Fase D): non-terminale.
+        assert!(!AgentRunStatus::AwaitingSubagents.is_terminal());
         // BlockedNeedsInput e' TERMINALE (ADR 0034): run concluso con
         // dichiarazione "serve input"; il prossimo input crea un nuovo run.
         assert!(AgentRunStatus::BlockedNeedsInput.is_terminal());

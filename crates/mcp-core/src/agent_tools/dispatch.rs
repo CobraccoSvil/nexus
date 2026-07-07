@@ -313,6 +313,7 @@ mod tests {
                 db: Arc::new(db.clone()),
                 run_db: Arc::new(db.clone()),
                 parent_run_id: None,
+                run_id: None,
                 long_running_patterns: Vec::new(),
                 user_role: "admin".to_string(),
                 is_nexus_operator: true,

@@ -204,11 +204,13 @@ where
                 return Ok(StepOutcome::Completed(state));
             }
 
-            // Interrupt-resume vero (HITL): SOLO `awaiting_confirmation`. Lo stato
-            // attende una conferma umana per RIPRENDERE lo STESSO run; il motore si
-            // ferma e indica da dove riprendere (il nodo gia' instradato). Replica
-            // l'`interrupt_before=["executor"]` di graph.py (modalita' legacy,
-            // ripreso via `/agent/approve`).
+            // Interrupt-resume vero: lo stato attende un evento esterno per
+            // RIPRENDERE lo STESSO run (conferma umana HITL, oppure completamento
+            // dei sub-run background). Il motore si ferma e indica da dove
+            // riprendere (il nodo gia' instradato); resta AGNOSTICO al motivo
+            // (`is_awaiting_interrupt` = PUNTO UNICO che compone i flag). Replica
+            // l'`interrupt_before=["executor"]` di graph.py (ripreso via
+            // `/agent/approve` per l'HITL).
             //
             // `pending_clarify` NON e' un interrupt-resume: in graph.py e' un edge
             // CONDIZIONALE che instrada a END (run terminale, Completed). Il prossimo
@@ -217,7 +219,7 @@ where
             // non da un interrupt nativo: qui non lo intercettiamo, altrimenti il run
             // verrebbe sospeso (divergenza da graph.py) e un resume riprenderebbe dal
             // nodo instradato saltando router+clarify.
-            if state.is_awaiting_confirmation() {
+            if state.is_awaiting_interrupt() {
                 return Ok(StepOutcome::Interrupted {
                     state,
                     resume_at: next,
