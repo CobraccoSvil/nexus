@@ -20,7 +20,7 @@ export interface PortEntry {
   label?: string;
   state?: string;
   url?: string;
-  /** Short-name del servizio systemd a cui appartiene la porta (se rilevato). */
+  /** Nome corto del servizio del progetto a cui appartiene la porta (se rilevato). */
   service?: string | null;
 }
 
@@ -195,7 +195,7 @@ export async function killPortProcess(
   );
 }
 
-/** Disinstalla un servizio systemd del progetto (stop+disable+rimuove unit file). */
+/** Disinstalla un servizio del progetto (lo ferma e lo rimuove dalla registrazione). */
 export async function uninstallProjectService(
   projectId: string,
   service: string,
@@ -206,7 +206,7 @@ export async function uninstallProjectService(
   );
 }
 
-/** Riavvia in batch tutti i servizi systemd `{slug}-*.service` del progetto. */
+/** Riavvia in batch tutti i servizi del progetto (prefisso `{slug}-`). */
 export async function restartAllProjectServices(
   projectId: string,
 ): Promise<{ slug: string; restarted: Array<{ unit: string; ok: boolean; stderr: string }> }> {
@@ -338,8 +338,8 @@ export async function launchRunConfig(
 }
 
 export interface ProjectServiceEntry {
-  unit: string;   // es. "redemptor-backend.service"
-  short: string;  // es. "backend"
+  unit: string;   // identificatore completo del servizio, es. "redemptor-backend.service"
+  short: string;  // nome corto del servizio, es. "backend"
   state: string;  // "active" | "inactive" | "failed" | "activating" | ...
   sub: string;    // "running" | "exited" | "dead" | ...
   // Diagnostica crash-loop (popolata solo se il servizio e' in stato failing/failed)
@@ -354,7 +354,7 @@ export async function getProjectServicesStatus(
 ): Promise<{
   services: ProjectServiceEntry[];
   slug: string;
-  // ADR 0022: distingue "bus systemd utente giu'" da "zero servizi installati".
+  // ADR 0022: distingue "gestore dei servizi non raggiungibile" da "zero servizi installati".
   // Il JSON e' passato grezzo (snake_case), coerente con last_error/crash_loop.
   manager_unavailable?: boolean;
   manager_hint?: string;
@@ -374,14 +374,14 @@ export async function controlProjectService(
 
 export interface ServiceWizardSuggestion {
   short: string;       // nome corto, es. "backend"
-  unit: string;        // nome unit completo, es. "redemptor-backend.service"
+  unit: string;        // identificatore completo del servizio, es. "redemptor-backend.service"
   label: string;       // descrizione leggibile
   kind: string;        // "npm" | "pnpm" | "dotnet" | "cargo" | "python" | "shell"
   command: string;
   args: string[];
   cwd: string;
   env?: Record<string, string>; // env suggerito (es. PORT deterministico)
-  existing: boolean;   // true se il .service è già installato
+  existing: boolean;   // true se il servizio è già installato
 }
 
 export async function detectProjectServices(

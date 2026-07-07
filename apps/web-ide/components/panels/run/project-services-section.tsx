@@ -4,11 +4,11 @@ import type { useThemeColors } from "../../../lib/theme";
 import type { ProjectServiceEntry, PortEntry } from "../../../lib/api-client";
 import { stateColor, stateLabel, actBtnStyle, hdrStyle, buildDiagnosticPrompt, type ServiceAction } from "./shared";
 
-interface SystemdServicesSectionProps {
+interface ProjectServicesSectionProps {
   tc: ReturnType<typeof useThemeColors>;
   services: ProjectServiceEntry[];
   slug: string;
-  // ADR 0022: il bus systemd utente e' giu' (servizi installati ma non elencabili).
+  // ADR 0022: il gestore dei servizi non e' raggiungibile (servizi presenti ma non elencabili).
   managerUnavailable?: boolean;
   managerHint?: string;
   ports: PortEntry[];
@@ -32,7 +32,7 @@ interface SystemdServicesSectionProps {
   setDiagResult: (v: "pending" | "resolved" | "failed" | null) => void;
 }
 
-export function SystemdServicesSection({
+export function ProjectServicesSection({
   tc,
   services,
   slug,
@@ -57,15 +57,15 @@ export function SystemdServicesSection({
   bumpLastRestart,
   setDiagSentFor,
   setDiagResult,
-}: SystemdServicesSectionProps) {
+}: ProjectServicesSectionProps) {
   return (
     <>
-      {/* ════════════════════════════════ A: SERVIZI SYSTEMD ══════════════ */}
-      <div style={hdrStyle(tc)} title="Servizi systemd persistenti del progetto: vivono in ~/.config/systemd/user/, partono al boot se enabled, vengono riavviati dal sistema se crashano.">
-        <span>Servizi systemd persistenti{slug ? ` — ${slug}` : ""}</span>
+      {/* ════════════════════════════════ A: SERVIZI DEL PROGETTO ═════════ */}
+      <div style={hdrStyle(tc)} title="Servizi gestiti del progetto: avvio, arresto e riavvio dal pannello.">
+        <span>Servizi del progetto{slug ? ` — ${slug}` : ""}</span>
         <div style={{ display:"flex", gap:6 }}>
           <button onClick={fetchServices} title="Aggiorna stato" disabled={batchBusy} style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:3,color:tc.textMuted,cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10 }}>↺</button>
-          <button onClick={handleRestartAll} title={managerUnavailable ? "Manager systemd utente non attivo — avvialo prima di gestire i servizi" : services.length===0 ? "Nessun servizio systemd. Clicca per dettagli." : "Riavvia tutti i servizi del progetto"} disabled={batchBusy} style={{ background:"transparent",border:`1px solid #f59e0b`,borderRadius:3,color:"#f59e0b",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>↻ Tutti</button>
+          <button onClick={handleRestartAll} title={managerUnavailable ? "Gestore dei servizi non attivo — avvialo prima di gestire i servizi" : services.length===0 ? "Nessun servizio del progetto. Clicca per dettagli." : "Riavvia tutti i servizi del progetto"} disabled={batchBusy} style={{ background:"transparent",border:`1px solid #f59e0b`,borderRadius:3,color:"#f59e0b",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>↻ Tutti</button>
           <button onClick={handleCleanupPorts} title="Termina processi su porte conflittuali (esclude i servizi del progetto)" disabled={batchBusy} style={{ background:"transparent",border:`1px solid #ef4444`,borderRadius:3,color:"#ef4444",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>✕ Porte</button>
           <button
             onClick={runWizard}
@@ -122,7 +122,7 @@ export function SystemdServicesSection({
             onClick={handleRestartAll}
             disabled={batchBusy}
             title={services.length===0
-              ? "Nessun servizio systemd installato. Clicca per istruzioni su come configurarli."
+              ? "Nessun servizio del progetto configurato. Clicca per istruzioni su come configurarli."
               : "Riavvia tutti i servizi per recepire le modifiche"}
             style={{
               background:"#f59e0b", color:"#fff", border:"none", borderRadius:3,
@@ -159,11 +159,11 @@ export function SystemdServicesSection({
             }}>
               <div style={{ display:"flex", alignItems:"center", gap:6, fontWeight:600 }}>
                 <span>⚠️</span>
-                <span>Manager systemd utente non attivo</span>
+                <span>Gestore dei servizi non attivo</span>
               </div>
               <div style={{ color: tc.textSecondary, lineHeight: 1.5 }}>
-                {(managerHint ?? "Impossibile elencare i servizi: il bus systemd utente non e' raggiungibile. Avvia il manager o riavvia WSL.")
-                  // Rende leggibili i comandi shell wrappati tra backtick letterali (es. `sudo systemctl start user@$(id -u)`).
+                {(managerHint ?? "Impossibile elencare i servizi del progetto: il gestore non e' al momento raggiungibile.")
+                  // Rende leggibili i comandi shell wrappati tra backtick letterali (se presenti nel messaggio del backend).
                   .split("`")
                   .map((seg, i) => (i % 2 === 1
                     ? <code key={i} style={{ fontFamily:'var(--font-mono)', fontSize:11 }}>{seg}</code>
@@ -173,7 +173,7 @@ export function SystemdServicesSection({
           ) : (
             <div style={{ color:tc.textMuted, fontSize:12 }}>
               {slug
-                ? <>Nessun servizio trovato con prefisso <code>{slug}-</code>. Usa <strong>+ Configura</strong> per crearne uno.</>
+                ? <>Nessun servizio del progetto configurato. Usa <strong>+ Configura</strong> per crearne uno.</>
                 : "Caricamento…"}
             </div>
           )
@@ -183,7 +183,7 @@ export function SystemdServicesSection({
               <div style={{ fontSize:11, padding:"2px 0 8px", display:"flex", alignItems:"center", gap:6 }}>
                 <span style={{ color:"#f59e0b", fontWeight:700 }}>•</span>
                 <span style={{ color:tc.textSecondary, lineHeight:1.4 }}>
-                  {managerHint ?? "Gestiti in modalita' detached (systemd utente non attivo): avvio, arresto e stato funzionano comunque, senza systemd."}
+                  {managerHint ?? "Servizi gestiti: avvio, arresto e stato funzionano comunque."}
                 </span>
               </div>
             )}
@@ -271,7 +271,7 @@ export function SystemdServicesSection({
                   <button
                     disabled={!!svcBusy[`${svc.unit}-uninstall`]}
                     onClick={()=>handleUninstall(svc)}
-                    title={`Disinstalla il servizio (rimuove ${svc.unit} da systemd --user)`}
+                    title={`Disinstalla il servizio ${svc.short}`}
                     style={{
                       background:"transparent", border:`1px solid ${tc.border}`,
                       color:tc.textMuted, borderRadius:3, padding:"1px 6px", fontSize:10,
