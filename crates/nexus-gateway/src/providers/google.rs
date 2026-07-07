@@ -1507,6 +1507,20 @@ fn clean_schema_for_google(schema: &serde_json::Value) -> serde_json::Value {
                 if SKIP.contains(&k.as_str()) {
                     continue;
                 }
+                // Gemini `functionDeclarations` vuole il Type enum in UPPERCASE
+                // (STRING/NUMBER/INTEGER/BOOLEAN/ARRAY/OBJECT): gli schemi tool
+                // Nexus sono JSON-Schema OpenAI-style con `type` lowercase
+                // ("string"), che Gemini rifiuta con HTTP 400 invalid_argument su
+                // OGNI richiesta con tool. Normalizza SOLO il VALORE stringa del
+                // campo `type`; una property NOMINATA "type" ha valore Object (non
+                // stringa) e prosegue nella ricorsione, i valori di `enum` restano
+                // array di stringhe (Gemini li accetta cosi').
+                if k == "type" {
+                    if let serde_json::Value::String(s) = v {
+                        out.insert(k.clone(), serde_json::Value::String(s.to_uppercase()));
+                        continue;
+                    }
+                }
                 out.insert(k.clone(), clean_schema_for_google(v));
             }
             serde_json::Value::Object(out)
@@ -3704,6 +3718,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn clean_schema_normalizza_type_uppercase_e_rimuove_skip() {
+        // Gemini functionDeclarations rifiuta con 400 invalid_argument sia le chiavi
+        // JSON-Schema extra sia il `type` lowercase: clean_schema_for_google deve
+        // rimuovere le prime E normalizzare il secondo a UPPERCASE, ricorsivamente.
+        let raw = serde_json::json!({
+            "type": "object",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "X",
+            "additionalProperties": false,
+            "properties": {
+                "path": { "type": "string", "default": "." },
+                "items": { "type": "array", "items": { "type": "integer" } },
+                // property NOMINATA "type": il suo VALORE e' uno schema (Object),
+                // NON il campo `type` -> non va trattata come tipo da uppercasare.
+                "type": { "type": "string" }
+            }
+        });
+        let cleaned = clean_schema_for_google(&raw);
+        assert_eq!(cleaned["type"], "OBJECT", "type di primo livello -> UPPERCASE");
+        assert!(cleaned.get("$schema").is_none(), "$schema rimosso");
+        assert!(cleaned.get("title").is_none(), "title rimosso");
+        assert!(
+            cleaned.get("additionalProperties").is_none(),
+            "additionalProperties rimosso"
+        );
+        assert_eq!(cleaned["properties"]["path"]["type"], "STRING");
+        assert!(
+            cleaned["properties"]["path"].get("default").is_none(),
+            "default rimosso"
+        );
+        assert_eq!(cleaned["properties"]["items"]["type"], "ARRAY");
+        assert_eq!(cleaned["properties"]["items"]["items"]["type"], "INTEGER");
+        // property nominata "type": la chiave-nome resta, il suo schema interno e'
+        // normalizzato (type:string -> STRING).
+        assert_eq!(cleaned["properties"]["type"]["type"], "STRING");
+    }
+
     fn req_with_tools(messages: Vec<LlmMessage>, tools: bool) -> LlmRequest {
         LlmRequest {
             model: "gemini-2.5-pro".to_string(),
@@ -3764,7 +3816,7 @@ mod tests {
     #[test]
     fn clean_schema_funzione_pura() {
         // Test diretto della funzione pura: chiavi note rimosse, struttura
-        // preservata.
+        // preservata, `type` normalizzato a UPPERCASE per Gemini (STRING/OBJECT/...).
         let raw = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -3776,12 +3828,12 @@ mod tests {
             }
         });
         let cleaned = clean_schema_for_google(&raw);
-        assert_eq!(cleaned["type"], "object");
+        assert_eq!(cleaned["type"], "OBJECT");
         assert!(cleaned.get("additionalProperties").is_none());
         assert!(cleaned.get("$defs").is_none());
         assert!(cleaned.get("definitions").is_none());
         assert!(cleaned.get("examples").is_none());
-        assert_eq!(cleaned["properties"]["a"]["type"], "string");
+        assert_eq!(cleaned["properties"]["a"]["type"], "STRING");
         assert!(cleaned["properties"]["a"].get("default").is_none());
     }
 
