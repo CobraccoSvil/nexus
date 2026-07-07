@@ -401,7 +401,9 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
                             .ok()
                             .flatten();
                     match status.as_deref() {
-                        Some("running") | Some("awaiting_confirmation") | None => continue,
+                        // run ancora attivo/sospeso-vivo (punto unico regola L): attendi
+                        Some(s) if crate::agent_types::is_active_run_status(s) => continue,
+                        None => continue,
                         _ => break,
                     }
                 }

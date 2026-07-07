@@ -158,6 +158,27 @@ pub enum AgentRunStatus {
     BlockedNeedsInput,
 }
 
+/// Stati di un run "attivo su una sessione": esegue (`running`) o e' sospeso ma
+/// VIVO e resumibile via checkpoint (`awaiting_confirmation` HITL,
+/// `awaiting_subagents` fan-in Fase D). PUNTO UNICO (regola L): ogni logica che
+/// decide "c'e' un run che occupa la sessione", "il checkpoint va conservato",
+/// "il run va superato/cancellato o atteso" deriva da qui, mai re-inlinando la
+/// lista. Un nuovo stato sospeso-vivo si aggiunge QUI, una volta sola.
+pub const ACTIVE_RUN_STATUSES: [&str; 3] =
+    ["running", "awaiting_confirmation", "awaiting_subagents"];
+
+/// Frammento SQL della lista [`ACTIVE_RUN_STATUSES`] per clausole `IN (...)` /
+/// `NOT IN (...)`. Const senza input utente: interpolazione sicura. La coerenza
+/// con l'array e' verificata dal test `active_run_status_sql_coerente_con_array`.
+pub const ACTIVE_RUN_STATUS_SQL: &str =
+    "'running', 'awaiting_confirmation', 'awaiting_subagents'";
+
+/// `true` se lo stato (stringa DB) e' un run attivo/sospeso-vivo su una sessione.
+/// Per i match-arm Rust che non usano SQL (es. loop di attesa della remediation).
+pub fn is_active_run_status(status: &str) -> bool {
+    ACTIVE_RUN_STATUSES.contains(&status)
+}
+
 impl AgentRunStatus {
     /// Stringa snake_case persistita in `agent_runs.status`. Punto unico (regola L):
     /// usato sia da `finalize_agent_run` sia dall'update inline in `agent_run.rs`,
@@ -841,6 +862,28 @@ pub async fn save_startup_command_if_needed(db: &PgPool, project_id: Uuid, steps
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_run_status_sql_coerente_con_array() {
+        // Il frammento SQL e l'array sono due rappresentazioni della STESSA lista
+        // (punto unico): ogni stato dell'array deve comparire quotato nel frammento e
+        // il conteggio deve coincidere. Se qualcuno aggiunge uno stato sospeso-vivo
+        // all'array ma dimentica il frammento SQL (o viceversa), questo test rompe.
+        for s in ACTIVE_RUN_STATUSES {
+            assert!(
+                ACTIVE_RUN_STATUS_SQL.contains(&format!("'{s}'")),
+                "lo stato {s} manca nel frammento SQL ACTIVE_RUN_STATUS_SQL"
+            );
+        }
+        let sql_count = ACTIVE_RUN_STATUS_SQL.matches('\'').count() / 2;
+        assert_eq!(
+            sql_count,
+            ACTIVE_RUN_STATUSES.len(),
+            "frammento SQL e array hanno un numero di stati diverso"
+        );
+        assert!(is_active_run_status("awaiting_subagents"));
+        assert!(!is_active_run_status("completed"));
+    }
 
     #[test]
     fn tool_action_chat_intent_is_none() {

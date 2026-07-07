@@ -1898,25 +1898,78 @@ fn build_resume_delta(resume_message: &str) -> nexus_graph::StateDelta {
 
 /// Costruisce il delta opaco del runtime che sblocca l'interrupt FAN-IN (Fase D):
 /// azzera `awaiting_subagents` (`Some(Some(false))`, load-bearing per non
-/// re-interrompere sul checkpoint ancora-in-attesa) e inietta i `subagent_results`
+/// re-interrompere sul checkpoint ancora-in-attesa) e CONSEGNA al modello gli esiti
 /// dei figli background completati. Gemello di [`build_resume_delta`] (regola L):
-/// la differenza dall'HITL e' il MOTIVO di interrupt azzerato e il payload
-/// iniettato (risultati strutturati vs messaggio umano di approvazione). Il delta
-/// e' TIPIZZATO e passa per il reducer (`into_opaque`): non si scrivono i campi a
-/// mano. `subagent_results` sono i verdetti strutturati (regola M) letti dalle
-/// righe `nexus_subagent_runs`, non prosa.
+/// la differenza dall'HITL e' il MOTIVO di interrupt azzerato.
+///
+/// CONSEGNA via `messages` (append), NON solo via `subagent_results`: il nodo che
+/// riprende e' l'`executor` (`interrupt_before=["executor"]`), che costruisce il
+/// prompt LLM da `state.messages` e NON legge il campo `subagent_results` (letto
+/// solo dal `todo_runner`). Iniettare solo nel campo lascerebbe il resume INERTE —
+/// il padre riprenderebbe CIECO sugli esiti (in history solo il marker
+/// `background_dispatched`). Il Message porta i verdetti STRUTTURATI (regola M).
+/// `subagent_results` resta valorizzato nel campo per osservabilita' / eventuali
+/// consumatori non-executor. Il delta e' TIPIZZATO e passa per il reducer
+/// (`into_opaque`): non si scrivono i campi a mano.
 fn build_resume_delta_subagents(subagent_results: Vec<Value>) -> nexus_graph::StateDelta {
+    use nexus_agent_graph::state::{Message, MessageContent};
+    let results_msg = format_fanin_results_message(&subagent_results);
     let typed = nexus_agent_graph::state::StateDelta {
         // Azzera il predicato di interrupt fan-in: senza, il motore si
         // re-interrompe sul checkpoint ancora-in-attesa (loop di fan-in).
         awaiting_subagents: Some(Some(false)),
-        // Inietta gli esiti dei sub-run background: l'executor li rilegge nello
-        // stato (`subagent_results`) al riavvio del turno. Segnali strutturati
-        // (verdict/status), mai prosa (regola M).
+        // Campo di stato (osservabilita' / consumatori non-executor). NON e' il
+        // canale che il modello legge: quello e' `messages` qui sotto.
         subagent_results: Some(Some(subagent_results)),
+        // Turno utente coi risultati: l'executor lo rilegge come ultimo messaggio
+        // della history al riavvio del turno (stesso canale del resume HITL).
+        messages: Some(vec![Message::Human {
+            content: MessageContent::text(results_msg),
+        }]),
         ..Default::default()
     };
     typed.into_opaque()
+}
+
+/// Cap per-figlio del `summary` iniettato al resume (caratteri). Evita che N figli
+/// con summary enormi (final_summary non ha cap alla fonte) producano un singolo
+/// turno gigantesco -> context_overflow al resume. Solo il `summary` (testo libero)
+/// e' troncato; `status`/`outcome` (segnali autoritativi, regola M) restano integri.
+const FANIN_SUMMARY_CAP: usize = 2000;
+
+/// Formatta i risultati strutturati dei figli background nel testo del turno utente
+/// iniettato al resume fan-in (`build_resume_delta_subagents`). Presenta un ARRAY
+/// JSON (i segnali autoritativi `status`/`outcome` sono struttura, non prosa: regola
+/// M); il modello lo parsa come JSON. NIENTE delimitatori XML: un `summary` LLM che
+/// contenesse la stringa di chiusura confonderebbe un parsing naive del delimitatore
+/// (l'array JSON e' auto-delimitante, un tag di chiusura dentro una stringa e' solo
+/// contenuto). Array vuoto -> nota esplicita (il modello riprende comunque non cieco).
+fn format_fanin_results_message(results: &[Value]) -> String {
+    if results.is_empty() {
+        return "I sub-agenti in background che avevi dispatchato sono terminati \
+                (nessun nuovo esito strutturato da riportare)."
+            .to_string();
+    }
+    // Tronca i soli `summary` (testo libero LLM, potenzialmente enorme).
+    let capped: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            if let Some(s) = r.get("summary").and_then(Value::as_str) {
+                if s.chars().count() > FANIN_SUMMARY_CAP {
+                    let head: String = s.chars().take(FANIN_SUMMARY_CAP).collect();
+                    r["summary"] = Value::String(format!("{head}... [troncato]"));
+                }
+            }
+            r
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&capped).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "I sub-agenti in background che avevi dispatchato sono terminati. Di seguito \
+         i loro esiti come array JSON (un oggetto per figlio; `status` e `outcome` \
+         sono i segnali autoritativi, `summary` e' descrittivo):\n{json}"
+    )
 }
 
 /// RESUME FAN-IN di un run nativo PRIMARIO sospeso su `awaiting_subagents`
@@ -2959,14 +3012,61 @@ mod tests {
             !state.is_awaiting_subagents(),
             "il delta deve azzerare awaiting_subagents (sblocca l'interrupt fan-in)"
         );
-        // I risultati sono OVERWRITE nello stato (non append come i messaggi).
+        // I risultati sono OVERWRITE nel campo di stato (osservabilita').
         assert_eq!(
             state.subagent_results.as_ref().map(|r| r.len()),
             Some(2),
-            "i risultati dei sub-run sono iniettati nello stato"
+            "i risultati dei sub-run sono iniettati nel campo di stato"
         );
-        // I messaggi NON sono toccati dal delta fan-in (nessun turno umano).
-        assert_eq!(state.messages.len(), 1, "nessun messaggio umano accodato");
+        // FIX B1 (resume non piu' inerte): il delta ACCODA un turno utente coi
+        // risultati, cioe' il canale che l'executor legge davvero (state.messages,
+        // reducer append). Senza, il padre riprenderebbe CIECO sugli esiti (l'executor
+        // NON legge il campo subagent_results, letto solo dal todo_runner).
+        assert_eq!(
+            state.messages.len(),
+            2,
+            "messaggio pregresso + turno coi risultati fan-in accodato"
+        );
+        match state.messages.last() {
+            Some(Message::Human { content }) => {
+                let txt = serde_json::to_string(content).unwrap_or_default();
+                assert!(
+                    txt.contains("completed_verified") && txt.contains("bbb"),
+                    "il turno iniettato deve portare gli esiti STRUTTURATI di entrambi i figli: {txt}"
+                );
+            }
+            other => panic!("atteso Human coi risultati in coda, trovato {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_fanin_results_message_vuoto_non_e_cieco() {
+        // Array vuoto -> nota esplicita (il modello riprende comunque non cieco),
+        // nessun array JSON spurio.
+        let msg = format_fanin_results_message(&[]);
+        assert!(msg.contains("terminati"), "nota di completamento: {msg}");
+        assert!(!msg.contains("array JSON"), "niente blocco JSON quando vuoto: {msg}");
+    }
+
+    #[test]
+    fn format_fanin_results_message_tronca_summary_enorme() {
+        // Un summary oltre il cap e' troncato (evita context_overflow al resume);
+        // status/outcome restano integri.
+        let big = "x".repeat(FANIN_SUMMARY_CAP + 500);
+        let results = vec![serde_json::json!({
+            "subagent_run_id": "aaa",
+            "status": "completed",
+            "summary": big,
+            "outcome": {"verdict": "completed_verified"},
+        })];
+        let msg = format_fanin_results_message(&results);
+        assert!(msg.contains("[troncato]"), "summary enorme troncato: {}", &msg[..80.min(msg.len())]);
+        assert!(msg.contains("completed_verified"), "outcome integro");
+        // Il testo non deve contenere l'intero summary enorme non troncato.
+        assert!(
+            !msg.contains(&"x".repeat(FANIN_SUMMARY_CAP + 1)),
+            "il summary oltre il cap non compare per intero"
+        );
     }
 
     #[test]

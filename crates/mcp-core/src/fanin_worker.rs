@@ -380,7 +380,16 @@ async fn process_queue_row(state: &AppState, row: QueueRow) {
     // vince UN solo consumer/giro (idempotenza del resume, regola H: e' il CAS a
     // chiudere la race, non uno sleep). updated_at aggiornato per l'osservabilita'.
     let cas = sqlx::query(
-        "UPDATE agent_runs SET status = 'running', updated_at = NOW() \
+        // `completed_at = NULL` (regola H, gemello di chat_agent.rs confirm-CAS): il
+        // persist di `awaiting_subagents` scrive `completed_at = NOW()` (stato di
+        // riposo), ma il resume ri-porta il run a `running`. Se NON azzerassimo
+        // `completed_at`, un `resume_fanin` che fallisce sul lookup infra DOPO questo
+        // CAS lascerebbe il run `running` con `completed_at` valorizzato -> invisibile
+        // sia al backstop fan-in (cerca `awaiting_subagents`) sia a `reap_stale_runs`
+        // (filtra `completed_at IS NULL`) -> hang fino a restart. Azzerandolo, il
+        // reaper time-gated recupera il run orfano. Sul resume riuscito il finalize
+        // riscrive `completed_at = NOW()`.
+        "UPDATE agent_runs SET status = 'running', completed_at = NULL, updated_at = NOW() \
          WHERE id = $1 AND status = 'awaiting_subagents' RETURNING id",
     )
     .bind(parent_run_id)
