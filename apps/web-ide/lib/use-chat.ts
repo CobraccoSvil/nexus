@@ -20,6 +20,7 @@ import {
   resendChatMessage,
   sendChatMessage,
   subscribeAgentStream,
+  isAgentRunLiveOrWaiting,
   type AgentRunInfo,
   type AgentStep,
   type AITraceEvent,
@@ -772,11 +773,7 @@ export function useChat(
     async (sid: string): Promise<boolean> => {
       try {
         const { activeRun } = await getActiveRunForSession(sid);
-        if (
-          !activeRun ||
-          (activeRun.status !== "running" &&
-            activeRun.status !== "awaiting_confirmation")
-        ) {
+        if (!activeRun || !isAgentRunLiveOrWaiting(activeRun.status)) {
           return false;
         }
         const runId = activeRun.runId;
@@ -1191,7 +1188,7 @@ export function useChat(
     let cancelled = false;
     getActiveRunForSession(sessionId).then(({ activeRun }) => {
       if (cancelled || !activeRun) return;
-      if (activeRun.status !== "running" && activeRun.status !== "awaiting_confirmation") return;
+      if (!isAgentRunLiveOrWaiting(activeRun.status)) return;
       const runId = activeRun.runId;
       setAgentRun(activeRun);
       setAgentSteps(activeRun.steps ?? []);

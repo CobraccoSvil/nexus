@@ -57,7 +57,7 @@ interface AgentRunUsage {
 export interface AgentRunInfo {
   runId: string;
   sessionId: string;
-  status: "running" | "completed" | "awaiting_confirmation" | "failed" | "timed_out" | "cancelled" | "interrupted" | "loop_aborted" | "provider_unavailable" | "completed_verified" | "completed_unverified" | "failed_diagnosed" | "blocked_needs_input";
+  status: "running" | "completed" | "awaiting_confirmation" | "awaiting_subagents" | "failed" | "timed_out" | "cancelled" | "interrupted" | "loop_aborted" | "provider_unavailable" | "completed_verified" | "completed_unverified" | "failed_diagnosed" | "blocked_needs_input";
   automationMode: string;
   provider: string;
   model: string;
@@ -213,9 +213,36 @@ export function isAgentRunTerminal(status: string): boolean {
     status === "failed_diagnosed" ||
     // ADR 0034: blocked_needs_input e' TERMINALE — run CONCLUSO con la
     // dichiarazione "serve input umano"; il prossimo messaggio crea un nuovo
-    // run (solo awaiting_confirmation resta un run sospeso con resume).
+    // run (solo awaiting_confirmation / awaiting_subagents restano run sospesi
+    // con resume, vedi isAgentRunSuspendedWaiting).
     status === "blocked_needs_input"
   );
+}
+
+/** Stati NON-terminali in cui il run e' SOSPESO in attesa che qualcosa accada
+ *  (punto unico regola L). Il run non e' finito: lo stream resta aperto, la
+ *  chat NON deve trattarlo come "run concluso" (niente reset dello stato agente,
+ *  tasto invio coerente col run vivo, reattach su mount/reconnect).
+ *
+ *  - `awaiting_confirmation` (HITL): l'agente aspetta l'approvazione dell'utente
+ *    su azioni pendenti (backend fa resume alla conferma).
+ *  - `awaiting_subagents` (fan-in async): il run PADRE ha dispatchato sub-agent
+ *    in background; il backend lo sospende e lo riprende quando i figli
+ *    completano (flag ora OFF). La UI deve mostrarlo come "in attesa dei
+ *    sub-agent", non come finito. Vedi crates lato backend (agent_runs.status).
+ *
+ *  Entrambi restano fuori da isAgentRunTerminal (corretto): sono stati vivi. */
+export function isAgentRunSuspendedWaiting(status: string): boolean {
+  return status === "awaiting_confirmation" || status === "awaiting_subagents";
+}
+
+/** true se il run tiene la chat "viva" (in esecuzione o sospeso in attesa):
+ *  usato per il reattach al run attivo e per mantenere aperto lo stream/pannello
+ *  step. Punto unico (regola L): sostituisce i confronti duplicati
+ *  `status === "running" || status === "awaiting_confirmation"` sparsi in
+ *  useChat / chat-panel. */
+export function isAgentRunLiveOrWaiting(status: string): boolean {
+  return status === "running" || isAgentRunSuspendedWaiting(status);
 }
 
 /**

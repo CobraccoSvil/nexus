@@ -61,6 +61,7 @@ const EVENT_GLYPH: Record<ActivityEvent["type"], string> = {
   context_overflow: "!",
   folded_tools: "…", // ellissi
   subagent: "◈", // rombo con centro (attivita' delegata)
+  awaiting_subagents: "⧗", // clessidra (attesa fan-in dei sub-agent)
 };
 
 const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
@@ -73,6 +74,7 @@ const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
   context_overflow: "Contesto",
   folded_tools: "Passi",
   subagent: "Subagente",
+  awaiting_subagents: "In attesa",
 };
 
 /** Accent della narrazione sub-agente (viola: attivita' delegata, distinto dal
@@ -630,6 +632,22 @@ function EventBody({
         </div>
       );
     }
+    case "awaiting_subagents":
+      // Attesa fan-in: il run PADRE e' sospeso finche' i sub-agent completano.
+      // NON e' un errore ne' una fine: la narrazione dei figli (subagent)
+      // continua sopra/sotto. Riga sobria col conteggio, se noto.
+      return (
+        <div style={rowStyle}>
+          <span className="nx-as-kind-label" style={kindLabelStyle(SUBAGENT_ACCENT)}>
+            {EVENT_KIND_LABEL.awaiting_subagents}
+          </span>
+          <span style={{ fontSize: 12.5, color: tc.text }}>
+            {typeof event.count === "number" && event.count > 0
+              ? `In attesa di ${event.count} sub-agent in background...`
+              : "In attesa dei sub-agent in background..."}
+          </span>
+        </div>
+      );
     default:
       return null;
   }

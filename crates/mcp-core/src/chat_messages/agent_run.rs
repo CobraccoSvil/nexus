@@ -3761,24 +3761,59 @@ pub(crate) async fn spawn_agent_run(
             .execute(&run_pool)
             .await;
 
-            // ── Terminatore unico dello stream (FIX ordine is_final) ───────────
+            // ── Terminatore dello stream: SOLO per gli stati TERMINALI ─────────
             // Emesso DOPO l'INSERT chat_messages e l'UPDATE agent_runs: quando il
             // frontend riceve `is_final` e rilegge il run dal DB, il record e' gia'
             // persistito (status canonico + final_answer), eliminando la race che
             // poteva forzare status=failed sul retry DB del client. Vale per
             // entrambi i path (loop Python e primario nativo): il blocco e'
-            // condiviso. `is_final` e' idempotente lato UI. La rimozione del canale
-            // segue subito dopo: nessun ulteriore evento va piu' emesso da qui.
-            let _ = tx_for_brain.send(AgentStepEvent {
-                run_id: run_id.to_string(),
-                step: None,
-                trace: None,
-                is_final: true,
-                token_delta: None,
-                thinking_delta: None,
-                meta_step: None,
-            });
-            channels_clone.remove(&run_id);
+            // condiviso. `is_final` e' idempotente lato UI.
+            //
+            // SOSPENSIONE (regola L, gemello di AwaitingConfirmation/HITL): se lo
+            // status e' NON-terminale (punto unico `is_terminal`: `AwaitingSubagents`
+            // per il fan-in background, `AwaitingConfirmation` per l'HITL quando il
+            // nodo che imposta il flag sara' portato al nativo), il run NON e' finito:
+            // e' SOSPESO e riprendera' (worker fan-in / conferma utente). Chiudere lo
+            // stream qui (a) farebbe trattare il run come FINITO al frontend (tasto
+            // invio riabilitato) e (b) rimuovendo il canale spegnerebbe la narrazione
+            // live dei figli background (agganciata al `step_tx` del padre). Quindi
+            // per la sospensione emettiamo un meta step (`is_final=false`) e TENIAMO
+            // il canale aperto — esattamente come l'HITL tiene "in attesa conferma".
+            if status_canonical.is_terminal() {
+                let _ = tx_for_brain.send(AgentStepEvent {
+                    run_id: run_id.to_string(),
+                    step: None,
+                    trace: None,
+                    is_final: true,
+                    token_delta: None,
+                    thinking_delta: None,
+                    meta_step: None,
+                });
+                channels_clone.remove(&run_id);
+            } else if status_canonical == AgentRunStatus::AwaitingSubagents {
+                // Fan-in (Fase D): sospeso in attesa dei figli background. Emette il
+                // meta step con il COUNT dei figli non-terminali; canale PRESERVATO
+                // (la narrazione dei figli continua, il worker fan-in riprendera' il
+                // run). Punto unico `emit_awaiting_subagents_meta`.
+                let pending =
+                    emit_awaiting_subagents_meta(&run_pool, &tx_for_brain, run_id).await;
+                tracing::info!(
+                    target: "mcp_core::fanin",
+                    run_id = %run_id,
+                    pending_background_children = pending,
+                    "fan-in: run padre SOSPESO in awaiting_subagents (stream mantenuto, meta step emesso)"
+                );
+            } else {
+                // Altro stato non-terminale (es. AwaitingConfirmation quando l'HITL
+                // sara' nativo): canale PRESERVATO, nessun is_final. Coerente col
+                // trattamento HITL storico (stream aperto, "in attesa conferma").
+                tracing::info!(
+                    target: "mcp_core::agent_run",
+                    run_id = %run_id,
+                    status = status_str,
+                    "run padre SOSPESO in stato non-terminale (stream mantenuto)"
+                );
+            }
 
             // ── Monitor finale del run (regola H, indipendente dall'LLM) ───────
             // Porta la card `agent_run` allo stato terminale. Non cancelliamo i
@@ -4497,6 +4532,80 @@ pub(crate) async fn confirm_native_run(
     Ok(status)
 }
 
+/// Conta i figli BACKGROUND DIRETTI di `run_id` ancora NON-terminali
+/// (`running`/`paused`) sul pool del progetto (segnale strutturato `status`,
+/// regola M — mai prosa). Correla per `dispatcher_run_id = run_id` (mig project
+/// 0010), come il backstop fan-in e `claim_subagent_fanin_results`: isola i figli
+/// DIRETTI dai nipoti annidati. Best-effort: su errore infra ritorna 0 (il meta
+/// step viene comunque emesso col count noto, non blocca la sospensione).
+async fn count_pending_background_children(proj_pool: &PgPool, run_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM nexus_subagent_runs \
+         WHERE dispatcher_run_id = $1 AND is_background = true \
+           AND status IN ('running', 'paused')",
+    )
+    .bind(run_id)
+    .fetch_one(proj_pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "mcp_core::fanin",
+            run_id = %run_id,
+            error = %e,
+            "fan-in: COUNT figli background pendenti fallita (uso 0 nel meta step)"
+        );
+        0
+    })
+}
+
+/// PUNTO UNICO (regola L) dell'evento SSE di SOSPENSIONE di un run non-terminale
+/// (`AwaitingSubagents` fan-in, e per parita' `AwaitingConfirmation` HITL quando
+/// il nodo che imposta il flag sara' portato al nativo). GEMELLO del terminatore
+/// `is_final=true`, ma per la sospensione: NON chiude lo stream e NON rimuove il
+/// canale broadcast (a differenza del finalize terminale), cosi' (a) il frontend
+/// tiene aperto lo stream e mostra "sospeso in attesa di N sub-agent" invece di
+/// riabilitare il tasto invio come su un run FINITO; (b) la narrazione live dei
+/// figli background — gia' collegata via il `step_tx` del padre — continua ad
+/// arrivare. Emette un `AgentMetaStep` con `is_final=false`.
+///
+/// CONTRATTO SSE (consumato dal frontend, NON cambiare senza aggiornare il web-ide):
+///   kind = "awaiting_subagents"
+///   title = "In attesa di N sub-agent"
+///   payload = { "status": "awaiting_subagents", "pending_count": <i64>,
+///               "run_id": "<uuid>" }
+/// `pending_count` = numero di figli background DIRETTI ancora non-terminali
+/// (`running`/`paused`), segnale strutturato (regola M), mai dedotto da prosa.
+/// Ritorna il `pending_count` emesso (per log/test).
+async fn emit_awaiting_subagents_meta(
+    proj_pool: &PgPool,
+    tx: &tokio::sync::broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+) -> i64 {
+    let pending = count_pending_background_children(proj_pool, run_id).await;
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        // NON terminale: lo stream resta aperto (gemello di AwaitingConfirmation,
+        // non del finalize). Il canale NON viene rimosso dal chiamante.
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "awaiting_subagents".to_string(),
+            title: format!("In attesa di {pending} sub-agent"),
+            payload: serde_json::json!({
+                "status": "awaiting_subagents",
+                "pending_count": pending,
+                "run_id": run_id.to_string(),
+            }),
+            correlation_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }),
+    });
+    pending
+}
+
 /// Risultati strutturati dei figli BACKGROUND di un parent, nella STESSA forma
 /// del tool_result di `nexus_subagent_poll` (regola L): un `Value` per figlio
 /// con `{subagent_run_id, kind, status, summary, outcome}`. `outcome` e' il
@@ -4721,18 +4830,42 @@ pub(crate) async fn resume_fanin(
         }
     };
 
-    // is_final sul canale SSE: sblocca i client agganciati (terminale o nuovo
-    // awaiting_subagents). Best-effort: nessun subscriber -> ignorato.
-    let _ = tx.send(AgentStepEvent {
-        run_id: parent_run_id.to_string(),
-        step: None,
-        trace: None,
-        is_final: true,
-        token_delta: None,
-        thinking_delta: None,
-        meta_step: None,
-    });
-    state.agent_channels.remove(&parent_run_id);
+    // SOSPENSIONE vs TERMINE (regola L, stesso trattamento del finalize del run
+    // principale): il resume fan-in puo' RI-sospendere il padre su una 2a ondata di
+    // figli background (`AwaitingSubagents`). In quel caso il run NON e' finito:
+    // NON emettere `is_final=true` e NON rimuovere il canale (spegnerebbe la
+    // narrazione della 2a ondata e farebbe trattare il run come concluso), ma
+    // emettere il meta step di sospensione col nuovo COUNT (punto unico
+    // `emit_awaiting_subagents_meta`). I figli della 2a ondata accoderanno una riga
+    // fresca al loro completamento -> il worker riprende di nuovo. Solo sugli stati
+    // terminali si chiude lo stream.
+    if status.is_terminal() {
+        let _ = tx.send(AgentStepEvent {
+            run_id: parent_run_id.to_string(),
+            step: None,
+            trace: None,
+            is_final: true,
+            token_delta: None,
+            thinking_delta: None,
+            meta_step: None,
+        });
+        state.agent_channels.remove(&parent_run_id);
+    } else if status == AgentRunStatus::AwaitingSubagents {
+        let pending = emit_awaiting_subagents_meta(&cn_pool, &tx, parent_run_id).await;
+        tracing::info!(
+            target: "mcp_core::fanin",
+            run_id = %parent_run_id,
+            pending_background_children = pending,
+            "fan-in: run padre RI-SOSPESO in awaiting_subagents dopo resume (2a ondata, stream mantenuto)"
+        );
+    } else {
+        tracing::info!(
+            target: "mcp_core::agent_run",
+            run_id = %parent_run_id,
+            status = status.as_str(),
+            "resume_fanin: run padre SOSPESO in stato non-terminale (stream mantenuto)"
+        );
+    }
 
     Ok(status)
 }
