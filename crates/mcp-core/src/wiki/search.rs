@@ -56,9 +56,72 @@ fn err400<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, format!("{e}"))
 }
 
+/// Clause di uguaglianza esatta su un campo payload (`key == value`).
+/// Punto unico della forma verbosa Qdrant, riusato dagli helper di filtro.
+fn eq_clause(key: &str, value: &str) -> Value {
+    json!({ "key": key, "match": { "value": value } })
+}
+
+/// Clause di scope in base allo scope richiesto e al cross-scope.
+/// Ritorna `None` per `scope=all` (nessun vincolo di scope). Da non confondere
+/// con `WikiAcl::scope_clause`, che genera la clausola SQL di ACL.
+fn scope_match_clause(scope: Option<WikiScope>, include_cross_scope: bool) -> Option<Value> {
+    // Scope: se richiesto progetto e cross-scope, ammettiamo meta+project; se
+    // solo scope=project senza cross-scope, ammettiamo solo project; idem per
+    // scope=meta (cross-scope ignorato per scope=meta perche' non ha senso).
+    match scope {
+        Some(WikiScope::Meta) => Some(eq_clause("scope", "meta")),
+        Some(WikiScope::Project) if include_cross_scope => Some(json!({
+            "should": [
+                eq_clause("scope", "project"),
+                eq_clause("scope", "meta"),
+            ]
+        })),
+        Some(WikiScope::Project) => Some(eq_clause("scope", "project")),
+        None => None,
+    }
+}
+
+/// Clause sul `project_id`. In modalita' cross-scope su `scope=project` il
+/// match esatto escluderebbe i meta-doc (project_id null), quindi ammettiamo
+/// anche i meta con un `should`.
+fn project_clause(pid: Uuid, scope: Option<WikiScope>, include_cross_scope: bool) -> Value {
+    let is_cross_project = include_cross_scope && matches!(scope, Some(WikiScope::Project));
+    if is_cross_project {
+        json!({
+            "should": [
+                eq_clause("project_id", &pid.to_string()),
+                eq_clause("scope", "meta"),
+            ]
+        })
+    } else {
+        eq_clause("project_id", &pid.to_string())
+    }
+}
+
+/// Clause sui `kind` richiesti: almeno uno deve corrispondere (`should`).
+/// Ritorna `None` se la lista e' assente o vuota.
+fn kind_clause(filter: &SearchFilter) -> Option<Value> {
+    let kinds = filter.kind.as_ref().filter(|v| !v.is_empty())?;
+    let should: Vec<Value> = kinds.iter().map(|k| eq_clause("kind", k)).collect();
+    Some(json!({ "should": should }))
+}
+
+/// Clause sui `tags` richiesti: ogni tag deve comparire (AND, un clause per
+/// tag). Qdrant tratta il payload array come "qualunque elemento corrisponde".
+fn tag_clauses(filter: &SearchFilter) -> Vec<Value> {
+    filter
+        .tags
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|tags| tags.iter().map(|t| eq_clause("tags", t)).collect())
+        .unwrap_or_default()
+}
+
 /// Costruisce il filtro Qdrant a partire dalla richiesta.
 /// I match sono `must` (AND); per gli scope multipli (es. cross-scope) usiamo
-/// `should` annidato dentro un `must` separato.
+/// `should` annidato dentro un `must` separato. Delega la costruzione dei
+/// singoli clause a helper coesi.
 fn build_qdrant_filter(
     scope: Option<WikiScope>,
     project_id: Option<Uuid>,
@@ -67,72 +130,16 @@ fn build_qdrant_filter(
 ) -> Option<Value> {
     let mut must: Vec<Value> = Vec::new();
 
-    // Scope: se richiesto progetto e cross-scope, ammettiamo meta+project; se
-    // solo scope=project senza cross-scope, ammettiamo solo project; idem per
-    // scope=meta (cross-scope ignorato per scope=meta perche' non ha senso).
-    match scope {
-        Some(WikiScope::Meta) => {
-            must.push(json!({
-                "key": "scope",
-                "match": { "value": "meta" }
-            }));
-        }
-        Some(WikiScope::Project) => {
-            if include_cross_scope {
-                must.push(json!({
-                    "should": [
-                        { "key": "scope", "match": { "value": "project" } },
-                        { "key": "scope", "match": { "value": "meta" } },
-                    ]
-                }));
-            } else {
-                must.push(json!({
-                    "key": "scope",
-                    "match": { "value": "project" }
-                }));
-            }
-        }
-        None => {}
+    if let Some(clause) = scope_match_clause(scope, include_cross_scope) {
+        must.push(clause);
     }
-
     if let Some(pid) = project_id {
-        // Quando include_cross_scope=true il match esatto su project_id
-        // escluderebbe i meta-doc (che hanno project_id null). Per cui in
-        // quella modalita' usiamo `should`: o e' del progetto, o e' meta.
-        if include_cross_scope && matches!(scope, Some(WikiScope::Project)) {
-            must.push(json!({
-                "should": [
-                    { "key": "project_id", "match": { "value": pid.to_string() } },
-                    { "key": "scope", "match": { "value": "meta" } },
-                ]
-            }));
-        } else {
-            must.push(json!({
-                "key": "project_id",
-                "match": { "value": pid.to_string() }
-            }));
-        }
+        must.push(project_clause(pid, scope, include_cross_scope));
     }
-
-    if let Some(kinds) = filter.kind.as_ref().filter(|v| !v.is_empty()) {
-        let should: Vec<Value> = kinds
-            .iter()
-            .map(|k| json!({ "key": "kind", "match": { "value": k } }))
-            .collect();
-        must.push(json!({ "should": should }));
+    if let Some(clause) = kind_clause(filter) {
+        must.push(clause);
     }
-
-    if let Some(tags) = filter.tags.as_ref().filter(|v| !v.is_empty()) {
-        // Qdrant match su array payload: usiamo `match: { value }` su `tags`,
-        // Qdrant considera l'array come "qualunque elemento corrisponde".
-        // Tutti i tag richiesti devono comparire (AND).
-        for t in tags {
-            must.push(json!({
-                "key": "tags",
-                "match": { "value": t }
-            }));
-        }
-    }
+    must.extend(tag_clauses(filter));
 
     if must.is_empty() {
         None
@@ -179,32 +186,39 @@ fn make_snippet(body: &str, q: &str) -> String {
     }
 }
 
-/// `POST /api/wiki/search`
-pub async fn search(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Json(body): Json<SearchBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let acl = WikiAcl::from_claims(&state.wiki_deps(), &claims)
-        .await
-        .map_err(err500)?;
+/// Parametri normalizzati della richiesta di ricerca, gia' validati e con i
+/// default applicati. Estratto da [`SearchBody`] per tenere `search` snella.
+struct SearchParams {
+    scope: Option<WikiScope>,
+    limit: i64,
+    min_score: f64,
+    include_cross_scope: bool,
+    filter: SearchFilter,
+}
 
-    let q = body.q.trim();
-    if q.is_empty() {
-        return Err(err400("query 'q' vuota"));
-    }
+/// Valida e normalizza i parametri della richiesta (scope, clamp di limit e
+/// min_score, default). Ritorna 400 su scope invalido.
+fn parse_search_params(body: &mut SearchBody) -> Result<SearchParams, (StatusCode, String)> {
     let scope: Option<WikiScope> = match body.scope.as_deref() {
         None | Some("") | Some("all") => None,
         Some(raw) => Some(WikiScope::parse(raw).ok_or_else(|| err400("scope invalido"))?),
     };
-    let limit = body.limit.unwrap_or(20).clamp(1, 100);
-    let min_score = body.min_score.unwrap_or(0.55).clamp(0.0, 1.0);
-    let include_cross_scope = body.include_cross_scope.unwrap_or(false);
-    let filter = body.filter.unwrap_or_default();
+    Ok(SearchParams {
+        scope,
+        limit: body.limit.unwrap_or(20).clamp(1, 100),
+        min_score: body.min_score.unwrap_or(0.55).clamp(0.0, 1.0),
+        include_cross_scope: body.include_cross_scope.unwrap_or(false),
+        filter: std::mem::take(&mut body.filter).unwrap_or_default(),
+    })
+}
 
-    // ── Embed ─────────────────────────────────────────────────────────────
+/// Embed del testo di query (troncato a 2000 char). 503 se l'embedder e' giu'.
+async fn embed_query(
+    state: &AppState,
+    q: &str,
+) -> Result<Vec<f32>, (StatusCode, String)> {
     let embed_text = if q.len() > 2000 { &q[..2000] } else { q };
-    let vector = state
+    state
         .orchestrator
         .neural
         .embed_text("", embed_text)
@@ -214,48 +228,17 @@ pub async fn search(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("embed fallito: {e}"),
             )
-        })?;
+        })
+}
 
-    // ── Qdrant search con filtro payload ──────────────────────────────────
-    let qfilter = build_qdrant_filter(scope, body.project_id, include_cross_scope, &filter);
-    // top_k margine: chiediamo `limit * 3` per dare spazio al filtro ACL
-    // (qualche hit potrebbe non essere visibile e va scartato).
-    let top_k_qdrant = ((limit as usize).saturating_mul(3)).clamp(10, 300);
-
-    let hits = crate::vector_memory::search_wiki_content_points_filtered(
-        &state.db,
-        vector,
-        top_k_qdrant,
-        min_score,
-        qfilter,
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("qdrant search: {e}"),
-        )
-    })?;
-
-    if hits.is_empty() {
-        return Ok(Json(json!({
-            "results": Vec::<Value>::new(),
-            "total_returned": 0,
-        })));
-    }
-
-    // ── Risolve hit -> Postgres con ACL clause ────────────────────────────
-    let ids: Vec<Uuid> = hits
-        .iter()
-        .filter_map(|h| h.point_id.parse::<Uuid>().ok())
-        .collect();
-    if ids.is_empty() {
-        return Ok(Json(json!({
-            "results": Vec::<Value>::new(),
-            "total_returned": 0,
-        })));
-    }
-
+/// Risolve gli `id` degli hit Qdrant in `WikiDoc` visibili all'utente,
+/// applicando la clausola ACL come filtro SQL. La visibilita' e' determinata
+/// qui: gli hit non visibili semplicemente non tornano dalla query.
+async fn resolve_visible_docs(
+    state: &AppState,
+    acl: &WikiAcl,
+    ids: &[Uuid],
+) -> Result<Vec<WikiDoc>, (StatusCode, String)> {
     let (acl_clause, acl_projects) = acl.scope_clause(1);
     let acl_param_used = !acl_projects.is_empty();
     // L'ids placeholder e' $2 se ACL bind usato, altrimenti $1.
@@ -269,16 +252,25 @@ pub async fn search(
     if acl_param_used {
         query = query.bind(acl_projects.clone());
     }
-    query = query.bind(&ids);
-    let docs = query.fetch_all(&state.db).await.map_err(err500)?;
+    query = query.bind(ids);
+    query.fetch_all(&state.db).await.map_err(err500)
+}
 
-    // ── Re-order by score (hits e' gia' in ordine di score) ───────────────
+/// Compone i risultati finali preservando l'ordine di score degli hit Qdrant
+/// (che sono gia' ordinati). Gli hit non presenti fra i doc visibili (scartati
+/// dall'ACL) vengono saltati in silenzio.
+fn build_results(
+    hits: Vec<crate::vector_memory::VectorPointHit>,
+    docs: Vec<WikiDoc>,
+    q: &str,
+    limit: usize,
+) -> Vec<Value> {
     let mut doc_by_id: std::collections::HashMap<Uuid, WikiDoc> =
         docs.into_iter().map(|d| (d.id, d)).collect();
 
-    let mut results: Vec<Value> = Vec::with_capacity(limit as usize);
+    let mut results: Vec<Value> = Vec::with_capacity(limit);
     for hit in hits.into_iter() {
-        if results.len() >= limit as usize {
+        if results.len() >= limit {
             break;
         }
         let Some(id) = hit.point_id.parse::<Uuid>().ok() else {
@@ -295,17 +287,89 @@ pub async fn search(
             "snippet": snippet,
         }));
     }
+    results
+}
+
+/// Risposta con lista vuota (nessun hit o nessun id valido), riusata dagli
+/// early-return di `search`.
+fn empty_results() -> Json<Value> {
+    Json(json!({
+        "results": Vec::<Value>::new(),
+        "total_returned": 0,
+    }))
+}
+
+/// `POST /api/wiki/search`
+pub async fn search(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(mut body): Json<SearchBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let acl = WikiAcl::from_claims(&state.wiki_deps(), &claims)
+        .await
+        .map_err(err500)?;
+
+    let q = body.q.trim().to_string();
+    if q.is_empty() {
+        return Err(err400("query 'q' vuota"));
+    }
+    let project_id = body.project_id;
+    let params = parse_search_params(&mut body)?;
+
+    let vector = embed_query(&state, &q).await?;
+
+    // ── Qdrant search con filtro payload ──────────────────────────────────
+    let qfilter = build_qdrant_filter(
+        params.scope,
+        project_id,
+        params.include_cross_scope,
+        &params.filter,
+    );
+    // top_k margine: chiediamo `limit * 3` per dare spazio al filtro ACL
+    // (qualche hit potrebbe non essere visibile e va scartato).
+    let top_k_qdrant = ((params.limit as usize).saturating_mul(3)).clamp(10, 300);
+
+    let hits = crate::vector_memory::search_wiki_content_points_filtered(
+        &state.db,
+        vector,
+        top_k_qdrant,
+        params.min_score,
+        qfilter,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("qdrant search: {e}"),
+        )
+    })?;
+
+    if hits.is_empty() {
+        return Ok(empty_results());
+    }
+
+    // ── Risolve hit -> Postgres con ACL clause ────────────────────────────
+    let ids: Vec<Uuid> = hits
+        .iter()
+        .filter_map(|h| h.point_id.parse::<Uuid>().ok())
+        .collect();
+    if ids.is_empty() {
+        return Ok(empty_results());
+    }
+
+    let docs = resolve_visible_docs(&state, &acl, &ids).await?;
+    let results = build_results(hits, docs, &q, params.limit as usize);
 
     let total_returned = results.len();
     Ok(Json(json!({
         "results": results,
         "total_returned": total_returned,
         "filters": {
-            "scope": scope.map(|s| s.as_str()),
-            "project_id": body.project_id,
-            "limit": limit,
-            "min_score": min_score,
-            "include_cross_scope": include_cross_scope,
+            "scope": params.scope.map(|s| s.as_str()),
+            "project_id": project_id,
+            "limit": params.limit,
+            "min_score": params.min_score,
+            "include_cross_scope": params.include_cross_scope,
         }
     })))
 }
