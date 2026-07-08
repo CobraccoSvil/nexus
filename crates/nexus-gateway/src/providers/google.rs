@@ -337,11 +337,20 @@ impl GoogleProvider {
     }
 
     /// Lista ORDINATA delle region da provare per un modello sul backend Vertex
-    /// (mig 0476): se la cache conosce gia' una region funzionante per quel
-    /// modello la usa da sola; altrimenti restituisce tutte le `discovery_locations`
-    /// nell'ordine di preferenza. Per il backend Gemini ritorna `None` (nessuna
-    /// region: si invia una volta sola sull'endpoint API key).
-    fn vertex_regions_for_model(&self, backend: &GoogleBackend, model: &str) -> Option<Vec<String>> {
+    /// (mig 0476 + 0545). Punto unico che decide l'ordine region (regola L):
+    ///   1. cache in-memory HIT -> usa quella region da sola (fast path, no DB);
+    ///   2. MISS -> legge la region persistita nel catalog (mig 0545, regola G:
+    ///      cache DB-driven) e, se ancora valida, la mette PER PRIMA con le altre
+    ///      `discovery_locations` come fallback (vedi [`order_regions_with_probed`]);
+    ///      popola anche la cache in-memory per non ri-leggere il DB entro il TTL;
+    ///   3. nessuna region persistita -> tutte le `discovery_locations` in ordine.
+    /// Per il backend Gemini ritorna `None` (nessuna region: si invia una volta
+    /// sola sull'endpoint API key).
+    async fn vertex_regions_for_model(
+        &self,
+        backend: &GoogleBackend,
+        model: &str,
+    ) -> Option<Vec<String>> {
         let GoogleBackend::Vertex {
             discovery_locations,
             ..
@@ -352,7 +361,20 @@ impl GoogleProvider {
         if let Some(cached) = self.vertex_model_region.get(model) {
             return Some(vec![cached]);
         }
-        Some(discovery_locations.clone())
+        // MISS in-memory: recupera la region persistita (sopravvive ai restart) e
+        // mettila per prima. La cache in-memory viene popolata cosi' le richieste
+        // successive entro il TTL non ri-leggono il DB; resta comunque validata dal
+        // fallback del loop se nel frattempo desse 404 (send_across_regions la
+        // sovrascrive con la region che funziona davvero, e ne persiste il cambio).
+        let probed = self.read_probed_region(model).await;
+        if let Some(region) = probed.as_deref() {
+            self.vertex_model_region
+                .insert(model.to_string(), region.to_string());
+        }
+        Some(order_regions_with_probed(
+            probed.as_deref(),
+            discovery_locations,
+        ))
     }
 
     /// Invia la richiesta con FALLBACK di region per il backend Vertex (mig 0476).
@@ -380,7 +402,7 @@ impl GoogleProvider {
         stream: bool,
         body: &GenerateContentRequest,
     ) -> anyhow::Result<reqwest::Response> {
-        let Some(regions) = self.vertex_regions_for_model(backend, model) else {
+        let Some(regions) = self.vertex_regions_for_model(backend, model).await else {
             // Backend Gemini: nessuna region, un solo invio.
             return self.post_body_in_region(backend, "", model, stream, body).await;
         };
@@ -436,10 +458,20 @@ impl GoogleProvider {
                 }
                 Ok(r) => {
                     // Primo status non-404: questa risposta vince. Se 2xx, cacha la
-                    // region cosi' le richieste successive saltano direttamente qui.
+                    // region (in-memory + DB) cosi' le richieste successive, ANCHE
+                    // dopo un restart del gateway, saltano direttamente qui.
                     if r.status().is_success() {
+                        let region_changed =
+                            self.vertex_model_region.get(model).as_deref() != Some(region.as_str());
                         self.vertex_model_region
                             .insert(model.to_string(), region.clone());
+                        // Persisti SOLO al cambio region: evita un round-trip DB a
+                        // ogni richiesta (la cache in-memory gia' converge). La
+                        // scrittura e' best-effort FAIL-OPEN (regola H): un errore
+                        // di persistenza non tocca l'inference gia' riuscita.
+                        if region_changed {
+                            self.persist_probed_region(model, region).await;
+                        }
                     }
                     return Ok(r);
                 }
@@ -461,6 +493,62 @@ impl GoogleProvider {
         match last {
             Some(r) => r,
             None => anyhow::bail!("vertex: nessuna region candidata per il modello {model}"),
+        }
+    }
+
+    /// Legge dal catalog la region Vertex confermata per il modello (mig 0545,
+    /// regola G: cache DB-driven). Best-effort FAIL-OPEN (regola H): assenza di
+    /// pool o qualunque errore DB ritorna `None` e il chiamante ricade sul
+    /// fallback multi-region — l'inference non si rompe mai per la persistenza.
+    /// Bind parametrico (regola M/G): niente interpolazione della stringa modello.
+    async fn read_probed_region(&self, model: &str) -> Option<String> {
+        let db = self.db.as_ref()?;
+        match sqlx::query_scalar::<_, Option<String>>(
+            "SELECT vertex_probed_region FROM ai_price_catalog \
+             WHERE provider = 'google' AND model = $1",
+        )
+        .bind(model)
+        .fetch_optional(db)
+        .await
+        {
+            Ok(row) => row.flatten(),
+            Err(e) => {
+                tracing::warn!(
+                    model = %model,
+                    error = %e,
+                    "vertex: lettura vertex_probed_region fallita, uso fallback multi-region"
+                );
+                None
+            }
+        }
+    }
+
+    /// Persiste nel catalog la region Vertex confermata per il modello (mig 0545,
+    /// regola G). Best-effort FAIL-OPEN (regola H): un errore di persistenza NON
+    /// deve rompere l'inference gia' riuscita — si logga WARN e si prosegue. La
+    /// clausola `IS DISTINCT FROM` rende la UPDATE un no-op se la region non e'
+    /// cambiata (guardia contro scritture concorrenti ridondanti). Bind
+    /// parametrico (regola M/G): niente interpolazione. Chiamata SOLO per il
+    /// backend Vertex (dal loop di [`send_across_regions`]), mai per Gemini.
+    async fn persist_probed_region(&self, model: &str, region: &str) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        if let Err(e) = sqlx::query(
+            "UPDATE ai_price_catalog SET vertex_probed_region = $1, updated_at = NOW() \
+             WHERE provider = 'google' AND model = $2 AND vertex_probed_region IS DISTINCT FROM $1",
+        )
+        .bind(region)
+        .bind(model)
+        .execute(db)
+        .await
+        {
+            tracing::warn!(
+                model = %model,
+                region = %region,
+                error = %e,
+                "vertex: persistenza vertex_probed_region fallita (best-effort, inference ok)"
+            );
         }
     }
 
@@ -1266,6 +1354,31 @@ fn build_discovery_locations(csv: &str, location: &str) -> Vec<String> {
         out.push(VERTEX_DEFAULT_LOCATION.to_string());
     }
     out
+}
+
+/// Compone l'ordine delle region Vertex da provare per un modello, data la
+/// region eventualmente persistita nel catalog (mig 0545). Funzione PURA (regola
+/// L: UN solo punto che decide l'ordine region, testabile senza DB): se `probed`
+/// e' presente ED e' ancora fra le `discovery_locations`, va provata PER PRIMA,
+/// seguita dalle altre come fallback (cosi' se nel frattempo desse 404 il loop
+/// prova comunque le altre). Se `probed` e' `None` o non piu' fra le candidate
+/// (robustezza: region rimossa dal deploy) viene ignorata e si torna alle
+/// `discovery_locations` nell'ordine di preferenza.
+fn order_regions_with_probed(probed: Option<&str>, discovery_locations: &[String]) -> Vec<String> {
+    match probed {
+        Some(p) if discovery_locations.iter().any(|r| r == p) => {
+            let mut ordered = Vec::with_capacity(discovery_locations.len());
+            ordered.push(p.to_string());
+            ordered.extend(
+                discovery_locations
+                    .iter()
+                    .filter(|r| r.as_str() != p)
+                    .cloned(),
+            );
+            ordered
+        }
+        _ => discovery_locations.to_vec(),
+    }
 }
 
 /// Dimensione pagina per la Gemini API `models.list` (`pageSize`): massimo
@@ -3785,8 +3898,9 @@ mod tests {
         let decls = &json["tools"][0]["functionDeclarations"];
         assert_eq!(decls[0]["name"], "read_file");
         assert_eq!(decls[0]["description"], "legge un file");
-        assert_eq!(decls[0]["parameters"]["type"], "object");
-        assert_eq!(decls[0]["parameters"]["properties"]["path"]["type"], "string");
+        // `type` normalizzato a UPPERCASE per Gemini functionDeclarations (fix 2774928f).
+        assert_eq!(decls[0]["parameters"]["type"], "OBJECT");
+        assert_eq!(decls[0]["parameters"]["properties"]["path"]["type"], "STRING");
     }
 
     #[test]
@@ -3800,15 +3914,15 @@ mod tests {
         assert!(params.get("$schema").is_none());
         assert!(params.get("title").is_none());
         assert!(params.get("additionalProperties").is_none());
-        // Property annidata ripulita (title/default rimossi, type preservato).
+        // Property annidata ripulita (title/default rimossi, type UPPERCASE 2774928f).
         let path = &params["properties"]["path"];
-        assert_eq!(path["type"], "string");
+        assert_eq!(path["type"], "STRING");
         assert!(path.get("title").is_none());
         assert!(path.get("default").is_none());
         // items annidato in array ripulito.
         let nested = &params["properties"]["lines"]["items"];
         assert!(nested.get("additionalProperties").is_none());
-        assert_eq!(nested["properties"]["n"]["type"], "integer");
+        assert_eq!(nested["properties"]["n"]["type"], "INTEGER");
         // required (vocabolario supportato) preservato.
         assert_eq!(params["required"][0], "path");
     }
@@ -4107,18 +4221,59 @@ mod tests {
     }
 
     #[test]
-    fn vertex_regions_gemini_ritorna_none() {
+    fn order_regions_probed_valida_messa_per_prima() {
+        // Region persistita valida (fra le candidate) -> per prima, il resto come
+        // fallback con l'ordine relativo preservato.
+        let discovery = vec![
+            "europe-west4".to_string(),
+            "global".to_string(),
+            "us-central1".to_string(),
+        ];
+        let ordered = order_regions_with_probed(Some("global"), &discovery);
+        assert_eq!(ordered, vec!["global", "europe-west4", "us-central1"]);
+    }
+
+    #[test]
+    fn order_regions_probed_gia_in_testa_e_idempotente() {
+        // Region persistita gia' prima candidata: nessun cambiamento d'ordine.
+        let discovery = vec!["europe-west4".to_string(), "global".to_string()];
+        let ordered = order_regions_with_probed(Some("europe-west4"), &discovery);
+        assert_eq!(ordered, vec!["europe-west4", "global"]);
+    }
+
+    #[test]
+    fn order_regions_probed_non_candidata_ignorata() {
+        // Region persistita non piu' fra le discovery_locations (es. rimossa dal
+        // deploy): ignorata, si torna all'ordine di preferenza.
+        let discovery = vec!["europe-west4".to_string(), "global".to_string()];
+        let ordered = order_regions_with_probed(Some("asia-east1"), &discovery);
+        assert_eq!(ordered, vec!["europe-west4", "global"]);
+    }
+
+    #[test]
+    fn order_regions_probed_assente_usa_discovery() {
+        // Nessuna region persistita -> discovery_locations intatte, in ordine.
+        let discovery = vec!["europe-west4".to_string(), "global".to_string()];
+        let ordered = order_regions_with_probed(None, &discovery);
+        assert_eq!(ordered, discovery);
+    }
+
+    #[tokio::test]
+    async fn vertex_regions_gemini_ritorna_none() {
         // Backend Gemini: nessuna region -> None (invio singolo su API key).
         let p = GoogleProvider::new(Client::new(), "k", None);
         assert!(p
             .vertex_regions_for_model(&GoogleBackend::Gemini, "gemini-x")
+            .await
             .is_none());
     }
 
-    #[test]
-    fn vertex_regions_usa_cache_se_presente() {
+    #[tokio::test]
+    async fn vertex_regions_usa_cache_se_presente() {
         // Se la cache conosce una region per il modello, e' l'unica provata
-        // (le richieste successive saltano il fallback 404).
+        // (le richieste successive saltano il fallback 404). Senza `db` la
+        // lettura persistita e' un no-op (FAIL-OPEN), quindi resta l'ordine di
+        // discovery: il comportamento del path senza DB e' invariato.
         let p = GoogleProvider::new(Client::new(), "k", None);
         let backend = GoogleBackend::Vertex {
             project: "proj".to_string(),
@@ -4131,6 +4286,7 @@ mod tests {
         // Prima del cache hit: tutte le region candidate, in ordine.
         let before = p
             .vertex_regions_for_model(&backend, "gemini-3.5-flash")
+            .await
             .unwrap();
         assert_eq!(before, vec!["europe-west4", "global"]);
         // Dopo aver cachato 'global' per quel modello: solo 'global'.
@@ -4138,10 +4294,14 @@ mod tests {
             .insert("gemini-3.5-flash".to_string(), "global".to_string());
         let after = p
             .vertex_regions_for_model(&backend, "gemini-3.5-flash")
+            .await
             .unwrap();
         assert_eq!(after, vec!["global"]);
         // Un modello diverso resta sull'ordine di discovery completo.
-        let other = p.vertex_regions_for_model(&backend, "gemini-2.5-pro").unwrap();
+        let other = p
+            .vertex_regions_for_model(&backend, "gemini-2.5-pro")
+            .await
+            .unwrap();
         assert_eq!(other, vec!["europe-west4", "global"]);
     }
 
