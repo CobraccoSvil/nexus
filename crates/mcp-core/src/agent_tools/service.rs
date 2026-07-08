@@ -385,6 +385,23 @@ async fn register_detected_port(
     port: i32,
     pid: Option<i32>,
 ) {
+    // Solo porte del range Nexus (20000-39999): l'output di un servizio puo'
+    // menzionare una porta a cui si CONNETTE (es. Postgres :5434), non su cui
+    // ASCOLTA. Registrarla creerebbe una "porta fantasma" fuori dallo scope del
+    // progetto (regola H: chiusura alla fonte, coerente con port_allocated_to_project
+    // che onora fuori-bucket solo le `manual`).
+    let (lo, hi) = (
+        crate::project_workspace::services::PROJECT_PORT_RANGE_START as i32,
+        crate::project_workspace::services::PROJECT_PORT_RANGE_END as i32,
+    );
+    if !(lo..=hi).contains(&port) {
+        tracing::debug!(
+            port,
+            service = %label,
+            "porta rilevata dall'output fuori dal range Nexus: non registrata (probabile connessione, non listener)"
+        );
+        return;
+    }
     let _ = sqlx::query(
         "INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode) \
          VALUES ($1, $2, $3, 'auto') ON CONFLICT (port) DO UPDATE SET \

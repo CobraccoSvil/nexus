@@ -52,6 +52,15 @@ pub fn similar_service_labels(a: &str, b: &str) -> bool {
         || !significant_service_words(a).is_disjoint(&significant_service_words(b))
 }
 
+/// PUNTO UNICO (regola L): numero di parole significative in comune tra due
+/// label. Serve a disambiguare in modo DETERMINISTICO un match ambiguo
+/// (preferire il candidato che condivide piu' scopo con la label di riferimento).
+pub fn shared_significant_words(a: &str, b: &str) -> usize {
+    significant_service_words(a)
+        .intersection(&significant_service_words(b))
+        .count()
+}
+
 /// PUNTO UNICO (regola L): ferma i processi `kind='service'` running/starting
 /// del progetto la cui label indica lo stesso servizio di `label`. Da chiamare
 /// PRIMA di ogni spawn di un servizio, da QUALUNQUE call site (tool agente

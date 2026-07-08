@@ -1455,10 +1455,10 @@ pub async fn cleanup_project_ports(
 
     // Rilascia (DB + cache registry) le allocazioni delle porte EFFETTIVAMENTE
     // liberate, tramite il punto unico PortRegistryCache::release (regola L).
-    // Senza, get_project_ports (che mostra anche nexus_port_allocations) le
-    // continuava a elencare con live=false dopo il kill: dal pannello sembrava
-    // "il reset non aggiorna nulla". NON tocca le porte "skipped" (servizi del
-    // progetto / infrastruttura protetta), che non vengono killate.
+    // Senza, la sezione "Porte allocate" (nexus_port_allocations) continuava a
+    // elencarle dopo il kill: dal pannello sembrava "il reset non aggiorna nulla".
+    // NON tocca le porte "skipped" (servizi del progetto / infrastruttura
+    // protetta), che non vengono killate.
     for entry in &killed {
         if let Some(p) = entry.get("port").and_then(|v| v.as_u64()) {
             let _ = state.port_registry.release(p as u16).await;
@@ -1484,60 +1484,38 @@ pub async fn get_project_ports(
     let project_root = context.root_path.to_string_lossy().to_string();
     let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
 
-    // Fix M37: il pannello "Porte" mostrava "Nessuna porta rilevata" anche
-    // quando nexus_port_allocations conteneva 2+ porte (backend-dev, frontend-dev)
-    // perche' detect_project_ports cercava solo porte LIVE (processi attivi + ss).
-    // Ora prima leggiamo le allocazioni in DB, poi aggiungiamo le porte live
-    // marcandole con `live=true`. Cosi' l'utente vede TUTTE le porte gestite dal
-    // progetto, anche se backend/frontend non sono attualmente avviati.
+    // Storico: il Fix M37 iniettava anche le allocazioni non-live per non mostrare
+    // "Nessuna porta rilevata"; il FIX 3b (scelta utente) ha RIMOSSO quell'iniezione
+    // -> vedi il contratto attuale sotto. NON reintrodurre l'injection delle riserve.
     let mut ports = detect_project_ports(&project_root, &slug, project_id, &state.db).await;
-    let live_ports: std::collections::HashSet<i32> = ports
-        .iter()
-        .filter_map(|p| p.get("port").and_then(|v| v.as_i64()).map(|n| n as i32))
-        .collect();
 
-    // Marca le live come live=true (le esistenti sono live)
+    // Il pannello "Porte" mostra SOLO le porte realmente in ascolto (probe live).
+    // Le allocazioni-riserva (servizio configurato ma FERMO) NON compaiono qui:
+    // vivono nella sezione "Porte allocate" del pannello Run & Debug (endpoint
+    // /port-allocations, fonte port_registry). Mostrare le riserve mescolate alle
+    // live confondeva ("porte strane che non puntano ai servizi attivi").
+    //
+    // Marchiamo ogni voce come `live` per chiarezza del contratto e arricchiamo il
+    // `service` mancante con la mappa AUTORITATIVA port->label di
+    // nexus_port_allocations (regola L): cosi' il pannello Servizi aggancia sempre
+    // il link al servizio corretto anche quando l'albero processi non risolve.
     for p in ports.iter_mut() {
         if let Some(obj) = p.as_object_mut() {
             obj.insert("live".to_string(), json!(true));
         }
     }
-
-    // Allocazioni port<->servizio dal DB: sono la FONTE AUTORITATIVA del mapping
-    // (Nexus alloca la porta a una label PRIMA dello spawn, regola L). Le usiamo per due cose.
-    let allocations: Vec<(i32, String, String)> = sqlx::query_as::<_, (i32, String, String)>(
-        "SELECT port, COALESCE(label, ''), allocation_mode \
-         FROM nexus_port_allocations WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    // (1) Arricchisci le porte LIVE il cui `service` NON e' stato risolto dall'albero
-    // processi con la label dell'allocazione. Senza questo, un dev server orfano
-    // (avviato fuori da Nexus, o il cui pid di servizio e' morto e non e' piu'
-    // antenato del listener) restava con service=null -> il pannello non mostrava il
-    // link URL, pur sapendo Nexus a quale servizio la porta e' allocata.
-    let alloc_label_by_port: std::collections::HashMap<i32, String> = allocations
-        .iter()
-        .filter(|(_, label, _)| !label.trim().is_empty())
-        .map(|(port, label, _)| (*port, label.clone()))
+    let alloc_label_by_port: std::collections::HashMap<i32, String> =
+        sqlx::query_as::<_, (i32, String)>(
+            "SELECT port, COALESCE(label, '') FROM nexus_port_allocations \
+             WHERE project_id = $1 AND COALESCE(label, '') <> ''",
+        )
+        .bind(project_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
         .collect();
     assign_service_from_allocations(&mut ports, &alloc_label_by_port);
-
-    // (2) Aggiungi le allocazioni non ancora live.
-    for (port, label, mode) in allocations {
-        if !live_ports.contains(&port) {
-            ports.push(json!({
-                "port": port,
-                "label": label,
-                "allocation_mode": mode,
-                "live": false,
-                "source": "db_allocation",
-            }));
-        }
-    }
 
     Ok(Json(json!({ "ports": ports })))
 }
@@ -1898,7 +1876,8 @@ async fn detect_project_ports_windows(
 
     let mut ports: Vec<serde_json::Value> = Vec::new();
     let mut seen: HashSet<u16> = HashSet::new();
-    for (port, pid, _program) in listening {
+    for (port, pid, _program) in &listening {
+        let (port, pid) = (*port, *pid);
         let Some(service) = resolve_service_ancestor(pid, &svc_pid_label, &child_to_parent) else {
             continue;
         };
@@ -1914,7 +1893,97 @@ async fn detect_project_ports_windows(
             "service": service,
         }));
     }
+
+    // Pass 2 (robustezza link — regola L + M). L'albero Win32 puo' NON collegare il
+    // listener al servizio (dev-server detached, catena parent spezzata): la porta
+    // veniva scartata e il pannello Servizi perdeva il link a un servizio ATTIVO.
+    // La mappa AUTORITATIVA porta->servizio e' nexus_port_allocations (META = `db`,
+    // regola L): se un servizio VIVO ha una porta allocata realmente in LISTEN
+    // (segnale strutturato, regola M), quella e' la sua porta live — a prescindere
+    // dall'ancestry. Match servizio<->label via il punto unico similar_service_labels.
+    let running_labels: HashSet<String> = svc_pid_label.values().cloned().collect();
+    let listening_ports: HashSet<u16> = listening.iter().map(|(p, _, _)| *p).collect();
+    let allocs: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT port, COALESCE(label, '') FROM nexus_port_allocations \
+         WHERE project_id = $1 AND COALESCE(label, '') <> ''",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for (port, service) in allocations_to_live_ports(&running_labels, &listening_ports, &seen, &allocs)
+    {
+        ports.push(json!({
+            "port": port,
+            "label": service,
+            "state": "LISTEN",
+            "url": format!("http://localhost:{port}"),
+            "service": service,
+        }));
+    }
     ports
+}
+
+/// Pura (regola L, testabile su ogni piattaforma): dalle allocazioni port->label
+/// del progetto ricava le porte LIVE aggiuntive del pass 2 di
+/// `detect_project_ports_windows`. Una porta e' live sse: (a) e' realmente in
+/// LISTEN (`listening_ports`, segnale strutturato — regola M), (b) non gia' emessa
+/// dal pass 1 (`already_seen`), (c) appartiene a un servizio VIVO (`running_labels`),
+/// con match via il PUNTO UNICO `similar_service_labels`. Ritorna (porta, servizio)
+/// deduplicato per porta.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn allocations_to_live_ports(
+    running_labels: &std::collections::HashSet<String>,
+    listening_ports: &std::collections::HashSet<u16>,
+    already_seen: &std::collections::HashSet<u16>,
+    allocs: &[(i32, String)],
+) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    let mut emitted: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for (port_i, label) in allocs {
+        let Ok(port) = u16::try_from(*port_i) else {
+            continue;
+        };
+        // Solo porte del range Nexus (20000-39999): un'allocazione spuria su una
+        // porta infrastrutturale (es. 5434 = cluster Postgres, auto-rilevata
+        // dall'output del backend) NON deve attribuire il listener ESTRANEO a un
+        // servizio del progetto solo perche' la label e' simile.
+        if !(PROJECT_PORT_RANGE_START..=PROJECT_PORT_RANGE_END).contains(&port) {
+            continue;
+        }
+        if !listening_ports.contains(&port)
+            || already_seen.contains(&port)
+            || !emitted.insert(port)
+        {
+            continue;
+        }
+        // Selezione DETERMINISTICA del servizio proprietario: una label che combacia
+        // con piu' servizi vivi non mutuamente simili (es. "api-web" ~ "api-server"
+        // E ~ "web-ui") altrimenti oscillerebbe tra i polling (HashSet iter order),
+        // facendo lampeggiare il link. Ordine: uguaglianza esatta case-insensitive,
+        // poi piu' parole significative in comune, infine lessicografico. Punto unico
+        // similar/shared in agent_processes (regola L).
+        let mut candidates: Vec<&String> = running_labels
+            .iter()
+            .filter(|rl| crate::agent_processes::similar_service_labels(rl, label))
+            .collect();
+        candidates.sort_by(|a, b| {
+            let (sa, sb): (&str, &str) = (a.as_str(), b.as_str());
+            let lab = label.trim();
+            let exact = |s: &str| s.trim().eq_ignore_ascii_case(lab);
+            exact(sb)
+                .cmp(&exact(sa))
+                .then_with(|| {
+                    crate::agent_processes::shared_significant_words(sb, label)
+                        .cmp(&crate::agent_processes::shared_significant_words(sa, label))
+                })
+                .then_with(|| sa.cmp(sb))
+        });
+        if let Some(service) = candidates.first() {
+            out.push((port, (*service).clone()));
+        }
+    }
+    out
 }
 
 /// Risale la catena dei genitori da `pid` finche' trova un pid servizio. Cap a
@@ -3144,6 +3213,70 @@ pub async fn port_allocated_to_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocations_to_live_ports_emette_solo_servizi_vivi_in_ascolto() {
+        use std::collections::HashSet;
+        let running: HashSet<String> = ["frontend".to_string(), "backend".to_string()]
+            .into_iter()
+            .collect();
+        let listening: HashSet<u16> = [31840u16, 31792, 31900].into_iter().collect();
+        // 31792 gia' emessa dal pass 1 (albero processi risolto)
+        let already_seen: HashSet<u16> = [31792u16].into_iter().collect();
+        let allocs = vec![
+            (31840i32, "frontend-dev".to_string()), // servizio vivo (frontend ~ frontend-dev) + in ascolto -> emesso
+            (31792, "backend".to_string()),         // gia' vista dal pass 1 -> saltata
+            (31900, "worker".to_string()),          // in ascolto ma servizio NON vivo -> saltata
+            (31999, "frontend".to_string()),        // servizio vivo ma NON in ascolto -> saltata
+            (70000, "frontend".to_string()),        // fuori range u16 -> saltata
+        ];
+        let out = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
+        assert_eq!(out, vec![(31840u16, "frontend".to_string())]);
+    }
+
+    #[test]
+    fn allocations_to_live_ports_dedup_per_porta() {
+        use std::collections::HashSet;
+        let running: HashSet<String> = ["api".to_string()].into_iter().collect();
+        let listening: HashSet<u16> = [31810u16].into_iter().collect();
+        let already_seen: HashSet<u16> = HashSet::new();
+        // due allocazioni sulla stessa porta: emessa una sola volta
+        let allocs = vec![(31810i32, "api".to_string()), (31810, "api-old".to_string())];
+        let out = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
+        assert_eq!(out, vec![(31810u16, "api".to_string())]);
+    }
+
+    #[test]
+    fn allocations_to_live_ports_ignora_porte_fuori_range_nexus() {
+        use std::collections::HashSet;
+        // Regressione (dati live Beaty-Book): un'allocazione spuria su 5434 (cluster
+        // Postgres, auto-rilevata dall'output del backend) NON deve attribuire il
+        // listener estraneo al servizio del progetto solo perche' la label e' simile.
+        let running: HashSet<String> = ["backend-dev".to_string()].into_iter().collect();
+        let listening: HashSet<u16> = [5434u16].into_iter().collect(); // Postgres ascolta qui
+        let already_seen: HashSet<u16> = HashSet::new();
+        let allocs = vec![(5434i32, "backend".to_string())];
+        assert!(allocations_to_live_ports(&running, &listening, &already_seen, &allocs).is_empty());
+    }
+
+    #[test]
+    fn allocations_to_live_ports_selezione_deterministica_su_match_ambiguo() {
+        use std::collections::HashSet;
+        // Label allocazione multi-parola simile a DUE servizi vivi mutuamente non
+        // simili: la scelta deve essere STABILE (niente flicker del link).
+        let running: HashSet<String> = ["api-server".to_string(), "web-ui".to_string()]
+            .into_iter()
+            .collect();
+        let listening: HashSet<u16> = [31500u16].into_iter().collect();
+        let already_seen: HashSet<u16> = HashSet::new();
+        let allocs = vec![(31500i32, "api-web".to_string())];
+        // Nessun match esatto, parole condivise pari (1 e 1) -> tie-break
+        // lessicografico: "api-server" < "web-ui". Deterministico e idempotente.
+        let out = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
+        assert_eq!(out, vec![(31500u16, "api-server".to_string())]);
+        let out2 = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
+        assert_eq!(out, out2);
+    }
 
     #[test]
     fn parse_port_pid_program_estrae_terne_valide() {

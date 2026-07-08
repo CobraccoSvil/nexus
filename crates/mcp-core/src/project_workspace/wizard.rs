@@ -408,7 +408,7 @@ pub(super) async fn mark_existing_services(
             slug,
             project_root,
         };
-        let installed_shorts: std::collections::HashSet<String> = service_manager::active()
+        let installed_shorts: Vec<String> = service_manager::active()
             .list(&ctx)
             .await
             .into_iter()
@@ -416,7 +416,7 @@ pub(super) async fn mark_existing_services(
             .collect();
         for s in suggestions.iter_mut() {
             let short = s["short"].as_str().unwrap_or("");
-            if !short.is_empty() && installed_shorts.contains(short) {
+            if short_matches_installed(short, &installed_shorts) {
                 s["existing"] = json!(true);
             }
         }
@@ -456,6 +456,22 @@ pub(super) async fn mark_existing_services(
             }
         }
     }
+}
+
+/// True se lo `short` proposto dal wizard corrisponde a un servizio GIA'
+/// installato, tramite il PUNTO UNICO di identita' servizio (regola L,
+/// `similar_service_labels`): "frontend" ~ "frontend-dev". Il match per short
+/// ESATTO ripropone invece "Installa" su un servizio gia' presente sotto un nome
+/// leggermente diverso -> doppio spawn dello stesso scopo. E' lo STESSO criterio
+/// del dedup allo spawn (`stop_similar_running_services`): se lo start fermerebbe
+/// il duplicato, il wizard non deve riproporlo come nuovo.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn short_matches_installed(short: &str, installed: &[String]) -> bool {
+    let short = short.trim();
+    !short.is_empty()
+        && installed
+            .iter()
+            .any(|inst| crate::agent_processes::similar_service_labels(short, inst))
 }
 
 // safety: pattern literal valido
@@ -3524,6 +3540,23 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn short_matches_installed_usa_identita_servizio_non_match_esatto() {
+        let installed = vec!["frontend-dev".to_string(), "backend".to_string()];
+        // il detector propone "frontend": stesso scopo di "frontend-dev" gia' installato
+        // (punto unico similar_service_labels) -> NON va riproposto come nuovo.
+        assert!(short_matches_installed("frontend", &installed));
+        // match esatto ovvio
+        assert!(short_matches_installed("backend", &installed));
+        // scopo diverso: non installato
+        assert!(!short_matches_installed("worker", &installed));
+        // short vuoto/whitespace: mai match
+        assert!(!short_matches_installed("", &installed));
+        assert!(!short_matches_installed("   ", &installed));
+        // nessun servizio installato
+        assert!(!short_matches_installed("frontend", &[]));
+    }
 
     // ── A2: derivazione env frontend dai sibling (regola L, punto unico) ──
 

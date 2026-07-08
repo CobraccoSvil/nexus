@@ -446,6 +446,7 @@ impl PortRegistryCache {
 /// come orfane. Punto unico (regola L) del parsing porte: riusa
 /// `extract_ports_from_unit_content`. False se il file non esiste piu' (servizio
 /// rimosso) o non dichiara piu' quella porta (mapping stale dopo riconfig).
+#[cfg_attr(windows, allow(dead_code))]
 async fn service_unit_reserves_port(unit: &str, port: u16) -> bool {
     let unit = unit.trim();
     if unit.is_empty() {
@@ -468,6 +469,56 @@ async fn service_unit_reserves_port(unit: &str, port: u16) -> bool {
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => extract_ports_from_unit_content(&content).contains(&port),
         Err(_) => false,
+    }
+}
+
+/// Segnale strutturato (regola M) che il servizio dietro un'allocazione ESISTE
+/// ancora su Windows: una delle `labels` di servizio del progetto (agent_processes
+/// kind='service') ricostruisce, via il PUNTO UNICO `service_unit_name(slug,label)`
+/// (regola L), esattamente `unit`. Puro e testabile su ogni piattaforma.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_unit_backed_by_label(slug: &str, unit: &str, labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|l| crate::project_workspace::services::service_unit_name(slug, l) == unit)
+}
+
+/// Windows: l'allocazione con `service_unit = unit` riserva ancora la porta? Vero
+/// SOLO se il servizio e' ancora installato, cioe' esiste una riga agent_processes
+/// (kind='service') del progetto che ricostruisce quell'unit. Uninstall e
+/// clear-finished cancellano quelle righe -> ritorna false -> l'allocazione orfana
+/// viene rilasciata dal GC. Sostituisce il `return true` cieco che tratteneva per
+/// sempre le porte fantasma dei servizi rimossi (bug pannello Porte segnalato).
+#[cfg(windows)]
+async fn windows_service_unit_still_exists(db: &PgPool, project_id: Uuid, unit: &str) -> bool {
+    // Postura DB-down (regole G + M): un errore TRANSITORIO del DB (acquire timeout
+    // su pool saturo, riconnessione, provisioning) NON deve diventare "servizio
+    // disinstallato" -> porterebbe al DELETE distruttivo della riserva e al drift
+    // porta 31792->31798, la regressione che questo fix deve EVITARE. Rilasciamo
+    // SOLO su esito Ok deterministico (progetto o label realmente assenti =
+    // uninstall/clear-finished); qualunque Err = fail-closed = preserva la riserva.
+    let name = match sqlx::query_scalar::<_, String>("SELECT name FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+    {
+        Ok(Some(n)) => n,
+        Ok(None) => return false, // progetto realmente rimosso: riserva orfana
+        Err(_) => return true,    // META transitorio: preserva la riserva
+    };
+    let slug = crate::project_workspace::services::project_service_slug(&name);
+    // agent_processes e' tabella migrata: instrada sul pool del progetto (flag OFF
+    // -> meta-pool, behavior-preserving).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    match sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT label FROM agent_processes WHERE project_id = $1 AND kind = 'service'",
+    )
+    .bind(project_id)
+    .fetch_all(&proj_pool)
+    .await
+    {
+        Ok(labels) => windows_unit_backed_by_label(&slug, unit, &labels),
+        Err(_) => true, // pool PROGETTO transitorio: preserva la riserva
     }
 }
 
@@ -505,15 +556,43 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     let mut released = 0u64;
     for (project_id, port, service_unit) in rows {
         let p = port as u16;
-        // Se qualcuno ascolta sulla porta, e' in uso: non la tocchiamo.
-        if crate::project_workspace::port_recovery::tcp_probe(p, 200).await {
-            continue;
-        }
-        // Riserva di un servizio configurato ma fermo: il file unit esiste ancora e
-        // dichiara questa porta -> non e' orfana, va preservata (come le `manual`).
-        if let Some(ref unit) = service_unit {
-            if service_unit_reserves_port(unit, p).await {
+        // Le allocazioni NON-manual FUORI dal range Nexus (20000-39999) sono
+        // artefatti: l'auto-detect (scan config / output servizio) ha pescato una
+        // porta infrastrutturale a cui il servizio si CONNETTE (es. 5434 Postgres),
+        // non una porta di progetto. Vanno sempre rilasciate, anche se qualcosa di
+        // ESTRANEO ci ascolta -> saltano le protezioni (tcp_probe + riserva) e
+        // cadono nel DELETE. La chiusura alla fonte e' in register_detected_port.
+        let in_nexus_range = (crate::project_workspace::services::PROJECT_PORT_RANGE_START
+            ..=crate::project_workspace::services::PROJECT_PORT_RANGE_END)
+            .contains(&p);
+        if in_nexus_range {
+            // Se qualcuno ascolta sulla porta, e' in uso: non la tocchiamo.
+            if crate::project_workspace::port_recovery::tcp_probe(p, 200).await {
                 continue;
+            }
+            // Riserva di un servizio configurato ma FERMO -> non e' orfana, va
+            // preservata (come le `manual`). Criterio platform-specifico:
+            //  - POSIX: il file unit esiste ancora e dichiara ANCORA questa porta.
+            //  - Windows: NON esiste alcun file unit. Segnale strutturato onesto
+            //    (regola M): esiste ancora una riga agent_processes (servizio
+            //    installato) che ricostruisce quell'unit? uninstall / clear-finished
+            //    cancellano quelle righe -> assenza = servizio rimosso = allocazione
+            //    ORFANA da rilasciare. Su errore DB TRANSITORIO si PRESERVA
+            //    (windows_service_unit_still_exists e' fail-closed).
+            if let Some(ref unit) = service_unit {
+                let reserved = {
+                    #[cfg(windows)]
+                    {
+                        windows_service_unit_still_exists(db, project_id, unit).await
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        service_unit_reserves_port(unit, p).await
+                    }
+                };
+                if reserved {
+                    continue;
+                }
             }
         }
         let n = sqlx::query(
@@ -905,7 +984,45 @@ fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dev_server_roots_to_kill, dev_server_signature, extract_ports_from_unit_content};
+    use super::{
+        dev_server_roots_to_kill, dev_server_signature, extract_ports_from_unit_content,
+        windows_unit_backed_by_label,
+    };
+
+    #[test]
+    fn windows_unit_backed_by_label_distingue_installato_da_orfano() {
+        // service_unit_name(slug, label) = "{slug}-{label}.service" (punto unico).
+        let labels = vec!["frontend".to_string(), "backend-dev".to_string()];
+        // servizio ancora installato: una label ricostruisce l'unit -> riserva legittima
+        assert!(windows_unit_backed_by_label(
+            "beauty-book",
+            "beauty-book-frontend.service",
+            &labels
+        ));
+        assert!(windows_unit_backed_by_label(
+            "beauty-book",
+            "beauty-book-backend-dev.service",
+            &labels
+        ));
+        // servizio disinstallato (nessuna riga lo ricostruisce) -> allocazione ORFANA
+        assert!(!windows_unit_backed_by_label(
+            "beauty-book",
+            "beauty-book-worker.service",
+            &labels
+        ));
+        // slug di un altro progetto -> non e' una riserva di questo
+        assert!(!windows_unit_backed_by_label(
+            "other-proj",
+            "beauty-book-frontend.service",
+            &labels
+        ));
+        // nessun servizio installato -> mai una riserva
+        assert!(!windows_unit_backed_by_label(
+            "beauty-book",
+            "beauty-book-frontend.service",
+            &[]
+        ));
+    }
 
     #[test]
     fn extract_ports_riconosce_riserva_servizio_unit() {
