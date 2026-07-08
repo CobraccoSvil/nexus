@@ -143,22 +143,31 @@ struct Tally {
     any_high_severity_fail: bool,
 }
 
-/// Classifica il verdetto di panel dal conteggio dei voti e dalla policy
-/// (regola L: unica sede della precedenza tra esiti; l'ordine dei rami e'
-/// significativo — soglia -> veto fail -> needs_changes -> pass).
+/// Classifica il verdetto di panel delegando la PRECEDENZA al punto unico
+/// generico [`super::panel_quorum::classify_panel`] (regola L) e mappando il
+/// vocabolario della review (pass/fail/needs_changes) sulle classi generiche
+/// (fail->veto, needs_changes->conditional). L'ordine dei rami e la semantica del
+/// veto avversario su high-severity vivono ora in `panel_quorum`, condivisi col
+/// panel advisory.
 fn classify_panel_verdict(t: &Tally, policy: &QuorumPolicy) -> PanelVerdict {
-    if t.valid < policy.min_valid_verdicts {
-        PanelVerdict::Inconclusive
-    } else if t.fail > 0 && (t.any_high_severity_fail || !policy.fail_on_high_severity) {
-        // Veto avversario: con fail_on_high_severity, un fail con evidenza grave
-        // basta; senza, qualunque fail vale come voto negativo.
-        PanelVerdict::Fail
-    } else if t.fail > 0 || t.needs_changes > 0 {
-        // fail senza high-severity (policy che richiede gravita') o needs_changes:
-        // difetto reale ma non bloccante di per se'.
-        PanelVerdict::NeedsChanges
-    } else {
-        PanelVerdict::Pass
+    use super::panel_quorum::{classify_panel, PanelClass, QuorumPolicy as GenPolicy, QuorumTally};
+    let class = classify_panel(
+        &QuorumTally {
+            valid: t.valid,
+            veto: t.fail,
+            conditional: t.needs_changes,
+            any_high_severity_veto: t.any_high_severity_fail,
+        },
+        &GenPolicy {
+            min_valid: policy.min_valid_verdicts,
+            veto_on_high_severity: policy.fail_on_high_severity,
+        },
+    );
+    match class {
+        PanelClass::Approve => PanelVerdict::Pass,
+        PanelClass::Conditional => PanelVerdict::NeedsChanges,
+        PanelClass::Veto => PanelVerdict::Fail,
+        PanelClass::Inconclusive => PanelVerdict::Inconclusive,
     }
 }
 

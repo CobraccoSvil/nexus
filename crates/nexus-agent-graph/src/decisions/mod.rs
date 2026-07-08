@@ -60,6 +60,7 @@
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
 pub mod adversarial_review;
+pub mod advisory_panel;
 pub mod clarify_signature;
 pub mod context_reduction;
 pub mod dag_scheduler;
@@ -72,6 +73,7 @@ pub mod loop_signatures;
 pub mod m16;
 pub mod meta_reason;
 pub mod orchestration_reason;
+pub mod panel_quorum;
 pub mod predictive_cap;
 pub mod progress_controller;
 pub mod reward;
@@ -83,6 +85,10 @@ pub mod turn_focus;
 
 pub use adversarial_review::{
     compose_panel_verdict, PanelOutcome, PanelVerdict, QuorumPolicy, ReviewVerdict,
+};
+pub use advisory_panel::{
+    compose_advisory_synthesis, AdvisoryPanelVerdict, AdvisoryPolicy, AdvisorySynthesis,
+    AdvisoryVerdict,
 };
 pub use clarify_signature::{clarify_signature, normalize_question};
 pub use context_reduction::{
@@ -118,6 +124,7 @@ pub use orchestration_reason::{
     build_orchestration_context, context_pressure_from_tokens, delegation_forbidden, orch_epoch,
     subtasks_are_disjoint, validate_orch_move,
 };
+pub use panel_quorum::{classify_panel, PanelClass, QuorumTally};
 pub use predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
 pub use tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,

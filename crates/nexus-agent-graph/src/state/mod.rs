@@ -219,6 +219,11 @@ pub struct AgentState {
     /// ultracode): dict normalizzato {verdict, summary, findings[]}. Propagato
     /// oltre il confine sub-run in `structured_verdict` (regola M).
     pub review_verdict: Option<Value>,
+    /// Parere strutturato di una FIGURA del consiglio di analisi a monte via tool
+    /// advisory_verdict: dict normalizzato {verdict, summary, requirements[],
+    /// risks[], recommendations[]}. Propagato oltre il confine sub-run in
+    /// `structured_verdict` (campo `advisory`, regola M).
+    pub advisory_verdict: Option<Value>,
     /// `true` se un tool e' fallito per ToolRunner gRPC down (infrastruttura).
     pub tool_infra_error: Option<bool>,
     /// Passi strutturati del playbook matchato.

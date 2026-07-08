@@ -96,8 +96,8 @@ use crate::decisions::m16::DiscoveredTool;
 use crate::decisions::predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
 use crate::decisions::tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
-    estimate_tool_result_size_bytes, extract_returned_bytes, normalize_declared_outcome,
-    normalize_review_verdict,
+    estimate_tool_result_size_bytes, extract_returned_bytes, normalize_advisory_verdict,
+    normalize_declared_outcome, normalize_review_verdict,
     ContextMessage,
 };
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
@@ -125,6 +125,13 @@ const RUN_NOTES_TOOL_NAME: &str = "nexus_run_notes";
 /// propagato oltre il confine sub-run via `structured_verdict` (regola M).
 const REVIEW_VERDICT_TOOL_NAME: &str = "review_verdict";
 
+/// Tool brain-only `advisory_verdict` (consiglio di figure a monte): una FIGURA
+/// di analisi dichiara il parere strutturato con la sua lente (gemello di
+/// `review_verdict` per il canale del consiglio). Non eseguito via ToolExecutor;
+/// registrato nello stato e propagato oltre il confine sub-run via
+/// `structured_verdict` (campo `advisory`, regola M).
+const ADVISORY_VERDICT_TOOL_NAME: &str = "advisory_verdict";
+
 /// Tool di dispatch sub-agente (singolo/batch). Il loro tool_result puo' portare
 /// il SEGNALE STRUTTURATO `background_dispatched: true` (Fase D fan-in): il padre
 /// NON attende l'esito, si sospende e riprende al fan-in dei sub-run background.
@@ -146,6 +153,7 @@ const M16_BRAIN_TOOLS: &[&str] = &[
     TASK_COMPLETE_TOOL_NAME,
     RUN_NOTES_TOOL_NAME,
     REVIEW_VERDICT_TOOL_NAME,
+    ADVISORY_VERDICT_TOOL_NAME,
 ];
 
 /// Config DB-driven del nodo tool_dispatch, PASSATA (regola G: nessuna lettura
@@ -427,6 +435,32 @@ impl ToolDispatchNode {
             };
         }
 
+        // ── advisory_verdict (brain-only, consiglio di figure a monte) ────────
+        if name == ADVISORY_VERDICT_TOOL_NAME {
+            let decl = normalize_advisory_verdict(&input);
+            let verdict = decl
+                .as_ref()
+                .and_then(|d| d.get("verdict").cloned())
+                .unwrap_or(Value::Null);
+            let acknowledged = decl.is_some();
+            if let Some(d) = decl {
+                collector
+                    .advisory_verdicts
+                    .lock()
+                    .expect("lock advisory verdicts")
+                    .push(d);
+            }
+            return ToolResultBlock {
+                tool_use_id,
+                content: Value::String(py_dumps(
+                    &json!({"acknowledged": acknowledged, "verdict": verdict}),
+                )),
+                is_error: !acknowledged,
+                exit_code: None,
+                raw_content: None,
+            };
+        }
+
         // ── tool generico via ToolExecutor ────────────────────────────────────
         let call = ToolCall {
             id: tool_use_id.clone(),
@@ -491,6 +525,8 @@ struct RunCollector {
     declared_outcomes: std::sync::Mutex<Vec<Value>>,
     /// Verdetti dichiarati via review_verdict (l'ultimo prevale, Fase B).
     review_verdicts: std::sync::Mutex<Vec<Value>>,
+    /// Pareri dichiarati via advisory_verdict (l'ultimo prevale, consiglio a monte).
+    advisory_verdicts: std::sync::Mutex<Vec<Value>>,
     /// tool_use_id dei task_complete del turno (guard blocked-da-cap).
     task_complete_ids: std::sync::Mutex<Vec<String>>,
     /// Taccuino del run (holder mutabile, P4). Inizializzato al valore di stato.
@@ -695,6 +731,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
         // ── (7) Guard blocked-da-cap (py:3924-3953) ───────────────────────────
         let declared_outcomes = collector.declared_outcomes.into_inner().expect("outcomes");
         let review_verdicts = collector.review_verdicts.into_inner().expect("review verdicts");
+        let advisory_verdicts = collector
+            .advisory_verdicts
+            .into_inner()
+            .expect("advisory verdicts");
         let task_complete_ids = collector.task_complete_ids.into_inner().expect("tc ids");
         let infra_error = collector.infra_error.into_inner().expect("infra");
         let awaiting_subagents = collector.awaiting_subagents.into_inner().expect("awaiting");
@@ -945,6 +985,15 @@ dell'utente.";
             delta.review_verdict = Some(Some(last.clone()));
         } else if state.review_verdict.is_some() {
             delta.review_verdict = Some(None);
+        }
+
+        // Consiglio a monte: parere di una FIGURA — stessa semantica dell'esito
+        // dichiarato (l'ultimo prevale; un parere seguito da altri tool era
+        // intermedio e viene azzerato).
+        if let Some(last) = advisory_verdicts.last() {
+            delta.advisory_verdict = Some(Some(last.clone()));
+        } else if state.advisory_verdict.is_some() {
+            delta.advisory_verdict = Some(None);
         }
 
         // WAVE 2.2: errore infrastruttura tool (mcp-core NON scala i provider).

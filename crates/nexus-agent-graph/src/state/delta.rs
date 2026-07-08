@@ -134,6 +134,9 @@ pub struct StateDelta {
     /// Vedi `AgentState::review_verdict`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub review_verdict: Option<Option<Value>>,
+    /// Vedi `AgentState::advisory_verdict`.
+    #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
+    pub advisory_verdict: Option<Option<Value>>,
     /// Vedi `AgentState::tool_infra_error`.
     #[serde(default, deserialize_with = "double_option", skip_serializing_if = "Option::is_none")]
     pub tool_infra_error: Option<Option<bool>>,

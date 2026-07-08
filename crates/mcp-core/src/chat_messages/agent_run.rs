@@ -5072,6 +5072,7 @@ mod tests_select_engine {
             messages_json: Some(r#"[{"role":"user","content":"ciao"}]"#.to_string()),
             declared_outcome: None,
             review_verdict: None,
+            advisory_verdict: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,

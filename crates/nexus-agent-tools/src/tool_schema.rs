@@ -255,9 +255,11 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
           "enum": [
             "plan", "explore", "implement", "verify", "review",
             "rust_implementer", "python_implementer", "frontend_implementer",
-            "db_architect", "doc_writer", "test_author"
+            "db_architect", "doc_writer", "test_author",
+            "program_manager", "project_manager", "functional_analyst",
+            "software_architect", "sysadmin", "security_engineer"
           ],
-          "description": "Tipo di sub-agent. SCEGLI implementativi (rust_implementer/python_implementer/frontend_implementer/db_architect/doc_writer/test_author) per creare/modificare file. SCEGLI explore solo per analisi senza scrittura. 'implement' e' il fallback generico se nessun specialista combacia."
+          "description": "Tipo di sub-agent. SCEGLI implementativi (rust_implementer/python_implementer/frontend_implementer/db_architect/doc_writer/test_author) per creare/modificare file. SCEGLI explore solo per analisi senza scrittura. Le FIGURE DI ANALISI del consiglio (program_manager/project_manager/functional_analyst/software_architect/sysadmin/security_engineer) sono READ-ONLY: convocale a MONTE per far analizzare la richiesta dalle diverse prospettive PRIMA di pianificare; ognuna chiude con advisory_verdict. 'implement' e' il fallback generico se nessun specialista combacia."
         },
         "task": {
           "type": "string",
@@ -281,7 +283,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "dispatch_subagents",
-    "description": "Come dispatch_subagent ma esegue PIU' sub-agent IN PARALLELO (a ondate). Usalo quando hai piu' task INDIPENDENTI da svolgere contemporaneamente (es. rami indipendenti di un piano). Per un singolo task usa dispatch_subagent. STESSE REGOLE sui kind: usa implementativi (*_implementer/db_architect/doc_writer/test_author) per scrivere codice, explore solo per analisi.",
+    "description": "Come dispatch_subagent ma esegue PIU' sub-agent IN PARALLELO (a ondate). Usalo quando hai piu' task INDIPENDENTI da svolgere contemporaneamente (es. rami indipendenti di un piano). Per un singolo task usa dispatch_subagent. STESSE REGOLE sui kind: usa implementativi (*_implementer/db_architect/doc_writer/test_author) per scrivere codice, explore solo per analisi. Per il CONSIGLIO DI ANALISI a monte convoca in un solo batch le figure pertinenti (program_manager/project_manager/functional_analyst/software_architect/sysadmin/security_engineer, tutte read-only): il tool_result includera' `advisory_synthesis`, la sintesi convergente dei loro pareri (requisiti uniti, rischi per severity, verdetto proceed/proceed_with_changes/block con veto avversario) da usare per costruire il piano.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -296,9 +298,11 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
                 "enum": [
                   "plan", "explore", "implement", "verify", "review",
                   "rust_implementer", "python_implementer", "frontend_implementer",
-                  "db_architect", "doc_writer", "test_author"
+                  "db_architect", "doc_writer", "test_author",
+                  "program_manager", "project_manager", "functional_analyst",
+                  "software_architect", "sysadmin", "security_engineer"
                 ],
-                "description": "Tipo di sub-agent (vedi dispatch_subagent per la guida)"
+                "description": "Tipo di sub-agent (vedi dispatch_subagent per la guida; le 6 figure di analisi read-only del consiglio sono convocabili qui in batch)"
               },
               "task": {"type": "string", "description": "Descrizione COMPLETA e AUTONOMA del task"},
               "context": {"type": "string", "description": "Contesto aggiuntivo opzionale"},
@@ -1609,6 +1613,22 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   }
   ,
   {
+    "name": "advisory_verdict",
+    "description": "Dichiara il PARERE strutturato di una figura del consiglio di analisi a monte (per i run di analisi, prima dell'esecuzione). Chiamalo UNA SOLA VOLTA, come ULTIMISSIMA azione, DOPO aver analizzato la richiesta con la TUA lente: se dopo la dichiarazione esegui altri tool, il parere viene invalidato. verdict=proceed se dalla tua prospettiva si puo' procedere senza vincoli aggiuntivi; proceed_with_changes se si puo' procedere rispettando i requisiti che indichi; block se la richiesta NON e' eseguibile cosi' com'e' e va corretta prima. Un block richiede almeno un rischio con evidenza concreta: niente veto senza motivo. requirements sono i vincoli che l'esecuzione DEVE rispettare secondo la tua lente; risks i rischi con la loro severity; recommendations i suggerimenti non vincolanti. Il summary e' il resoconto umano del tuo parere; il parere macchina e' SOLO quello del tool.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "verdict": {"type": "string", "enum": ["proceed", "proceed_with_changes", "block"], "description": "Parere macchina: proceed = via libera dalla tua lente; proceed_with_changes = si procede coi requisiti indicati; block = non eseguibile cosi', va corretto prima (richiede almeno un rischio con evidenza)."},
+        "summary": {"type": "string", "description": "Resoconto umano del parere (cosa hai analizzato e con quale conclusione)."},
+        "requirements": {"type": "array", "items": {"type": "string"}, "description": "Vincoli/requisiti che l'esecuzione DEVE rispettare secondo la tua lente. Ognuno una frase azionabile."},
+        "risks": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["alta", "media", "bassa"], "description": "Severita' del rischio."}, "area": {"type": "string", "description": "Ambito del rischio (es. sicurezza, dati, deploy)."}, "description": {"type": "string", "description": "Il rischio e la sua evidenza concreta."}}, "required": ["description"]}, "description": "Rischi con evidenza. Obbligatorio (non vuoto) con verdict=block: un veto senza evidenza viene rifiutato."},
+        "recommendations": {"type": "array", "items": {"type": "string"}, "description": "Suggerimenti non vincolanti dalla tua prospettiva."}
+      },
+      "required": ["verdict", "summary"]
+    }
+  }
+  ,
+  {
     "name": "nexus_verify_change",
     "description": "Verifica le modifiche appena fatte eseguendo la catena typecheck -> build -> lint -> test del progetto (fail-fast al primo step rosso). Usalo PRIMA di dichiarare completato un task di codice: e' la prova oggettiva che la modifica compila e non rompe i test. Ritorna un VerifyReport JSON strutturato: passed complessivo, first_failure, e per ogni step exit_code, build_errors, durata e un estratto dell'output. I comandi vengono dalle run_configurations del progetto o dai default per linguaggio configurati dall'admin: se uno step non ha comando configurato viene saltato con motivo esplicito, non inventato.",
     "input_schema": {
@@ -1630,8 +1650,11 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
 ///
 /// `review_verdict` (Fase B ultracode): canale dichiarativo del kind `review`;
 /// al run principale non serve (nessun punto decisionale ne consuma il
-/// verdetto) e lo esporrebbe come rumore di catalogo.
-pub const SUBAGENT_ONLY_TOOLS: &[&str] = &["review_verdict"];
+/// verdetto) e lo esporrebbe come rumore di catalogo. `advisory_verdict`
+/// (consiglio di figure a monte): canale dichiarativo delle figure di analisi
+/// (program_manager, software_architect, security_engineer, ...); come sopra e'
+/// esposto SOLO ai kind che lo whitelistano, mai al run principale.
+pub const SUBAGENT_ONLY_TOOLS: &[&str] = &["review_verdict", "advisory_verdict"];
 
 #[cfg(test)]
 mod tests {

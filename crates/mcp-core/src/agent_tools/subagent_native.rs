@@ -52,7 +52,7 @@ use uuid::Uuid;
 
 use super::AgentToolContext;
 use crate::native_engine::{verdict_keys, NativeDeps, NativeRunInput, NativeRunOutcome};
-use nexus_agent_graph::decisions::QuorumPolicy;
+use nexus_agent_graph::decisions::{AdvisoryPolicy, QuorumPolicy};
 
 /// Marker d'errore (stesso contratto di `subagent.rs`: prefisso U+274C ->
 /// `tool_result_is_error` deriva `is_error=true`).
@@ -492,6 +492,17 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         &read_quorum_policy(ctx).await,
     ) {
         out["panel_verdict"] = panel.to_value();
+    }
+    // Consiglio a monte (regola L/M): se il batch e' un PANEL advisory (almeno una
+    // figura ha dichiarato un `advisory`), compone la SINTESI aggregata dai segnali
+    // strutturati `outcome.advisory` — mai dalla prosa. Simmetrico al panel di
+    // review; il coordinatore (run padre) legge `advisory_synthesis` per costruire
+    // il piano rispettando i requisiti e fermandosi sui veti (verdict=block).
+    if let Some(synthesis) = nexus_agent_graph::decisions::compose_advisory_synthesis(
+        &outcomes,
+        &read_advisory_policy(ctx).await,
+    ) {
+        out["advisory_synthesis"] = synthesis.to_value();
     }
     out.to_string()
 }
@@ -991,6 +1002,39 @@ async fn read_quorum_policy(ctx: &AgentToolContext) -> QuorumPolicy {
             }
             "orchestrator.review_fail_on_high_severity" => {
                 policy.fail_on_high_severity = settings_flag(v.trim());
+            }
+            _ => {}
+        }
+    }
+    policy
+}
+
+/// Policy del quorum del panel ADVISORY (gemello di [`read_quorum_policy`], regola
+/// L): letta dai settings `orchestrator.council_advisory_*` (mig 0548) e passata al
+/// punto unico PURO `compose_advisory_synthesis`. Niente hardcode; safe-default
+/// coincidente con `AdvisoryPolicy::default` se le chiavi mancano.
+async fn read_advisory_policy(ctx: &AgentToolContext) -> AdvisoryPolicy {
+    let rows = sqlx::query(
+        "SELECT key, value FROM settings WHERE key IN (
+            'orchestrator.council_advisory_min_valid',
+            'orchestrator.council_advisory_block_on_high_severity'
+        )",
+    )
+    .fetch_all(&*ctx.core.db)
+    .await
+    .unwrap_or_default();
+    let mut policy = AdvisoryPolicy::default();
+    for row in rows {
+        let k: String = row.get("key");
+        let v: String = row.get("value");
+        match k.as_str() {
+            "orchestrator.council_advisory_min_valid" => {
+                if let Ok(n) = v.trim().parse::<usize>() {
+                    policy.min_valid_advisories = n.max(1);
+                }
+            }
+            "orchestrator.council_advisory_block_on_high_severity" => {
+                policy.block_on_high_severity = settings_flag(v.trim());
             }
             _ => {}
         }
@@ -2298,6 +2342,7 @@ fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
         k::SUCCESS: false,
         k::DECLARED: Value::Null,
         k::REVIEW: Value::Null,
+        k::ADVISORY: Value::Null,
         k::FINAL_GATE_PASSED: Value::Null,
         k::FINAL_GATE_UNVERIFIED: Value::Null,
         k::FINAL_GATE_FAILED_PENDING: false,
@@ -3348,6 +3393,7 @@ mod tests {
             messages_json: None,
             declared_outcome: None,
             review_verdict: None,
+            advisory_verdict: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,

@@ -271,6 +271,122 @@ pub fn normalize_review_verdict(tool_input: &Value) -> Option<Value> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+//  normalize_advisory_verdict (advisory_verdict, consiglio di figure a monte)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Verdetti validi dichiarabili via `advisory_verdict` (segnale ENUM, regola M:
+/// mai dedotto dalla prosa del parere).
+pub const VALID_ADVISORY_VERDICTS: &[&str] = &["proceed", "proceed_with_changes", "block"];
+
+/// Cap sul numero di elementi (requirements/risks/recommendations) per parere
+/// (self-report bounded, stesso razionale di [`FINDINGS_CAP`]).
+const ADVISORY_LIST_CAP: usize = 30;
+
+/// Valida/normalizza l'input di `advisory_verdict` (gemello di
+/// [`normalize_review_verdict`] per il canale delle FIGURE del consiglio a monte).
+/// `None` se invalido: verdict fuori enum, input non-oggetto, oppure
+/// verdict=block SENZA alcun rischio con descrizione (un veto senza evidenza non
+/// e' componibile da un coordinatore e va rifiutato alla fonte, regola M).
+///
+/// L'output mantiene SEMPRE `verdict` e `summary`; `requirements`/`risks`/
+/// `recommendations` inclusi solo se non vuoti dopo la sanificazione. Ogni
+/// requirement/recommendation e' una stringa non vuota (trim); ogni risk richiede
+/// `description` non vuota, `severity` fuori enum ricade su `media`, `area`
+/// inclusa solo se non vuota. La forma dell'output e' quella letta dal punto unico
+/// [`super::advisory_panel::compose_advisory_synthesis`] nel campo `advisory`.
+pub fn normalize_advisory_verdict(tool_input: &Value) -> Option<Value> {
+    let obj = tool_input.as_object()?;
+    let verdict = obj
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !VALID_ADVISORY_VERDICTS.contains(&verdict.as_str()) {
+        return None;
+    }
+    let summary = obj
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let string_list = |key: &str| -> Vec<Value> {
+        obj.get(key)
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let s = v.as_str()?.trim();
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(Value::String(s.to_string()))
+                        }
+                    })
+                    .take(ADVISORY_LIST_CAP)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let requirements = string_list("requirements");
+    let recommendations = string_list("recommendations");
+    let risks: Vec<Value> = obj
+        .get("risks")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let ro = r.as_object()?;
+                    let description = ro.get("description").and_then(Value::as_str)?.trim();
+                    if description.is_empty() {
+                        return None;
+                    }
+                    let severity = ro
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| VALID_FINDING_SEVERITIES.contains(&s.as_str()))
+                        .unwrap_or_else(|| "media".to_string());
+                    let mut out = serde_json::Map::new();
+                    out.insert("severity".to_string(), Value::String(severity));
+                    if let Some(area) = ro.get("area").and_then(Value::as_str) {
+                        let area = area.trim();
+                        if !area.is_empty() {
+                            out.insert("area".to_string(), Value::String(area.to_string()));
+                        }
+                    }
+                    out.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+                    Some(Value::Object(out))
+                })
+                .take(ADVISORY_LIST_CAP)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Veto senza evidenza: rifiutato alla fonte (regola M — il coordinatore non
+    // deve mai dover "credere" a un block senza rischi con descrizione).
+    if verdict == "block" && risks.is_empty() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("verdict".to_string(), Value::String(verdict));
+    out.insert("summary".to_string(), Value::String(summary));
+    if !requirements.is_empty() {
+        out.insert("requirements".to_string(), Value::Array(requirements));
+    }
+    if !risks.is_empty() {
+        out.insert("risks".to_string(), Value::Array(risks));
+    }
+    if !recommendations.is_empty() {
+        out.insert("recommendations".to_string(), Value::Array(recommendations));
+    }
+    Some(Value::Object(out))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 //  estimate_tool_result_size_bytes (upper-bound per-tool)
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -681,6 +797,64 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["severity"], json!("media"));
         assert!(findings[0].get("line").is_none());
+    }
+
+    #[test]
+    fn normalize_advisory_verdict_proceed_e_block() {
+        // proceed senza risks: valido (via libera dalla lente della figura).
+        let p = normalize_advisory_verdict(&json!({"verdict": " PROCEED ", "summary": "  ok  "}))
+            .unwrap();
+        assert_eq!(p["verdict"], json!("proceed"));
+        assert_eq!(p["summary"], json!("ok"));
+        assert!(p.get("risks").is_none());
+
+        // block con risk completo: severity normalizzata, area/requirements/reco trim.
+        let b = normalize_advisory_verdict(&json!({
+            "verdict": "block",
+            "summary": "manca PKCE",
+            "requirements": [" usa PKCE ", ""],
+            "risks": [{"severity": "ALTA", "area": " auth ", "description": " redirect aperto "}],
+            "recommendations": ["aggiungi test"]
+        }))
+        .unwrap();
+        assert_eq!(b["verdict"], json!("block"));
+        assert_eq!(b["requirements"], json!(["usa PKCE"]));
+        let r = &b["risks"][0];
+        assert_eq!(r["severity"], json!("alta"));
+        assert_eq!(r["area"], json!("auth"));
+        assert_eq!(r["description"], json!("redirect aperto"));
+        assert_eq!(b["recommendations"], json!(["aggiungi test"]));
+    }
+
+    #[test]
+    fn normalize_advisory_verdict_invalidi() {
+        // verdict fuori enum -> None.
+        assert!(normalize_advisory_verdict(&json!({"verdict": "boh", "summary": "x"})).is_none());
+        // input non-oggetto -> None.
+        assert!(normalize_advisory_verdict(&json!("block")).is_none());
+        // block SENZA rischi -> None (veto senza evidenza rifiutato alla fonte).
+        assert!(normalize_advisory_verdict(&json!({"verdict": "block", "summary": "no"})).is_none());
+        // block con rischi tutti invalidi (description vuota) -> None.
+        assert!(normalize_advisory_verdict(&json!({
+            "verdict": "block",
+            "summary": "no",
+            "risks": [{"severity": "alta", "description": ""}]
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn normalize_advisory_verdict_proceed_with_changes_requisiti() {
+        // proceed_with_changes: risks opzionali, requirements preservati.
+        let out = normalize_advisory_verdict(&json!({
+            "verdict": "proceed_with_changes",
+            "summary": "quasi",
+            "requirements": ["valida input"]
+        }))
+        .unwrap();
+        assert_eq!(out["verdict"], json!("proceed_with_changes"));
+        assert_eq!(out["requirements"], json!(["valida input"]));
+        assert!(out.get("risks").is_none());
     }
 
     #[test]

@@ -379,6 +379,13 @@ pub struct NativeRunOutcome {
     /// [`Self::structured_verdict`] (campo `review`) cosi' un coordinatore
     /// compone i verdetti dei giudici senza parsare prosa (regola M).
     pub review_verdict: Option<serde_json::Value>,
+    /// Parere strutturato di una FIGURA del consiglio di analisi a monte via tool
+    /// `advisory_verdict` (campo `advisory_verdict` dello stato): dict normalizzato
+    /// {verdict, summary, requirements[], risks[], recommendations[]} o `None` se il
+    /// run non era una figura di analisi o non ha dichiarato. Viaggia oltre il
+    /// confine sub-run dentro [`Self::structured_verdict`] (campo `advisory`) cosi'
+    /// il coordinatore compone la sintesi dei pareri senza parsare prosa (regola M).
+    pub advisory_verdict: Option<serde_json::Value>,
     /// Classe d'errore STRUTTURATA del run (`extra.error_class` dello stato, es.
     /// `context_overflow` — ADR 0016 D2): segnale MACCHINA per il finalizzatore
     /// (regola M: mai dedotta dal testo). `None` se il run non ha classificato.
@@ -443,6 +450,10 @@ pub(crate) mod verdict_keys {
     /// Verdetto strutturato del REVISORE (Fase B) via `review_verdict`
     /// ({verdict, summary, findings[]}); null nei run non-review.
     pub const REVIEW: &str = "review";
+    /// Parere strutturato di una FIGURA del consiglio a monte via `advisory_verdict`
+    /// ({verdict, summary, requirements[], risks[], recommendations[]}); null nei
+    /// run che non sono figure di analisi.
+    pub const ADVISORY: &str = "advisory";
     /// Segnali strutturati grezzi del final_gate / chiusura (ADR 0036).
     pub const FINAL_GATE_PASSED: &str = "final_gate_passed";
     pub const FINAL_GATE_UNVERIFIED: &str = "final_gate_unverified";
@@ -575,6 +586,9 @@ impl NativeRunOutcome {
             // Verdetto del REVISORE (Fase B ultracode): presente solo nei run
             // di review col tool `review_verdict` whitelistato; `null` altrove.
             k::REVIEW: self.review_verdict,
+            // Parere della FIGURA (consiglio a monte): presente solo nei run di
+            // analisi col tool `advisory_verdict` whitelistato; `null` altrove.
+            k::ADVISORY: self.advisory_verdict,
             k::FINAL_GATE_PASSED: self.final_gate_passed,
             k::FINAL_GATE_UNVERIFIED: self.final_gate_unverified,
             k::FINAL_GATE_FAILED_PENDING: self.final_gate_failed_pending,
@@ -2162,6 +2176,7 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         },
         declared_outcome: state.declared_outcome.clone(),
         review_verdict: state.review_verdict.clone(),
+        advisory_verdict: state.advisory_verdict.clone(),
         error_class: state
             .extra
             .get("error_class")
@@ -3607,6 +3622,7 @@ mod tests {
             messages_json: None,
             declared_outcome: None,
             review_verdict: None,
+            advisory_verdict: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,
@@ -3737,6 +3753,7 @@ mod tests {
         assert_eq!(v["success"], serde_json::json!(true));
         assert_eq!(v["declared"], serde_json::Value::Null);
         assert_eq!(v["review"], serde_json::Value::Null);
+        assert_eq!(v["advisory"], serde_json::Value::Null);
         assert_eq!(v["final_gate_passed"], serde_json::Value::Null);
 
         // Fase B: il verdetto del REVISORE attraversa il confine dentro il
@@ -3752,6 +3769,20 @@ mod tests {
         let vr = reviewer.structured_verdict();
         assert_eq!(vr["review"]["verdict"], serde_json::json!("needs_changes"));
         assert_eq!(vr["review"]["findings"][0]["file"], serde_json::json!("a.rs"));
+
+        // Consiglio a monte: il parere della FIGURA attraversa il confine dentro il
+        // blocco (campo `advisory`), indipendente dallo status lifecycle.
+        let figure = NativeRunOutcome {
+            advisory_verdict: Some(serde_json::json!({
+                "verdict": "block",
+                "summary": "manca PKCE",
+                "risks": [{"severity": "alta", "description": "auth senza PKCE"}]
+            })),
+            ..base_outcome()
+        };
+        let vf = figure.structured_verdict();
+        assert_eq!(vf["advisory"]["verdict"], serde_json::json!("block"));
+        assert_eq!(vf["advisory"]["risks"][0]["severity"], serde_json::json!("alta"));
 
         // Gate fallito + dichiarazione "done" ottimista: il verdetto oggettivo
         // prevale (failed_diagnosed) e l'error_class strutturata viaggia col blocco.
