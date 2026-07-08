@@ -621,6 +621,24 @@ impl FinalGateNode {
         results.iter().all(|r| r.passed)
     }
 
+    /// True se l'UNICO tipo di criterio fallito e' `completion_confirmed`: il
+    /// lavoro ha superato TUTTI i criteri OGGETTIVI (build/typecheck/runtime/no
+    /// orphan/...) e ne manca solo la firma strutturale (il modello ha risolto ma
+    /// non ha chiamato `task_complete`, ADR 0034). Guida il TURNO DI GRAZIA del
+    /// gate: invece di bocciare un lavoro di fatto riuscito, si concede un turno
+    /// mirato per la dichiarazione. Richiede almeno un fallito (altrimenti e' gia'
+    /// PASSED) e che TUTTI i falliti siano `completion_confirmed`.
+    fn only_completion_confirmed_failed(results: &[CriterionResult]) -> bool {
+        let mut any_failed = false;
+        for r in results.iter().filter(|r| !r.passed) {
+            any_failed = true;
+            if r.criterion_type != "completion_confirmed" {
+                return false;
+            }
+        }
+        any_failed
+    }
+
     /// Costruisce il testo del `HumanMessage` da iniettare quando il gate
     /// fallisce (`_render_failed_block`, `final_gate.py:396-493`). PURA: i
     /// risultati arrivano gia' calcolati; il `behavior_mode` viene dallo stato.
@@ -924,6 +942,48 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
         // reale, invece di lasciarlo passare per "completed".
         let forced_close = state.forced_close_unverified.unwrap_or(false);
         if forced_close || cycle >= max_cycles {
+            // ── TURNO DI GRAZIA completion (regola M + UX) ────────────────────
+            // Il modello ha superato TUTTI i criteri OGGETTIVI (build/typecheck/
+            // runtime/...) ma ha omesso la sola dichiarazione strutturata di
+            // chiusura (`completion_confirmed`: niente `task_complete`). Non
+            // bocciare come FailedDiagnosed un lavoro di fatto riuscito e
+            // verificato: concedi UN turno mirato per la firma. SOLO al primo
+            // ingresso al cap (`cycle == max_cycles`) e NON su forced_close (abort
+            // anti-loop): il turno porta `final_gate_cycle` a max_cycles, quindi il
+            // giro successivo rientra qui con `cycle > max_cycles` e chiude — grazia
+            // una volta sola, nessun loop, nessun nuovo campo di stato.
+            if !forced_close
+                && cycle == max_cycles
+                && Self::only_completion_confirmed_failed(&results)
+            {
+                crate::nodes::emit_phase_meta(
+                    ctx.emit.as_ref(),
+                    self.meta_steps.as_ref(),
+                    ctx.exec_mode(),
+                    "final_gate",
+                    "Criteri oggettivi superati: chiudi con task_complete".to_string(),
+                    serde_json::json!({"cycle": cycle, "phase": "completion_grace"}),
+                )
+                .await;
+                let hm = Message::Human {
+                    content: MessageContent::text(
+                        "I criteri OGGETTIVI di verifica (build, typecheck, runtime) sono \
+                         TUTTI superati: il lavoro e' verificato e completo. Manca solo la \
+                         dichiarazione strutturata di chiusura. Chiudi ORA il task chiamando \
+                         il tool task_complete (outcome + summary). NON serve altro lavoro sul \
+                         codice: NON ri-eseguire build/typecheck, chiama SOLO task_complete."
+                            .to_string(),
+                    ),
+                };
+                return Ok(StateDelta {
+                    messages: Some(vec![hm]),
+                    final_gate_cycle: Some(Some(cycle)),
+                    stop_reason: Some(Some(StopReason::ToolUse)),
+                    pending_tool_uses: Some(Some(vec![])),
+                    ..Default::default()
+                }
+                .into_opaque());
+            }
             tracing::warn!(
                 target: "nexus_agent_graph::final_gate",
                 forced_close,
@@ -1145,6 +1205,80 @@ mod tests {
         let seen = runner.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1, ExecMode::Real);
+    }
+
+    // ── Turno di grazia completion ──────────────────────────────────────────────
+
+    #[test]
+    fn only_completion_confirmed_failed_predicato() {
+        // solo completion_confirmed fallito (oggettivi ok) -> true
+        assert!(FinalGateNode::only_completion_confirmed_failed(&[
+            ok_result("run_command"),
+            fail_result("completion_confirmed", json!({})),
+        ]));
+        // un criterio OGGETTIVO fallito -> false (non e' solo la firma)
+        assert!(!FinalGateNode::only_completion_confirmed_failed(&[
+            fail_result("run_command", json!({})),
+            fail_result("completion_confirmed", json!({})),
+        ]));
+        // nessun fallito -> false (e' gia' PASSED)
+        assert!(!FinalGateNode::only_completion_confirmed_failed(&[ok_result(
+            "run_command"
+        )]));
+    }
+
+    #[tokio::test]
+    async fn completion_grace_concede_turno_extra_su_solo_completion_confirmed() {
+        // Tutti gli oggettivi passano, solo completion_confirmed fallisce, al cap
+        // (cycle == max_cycles=2): il gate concede UN turno mirato per task_complete
+        // invece di chiudere failed.
+        let runner = Arc::new(StubCriteriaRunner::with_results(vec![
+            ok_result("no_orphan_imported"),
+            ok_result("run_command"),
+            fail_result("completion_confirmed", json!({"excerpt": "manca task_complete"})),
+        ]));
+        let node = node_with(FinalGateConfig::default(), runner);
+        let ctx = ctx_with(false);
+        let st = AgentState {
+            final_gate_cycle: Some(1), // -> cycle diventa 2 == max_cycles
+            ..software_state()
+        };
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        // NON boccia: rimanda all'executor chiedendo task_complete.
+        assert_eq!(out.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(
+            out.final_gate_passed, None,
+            "il turno di grazia NON registra final_gate_passed=false"
+        );
+        assert_eq!(out.final_gate_cycle, Some(2));
+        let msg = serde_json::to_string(&out.messages).unwrap();
+        assert!(
+            msg.contains("task_complete"),
+            "il turno mirato chiede task_complete: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_grace_una_volta_sola_poi_chiude() {
+        // Al giro DOPO la grazia (cycle > max_cycles) il gate chiude failed anche
+        // se completion_confirmed e' ancora l'unico fallito: nessun loop.
+        let runner = Arc::new(StubCriteriaRunner::with_results(vec![
+            ok_result("run_command"),
+            fail_result("completion_confirmed", json!({})),
+        ]));
+        let node = node_with(FinalGateConfig::default(), runner);
+        let ctx = ctx_with(false);
+        let st = AgentState {
+            final_gate_cycle: Some(2), // -> cycle diventa 3 > max_cycles
+            ..software_state()
+        };
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(
+            out.final_gate_passed,
+            Some(false),
+            "grazia gia' spesa: chiude failed"
+        );
+        assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
     }
 
     // ── Ramo FORCED / CAP ───────────────────────────────────────────────────────
