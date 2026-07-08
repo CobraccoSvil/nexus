@@ -578,6 +578,13 @@ pub async fn send_chat_message(
         "system.nexus_base",
     )
     .await;
+    // Gate a soglia del consiglio di analisi (deterministico, DB-driven): sotto la
+    // soglia di complessita' la direttiva <consiglio_analisi> (mig 0549) viene
+    // rimossa dal system prompt (task banale -> percorso agentico diretto); sopra
+    // soglia resta e il modello convoca le figure. Punto unico: gate_council_directive.
+    let system_prompt =
+        crate::prompt_templates::gate_council_directive(&state.db, system_prompt, &body.content)
+            .await;
 
     let system_context = {
         let mut ctx = system_prompt;

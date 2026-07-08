@@ -255,11 +255,9 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
           "enum": [
             "plan", "explore", "implement", "verify", "review",
             "rust_implementer", "python_implementer", "frontend_implementer",
-            "db_architect", "doc_writer", "test_author",
-            "program_manager", "project_manager", "functional_analyst",
-            "software_architect", "sysadmin", "security_engineer"
+            "db_architect", "doc_writer", "test_author"
           ],
-          "description": "Tipo di sub-agent. SCEGLI implementativi (rust_implementer/python_implementer/frontend_implementer/db_architect/doc_writer/test_author) per creare/modificare file. SCEGLI explore solo per analisi senza scrittura. Le FIGURE DI ANALISI del consiglio (program_manager/project_manager/functional_analyst/software_architect/sysadmin/security_engineer) sono READ-ONLY: convocale a MONTE per far analizzare la richiesta dalle diverse prospettive PRIMA di pianificare; ognuna chiude con advisory_verdict. 'implement' e' il fallback generico se nessun specialista combacia."
+          "description": "Tipo di sub-agent. SCEGLI implementativi (rust_implementer/python_implementer/frontend_implementer/db_architect/doc_writer/test_author) per creare/modificare file. SCEGLI explore solo per analisi senza scrittura. Le FIGURE DI ANALISI del consiglio (program_manager/project_manager/functional_analyst/software_architect/sysadmin/security_engineer) sono READ-ONLY: convocale a MONTE per far analizzare la richiesta dalle diverse prospettive PRIMA di pianificare; ognuna chiude con advisory_verdict. 'implement' e' il fallback generico se nessun specialista combacia. NB: l'enum qui e' un SEED di fallback; a runtime il catalogo del run principale (build_tools_json_for_agent) lo SOSTITUISCE con i kind reali da nexus_subagent_definitions (regola G/L: registry DB unica fonte)."
         },
         "task": {
           "type": "string",
@@ -298,11 +296,9 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
                 "enum": [
                   "plan", "explore", "implement", "verify", "review",
                   "rust_implementer", "python_implementer", "frontend_implementer",
-                  "db_architect", "doc_writer", "test_author",
-                  "program_manager", "project_manager", "functional_analyst",
-                  "software_architect", "sysadmin", "security_engineer"
+                  "db_architect", "doc_writer", "test_author"
                 ],
-                "description": "Tipo di sub-agent (vedi dispatch_subagent per la guida; le 6 figure di analisi read-only del consiglio sono convocabili qui in batch)"
+                "description": "Tipo di sub-agent (vedi dispatch_subagent per la guida; le 6 figure di analisi read-only del consiglio sono convocabili qui in batch). Enum SEED: a runtime sostituito coi kind da nexus_subagent_definitions."
               },
               "task": {"type": "string", "description": "Descrizione COMPLETA e AUTONOMA del task"},
               "context": {"type": "string", "description": "Contesto aggiuntivo opzionale"},

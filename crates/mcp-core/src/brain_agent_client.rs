@@ -374,6 +374,72 @@ fn load_base_agent_tools() -> Value {
         .unwrap_or_else(|_| json!([]))
 }
 
+/// Sostituisce l'enum `kind` dei tool dispatch_subagent(s) coi kind reali passati
+/// (regola G/L: registry DB unica fonte, niente enum hardcoded nello schema).
+/// PURA: manipola il JSON del catalogo. `kinds` vuoto -> no-op (mantiene il SEED
+/// statico). PUNTO UNICO della conoscenza "dove vive l'enum kind nei due schemi
+/// dispatch" (singolare: kind.enum; plurale: tasks.items.kind.enum).
+fn apply_dispatch_kinds_enum(tools: &mut Value, kinds: &[String]) {
+    if kinds.is_empty() {
+        return;
+    }
+    let enum_val = Value::Array(kinds.iter().map(|k| Value::String(k.clone())).collect());
+    let Some(arr) = tools.as_array_mut() else {
+        return;
+    };
+    for t in arr.iter_mut() {
+        match t.get("name").and_then(Value::as_str) {
+            Some("dispatch_subagent") => {
+                if let Some(e) = t.pointer_mut("/input_schema/properties/kind/enum") {
+                    *e = enum_val.clone();
+                }
+            }
+            Some("dispatch_subagents") => {
+                if let Some(e) =
+                    t.pointer_mut("/input_schema/properties/tasks/items/properties/kind/enum")
+                {
+                    *e = enum_val.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_kinds_enum_tests {
+    use super::*;
+
+    #[test]
+    fn sostituisce_enum_kind_dei_due_dispatch() {
+        let mut tools = json!([
+            {"name": "dispatch_subagent", "input_schema": {"properties": {"kind": {"type": "string", "enum": ["plan"]}}}},
+            {"name": "dispatch_subagents", "input_schema": {"properties": {"tasks": {"items": {"properties": {"kind": {"enum": ["plan"]}}}}}}},
+            {"name": "read_file", "input_schema": {"properties": {}}}
+        ]);
+        apply_dispatch_kinds_enum(&mut tools, &["plan".to_string(), "security_engineer".to_string()]);
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]["kind"]["enum"],
+            json!(["plan", "security_engineer"])
+        );
+        assert_eq!(
+            tools[1]["input_schema"]["properties"]["tasks"]["items"]["properties"]["kind"]["enum"],
+            json!(["plan", "security_engineer"])
+        );
+        // Tool non-dispatch intatto.
+        assert!(tools[2]["input_schema"]["properties"].get("kind").is_none());
+    }
+
+    #[test]
+    fn kinds_vuoto_no_op_mantiene_seed() {
+        let mut tools = json!([
+            {"name": "dispatch_subagent", "input_schema": {"properties": {"kind": {"enum": ["plan"]}}}}
+        ]);
+        apply_dispatch_kinds_enum(&mut tools, &[]);
+        assert_eq!(tools[0]["input_schema"]["properties"]["kind"]["enum"], json!(["plan"]));
+    }
+}
+
 /// Compone il set completo di tool prima del gating per automation_mode:
 /// se il catalogo MCP e' piccolo (< soglia, > 0) include le definizioni MCP
 /// dirette; altrimenti resta in discovery mode con i soli `base_tools`.
@@ -425,7 +491,15 @@ pub async fn build_tools_json_for_agent(
 ) -> Value {
     let hard_limit = load_mcp_tool_hard_limit(db).await;
     let mcp_tool_count = count_accessible_mcp_tools(db, user_id, project_id).await;
-    let base_tools = load_base_agent_tools();
+    let mut base_tools = load_base_agent_tools();
+    // Regola G/L: l'enum `kind` dei tool dispatch_subagent(s) e' generato a runtime
+    // dal registry DB (nexus_subagent_definitions ∩ whitelist runtime), non hardcoded
+    // nel catalogo statico: aggiungere un kind/figura in DB lo rende convocabile senza
+    // toccare lo schema. Lista vuota (DB irraggiungibile) -> resta il SEED del catalogo.
+    apply_dispatch_kinds_enum(
+        &mut base_tools,
+        &crate::agent_tools::subagent_native::convocable_kinds(db).await,
+    );
     let full_tools =
         assemble_full_tools(db, user_id, project_id, mcp_tool_count, hard_limit, base_tools).await;
 

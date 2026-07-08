@@ -18,6 +18,79 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // `crate::prompt_templates::{TemplateCache, get_template_or_default}`.
 pub use nexus_types::{get_template_or_default, TemplateCache};
 
+/// Sentinel e chiusura del blocco direttiva del consiglio (mig 0549), per lo strip
+/// deterministico quando il task e' sotto la soglia di complessita'.
+const COUNCIL_DIRECTIVE_SENTINEL: &str = "<!-- 0549:council_advisory -->";
+const COUNCIL_DIRECTIVE_END: &str = "</consiglio_analisi>";
+
+/// Rimuove il blocco `<consiglio_analisi>` (mig 0549) da un system prompt. PURA.
+/// Se il blocco non c'e' (sentinel o chiusura assenti) ritorna il prompt invariato.
+/// Toglie anche i newline che precedono il sentinel (l'append era `\n\n`), cosi'
+/// non resta spaziatura orfana. PUNTO UNICO dello strip (regola L).
+pub fn strip_council_directive(prompt: &str) -> String {
+    let Some(start) = prompt.find(COUNCIL_DIRECTIVE_SENTINEL) else {
+        return prompt.to_string();
+    };
+    let Some(end_rel) = prompt[start..].find(COUNCIL_DIRECTIVE_END) else {
+        return prompt.to_string();
+    };
+    let end = start + end_rel + COUNCIL_DIRECTIVE_END.len();
+    let head = prompt[..start].trim_end_matches('\n');
+    let mut out = String::with_capacity(head.len() + prompt.len().saturating_sub(end));
+    out.push_str(head);
+    out.push_str(&prompt[end..]);
+    out
+}
+
+/// Gate a SOGLIA del consiglio di analisi (regola G, DB-driven): sotto uno score di
+/// complessita' OGGETTIVO il consiglio non serve e la direttiva viene RIMOSSA dal
+/// system prompt (task banale -> percorso agentico diretto); sopra soglia la
+/// direttiva resta (il modello convoca le figure). Deterministico: lo score viene
+/// dal punto unico `estimate_prompt_complexity`, mai dal giudizio del modello.
+/// Soglia in `orchestrator.council_min_complexity` (0-100); assente -> default 40.
+/// PUNTO UNICO del gate; i call site che costruiscono il system prompt agentico
+/// delegano qui.
+pub async fn gate_council_directive(db: &PgPool, prompt: String, user_text: &str) -> String {
+    let min_complexity = nexus_auth::get_setting(db, "orchestrator.council_min_complexity")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(40);
+    let score = nexus_agent_graph::decisions::estimate_prompt_complexity(
+        user_text,
+        &nexus_agent_graph::decisions::AdaptiveBudgetConfig::default(),
+    );
+    if score < min_complexity {
+        strip_council_directive(&prompt)
+    } else {
+        prompt
+    }
+}
+
+#[cfg(test)]
+mod council_gate_tests {
+    use super::strip_council_directive;
+
+    #[test]
+    fn strip_rimuove_il_blocco_direttiva() {
+        let p = "PROMPT BASE.\n\n<!-- 0549:council_advisory -->\n<consiglio_analisi>\nblah\n</consiglio_analisi>";
+        let out = strip_council_directive(p);
+        assert_eq!(out, "PROMPT BASE.");
+        assert!(!out.contains("consiglio_analisi"));
+    }
+
+    #[test]
+    fn strip_conserva_coda_dopo_il_blocco() {
+        let p = "HEAD\n\n<!-- 0549:council_advisory -->\n<consiglio_analisi>\nX\n</consiglio_analisi>\n\nTAIL";
+        assert_eq!(strip_council_directive(p), "HEAD\n\nTAIL");
+    }
+
+    #[test]
+    fn strip_no_op_senza_blocco() {
+        let p = "PROMPT senza direttiva";
+        assert_eq!(strip_council_directive(p), p);
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
 pub struct PromptTemplate {
     pub id: i32,

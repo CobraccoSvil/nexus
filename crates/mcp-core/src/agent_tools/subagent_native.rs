@@ -192,6 +192,30 @@ async fn fetch_definition(
     }))
 }
 
+/// Kind di sub-agent CONVOCABILI dal run principale (regola G/L: registry DB unica
+/// fonte, niente enum hardcoded nello schema tool). Sono i kind con definition
+/// abilitata E presenti nella whitelist runtime
+/// (`orchestrator.subagent_kinds_whitelist`) — lo STESSO gate del Guard 1 del
+/// dispatcher, cosi' il modello vede esattamente i kind che potra' davvero
+/// dispatchare. Usati da `build_tools_json_for_agent` per generare a runtime l'enum
+/// `kind` dei tool dispatch_subagent(s), sostituendo il SEED statico del catalogo.
+/// Ordinati per output stabile. Lista vuota (DB irraggiungibile) -> il chiamante
+/// mantiene il seed statico.
+pub async fn convocable_kinds(db: &sqlx::PgPool) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT d.kind
+           FROM nexus_subagent_definitions d
+          WHERE d.is_enabled
+            AND d.kind = ANY(string_to_array(
+                COALESCE((SELECT value FROM settings
+                           WHERE key = 'orchestrator.subagent_kinds_whitelist'), ''), ','))
+          ORDER BY d.kind",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+}
+
 /// Risolve il system_text del sub-agente dal registry prompt (`nexus_prompt_templates`,
 /// stesso punto del brain `prompt_registry.get_prompt`). Vuoto -> errore (parita'
 /// col brain: prompt mancante -> sub-run fallito).
