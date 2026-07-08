@@ -42,33 +42,94 @@ pub fn strip_council_directive(prompt: &str) -> String {
     out
 }
 
-/// Gate a SOGLIA del consiglio di analisi (regola G, DB-driven): sotto uno score di
-/// complessita' OGGETTIVO il consiglio non serve e la direttiva viene RIMOSSA dal
-/// system prompt (task banale -> percorso agentico diretto); sopra soglia la
-/// direttiva resta (il modello convoca le figure). Deterministico: lo score viene
-/// dal punto unico `estimate_prompt_complexity`, mai dal giudizio del modello.
-/// Soglia in `orchestrator.council_min_complexity` (0-100); assente -> default 40.
-/// PUNTO UNICO del gate; i call site che costruiscono il system prompt agentico
-/// delegano qui.
+/// Conta quante keyword di AMBITO SENSIBILE il testo tocca (case-insensitive,
+/// substring). PURA. Il consiglio serve sui task a rischio di DOMINIO — auth/
+/// sicurezza, pagamenti, schema/migrazioni DB, azioni distruttive, privacy — non
+/// in base alla "quantita' di lavoro" (la metrica del gate precedente,
+/// `estimate_prompt_complexity`, pesava keyword di AZIONE come build/deploy/
+/// fullstack e mancava i task di sicurezza: un "aggiungi 2FA" otteneva score ~2).
+/// PUNTO UNICO della detection d'ambito sensibile (regola L). Keyword vuote/spazi
+/// ignorate.
+pub fn count_sensitive_domain_hits(text: &str, keywords: &[String]) -> usize {
+    let lower = text.to_lowercase();
+    keywords
+        .iter()
+        .filter_map(|k| {
+            let k = k.trim().to_lowercase();
+            if k.is_empty() {
+                None
+            } else {
+                Some(k)
+            }
+        })
+        .filter(|k| lower.contains(k.as_str()))
+        .count()
+}
+
+/// Gate ad AMBITO SENSIBILE del consiglio (regola G/H/L, DB-driven): il consiglio
+/// si attiva quando il task tocca ambiti a rischio (auth/sicurezza, pagamenti,
+/// schema/migrazioni DB, azioni distruttive, privacy), rilevati dalle keyword di
+/// dominio in `orchestrator.council_trigger_keywords` (CSV). Se le keyword toccate
+/// sono >= `orchestrator.council_min_trigger_hits` (default 1) la direttiva
+/// <consiglio_analisi> resta; altrimenti viene RIMOSSA (task ordinario -> percorso
+/// agentico diretto). Deterministico: keyword di DOMINIO, mai la "quantita' di
+/// lavoro". Config assente (DB hiccup) -> fail-open verso il consiglio (meglio un
+/// consiglio di troppo che perderne uno su un task sensibile). PUNTO UNICO del
+/// gate; i call site che costruiscono il system prompt agentico delegano qui.
 pub async fn gate_council_directive(db: &PgPool, prompt: String, user_text: &str) -> String {
-    let min_complexity = nexus_auth::get_setting(db, "orchestrator.council_min_complexity")
+    let keywords: Vec<String> = match nexus_auth::get_setting(db, "orchestrator.council_trigger_keywords")
         .await
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(40);
-    let score = nexus_agent_graph::decisions::estimate_prompt_complexity(
-        user_text,
-        &nexus_agent_graph::decisions::AdaptiveBudgetConfig::default(),
-    );
-    if score < min_complexity {
-        strip_council_directive(&prompt)
-    } else {
+    {
+        Some(csv) => csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => return prompt, // fail-open: nessuna config -> lascia la direttiva.
+    };
+    if keywords.is_empty() {
+        return prompt;
+    }
+    let min_hits = nexus_auth::get_setting(db, "orchestrator.council_min_trigger_hits")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    if count_sensitive_domain_hits(user_text, &keywords) >= min_hits {
         prompt
+    } else {
+        strip_council_directive(&prompt)
     }
 }
 
 #[cfg(test)]
 mod council_gate_tests {
-    use super::strip_council_directive;
+    use super::{count_sensitive_domain_hits, strip_council_directive};
+
+    #[test]
+    fn count_hits_rileva_ambiti_sensibili_non_quantita_lavoro() {
+        let kw = vec![
+            "autenticazione".to_string(),
+            "login".to_string(),
+            "otp".to_string(),
+            "sicurezza".to_string(),
+            "pagamento".to_string(),
+        ];
+        // Il task 2FA del test UI: 4 ambiti sensibili toccati -> consiglio attivo.
+        let task = "Aggiungi l'autenticazione a due fattori via email per il login \
+                    con codice OTP e gestisci la sicurezza";
+        assert_eq!(count_sensitive_domain_hits(task, &kw), 4);
+        // Task banale: 0 hit -> niente consiglio.
+        assert_eq!(
+            count_sensitive_domain_hits("correggi il typo nel bottone salva", &kw),
+            0
+        );
+        // Keyword vuote/spazi ignorate.
+        assert_eq!(
+            count_sensitive_domain_hits("login", &["".to_string(), "  ".to_string(), "login".to_string()]),
+            1
+        );
+    }
 
     #[test]
     fn strip_rimuove_il_blocco_direttiva() {
