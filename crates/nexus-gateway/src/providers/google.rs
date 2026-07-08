@@ -444,6 +444,11 @@ impl GoogleProvider {
         regions: &[String],
     ) -> anyhow::Result<reqwest::Response> {
         let mut last: Option<anyhow::Result<reqwest::Response>> = None;
+        // `true` finche' OGNI region provata risponde 404 (modello assente). Un
+        // errore di trasporto (transiente) o un non-404 lo azzera: l'auto-disable
+        // scatta SOLO su 404-in-tutte-le-region (segnale strutturale = modello non
+        // servibile in Vertex per il progetto), mai su un glitch temporaneo.
+        let mut all_404 = true;
         for region in regions {
             match self.post_body_in_region(backend, region, model, stream, body).await {
                 Ok(r) if r.status().as_u16() == 404 => {
@@ -483,6 +488,7 @@ impl GoogleProvider {
                         region = %region,
                         "vertex errore di trasporto, provo la region successiva"
                     );
+                    all_404 = false;
                     last = Some(Err(e));
                 }
             }
@@ -490,9 +496,56 @@ impl GoogleProvider {
         // Tutte le region hanno dato 404 (o errore di trasporto): ritorna l'ultimo
         // esito. `regions` non e' mai vuoto (discovery_locations garantito non
         // vuoto), quindi `last` e' sempre `Some`.
+        //
+        // AUTO-DISABLE 404-ovunque (regola H + M): se OGNI region ha risposto 404,
+        // il modello e' pubblicato nel listing Vertex ma NON servibile in inference
+        // per questo progetto/region (es. gemini-2.0-flash-001, gemma4). Il router
+        // continuerebbe a sceglierlo e a pagare il cambio-provider ad ogni run. Lo
+        // disabilitiamo nel catalog (best-effort, fail-open): il segnale e' il 404
+        // strutturato di TUTTE le region, mai un errore transiente (all_404 azzerato
+        // da qualunque Err di trasporto o non-404). Ripristino: ri-abilitazione
+        // manuale o via re-probe (follow-up), i modelli 404-ovunque raramente
+        // tornano servibili.
+        if all_404 {
+            self.mark_model_unavailable_all_regions(model).await;
+        }
         match last {
             Some(r) => r,
             None => anyhow::bail!("vertex: nessuna region candidata per il modello {model}"),
+        }
+    }
+
+    /// Disabilita nel catalog un modello Vertex risultato 404 in TUTTE le region
+    /// (auto-disable su segnale strutturato, regola H/M). Best-effort FAIL-OPEN: un
+    /// errore di persistenza NON tocca l'inference (che comunque fallira' con l'esito
+    /// 404 restituito al chiamante). `is_enabled = true` nella WHERE rende l'UPDATE un
+    /// no-op idempotente sui modelli gia' disabilitati. `auto_disabled_reason`
+    /// distingue questo motivo (ripristinabile via re-probe) dai disable di policy;
+    /// `reconcile_policy` NON ri-abilita i disable per fallimento (motivo != policy).
+    async fn mark_model_unavailable_all_regions(&self, model: &str) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        if let Err(e) = sqlx::query(
+            "UPDATE ai_price_catalog \
+             SET is_enabled = false, auto_disabled_reason = 'vertex_404_all_regions', \
+                 auto_disabled_at = NOW(), updated_at = NOW() \
+             WHERE provider = 'google' AND model = $1 AND is_enabled = true",
+        )
+        .bind(model)
+        .execute(db)
+        .await
+        {
+            tracing::warn!(
+                model = %model,
+                error = %e,
+                "vertex: auto-disable 404-ovunque fallito (best-effort)"
+            );
+        } else {
+            tracing::warn!(
+                model = %model,
+                "vertex: modello 404 in TUTTE le region -> auto-disabilitato nel catalog"
+            );
         }
     }
 
