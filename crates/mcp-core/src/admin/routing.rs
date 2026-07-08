@@ -156,13 +156,17 @@ pub async fn update_purpose_model(
 }
 
 /// Normalizza il valore del tier ricevuto dall'admin in un `Option<String>`
-/// adatto alla colonna `nexus_purpose_model.tier` (vincolo CHECK mig 0203):
-///   - 'light' | 'medium' | 'heavy' (case-insensitive) -> Some(valore normalizzato)
+/// adatto alla colonna `nexus_purpose_model.tier` (vincolo CHECK mig 0203, esteso
+/// alla scala a 5 livelli light|medium|high|heavy|frontier dalla mig 0547):
+///   - 'light' | 'medium' | 'high' | 'heavy' | 'frontier' (case-insensitive)
+///     -> Some(valore normalizzato)
 ///   - None / '' / 'static' / 'none' -> None (selezione statica)
 ///   - qualunque altro valore -> Err (il chiamante risponde 400)
 fn normalize_tier(raw: Option<&str>) -> Result<Option<String>, ()> {
     match raw.map(|s| s.trim().to_ascii_lowercase()) {
-        Some(t) if t == "light" || t == "medium" || t == "heavy" => Ok(Some(t)),
+        // Validazione delegata al PUNTO UNICO del vocabolario tier (regola L):
+        // la lista dei tier validi vive in un solo posto.
+        Some(t) if nexus_agent_graph::decisions::tiers::is_performance_tier(&t) => Ok(Some(t)),
         Some(t) if t.is_empty() || t == "static" || t == "none" => Ok(None),
         None => Ok(None),
         Some(_) => Err(()),
@@ -183,6 +187,12 @@ mod tests {
         assert_eq!(
             normalize_tier(Some(" heavy ")).unwrap(),
             Some("heavy".into())
+        );
+        // Scala a 5 livelli (mig 0528/0547): high e frontier ora accettati.
+        assert_eq!(normalize_tier(Some("high")).unwrap(), Some("high".into()));
+        assert_eq!(
+            normalize_tier(Some("FRONTIER")).unwrap(),
+            Some("frontier".into())
         );
     }
 

@@ -88,7 +88,7 @@ export function BehaviorModeSection({ config, setConfig, behaviorSaved }: Behavi
           <div style={{ fontSize: 12, color: "var(--color-textMuted)", lineHeight: 1.6 }}>
             Per ogni messaggio l&apos;orchestratore analizza:
             <br />① <strong>Intent</strong> (fix / chat / architettura…) e <strong>complessità</strong> (token stimati)
-            <br />② Determina il <strong>tier richiesto</strong> (light / medium / heavy) e la <strong>capability</strong> necessaria
+            <br />② Determina il <strong>tier richiesto</strong> (light / medium / high / heavy / frontier) e la <strong>capability</strong> necessaria
             <br />③ Interroga il <strong>catalogo modelli</strong> ordinando per costo — sceglie il più economico che soddisfa i requisiti
             <br />④ Se il catalogo è vuoto, usa la matrice Bilanciata come fallback
           </div>

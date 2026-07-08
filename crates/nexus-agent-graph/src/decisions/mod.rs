@@ -30,6 +30,11 @@
 //!     l'I/O (catena DB + cooldown) e' la porta [`crate::runtime::ports::EscalationPort`].
 //!   - [`helpers`]: tool_choice forcing, segnale strutturale, action-oriented,
 //!     stima complessita' e budget iterazioni.
+//!   - [`tiers`]: PUNTO UNICO del vocabolario performance-tier (scala a 5 livelli
+//!     light<medium<high<heavy<frontier): ordinamento (`tier_rank`) e validazione
+//!     (`is_performance_tier`). I due `tier_rank` storici (escalation qui,
+//!     routing_matrix_auto_promoter in mcp-core) e i validatori admin/pavimento
+//!     agentico DELEGANO qui invece di re-elencare i tier.
 //!   - [`loop_signatures`]: RILEVAZIONE pura del loop di tool call per signature
 //!     ripetuta + aggiornamento del contatore di esplorazione (PUNTO UNICO della
 //!     signature anti-loop dell'executor; l'auto-escalation I/O resta nel nodo).
@@ -72,6 +77,7 @@ pub mod progress_controller;
 pub mod reward;
 pub mod scale_reason;
 pub mod text_repetition;
+pub mod tiers;
 pub mod tool_dispatch;
 pub mod turn_focus;
 

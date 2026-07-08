@@ -759,10 +759,14 @@ function tdStyleR(tc: Tc): React.CSSProperties {
 }
 
 function tierBadge(tc: Tc, tier: string): React.CSSProperties {
+  // Scala a 5 livelli (light < medium < high < heavy < frontier, mig 0528/0547):
+  // colori progressivi per capacita' crescente.
   const colors: Record<string, string> = {
     light: "#10b981",
     medium: "#3b82f6",
+    high: "#6366f1",
     heavy: "#f59e0b",
+    frontier: "#ef4444",
   };
   const bg = colors[tier] || tc.textMuted;
   return {

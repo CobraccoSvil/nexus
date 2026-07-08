@@ -633,7 +633,8 @@ pub struct CatalogEntry {
 /// Filtri opzionali per il lookup catalogo via query string.
 #[derive(Debug, serde::Deserialize)]
 pub struct CatalogQuery {
-    /// Filtra per tier (light | medium | heavy). Se None ritorna tutti.
+    /// Filtra per tier (light | medium | high | heavy | frontier, scala a 5
+    /// livelli mig 0528/0547). Se None ritorna tutti.
     #[serde(default)]
     pub tier: Option<String>,
     /// Filtra per provider esatto (anthropic, openai, ...). None = tutti.

@@ -34,11 +34,15 @@ export interface PurposeModelConfig {
   requires_tool_use?: boolean;
 }
 
+// Scala di capacita' a 5 livelli (light < medium < high < heavy < frontier),
+// allineata a ai_price_catalog.performance_tier (mig 0528) e ai CHECK vivi (0547).
 export const PURPOSE_TIER_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "", label: "Statico (modello fisso)" },
   { value: "light", label: "Light" },
   { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
   { value: "heavy", label: "Heavy" },
+  { value: "frontier", label: "Frontier" },
 ];
 
 export const PROVIDERS: ProviderName[] = ["anthropic", "openai", "google", "deepseek", "mistral"];

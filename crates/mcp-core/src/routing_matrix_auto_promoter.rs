@@ -740,15 +740,12 @@ pub(crate) fn tier_score(preferred: &str, actual: &str) -> f32 {
     }
 }
 
+/// Rank 0-based del performance-tier (`light`=0 ... `frontier`=4; sconosciuto ->
+/// `medium`=1). DELEGA al PUNTO UNICO del vocabolario tier
+/// ([`nexus_agent_graph::decisions::tiers::tier_rank`], scala 1..=5) e lo riporta
+/// alla base 0 usata qui: nessuna lista di tier duplicata (regola L).
 pub(crate) fn tier_rank(tier: &str) -> i32 {
-    match tier {
-        "frontier" => 4,
-        "heavy" => 3,
-        "high" => 2,
-        "medium" => 1,
-        "light" => 0,
-        _ => 1,
-    }
+    nexus_agent_graph::decisions::tiers::tier_rank(tier) as i32 - 1
 }
 
 fn cost_score(

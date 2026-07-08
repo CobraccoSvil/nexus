@@ -35,17 +35,12 @@ use crate::decisions::governance::{
 };
 
 /// Rank numerico del performance-tier per l'ordinamento di escalation (piu' alto =
-/// piu' capace). Scala a 5 livelli (light<medium<high<heavy<frontier).
-/// Sconosciuto/assente -> `medium` (neutro): non penalizza ne' premia.
+/// piu' capace). DELEGA al PUNTO UNICO del vocabolario tier
+/// ([`super::tiers::tier_rank`], scala a 5 livelli light<medium<high<heavy<frontier;
+/// sconosciuto/assente -> `medium` neutro). Wrapper sottile che adatta l'`Option`
+/// del chiamante (assente == "" == medium neutro).
 fn tier_rank(tier: Option<&str>) -> u8 {
-    match tier.map(|t| t.trim().to_ascii_lowercase()).as_deref() {
-        Some("light") => 1,
-        Some("medium") => 2,
-        Some("high") => 3,
-        Some("heavy") => 4,
-        Some("frontier") => 5,
-        _ => 2,
-    }
+    super::tiers::tier_rank(tier.unwrap_or(""))
 }
 
 /// Una voce della catena di escalation intra-provider

@@ -9,7 +9,7 @@ export interface ModelCatalogEntry {
   inputCostPerMillion: number;
   outputCostPerMillion: number;
   currency: string;
-  performanceTier: "light" | "medium" | "heavy";
+  performanceTier: "light" | "medium" | "high" | "heavy" | "frontier";
   speedTier: "fast" | "medium" | "slow";
   capabilities: string[];
   contextWindow: number;

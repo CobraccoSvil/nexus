@@ -163,9 +163,11 @@ const AGENTIC_MIN_TIER_KEY: &str = "agent.routing.agentic_min_tier";
 const AGENTIC_MIN_TIER_DEFAULT: &str = "medium";
 
 /// Legge il pavimento di tier agentico dal DB (punto unico `get_setting`,
-/// cache 60s di nexus-auth). Valori validi: light/medium/heavy. Qualunque
-/// valore non riconosciuto o assenza del setting -> [`AGENTIC_MIN_TIER_DEFAULT`].
-/// Best-effort: un errore DB non fa fallire il routing, degrada al default.
+/// cache 60s di nexus-auth). Valori validi: la scala a 5 livelli del catalog
+/// light/medium/high/heavy/frontier (mig 0528/0547; performance_tier di
+/// ai_price_catalog). Qualunque valore non riconosciuto o assenza del setting ->
+/// [`AGENTIC_MIN_TIER_DEFAULT`]. Best-effort: un errore DB non fa fallire il
+/// routing, degrada al default.
 async fn agentic_min_tier(db: &PgPool) -> String {
     let raw = crate::settings::get_setting(db, AGENTIC_MIN_TIER_KEY)
         .await
@@ -173,14 +175,19 @@ async fn agentic_min_tier(db: &PgPool) -> String {
         .flatten()
         .map(|v| v.trim().to_lowercase());
     match raw.as_deref() {
-        Some("light") | Some("medium") | Some("heavy") => raw.unwrap(),
+        // Validazione delegata al PUNTO UNICO del vocabolario tier (regola L):
+        // niente lista di tier duplicata qui. Un valore fuori scala -> default.
+        Some(t) if nexus_agent_graph::decisions::tiers::is_performance_tier(t) => raw.unwrap(),
         _ => AGENTIC_MIN_TIER_DEFAULT.to_string(),
     }
 }
 
-/// Alza `required_tier` ad almeno `floor` quando il turno e' AGENTICO, usando il
-/// PUNTO UNICO dell'ordinamento tier ([`crate::routing_matrix_auto_promoter::tier_rank`]):
-/// light < medium < heavy. Funzione PURA (testabile senza DB). Per i turni NON
+/// Alza `required_tier` ad almeno `floor` quando il turno e' AGENTICO, usando
+/// l'ordinamento tier di [`crate::routing_matrix_auto_promoter::tier_rank`], a sua
+/// volta wrapper del PUNTO UNICO del vocabolario
+/// ([`nexus_agent_graph::decisions::tiers`]): light < medium < high < heavy <
+/// frontier (5 livelli, mig 0528/0547). Funzione PURA (testabile senza DB). Per i
+/// turni NON
 /// agentici e' un no-op (ritorna `required_tier` invariato): la chat semplice
 /// resta libera di usare 'light'. Se `required_tier` e' gia' >= `floor` non lo
 /// abbassa MAI (es. un task heavy resta heavy anche con pavimento 'medium').
