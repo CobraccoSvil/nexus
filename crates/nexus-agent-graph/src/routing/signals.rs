@@ -1400,46 +1400,17 @@ pub fn final_gate_eligible(state: &AgentState, cfg: &RoutingConfig) -> bool {
 //  Isolamento todo (todo_isolation_active, orchestrator_config.py)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Modalita' di automazione che attivano l'esecuzione autonoma continua.
-/// `_AUTONOMOUS_MODES` Python (confronto case-insensitive su stringa cruda).
-const AUTONOMOUS_MODES: &[&str] = &["automatic", "automatico", "continuous", "continuo"];
-
 /// True se il run deve eseguire i todo come sub-run ISOLATE sequenziali.
 /// Vedi `todo_isolation_active`. Richiede TUTTE e tre: plan_phase_active True,
 /// modalita' autonoma, setting abilitato.
-///
-/// NB: in Python il confronto della modalita' usa la stringa cruda di
-/// `automation_mode or behavior_mode`; qui `automation_mode` e' un enum, quindi
-/// ne ricaviamo la forma stringa snake_case (serde) prima del fallback su
-/// `behavior_mode`. Le label dell'enum (`automatic`/`continuous`) sono incluse
-/// in `AUTONOMOUS_MODES`, quindi il comportamento e' identico.
 pub fn todo_isolation_active(state: &AgentState, cfg: &RoutingConfig) -> bool {
     if state.plan_phase_active != Some(true) {
         return false;
     }
-    let mode = automation_or_behavior_mode(state);
-    if !AUTONOMOUS_MODES.contains(&mode.as_str()) {
+    if !state.is_autonomous_run() {
         return false;
     }
     cfg.todo_isolation_enabled
-}
-
-/// Stringa di modalita' per il gate isolamento/G1: `automation_mode` (enum ->
-/// snake_case) con fallback a `behavior_mode`, lower-case e trimmata. Replica
-/// `str(state.get("automation_mode") or state.get("behavior_mode") or "")`.
-fn automation_or_behavior_mode(state: &AgentState) -> String {
-    if let Some(mode) = state.automation_mode {
-        // serde dell'enum produce la label snake_case ("automatic", ...).
-        if let Value::String(s) = serde_json::to_value(mode).unwrap_or(Value::Null) {
-            return s.trim().to_lowercase();
-        }
-    }
-    state
-        .behavior_mode
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .to_lowercase()
 }
 
 #[cfg(test)]

@@ -72,7 +72,13 @@ pub enum AutomationMode {
     Automatic,
 }
 
+/// Identificatore automation_mode non canonico (solo `study|confirm|automatic`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidAutomationMode;
+
 impl AutomationMode {
+    pub const CANONICAL: [&'static str; 3] = ["study", "confirm", "automatic"];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Study => "study",
@@ -81,21 +87,35 @@ impl AutomationMode {
         }
     }
 
-    /// Parsa la modalita' da stringa (DB o body HTTP), case-insensitive e
-    /// tollerante (accetta sinonimi it/en). Punto unico (regola L): `parse_automation_mode`
-    /// e i lettori della colonna `chat_sessions.automation_mode` delegano qui.
-    /// Default `Confirm` (la modalita' piu' conservativa) per valore mancante/ignoto.
-    pub fn from_str_lenient(value: Option<&str>) -> Self {
-        match value
+    /// Parsa l'identificatore canonico (ASCII lowercase esatto). Punto unico
+    /// (regola L): `parse_automation_mode` e i lettori di
+    /// `chat_sessions.automation_mode` delegano qui. Valore mancante/vuoto ->
+    /// `Confirm` (default conservativo della colonna DB).
+    pub fn parse(value: Option<&str>) -> Self {
+        Self::try_parse(value).unwrap_or(Self::Confirm)
+    }
+
+    /// Parsa l'identificatore canonico. Rifiuta sinonimi e varianti non inglesi.
+    pub fn try_parse(value: Option<&str>) -> Result<Self, InvalidAutomationMode> {
+        let s = value
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .unwrap_or("confirm")
-            .to_lowercase()
-            .as_str()
-        {
-            "study" | "studio" => Self::Study,
-            "automatic" | "automatico" | "auto" => Self::Automatic,
-            _ => Self::Confirm,
+            .ok_or(InvalidAutomationMode)?;
+        match s {
+            "study" => Ok(Self::Study),
+            "confirm" => Ok(Self::Confirm),
+            "automatic" => Ok(Self::Automatic),
+            _ => Err(InvalidAutomationMode),
+        }
+    }
+
+    /// Mappa nel enum del grafo agente (None = study, niente automazione mutativa).
+    pub fn to_graph_mode(self) -> nexus_agent_graph::state::AutomationMode {
+        use nexus_agent_graph::state::AutomationMode as GraphMode;
+        match self {
+            Self::Study => GraphMode::None,
+            Self::Confirm => GraphMode::Confirm,
+            Self::Automatic => GraphMode::Automatic,
         }
     }
 
@@ -150,4 +170,42 @@ pub struct Orchestrator {
     /// (provider, model). Piu' precisa di (intent, behavior_mode); il
     /// router la prova per prima e cade su routing classico se no-match.
     pub(crate) slots_matrix: crate::routing_slots::SlotsRoutingMatrixCache,
+}
+
+#[cfg(test)]
+mod automation_mode_tests {
+    use super::{AutomationMode, InvalidAutomationMode};
+
+    #[test]
+    fn try_parse_accepts_canonical_only() {
+        assert_eq!(
+            AutomationMode::try_parse(Some("automatic")).unwrap(),
+            AutomationMode::Automatic
+        );
+        assert_eq!(
+            AutomationMode::try_parse(Some("confirm")).unwrap(),
+            AutomationMode::Confirm
+        );
+        assert_eq!(
+            AutomationMode::try_parse(Some("study")).unwrap(),
+            AutomationMode::Study
+        );
+    }
+
+    #[test]
+    fn try_parse_rejects_synonyms() {
+        for bad in ["automatico", "auto", "continuo", "conferma", "studio", "Automatic"] {
+            assert_eq!(
+                AutomationMode::try_parse(Some(bad)),
+                Err(InvalidAutomationMode),
+                "unexpected accept: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_defaults_missing_to_confirm() {
+        assert_eq!(AutomationMode::parse(None), AutomationMode::Confirm);
+        assert_eq!(AutomationMode::parse(Some("")), AutomationMode::Confirm);
+    }
 }

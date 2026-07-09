@@ -47,9 +47,9 @@ impl std::str::FromStr for SupervisorMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s.trim().to_ascii_lowercase().as_str() {
-            "anomaly" | "c" => Self::Anomaly,
-            "interleaved" | "a" => Self::Interleaved,
-            "continuous" | "b" => Self::Continuous,
+            "anomaly" => Self::Anomaly,
+            "interleaved" => Self::Interleaved,
+            "continuous" => Self::Continuous,
             _ => Self::None,
         })
     }
@@ -69,6 +69,22 @@ pub enum AutomationMode {
     Automatic,
     /// Modalita' continua (catena di turni autonomi).
     Continuous,
+}
+
+impl AutomationMode {
+    /// True se il run procede senza HITL strutturale (automatic o continuous).
+    pub fn is_autonomous(self) -> bool {
+        matches!(self, Self::Automatic | Self::Continuous)
+    }
+
+    /// Etichetta wire canonica per hint di autonomia (`automatic` / `continuous`).
+    pub fn wire_label(self) -> Option<&'static str> {
+        match self {
+            Self::Automatic => Some("automatic"),
+            Self::Continuous => Some("continuous"),
+            Self::None | Self::Confirm => None,
+        }
+    }
 }
 
 /// Complessita' del task stimata dal classifier agentico (`state.py:31`).
@@ -595,6 +611,13 @@ impl AgentState {
     pub fn is_pending_clarify(&self) -> bool {
         self.pending_clarify.unwrap_or(false)
     }
+
+    /// True se `automation_mode` e' autonomo (`automatic` / `continuous`).
+    pub fn is_autonomous_run(&self) -> bool {
+        self.automation_mode
+            .map(AutomationMode::is_autonomous)
+            .unwrap_or(false)
+    }
 }
 
 /// Impl del trait di runtime `nexus_graph::GraphState`.
@@ -630,6 +653,24 @@ impl nexus_graph::GraphState for AgentState {
         // background (fan-in, Fase D). Il resume azzera il flag specifico.
         AgentState::is_awaiting_confirmation(self) || AgentState::is_awaiting_subagents(self)
     }
+
+    fn interrupt_resume_node(
+        &self,
+        interrupted_after: nexus_graph::node::NodeId,
+        routed_next: nexus_graph::node::NodeId,
+    ) -> nexus_graph::node::NodeId {
+        // HITL: tool_dispatch ha sospeso PRIMA di eseguire i mutators pendenti.
+        // Al resume rientra in tool_dispatch (con approved=true nel delta), non
+        // nell'executor gia' instradato (evita un turno LLM che consumerebbe il
+        // prossimo script prima del dispatch dei pending approvati).
+        if self.is_awaiting_confirmation()
+            && interrupted_after == nexus_graph::node::NodeId::ToolDispatch
+        {
+            interrupted_after
+        } else {
+            routed_next
+        }
+    }
 }
 
 #[cfg(test)]
@@ -664,6 +705,26 @@ mod tests {
                 ..Default::default()
             }),
             "Some(false) azzera l'interrupt (load-bearing per il resume)"
+        );
+    }
+
+    #[test]
+    fn interrupt_resume_node_hitl_riparte_da_tool_dispatch() {
+        use nexus_graph::GraphState;
+        use nexus_graph::node::NodeId;
+        let hitl = AgentState {
+            awaiting_confirmation: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            GraphState::interrupt_resume_node(&hitl, NodeId::ToolDispatch, NodeId::Executor),
+            NodeId::ToolDispatch,
+            "HITL sospeso in tool_dispatch -> resume li', non nell'executor instradato"
+        );
+        assert_eq!(
+            GraphState::interrupt_resume_node(&hitl, NodeId::Executor, NodeId::FinalGate),
+            NodeId::FinalGate,
+            "altri nodi restano sul routed_next"
         );
     }
 

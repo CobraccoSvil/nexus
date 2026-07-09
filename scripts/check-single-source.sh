@@ -95,6 +95,27 @@ assert_single "flag separazione DB" 'get_setting\(.*"db\.project_separation\.ena
 assert_single "registry DB metadati progetto" "connection_role = 'nexus_metadata'" 'crates/nexus-project-pools/*' crates
 assert_single "directory nexus_data_routing" '(FROM|INTO) nexus_data_routing' 'crates/nexus-project-pools/*' crates
 
+# Aggregazione problemi ripetitivi (2026-07-09): chiave di gruppo semantica e
+# pipeline dedup+raggruppamento del pannello Problemi. Punto unico:
+# project_workspace/problem_aggregation.rs; get_project_problems delega.
+assert_single "problem_group_key" 'fn problem_group_key' 'crates/mcp-core/src/project_workspace/problem_aggregation.rs' crates
+assert_single "aggregate_problems" 'fn aggregate_problems' 'crates/mcp-core/src/project_workspace/problem_aggregation.rs' crates
+
+# Identificatori canonici (2026-07-09): enum/command identifiers in inglese,
+# niente sinonimi IT negli parser Rust (regola CLAUDE.md sezione N).
+alias_hits="$(grep -rEn \
+  '\| "automatico"|\| "continuo"|\| "conferma"|\| "studio"|from_str_lenient' \
+  crates/mcp-core crates/nexus-agent-graph \
+  --include='*.rs' \
+  2>/dev/null || true)"
+if [[ -n "$alias_hits" ]]; then
+  echo "!! canonical-identifiers: sinonimi IT o from_str_lenient trovati:" >&2
+  echo "$alias_hits" >&2
+  fail=1
+else
+  echo "OK canonical-identifiers: nessun sinonimo IT nei parser enum"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -155,10 +155,16 @@ export async function confirmAgentRun(
   runId: string,
   approved: boolean,
 ): Promise<{ runId: string; status: string }> {
-  return fetchJson(`${API_BASE}/api/chat/agent-runs/${runId}/confirm`, {
-    method: "POST",
-    body: JSON.stringify({ approved }),
-  });
+  // Il resume nativo gira in background: la POST risponde subito. Timeout breve
+  // basta per il round-trip DB; evita attese da 30s del default fetchJson.
+  return fetchJson(
+    `${API_BASE}/api/chat/agent-runs/${runId}/confirm`,
+    {
+      method: "POST",
+      body: JSON.stringify({ approved }),
+    },
+    15_000,
+  );
 }
 
 export async function cancelAgentRun(

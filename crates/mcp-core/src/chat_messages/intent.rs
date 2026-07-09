@@ -1,9 +1,8 @@
 use super::*;
 
 pub(crate) fn parse_automation_mode(value: Option<&str>) -> AutomationMode {
-    // Delega al punto unico (regola L): stessa logica usata anche per leggere
-    // la colonna persistita chat_sessions.automation_mode.
-    AutomationMode::from_str_lenient(value)
+    // Delega al punto unico (regola L): identificatori canonici inglesi only.
+    AutomationMode::parse(value)
 }
 
 /// Legge la modalita' di automazione persistita sulla sessione (mig 0371).
@@ -18,7 +17,7 @@ pub(crate) async fn read_session_automation_mode(db: &PgPool, session_id: Uuid) 
             .await
             .ok()
             .flatten();
-    AutomationMode::from_str_lenient(raw.as_deref())
+    AutomationMode::parse(raw.as_deref())
 }
 
 /// Guard-rail anti-mismatch: verifica che model appartenga a provider.

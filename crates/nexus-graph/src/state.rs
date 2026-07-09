@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::node::NodeId;
+
 /// Aggiornamento di stato prodotto da un nodo. Opaco al runtime.
 ///
 /// Internamente e' una mappa JSON: chiave assente = "non toccare" (no-op),
@@ -74,4 +76,12 @@ pub trait GraphState: Send + Sync {
     /// senza conoscere il motivo; il resume inietta il delta che azzera il flag
     /// specifico. PUNTO UNICO dell'interrupt-resume (regola L).
     fn is_awaiting_interrupt(&self) -> bool;
+
+    /// Nodo da cui riprendere dopo un interrupt. Default: `routed_next`
+    /// (`interrupt_before` semantics). Lo stato concreto puo' override — es.
+    /// HITL in `tool_dispatch` riparte da quel nodo per eseguire i pending
+    /// approvati, non dall'executor gia' instradato.
+    fn interrupt_resume_node(&self, _interrupted_after: NodeId, routed_next: NodeId) -> NodeId {
+        routed_next
+    }
 }

@@ -2313,6 +2313,9 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         }
     }
 
+    let graph_automation_mode = parse_automation_mode(&input.automation_mode);
+    let skip_hitl = automation_mode_skips_hitl(graph_automation_mode);
+
     AgentState {
         messages,
         thread_id: Some(input.run_id.to_string()),
@@ -2325,7 +2328,8 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         provider_override: Some(input.provider.clone()),
         model_override: Some(input.model.clone()),
         tools_json: tools,
-        automation_mode: parse_automation_mode(&input.automation_mode),
+        automation_mode: graph_automation_mode,
+        approved: skip_hitl.then_some(true),
         supervisor_mode: Some(input.supervisor_mode),
         declared_outcome,
         stop_reason,
@@ -2354,10 +2358,24 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
     }
 }
 
-/// Parsing della modalita' automazione testuale nell'enum dello stato. Stringa
-/// ignota -> `None` (lo stato usa il default a valle, nessun panic).
+/// Parsing della modalita' automazione nel enum del grafo. Delega al punto unico
+/// `orchestrator::AutomationMode::try_parse` (identificatori canonici inglesi).
 fn parse_automation_mode(s: &str) -> Option<nexus_agent_graph::AutomationMode> {
-    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    crate::orchestrator::AutomationMode::try_parse(Some(trimmed))
+        .ok()
+        .map(|m| m.to_graph_mode())
+}
+
+fn automation_mode_skips_hitl(mode: Option<nexus_agent_graph::AutomationMode>) -> bool {
+    matches!(
+        mode,
+        Some(nexus_agent_graph::state::AutomationMode::Automatic)
+            | Some(nexus_agent_graph::state::AutomationMode::Continuous)
+    )
 }
 
 /// Esegue un run sul motore nativo end-to-end: costruisce engine+ctx,
@@ -2394,7 +2412,7 @@ pub async fn resume_native(
     input: &NativeRunInput,
     resume_message: &str,
 ) -> anyhow::Result<NativeRunOutcome> {
-    let resume_delta = build_resume_delta(resume_message);
+    let resume_delta = build_resume_delta(resume_message, Some(&input.automation_mode));
     let outcome = run_engine(
         deps,
         input,
@@ -2409,14 +2427,17 @@ pub async fn resume_native(
 /// `awaiting_confirmation` e accoda il messaggio umano di approvazione (campo
 /// `messages`, reducer append). Costruito col delta TIPIZZATO del grafo ->
 /// `into_opaque` (punto unico tipizzato->opaco, regola L).
-fn build_resume_delta(resume_message: &str) -> nexus_graph::StateDelta {
+fn build_resume_delta(resume_message: &str, automation_mode: Option<&str>) -> nexus_graph::StateDelta {
     use nexus_agent_graph::state::{Message, MessageContent};
+    let parsed_mode = automation_mode.and_then(parse_automation_mode);
     let typed = nexus_agent_graph::state::StateDelta {
         // Azzera il predicato di interrupt: senza, il motore si re-interrompe sul
         // checkpoint ancora-in-attesa (loop di conferma).
         awaiting_confirmation: Some(Some(false)),
         // Dopo l'approvazione esegui i tool mutativi senza re-interrompere.
         approved: Some(Some(true)),
+        // Ripara automation_mode su checkpoint legacy (None -> HITL spurio).
+        automation_mode: parsed_mode.map(Some),
         // Accoda l'approvazione come turno utente: l'executor la rilegge nel
         // contesto come ultimo messaggio (parita' col `resume_message` iniettato
         // dal brain nello state al `/agent/approve`).
@@ -3541,7 +3562,7 @@ mod tests {
             ..Default::default()
         };
         // Applica il delta di resume (via reducer, punto unico).
-        let delta = build_resume_delta("Azioni confermate dall'utente.");
+        let delta = build_resume_delta("Azioni confermate dall'utente.", None);
         state.merge(delta);
 
         assert!(
@@ -3664,14 +3685,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_automation_mode_robusto() {
-        // Una modalita' nota deve parsare; una ignota -> None (nessun panic).
-        let known = parse_automation_mode("automatic");
-        // Non asseriamo il valore esatto dell'enum (dipende dalla serde repr), solo
-        // che una stringa palesemente ignota non panica e da' None.
-        let unknown = parse_automation_mode("modalita-che-non-esiste-xyz");
-        assert!(unknown.is_none());
-        let _ = known; // la repr e' coperta dai test dello stato; qui basta no-panic
+    fn parse_automation_mode_canonical_only() {
+        use nexus_agent_graph::state::AutomationMode as GraphMode;
+        assert_eq!(
+            parse_automation_mode("automatic"),
+            Some(GraphMode::Automatic)
+        );
+        assert_eq!(parse_automation_mode("confirm"), Some(GraphMode::Confirm));
+        assert_eq!(parse_automation_mode("study"), Some(GraphMode::None));
+        assert!(parse_automation_mode("").is_none());
+        assert!(parse_automation_mode("automatico").is_none());
+        assert!(parse_automation_mode("continuo").is_none());
+        assert!(parse_automation_mode("modalita-che-non-esiste-xyz").is_none());
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
 import { iconButton } from "../../lib/icon-button-style";
 import type { EditorGroupState, EditorTabState, ProblemItem, UserProjectDetails } from "../../lib/api-client";
+import { expandProblemMarkers } from "../../lib/api/workspace";
 import type * as Monaco from "monaco-editor";
 import { MarkdownBlock } from "../chat/markdown-renderer";
 
@@ -138,11 +139,13 @@ export function EditorArea({
     // Group problems by normalized file path
     const byPath = new Map<string, ProblemItem[]>();
     for (const item of problemItems) {
-      if (!item.filePath) continue;
-      const key = normalizePath(item.filePath);
-      const group = byPath.get(key) ?? [];
-      group.push(item);
-      byPath.set(key, group);
+      for (const markerItem of expandProblemMarkers(item)) {
+        if (!markerItem.filePath) continue;
+        const key = normalizePath(markerItem.filePath);
+        const group = byPath.get(key) ?? [];
+        group.push(markerItem);
+        byPath.set(key, group);
+      }
     }
 
     for (const model of models) {

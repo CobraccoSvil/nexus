@@ -424,24 +424,13 @@ impl VerifierNode {
     }
 
     /// Prefisso `<autonomy_hint>` per le modalita' autonome
-    /// (`verifier_node.py:266-279`): `behavior_mode` trimmed+lower in {automatic,
-    /// automatico, continuous, continuo}. PURA. Ritorna `None` se non autonomo.
+    /// (`verifier_node.py:266-279`): usa `automation_mode` (enum canonico).
+    /// PURA. Ritorna `None` se non autonomo.
     fn autonomy_prefix(state: &AgentState, max_cycles: i64) -> Option<String> {
-        let behavior_mode = state
-            .behavior_mode
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
-        if !matches!(
-            behavior_mode.as_str(),
-            "automatic" | "automatico" | "continuous" | "continuo"
-        ) {
-            return None;
-        }
+        let mode_label = state.automation_mode.and_then(|m| m.wire_label())?;
         Some(format!(
-            "<autonomy_hint mode=\"{behavior_mode}\">\n\
-             L'utente ha selezionato la modalita' '{behavior_mode}': procedi\n\
+            "<autonomy_hint mode=\"{mode_label}\">\n\
+             L'utente ha selezionato la modalita' '{mode_label}': procedi\n\
              AUTONOMAMENTE col retry. NON chiedere conferma all'utente, NON\n\
              scrivere domande tipo 'Vuoi che lo faccia?' o 'Confermi?'. Esegui\n\
              direttamente le azioni necessarie usando i tool disponibili per\n\
@@ -1311,9 +1300,9 @@ mod tests {
     fn autonomy_prefix_solo_autonomo() {
         let mut st = plan_state("a", false);
         assert!(VerifierNode::autonomy_prefix(&st, 3).is_none());
-        st.behavior_mode = Some("automatico".to_string());
+        st.automation_mode = Some(crate::state::AutomationMode::Automatic);
         let p = VerifierNode::autonomy_prefix(&st, 3).expect("prefisso");
-        assert!(p.contains("<autonomy_hint mode=\"automatico\">"));
+        assert!(p.contains("<autonomy_hint mode=\"automatic\">"));
         assert!(p.contains("cap di 3 cicli"));
     }
 }

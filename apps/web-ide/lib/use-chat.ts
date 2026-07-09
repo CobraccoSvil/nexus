@@ -46,6 +46,10 @@ export function useChat(
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(opts.sessionId ?? null);
   const [isLoading, setIsLoading] = useState(false);
+  const isLoadingRef = useRef(false);
+  useEffect(() => {
+    isLoadingRef.current = isLoading;
+  }, [isLoading]);
   // POST /messages in volo, NON ancora confermata dal server. Distinta da
   // isLoading (che copre anche il run agentico gia' avviato): finche'
   // isSending=true il messaggio NON e' persistito e la UI deve dirlo
@@ -103,6 +107,13 @@ export function useChat(
   // approviamo via API (resume checkpoint), MAI con un nuovo messaggio "Continua".
   const autoConfirmCountRef = useRef(0);
   const [autoConfirmRunId, setAutoConfirmRunId] = useState<string | null>(null);
+  const confirmingRunIdRef = useRef<string | null>(null);
+  const [confirmingRunId, setConfirmingRunId] = useState<string | null>(null);
+
+  const pendingQueueStorageKey = useCallback(
+    (sid: string) => `nexus:chat-pending-queue:${sid}`,
+    [],
+  );
 
   // ── Coda messaggi ──
   // Messaggi inviati dall'utente MENTRE un agent run e' in corso. Vengono
@@ -113,6 +124,37 @@ export function useChat(
   const [pendingQueue, setPendingQueue] = useState<
     Array<{ content: string; options: SendChatMessageOptions }>
   >([]);
+
+  // Ripristina la coda messaggi da sessionStorage al cambio sessione (sopravvive
+  // al refresh della pagina finche' la sessione e' la stessa).
+  useEffect(() => {
+    if (!sessionId || typeof window === "undefined") return;
+    try {
+      const raw = window.sessionStorage.getItem(pendingQueueStorageKey(sessionId));
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        setPendingQueue(parsed as Array<{ content: string; options: SendChatMessageOptions }>);
+      }
+    } catch {
+      // best-effort
+    }
+  }, [sessionId, pendingQueueStorageKey]);
+
+  // Persiste la coda in sessionStorage ad ogni modifica.
+  useEffect(() => {
+    if (!sessionId || typeof window === "undefined") return;
+    try {
+      const key = pendingQueueStorageKey(sessionId);
+      if (pendingQueue.length === 0) {
+        window.sessionStorage.removeItem(key);
+      } else {
+        window.sessionStorage.setItem(key, JSON.stringify(pendingQueue));
+      }
+    } catch {
+      // best-effort
+    }
+  }, [sessionId, pendingQueue, pendingQueueStorageKey]);
 
   // ── Punto unico contabilita' di sessione (regola L) ────────────────────────
   // La TokenUsageBar (token totali + costo) DEVE leggere sempre dalla stessa
@@ -1090,39 +1132,64 @@ export function useChat(
 
   const confirmAgent = useCallback(
     async (runId: string, approved: boolean) => {
+      if (confirmingRunIdRef.current === runId) return;
+      confirmingRunIdRef.current = runId;
+      setConfirmingRunId(runId);
       setError(null);
       try {
-        await confirmAgentRun(runId, approved);
+        const result = await confirmAgentRun(runId, approved);
         if (!approved) {
           stopPrimaryAgentStream();
           setAgentRun((prev) => (prev ? { ...prev, status: "cancelled" } : null));
           setIsLoading(false);
           return;
         }
-        setAgentRun((prev) => (prev ? { ...prev, status: "running", pendingActions: [] } : null));
+        const nextStatus = result.status;
+        if (nextStatus === "failed" || nextStatus === "failed_diagnosed") {
+          stopPrimaryAgentStream();
+          try {
+            const finalRun = await getAgentRun(runId);
+            setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
+            setAgentRun(null);
+            setAgentSteps([]);
+            setIsLoading(false);
+            setError(formatChatError(new Error(finalRun.finalAnswer ?? "Run fallito dopo conferma."), "Conferma fallita."));
+          } catch {
+            setAgentRun(null);
+            setAgentSteps([]);
+            setIsLoading(false);
+            setError("Conferma fallita: il run non e' riuscito a riprendere.");
+          }
+          return;
+        }
+        setAgentRun((prev) =>
+          prev && prev.runId === runId
+            ? { ...prev, status: nextStatus === "awaiting_confirmation" ? "awaiting_confirmation" : "running", pendingActions: [] }
+            : prev,
+        );
         setAgentRuns((prev) => {
           const run = prev.get(runId);
           if (!run) return prev;
-          return new Map(prev).set(runId, { ...run, status: "running", pendingActions: [] });
+          return new Map(prev).set(runId, {
+            ...run,
+            status: nextStatus === "awaiting_confirmation" ? "awaiting_confirmation" : "running",
+            pendingActions: [],
+          });
         });
         setIsLoading(true);
-        // Riavvia l'ascolto dello stream (punto unico subscribeToRun: chiude la
-        // subscription precedente e traccia primarySubCleanupRef).
         if (sessionId) {
           subscribeToRun(sessionId, runId, true);
         }
       } catch (e) {
         if (e instanceof ApiError && e.status === 409 && sessionId) {
-          // Stato HITL stale: il run non e' piu' in attesa di conferma nel DB.
-          // Riconcilia invece di mostrare un errore bloccante all'utente.
           try {
             const current = await getAgentRun(runId);
             setAgentRuns((prev) => new Map(prev).set(runId, current));
             if (isAgentRunLiveOrWaiting(current.status)) {
               setAgentRun({ ...current, pendingActions: [] });
               setAgentSteps(current.steps ?? []);
-              setIsLoading(current.status === "running");
-              if (current.status === "running") {
+              setIsLoading(current.status === "running" || current.status === "awaiting_subagents");
+              if (current.status === "running" || current.status === "awaiting_subagents") {
                 subscribeToRun(sessionId, runId, true);
               }
               return;
@@ -1136,8 +1203,13 @@ export function useChat(
             // fallback al messaggio originale
           }
         }
-        setError(e instanceof Error ? e.message : "Conferma fallita.");
+        setError(formatChatError(e, "Conferma fallita."));
         setIsLoading(false);
+      } finally {
+        if (confirmingRunIdRef.current === runId) {
+          confirmingRunIdRef.current = null;
+          setConfirmingRunId(null);
+        }
       }
     },
     [sessionId, subscribeToRun, stopPrimaryAgentStream],
@@ -1202,17 +1274,28 @@ export function useChat(
       }
       try {
         const finalRun = await getAgentRun(runId);
-        if (cancelled || !isStatusTerminal(finalRun.status)) return;
-        // Run gia' terminato nel DB ma lo stream non ce l'ha notificato: chiudi
-        // anche il loop SSE (altrimenti isReconnecting resta true all'infinito).
-        stopPrimaryAgentStream();
-        setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
-        setAgentStepsMap((prev) => new Map(prev).set(runId, finalRun.steps));
-        setAgentRun(null);
-        setAgentSteps([]);
-        setIsLoading(false);
-        const syntheticMsg = createTerminalMessage(finalRun, projectId);
-        setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
+        if (cancelled) return;
+        if (isStatusTerminal(finalRun.status)) {
+          stopPrimaryAgentStream();
+          setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
+          setAgentStepsMap((prev) => new Map(prev).set(runId, finalRun.steps));
+          setAgentRun(null);
+          setAgentSteps([]);
+          setIsLoading(false);
+          const syntheticMsg = createTerminalMessage(finalRun, projectId);
+          setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
+          return;
+        }
+        // Run ancora vivo nel DB ma stream/UI congelati (stato fantasma):
+        // riaggancia SSE + step dal DB cosi' la coda puo' drenarsi a fine run.
+        if (isAgentRunLiveOrWaiting(finalRun.status) && !isLoadingRef.current) {
+          setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
+          setAgentStepsMap((prev) => new Map(prev).set(runId, finalRun.steps ?? []));
+          setAgentRun(finalRun);
+          setAgentSteps(finalRun.steps ?? []);
+          setIsLoading(true);
+          subscribeToRun(sessionId, runId, true);
+        }
       } catch {
         // Backend irraggiungibile: riprova al tick successivo (non arrenderti).
       }
@@ -1318,6 +1401,7 @@ export function useChat(
     // Numero di messaggi accodati in attesa che il run corrente finisca (per
     // mostrare un indicatore "N in coda" nell'input).
     pendingCount: pendingQueue.length,
+    confirmingRunId,
     send,
     resend,
     remove,

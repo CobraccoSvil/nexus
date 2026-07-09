@@ -181,6 +181,7 @@ export interface AgentStepsPanelProps {
   traces?: AITraceEvent[];
   // Soglia densita' del collasso tool (derivata dalla larghezza @container).
   foldThreshold?: FoldThreshold;
+  isConfirming?: boolean;
 }
 
 /** P5: Blocco collassabile per gli step piu' vecchi */
@@ -228,6 +229,7 @@ function SingleRunPanel({
   tc,
   t,
   onConfirm,
+  isConfirming = false,
   label,
   streamingToken,
   narrationWarnAfterMs,
@@ -239,6 +241,7 @@ function SingleRunPanel({
   tc: ThemeColors;
   t: (key: string) => string;
   onConfirm: (runId: string, approved: boolean) => void;
+  isConfirming?: boolean;
   label?: string;
   streamingToken?: string;
   narrationWarnAfterMs?: number;
@@ -631,21 +634,25 @@ function SingleRunPanel({
           ))}
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
             <button
+              type="button"
+              disabled={isConfirming}
               onClick={() => onConfirm(run.runId, true)}
               style={{
                 padding: "4px 14px",
                 borderRadius: 6,
                 border: "none",
-                background: "#22c55e",
+                background: isConfirming ? "#6b7280" : "#22c55e",
                 color: "#fff",
-                cursor: "pointer",
+                cursor: isConfirming ? "wait" : "pointer",
                 fontWeight: 600,
                 fontSize: 12,
               }}
             >
-              Approva
+              {isConfirming ? "Conferma..." : "Approva"}
             </button>
             <button
+              type="button"
+              disabled={isConfirming}
               onClick={() => onConfirm(run.runId, false)}
               style={{
                 padding: "4px 14px",
@@ -653,7 +660,7 @@ function SingleRunPanel({
                 border: `1px solid ${tc.border}`,
                 background: "transparent",
                 color: tc.error,
-                cursor: "pointer",
+                cursor: isConfirming ? "wait" : "pointer",
                 fontWeight: 600,
                 fontSize: 12,
               }}
@@ -724,6 +731,7 @@ export function AgentStepsPanel({
   tc,
   t,
   onConfirm,
+  isConfirming = false,
   agentRuns,
   agentStepsMap,
   metaSteps,
@@ -933,6 +941,7 @@ export function AgentStepsPanel({
           tc={tc}
           t={t}
           onConfirm={onConfirm}
+          isConfirming={isConfirming}
           label={isMulti ? activeRunData.label : ""}
           streamingToken={activeRunData.run.runId === agentRun.runId ? streamingToken : undefined}
           narrationWarnAfterMs={narrationWarnAfterMs}

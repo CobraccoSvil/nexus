@@ -15,6 +15,7 @@ use reqwest::Client;
 use sqlx::PgPool;
 
 use crate::cooldown::CooldownManager;
+use crate::http_timeouts;
 use crate::model_alias_resolver::ModelAliasResolver;
 use crate::policy_engine::PolicyEngine;
 use crate::provider::LlmProvider;
@@ -246,7 +247,13 @@ pub async fn build_runtime(
 /// e cooldown manager. NON avvia il re-probe loop ne' il server (lo fa il
 /// binario). Il client HTTP e' condiviso tra tutti i provider (pool riuso).
 pub async fn build_state(db: PgPool) -> Result<AppState> {
+    let http_timeout = http_timeouts::resolve_provider_http_timeout(&db).await;
+    tracing::info!(
+        timeout_secs = http_timeout.as_secs(),
+        "gateway: client HTTP provider con timeout DB-driven"
+    );
     let http = Client::builder()
+        .timeout(http_timeout)
         .build()
         .context("costruzione client HTTP gateway")?;
 

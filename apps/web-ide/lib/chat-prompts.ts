@@ -58,6 +58,20 @@ export function promptFromProblem(item: ProblemItem): string {
           "3) Esegui verifica (build/lint/test/comando rilevante).",
         ];
 
+  const instancesBlock =
+    item.instances && item.instances.length > 1
+      ? [
+          "",
+          `Occorrenze raggruppate (${item.instances.length}):`,
+          ...item.instances.map((inst) => {
+            const instLoc = inst.filePath
+              ? `${inst.filePath}${inst.line ? `:${inst.line}` : ""}`
+              : "(runtime)";
+            return `- ${instLoc}: ${inst.message}`;
+          }),
+        ]
+      : [];
+
   return [
     operativePreamble(),
     header(sev, "Problema rilevato"),
@@ -65,10 +79,14 @@ export function promptFromProblem(item: ProblemItem): string {
     `- Severità: ${item.severity}`,
     `- Sorgente: ${item.source}`,
     loc ? `- File: ${loc}` : undefined,
+    item.occurrenceCount && item.occurrenceCount > 1
+      ? `- Occorrenze: ${item.occurrenceCount}`
+      : undefined,
     item.createdAt ? `- Quando: ${new Date(item.createdAt).toLocaleString()}` : undefined,
     "",
     "Messaggio:",
     item.message,
+    ...instancesBlock,
     "",
     ...req,
   ]

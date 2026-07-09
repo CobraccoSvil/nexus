@@ -1811,6 +1811,7 @@ mod tests {
         AgentState {
             pending_tool_uses: Some(pending),
             thread_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            automation_mode: Some(crate::state::AutomationMode::Automatic),
             ..Default::default()
         }
     }

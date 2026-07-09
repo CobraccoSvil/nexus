@@ -248,11 +248,60 @@ impl std::fmt::Display for GatewayHttpError {
 
 impl std::error::Error for GatewayHttpError {}
 
+/// Default mig 0421 (allineato a `nexus_gateway::http_timeouts`).
+const DEFAULT_COMPLETE_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_RETRY_MAX_ATTEMPTS: u64 = 3;
+const DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S: i64 = 45;
+/// Margine sopra il budget gateway (retry + cooldown) per non chiudere la
+/// connessione mcp-core->gateway prima che il gateway risponda.
+const CLIENT_TIMEOUT_MARGIN_SECS: u64 = 30;
+
+fn parse_positive_u64(raw: Option<String>, default: u64) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+fn parse_positive_i64(raw: Option<String>, default: i64) -> i64 {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// Budget HTTP mcp-core -> gateway per `/v1/complete`: copre timeout provider
+/// (complete) x retry + attesa cooldown breve + margine (regola G).
+async fn resolve_client_timeout_secs(db: &sqlx::PgPool) -> u64 {
+    let complete = parse_positive_u64(
+        nexus_auth::get_setting(db, "gateway.complete_timeout_seconds").await,
+        DEFAULT_COMPLETE_TIMEOUT_SECS,
+    );
+    let max_attempts = parse_positive_u64(
+        nexus_auth::get_setting(db, "gateway.retry.max_attempts").await,
+        DEFAULT_RETRY_MAX_ATTEMPTS,
+    );
+    let cooldown_cap = parse_positive_i64(
+        nexus_auth::get_setting(db, "gateway.retry.wait_short_cooldown_cap_s").await,
+        DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S,
+    ) as u64;
+    complete
+        .saturating_mul(max_attempts)
+        .saturating_add(cooldown_cap)
+        .saturating_add(CLIENT_TIMEOUT_MARGIN_SECS)
+}
+
 impl NexusGatewayClient {
     pub fn new(base_url: String, service_token: String) -> Self {
+        let timeout_secs = DEFAULT_COMPLETE_TIMEOUT_SECS
+            .saturating_mul(DEFAULT_RETRY_MAX_ATTEMPTS)
+            .saturating_add(DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S as u64)
+            .saturating_add(CLIENT_TIMEOUT_MARGIN_SECS);
+        Self::with_timeout(base_url, service_token, timeout_secs)
+    }
+
+    fn with_timeout(base_url: String, service_token: String, timeout_secs: u64) -> Self {
         Self {
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
+                .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()
                 .expect("reqwest client"),
             base_url,
@@ -271,7 +320,8 @@ impl NexusGatewayClient {
         let gw_url = format!("http://127.0.0.1:{gw_port}");
         let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
             .unwrap_or_else(|_| "dev-internal-token".to_string());
-        Self::new(gw_url, gw_token)
+        let timeout_secs = resolve_client_timeout_secs(db).await;
+        Self::with_timeout(gw_url, gw_token, timeout_secs)
     }
 
     pub async fn complete(&self, req: GwRequest) -> Result<GwResponse> {
@@ -453,5 +503,21 @@ mod tests {
         let parsed: GwModelsResponse = serde_json::from_str(raw).expect("parse google models");
         assert_eq!(parsed.models.len(), 2);
         assert!(parsed.models.contains(&"gemini-2.5-pro".to_string()));
+    }
+
+    #[test]
+    fn client_timeout_budget_default() {
+        assert_eq!(
+            DEFAULT_COMPLETE_TIMEOUT_SECS
+                .saturating_mul(DEFAULT_RETRY_MAX_ATTEMPTS)
+                .saturating_add(DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S as u64)
+                .saturating_add(CLIENT_TIMEOUT_MARGIN_SECS),
+            435
+        );
+    }
+
+    #[test]
+    fn parse_positive_u64_reject_zero() {
+        assert_eq!(parse_positive_u64(Some("0".into()), 120), 120);
     }
 }

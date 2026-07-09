@@ -658,14 +658,14 @@ pub async fn confirm_agent_run(
     .await?;
 
     let status: String = run.try_get("status").unwrap_or_default();
-    if status != "awaiting_confirmation" {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "Il run non e' in attesa di conferma",
-        ));
-    }
 
     if !body.approved {
+        if status != "awaiting_confirmation" {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "Il run non e' in attesa di conferma",
+            ));
+        }
         // Cancella il run
         sqlx::query("UPDATE agent_runs SET status='cancelled', completed_at=NOW() WHERE id=$1")
             .bind(run_id)
@@ -674,6 +674,23 @@ pub async fn confirm_agent_run(
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(Json(
             json!({ "runId": run_id.to_string(), "status": "cancelled" }),
+        ));
+    }
+
+    // Idempotenza approve: un doppio click (o timeout client + retry) puo'
+    // arrivare dopo che lo status e' gia' `running` (UPDATE sincrono sotto).
+    // Rispondi 200 coerente invece di 409 per non far fallire la UI.
+    if status == "running" {
+        return Ok(Json(json!({
+            "runId": run_id.to_string(),
+            "status": "running",
+        })));
+    }
+
+    if status != "awaiting_confirmation" {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Il run non e' in attesa di conferma",
         ));
     }
 
@@ -713,9 +730,10 @@ pub async fn confirm_agent_run(
         .unwrap_or_default();
 
     if engine.eq_ignore_ascii_case("rust") {
-        // Resume nativo IN-PROCESS: ricostruisce ctx + porte dai dati del run e
-        // riprende dal checkpoint. Finalizzazione + is_final SSE dentro
-        // `confirm_native_run` (punto unico del resume nativo, regola L).
+        // Resume nativo in BACKGROUND (parita' col path brain e collo spawn
+        // primario in agent_run.rs): la POST risponde subito con `running` cosi'
+        // il client non va in timeout HTTP mentre il grafo riprende dal checkpoint.
+        // Finalizzazione + is_final SSE dentro `confirm_native_run`.
         let session_id: Uuid = run.get::<Uuid, _>("session_id");
         let provider: String = run.try_get("provider").unwrap_or_default();
         let model: String = run.try_get("model").unwrap_or_default();
@@ -724,33 +742,24 @@ pub async fn confirm_agent_run(
             .ok()
             .flatten()
             .unwrap_or_default();
-
-        match crate::chat_messages::confirm_native_run(
-            &state,
-            run_id,
-            session_id,
-            provider,
-            model,
-            automation_mode,
-            &resume_message,
-        )
-        .await
-        {
-            Ok(final_status) => Ok(Json(json!({
-                "runId": run_id.to_string(),
-                "status": final_status.as_str(),
-            }))),
-            Err(e) => {
-                tracing::error!(run_id = %run_id, "confirm_agent_run: resume nativo fallito");
-                // confirm_native_run ha gia' marcato il run failed + emesso is_final;
-                // qui rispondiamo con l'errore senza riportare a awaiting (regola H:
-                // un fallimento del motore nativo e' un fallimento del run, onesto).
-                Err(api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Resume nativo fallito: {e}"),
-                ))
-            }
-        }
+        let state_bg = state.clone();
+        let resume_message_bg = resume_message.clone();
+        tokio::spawn(async move {
+            let _ = crate::chat_messages::confirm_native_run(
+                &state_bg,
+                run_id,
+                session_id,
+                provider,
+                model,
+                automation_mode,
+                &resume_message_bg,
+            )
+            .await;
+        });
+        return Ok(Json(json!({
+            "runId": run_id.to_string(),
+            "status": "running",
+        })));
     } else {
         // Resume LEGACY sul brain Python (engine='python' o NULL). Il brain
         // mantiene lo state del thread ed e' l'unica sorgente del loop per quei run.

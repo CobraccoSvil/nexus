@@ -37,10 +37,10 @@ impl FromStr for SupervisorMode {
     type Err = std::convert::Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.trim().to_lowercase().as_str() {
-            "anomaly" | "c" => Self::Anomaly,
-            "interleaved" | "a" => Self::Interleaved,
-            "continuous" | "b" => Self::Continuous,
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "anomaly" => Self::Anomaly,
+            "interleaved" => Self::Interleaved,
+            "continuous" => Self::Continuous,
             _ => Self::None,
         })
     }
@@ -56,6 +56,16 @@ impl SupervisorMode {
         }
     }
 
+    /// Parsa identificatore canonico supervisor (none/anomaly/interleaved/continuous).
+    pub fn try_parse(value: &str) -> Result<Self, &'static str> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "none" => Ok(Self::None),
+            "anomaly" => Ok(Self::Anomaly),
+            "interleaved" => Ok(Self::Interleaved),
+            "continuous" => Ok(Self::Continuous),
+            _ => Err("invalid supervisor_mode"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

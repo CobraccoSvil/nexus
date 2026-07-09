@@ -66,6 +66,15 @@ export interface SearchResultItem {
   preview: string;
 }
 
+export interface ProblemInstance {
+  id: string;
+  filePath?: string | null;
+  line?: number | null;
+  column?: number | null;
+  message: string;
+  createdAt: string;
+}
+
 export interface ProblemItem {
   id: string;
   severity: string;
@@ -75,6 +84,29 @@ export interface ProblemItem {
   line?: number;
   column?: number;
   createdAt: string;
+  /** Chiave semantica di raggruppamento (backend). */
+  groupKey?: string;
+  /** Numero di occorrenze raggruppate sotto questa riga. */
+  occurrenceCount?: number;
+  /** Id delle diagnosi originali incluse nel gruppo. */
+  relatedIds?: string[];
+  /** Dettaglio per marker editor e prompt chat. */
+  instances?: ProblemInstance[];
+}
+
+/** Espande un problema raggruppato in voci singole per marker/diagnostica. */
+export function expandProblemMarkers(item: ProblemItem): ProblemItem[] {
+  if (!item.instances?.length) return [item];
+  return item.instances.map((inst) => ({
+    id: inst.id,
+    severity: item.severity,
+    source: item.source,
+    message: inst.message || item.message,
+    filePath: inst.filePath ?? undefined,
+    line: inst.line ?? undefined,
+    column: inst.column ?? undefined,
+    createdAt: inst.createdAt,
+  }));
 }
 
 export interface OutputChannel {

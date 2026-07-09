@@ -19,6 +19,15 @@ export interface PortEntry {
   pid?: number;
 }
 
+export interface ProblemInstance {
+  id: string;
+  filePath?: string | null;
+  line?: number | null;
+  column?: number | null;
+  message: string;
+  createdAt: string;
+}
+
 export interface ProblemItem {
   id: string;
   severity: string;
@@ -28,6 +37,10 @@ export interface ProblemItem {
   line?: number | null;
   column?: number | null;
   createdAt: string;
+  groupKey?: string;
+  occurrenceCount?: number;
+  relatedIds?: string[];
+  instances?: ProblemInstance[];
 }
 
 export interface ChatSessionUsage {

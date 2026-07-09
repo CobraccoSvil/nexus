@@ -277,6 +277,7 @@ condividere codice (fragile base class).
 | Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
 | Pool DB metadati per-progetto (flag, registry, elenco progetti, directory routing) | crate `nexus-project-pools`; `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
+| Aggregazione problemi ripetitivi (pannello Problemi) | `mcp-core/src/project_workspace/problem_aggregation.rs` (`problem_group_key`, `aggregate_problems`); `get_project_problems` delega |
 
 ### Enforcement automatico (la regola e' duratura, non una-tantum)
 
@@ -367,6 +368,37 @@ Prima di scrivere un `if msg.contains(...)` per decidere qualcosa su una richies
 FERMATI: quel segnale esiste gia' in forma strutturata (status, codice, campo enum)
 o va reso disponibile alla fonte. Un PR che classifica lo stato tecnico dal testo e'
 rifiutato come toppa (regola H).
+
+## N. Identificatori canonici (inglese, univoci)
+
+Regola autoritativa per nomi di comandi, enum wire, valori API/DB e chiavi
+configurazione: **un solo identificatore in inglese per azione**, valido in tutto
+il codebase.
+
+### Cosa e' vietato
+
+- Parser "lenienti" con sinonimi multipli (`automatic`/`automatico`/`auto`,
+  `confirm`/`conferma`, `study`/`studio`, alias supervisor `a`/`b`/`c`, ecc.).
+- Duplicare la stessa logica di parse in piu' moduli: un solo punto unico per enum.
+- Usare etichette UI tradotte come `value` inviato al backend.
+
+### Cosa e' richiesto
+
+1. Identificatori canonici documentati e usati ovunque (es. automation:
+   `study|confirm|automatic`; supervisor: `none|anomaly|interleaved|continuous`).
+2. Punto unico parse: `orchestrator::AutomationMode::try_parse` (mcp-core).
+3. Etichette UI tradotte solo per display; il `value` del controllo e' sempre
+   l'identificatore canonico.
+4. Valori legacy nel DB normalizzati via migrazione SQL versionata (es. mig `0558`),
+   non accettati permanentemente nel codice.
+5. Guard in `scripts/check-single-source.sh` (check `canonical-identifiers`).
+
+### Punto unico noto
+
+| Concern | Modulo/funzione autoritativa |
+|---|---|
+| Parse automation_mode | `crates/mcp-core/src/orchestrator/mod.rs` (`AutomationMode::try_parse`) |
+| Parse supervisor_mode | `SupervisorMode` FromStr in `agent_types.rs` / `nexus-agent-graph` state |
 
 ## Esecuzione locale canonica
 

@@ -145,10 +145,18 @@ function hasBlocking(notifications: RunNotification[]): boolean {
 export function RunNotifications({
   stream,
   runStatus,
+  runId,
+  pendingActions,
+  onConfirm,
+  isConfirming,
   tc,
 }: {
   stream: ActivityStream;
   runStatus?: string;
+  runId?: string;
+  pendingActions?: Array<{ description: string }>;
+  onConfirm?: (runId: string, approved: boolean) => void;
+  isConfirming?: boolean;
   tc: ThemeColors;
 }) {
   const notifications = useMemo(
@@ -156,10 +164,17 @@ export function RunNotifications({
     [stream, runStatus, tc],
   );
   const [open, setOpen] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const bellRef = useRef<HTMLButtonElement>(null);
   // Traccia se abbiamo gia' auto-aperto per l'attuale ondata di blocco, cosi'
   // non riapriamo dopo che l'utente ha chiuso.
   const autoOpenedRef = useRef(false);
   const blocking = hasBlocking(notifications);
+  const showHitlActions =
+    runStatus === "awaiting_confirmation" &&
+    !!runId &&
+    !!onConfirm &&
+    (pendingActions?.length ?? 0) > 0;
 
   // Auto-apertura SOLO su evento bloccante (una volta per transizione a blocco).
   useEffect(() => {
@@ -170,14 +185,28 @@ export function RunNotifications({
     if (!blocking) autoOpenedRef.current = false;
   }, [blocking]);
 
+  // Chiudi al click fuori dal pannello (non blocca il resto della chat).
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (ev: MouseEvent) => {
+      const target = ev.target as Node;
+      if (panelRef.current?.contains(target)) return;
+      if (bellRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [open]);
+
   if (notifications.length === 0) return null;
 
   const count = notifications.length;
   const badgeColor = blocking ? "#8b5cf6" : notifications[0]?.color ?? tc.error;
 
   return (
-    <div style={{ position: "relative", display: "inline-block" }}>
+    <div style={{ position: "relative", display: "inline-block", flexShrink: 0 }}>
       <button
+        ref={bellRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
         title="Centro notifiche del run"
@@ -188,21 +217,17 @@ export function RunNotifications({
           width: 28,
           height: 28,
           borderRadius: 8,
-          border: `1px solid ${tc.border}`,
-          background: tc.bgCard,
-          color: tc.textSecondary,
+          border: `1px solid ${blocking ? "#8b5cf6" : tc.border}`,
+          background: blocking ? "#8b5cf611" : tc.bgCard,
+          color: blocking ? "#8b5cf6" : tc.textSecondary,
           display: "inline-flex",
           alignItems: "center",
           justifyContent: "center",
           cursor: "pointer",
           fontSize: 14,
-          // Pulsazione discreta quando ci sono notifiche non lette (mai su
-          // prefers-reduced-motion, gestito in globals.css se necessario).
-          animation: blocking ? "none" : undefined,
           flexShrink: 0,
         }}
       >
-        {/* Glifo campanella non-emoji */}
         <span aria-hidden style={{ fontFamily: "var(--font-mono)" }}>{"◉"}</span>
         <span
           style={{
@@ -228,15 +253,16 @@ export function RunNotifications({
 
       {open && (
         <div
+          ref={panelRef}
           role="dialog"
           aria-label="Notifiche del run"
           style={{
             position: "absolute",
-            top: 34,
+            bottom: "calc(100% + 6px)",
             right: 0,
             zIndex: 50,
-            width: 260,
-            maxWidth: "80vw",
+            width: 280,
+            maxWidth: "85vw",
             borderRadius: 10,
             border: `1px solid ${tc.border}`,
             background: tc.bgCard,
@@ -250,15 +276,39 @@ export function RunNotifications({
         >
           <div
             style={{
-              fontSize: 10,
-              textTransform: "uppercase",
-              letterSpacing: "0.08em",
-              color: tc.textMuted,
-              fontWeight: 700,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
               padding: "2px 6px",
             }}
           >
-            Notifiche del run
+            <div
+              style={{
+                fontSize: 10,
+                textTransform: "uppercase",
+                letterSpacing: "0.08em",
+                color: tc.textMuted,
+                fontWeight: 700,
+              }}
+            >
+              Notifiche del run
+            </div>
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              aria-label="Chiudi notifiche"
+              style={{
+                border: "none",
+                background: "transparent",
+                color: tc.textMuted,
+                cursor: "pointer",
+                fontSize: 14,
+                lineHeight: 1,
+                padding: "0 2px",
+              }}
+            >
+              x
+            </button>
           </div>
           {notifications.map((n, i) => (
             <div
@@ -303,6 +353,83 @@ export function RunNotifications({
               </div>
             </div>
           ))}
+
+          {showHitlActions && (
+            <div
+              style={{
+                marginTop: 4,
+                padding: "6px 6px 4px",
+                borderTop: `1px solid ${tc.border}`,
+                display: "flex",
+                flexDirection: "column",
+                gap: 6,
+              }}
+            >
+              <div style={{ fontSize: 10.5, fontWeight: 600, color: tc.textSecondary }}>
+                Azioni in attesa:
+              </div>
+              {pendingActions!.map((action, idx) => (
+                <div
+                  key={`pending-${idx}`}
+                  style={{
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 10,
+                    color: tc.text,
+                    background: `${tc.border}30`,
+                    borderRadius: 4,
+                    padding: "3px 6px",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {action.description}
+                </div>
+              ))}
+              <div style={{ display: "flex", gap: 6 }}>
+                <button
+                  type="button"
+                  disabled={isConfirming}
+                  onClick={() => {
+                    onConfirm!(runId!, true);
+                    setOpen(false);
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: "5px 10px",
+                    borderRadius: 6,
+                    border: "none",
+                    background: isConfirming ? "#6b7280" : "#22c55e",
+                    color: "#fff",
+                    cursor: isConfirming ? "wait" : "pointer",
+                    fontWeight: 600,
+                    fontSize: 11,
+                  }}
+                >
+                  {isConfirming ? "Conferma..." : "Approva"}
+                </button>
+                <button
+                  type="button"
+                  disabled={isConfirming}
+                  onClick={() => {
+                    onConfirm!(runId!, false);
+                    setOpen(false);
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: "5px 10px",
+                    borderRadius: 6,
+                    border: `1px solid ${tc.border}`,
+                    background: "transparent",
+                    color: tc.error,
+                    cursor: isConfirming ? "wait" : "pointer",
+                    fontWeight: 600,
+                    fontSize: 11,
+                  }}
+                >
+                  Annulla
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -713,9 +713,7 @@ async fn build_orchestrator(
     // URL gateway dalla porta nel DB (regola G: niente env/hardcoded).
     let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
     let gw_url = format!("http://127.0.0.1:{gw_port}");
-    let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| "dev-internal-token".to_string());
-    let nexus_gw = nexus_gateway::NexusGatewayClient::new(gw_url.clone(), gw_token);
+    let nexus_gw = nexus_gateway::NexusGatewayClient::from_db(db).await;
     let orchestrator = {
         let base = Orchestrator::new(
             neural_client,

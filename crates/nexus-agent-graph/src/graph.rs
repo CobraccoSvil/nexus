@@ -364,6 +364,7 @@ use routing as _routing_doc_anchor;
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -396,7 +397,7 @@ mod tests {
         StubVerifierRunStore,
     };
     use crate::runtime::StubMetaReasonerPort;
-    use crate::state::{Message, MessageContent, StopReason, ToolUse};
+    use crate::state::{AutomationMode, Message, MessageContent, StateDelta, StopReason, ToolUse};
 
     // ── Checkpointer in-memory (zero DB nel test) ─────────────────────────────
 
@@ -524,6 +525,40 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
             ..Default::default()
         }
+    }
+
+    /// Tool stub che conta le esecuzioni (per verificare HITL: zero prima, uno dopo).
+    struct TrackingStubTool {
+        exec_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for TrackingStubTool {
+        async fn execute(&self, call: ToolCall, _mode: ExecMode) -> Result<ToolOutcome, PortError> {
+            self.exec_count.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutcome {
+                tool_call_id: call.id,
+                content: json!("ok"),
+                is_error: false,
+                exit_code: None,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Delta di resume HITL (parita' `build_resume_delta` in mcp-core native_engine).
+    fn hitl_resume_delta() -> nexus_graph::StateDelta {
+        StateDelta {
+            awaiting_confirmation: Some(Some(false)),
+            approved: Some(Some(true)),
+            messages: Some(vec![Message::Human {
+                content: MessageContent::text(
+                    "Azioni confermate dall'utente. Esegui le operazioni approvate.",
+                ),
+            }]),
+            ..Default::default()
+        }
+        .into_opaque()
     }
 
     // ── Costruzione dei nodi con stub ─────────────────────────────────────────
@@ -701,6 +736,7 @@ mod tests {
             }],
             thread_id: Some(run_id.to_string()),
             intent_hint: Some("chat".to_string()),
+            automation_mode: Some(AutomationMode::Automatic),
             ..Default::default()
         }
     }
@@ -894,6 +930,87 @@ mod tests {
         assert!(
             matches!(resumed, StepOutcome::Completed(_)),
             "resume da checkpoint a fine run -> Completed immediato"
+        );
+    }
+
+    // ── HITL: sospensione, resume, esecuzione pending, chiusura ───────────────
+
+    #[tokio::test]
+    async fn hitl_confirm_resume_esegue_pending_e_completa() {
+        let gateway = Arc::new(ScriptedLlmGateway::new(vec![turn_tool_use(), turn_end()]));
+        let llm: Arc<dyn LlmGateway> = gateway.clone();
+        let tools = Arc::new(TrackingStubTool {
+            exec_count: AtomicUsize::new(0),
+        });
+        let tools_trait: Arc<dyn ToolExecutor> = tools.clone();
+        let run_id = Uuid::new_v4();
+
+        let nodes = build_stub_nodes(tools_trait.clone());
+        let checkpointer = Arc::new(MemoryCheckpointer::default());
+        let engine = build_agent_graph(
+            nodes,
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+            checkpointer,
+        );
+
+        let ctx = ctx_with(llm, tools_trait, run_id);
+        let mut state = initial_state(run_id);
+        state.automation_mode = Some(AutomationMode::Confirm);
+
+        let suspended = engine
+            .run_until_interrupt(run_id, Some(state), &ctx)
+            .await
+            .expect("il run deve sospendersi su HITL");
+
+        match &suspended {
+            StepOutcome::Interrupted { state, resume_at } => {
+                assert!(state.is_awaiting_confirmation());
+                assert_eq!(*resume_at, NodeId::ToolDispatch);
+                assert!(
+                    state
+                        .pending_tool_uses
+                        .as_ref()
+                        .is_some_and(|p| !p.is_empty())
+                );
+            }
+            other => panic!("atteso Interrupted (HITL), ottenuto {other:?}"),
+        }
+        assert_eq!(
+            tools.exec_count.load(Ordering::SeqCst),
+            0,
+            "HITL: nessun tool mutativo eseguito prima della conferma"
+        );
+        assert_eq!(gateway.call_count(), 1, "un solo turno LLM pre-sospensione");
+
+        let completed = engine
+            .resume_until_interrupt(run_id, hitl_resume_delta(), &ctx)
+            .await
+            .expect("resume HITL deve completare il run");
+
+        let final_state = match completed {
+            StepOutcome::Completed(s) => s,
+            other => panic!("atteso Completed dopo resume HITL, ottenuto {other:?}"),
+        };
+
+        assert_eq!(final_state.stop_reason, Some(StopReason::EndTurn));
+        assert!(
+            final_state
+                .pending_tool_uses
+                .as_ref()
+                .map(|p| p.is_empty())
+                .unwrap_or(true)
+        );
+        assert_eq!(
+            tools.exec_count.load(Ordering::SeqCst),
+            1,
+            "dopo conferma il tool mutativo pending deve essere eseguito una volta"
+        );
+        assert_eq!(
+            gateway.call_count(),
+            2,
+            "due turni LLM: tool_use pre-HITL + end_turn post-resume"
         );
     }
 

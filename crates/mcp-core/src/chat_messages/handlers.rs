@@ -232,12 +232,23 @@ pub async fn send_chat_message(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let canonical = parse_automation_mode(Some(m)).as_str();
-        let _ = sqlx::query("UPDATE chat_sessions SET automation_mode = $1 WHERE id = $2")
-            .bind(canonical)
-            .bind(context.session_id)
-            .execute(&session_pool)
-            .await;
+        match AutomationMode::try_parse(Some(m)) {
+            Ok(mode) => {
+                let _ = sqlx::query("UPDATE chat_sessions SET automation_mode = $1 WHERE id = $2")
+                    .bind(mode.as_str())
+                    .bind(context.session_id)
+                    .execute(&session_pool)
+                    .await;
+            }
+            Err(_) => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "automation_mode non valido: '{m}'. Valori ammessi: study, confirm, automatic"
+                    ),
+                ));
+            }
+        }
     }
 
     // ── Idempotenza invio (mig progetto 0008) ────────────────────────────────
@@ -551,19 +562,36 @@ pub async fn send_chat_message(
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(v) => parse_automation_mode(Some(v)),
+            Some(v) => AutomationMode::try_parse(Some(v)).map_err(|_| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "automation_mode non valido: '{v}'. Valori ammessi: study, confirm, automatic"
+                    ),
+                )
+            })?,
             // chat_sessions e' migrata: la modalita' persistita (mig 0371) va
             // letta dal pool del progetto gia' risolto sopra, non dal meta
             // (dove la riga sessione non esiste e tornava sempre il default).
             None => read_session_automation_mode(&session_pool, context.session_id).await,
         }
     };
-    let supervisor_mode = body
+    let supervisor_mode = match body
         .supervisor_mode
         .as_deref()
-        .unwrap_or("none")
-        .parse::<SupervisorMode>()
-        .unwrap();
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => SupervisorMode::try_parse(v).map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "supervisor_mode non valido: '{v}'. Valori ammessi: none, anomaly, interleaved, continuous"
+                ),
+            )
+        })?,
+        None => SupervisorMode::None,
+    };
 
     // Fetch user info to build system context
     let github_username: Option<String> =

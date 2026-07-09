@@ -187,9 +187,16 @@ where
                 .resolve(&state);
 
             // Checkpoint DOPO il route: il record contiene gia' il prossimo
-            // nodo, cosi' il resume riparte da li' senza ricalcolo.
+            // nodo, cosi' il resume riparte da li' senza ricalcolo. Su interrupt
+            // il puntatore e' quello di resume (es. HITL riparte da tool_dispatch
+            // per eseguire i pending approvati, non dall'executor instradato).
+            let checkpoint_next = if state.is_awaiting_interrupt() {
+                state.interrupt_resume_node(current, next)
+            } else {
+                next
+            };
             self.checkpointer
-                .put(run_id, superstep as i64, next, &state)
+                .put(run_id, superstep as i64, checkpoint_next, &state)
                 .await?;
 
             tracing::debug!(
@@ -220,10 +227,8 @@ where
             // verrebbe sospeso (divergenza da graph.py) e un resume riprenderebbe dal
             // nodo instradato saltando router+clarify.
             if state.is_awaiting_interrupt() {
-                return Ok(StepOutcome::Interrupted {
-                    state,
-                    resume_at: next,
-                });
+                let resume_at = state.interrupt_resume_node(current, next);
+                return Ok(StepOutcome::Interrupted { state, resume_at });
             }
 
             current = next;

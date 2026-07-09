@@ -803,23 +803,12 @@ impl FinalGateNode {
              </final_gate_failed>"
         );
 
-        // Prefisso autonomy_hint per le modalita' autonome
-        // (`final_gate.py:481-492`): behavior_mode trimmed+lowercased in
-        // {automatic, automatico, continuous, continuo}.
-        let behavior_mode = state
-            .behavior_mode
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
-        let is_autonomous = matches!(
-            behavior_mode.as_str(),
-            "automatic" | "automatico" | "continuous" | "continuo"
-        );
-        if is_autonomous {
+        // Prefisso autonomy_hint per le modalita' autonome (`final_gate.py:481-492`):
+        // usa `automation_mode` (enum canonico), non sinonimi su behavior_mode.
+        if let Some(mode_label) = state.automation_mode.and_then(|m| m.wire_label()) {
             let autonomy_prefix = format!(
-                "<autonomy_hint mode=\"{behavior_mode}\">\n\
-                 L'utente ha selezionato la modalita' '{behavior_mode}': procedi\n\
+                "<autonomy_hint mode=\"{mode_label}\">\n\
+                 L'utente ha selezionato la modalita' '{mode_label}': procedi\n\
                  AUTONOMAMENTE con l'integrazione. NON chiedere conferma, NON scrivere\n\
                  domande tipo 'Vuoi che lo faccia?' o 'Confermi?'. Esegui direttamente\n\
                  le modifiche necessarie usando i tool disponibili.\n\
@@ -1705,14 +1694,14 @@ mod tests {
     #[test]
     fn render_failed_block_criterio_non_build_e_autonomy_hint() {
         let mut st = software_state();
-        st.behavior_mode = Some("automatico".to_string());
+        st.automation_mode = Some(crate::state::AutomationMode::Automatic);
         let results = vec![fail_result(
             "service_logs_clean",
             json!({"verdict": "errore 500 nei log del servizio"}),
         )];
         let block = FinalGateNode::render_failed_block(&st, 1, 2, &results);
         // autonomy_hint prefisso per modalita' autonoma.
-        assert!(block.contains("<autonomy_hint mode=\"automatico\">"));
+        assert!(block.contains("<autonomy_hint mode=\"automatic\">"));
         assert!(block.contains("[service_logs_clean]"));
         assert!(block.contains("errore 500 nei log"));
         // Nessun header build (niente "errori rilevati").

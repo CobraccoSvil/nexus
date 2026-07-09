@@ -26,6 +26,9 @@ export interface ComposerProps {
   availableProviders: string[];
   runProvider?: string | null;
   runModel?: string | null;
+  /** Modalita' automazione del run ATTIVO (fissata all'avvio). Se diversa dal
+   *  dropdown, il run in corso NON eredita il cambio. */
+  runAutomationMode?: string | null;
   automationMode: "study" | "confirm" | "automatic";
   onAutomationModeChange: (value: "study" | "confirm" | "automatic") => void;
   supervisorMode: "none" | "anomaly" | "interleaved" | "continuous";
@@ -70,6 +73,7 @@ export function Composer({
   availableProviders,
   runProvider = null,
   runModel = null,
+  runAutomationMode = null,
   automationMode,
   onAutomationModeChange,
   supervisorMode,
@@ -167,6 +171,13 @@ export function Composer({
   // Un provider selezionato (diverso da "auto") e' gia' forzato come override,
   // a prescindere dal toggle "Forza": il dropdown e' la fonte di verita'.
   const isProviderLocked = selectedProvider !== "auto";
+  const showAutomationRunMismatch =
+    !!runAutomationMode &&
+    runAutomationMode !== automationMode &&
+    isAgentRunning;
+  const automationTitle = showAutomationRunMismatch
+    ? `Run in corso avviato in modalita' "${runAutomationMode}" — il dropdown (${automationMode}) vale solo per i prossimi messaggi.`
+    : "Automazione: Studio = solo lettura, Conferma = chiede approvazione prima di modifiche, Automatico = esegue senza fermarsi";
   const showOverrideMismatch =
     isProviderLocked &&
     !!runProvider &&
@@ -408,20 +419,6 @@ export function Composer({
               ))}
             </select>
           )}
-          {(runProvider || runModel) && (
-            <span
-              title="Provider/model effettivo dell'ultima run"
-              style={{
-                ...selectStyle,
-                border: `1px solid ${showOverrideMismatch ? "#ef4444" : tc.border}`,
-                background: showOverrideMismatch ? "rgba(239,68,68,0.10)" : tc.bgCard,
-                color: showOverrideMismatch ? "#ef4444" : tc.textMuted,
-                fontWeight: 600,
-              }}
-            >
-              run: {runProvider ?? "?"}/{runModel ?? "?"}
-            </span>
-          )}
           {(showOverrideMismatch || showModelMismatch) && (
             <span
               title="La run non sta rispettando l'override. Possibili cause: provider in cooldown/quota, modello non disponibile, fallback del router."
@@ -439,10 +436,18 @@ export function Composer({
           <select
             value={automationMode}
             onChange={(e) => onAutomationModeChange(e.target.value as "study" | "confirm" | "automatic")}
-            title="Automazione: Studio = solo lettura, Conferma = chiede approvazione prima di modifiche, Automatico = esegue senza fermarsi"
+            title={automationTitle}
             style={{
               ...selectStyle,
               cursor: "pointer",
+              ...(showAutomationRunMismatch
+                ? {
+                    border: "1px solid #f59e0b",
+                    background: "rgba(245,158,11,0.10)",
+                    color: "#f59e0b",
+                    fontWeight: 700,
+                  }
+                : {}),
             }}
           >
             {AUTOMATION_OPTIONS.map((option) => (
@@ -463,7 +468,7 @@ export function Composer({
             <option value="none">👁 Supervisor off</option>
             <option value="anomaly">👁 Su anomalia</option>
             <option value="interleaved">👁 Ogni 5 step</option>
-            <option value="continuous">👁 Supervisione continua</option>
+            <option value="continuous">continuo</option>
           </select>
           <IconButton
             label="Allega file"

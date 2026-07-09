@@ -25,7 +25,7 @@ pub async fn get_project_problems(
     items.extend(collect_service_diagnosis_problems(&state.db, project_id).await?);
     items.extend(collect_runtime_problems(&state.db, project_id).await?);
 
-    deduplicate_problems(&mut items);
+    crate::project_workspace::problem_aggregation::aggregate_problems(&mut items);
     sort_problems(&mut items);
 
     Ok(Json(json!({ "items": items })))
@@ -114,114 +114,6 @@ pub(crate) fn emit_problems_panel_refresh(project_id: Uuid, resolved_ids: Vec<Uu
             resolved_ids,
         },
     );
-}
-
-fn normalize_path_for_dedup(path: &str) -> String {
-    path.replace('\\', "/")
-        .trim_start_matches("./")
-        .to_ascii_lowercase()
-}
-
-fn normalize_message_for_dedup(message: &str) -> String {
-    message
-        .split_whitespace()
-        .take(24)
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-        .chars()
-        .take(160)
-        .collect()
-}
-
-fn source_priority_for_dedup(source: &str) -> i32 {
-    if source.starts_with("quality:") {
-        0
-    } else if source.starts_with("policy:") {
-        1
-    } else if source.starts_with("service_observer:") {
-        2
-    } else if source == "security" {
-        3
-    } else if source.starts_with("runtime:") {
-        4
-    } else {
-        5
-    }
-}
-
-fn problem_dedup_key(item: &Value) -> (String, i32, String) {
-    let file = item
-        .get("filePath")
-        .and_then(Value::as_str)
-        .map(normalize_path_for_dedup)
-        .unwrap_or_default();
-    let line = item
-        .get("line")
-        .and_then(Value::as_i64)
-        .map(|l| (l / 10) as i32)
-        .unwrap_or(-1);
-    let message = item
-        .get("message")
-        .and_then(Value::as_str)
-        .map(normalize_message_for_dedup)
-        .unwrap_or_default();
-    (file, line, message)
-}
-
-fn prefer_problem_candidate(left: &Value, right: &Value) -> bool {
-    let left_sev = left
-        .get("severity")
-        .and_then(Value::as_str)
-        .map(severity_rank)
-        .unwrap_or(2);
-    let right_sev = right
-        .get("severity")
-        .and_then(Value::as_str)
-        .map(severity_rank)
-        .unwrap_or(2);
-    if left_sev != right_sev {
-        return left_sev < right_sev;
-    }
-    let left_src = left
-        .get("source")
-        .and_then(Value::as_str)
-        .map(source_priority_for_dedup)
-        .unwrap_or(5);
-    let right_src = right
-        .get("source")
-        .and_then(Value::as_str)
-        .map(source_priority_for_dedup)
-        .unwrap_or(5);
-    left_src < right_src
-}
-
-/// Dedup cross-fonte: stesso file+riga+messaggio (normalizzati) -> una sola riga,
-/// preferendo severita' piu' alta e fonte piu' canonica (quality > policy > ...).
-fn deduplicate_problems(items: &mut Vec<Value>) {
-    use std::collections::HashMap;
-
-    let mut best_idx: HashMap<(String, i32, String), usize> = HashMap::new();
-    let mut deduped: Vec<Value> = Vec::new();
-
-    for item in items.drain(..) {
-        let key = problem_dedup_key(&item);
-        if key.2.is_empty() {
-            deduped.push(item);
-            continue;
-        }
-        if let Some(&idx) = best_idx.get(&key) {
-            if prefer_problem_candidate(&item, &deduped[idx]) {
-                deduped[idx] = item;
-            }
-        } else {
-            let idx = deduped.len();
-            best_idx.insert(key, idx);
-            deduped.push(item);
-        }
-    }
-
-    *items = deduped;
 }
 
 /// Audit 27/05/2026: aggiunto 'passed' alla lista di esclusione.
@@ -529,60 +421,33 @@ pub(super) fn severity_rank(value: &str) -> i32 {
 
 #[cfg(test)]
 mod problems_tests {
-    use super::*;
+    use crate::project_workspace::problem_aggregation;
     use serde_json::json;
 
     #[test]
-    fn deduplicate_problems_keeps_higher_severity() {
+    fn problem_aggregation_delegates_to_module() {
         let mut items = vec![
             json!({
-                "id": "1",
-                "severity": "warning",
-                "source": "runtime:run_command",
-                "message": "Command failed npm test",
-                "filePath": "src/app.ts",
-                "line": 12,
+                "id": "a",
+                "severity": "error",
+                "source": "policy:port",
+                "message": "Violazione risorse [port/require_allocation]: a.ts:1 21950 (port/require_allocation) | x",
+                "filePath": "a.ts",
+                "line": 1,
                 "createdAt": "2026-01-01T00:00:00Z",
             }),
             json!({
-                "id": "2",
+                "id": "b",
                 "severity": "error",
-                "source": "quality:lint",
-                "message": "Command failed npm test",
-                "filePath": "src/app.ts",
-                "line": 14,
+                "source": "policy:port",
+                "message": "Violazione risorse [port/require_allocation]: b.ts:2 21951 (port/require_allocation) | y",
+                "filePath": "b.ts",
+                "line": 2,
                 "createdAt": "2026-01-01T00:00:01Z",
             }),
         ];
-        deduplicate_problems(&mut items);
+        problem_aggregation::aggregate_problems(&mut items);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].get("id").and_then(Value::as_str), Some("2"));
-    }
-
-    #[test]
-    fn deduplicate_problems_keeps_distinct_messages() {
-        let mut items = vec![
-            json!({
-                "id": "1",
-                "severity": "error",
-                "source": "quality:a",
-                "message": "first issue",
-                "filePath": "src/a.ts",
-                "line": 1,
-                "createdAt": "2026-01-01T00:00:00Z",
-            }),
-            json!({
-                "id": "2",
-                "severity": "error",
-                "source": "quality:b",
-                "message": "second issue",
-                "filePath": "src/a.ts",
-                "line": 1,
-                "createdAt": "2026-01-01T00:00:01Z",
-            }),
-        ];
-        deduplicate_problems(&mut items);
-        assert_eq!(items.len(), 2);
     }
 }
 

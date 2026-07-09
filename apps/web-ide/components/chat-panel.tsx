@@ -209,6 +209,7 @@ export function ChatPanel({
     tokenUsage, traces, streamingToken, thinkingText,
     attachmentIndexProposal, clearAttachmentIndexProposal, applyAttachmentsIndexed,
     pendingCount,
+    confirmingRunId,
     send, resend, remove, feedbackError, feedbackPositive, positiveFeedback,
     confirmAgent, cancelRun,
   } = useChat(projectId, profileId, { sessionId });
@@ -329,7 +330,8 @@ export function ChatPanel({
   const hasBusyMessageAction = Object.values(busyByMessage).some(
     (action) => action === "resend" || action === "delete" || action === "feedback",
   );
-  const isAgentRunning = agentRun?.status === "running";
+  const isAgentRunning =
+    agentRun != null && isAgentRunLiveOrWaiting(agentRun.status);
 
   // ADR 0037: osserva la larghezza reale della lista messaggi per derivare la
   // soglia densita' del collasso, coerente con le @container query (che agiscono
@@ -1248,6 +1250,7 @@ export function ChatPanel({
               tc={tc}
               t={t as (key: string) => string}
               onConfirm={handleConfirmAgent}
+              isConfirming={confirmingRunId === agentRun.runId}
               streamingToken={agentRun.status === "running" ? streamingToken : undefined}
               narrationWarnAfterMs={narrationWarnAfterMs}
               narrationWarnAfterChars={narrationWarnAfterChars}
@@ -1402,6 +1405,10 @@ export function ChatPanel({
                 foldThreshold,
               )}
               runStatus={agentRun.status}
+              runId={agentRun.runId}
+              pendingActions={agentRun.pendingActions}
+              onConfirm={handleConfirmAgent}
+              isConfirming={confirmingRunId === agentRun.runId}
               tc={tc}
             />
           ) : null;
@@ -1478,6 +1485,7 @@ export function ChatPanel({
         availableProviders={availableProviders}
         runProvider={agentRun?.provider ?? null}
         runModel={agentRun?.model ?? null}
+        runAutomationMode={agentRun?.automationMode ?? null}
         automationMode={automationMode}
         onAutomationModeChange={setAutomationMode}
         supervisorMode={supervisorMode}

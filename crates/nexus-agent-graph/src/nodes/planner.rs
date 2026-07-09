@@ -121,7 +121,7 @@ pub struct PlannerConfig {
     /// `is_eligible` sempre false -> pass-through.
     pub plan_phase_enabled: bool,
     /// Behavior_mode che attivano il planner (`plan_behavior_modes`, default
-    /// `["automatico", "continuo"]`). Confronto case-insensitive.
+    /// `["bilanciata", "approfondita"]`). Confronto case-insensitive.
     pub plan_behavior_modes: Vec<String>,
     /// Intent che attivano il planner (`plan_intents`, default code/implement/
     /// fix/...). Confronto case-insensitive.
@@ -178,7 +178,7 @@ impl Default for PlannerConfig {
         // logica. plan_phase_enabled FALSE -> il planner e' OFF di default.
         Self {
             plan_phase_enabled: false,
-            plan_behavior_modes: vec!["automatico".to_string(), "continuo".to_string()],
+            plan_behavior_modes: vec!["bilanciata".to_string(), "approfondita".to_string()],
             // DEBITO 4 (TODO Fase 5): allineato 1:1 ai `_SAFE_DEFAULTS["plan_intents"]`
             // del brain (`orchestrator_config.py`, mig 0426): intent canonici del
             // classifier + hook `fix_semplice`/`fix_complesso`. Era divergente
@@ -326,21 +326,26 @@ pub enum ClarifyingBranch {
     },
 }
 
-/// `true` se il `behavior_mode` impone la HITL (Confirm) sul ramo clarifying:
-/// `behavior_mode in (None, "confirm", "study")` (`planner_node.py:147`).
-/// Confronto case-sensitive come il Python (i valori sono normalizzati a monte).
-fn clarifying_is_confirm(behavior_mode: Option<&str>) -> bool {
-    matches!(behavior_mode, None | Some("confirm") | Some("study"))
+/// `true` se l'`automation_mode` impone HITL sul ramo clarifying (study/confirm).
+fn clarifying_requires_hitl(automation_mode: Option<crate::state::AutomationMode>) -> bool {
+    matches!(
+        automation_mode,
+        None | Some(crate::state::AutomationMode::None)
+            | Some(crate::state::AutomationMode::Confirm)
+    )
 }
 
 /// Branching clarifying PURO (`planner_node.py:144-170`). `questions` sono le
 /// domande emesse da `_detect_clarifications` (gia' filtrate/clampate dal lato
 /// LLM): vuote -> `Proceed`. PUNTO UNICO del branching (regola L).
-pub fn clarifying_branch(questions: &[Value], behavior_mode: Option<&str>) -> ClarifyingBranch {
+pub fn clarifying_branch(
+    questions: &[Value],
+    automation_mode: Option<crate::state::AutomationMode>,
+) -> ClarifyingBranch {
     if questions.is_empty() {
         return ClarifyingBranch::Proceed;
     }
-    if clarifying_is_confirm(behavior_mode) {
+    if clarifying_requires_hitl(automation_mode) {
         ClarifyingBranch::Halt {
             questions: questions.to_vec(),
         }
@@ -1124,7 +1129,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         let mut applied_assumptions: Option<Vec<Value>> = None;
         if self.cfg.clarifying_questions_enabled && state.pending_clarifications.is_none() {
             let questions = self.detect_clarifications(state, ctx).await;
-            match clarifying_branch(&questions, behavior_mode) {
+            match clarifying_branch(&questions, state.automation_mode) {
                 ClarifyingBranch::Halt { questions } => {
                     tracing::info!(
                         target: "nexus_agent_graph::planner",
@@ -1624,12 +1629,13 @@ mod tests {
         }
     }
 
-    /// Stato eleggibile: behavior_mode automatico, intent code, budget alto,
+    /// Stato eleggibile: behavior_mode bilanciata, intent code, budget alto,
     /// thread_id + session_id presenti, un messaggio utente.
     fn eligible_state() -> AgentState {
         AgentState {
             messages: vec![human("Implementa il login del progetto in modo robusto")],
-            behavior_mode: Some("automatico".to_string()),
+            behavior_mode: Some("bilanciata".to_string()),
+            automation_mode: Some(crate::state::AutomationMode::Automatic),
             user_intent: Some("code".to_string()),
             token_budget: Some(8000),
             thread_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
@@ -1864,13 +1870,13 @@ mod tests {
         );
         // plan_phase OFF -> mai eleggibile.
         let off = PlannerConfig::default();
-        assert!(!off.is_eligible(Some("automatico"), Some("code"), 8000));
+        assert!(!off.is_eligible(Some("bilanciata"), Some("code"), 8000));
         // behavior_mode fuori lista.
         assert!(!cfg.is_eligible(Some("confirm"), Some("code"), 8000));
         // intent fuori lista.
-        assert!(!cfg.is_eligible(Some("automatico"), Some("chat"), 8000));
+        assert!(!cfg.is_eligible(Some("bilanciata"), Some("chat"), 8000));
         // budget sotto soglia.
-        assert!(!cfg.is_eligible(Some("automatico"), Some("code"), 100));
+        assert!(!cfg.is_eligible(Some("bilanciata"), Some("code"), 100));
         // behavior_mode None/"" salta il gate del mode (parita' falsy Python).
         assert!(cfg.is_eligible(None, Some("code"), 8000));
         assert!(cfg.is_eligible(Some(""), Some("code"), 8000));
@@ -1914,7 +1920,7 @@ mod tests {
             vec![todo("t1", TodoStatus::Pending, 1)],
             Some(PlanRow {
                 user_intent: Some("code".to_string()),
-                behavior_mode: Some("automatico".to_string()),
+                behavior_mode: Some("bilanciata".to_string()),
             }),
         ))
     }
@@ -2262,7 +2268,7 @@ mod tests {
             ],
             Some(PlanRow {
                 user_intent: Some("code".to_string()),
-                behavior_mode: Some("automatico".to_string()),
+                behavior_mode: Some("bilanciata".to_string()),
             }),
         ));
         let llm = Arc::new(ScriptedLlm::never_tool());
@@ -2291,7 +2297,7 @@ mod tests {
             vec![todo("t1", TodoStatus::Pending, 1)],
             Some(PlanRow {
                 user_intent: Some("docs".to_string()), // diverso da "code"
-                behavior_mode: Some("automatico".to_string()),
+                behavior_mode: Some("bilanciata".to_string()),
             }),
         ));
         let llm = Arc::new(ScriptedLlm::always_tool(
@@ -2639,9 +2645,10 @@ mod tests {
 
     #[test]
     fn clarifying_branch_pura() {
+        use crate::state::AutomationMode;
         // Nessuna domanda -> proceed (a prescindere dal mode).
         assert_eq!(
-            clarifying_branch(&[], Some("confirm")),
+            clarifying_branch(&[], Some(AutomationMode::Confirm)),
             ClarifyingBranch::Proceed
         );
         let q = vec![json!({"id": "q1", "question": "x"})];
@@ -2651,16 +2658,16 @@ mod tests {
             ClarifyingBranch::Halt { .. }
         ));
         assert!(matches!(
-            clarifying_branch(&q, Some("confirm")),
+            clarifying_branch(&q, Some(AutomationMode::Confirm)),
             ClarifyingBranch::Halt { .. }
         ));
         assert!(matches!(
-            clarifying_branch(&q, Some("study")),
+            clarifying_branch(&q, Some(AutomationMode::None)),
             ClarifyingBranch::Halt { .. }
         ));
-        // automatico/continuo -> apply defaults.
+        // automatic/continuous -> apply defaults.
         assert!(matches!(
-            clarifying_branch(&q, Some("automatico")),
+            clarifying_branch(&q, Some(AutomationMode::Automatic)),
             ClarifyingBranch::ApplyDefaults { .. }
         ));
     }
@@ -2687,12 +2694,12 @@ mod tests {
             "anthropic",
             "m1",
             Some("code"),
-            Some("automatico"),
+            Some("bilanciata"),
         );
         assert_eq!(out["run_id"], json!("RID"));
         assert_eq!(out["planner_model"], json!("anthropic/m1"));
         assert_eq!(out["user_intent"], json!("code"));
-        assert_eq!(out["behavior_mode"], json!("automatico"));
+        assert_eq!(out["behavior_mode"], json!("bilanciata"));
         // setdefault: se planner_model gia' presente, NON sovrascrive.
         let block2 = json!({"input": {"planner_model": "gia-presente", "todos": []}});
         let out2 = build_tool_input(&block2, "RID", "p", "m", None, None);
@@ -2873,14 +2880,25 @@ mod golden {
                     )))
                 }
                 "clarifying_branch" => {
+                    use crate::state::AutomationMode;
                     let questions = c
                         .input
                         .get("questions")
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
-                    let bm = opt_str(&c.input, "behavior_mode");
-                    clarifying_label(&clarifying_branch(&questions, bm.as_deref()))
+                    let auto_mode = c
+                        .input
+                        .get("automation_mode")
+                        .and_then(Value::as_str)
+                        .and_then(|s| match s {
+                            "confirm" => Some(AutomationMode::Confirm),
+                            "none" => Some(AutomationMode::None),
+                            "automatic" => Some(AutomationMode::Automatic),
+                            "continuous" => Some(AutomationMode::Continuous),
+                            _ => None,
+                        });
+                    clarifying_label(&clarifying_branch(&questions, auto_mode))
                 }
                 "tool_catalog" => {
                     // La lista di un solo tool; confronto strutturale JSON.

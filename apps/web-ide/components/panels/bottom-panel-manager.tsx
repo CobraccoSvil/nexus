@@ -239,8 +239,24 @@ export function BottomPanelManager({
                     <span style={{ color: tc.text, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {item.message}
                     </span>
-                    <span style={{ color: severityColor(item.severity, tc), fontSize: 11, flexShrink: 0 }}>
-                      {item.severity}
+                    <span style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                      {item.occurrenceCount && item.occurrenceCount > 1 ? (
+                        <span
+                          style={{
+                            color: tc.textMuted,
+                            fontSize: 10,
+                            background: "rgba(148,163,184,0.15)",
+                            borderRadius: 8,
+                            padding: "1px 6px",
+                          }}
+                          title={`${item.occurrenceCount} occorrenze raggruppate`}
+                        >
+                          x{item.occurrenceCount}
+                        </span>
+                      ) : null}
+                      <span style={{ color: severityColor(item.severity, tc), fontSize: 11 }}>
+                        {item.severity}
+                      </span>
                     </span>
                   </div>
                   <div style={{ color: tc.textMuted, fontSize: 11, marginTop: 4 }}>
