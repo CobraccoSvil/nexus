@@ -439,6 +439,7 @@ export function Composer({
           <select
             value={automationMode}
             onChange={(e) => onAutomationModeChange(e.target.value as "study" | "confirm" | "automatic")}
+            title="Automazione: Studio = solo lettura, Conferma = chiede approvazione prima di modifiche, Automatico = esegue senza fermarsi"
             style={{
               ...selectStyle,
               cursor: "pointer",
@@ -451,7 +452,7 @@ export function Composer({
           <select
             value={supervisorMode}
             onChange={(e) => onSupervisorModeChange(e.target.value as "none" | "anomaly" | "interleaved" | "continuous")}
-            title="Supervisore AI: controlla e corregge l'agente durante l'esecuzione (usa gemini-flash)"
+            title="Supervisore AI (monitora e corregge l'agente). Non sostituisce Conferma/Automatico: per saltare le approvazioni usa Automatico."
             style={{
               ...selectStyle,
               border: `1px solid ${supervisorMode !== "none" ? "#8b5cf6" : tc.border}`,
@@ -462,7 +463,7 @@ export function Composer({
             <option value="none">👁 Supervisor off</option>
             <option value="anomaly">👁 Su anomalia</option>
             <option value="interleaved">👁 Ogni 5 step</option>
-            <option value="continuous">👁 Continuo</option>
+            <option value="continuous">👁 Supervisione continua</option>
           </select>
           <IconButton
             label="Allega file"

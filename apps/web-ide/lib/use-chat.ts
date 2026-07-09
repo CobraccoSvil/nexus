@@ -98,12 +98,11 @@ export function useChat(
     attachments: SavedChatAttachment[];
   } | null>(null);
 
-  // ── Auto-continuazione per modalita' "Automatico" ──
-  // Quando un run primario completa con status "completed" e automationMode "automatic",
-  // invia automaticamente "Continua" per far proseguire l'agente senza intervento utente.
-  // Limite: max 10 continuazioni automatiche consecutive per evitare loop infiniti.
-  const autoContinueCountRef = useRef(0);
-  const [autoContinuePending, setAutoContinuePending] = useState(false);
+  // ── Auto-conferma HITL per modalita' "Automatico" ──
+  // Se un run in automatic dovesse comunque sospendersi su awaiting_confirmation,
+  // approviamo via API (resume checkpoint), MAI con un nuovo messaggio "Continua".
+  const autoConfirmCountRef = useRef(0);
+  const [autoConfirmRunId, setAutoConfirmRunId] = useState<string | null>(null);
 
   // ── Coda messaggi ──
   // Messaggi inviati dall'utente MENTRE un agent run e' in corso. Vengono
@@ -204,62 +203,6 @@ export function useChat(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastMessage?.messageId, sessionId]);
 
-  // ── Auto-continuazione: quando il run completa in modalita' "automatic" e
-  // autoContinuePending e' true, invia "Continua" dopo 2s (attende che isLoading
-  // sia false). Il contatore limita a max 10 continuazioni consecutive.
-  // Reset del contatore: ogni messaggio manuale dell'utente lo azzera.
-  const autoContinueSendRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (!autoContinuePending || isLoading || !sessionId) return;
-    // Piccolo delay per dare tempo alla UI di aggiornarsi (mostra il messaggio sintetico)
-    autoContinueSendRef.current = setTimeout(() => {
-      setAutoContinuePending(false);
-      // Usa sendChatMessage direttamente per evitare dipendenze circolari con send()
-      void (async () => {
-        try {
-          setIsLoading(true);
-          const response = await sendChatMessage(sessionId, "Continua", {
-            automationMode: "automatic",
-            // synthetic: messaggio auto-generato dal sistema, la UI lo nasconde
-            // (l'utente non lo ha digitato; vedere chat_messages.rs::synthetic).
-            synthetic: true,
-          });
-          if (response.agentRun) {
-            setMessages((current) => [
-              ...current,
-              ...(response.userMessage ? [response.userMessage] : []),
-            ]);
-            setAgentSteps([]);
-            const initialRun: AgentRunInfo = {
-              runId: response.agentRun.runId,
-              sessionId: sessionId,
-              status: "running",
-              automationMode: "automatic",
-              provider: response.agentRun.provider,
-              model: response.agentRun.model,
-              iterationCount: 0,
-              pendingActions: [],
-              steps: [],
-              createdAt: new Date().toISOString(),
-            };
-            setAgentRun(initialRun);
-            setAgentRuns((prev) => new Map(prev).set(initialRun.runId, initialRun));
-            setAgentStepsMap((prev) => new Map(prev).set(initialRun.runId, []));
-            subscribeToRun(sessionId, response.agentRun.runId, true);
-          } else {
-            setIsLoading(false);
-          }
-        } catch {
-          setIsLoading(false);
-          setAutoContinuePending(false);
-        }
-      })();
-    }, 2000);
-    return () => {
-      if (autoContinueSendRef.current) clearTimeout(autoContinueSendRef.current);
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoContinuePending, isLoading, sessionId]);
 
   // Persist traces to sessionStorage when they change
   useEffect(() => {
@@ -483,6 +426,18 @@ export function useChat(
             // il run concluso (failed) e sblocchiamo la UI. Senza questo
             // l'utente vede il pulsante Stop rosso indefinitamente.
             const dbIsTerminal = isStatusTerminal(finalRun.status);
+            if (!dbIsTerminal && isAgentRunLiveOrWaiting(finalRun.status)) {
+              // Stream chiuso ma il run e' ancora vivo (HITL, fan-in, running):
+              // NON forzare failed — mantieni lo stato reale dal DB.
+              setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
+              setAgentStepsMap((prev) => new Map(prev).set(runId, finalRun.steps));
+              if (isPrimary) {
+                setAgentRun(finalRun);
+                setAgentSteps(finalRun.steps);
+                setIsLoading(finalRun.status === "running");
+              }
+              return;
+            }
             if (!dbIsTerminal) {
               console.warn(
                 `[use-chat] agent_final ricevuto ma DB resta status=${finalRun.status} dopo ${MAX_RETRIES} retry. Forzo terminale (failed) lato UI.`,
@@ -586,14 +541,14 @@ export function useChat(
                 if (
                   finalRun.status === "awaiting_confirmation" &&
                   finalRun.automationMode === "automatic" &&
-                  autoContinueCountRef.current < 3
+                  autoConfirmCountRef.current < 3
                 ) {
-                  autoContinueCountRef.current += 1;
-                  setAutoContinuePending(true);
+                  autoConfirmCountRef.current += 1;
+                  setAutoConfirmRunId(runId);
                 } else {
                   // Run completato/failed/cancelled: STOP. L'utente puo' digitare
                   // "Continua" manualmente se vuole proseguire.
-                  autoContinueCountRef.current = 0;
+                  autoConfirmCountRef.current = 0;
                 }
                 // REATTACH automatico al run attivo della sessione. Se il backend
                 // ha GIA' un ALTRO run in corso (l'agente si e' rilanciato come
@@ -727,7 +682,16 @@ export function useChat(
             setAgentRuns((prevMap) => {
               const cur = prevMap.get(runId);
               if (!cur) return prevMap;
-              return new Map(prevMap).set(runId, patchRun(cur));
+              const next = new Map(prevMap).set(runId, patchRun(cur));
+              if (
+                isPrimary &&
+                cur.automationMode === "automatic" &&
+                autoConfirmCountRef.current < 3
+              ) {
+                autoConfirmCountRef.current += 1;
+                setAutoConfirmRunId(runId);
+              }
+              return next;
             });
             if (isPrimary) {
               setAgentRun((prev) => (prev && prev.runId === runId ? patchRun(prev) : prev));
@@ -839,10 +803,10 @@ export function useChat(
         setPendingQueue((q) => [...q, { content: trimmed, options }]);
         return;
       }
-      // Reset contatore auto-continuazione: ogni messaggio manuale dell'utente
-      // azzera il conteggio per permettere nuove sequenze di auto-continuazione.
-      autoContinueCountRef.current = 0;
-      setAutoContinuePending(false);
+      // Reset contatore auto-conferma HITL: ogni messaggio manuale dell'utente
+      // azzera il conteggio per permettere nuove sequenze di auto-conferma.
+      autoConfirmCountRef.current = 0;
+      setAutoConfirmRunId(null);
 
       setIsLoading(true);
       setIsSending(true);
@@ -1135,24 +1099,57 @@ export function useChat(
           setIsLoading(false);
           return;
         }
-        setAgentRun((prev) => (prev ? { ...prev, status: "running" } : null));
+        setAgentRun((prev) => (prev ? { ...prev, status: "running", pendingActions: [] } : null));
         setAgentRuns((prev) => {
           const run = prev.get(runId);
           if (!run) return prev;
-          return new Map(prev).set(runId, { ...run, status: "running" });
+          return new Map(prev).set(runId, { ...run, status: "running", pendingActions: [] });
         });
+        setIsLoading(true);
         // Riavvia l'ascolto dello stream (punto unico subscribeToRun: chiude la
         // subscription precedente e traccia primarySubCleanupRef).
         if (sessionId) {
           subscribeToRun(sessionId, runId, true);
         }
       } catch (e) {
+        if (e instanceof ApiError && e.status === 409 && sessionId) {
+          // Stato HITL stale: il run non e' piu' in attesa di conferma nel DB.
+          // Riconcilia invece di mostrare un errore bloccante all'utente.
+          try {
+            const current = await getAgentRun(runId);
+            setAgentRuns((prev) => new Map(prev).set(runId, current));
+            if (isAgentRunLiveOrWaiting(current.status)) {
+              setAgentRun({ ...current, pendingActions: [] });
+              setAgentSteps(current.steps ?? []);
+              setIsLoading(current.status === "running");
+              if (current.status === "running") {
+                subscribeToRun(sessionId, runId, true);
+              }
+              return;
+            }
+            stopPrimaryAgentStream();
+            setAgentRun(null);
+            setAgentSteps([]);
+            setIsLoading(false);
+            return;
+          } catch {
+            // fallback al messaggio originale
+          }
+        }
         setError(e instanceof Error ? e.message : "Conferma fallita.");
         setIsLoading(false);
       }
     },
-    [projectId, sessionId, subscribeToRun, stopPrimaryAgentStream],
+    [sessionId, subscribeToRun, stopPrimaryAgentStream],
   );
+
+  // Auto-conferma HITL per run in modalita' "automatic" (punto unico: resume API).
+  useEffect(() => {
+    if (!autoConfirmRunId || !sessionId) return;
+    const runId = autoConfirmRunId;
+    setAutoConfirmRunId(null);
+    void confirmAgent(runId, true);
+  }, [autoConfirmRunId, confirmAgent, sessionId]);
 
   // Dopo bootstrap: riconnetti all'agente in corso (se il browser è stato refreshato mentre girava)
   useEffect(() => {

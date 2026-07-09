@@ -214,12 +214,13 @@ fn recent_tool_lines_from_messages(messages: &[Message], max: usize) -> Vec<Stri
             break;
         }
         match msg {
-            Message::Ai { content, .. } => {
-                if let MessageContent::Blocks(blocks) = content {
-                    for b in blocks {
-                        if let crate::state::ContentBlock::ToolUse { name, .. } = b {
-                            lines.push(format!("- tool {name}"));
-                        }
+            Message::Ai {
+                content: MessageContent::Blocks(blocks),
+                ..
+            } => {
+                for b in blocks {
+                    if let crate::state::ContentBlock::ToolUse { name, .. } = b {
+                        lines.push(format!("- tool {name}"));
                     }
                 }
             }
@@ -237,12 +238,14 @@ fn recent_tool_lines_from_messages(messages: &[Message], max: usize) -> Vec<Stri
 fn detect_tool_loop(messages: &[Message]) -> bool {
     let mut signatures: Vec<String> = Vec::new();
     for msg in messages.iter().rev().take(12) {
-        if let Message::Ai { content, .. } = msg {
-            if let MessageContent::Blocks(blocks) = content {
-                for b in blocks {
-                    if let crate::state::ContentBlock::ToolUse { name, input, .. } = b {
-                        signatures.push(build_signature(name, input));
-                    }
+        if let Message::Ai {
+            content: MessageContent::Blocks(blocks),
+            ..
+        } = msg
+        {
+            for b in blocks {
+                if let crate::state::ContentBlock::ToolUse { name, input, .. } = b {
+                    signatures.push(build_signature(name, input));
                 }
             }
         }

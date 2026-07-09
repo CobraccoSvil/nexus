@@ -783,7 +783,7 @@ async fn load_supervisor_config(db: &PgPool) -> SupervisorConfig {
 
 /// Converte il tipo condiviso mcp-core nel tipo del grafo (stesse varianti).
 pub fn graph_supervisor_mode(mode: crate::agent_types::SupervisorMode) -> SupervisorMode {
-    SupervisorMode::from_str(mode.as_str())
+    mode.as_str().parse::<SupervisorMode>().unwrap()
 }
 
 /// Costruisce la [`PlannerConfig`] DB-driven (regola G), 1:1 con le chiavi

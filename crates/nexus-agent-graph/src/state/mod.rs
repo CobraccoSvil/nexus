@@ -42,14 +42,16 @@ pub enum SupervisorMode {
     Continuous,
 }
 
-impl SupervisorMode {
-    pub fn from_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
+impl std::str::FromStr for SupervisorMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
             "anomaly" | "c" => Self::Anomaly,
             "interleaved" | "a" => Self::Interleaved,
             "continuous" | "b" => Self::Continuous,
             _ => Self::None,
-        }
+        })
     }
 }
 

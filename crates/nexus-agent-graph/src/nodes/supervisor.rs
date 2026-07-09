@@ -40,7 +40,7 @@ impl SupervisorNode {
         state
             .extra
             .get(key)
-            .map(|v| crate::decisions::supervisor::validate_supervisor_response(v))
+            .map(crate::decisions::supervisor::validate_supervisor_response)
     }
 
     fn decision_to_json(decision: &SupervisorDecision) -> serde_json::Value {
@@ -107,7 +107,7 @@ impl SupervisorNode {
                 };
                 extra = put_extra(
                     &merged,
-                    &supervisor_cache_key(state.iterations.unwrap_or(0)),
+                    supervisor_cache_key(state.iterations.unwrap_or(0)),
                     json!({ "action": "abandon", "reason": reason.clone() }),
                 );
                 StateDelta {
