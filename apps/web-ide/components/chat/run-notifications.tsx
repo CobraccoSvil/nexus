@@ -73,13 +73,26 @@ export function deriveRunNotifications(
         });
       }
       if (ev.type === "council_of_competencies") {
+        const failedFigures = ev.figureReports?.filter((r) => r.status !== "advisory_ok") ?? [];
+        const figureDetail =
+          ev.phase === "convening"
+            ? typeof ev.completedCount === "number" &&
+              typeof ev.figureCount === "number" &&
+              ev.figureCount > 0
+              ? `${ev.completedCount}/${ev.figureCount} figure completate`
+              : "Convocazione figure in corso"
+            : ev.degraded && failedFigures.length > 0
+              ? failedFigures.map((r) => `${r.kind}: ${r.detail_message}`).join(" · ")
+              : undefined;
         out.push({
-          tone: ev.degraded ? "warn" : "info",
+          tone: ev.phase === "convening" ? "info" : ev.degraded ? "warn" : "info",
           title: "Consiglio delle Competenze",
-          detail: ev.degraded
-            ? ev.degradationReason ??
-              "Gate attivato ma la convocazione non ha prodotto una sintesi valida."
-            : "Attivato dall'analisi agentica/deterministica della richiesta.",
+          detail:
+            figureDetail ??
+            (ev.degraded
+              ? ev.degradationReason ??
+                "Gate attivato ma la convocazione non ha prodotto una sintesi valida."
+              : "Attivato dall'analisi agentica/deterministica della richiesta."),
           color: ev.degraded ? "#f59e0b" : "#0ea5e9",
         });
       }

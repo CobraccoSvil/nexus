@@ -174,6 +174,29 @@ export interface AwaitingSubagentsEvent extends EventProvenance {
   title: string;
 }
 
+/** Report per-figura del consiglio (segnale strutturato backend). */
+export interface FigureAdvisoryReport {
+  kind: string;
+  status:
+    | "prepare_failed"
+    | "run_failed"
+    | "run_timeout"
+    | "completed_no_advisory"
+    | "invalid_advisory"
+    | "advisory_ok";
+  detail_code: string;
+  detail_message: string;
+  advisory_verdict?: string;
+  subagent_run_id?: string;
+}
+
+export type CouncilFigureTaskStatus = "pending" | "running" | "done" | "failed";
+
+export interface CouncilFigureTask {
+  kind: string;
+  status: CouncilFigureTaskStatus;
+}
+
 /** Il run ha attivato il Consiglio delle Competenze tramite analisi agentica/
  *  deterministica di complessita' e ambito. Non e' un toggle manuale: la fonte
  *  e' il meta-step backend `council_of_competencies`. */
@@ -182,8 +205,13 @@ export interface CouncilOfCompetenciesEvent extends EventProvenance {
   title: string;
   productName: string;
   activationSource?: string;
+  phase?: "convening" | "complete";
+  completedCount?: number;
+  figureCount?: number;
+  figureTasks?: CouncilFigureTask[];
   degraded?: boolean;
   degradationReason?: string;
+  figureReports?: FigureAdvisoryReport[];
 }
 
 /** Panel multi-provider: stesso problema analizzato da provider/modelli distinti
@@ -247,6 +275,82 @@ function asString(v: unknown): string | undefined {
 
 function asNumber(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+function readFigureReports(payload: Record<string, unknown>): FigureAdvisoryReport[] | undefined {
+  const raw = payload.figure_reports;
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: FigureAdvisoryReport[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const r = item as Record<string, unknown>;
+    const kind = asString(r.kind);
+    const status = asString(r.status);
+    const detailCode = asString(r.detail_code);
+    const detailMessage = asString(r.detail_message);
+    if (!kind || !status || !detailCode || !detailMessage) continue;
+    if (
+      status !== "prepare_failed" &&
+      status !== "run_failed" &&
+      status !== "run_timeout" &&
+      status !== "completed_no_advisory" &&
+      status !== "invalid_advisory" &&
+      status !== "advisory_ok"
+    ) {
+      continue;
+    }
+    out.push({
+      kind,
+      status,
+      detail_code: detailCode,
+      detail_message: detailMessage,
+      advisory_verdict: asString(r.advisory_verdict),
+      subagent_run_id: asString(r.subagent_run_id),
+    });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function readCouncilFigureTasks(
+  payload: Record<string, unknown>,
+): CouncilFigureTask[] | undefined {
+  const raw = payload.figure_tasks;
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: CouncilFigureTask[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const r = item as Record<string, unknown>;
+    const kind = asString(r.kind);
+    const status = asString(r.status);
+    if (!kind || !status) continue;
+    if (
+      status !== "pending" &&
+      status !== "running" &&
+      status !== "done" &&
+      status !== "failed"
+    ) {
+      continue;
+    }
+    out.push({ kind, status });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function upsertCouncilEvent(seg: ActivitySegment, ev: CouncilOfCompetenciesEvent): void {
+  for (let i = seg.events.length - 1; i >= 0; i--) {
+    const prev = seg.events[i];
+    if (prev.type !== "council_of_competencies") continue;
+    if (ev.phase === "convening" && prev.phase === "convening") {
+      seg.events[i] = ev;
+      return;
+    }
+    if (ev.phase !== "convening" && prev.phase === "convening") {
+      seg.events[i] = ev;
+      return;
+    }
+    break;
+  }
+  seg.events.push(ev);
 }
 
 /** Legge il numero di sub-agent in attesa dal payload del meta-step
@@ -601,14 +705,24 @@ export function composeActivityStream(
           // da un gate strutturato a monte, non da un toggle manuale o dal testo
           // del modello.
           const seg = ensureSegment(undefined, undefined);
-          seg.events.push({
+          const signal = asString(p.signal);
+          const phase =
+            signal === "council_convening" || p.phase === "convening"
+              ? ("convening" as const)
+              : ("complete" as const);
+          upsertCouncilEvent(seg, {
             type: "council_of_competencies",
             title: m.title,
             productName: asString(p.product_name) ?? "Consiglio delle Competenze",
             activationSource: asString(p.activation_source),
+            phase,
+            completedCount: asNumber(p.completed_count),
+            figureCount: asNumber(p.figure_count),
+            figureTasks: readCouncilFigureTasks(p),
             degraded: p.degraded === true,
             degradationReason:
               asString(p.degradation_detail) ?? asString(p.degradation_reason),
+            figureReports: readFigureReports(p),
           });
           break;
         }

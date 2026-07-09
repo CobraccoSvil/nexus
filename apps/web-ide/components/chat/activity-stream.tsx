@@ -660,7 +660,7 @@ function EventBody({
           style={{
             minWidth: 0,
             borderRadius: 10,
-            border: `1px solid ${withAlpha(event.degraded ? "#f59e0b" : COUNCIL_ACCENT, 0.35)}`,
+            border: `1px solid ${withAlpha(event.degraded ? "#f59e0b" : event.phase === "convening" ? COUNCIL_ACCENT : COUNCIL_ACCENT, 0.35)}`,
             background: withAlpha(event.degraded ? "#f59e0b" : COUNCIL_ACCENT, 0.08),
             padding: "7px 9px",
           }}
@@ -676,15 +676,100 @@ function EventBody({
               {event.productName}
             </span>
             <span style={tagStyle(event.degraded ? "#f59e0b" : COUNCIL_ACCENT)}>
-              {event.degraded ? "degradato" : "attivo"}
+              {event.phase === "convening"
+                ? "in corso"
+                : event.degraded
+                  ? "degradato"
+                  : "attivo"}
             </span>
           </div>
           <div style={{ marginTop: 3, fontSize: 11.5, color: tc.textMuted }}>
-            {event.degraded
-              ? event.degradationReason ??
-                "Gate attivato ma la convocazione non ha prodotto una sintesi valida."
-              : "Attivato dall'analisi agentica/deterministica di complessita' e ambito della richiesta."}
+            {event.phase === "convening"
+              ? typeof event.completedCount === "number" &&
+                typeof event.figureCount === "number" &&
+                event.figureCount > 0
+                ? `Convocazione figure (${event.completedCount}/${event.figureCount})...`
+                : "Convocazione delle figure del consiglio in corso..."
+              : event.degraded
+                ? event.degradationReason ??
+                  "Gate attivato ma la convocazione non ha prodotto una sintesi valida."
+                : "Attivato dall'analisi agentica/deterministica di complessita' e ambito della richiesta."}
           </div>
+          {event.figureTasks && event.figureTasks.length > 0 ? (
+            <ul
+              style={{
+                margin: "6px 0 0",
+                paddingLeft: 0,
+                listStyle: "none",
+                fontSize: 11,
+                color: tc.textMuted,
+              }}
+            >
+              {event.figureTasks.map((task) => (
+                <li
+                  key={task.kind}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "2px 0",
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      flexShrink: 0,
+                      background:
+                        task.status === "done"
+                          ? "#22c55e"
+                          : task.status === "failed"
+                            ? tc.error
+                            : task.status === "running"
+                              ? COUNCIL_ACCENT
+                              : withAlpha(tc.textMuted, 0.5),
+                      opacity: task.status === "running" ? 0.85 : 1,
+                    }}
+                  />
+                  <span
+                    style={{
+                      fontWeight: 600,
+                      color:
+                        task.status === "failed"
+                          ? tc.error
+                          : task.status === "done"
+                            ? tc.text
+                            : tc.textMuted,
+                    }}
+                  >
+                    {task.kind.replace(/_/g, " ")}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {event.degraded && event.figureReports && event.figureReports.length > 0 ? (
+            <ul
+              style={{
+                margin: "6px 0 0",
+                paddingLeft: 16,
+                fontSize: 11,
+                color: tc.textMuted,
+                listStyle: "disc",
+              }}
+            >
+              {event.figureReports
+                .filter((r) => r.status !== "advisory_ok")
+                .map((r) => (
+                  <li key={`${r.kind}-${r.detail_code}`}>
+                    <span style={{ fontWeight: 600, color: tc.text }}>{r.kind}</span>
+                    {": "}
+                    {r.detail_message}
+                  </li>
+                ))}
+            </ul>
+          ) : null}
         </div>
       );
     case "multi_provider_panel":

@@ -52,7 +52,9 @@
 //!
 //! TESTA (gate/early-return, ordine esatto del Python):
 //!  1. `_check_superseded` -> early return `stop_reason=superseded` (`:1669`).
-//!  2. `declared_outcome=done` & `declared_done_count>=3` -> end_turn (`:1683`).
+//!  2. `declared_outcome=done` & `declared_done_count>=3` -> end_turn (`:1683`),
+//!     SALVO rientro da final_gate in correzione (`final_gate_cycle>0`: il gate
+//!     ha bocciato e chiede fix; la chiusura d'autorita' neutralizzerebbe il ciclo).
 //!  3. M16 merge discovered (iniezione native, cap DB) + strategia discovery-only
 //!     search (`:1714-1759`).
 //!  4. worker-mode (`:1792`) + DAG parallelo (`:1832`): rami GENUINAMENTE OFF di
@@ -852,6 +854,7 @@ pub(crate) enum HeadGate {
     /// `_check_superseded` -> stop_reason superseded (py:1669).
     Superseded,
     /// `declared_outcome=done` & count>=3 -> chiusura d'autorita' end_turn (py:1683).
+    /// Soppresso quando `final_gate_cycle>0` (correzione oggettiva in corso).
     DeclaredDone,
     /// G1 cap raggiunto (escalation esaurita) -> g1_cap_reached (py:1945).
     G1Cap,
@@ -860,23 +863,46 @@ pub(crate) enum HeadGate {
 }
 
 /// Decisione PURA dei gate di TESTA (priorita' 1:1 col Python). `g1_cap_reached`
-/// arriva gia' calcolato da [`g1_accounting`] (punto unico). PURA.
+/// arriva gia' calcolato da [`g1_accounting`] (punto unico). `final_gate_correction_active`
+/// true quando `final_gate_cycle > 0`: il gate ha bocciato e chiede fix; in quel
+/// turno la chiusura d'autorita' su `done>=3` e' soppressa (incidente run 97cbaa45).
 pub(crate) fn head_gate(
     superseded: bool,
     declared_done: bool,
     declared_done_count: i64,
     g1_cap_reached: bool,
+    final_gate_correction_active: bool,
 ) -> HeadGate {
     if superseded {
         return HeadGate::Superseded;
     }
-    if declared_done && declared_done_count >= 3 {
+    if declared_done
+        && declared_done_count >= 3
+        && !final_gate_correction_active
+    {
         return HeadGate::DeclaredDone;
     }
     if g1_cap_reached {
         return HeadGate::G1Cap;
     }
     HeadGate::Proceed
+}
+
+/// Finestra forced-text (ultime N iterazioni): svuota il catalogo tool per
+/// obbligare un resoconto testuale. Soppressa durante la correzione post-
+/// `final_gate` (`final_gate_cycle>0`): in quel turno servono i tool di scrittura
+/// per applicare i fix richiesti dal gate (incidente run cee89699).
+pub(crate) fn forced_text_turn_active(
+    iters_in: i64,
+    forced_text_threshold: i64,
+    stop_reason: Option<StopReason>,
+    final_gate_correction_active: bool,
+    tools_available: bool,
+) -> bool {
+    tools_available
+        && iters_in >= forced_text_threshold
+        && stop_reason == Some(StopReason::ToolUse)
+        && !final_gate_correction_active
 }
 
 /// Risolve provider/model: sticky > override > routing-risolto-a-monte
@@ -954,7 +980,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
             .and_then(|d| d.get("outcome").and_then(Value::as_str))
             == Some("done");
         let done_count = state.declared_done_count.unwrap_or(0);
-        match head_gate(superseded, declared_done, done_count, false) {
+        let final_gate_correction_active = state.final_gate_cycle.unwrap_or(0) > 0;
+        match head_gate(
+            superseded,
+            declared_done,
+            done_count,
+            false,
+            final_gate_correction_active,
+        ) {
             HeadGate::Superseded => {
                 tracing::warn!(
                     target: "nexus_agent_graph::executor",
@@ -1512,7 +1545,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
             || (unfulfilled_for_g1 && iters_in >= g1_loop_threshold && !g1_recent_productive))
             && !declaration_pending;
         if matches!(
-            head_gate(false, false, 0, g1_cap_effective),
+            head_gate(false, false, 0, g1_cap_effective, false),
             HeadGate::G1Cap
         ) {
             // ESCALATION orchestratore (py:1962-1993): prima di arrenderci, l'
@@ -2617,10 +2650,13 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
         // vuota alla finestra forced-text -> final_answer NULL, chat muta).
         let forced_text_threshold = self.cfg.iteration_cap - self.cfg.forced_text_offset;
         let mut forced_text_turn = false;
-        if !tools_json.is_empty()
-            && iters_in >= forced_text_threshold
-            && state.stop_reason == Some(StopReason::ToolUse)
-        {
+        if forced_text_turn_active(
+            iters_in,
+            forced_text_threshold,
+            state.stop_reason,
+            final_gate_correction_active,
+            !tools_json.is_empty(),
+        ) {
             tracing::warn!(
                 target: "nexus_agent_graph::executor",
                 iters = iters_in,

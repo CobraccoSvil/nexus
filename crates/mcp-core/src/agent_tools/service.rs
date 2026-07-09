@@ -130,7 +130,7 @@ fn existing_service_action(listening: bool) -> ExistingServiceAction {
 /// Avvia un servizio/processo long-running direttamente sul server.
 /// L'output viene catturato nel DB e mostrato nel pannello Output dell'IDE.
 pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind: &str) -> String {
-    // Fase 1: validazione input + risoluzione kind/label/work_dir + anti-duplicato.
+    // Fase 1: validazione + label/work_dir (senza refuse: la dedup deve girare prima).
     let launch = match resolve_service_launch(ctx, input, kind).await {
         Ok(l) => l,
         Err(msg) => return msg,
@@ -142,8 +142,18 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         work_dir,
     } = launch;
 
-    // ── Deduplicazione servizi: kill processi simili + cleanup porte orfane ──
-    dedup_and_cleanup_ports(ctx, &label).await;
+    // ── Deduplicazione PRIMA del refuse (regola L, fix strutturale) ─────────
+    // stop_similar + cleanup porte, poi liberazione LISTEN orfano/zombie sullo
+    // stesso scopo. Solo DOPO si valuta refuse_if_same_scope_active: cosi' un
+    // riavvio non resta bloccato da PID 12812/child ancora in ascolto mentre il
+    // check refuse girava prima della dedup (incidente Vite 31754).
+    dedup_and_cleanup_ports(ctx, &label, &command).await;
+
+    if let Some(kind_hint) = derive_kind_hint(&command, &label) {
+        if let Some(refuse_msg) = refuse_if_same_scope_active(ctx, kind_hint).await {
+            return refuse_msg;
+        }
+    }
 
     // ── Quota container (PR hardening) ────────────────────────────────────
     // Solo per kind="service": i tool agente short-lived non contano contro
@@ -211,10 +221,9 @@ async fn validate_service_command(ctx: &AgentToolContext, input: &Value) -> Resu
     Ok(command)
 }
 
-/// Fase 1 di `tool_run_service`: valida il comando (non vuoto, niente
-/// placeholder di redazione), declassa il kind one-shot, deriva la label e lo
-/// scopo, risolve il working directory ed esegue l'anti-duplicato per scopo.
-/// Ritorna `Err(msg)` col messaggio gia' pronto da restituire (errore o refuse).
+/// Fase 1 di `tool_run_service`: valida il comando, declassa one-shot, deriva
+/// label e working directory. Il refuse per scopo duplicato avviene DOPO
+/// `dedup_and_cleanup_ports` in `tool_run_service` (ordine vincolante).
 async fn resolve_service_launch(
     ctx: &AgentToolContext,
     input: &Value,
@@ -238,8 +247,8 @@ async fn resolve_service_launch(
     // Risoluzione working directory (punto unico riusato anche dal restart).
     let work_dir = resolve_service_work_dir(ctx, input)?;
 
-    // Derivazione label + scopo + anti-duplicato (fase estratta).
-    let label = resolve_label_and_check_dup(ctx, input, &command, kind).await?;
+    // Derivazione label (refuse per scopo: dopo dedup in tool_run_service).
+    let label = resolve_service_label(ctx, input, &command, kind)?;
 
     Ok(ServiceLaunch {
         command,
@@ -250,19 +259,10 @@ async fn resolve_service_launch(
 }
 
 /// Deriva la label finale del servizio dal parametro esplicito o dallo scopo
-/// (frontend/backend) ed esegue l'anti-duplicato per scopo. Ritorna `Err(msg)`
-/// se un servizio dello stesso scopo e' gia' ATTIVO (refuse).
-///
-/// Una label esplicita ma GENERICA ("Service", "server") equivale a nessuna
-/// label: non identifica uno scopo, crea una voce autonoma nel pannello che
-/// sfugge alla dedup e resta per sempre. La si scarta e si deriva dallo scopo
-/// (kind_hint) come per la label mancante. Senza il default per scopo, ogni
-/// avvio senza label crea la voce generica "Service" che sfugge sia alla dedup
-/// per label sia alla similarity, producendo duplicati dello stesso server nel
-/// pannello (caso reale: "Service" + "backend" sullo stesso server.js).
-/// Punto unico: regola L.
-async fn resolve_label_and_check_dup(
-    ctx: &AgentToolContext,
+/// (frontend/backend). Il refuse per duplicato attivo e' in `tool_run_service`,
+/// dopo `dedup_and_cleanup_ports`.
+fn resolve_service_label(
+    _ctx: &AgentToolContext,
     input: &Value,
     command: &str,
     kind: &str,
@@ -274,32 +274,63 @@ async fn resolve_label_and_check_dup(
         .filter(|s| !crate::agent_processes::is_generic_service_label(s));
     let label = explicit_label.unwrap_or("Service").to_string();
 
-    // Anti-duplicato: lo scopo deriva dal command (vite/express/etc) o dal label.
     let kind_hint = derive_kind_hint(command, &label);
     let label = match (explicit_label, kind_hint) {
         (None, Some(hint)) if kind == "service" => hint.to_string(),
         _ => label,
     };
-    if let Some(kind_hint) = kind_hint {
-        if let Some(refuse_msg) = refuse_if_same_scope_active(ctx, kind_hint).await {
-            return Err(refuse_msg);
-        }
-    }
     Ok(label)
 }
 
-/// Deduplicazione servizi prima dell'avvio: ferma i processi simili e rilascia
-/// le porte orfane. Delegata al PUNTO UNICO stop_similar_running_services
-/// (regola L), lo stesso usato da wizard install, start/restart del pannello e
-/// run config: query dedicata sui running kind='service' (nessun LIMIT come
-/// list_processes) e similarity che splitta anche trattini/underscore
-/// ("frontend-dev" ~ "frontend"). Il cleanup preserva la label che stiamo
-/// (ri)avviando: la sua porta spenta verra' adottata, non rilasciata.
-async fn dedup_and_cleanup_ports(ctx: &AgentToolContext, label: &str) {
+/// Deduplicazione servizi prima del refuse: ferma processi simili, cleanup
+/// porte orfane, libera LISTEN residuo sullo stesso scopo (zombie/orfani non
+/// tracciati in agent_processes). Delega stop a stop_similar_running_services
+/// (punto unico, regola L).
+async fn dedup_and_cleanup_ports(ctx: &AgentToolContext, label: &str, command: &str) {
     let _ =
         crate::agent_processes::stop_similar_running_services(&ctx.db, ctx.project_id, label).await;
     if let Ok(existing) = crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
         cleanup_dead_process_ports(&ctx.db, ctx.project_id, &existing, label).await;
+    }
+    if let Some(kind_hint) = derive_kind_hint(command, label) {
+        free_listening_scope_port(ctx, kind_hint).await;
+    }
+}
+
+/// Dopo stop_similar: se lo stesso scopo e' ancora in LISTEN (child orfano,
+/// processo non tracciato, stop non verificato), tenta try_free_port sul punto
+/// unico port_recovery (regola L). Best-effort: il refuse successivo intercetta
+/// solo i casi in cui la porta resta occupata.
+async fn free_listening_scope_port(ctx: &AgentToolContext, kind_hint: &str) {
+    let Some(res) = crate::project_workspace::resource_resolver::resolve_for_label(
+        &ctx.port_registry,
+        ctx.project_id,
+        kind_hint,
+    )
+    .await
+    else {
+        return;
+    };
+    if !res.listening {
+        return;
+    }
+    let Some(port) = res.port else {
+        return;
+    };
+    tracing::info!(
+        kind = %kind_hint,
+        port = port,
+        matched_label = %res.label,
+        pid = ?res.pid,
+        "run_service: LISTEN residuo sullo stesso scopo dopo dedup, libero la porta"
+    );
+    if crate::project_workspace::port_recovery::try_free_port(port).await {
+        tracing::info!(port = port, "run_service: porta liberata, proseguo avvio");
+    } else {
+        tracing::warn!(
+            port = port,
+            "run_service: porta ancora occupata dopo try_free_port"
+        );
     }
 }
 
@@ -498,13 +529,9 @@ fn resolve_service_work_dir(
     }
 }
 
-/// Anti-duplicato convergente sul PUNTO UNICO resource_resolver (regola L):
-/// niente piu' query SQL + parsing systemctl re-implementati qui. Il resolver
-/// riconcilia DB (nexus_port_allocations) + porte realmente in LISTEN (verita'
-/// di runtime, systemd cieco in WSL) e applica il matching label/scopo a 2
-/// classi disgiunte (frontend/backend). `kind` e' gia' una label di classe che
-/// il resolver riconosce. Ritorna `Some(msg)` se il servizio dello stesso scopo
-/// e' gia' ATTIVO (refuse); `None` per proseguire l'avvio (adozione stantia).
+/// Anti-duplicato convergente sul PUNTO UNICO resource_resolver (regola L).
+/// Valutato DOPO `dedup_and_cleanup_ports`: refuse solo se, dopo stop_similar e
+/// try_free_port, lo stesso scopo e' ancora in LISTEN (servizio legit da riusare).
 async fn refuse_if_same_scope_active(ctx: &AgentToolContext, kind: &str) -> Option<String> {
     let res = crate::project_workspace::resource_resolver::resolve_for_label(
         &ctx.port_registry,
@@ -1071,10 +1098,7 @@ mod tests {
         assert!(!looks_like_web_service("npm install"));
     }
 
-    /// Regressione deadlock allocazione stantia: un servizio dello stesso scopo
-    /// gia' ATTIVO va rifiutato (no duplicato), ma una allocazione SPENTA va
-    /// ADOTTATA (run_service prosegue e riavvia) invece di rifiutare rimandando a
-    /// `service_restart` (che non puo' riavviare un servizio non-systemd).
+    /// Regressione deadlock allocazione stantia + ordine dedup/refuse.
     #[test]
     fn esistente_attivo_rifiuta_spento_adotta() {
         assert_eq!(

@@ -169,7 +169,7 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   escalation: { icon: "▲", label: "Cambio modello", accent: "#0ea5e9", defaultOpen: true },
   strategy_shift: { icon: "↷", label: "Cambio strategia", accent: "#8b5cf6", defaultOpen: true },
   loop_break: { icon: "◼", label: "Interruzione", accent: "#ef4444", defaultOpen: true },
-  final_gate: { icon: "✓", label: "Verifica", accent: "#22c55e", defaultOpen: false },
+  final_gate: { icon: "✓", label: "Verifica", accent: "#22c55e", defaultOpen: true },
   declaration_request: { icon: "…", label: "Richiesta esito", accent: "#f59e0b", defaultOpen: false },
   outcome_declared: { icon: "◆", label: "Esito dichiarato", accent: "#22c55e", defaultOpen: true },
   // Narrazione del sub-agente sul run padre (ponte subagent_native.rs, mig
@@ -207,6 +207,7 @@ const PAYLOAD_KEY_LABELS: Record<string, string> = {
   model: "Modello",
   iteration: "Iterazione",
   forced: "Chiusura forzata",
+  failed_criteria: "Criteri falliti",
   outcome: "Esito",
   blocker: "Blocco",
   summary: "Sintesi",
@@ -231,7 +232,79 @@ const FINAL_GATE_PHASES: Record<string, string> = {
   passed: "superata",
   failed: "non superata, nuovo tentativo",
   forced_close: "chiusura al limite tentativi",
+  completion_grace: "criteri ok, manca solo task_complete",
 };
+
+/** Etichette leggibili per i tipi di criterio del final_gate (payload
+ * `failed_criteria[].type`, regola M: segnale strutturato, non prosa). */
+const CRITERION_TYPE_LABELS: Record<string, string> = {
+  run_command: "Comando di verifica",
+  completion_confirmed: "Dichiarazione di chiusura",
+  service_logs_clean: "Log servizio",
+  http_endpoint: "Endpoint HTTP",
+  design_verify: "Verifica visiva",
+  no_orphan_outputs: "Output orfani",
+  outputs_exist: "Output attesi",
+  tool_capability: "Capacita' tool",
+};
+
+type FailedCriterionPayload = {
+  type?: string;
+  command?: string | null;
+  excerpt?: string;
+  exit_code?: number | null;
+  build_errors?: number | null;
+};
+
+function criterionTypeLabel(t: string | undefined): string {
+  if (!t) return "Criterio";
+  return CRITERION_TYPE_LABELS[t] ?? t.replace(/_/g, " ");
+}
+
+function formatFailedCriterion(c: FailedCriterionPayload): string {
+  const parts: string[] = [];
+  if (c.command) parts.push(c.command);
+  if (c.exit_code !== undefined && c.exit_code !== null) {
+    parts.push(`exit ${c.exit_code}`);
+  }
+  if (typeof c.build_errors === "number" && c.build_errors > 0) {
+    parts.push(`${c.build_errors} errori build`);
+  }
+  const head = parts.length > 0 ? parts.join(" · ") : null;
+  const excerpt = (c.excerpt ?? "").trim();
+  if (head && excerpt) return `${head} — ${excerpt}`;
+  if (head) return head;
+  if (excerpt) return excerpt;
+  return "dettaglio non disponibile";
+}
+
+function FailedCriteriaList({
+  items,
+  tc,
+}: {
+  items: FailedCriterionPayload[];
+  tc: ReturnType<typeof useThemeColors>;
+}) {
+  if (!items.length) return null;
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: tc.textMuted }}>
+        Criteri non superati
+      </div>
+      <ul style={{ margin: 0, paddingLeft: 16, fontSize: 11, lineHeight: 1.45 }}>
+        {items.map((c, i) => (
+          <li key={`${c.type ?? "criterion"}-${i}`} style={{ marginBottom: 4 }}>
+            <span style={{ fontWeight: 600, color: tc.text }}>
+              {criterionTypeLabel(c.type)}
+            </span>
+            {": "}
+            <span style={{ color: tc.textMuted }}>{formatFailedCriterion(c)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 // M15.1 — Checklist todo del piano con aggiornamento LIVE via eventi TodoUpdated.
 // Lo stato iniziale viene dal payload del meta_step plan; gli aggiornamenti
@@ -391,12 +464,17 @@ function renderPayload(
     const cycle = payload.cycle as number | undefined;
     const maxCycles = payload.max_cycles as number | undefined;
     const phase = payload.phase as string | undefined;
+    const failedRaw = payload.failed_criteria;
+    const failedCriteria = Array.isArray(failedRaw)
+      ? (failedRaw as FailedCriterionPayload[])
+      : [];
     return (
       <div style={grid}>
         {typeof cycle === "number" && (
           <DefRow k="Tentativo" v={maxCycles ? `${cycle} di ${maxCycles}` : String(cycle)} tc={tc} />
         )}
         {phase && <DefRow k="Fase" v={FINAL_GATE_PHASES[phase] ?? phase} tc={tc} />}
+        <FailedCriteriaList items={failedCriteria} tc={tc} />
       </div>
     );
   }

@@ -1150,6 +1150,78 @@ pub(crate) enum CouncilDegradeReason {
     SynthesisUnavailable,
 }
 
+/// Stato strutturato del parere di UNA figura del consiglio (regola M).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FigureAdvisoryStatus {
+    PrepareFailed,
+    RunFailed,
+    RunTimeout,
+    CompletedNoAdvisory,
+    InvalidAdvisory,
+    AdvisoryOk,
+}
+
+/// Stato UI di UNA figura durante la convocazione parallela del consiglio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CouncilFigureTaskStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+/// Task del consiglio mostrato in UI mentre le figure lavorano in parallelo.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CouncilFigureTask {
+    pub kind: String,
+    pub status: CouncilFigureTaskStatus,
+}
+
+/// Costruisce la lista task per la UI: figure ancora in corso -> `running`,
+/// completate con parere valido -> `done`, altrimenti `failed`.
+pub(crate) fn council_figure_tasks(
+    figures: &[String],
+    completed_reports: &[FigureAdvisoryReport],
+) -> Vec<CouncilFigureTask> {
+    use std::collections::HashMap;
+    let done: HashMap<_, _> = completed_reports
+        .iter()
+        .map(|r| (r.kind.as_str(), r))
+        .collect();
+    figures
+        .iter()
+        .map(|kind| {
+            let status = match done.get(kind.as_str()) {
+                Some(r) if r.status == FigureAdvisoryStatus::AdvisoryOk => {
+                    CouncilFigureTaskStatus::Done
+                }
+                Some(_) => CouncilFigureTaskStatus::Failed,
+                None if completed_reports.is_empty() => CouncilFigureTaskStatus::Running,
+                None => CouncilFigureTaskStatus::Running,
+            };
+            CouncilFigureTask {
+                kind: kind.clone(),
+                status,
+            }
+        })
+        .collect()
+}
+
+/// Report per-figura del consiglio: esito macchina + messaggio display.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct FigureAdvisoryReport {
+    pub kind: String,
+    pub status: FigureAdvisoryStatus,
+    pub detail_code: String,
+    pub detail_message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advisory_verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_run_id: Option<String>,
+}
+
 /// Esito del pre-step Consiglio delle Competenze: sintesi attiva o degrado esplicito.
 /// `None` dal call site significa che i gate pre-convocazione non sono passati
 /// (feature off, keyword miss, nessuna figura): nessun segnale UI.
@@ -1158,10 +1230,12 @@ pub(crate) enum CouncilConveneOutcome {
     Active {
         synthesis: AdvisorySynthesis,
         figures: Vec<String>,
+        figure_reports: Vec<FigureAdvisoryReport>,
     },
     Degraded {
         reason: CouncilDegradeReason,
         figures: Vec<String>,
+        figure_reports: Vec<FigureAdvisoryReport>,
     },
 }
 
@@ -1195,6 +1269,14 @@ impl CouncilConveneOutcome {
     pub(crate) fn figures(&self) -> &[String] {
         match self {
             Self::Active { figures, .. } | Self::Degraded { figures, .. } => figures.as_slice(),
+        }
+    }
+
+    pub(crate) fn figure_reports(&self) -> &[FigureAdvisoryReport] {
+        match self {
+            Self::Active { figure_reports, .. } | Self::Degraded { figure_reports, .. } => {
+                figure_reports.as_slice()
+            }
         }
     }
 }
@@ -1342,6 +1424,137 @@ pub(crate) async fn read_multi_provider_config(db: &sqlx::PgPool) -> Option<Mult
     })
 }
 
+/// Segnale strutturato di rifiuto in fase PREPARE (regola M): il coordinatore
+/// legge `error_code`, non il testo di `error`.
+fn prepare_reject(error_code: &'static str, message: impl Into<String>) -> Value {
+    json!({
+        "error": message.into(),
+        "error_code": error_code,
+        "status": "prepare_failed",
+        "outcome": terminal_verdict("failed", error_code),
+    })
+}
+
+/// Classifica l'esito di UNA figura del consiglio dal tool_result strutturato.
+fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryReport {
+    let subagent_run_id = result
+        .get(K_SUB_RUN_ID)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(code) = result.get("error_code").and_then(Value::as_str) {
+        let message = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or(code)
+            .to_string();
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::PrepareFailed,
+            detail_code: code.to_string(),
+            detail_message: message,
+            advisory_verdict: None,
+            subagent_run_id,
+        };
+    }
+    let lifecycle = result.get("status").and_then(Value::as_str).unwrap_or("");
+    if lifecycle == "timeout" {
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::RunTimeout,
+            detail_code: "run_timeout".to_string(),
+            detail_message: result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Sub-agent in timeout")
+                .to_string(),
+            advisory_verdict: None,
+            subagent_run_id,
+        };
+    }
+    if lifecycle == "failed" || lifecycle == "prepare_failed" {
+        let outcome = result.get("outcome").cloned().unwrap_or(Value::Null);
+        let code = outcome
+            .get("error_class")
+            .or_else(|| outcome.get("verdict"))
+            .and_then(Value::as_str)
+            .unwrap_or("run_failed")
+            .to_string();
+        let message = result
+            .get("error")
+            .or_else(|| result.get(K_SUMMARY))
+            .and_then(Value::as_str)
+            .unwrap_or("Sub-run fallito")
+            .to_string();
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::RunFailed,
+            detail_code: code,
+            detail_message: message,
+            advisory_verdict: None,
+            subagent_run_id,
+        };
+    }
+    let outcome = result.get("outcome").cloned().unwrap_or(Value::Null);
+    if outcome.get("success").and_then(Value::as_bool) != Some(true) {
+        let code = outcome
+            .get("error_class")
+            .or_else(|| outcome.get("verdict"))
+            .and_then(Value::as_str)
+            .unwrap_or("run_failed")
+            .to_string();
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::RunFailed,
+            detail_code: code,
+            detail_message: "Sub-run terminato senza esito positivo".to_string(),
+            advisory_verdict: None,
+            subagent_run_id,
+        };
+    }
+    let advisory = match outcome.get("advisory") {
+        Some(a) if !a.is_null() => a,
+        _ => {
+            return FigureAdvisoryReport {
+                kind: kind.to_string(),
+                status: FigureAdvisoryStatus::CompletedNoAdvisory,
+                detail_code: "no_advisory".to_string(),
+                detail_message: "Sub-run completato senza chiamare advisory_verdict".to_string(),
+                advisory_verdict: None,
+                subagent_run_id,
+            };
+        }
+    };
+    let verdict = advisory.get("verdict").and_then(Value::as_str);
+    let valid_verdict = verdict.is_some_and(|v| {
+        matches!(v, "proceed" | "proceed_with_changes" | "block")
+    });
+    if !valid_verdict {
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::InvalidAdvisory,
+            detail_code: "invalid_advisory".to_string(),
+            detail_message: "Parere advisory presente ma verdetto non valido".to_string(),
+            advisory_verdict: verdict.map(str::to_owned),
+            subagent_run_id,
+        };
+    }
+    FigureAdvisoryReport {
+        kind: kind.to_string(),
+        status: FigureAdvisoryStatus::AdvisoryOk,
+        detail_code: "advisory_ok".to_string(),
+        detail_message: "Parere advisory valido".to_string(),
+        advisory_verdict: verdict.map(str::to_owned),
+        subagent_run_id,
+    }
+}
+
+/// Esito della convocazione parallela: report per-figura + sintesi opzionale.
+#[derive(Debug, Clone)]
+pub(crate) struct CouncilConvokeResult {
+    pub figure_reports: Vec<FigureAdvisoryReport>,
+    pub synthesis: Option<AdvisorySynthesis>,
+}
+
 /// Convoca le figure `kinds` in PARALLELO (sub-run read-only, sincroni) e compone la
 /// SINTESI del loro parere col punto unico PURO `compose_advisory_synthesis` (regola
 /// L/M: legge i segnali strutturati `outcome.advisory`, mai la prosa di `summary`).
@@ -1353,19 +1566,52 @@ pub(crate) async fn convene_council(
     task: &str,
     kinds: &[&str],
     policy: &AdvisoryPolicy,
-) -> Option<AdvisorySynthesis> {
+    progress_tx: Option<tokio::sync::mpsc::Sender<FigureAdvisoryReport>>,
+) -> CouncilConvokeResult {
     if kinds.is_empty() {
-        return None;
+        return CouncilConvokeResult {
+            figure_reports: Vec::new(),
+            synthesis: None,
+        };
     }
     // Le figure hanno gia' l'istruzione advisory_verdict nel loro prompt (mig 0548);
     // qui ribadiamo il formato atteso come promemoria operativo.
     let expected = "Concludi la tua analisi chiamando il tool advisory_verdict \
                     (verdict, requirements, risks[severity+description], recommendations).";
-    let futs = kinds
-        .iter()
-        .map(|kind| run_single_subagent(ctx, kind, task, "", expected, None, false));
-    let results: Vec<Value> = futures::future::join_all(futs).await;
-    compose_council_synthesis(&results, policy)
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut futs = FuturesUnordered::new();
+    for kind in kinds {
+        let ctx = ctx.clone();
+        let task = task.to_string();
+        let expected = expected.to_string();
+        let kind = kind.to_string();
+        futs.push(async move {
+            let result =
+                run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await;
+            let report = classify_council_figure_result(&kind, &result);
+            (report, result)
+        });
+    }
+    let mut pairs: Vec<(FigureAdvisoryReport, Value)> = Vec::with_capacity(kinds.len());
+    while let Some((report, result)) = futs.next().await {
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.send(report.clone()).await;
+        }
+        pairs.push((report, result));
+    }
+    pairs.sort_by_key(|(report, _)| {
+        kinds
+            .iter()
+            .position(|k| *k == report.kind)
+            .unwrap_or(usize::MAX)
+    });
+    let figure_reports: Vec<FigureAdvisoryReport> = pairs.iter().map(|(r, _)| r.clone()).collect();
+    let raw_results: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
+    let synthesis = compose_council_synthesis(&raw_results, policy);
+    CouncilConvokeResult {
+        figure_reports,
+        synthesis,
+    }
 }
 
 /// Convoca lo stesso analista read-only su provider diversi, scelti dal catalog
@@ -1966,9 +2212,10 @@ async fn prepare_subagent_run(
     let session_id = match ctx.core.session_id {
         Some(s) => s,
         None => {
-            return Err(
-                json!({"error": "sub-agent richiede una sessione chat (session_id assente)"}),
-            )
+            return Err(prepare_reject(
+                "session_missing",
+                "sub-agent richiede una sessione chat (session_id assente)",
+            ))
         }
     };
     // Routing separazione DB: nexus_subagent_runs e' tabella migrata, vive nel DB
@@ -1979,55 +2226,70 @@ async fn prepare_subagent_run(
     // ── Guard 1: settings (enabled / whitelist / depth / cost) ────────────────
     let settings = match read_subagent_settings(ctx).await {
         Ok(v) => v,
-        Err(e) => return Err(json!({"error": format!("lettura settings fallita: {e}")})),
+        Err(e) => {
+            return Err(prepare_reject(
+                "settings_read_failed",
+                format!("lettura settings fallita: {e}"),
+            ))
+        }
     };
     if !settings.enabled {
-        return Err(
-            json!({"error": "sub-agents disabilitati (orchestrator.subagents_enabled=false)"}),
-        );
+        return Err(prepare_reject(
+            "subagents_disabled",
+            "sub-agents disabilitati (orchestrator.subagents_enabled=false)",
+        ));
     }
     if !settings.whitelist.iter().any(|w| w == kind) {
-        return Err(
-            json!({"error": format!("kind '{kind}' non in whitelist: {:?}", settings.whitelist)}),
-        );
+        return Err(prepare_reject(
+            "kind_not_whitelisted",
+            format!("kind '{kind}' non in whitelist: {:?}", settings.whitelist),
+        ));
     }
 
     // ── Guard 2: definition del kind ──────────────────────────────────────────
     let definition = match fetch_definition(ctx, kind).await {
         Ok(Some(d)) => d,
         Ok(None) => {
-            return Err(
-                json!({"error": format!("kind '{kind}' non trovato in nexus_subagent_definitions")}),
-            )
+            return Err(prepare_reject(
+                "kind_not_found",
+                format!("kind '{kind}' non trovato in nexus_subagent_definitions"),
+            ))
         }
-        Err(e) => return Err(json!({"error": e})),
+        Err(e) => return Err(prepare_reject("definition_fetch_failed", e)),
     };
 
     // ── Guard 3: anti-ricorsione (depth DB-driven dalla catena) ───────────────
     let anchor = parent_anchor(ctx);
     let current_depth = current_chain_depth(&proj_pool, anchor).await + 1;
     if current_depth > settings.max_depth {
-        return Err(json!({"error": format!(
-            "depth {current_depth} > max {}: annidamento sub-agent eccessivo (anti-ricorsione)",
-            settings.max_depth
-        )}));
+        return Err(prepare_reject(
+            "depth_exceeded",
+            format!(
+                "depth {current_depth} > max {}: annidamento sub-agent eccessivo (anti-ricorsione)",
+                settings.max_depth
+            ),
+        ));
     }
 
     // ── Guard 4: cost cap cumulativo per parent ───────────────────────────────
     let spent = cumulative_cost(&proj_pool, anchor).await;
     if spent >= settings.cost_cap_usd {
-        return Err(json!({"error": format!(
-            "cost cap raggiunto per parent={anchor} ({spent:.4} >= {:.4})",
-            settings.cost_cap_usd
-        )}));
+        return Err(prepare_reject(
+            "cost_cap_reached",
+            format!(
+                "cost cap raggiunto per parent={anchor} ({spent:.4} >= {:.4})",
+                settings.cost_cap_usd
+            ),
+        ));
     }
 
     // ── Risoluzione system_text + tools + modello worker (DB-driven) ──────────
     let system_text = resolve_system_text(ctx, &definition.prompt_key).await;
     if system_text.trim().is_empty() {
-        return Err(
-            json!({"error": format!("prompt '{}' non trovato o vuoto", definition.prompt_key)}),
-        );
+        return Err(prepare_reject(
+            "prompt_missing",
+            format!("prompt '{}' non trovato o vuoto", definition.prompt_key),
+        ));
     }
     let tools_json = build_tools_json(&definition.tool_whitelist);
 
@@ -2075,9 +2337,10 @@ async fn prepare_subagent_run(
     let subagent_run_id: Uuid = match insert_subagent_run(&proj_pool, &insert, isolation).await {
         Ok(id) => id,
         Err(e) => {
-            return Err(
-                json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")}),
-            )
+            return Err(prepare_reject(
+                "insert_failed",
+                format!("creazione riga nexus_subagent_runs fallita: {e}"),
+            ))
         }
     };
 
@@ -4546,12 +4809,54 @@ mod tests {
     }
 
     #[test]
+    fn council_figure_tasks_progresso_ui() {
+        use super::{council_figure_tasks, FigureAdvisoryReport, FigureAdvisoryStatus};
+        let figures = vec![
+            "security_engineer".to_string(),
+            "software_architect".to_string(),
+        ];
+        let start = council_figure_tasks(&figures, &[]);
+        assert_eq!(start.len(), 2);
+        assert_eq!(start[0].status, super::CouncilFigureTaskStatus::Running);
+        assert_eq!(start[1].status, super::CouncilFigureTaskStatus::Running);
+
+        let partial = council_figure_tasks(
+            &figures,
+            &[FigureAdvisoryReport {
+                kind: "security_engineer".to_string(),
+                status: FigureAdvisoryStatus::AdvisoryOk,
+                detail_code: "advisory_ok".to_string(),
+                detail_message: "ok".to_string(),
+                advisory_verdict: Some("proceed".to_string()),
+                subagent_run_id: None,
+            }],
+        );
+        assert_eq!(partial[0].status, super::CouncilFigureTaskStatus::Done);
+        assert_eq!(partial[1].status, super::CouncilFigureTaskStatus::Running);
+
+        let failed = council_figure_tasks(
+            &figures,
+            &[FigureAdvisoryReport {
+                kind: "software_architect".to_string(),
+                status: FigureAdvisoryStatus::RunTimeout,
+                detail_code: "run_timeout".to_string(),
+                detail_message: "timeout".to_string(),
+                advisory_verdict: None,
+                subagent_run_id: None,
+            }],
+        );
+        assert_eq!(failed[0].status, super::CouncilFigureTaskStatus::Running);
+        assert_eq!(failed[1].status, super::CouncilFigureTaskStatus::Failed);
+    }
+
+    #[test]
     fn council_outcome_degraded_codes_strutturati() {
         let figures = vec!["security_engineer".to_string()];
         assert_eq!(
             CouncilConveneOutcome::Degraded {
                 reason: CouncilDegradeReason::SubagentsDisabled,
                 figures: figures.clone(),
+                figure_reports: Vec::new(),
             }
             .degradation_reason_code(),
             Some("subagents_disabled")
@@ -4560,6 +4865,7 @@ mod tests {
             CouncilConveneOutcome::Degraded {
                 reason: CouncilDegradeReason::SynthesisUnavailable,
                 figures: figures.clone(),
+                figure_reports: Vec::new(),
             }
             .degradation_reason_code(),
             Some("synthesis_unavailable")
@@ -4568,10 +4874,41 @@ mod tests {
             CouncilConveneOutcome::Degraded {
                 reason: CouncilDegradeReason::BuildCtxFailed,
                 figures,
+                figure_reports: Vec::new(),
             }
             .render_block()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn classify_figure_prepare_failed_usa_error_code() {
+        let result = json!({
+            "error": "depth 3 > max 2",
+            "error_code": "depth_exceeded",
+            "status": "prepare_failed",
+        });
+        let report = classify_council_figure_result("security_engineer", &result);
+        assert_eq!(report.status, FigureAdvisoryStatus::PrepareFailed);
+        assert_eq!(report.detail_code, "depth_exceeded");
+    }
+
+    #[test]
+    fn classify_figure_no_advisory() {
+        let result = json!({
+            "status": "completed",
+            "outcome": { "success": true },
+        });
+        let report = classify_council_figure_result("software_architect", &result);
+        assert_eq!(report.status, FigureAdvisoryStatus::CompletedNoAdvisory);
+    }
+
+    #[test]
+    fn classify_figure_advisory_ok() {
+        let result = mock_figure_result("proceed", "test", None);
+        let report = classify_council_figure_result("project_manager", &result);
+        assert_eq!(report.status, FigureAdvisoryStatus::AdvisoryOk);
+        assert_eq!(report.advisory_verdict.as_deref(), Some("proceed"));
     }
 
     /// Un tool_result mock di una figura col blocco `outcome.advisory` (regola M).

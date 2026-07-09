@@ -1,6 +1,7 @@
 use super::*;
 
 /// Parametri condivisi per avviare un agent run (usato da send e resend).
+#[derive(Clone)]
 pub(crate) struct SpawnAgentParams {
     pub(crate) user_id: Uuid,
     pub(crate) session_id: Uuid,
@@ -1114,6 +1115,7 @@ pub(crate) async fn supersede_active_runs(
             session_id,
             reason
         );
+        cancel_orphan_subagent_runs(&wpool, session_id, &cancelled_ids).await;
         // Worklog di sessione (mig 0411): ingest SINCRONO del lavoro gia'
         // svolto dai run superati, dagli agent_steps gia' persistiti
         // incrementalmente dal brain (M68). Sincrono by-design: il chiamante
@@ -1136,6 +1138,45 @@ pub(crate) async fn supersede_active_runs(
         }
     }
     cancelled_ids
+}
+
+/// Chiude i sub-run ancora `running` ancorati alla sessione (legacy pre-fix) o ai
+/// run primari appena superati: depth/cost chain non devono inquinare il run nuovo.
+async fn cancel_orphan_subagent_runs(
+    wpool: &sqlx::PgPool,
+    session_id: Uuid,
+    cancelled_parent_ids: &[Uuid],
+) {
+    let mut anchors: Vec<Uuid> = Vec::with_capacity(1 + cancelled_parent_ids.len());
+    anchors.push(session_id);
+    anchors.extend(cancelled_parent_ids.iter().copied());
+    let cancelled = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE nexus_subagent_runs SET status='cancelled', completed_at=NOW(), \
+         final_summary=COALESCE(final_summary, 'superseded') \
+         WHERE parent_run_id = ANY($1) AND status = 'running' \
+         RETURNING id",
+    )
+    .bind(&anchors)
+    .fetch_all(wpool)
+    .await
+    .unwrap_or_default();
+    if cancelled.is_empty() {
+        return;
+    }
+    let _ = sqlx::query(
+        "UPDATE agent_runs SET status='cancelled', completed_at=NOW(), \
+         cancellation_requested=NOW(), cancellation_reason='superseded', \
+         final_answer=COALESCE(final_answer, 'Superato da un nuovo run.') \
+         WHERE id = ANY($1) AND status IN ('running', 'awaiting_confirmation', 'awaiting_subagents')",
+    )
+    .bind(&cancelled)
+    .execute(wpool)
+    .await;
+    tracing::info!(
+        session_id = %session_id,
+        count = cancelled.len(),
+        "supersede_active_runs: chiusi sub-run orfani ancora running"
+    );
 }
 
 /// Punto unico (regola L) della domanda "c'e' un run agentico attivo su questa
@@ -1610,6 +1651,105 @@ fn native_engine_failure_result(
     }
 }
 
+// =============================================================================
+// Punto UNICO (regola L) dispatch post-INSERT agent run.
+//
+// Tutto cio' che supera il budget HTTP del proxy Next.js (compact, monitor,
+// history, consiglio, multi-provider, motore) passa da UN solo `tokio::spawn`
+// avviato da `spawn_agent_run` subito dopo INSERT `agent_runs`. I call site
+// HTTP (handlers send/resend) attendono solo `SpawnOutcome::Started`.
+//
+// Compact e monitor sono helper interni (task figli), non secondi punti di
+// controllo architetturali.
+// =============================================================================
+
+/// Unico `tokio::spawn` per il lifecycle post-INSERT di un agent run.
+fn dispatch_agent_run_post_insert<F>(work: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(work);
+}
+
+/// Auto-compact best-effort in parallelo al turno (non blocca consiglio/run).
+fn spawn_auto_compact_for_run(
+    state: AppState,
+    session_id: Uuid,
+    project_id: Uuid,
+    provider: String,
+    model: String,
+) {
+    tokio::spawn(async move {
+        maybe_auto_compact(&state, session_id, project_id, &provider, &model).await;
+    });
+}
+
+/// Ascoltatore monitor pannello: si sottoscrive al broadcast prima del corpo run.
+fn spawn_agent_run_step_monitor(
+    step_tx: broadcast::Sender<AgentStepEvent>,
+    monitor_registry: crate::agent_tools::monitor::MonitorRegistry,
+    project_channels: nexus_events::ProjectChannels,
+    project_id: Uuid,
+) {
+    let mut step_rx = step_tx.subscribe();
+    crate::agent_tools::monitor::set_monitor(
+        &monitor_registry,
+        &project_channels,
+        project_id,
+        "agent_run",
+        serde_json::Value::String("in corso".to_string()),
+        Some("avvio run agente".to_string()),
+    );
+    tokio::spawn(async move {
+        let mut files_touched: u64 = 0;
+        loop {
+            let ev = match step_rx.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if ev.is_final {
+                break;
+            }
+            let Some(step) = ev.step else { continue };
+            if step.status == AgentStepStatus::Running && !step.tool_name.is_empty() {
+                let target = step
+                    .tool_input
+                    .get("file_path")
+                    .or_else(|| step.tool_input.get("path"))
+                    .or_else(|| step.tool_input.get("file"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let label = target
+                    .clone()
+                    .map(|t| format!("step {} · {}", step.step_index, t))
+                    .unwrap_or_else(|| format!("step {}", step.step_index));
+                crate::agent_tools::monitor::set_monitor(
+                    &monitor_registry,
+                    &project_channels,
+                    project_id,
+                    "agent_tool",
+                    serde_json::Value::String(step.tool_name.clone()),
+                    Some(label),
+                );
+            }
+            if step.status == AgentStepStatus::Completed
+                && matches!(step.tool_name.as_str(), "write_file" | "edit_file")
+            {
+                files_touched = files_touched.saturating_add(1);
+                crate::agent_tools::monitor::set_monitor(
+                    &monitor_registry,
+                    &project_channels,
+                    project_id,
+                    "agent_files",
+                    serde_json::Value::from(files_touched),
+                    Some("file modificati".to_string()),
+                );
+            }
+        }
+    });
+}
+
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
 /// Ritorna `SpawnOutcome::NotStarted` se il progetto non è caricabile (fallback al
 /// singolo turn) e `SpawnOutcome::Disambiguation` se l'intent e' ambiguo (turno
@@ -1855,8 +1995,16 @@ pub(crate) async fn spawn_agent_run(
     } else {
         params
             .provider_override
+            .as_ref()
             .filter(|v| !v.trim().is_empty())
-            .or_else(|| params.profile_provider.filter(|v| !v.trim().is_empty()))
+            .cloned()
+            .or_else(|| {
+                params
+                    .profile_provider
+                    .as_ref()
+                    .filter(|v| !v.trim().is_empty())
+                    .cloned()
+            })
     };
     let effective_model_override =
         if let Some((_slot_provider, slot_model, _src)) = &slot_routing_hit {
@@ -1864,8 +2012,16 @@ pub(crate) async fn spawn_agent_run(
         } else {
             params
                 .model_override
+                .as_ref()
                 .filter(|v| !v.trim().is_empty())
-                .or_else(|| params.profile_model.filter(|v| !v.trim().is_empty()))
+                .cloned()
+                .or_else(|| {
+                    params
+                        .profile_model
+                        .as_ref()
+                        .filter(|v| !v.trim().is_empty())
+                        .cloned()
+                })
         };
     if let Some((p, m, src)) = &slot_routing_hit {
         tracing::info!("spawn_agent_run: routing slot-based {} → {}/{}", src, p, m);
@@ -1979,30 +2135,6 @@ pub(crate) async fn spawn_agent_run(
         });
     }
 
-    // ── AUTO-COMPACT a soglia, in BACKGROUND (regola H: fix strutturale) ─────
-    // Valuta il rapporto token sessione / context window e, se supera la soglia
-    // (DB-driven, regola G), compatta la sessione riusando compact_session_core.
-    //
-    // ESEGUITO IN BACKGROUND (fire-and-forget): la compattazione chiama un LLM e
-    // su sessioni grandi puo' durare oltre 20s. Eseguirla sincrona qui bloccava
-    // la risposta "running" della POST /chat/.../messages oltre il timeout del
-    // proxy Next.js: la chat riceveva HTTP 500 (socket hang up) ad OGNI invio su
-    // una sessione vicina alla soglia, perche' il compact riscattava ogni volta.
-    // Il turno corrente NON dipende dalla compattazione: la history dell'agente
-    // usa una finestra limitata (ultimi 4 raw + top-6 semantici), non l'intera
-    // sessione. Quindi snellire la sessione puo' avvenire async, a beneficio dei
-    // turni futuri. Best-effort: ogni fallimento e' loggato WARN dentro il task.
-    {
-        let state_bg = state.clone();
-        let session_id = params.session_id;
-        let project_id = params.project_id;
-        let provider_bg = provider.clone();
-        let model_bg = model_str.clone();
-        tokio::spawn(async move {
-            maybe_auto_compact(&state_bg, session_id, project_id, &provider_bg, &model_bg).await;
-        });
-    }
-
     // Last-wins (punto unico, regola L): questo nuovo run supera OGNI run ancora
     // attivo sulla stessa sessione, fermandoli cooperativamente. Vale per tutti i
     // call site (chat, resume, process_resume, service_observer) perche' passano
@@ -2034,11 +2166,52 @@ pub(crate) async fn spawn_agent_run(
     .execute(&run_pool)
     .await;
 
-    // Il loop agente gira integralmente nel brain LangGraph (Python): qui
-    // serve solo il Sender broadcast per ri-emettere gli eventi SSE.
     let tx_for_brain = tx.clone();
-    // Consumato dal tokio::spawn sotto per non lasciare dangling clone.
     drop(tx);
+
+    let provider_for_response = provider.clone();
+    let model_for_response = model_str.clone();
+
+    let state_bg = state.clone();
+    let params_bg = params;
+    let proj_bg = proj;
+    let classified_bg = classified;
+    let resolved_intent_hint_bg = resolved_intent_hint;
+    let classifier_input_bg = classifier_input;
+    let effective_override_bg = effective_override;
+    let superseded_runs_bg = superseded_runs;
+    let provider_bg = provider;
+    let model_str_bg = model_str;
+    let msgs_pool_bg = msgs_pool;
+    let tx_bg = tx_for_brain.clone();
+
+    dispatch_agent_run_post_insert(async move {
+        let state = state_bg;
+        let params = params_bg;
+        let proj = proj_bg;
+        let classified = classified_bg;
+        let resolved_intent_hint = resolved_intent_hint_bg;
+        let classifier_input = classifier_input_bg;
+        let effective_override = effective_override_bg;
+        let superseded_runs = superseded_runs_bg;
+        let provider = provider_bg;
+        let model_str = model_str_bg;
+        let msgs_pool = msgs_pool_bg;
+        let tx_for_brain = tx_bg;
+
+        spawn_auto_compact_for_run(
+            state.clone(),
+            params.session_id,
+            params.project_id,
+            provider.clone(),
+            model_str.clone(),
+        );
+        spawn_agent_run_step_monitor(
+            tx_for_brain.clone(),
+            state.monitor_registry.clone(),
+            state.project_channels.clone(),
+            params.project_id,
+        );
 
     // History ibrida: ultimi 4 raw (2 turni completi) + top-6 semanticamente
     // rilevanti da Qdrant. L'embedding di ricerca include l'ULTIMO turno
@@ -2347,8 +2520,15 @@ pub(crate) async fn spawn_agent_run(
         params.session_id,
     )
     .await;
-    let council_outcome =
-        maybe_convene_council(state, params.session_id, &params.content).await;
+    let council_outcome = maybe_convene_council(
+        &state,
+        &run_pool,
+        &tx_for_brain,
+        params.session_id,
+        run_id,
+        &params.content,
+    )
+    .await;
     if let Some(ref outcome) = council_outcome {
         emit_council_of_competencies_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
     }
@@ -2357,7 +2537,7 @@ pub(crate) async fn spawn_agent_run(
         .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
         .filter(|b| !b.is_empty());
     let multi_provider_block =
-        maybe_convene_multi_provider_panel(state, params.session_id, &params.content).await;
+        maybe_convene_multi_provider_panel(&state, params.session_id, &params.content).await;
     if let Some(outcome) = &multi_provider_block {
         emit_multi_provider_panel_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
     }
@@ -2520,94 +2700,11 @@ pub(crate) async fn spawn_agent_run(
     let panic_project_id = project_id_cp;
     let panic_user_msg_id = user_message_id;
 
-    // ── Monitor automatici del run (regola H, indipendenti dall'LLM) ─────────
-    // Il pannello Monitor si popola guardando lo STREAM degli step del run
-    // (eventi gia' prodotti dal parsing SSE del brain), non da chiamate del
-    // modello a `dispatcher_update_monitor`. Un task dedicato si sottoscrive al
-    // broadcast del run e traduce gli step in poche card chiave:
-    //   - `agent_run`  -> stato del run ("in corso", poi "completato"/"errore")
-    //   - `agent_tool` -> nome dell'ultimo tool eseguito (+ target file in label)
-    //   - `agent_files`-> contatore file toccati (write_file/edit_file)
-    // Sottoscriviamo PRIMA di spawnare il run cosi' nessun evento si perde.
-    {
-        let mut step_rx = tx_for_brain.subscribe();
-        let mon_reg = monitor_registry_for_run.clone();
-        let mon_ch = project_channels_for_run.clone();
-        let mon_project = project_id_cp;
-        // Stato iniziale immediato: il pannello mostra "in corso" appena parte.
-        crate::agent_tools::monitor::set_monitor(
-            &mon_reg,
-            &mon_ch,
-            mon_project,
-            "agent_run",
-            serde_json::Value::String("in corso".to_string()),
-            Some("avvio run agente".to_string()),
-        );
-        tokio::spawn(async move {
-            let mut files_touched: u64 = 0;
-            loop {
-                let ev = match step_rx.recv().await {
-                    Ok(ev) => ev,
-                    // Lagged: alcuni eventi persi (buffer pieno). Continuiamo:
-                    // i monitor sono best-effort, non un log esaustivo.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    // Tutti i sender chiusi: il run e' finito. Lo stato finale
-                    // (completato/errore) lo emette il corpo del run con
-                    // result.status (qui non lo conosciamo). Usciamo.
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                };
-                if ev.is_final {
-                    break;
-                }
-                let Some(step) = ev.step else { continue };
-                // Aggiorna `agent_tool` quando un tool inizia (status Running):
-                // value = nome tool, label = target file se ricavabile dall'input.
-                if step.status == AgentStepStatus::Running && !step.tool_name.is_empty() {
-                    let target = step
-                        .tool_input
-                        .get("file_path")
-                        .or_else(|| step.tool_input.get("path"))
-                        .or_else(|| step.tool_input.get("file"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
-                    let label = target
-                        .clone()
-                        .map(|t| format!("step {} · {}", step.step_index, t))
-                        .unwrap_or_else(|| format!("step {}", step.step_index));
-                    crate::agent_tools::monitor::set_monitor(
-                        &mon_reg,
-                        &mon_ch,
-                        mon_project,
-                        "agent_tool",
-                        serde_json::Value::String(step.tool_name.clone()),
-                        Some(label),
-                    );
-                }
-                // Contatore file toccati: incrementa quando write_file/edit_file
-                // si completa con successo.
-                if step.status == AgentStepStatus::Completed
-                    && matches!(step.tool_name.as_str(), "write_file" | "edit_file")
-                {
-                    files_touched = files_touched.saturating_add(1);
-                    crate::agent_tools::monitor::set_monitor(
-                        &mon_reg,
-                        &mon_ch,
-                        mon_project,
-                        "agent_files",
-                        serde_json::Value::from(files_touched),
-                        Some("file modificati".to_string()),
-                    );
-                }
-            }
-        });
-    }
-
     // Clone di AppState per il finalize dentro il task 'static: serve a
     // narrative_or (mig 0415) per risolvere il purpose e chiamare il neural.
     // Cheap: i campi di AppState sono Arc/pool condivisi.
     let state_for_finalize = state.clone();
 
-    tokio::spawn(async move {
         use futures::FutureExt;
 
         tracing::info!(
@@ -3235,7 +3332,10 @@ pub(crate) async fn spawn_agent_run(
                             crate::provider_cooldown::is_provider_in_cooldown(&current_provider);
                         let retriable_class = matches!(
                             result.error_class.as_deref(),
-                            Some("billing_error") | Some("rate_limit") | Some("provider_error")
+                            Some("billing_error")
+                                | Some("rate_limit")
+                                | Some("provider_error")
+                                | Some("invalid_request")
                         );
                         in_cooldown || retriable_class
                     };
@@ -4266,8 +4366,8 @@ pub(crate) async fn spawn_agent_run(
 
     SpawnOutcome::Started(SpawnAgentResult {
         run_id,
-        provider,
-        model: model_str,
+        provider: provider_for_response,
+        model: model_for_response,
     })
 }
 
@@ -5048,7 +5148,10 @@ fn build_tool_runner_deps(state: &AppState) -> crate::tool_runner_server::ToolRu
 /// run primario della chat.
 async fn maybe_convene_council(
     state: &AppState,
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
     session_id: Uuid,
+    run_id: Uuid,
     user_text: &str,
 ) -> Option<crate::agent_tools::subagent_native::CouncilConveneOutcome> {
     use crate::agent_tools::subagent_native::{
@@ -5092,47 +5195,113 @@ async fn maybe_convene_council(
         return Some(CouncilConveneOutcome::Degraded {
             reason: CouncilDegradeReason::SubagentsDisabled,
             figures,
+            figure_reports: Vec::new(),
         });
     }
-    // Costruzione del ctx tool (PUNTO UNICO ToolRunnerService::build_ctx, regola L).
-    // Sessione non risolvibile -> degrado strutturato (best-effort).
+    // Costruzione del ctx tool ancorato al run primario (PUNTO UNICO
+    // ToolRunnerService::build_ctx_for_primary_run, regola L): depth/cost isolati
+    // per run, non per sessione.
     let deps = build_tool_runner_deps(state);
     let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
-    let ctx = match svc.build_ctx(session_id).await {
+    let ctx = match svc.build_ctx_for_primary_run(session_id, run_id).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("consiglio a monte: build_ctx fallita (session={session_id}): {e}");
+            tracing::warn!(
+                run_id = %run_id,
+                "consiglio a monte: build_ctx fallita (session={session_id}): {e}"
+            );
             return Some(CouncilConveneOutcome::Degraded {
                 reason: CouncilDegradeReason::BuildCtxFailed,
                 figures,
+                figure_reports: Vec::new(),
             });
         }
     };
     let policy = crate::agent_tools::subagent_native::read_advisory_policy(&ctx).await;
-    let kinds: Vec<&str> = figures.iter().map(String::as_str).collect();
     tracing::info!(
         session_id = %session_id,
+        run_id = %run_id,
         figure = ?figures,
         "consiglio a monte: convocazione programmatica delle figure"
     );
-    let synthesis = match crate::agent_tools::subagent_native::convene_council(
-        &ctx,
-        user_text,
-        &kinds,
-        &policy,
-    )
-    .await
-    {
+
+    let total = figures.len();
+    emit_council_convening_meta_step(run_pool, tx, run_id, &figures, &[], 0, total).await;
+
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(total.max(1));
+    let ctx_bg = ctx.clone();
+    let user_text_bg = user_text.to_string();
+    let figures_bg = figures.clone();
+    let policy_bg = policy.clone();
+    let convene_handle = tokio::spawn(async move {
+        let kinds_bg: Vec<&str> = figures_bg.iter().map(String::as_str).collect();
+        crate::agent_tools::subagent_native::convene_council(
+            &ctx_bg,
+            &user_text_bg,
+            &kinds_bg,
+            &policy_bg,
+            Some(progress_tx),
+        )
+        .await
+    });
+
+    let mut completed_reports: Vec<crate::agent_tools::subagent_native::FigureAdvisoryReport> =
+        Vec::with_capacity(total);
+    while let Some(report) = progress_rx.recv().await {
+        completed_reports.push(report);
+        emit_council_convening_meta_step(
+            run_pool,
+            tx,
+            run_id,
+            &figures,
+            &completed_reports,
+            completed_reports.len(),
+            total,
+        )
+        .await;
+    }
+
+    let convoke = match convene_handle.await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %e,
+                "consiglio a monte: task convocazione join fallito"
+            );
+            return Some(CouncilConveneOutcome::Degraded {
+                reason: CouncilDegradeReason::SynthesisUnavailable,
+                figures,
+                figure_reports: completed_reports,
+            });
+        }
+    };
+    for report in &convoke.figure_reports {
+        if report.status != crate::agent_tools::subagent_native::FigureAdvisoryStatus::AdvisoryOk
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                run_id = %run_id,
+                kind = %report.kind,
+                status = ?report.status,
+                detail_code = %report.detail_code,
+                "consiglio a monte: figura senza parere valido"
+            );
+        }
+    }
+    let synthesis = match convoke.synthesis {
         Some(s) => s,
         None => {
             tracing::warn!(
                 session_id = %session_id,
+                run_id = %run_id,
                 figure = ?figures,
                 "consiglio a monte: nessuna sintesi valida dalle figure"
             );
             return Some(CouncilConveneOutcome::Degraded {
                 reason: CouncilDegradeReason::SynthesisUnavailable,
                 figures,
+                figure_reports: convoke.figure_reports,
             });
         }
     };
@@ -5146,6 +5315,7 @@ async fn maybe_convene_council(
     Some(CouncilConveneOutcome::Active {
         synthesis,
         figures,
+        figure_reports: convoke.figure_reports,
     })
 }
 
@@ -5208,6 +5378,80 @@ async fn maybe_convene_multi_provider_panel(
     Some(outcome)
 }
 
+/// Progresso live del Consiglio: lista figure con stato running/done/failed mentre
+/// la convocazione parallela e' in corso. Emesso a inizio (0/N) e ad ogni figura
+/// che termina, cosi' la chat non resta muta per minuti.
+async fn emit_council_convening_meta_step(
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+    figures: &[String],
+    completed_reports: &[crate::agent_tools::subagent_native::FigureAdvisoryReport],
+    completed_count: usize,
+    total: usize,
+) {
+    let created_at_dt = Utc::now();
+    let created_at = created_at_dt.to_rfc3339();
+    let figure_tasks = crate::agent_tools::subagent_native::council_figure_tasks(
+        figures,
+        completed_reports,
+    );
+    let figure_tasks_json: Vec<serde_json::Value> = figure_tasks
+        .iter()
+        .map(|t| serde_json::to_value(t).unwrap_or_else(|_| json!({})))
+        .collect();
+    let figure_reports_json: Vec<serde_json::Value> = completed_reports
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap_or_else(|_| json!({})))
+        .collect();
+    let title = format!("Consiglio in corso ({completed_count}/{total})");
+    let payload = json!({
+        "product_name": "Consiglio delle Competenze",
+        "activation_source": "agentic_deterministic_complexity_scope_analysis",
+        "signal": "council_convening",
+        "phase": "convening",
+        "activated": false,
+        "degraded": false,
+        "figure_count": total,
+        "completed_count": completed_count,
+        "figure_tasks": figure_tasks_json,
+        "figure_reports": figure_reports_json,
+    });
+    if let Err(e) = sqlx::query(
+        "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(run_id)
+    .bind("council_of_competencies")
+    .bind(&title)
+    .bind(&payload)
+    .bind(created_at_dt)
+    .execute(run_pool)
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "consiglio competenze: meta_step progresso persistito fallito (best-effort)"
+        );
+    }
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "council_of_competencies".to_string(),
+            title,
+            payload,
+            correlation_id: None,
+            created_at,
+        }),
+    });
+}
+
 /// Segnale strutturato per la UI chat: il Consiglio delle Competenze e' stato
 /// attivato dal gate agentico/deterministico. Emesso anche in degrado (es.
 /// sub-agents off o sintesi assente) cosi' l'utente vede il tentativo di
@@ -5221,6 +5465,11 @@ async fn emit_council_of_competencies_meta_step(
     let created_at_dt = Utc::now();
     let created_at = created_at_dt.to_rfc3339();
     let figure_count = outcome.figures().len();
+    let figure_reports_json: Vec<serde_json::Value> = outcome
+        .figure_reports()
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap_or_else(|_| json!({})))
+        .collect();
     let (title, payload) = match outcome {
         crate::agent_tools::subagent_native::CouncilConveneOutcome::Active { synthesis, .. } => (
             "Consiglio delle Competenze attivo".to_string(),
@@ -5231,6 +5480,7 @@ async fn emit_council_of_competencies_meta_step(
                 "activated": true,
                 "degraded": false,
                 "figure_count": figure_count,
+                "figure_reports": figure_reports_json,
                 "advisory_verdict": synthesis.verdict.as_str(),
                 "requirements_count": synthesis.requirements.len(),
                 "risks_count": synthesis.risks.len(),
@@ -5245,6 +5495,7 @@ async fn emit_council_of_competencies_meta_step(
                 "activated": false,
                 "degraded": true,
                 "figure_count": figure_count,
+                "figure_reports": figure_reports_json,
                 "degradation_reason": outcome.degradation_reason_code(),
                 "degradation_detail": match reason {
                     crate::agent_tools::subagent_native::CouncilDegradeReason::SubagentsDisabled =>

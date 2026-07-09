@@ -165,6 +165,112 @@ test("consiglio competenze usa meta-step strutturato dedicato", () => {
   assert.equal(event.activationSource, "agentic_deterministic_complexity_scope_analysis");
 });
 
+test("consiglio in corso espone figure_tasks e aggiorna lo stesso evento", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        signal: "council_convening",
+        phase: "convening",
+        figure_count: 3,
+        completed_count: 0,
+        figure_tasks: [
+          { kind: "security_engineer", status: "running" },
+          { kind: "software_architect", status: "running" },
+          { kind: "project_manager", status: "running" },
+        ],
+      },
+      "Consiglio in corso (0/3)",
+    ),
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        signal: "council_convening",
+        phase: "convening",
+        figure_count: 3,
+        completed_count: 2,
+        figure_tasks: [
+          { kind: "security_engineer", status: "done" },
+          { kind: "software_architect", status: "done" },
+          { kind: "project_manager", status: "running" },
+        ],
+      },
+      "Consiglio in corso (2/3)",
+    ),
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        signal: "council_synthesis_present",
+        activated: true,
+        degraded: false,
+        figure_count: 3,
+      },
+      "Consiglio delle Competenze attivo",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const events = stream.segments.flatMap((seg) => seg.events).filter(
+    (e): e is Extract<ActivityEvent, { type: "council_of_competencies" }> =>
+      e.type === "council_of_competencies",
+  );
+
+  assert.equal(events.length, 1, "convening progress deve essere upsertato");
+  assert.equal(events[0]?.phase, "complete");
+  assert.equal(events[0]?.degraded, false);
+});
+
+test("consiglio competenze degradato espone figure_reports strutturati", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        activation_source: "agentic_deterministic_complexity_scope_analysis",
+        signal: "council_degraded",
+        activated: false,
+        degraded: true,
+        degradation_reason: "synthesis_unavailable",
+        degradation_detail:
+          "Nessuna figura ha prodotto un parere advisory valido.",
+        figure_count: 2,
+        figure_reports: [
+          {
+            kind: "security_engineer",
+            status: "prepare_failed",
+            detail_code: "depth_exceeded",
+            detail_message: "depth 3 > max 2",
+          },
+          {
+            kind: "software_architect",
+            status: "completed_no_advisory",
+            detail_code: "no_advisory",
+            detail_message: "Sub-run completato senza chiamare advisory_verdict",
+          },
+        ],
+      },
+      "Consiglio delle Competenze degradato (2 figure)",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const event = stream.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is Extract<ActivityEvent, { type: "council_of_competencies" }> =>
+      e.type === "council_of_competencies",
+    );
+
+  assert.ok(event, "evento Consiglio degradato atteso");
+  assert.equal(event.degraded, true);
+  assert.equal(event.figureReports?.length, 2);
+  assert.equal(event.figureReports?.[0]?.detail_code, "depth_exceeded");
+});
+
 test("consiglio competenze degradato espone segnale strutturato", () => {
   beforeEach();
   const metaSteps: MetaStepEntry[] = [

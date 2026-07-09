@@ -238,6 +238,42 @@ async fn declared_done_ripetuto_chiude() {
 }
 
 #[tokio::test]
+async fn declared_done_non_chiude_durante_correzione_final_gate() {
+    // Dopo un final_gate FAILED (final_gate_cycle>0) la chiusura d'autorita'
+    // su done>=3 NON deve scattare: il modello deve poter applicare il fix
+    // richiesto dal gate (incidente run 97cbaa45).
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("applico il fix richiesto dal gate"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![
+            human("crea x"),
+            human("<final_gate_failed> build rotta"),
+        ],
+        declared_outcome: Some(json!({"outcome": "done", "summary": "fatto tutto"})),
+        declared_done_count: Some(3),
+        final_gate_cycle: Some(1),
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "edit_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_ne!(
+        out.result.as_deref(),
+        Some("fatto tutto"),
+        "non deve chiudere col summary stantio"
+    );
+    assert_eq!(
+        llm.seen.lock().unwrap().len(),
+        1,
+        "il turno di correzione prosegue con chiamata LLM"
+    );
+}
+
+#[tokio::test]
 async fn g1_cap_raggiunto_ferma_senza_modello() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
@@ -4841,6 +4877,31 @@ mod golden {
     }
 
     #[test]
+    fn head_gate_sopprime_declared_done_in_correzione_final_gate() {
+        assert_eq!(
+            head_gate(false, true, 3, false, true),
+            HeadGate::Proceed
+        );
+        assert_eq!(
+            head_gate(false, true, 3, false, false),
+            HeadGate::DeclaredDone
+        );
+    }
+
+    #[test]
+    fn forced_text_soppresso_in_correzione_final_gate() {
+        use super::forced_text_turn_active;
+        assert!(
+            !forced_text_turn_active(56, 55, Some(StopReason::ToolUse), true, true),
+            "correzione final_gate: i tool devono restare disponibili"
+        );
+        assert!(
+            forced_text_turn_active(56, 55, Some(StopReason::ToolUse), false, true),
+            "fuori correzione final_gate la finestra forced-text resta attiva"
+        );
+    }
+
+    #[test]
     #[ignore = "richiede /tmp/golden_executor_node.json generato da gen_golden_executor_node.py"]
     fn golden_executor_node() {
         let Some(raw) = crate::golden_util::load_golden(
@@ -4871,6 +4932,9 @@ mod golden {
                             .and_then(Value::as_i64)
                             .unwrap_or(0),
                         inp.get("g1_cap_reached")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        inp.get("final_gate_correction_active")
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
                     );
